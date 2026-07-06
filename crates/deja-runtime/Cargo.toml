@@ -1,0 +1,26 @@
+[package]
+name = "deja-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Semantic record/replay engine for Déjà — captures trait-level operations"
+
+[dependencies]
+async-trait = "0.1"
+deja-core = { path = "../deja-core" }
+deja-context = { path = "../deja-context" }
+deja-derive = { path = "../deja-derive" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

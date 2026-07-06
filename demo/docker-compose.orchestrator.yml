@@ -1,0 +1,23 @@
+# Dedicated Postgres for the deja orchestrator (run state, stage
+# history, logs, artifacts, audit). Separate from the per-run demo stack so it
+# survives `down -v` between runs; non-default host port to avoid collisions
+# with local postgres / the demo's unpublished pg.
+#
+#   docker compose -p deja-orchestrator -f demo/docker-compose.orchestrator.yml up -d
+services:
+  pg:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: deja
+      POSTGRES_PASSWORD: deja
+      POSTGRES_DB: deja
+    ports:
+      - "55432:5432"
+    volumes:
+      - orchestrator-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deja"]
+      interval: 3s
+      retries: 20
+volumes:
+  orchestrator-pg-data:

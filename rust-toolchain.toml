@@ -1,0 +1,7 @@
+[toolchain]
+# Workspace toolchain (orchestrator/harness/tui may use modern deps freely).
+# The 5 runtime crates Hyperswitch consumes (deja, deja-context, deja-core,
+# deja-derive, deja-record) keep a 1.85 MSRV, CI-enforced by the msrv-runtime
+# job — they must never outrun Hyperswitch's rust-version.
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

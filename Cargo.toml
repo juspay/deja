@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/deja",
+    "crates/deja-context",
+    "crates/deja-core",
+    "crates/deja-derive",
+    "crates/deja-compactor",
+    "crates/deja-runtime",
+    "crates/deja-tui",
+    "crates/deja-kernel",
+    "crates/deja-orchestrator",
+    "crates/deja-store",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+version = "0.1.0"
+authors = ["Déjà contributors"]
+repository = "https://github.com/juspay/deja"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

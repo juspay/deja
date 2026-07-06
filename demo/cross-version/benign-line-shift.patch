@@ -1,0 +1,19 @@
+diff --git a/crates/router/src/core/payments/operations/payment_create.rs b/crates/router/src/core/payments/operations/payment_create.rs
+index c177c72db1..d2057e417b 100644
+--- a/crates/router/src/core/payments/operations/payment_create.rs
++++ b/crates/router/src/core/payments/operations/payment_create.rs
+@@ -62,6 +62,14 @@ use crate::{
+     utils::{self, OptionExt},
+ };
+ 
++// ---------------------------------------------------------------------------
++// V2 CANDIDATE (benign): a documentation comment added above the PaymentCreate
++// operation. It shifts every `#[track_caller]` boundary line below it WITHOUT
++// changing any behavior or any argument flowing into a boundary. The
++// cross-version harness must still resolve every recorded call (via the
++// version-stable LogicalContext / SyntacticHash ranks, not source location), so
++// this candidate must replay V1's recording with NO divergence.
++// ---------------------------------------------------------------------------
+ #[derive(Debug, Clone, Copy, PaymentOperation)]
+ #[operation(operations = "all", flow = "authorize")]
+ pub struct PaymentCreate;

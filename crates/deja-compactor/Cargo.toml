@@ -1,0 +1,21 @@
+[package]
+name = "deja-compactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compacts deja landing objects into sealed, manifested session layouts in S3"
+
+[dependencies]
+futures = "0.3"
+object_store = { version = "0.11", features = ["aws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt"] }
+zstd = "0.13"
+
+[[bin]]
+name = "deja-compactor"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,6 +20,7 @@
+ # (Rust 1.85) continues to work for all other crates.
+ exclude = [
+     "crates/deja-actix",
++    "vendor/fred-deja",
+ ]
+ resolver = "2"
+ 
+@@ -41,3 +42,4 @@
+ 
+ [patch.crates-io]
+ tokio = { path = "vendor/tokio-deja" }
++fred = { path = "vendor/fred-deja" }
+--- a/vendor/hyperswitch/Cargo.toml
++++ b/vendor/hyperswitch/Cargo.toml
+@@ -64,3 +64,6 @@
+ # Patch Tokio 1.48.0 so fred's tokio::sync::mpsc::UnboundedSender<RouterCommand>
+ # carries Déjà context from request task -> long-lived Redis router task.
+ tokio = { path = "../tokio-deja" }
++# Patch fred so the Redis reader task scopes socket reads using the oldest in-flight
++# command context, improving Redis recv-side request attribution.
++fred = { path = "../fred-deja" }

@@ -1,0 +1,367 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -118,6 +118,10 @@
+ [dependencies.bytes-utils]
+ version = "0.1"
+ 
++[dependencies.deja-context]
++path = "../../crates/deja-context"
++version = "0.1.0"
++
+ [dependencies.crossbeam-queue]
+ version = "0.3"
+ 
+--- a/src/protocol/command.rs
++++ b/src/protocol/command.rs
+@@ -14,6 +14,7 @@
+   utils,
+ };
+ use bytes_utils::Str;
++use deja_context::{capture_current, ContextSnapshot};
+ use parking_lot::Mutex;
+ use redis_protocol::resp3::types::RespVersion;
+ use std::{
+@@ -1456,6 +1457,8 @@
+   ///
+   /// Some commands store arguments differently. Callers should use `self.args()` to account for this.
+   pub arguments:              Vec<RedisValue>,
++  /// Déjà request context captured when the command was created.
++  pub deja_context:           ContextSnapshot,
+   /// A oneshot sender used to communicate with the router.
+   pub router_tx:              Arc<Mutex<Option<RouterSender>>>,
+   /// The number of times the command has been written to a socket.
+@@ -1539,6 +1542,7 @@
+       timeout_dur: None,
+       response: ResponseKind::Respond(None),
+       hasher: ClusterHash::default(),
++      deja_context: capture_current(),
+       router_tx: Arc::new(Mutex::new(None)),
+       attempts_remaining: 0,
+       redirections_remaining: 0,
+@@ -1571,6 +1575,7 @@
+       timed_out: Arc::new(AtomicBool::new(false)),
+       timeout_dur: None,
+       hasher: ClusterHash::default(),
++      deja_context: capture_current(),
+       router_tx: Arc::new(Mutex::new(None)),
+       attempts_remaining: 0,
+       redirections_remaining: 0,
+@@ -1603,6 +1608,7 @@
+       timed_out: Arc::new(AtomicBool::new(false)),
+       timeout_dur: None,
+       hasher: ClusterHash::default(),
++      deja_context: capture_current(),
+       router_tx: Arc::new(Mutex::new(None)),
+       attempts_remaining: 0,
+       redirections_remaining: 0,
+@@ -1636,6 +1642,7 @@
+       timeout_dur: None,
+       response: ResponseKind::Respond(None),
+       hasher: ClusterHash::default(),
++      deja_context: capture_current(),
+       router_tx: Arc::new(Mutex::new(None)),
+       attempts_remaining: 0,
+       redirections_remaining: 0,
+@@ -1667,6 +1674,7 @@
+       timed_out:                                   Arc::new(AtomicBool::new(false)),
+       timeout_dur:                                 None,
+       response:                                    ResponseKind::Respond(None),
++      deja_context:                                capture_current(),
+       router_tx:                                   Arc::new(Mutex::new(None)),
+       attempts_remaining:                          0,
+       redirections_remaining:                      0,
+@@ -1756,6 +1764,11 @@
+     }
+   }
+ 
++  /// Read the Déjà context associated with this command.
++  pub fn context(&self) -> ContextSnapshot {
++    self.deja_context.clone()
++  }
++
+   /// Whether the command blocks the connection.
+   pub fn blocks_connection(&self) -> bool {
+     self.transaction_id.is_none()
+@@ -1839,6 +1852,7 @@
+       timeout_dur: self.timeout_dur,
+       can_pipeline: self.can_pipeline,
+       skip_backpressure: self.skip_backpressure,
++      deja_context: self.deja_context.clone(),
+       router_tx: self.router_tx.clone(),
+       cluster_node: self.cluster_node.clone(),
+       fail_fast: self.fail_fast,
+@@ -2180,3 +2194,18 @@
+     RouterCommand::Command(cmd)
+   }
+ }
++
++#[cfg(test)]
++mod tests {
++  use super::*;
++
++  #[test]
++  fn duplicate_preserves_deja_context() {
++    let command = deja_context::scope_sync(ContextSnapshot::new("req-dup"), || {
++      RedisCommand::new(RedisCommandKind::Ping, vec![])
++    });
++
++    let duplicate = command.duplicate(ResponseKind::Skip);
++    assert_eq!(duplicate.context().correlation_id(), Some("req-dup"));
++  }
++}
+--- a/src/protocol/connection.rs
++++ b/src/protocol/connection.rs
+@@ -12,17 +12,19 @@
+   utils,
+ };
+ use bytes_utils::Str;
+-use crossbeam_queue::SegQueue;
++use deja_context::ContextSnapshot;
+ use futures::{
+   sink::SinkExt,
+   stream::{SplitSink, SplitStream, StreamExt},
+   Sink,
+   Stream,
+ };
++use parking_lot::Mutex;
+ use redis_protocol::resp3::types::{Frame as Resp3Frame, RespVersion};
+ use semver::Version;
+ use socket2::SockRef;
+ use std::{
++  collections::VecDeque,
+   fmt,
+   net::SocketAddr,
+   pin::Pin,
+@@ -67,28 +69,38 @@
+ /// A shared buffer across tasks.
+ #[derive(Clone, Debug)]
+ pub struct SharedBuffer {
+-  inner:   Arc<SegQueue<RedisCommand>>,
++  inner:   Arc<Mutex<VecDeque<RedisCommand>>>,
+   blocked: Arc<AtomicBool>,
+ }
+ 
+ impl SharedBuffer {
+   pub fn new() -> Self {
+     SharedBuffer {
+-      inner:   Arc::new(SegQueue::new()),
++      inner:   Arc::new(Mutex::new(VecDeque::new())),
+       blocked: Arc::new(AtomicBool::new(false)),
+     }
+   }
+ 
+   pub fn push(&self, cmd: RedisCommand) {
+-    self.inner.push(cmd);
++    self.inner.lock().push_back(cmd);
+   }
+ 
+   pub fn pop(&self) -> Option<RedisCommand> {
+-    self.inner.pop()
++    self.inner.lock().pop_front()
+   }
+ 
+   pub fn len(&self) -> usize {
+-    self.inner.len()
++    self.inner.lock().len()
++  }
++
++  /// Read the oldest in-flight command context, if any.
++  pub fn front_context(&self) -> ContextSnapshot {
++    self
++      .inner
++      .lock()
++      .front()
++      .map(|cmd| cmd.context())
++      .unwrap_or_else(ContextSnapshot::empty)
+   }
+ 
+   pub fn set_blocked(&self) {
+@@ -105,11 +117,7 @@
+ 
+   pub fn drain(&self) -> Vec<RedisCommand> {
+     utils::set_bool_atomic(&self.blocked, false);
+-    let mut out = Vec::with_capacity(self.inner.len());
+-    while let Some(cmd) = self.inner.pop() {
+-      out.push(cmd);
+-    }
+-    out
++    self.inner.lock().drain(..).collect()
+   }
+ }
+ 
+@@ -1197,3 +1205,29 @@
+   writer.write_frame(frame, true, false).await?;
+   utils::apply_timeout(async { rx.await? }, timeout_dur).await
+ }
++
++#[cfg(test)]
++mod tests {
++  use super::*;
++  use crate::protocol::command::RedisCommandKind;
++
++  #[test]
++  fn shared_buffer_exposes_oldest_command_context() {
++    let buffer = SharedBuffer::new();
++
++    let first = deja_context::scope_sync(ContextSnapshot::new("req-1"), || {
++      RedisCommand::new(RedisCommandKind::Ping, vec![])
++    });
++    let second = deja_context::scope_sync(ContextSnapshot::new("req-2"), || {
++      RedisCommand::new(RedisCommandKind::Ping, vec![])
++    });
++
++    buffer.push(first);
++    buffer.push(second);
++
++    assert_eq!(buffer.front_context().correlation_id(), Some("req-1"));
++    let popped = buffer.pop().expect("first command should exist");
++    assert_eq!(popped.context().correlation_id(), Some("req-1"));
++    assert_eq!(buffer.front_context().correlation_id(), Some("req-2"));
++  }
++}
+--- a/src/router/centralized.rs
++++ b/src/router/centralized.rs
+@@ -13,6 +13,7 @@
+   router::{responses, utils, Connections, Written},
+   types::ServerConfig,
+ };
++use deja_context::{current_correlation_id, scope_snapshot};
+ use std::{collections::VecDeque, sync::Arc};
+ use tokio::task::JoinHandle;
+ 
+@@ -49,9 +50,47 @@
+ 
+   tokio::spawn(async move {
+     let mut last_error = None;
++    let context_debug = std::env::var_os("DEJA_FRED_CONTEXT_DEBUG").is_some();
+ 
+     loop {
+-      let frame = match utils::next_frame(&inner, &mut reader, &server, &buffer).await {
++      let read_context = buffer.front_context();
++      if context_debug {
++        _debug!(
++          inner,
++          "fred reader before next_frame {} front={:?} current={:?}",
++          server,
++          read_context.correlation_id(),
++          current_correlation_id()
++        );
++      }
++      let debug_context = read_context.clone();
++      let frame = match scope_snapshot(
++        read_context.clone(),
++        async {
++          if context_debug {
++            _debug!(
++              inner,
++              "fred reader inside scope before next_frame {} front={:?} current={:?}",
++              server,
++              debug_context.correlation_id(),
++              current_correlation_id()
++            );
++          }
++          let result = utils::next_frame(&inner, &mut reader, &server, &buffer).await;
++          if context_debug {
++            _debug!(
++              inner,
++              "fred reader inside scope after next_frame {} front={:?} current={:?}",
++              server,
++              debug_context.correlation_id(),
++              current_correlation_id()
++            );
++          }
++          result
++        },
++      )
++      .await
++      {
+         Ok(Some(frame)) => frame.into_resp3(),
+         Ok(None) => {
+           last_error = None;
+@@ -68,7 +107,12 @@
+         break;
+       }
+       if let Some(frame) = responses::check_pubsub_message(&inner, &server, frame) {
+-        if let Err(e) = process_response_frame(&inner, &server, &buffer, &counters, frame).await {
++        if let Err(e) = scope_snapshot(
++          read_context,
++          process_response_frame(&inner, &server, &buffer, &counters, frame),
++        )
++        .await
++        {
+           _debug!(inner, "Error processing response frame from {}: {:?}", server, e);
+           last_error = Some(e);
+           break;
+--- a/src/router/clustered.rs
++++ b/src/router/clustered.rs
+@@ -15,6 +15,7 @@
+   types::ClusterStateChange,
+   utils as client_utils,
+ };
++use deja_context::{current_correlation_id, scope_snapshot};
+ use futures::future::try_join_all;
+ use parking_lot::Mutex;
+ use std::{
+@@ -247,9 +248,47 @@
+ 
+   tokio::spawn(async move {
+     let mut last_error = None;
++    let context_debug = std::env::var_os("DEJA_FRED_CONTEXT_DEBUG").is_some();
+ 
+     loop {
+-      let frame = match utils::next_frame(&inner, &mut reader, &server, &buffer).await {
++      let read_context = buffer.front_context();
++      if context_debug {
++        _debug!(
++          inner,
++          "fred reader before next_frame {} front={:?} current={:?}",
++          server,
++          read_context.correlation_id(),
++          current_correlation_id()
++        );
++      }
++      let debug_context = read_context.clone();
++      let frame = match scope_snapshot(
++        read_context.clone(),
++        async {
++          if context_debug {
++            _debug!(
++              inner,
++              "fred reader inside scope before next_frame {} front={:?} current={:?}",
++              server,
++              debug_context.correlation_id(),
++              current_correlation_id()
++            );
++          }
++          let result = utils::next_frame(&inner, &mut reader, &server, &buffer).await;
++          if context_debug {
++            _debug!(
++              inner,
++              "fred reader inside scope after next_frame {} front={:?} current={:?}",
++              server,
++              debug_context.correlation_id(),
++              current_correlation_id()
++            );
++          }
++          result
++        },
++      )
++      .await
++      {
+         Ok(Some(frame)) => frame.into_resp3(),
+         Ok(None) => {
+           last_error = None;
+@@ -266,7 +305,12 @@
+         break;
+       }
+       if let Some(frame) = responses::check_pubsub_message(&inner, &server, frame) {
+-        if let Err(e) = process_response_frame(&inner, &server, &buffer, &counters, frame).await {
++        if let Err(e) = scope_snapshot(
++          read_context,
++          process_response_frame(&inner, &server, &buffer, &counters, frame),
++        )
++        .await
++        {
+           _debug!(
+             inner,
+             "Error processing clustered response frame from {}: {:?}",

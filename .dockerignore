@@ -1,0 +1,17 @@
+# Exclude from Docker build context — keep it lean for fast builds.
+# The vendor router binary is the ONE build artifact the candidate image needs
+# (COPY in demo/Dockerfile.hyperswitch-semantic), so un-ignore exactly it.
+vendor/hyperswitch-deja-clean/target/*
+!vendor/hyperswitch-deja-clean/target/release/
+vendor/hyperswitch-deja-clean/target/release/*
+!vendor/hyperswitch-deja-clean/target/release/router
+vendor/hyperswitch-deja-clean/.git/
+target/
+demo/harness-state/
+artifacts/
+banks/
+.git/
+.claude/
+*.swp
+*.swo
+.DS_Store

@@ -1,0 +1,13 @@
+diff --git a/crates/router/src/core/payments/operations/payment_create.rs b/crates/router/src/core/payments/operations/payment_create.rs
+index b2a256a317..32e7c3f228 100644
+--- a/crates/router/src/core/payments/operations/payment_create.rs
++++ b/crates/router/src/core/payments/operations/payment_create.rs
+@@ -166,7 +166,7 @@ impl<F: Send + Clone + Sync> GetTracker<F, PaymentData<F>, api::PaymentsRequest>
+         #[cfg(feature = "deja")]
+         {
+             if let Ok(redis) = state.store.get_redis_conn() {
+-                let rate = eu_settlement_read(&redis, "settlement_rate_default").await;
++                let rate = eu_settlement_read(&redis, "settlement_rate_premium").await;
+                 if let Some(r) = rate {
+                     eu_settlement_write(&redis, "eu_settlement_audit", &r).await;
+                 }

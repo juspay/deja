@@ -1,0 +1,35 @@
+flowchart TD
+    A["POST /v2/payments"] --> B["routes/app.rs:790\n/v2/payments -> payments_create_and_confirm_intent"]
+    B --> C["routes/payments.rs:431-481\nserver_wrap + auth"]
+    C --> D["core/payments.rs:3379-3427\npayments_create_and_confirm_intent"]
+
+    D --> E["PaymentIntentCreate\npayments_intent_core"]
+    E --> F["PaymentIntentCreate::get_trackers\ncore/payments/operations/payment_create_intent.rs:90-191"]
+    F --> G["insert_payment_intent"]
+    G --> H{"storage_scheme"}
+    H -->|PostgresOnly| I["DB INSERT payment_intent"]
+    H -->|RedisKv| J["HSETNX pi_{global_payment_id}\noptional merchant_reference reverse_lookup\npush drainer TypedSql"]
+
+    D --> K["decide_authorize_or_setup_intent_flow\ncore/payments.rs:3429-3481"]
+    K -->|amount == 0| L["payments_core<SetupMandate>\nPaymentIntentConfirm"]
+    K -->|amount > 0| M["payments_core<Authorize>\nPaymentIntentConfirm"]
+
+    L --> N["payments_core\ncore/payments.rs:3211-3292"]
+    M --> N
+    N --> O["PaymentIntentConfirm::get_trackers\ncore/payments/operations/payment_confirm_intent.rs:152-281"]
+    O --> P["find_payment_intent_by_id\nHGET pi_{id} -> DB fallback"]
+    O --> Q["insert_payment_attempt\nHSETNX {cluster_label}_{attempt_id}\nattempt reverse_lookup"]
+
+    N --> R["payments_operation_core\ncore/payments.rs:182-466"]
+    R --> S["create_or_fetch_payment_method\noptional payment token/CVC branch"]
+    S --> T["retrieve payment token + PM\nRedis token GET + PM lookup"]
+    S --> U["retrieve_and_delete_cvc_from_payment_token\nGET pm_token_*_cvc then DEL"]
+
+    R --> V["complete_connector_service\ncore/payments.rs:5306-5378"]
+    V --> W["PaymentIntentConfirm::update_trackers\nintent=Processing, attempt=Pending\ncore/payments/operations/payment_confirm_intent.rs:749-873"]
+    W --> X["update_payment_intent + update_payment_attempt\nHSET/DB UPDATE"]
+    V --> Y["connector decide_flows / external connector"]
+    Y --> Z["PaymentResponse::update_tracker\ncore/payments/operations/payment_response.rs:3197-3260\nfinal intent/attempt HSET/DB UPDATE"]
+    Z --> AA["delete_payment_token when final status is not customer/merchant action\ncore/payment_methods/vault.rs:2309-2326"]
+
+    AA --> AB["Replay verdict:\nneeds causal scope + local ordinal\nplus stateful Redis hash/key emulation"]

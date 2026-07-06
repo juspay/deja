@@ -1,0 +1,16 @@
+[package]
+name = "deja-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Runtime-independent context carrier for Déjà causal attribution"
+
+[dependencies]
+pin-project-lite = "0.2"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
