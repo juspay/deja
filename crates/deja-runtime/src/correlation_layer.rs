@@ -45,6 +45,21 @@ const CORRELATION_FIELD: &str = "request_id";
 #[derive(Clone)]
 struct SpanCorrelation(String);
 
+/// The span field that marks a spawned-task boundary: a span carrying
+/// `deja.fork = true` (minted by [`crate::fork_span`] at the `tokio::spawn` site)
+/// opens a NEW lineage bucket, so its subtree is an independent, unordered task
+/// region. Every other span inherits its parent's bucket — synchronous nesting
+/// stays in one bucket, exactly as the old task-local model did, but now derived
+/// purely from the span tree instead of `spawn_detached`.
+const FORK_FIELD: &str = "deja.fork";
+
+/// Task lineage resolved for a span (own bucket if it is a fork boundary, else
+/// inherited from parent), stored in the span's extensions by `on_new_span` and
+/// mirrored onto the current thread by `on_enter` — the span-derived replacement
+/// for the `CURRENT_TASK_LINEAGE` task-local.
+#[derive(Clone)]
+struct SpanLineage(crate::TaskLineage);
+
 thread_local! {
     /// LIFO stack of restore guards, one frame per `on_enter`/`on_exit` pair on
     /// this thread. `None` when the entered span resolved no correlation. Tracing
@@ -68,6 +83,14 @@ thread_local! {
     /// interleaving otherwise causes (see `addresses_for` / the
     /// `Address::SpanPath` rank).
     static NAME_STACK: RefCell<Vec<Option<&'static str>>> = const { RefCell::new(Vec::new()) };
+
+    /// LIFO stack of the task lineage active on this thread — one frame per
+    /// `on_enter`/`on_exit` pair, in lock-step with `GUARD_STACK`/`NAME_STACK`.
+    /// `on_enter` pushes the span's resolved `SpanLineage`; `on_exit` pops. The
+    /// top frame is what `current_task_lineage` reads; an empty stack means the
+    /// root region. Balanced per poll, so work-stealing safe for the same reason
+    /// the correlation stack is.
+    static LINEAGE_STACK: RefCell<Vec<crate::TaskLineage>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The logical span-path currently active on this thread — the entered span NAMES
@@ -116,6 +139,15 @@ pub fn current_span_path() -> Option<String> {
     })
 }
 
+/// The task lineage active on this thread, derived from the entered span tree —
+/// the span-based replacement for the `CURRENT_TASK_LINEAGE` task-local. Returns
+/// the root region's lineage when no lineage-bearing span is entered.
+pub(crate) fn current_span_lineage() -> crate::TaskLineage {
+    LINEAGE_STACK
+        .with(|stack| stack.borrow().last().cloned())
+        .unwrap_or_else(crate::TaskLineage::root)
+}
+
 /// Tracing layer mirroring the ingress `request_id` span field into deja-context.
 #[derive(Debug, Default)]
 pub struct DejaCorrelationLayer;
@@ -147,6 +179,19 @@ impl Visit for CorrelationVisitor {
     }
 }
 
+/// Visitor that detects the `deja.fork` boundary marker on a span.
+struct ForkVisitor(bool);
+
+impl Visit for ForkVisitor {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == FORK_FIELD {
+            self.0 = self.0 || value;
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
 impl<S> Layer<S> for DejaCorrelationLayer
 where
     S: Subscriber,
@@ -171,35 +216,63 @@ where
             })
         });
 
-        if let Some(correlation) = resolved {
+        if let Some(correlation) = resolved.clone() {
             span.extensions_mut().insert(SpanCorrelation(correlation));
         }
+
+        // Resolve task lineage from the span tree. A `deja.fork`-marked span opens
+        // a fresh bucket (an independent, unordered task region); every other span
+        // inherits its parent's lineage, so synchronous nesting stays in one
+        // bucket. This replaces the `spawn_detached`/task-local model outright.
+        let mut fork_visitor = ForkVisitor(false);
+        attrs.record(&mut fork_visitor);
+        let parent_lineage = span.parent().and_then(|parent| {
+            parent
+                .extensions()
+                .get::<SpanLineage>()
+                .map(|l| l.0.clone())
+        });
+        let lineage = if fork_visitor.0 {
+            let base = parent_lineage.unwrap_or_else(crate::TaskLineage::root);
+            crate::TaskLineage::forked_child_of(base, resolved.as_deref())
+        } else {
+            parent_lineage.unwrap_or_else(crate::TaskLineage::root)
+        };
+        span.extensions_mut().insert(SpanLineage(lineage));
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        // Brief read of the pre-resolved correlation + the span's static name;
-        // never a write, never a walk.
+        // Brief read of the pre-resolved correlation, the span's static name, and
+        // the pre-resolved lineage; never a write, never a walk.
         let span = ctx.span(id);
         let name: Option<&'static str> = span.as_ref().map(|span| span.name());
-        let correlation = span.and_then(|span| {
+        let correlation = span.as_ref().and_then(|span| {
             span.extensions()
                 .get::<SpanCorrelation>()
                 .map(|c| c.0.clone())
         });
+        let lineage = span
+            .as_ref()
+            .and_then(|span| span.extensions().get::<SpanLineage>().map(|l| l.0.clone()))
+            .unwrap_or_else(crate::TaskLineage::root);
 
-        // Always push a frame (Some or None) to BOTH stacks so `on_exit` can pop
-        // each unconditionally, keeping them balanced across nested spans.
+        // Always push a frame to EVERY stack so `on_exit` can pop each
+        // unconditionally, keeping them balanced across nested spans.
         let frame = correlation.map(enter_correlation_id);
         GUARD_STACK.with(|stack| stack.borrow_mut().push(frame));
         NAME_STACK.with(|stack| stack.borrow_mut().push(name));
+        LINEAGE_STACK.with(|stack| stack.borrow_mut().push(lineage));
     }
 
     fn on_exit(&self, _id: &Id, _ctx: Context<'_, S>) {
-        // Pop the span-name frame first (pure thread-local, no guard restore), then
-        // pop this poll's correlation frame OUT and drop it — so the guard's restore
-        // (which touches a different thread-local) never runs while a stack borrow is
-        // held. A spurious exit with empty stacks pops `None` and is a no-op.
+        // Pop the name + lineage frames first (pure thread-local, no guard
+        // restore), then pop this poll's correlation frame OUT and drop it — so the
+        // guard's restore (which touches a different thread-local) never runs while
+        // a stack borrow is held. A spurious exit with empty stacks is a no-op.
         NAME_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+        LINEAGE_STACK.with(|stack| {
             stack.borrow_mut().pop();
         });
         let frame = GUARD_STACK.with(|stack| stack.borrow_mut().pop());
@@ -311,6 +384,45 @@ mod tests {
                 Some("payments_core>update_payment_intent")
             );
             assert_ne!(path_a, path_b);
+        });
+    }
+
+    #[test]
+    fn fork_span_opens_a_new_lineage_bucket() {
+        // The substrate's lineage proof: a `deja.fork`-marked span (what
+        // `spawn_fork` instruments at the `tokio::spawn` site) opens a fresh,
+        // non-root bucket — an unordered region — while ordinary spans inherit
+        // their parent's. This replaces the removed task-local `spawn_detached`.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-fork");
+            let _root = root.enter();
+            // The synchronous request path stays in the root bucket.
+            let base = current_span_lineage();
+            assert_eq!(base.bucket_id, crate::ROOT_TASK_ID);
+            assert_eq!(base.fork_seq, 0);
+
+            {
+                let fork = crate::fork_span();
+                let _fork = fork.enter();
+                let forked = current_span_lineage();
+                assert!(
+                    forked.bucket_id.contains("::fork-"),
+                    "fork bucket must carry the marker, got {:?}",
+                    forked.bucket_id
+                );
+                assert_eq!(forked.fork_seq, 1, "first fork sequence is deterministic");
+                assert_eq!(forked.parent_task_id.as_deref(), Some(crate::ROOT_TASK_ID));
+
+                // A plain child under the fork inherits the fork bucket — the
+                // unordered region propagates down the span tree.
+                let child = tracing::info_span!("inside_fork");
+                let _child = child.enter();
+                assert_eq!(current_span_lineage().bucket_id, forked.bucket_id);
+            }
+
+            // Fork popped LIFO → back to the synchronous root bucket.
+            assert_eq!(current_span_lineage().bucket_id, crate::ROOT_TASK_ID);
         });
     }
 }

@@ -145,17 +145,38 @@ fn load_recording(path: &PathBuf) -> std::io::Result<Vec<BoundaryEvent>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
+    let mut graph_nodes = 0usize;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<BoundaryEvent>(&line) {
-            Ok(ev) => events.push(ev),
+        // Tagged one-stream tape: `record_kind` routes each line. Boundary
+        // events deserialize with the tag beside their flat fields (serde
+        // ignores the extra key); graph nodes ride the same stream but are
+        // not driveable, so they skip silently.
+        let value = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(value) => value,
             Err(err) => {
                 eprintln!("deja-kernel: skipping unparseable line: {err}");
+                continue;
+            }
+        };
+        match value.get("record_kind").and_then(|k| k.as_str()) {
+            Some("boundary_event") => match serde_json::from_value::<BoundaryEvent>(value) {
+                Ok(ev) => events.push(ev),
+                Err(err) => {
+                    eprintln!("deja-kernel: skipping unparseable boundary_event: {err}");
+                }
+            },
+            Some("graph_node") => graph_nodes += 1,
+            other => {
+                eprintln!("deja-kernel: skipping line with record_kind {other:?}");
             }
         }
+    }
+    if graph_nodes > 0 {
+        eprintln!("deja-kernel: skipped {graph_nodes} graph_node record(s) riding the tape");
     }
     Ok(events)
 }

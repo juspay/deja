@@ -99,6 +99,21 @@ pub fn pull_recording(
     Ok((report, manifest))
 }
 
+/// Inject the internally-tagged `record_kind` as the first field of a raw JSON
+/// event object, so the unwrapped line deserializes as a `DejaRecord`. Preserves
+/// the original payload bytes verbatim (no reparse of the event body).
+fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
+    match event_json.trim_start().strip_prefix('{') {
+        // Empty object `{}` — no trailing comma.
+        Some(rest) if rest.trim_start().starts_with('}') => {
+            format!("{{\"record_kind\":\"{record_kind}\"{rest}")
+        }
+        Some(rest) => format!("{{\"record_kind\":\"{record_kind}\",{rest}"),
+        // Not a JSON object; leave as-is (it will fail the EventProbe parse and drop).
+        None => event_json.to_owned(),
+    }
+}
+
 /// Unwrap envelopes (raw event bytes preserved), probe the dedup/sort key,
 /// drop duplicates and sink markers, sort canonically. Returns the sorted
 /// `(recording_run_id, global_sequence, raw_event_json)` triples plus
@@ -122,10 +137,17 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize
                     artifact_type,
                     event: Some(event),
                 }) => {
-                    if artifact_type.as_deref() == Some("deja_sink_marker") {
-                        continue; // loss-accounting records, not events
-                    }
-                    event.get().to_owned()
+                    // The canonical events.jsonl is a `DejaRecord` stream, internally
+                    // tagged by `record_kind`. The wire envelope's `artifact_type` is
+                    // the record kind, but the sink omits the tag from the raw event
+                    // payload — stamp the matching one as we unwrap so the renderer
+                    // and kernel can deserialize the line as a `DejaRecord`.
+                    let record_kind = match artifact_type.as_deref() {
+                        Some("deja_sink_marker") => continue, // loss-accounting, not events
+                        Some("deja_graph_node") => "graph_node",
+                        _ => "boundary_event", // deja_artifact_record (+ unset legacy)
+                    };
+                    stamp_record_kind(event.get(), record_kind)
                 }
                 _ => {
                     eprintln!("ingest: dropping non-envelope line");

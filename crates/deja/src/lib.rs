@@ -53,12 +53,11 @@ pub use deja_runtime::ExecutionGraphLayer;
 /// Re-export semantic recording primitives so downstream crates only need
 /// one `deja` dependency.
 pub use deja_runtime::{
-    current_task_is_detached, flush_global_hook, global_hook_from_env, hook_from_env,
-    spawn_detached, AsyncRecordWriter, BoundaryEvent, CompositeSink, DisabledHook, EventBuilder,
-    Fidelity, JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink, RecordedOutput,
+    flush_global_hook, fork_span, global_hook_from_env, graph_recording_enabled, hook_from_env,
+    installed_runtime_hook, set_graph_recording_enabled, spawn_fork, AsyncRecordWriter,
+    BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder, Fidelity, GraphNodeSink,
+    JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink, RecordedOutput,
     RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot, CURRENT_EVENT_SCHEMA_VERSION,
-    DEJA_BATCH_SIZE_ENV_VAR, DEJA_GRAPH_DIR_ENV_VAR, DEJA_QUEUE_CAPACITY_ENV_VAR,
-    DEJA_SINK_POLICY_ENV_VAR,
 };
 /// Re-export callsite identity and runtime hook primitives for the
 /// `DEJA_MODE=record|replay` foundation.
@@ -873,9 +872,6 @@ pub mod db {
 /// Not part of the public API — the `deja::*` attribute macros call these.
 pub mod __private {
     pub use deja_context::current_correlation_id;
-    /// Scope a closure to a correlation id (used by integration middleware to
-    /// bind the request id around handler execution).
-    pub use deja_context::scope as scope_correlation;
     // The single boundary-crossing seam the `#[deja::boundary]` family emits.
     // `dispatch` owns ALL replay/record/execute control flow internally, so the
     // macro names no replay-only operation. The older `replay_boundary` /

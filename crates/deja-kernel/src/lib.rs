@@ -297,7 +297,6 @@ mod tests {
             recording_run_id: Some("run".to_owned()),
             graph_node_id: None,
             tracing_span_id: None,
-            detached: false,
             task_id: Some("root".to_owned()),
             parent_task_id: None,
             task_bucket: Some("c-1".to_owned()),

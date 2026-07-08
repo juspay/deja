@@ -57,6 +57,8 @@ services:
     build:
       context: ../..
       dockerfile: demo/Dockerfile.hyperswitch-semantic
+      args:
+        DEJA_VENDOR_PATH: ${DEJA_VENDOR_PATH:-vendor/hyperswitch-deja-clean}
       platforms: [linux/amd64]
     # The demo image's ENTRYPOINT is the benchmark script; run the router server.
     entrypoint: ["/local/bin/router"]
@@ -115,6 +117,8 @@ services:
     build:
       context: ../..
       dockerfile: demo/Dockerfile.hyperswitch-semantic
+      args:
+        DEJA_VENDOR_PATH: ${DEJA_VENDOR_PATH:-vendor/hyperswitch-deja-clean}
       platforms: [linux/amd64]
     networks:
       - router_net

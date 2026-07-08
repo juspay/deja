@@ -46,6 +46,8 @@ pub struct S3Config {
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
+    pub region: String,
+    pub allow_http: bool,
 }
 
 impl S3Config {
@@ -56,19 +58,31 @@ impl S3Config {
             bucket: env("DEJA_S3_BUCKET", "deja-recordings"),
             access_key: env("DEJA_S3_ACCESS_KEY", "minioadmin"),
             secret_key: env("DEJA_S3_SECRET_KEY", "minioadmin"),
+            region: env("DEJA_S3_REGION", "us-east-1"),
+            // Default true for the demo MinIO (plaintext); a real S3 endpoint
+            // sets DEJA_S3_ALLOW_HTTP=false to require TLS.
+            allow_http: env("DEJA_S3_ALLOW_HTTP", "true") != "false",
         }
     }
 
+    fn has_static_credentials(&self) -> bool {
+        !self.access_key.trim().is_empty() && !self.secret_key.trim().is_empty()
+    }
+
     pub fn build(&self) -> Result<DynStore, String> {
-        let store = AmazonS3Builder::new()
+        let mut builder = AmazonS3Builder::new()
             .with_endpoint(&self.endpoint)
             .with_bucket_name(&self.bucket)
-            .with_access_key_id(&self.access_key)
-            .with_secret_access_key(&self.secret_key)
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .build()
-            .map_err(|e| format!("s3 client: {e}"))?;
+            .with_region(&self.region)
+            .with_allow_http(self.allow_http);
+
+        if self.has_static_credentials() {
+            builder = builder
+                .with_access_key_id(&self.access_key)
+                .with_secret_access_key(&self.secret_key);
+        }
+
+        let store = builder.build().map_err(|e| format!("s3 client: {e}"))?;
         Ok(Arc::new(store))
     }
 }
@@ -560,6 +574,26 @@ mod tests {
         format!(
             r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"{inst}","capture":{{"mode":"session","session_id":"s1"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"s1","global_sequence":{gseq},"correlation_id":{corr_json},"boundary":"{boundary}","event_schema_version":1}}}}"#
         )
+    }
+
+    #[test]
+    fn s3_config_requires_both_static_credentials() {
+        let mut cfg = S3Config {
+            endpoint: "http://127.0.0.1:9100".to_owned(),
+            bucket: "deja-recordings".to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: "us-east-1".to_owned(),
+            allow_http: true,
+        };
+
+        assert!(!cfg.has_static_credentials());
+        cfg.access_key = "access".to_owned();
+        assert!(!cfg.has_static_credentials());
+        cfg.secret_key = "secret".to_owned();
+        assert!(cfg.has_static_credentials());
+        cfg.access_key = " ".to_owned();
+        assert!(!cfg.has_static_credentials());
     }
 
     #[test]

@@ -426,6 +426,7 @@ dependencies = [
  "deja",
  "deja-compactor",
  "deja-context",
+ "deja-core",
  "deja-kernel",
  "deja-store",
  "hex",

@@ -1096,10 +1096,6 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "ObservedCallWire")]
 pub struct ObservedCall {
@@ -1122,10 +1118,6 @@ pub struct ObservedCall {
     /// finalizer marker (`http_incoming`) or another boundary can provide it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_timestamp_ns: Option<u64>,
-    /// True when this observed call was emitted while draining declared detached
-    /// work; post-finalization detached work is expected and non-diagnostic.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub detached: bool,
     /// Stable replay task id stamped by the runtime kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -1214,8 +1206,6 @@ struct ObservedCallWire {
     #[serde(default)]
     end_timestamp_ns: Option<u64>,
     #[serde(default)]
-    detached: bool,
-    #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
     parent_task_id: Option<String>,
@@ -1264,7 +1254,6 @@ impl From<ObservedCallWire> for ObservedCall {
             source_event_global_sequence: wire.source_event_global_sequence,
             timestamp_ns: wire.timestamp_ns,
             end_timestamp_ns: wire.end_timestamp_ns,
-            detached: wire.detached,
             task_id: wire.task_id,
             parent_task_id: wire.parent_task_id,
             task_bucket,
@@ -1482,6 +1471,10 @@ pub trait LookupTableSource: Send {
 /// inline.
 pub trait ObservedCallSink: Send + Sync {
     fn observed(&self, call: ObservedCall);
+    /// Execution-graph node captured during replay; rides the observed
+    /// stream. Default no-op: sinks that persist the stream must override,
+    /// assertion-only test sinks may ignore graph traffic.
+    fn graph_node(&self, _node: deja_core::ExecutionGraphNode) {}
     fn flush(&self) -> std::io::Result<()>;
 }
 
@@ -1526,6 +1519,7 @@ impl LookupTableSource for LocalFileLookupSource {
 /// In-memory `ObservedCallSink` for tests and standalone harness use.
 pub struct InMemoryObservedSink {
     calls: std::sync::Arc<Mutex<Vec<ObservedCall>>>,
+    graph_nodes: std::sync::Arc<Mutex<Vec<deja_core::ExecutionGraphNode>>>,
 }
 
 impl Default for InMemoryObservedSink {
@@ -1538,7 +1532,16 @@ impl InMemoryObservedSink {
     pub fn new() -> Self {
         Self {
             calls: std::sync::Arc::new(Mutex::new(Vec::new())),
+            graph_nodes: std::sync::Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Graph nodes captured so far; useful for assertions in tests.
+    pub fn graph_nodes(&self) -> Vec<deja_core::ExecutionGraphNode> {
+        self.graph_nodes
+            .lock()
+            .map(|buf| buf.clone())
+            .unwrap_or_default()
     }
 
     /// Clone of the underlying buffer; useful for assertions in tests.
@@ -1558,6 +1561,11 @@ impl ObservedCallSink for InMemoryObservedSink {
     fn observed(&self, call: ObservedCall) {
         if let Ok(mut buf) = self.calls.lock() {
             buf.push(call);
+        }
+    }
+    fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
+        if let Ok(mut buf) = self.graph_nodes.lock() {
+            buf.push(node);
         }
     }
     fn flush(&self) -> std::io::Result<()> {
@@ -1587,15 +1595,24 @@ impl FileObservedSink {
     }
 }
 
-impl ObservedCallSink for FileObservedSink {
-    fn observed(&self, call: ObservedCall) {
+impl FileObservedSink {
+    fn write_record(&self, record: &crate::DejaRecord) {
         use std::io::Write;
         if let Ok(mut guard) = self.file.lock() {
-            if let Ok(line) = serde_json::to_string(&call) {
+            if let Ok(line) = serde_json::to_string(record) {
                 let _ = guard.write_all(line.as_bytes());
                 let _ = guard.write_all(b"\n");
             }
         }
+    }
+}
+
+impl ObservedCallSink for FileObservedSink {
+    fn observed(&self, call: ObservedCall) {
+        self.write_record(&crate::DejaRecord::Observed(Box::new(call)));
+    }
+    fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
+        self.write_record(&crate::DejaRecord::GraphNode(node));
     }
     fn flush(&self) -> std::io::Result<()> {
         use std::io::Write;
@@ -1635,6 +1652,10 @@ pub struct LookupTableHook {
     /// (occurrence-0) call at each callsite would resolve.
     callsite_occurrence: Mutex<crate::CallsiteOccurrenceMap>,
     observed_sink: Box<dyn ObservedCallSink>,
+    /// Sequence space for replay-side graph nodes on the observed stream;
+    /// separate from the lookup counters so replay addressing stays in
+    /// lockstep with the recorder whether or not graph capture is on.
+    graph_counter: std::sync::atomic::AtomicU64,
 }
 
 impl LookupTableHook {
@@ -1659,6 +1680,7 @@ impl LookupTableHook {
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
             observed_sink: Box::new(sink),
+            graph_counter: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1671,6 +1693,14 @@ impl LookupTableHook {
     /// auto-flush on drop; orchestrators should call this at run end.
     pub fn flush(&self) -> std::io::Result<()> {
         self.observed_sink.flush()
+    }
+
+    /// Replay-side execution-graph capture: nodes ride the observed stream.
+    pub fn record_graph_node(&self, mut node: deja_core::ExecutionGraphNode) {
+        node.global_sequence = self
+            .graph_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.observed_sink.graph_node(node);
     }
 
     fn bump_request_sequence(&self, correlation_id: Option<&str>) -> u64 {
@@ -1818,7 +1848,6 @@ impl Resolution {
             source_event_global_sequence: self.source_event_global_sequence,
             timestamp_ns: crate::now_ns(),
             end_timestamp_ns: None,
-            detached: crate::current_task_is_detached(),
             task_id: self.task_id,
             parent_task_id: self.parent_task_id,
             task_bucket: self.task_bucket,
@@ -1838,6 +1867,12 @@ impl Resolution {
             provenance,
             seed_gap: false,
         }
+    }
+}
+
+impl crate::graph::GraphNodeSink for LookupTableHook {
+    fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
+        self.record_graph_node(node);
     }
 }
 
@@ -1862,6 +1897,10 @@ impl DejaHook for LookupTableHook {
             crate::Provenance::Recorded,
         ));
         recorded
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        LookupTableHook::flush(self)
     }
 
     fn execute_shadow_peek(&self, query: ReplayLookup<'_>) -> Option<crate::ExecuteShadowToken> {
@@ -1964,7 +2003,6 @@ impl DejaHook for LookupTableHook {
             source_event_global_sequence: None,
             timestamp_ns: event.timestamp_ns,
             end_timestamp_ns: event.end_timestamp_ns,
-            detached: event.detached,
             task_id: event.task_id,
             parent_task_id: event.parent_task_id,
             task_bucket,
@@ -2502,7 +2540,6 @@ mod tests {
             recording_run_id: None,
             graph_node_id: None,
             tracing_span_id: None,
-            detached: false,
             task_id: Some(crate::ROOT_TASK_ID.to_string()),
             parent_task_id: None,
             task_bucket: Some(crate::ROOT_TASK_ID.to_string()),
@@ -3792,7 +3829,6 @@ mod tests {
         finalizer.trait_name = "router_env::request".to_owned();
         finalizer.timestamp_ns = 1_000;
         finalizer.end_timestamp_ns = Some(12_345);
-        finalizer.detached = true;
         finalizer.graph_node_id = Some(42);
         hook.record(finalizer);
 
@@ -3808,7 +3844,6 @@ mod tests {
         assert!(!call.resolved);
         assert_eq!(call.timestamp_ns, 1_000);
         assert_eq!(call.end_timestamp_ns, Some(12_345));
-        assert!(call.detached);
         assert_eq!(call.graph_node_id, Some(42));
         assert_eq!(
             call.observed_result,
@@ -3845,7 +3880,6 @@ mod tests {
             "method_name": "find",
             "args": {"id": 1},
             "resolved": false,
-            "detached": true,
             "task_id": "detached-7",
             "parent_task_id": "root",
             "task_bucket": "corr-2",
@@ -3854,7 +3888,6 @@ mod tests {
         });
         let call: ObservedCall =
             serde_json::from_value(current).expect("current observed call must deserialize");
-        assert!(call.detached);
         assert_eq!(call.task_id.as_deref(), Some("detached-7"));
         assert_eq!(call.parent_task_id.as_deref(), Some("root"));
         assert_eq!(call.task_bucket.as_deref(), Some("corr-2"));
@@ -3885,7 +3918,6 @@ mod tests {
             "method_name": "get_key",
             "args": {"key": "k"},
             "resolved": true,
-            "detached": true,
             "task_id": "detached-legacy",
             "parent_task_id": "root",
             "task_bucket": "legacy-bucket",
@@ -3913,7 +3945,6 @@ mod tests {
             "method_name": "find",
             "args": {"id": 1},
             "resolved": false,
-            "detached": true,
             "task_id": "detached-7",
             "parent_task_id": "root",
             "task_bucket": "detached-bucket-7",

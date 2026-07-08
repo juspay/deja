@@ -414,27 +414,35 @@ async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
 /// graphs (raw nodes) for the cascade/tree view. The UI builds the tree from
 /// node_id/parent_id and hangs boundary events off nodes via graph_node_id
-/// (recorded events + the call ledger's observed side).
+/// (recorded events + the call ledger's observed side). Graph nodes ride the
+/// shared `DejaRecord` stream: record-side in the recording tape, replay-side
+/// in the run's observed stream.
 async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     // recording_id comes from the run record (replay) or the run itself.
     let rec = runs::get(&st.root, &id)
         .ok()
         .and_then(|r| r.recording_id.or(r.spec.recording_id));
     let read_nodes = |path: std::path::PathBuf| -> Vec<serde_json::Value> {
-        std::fs::read_to_string(&path)
-            .map(|c| {
-                c.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufRead::lines(std::io::BufReader::new(file))
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(
+                |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                    Ok(deja::DejaRecord::GraphNode(node)) => serde_json::to_value(node).ok(),
+                    Ok(deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::Observed(_)) => None,
+                    Err(_) => None,
+                },
+            )
+            .collect()
     };
     let record = rec
         .as_deref()
-        .map(|r| read_nodes(st.root.graph_record_dir(r).join("execution-graph.jsonl")))
+        .map(|r| read_nodes(st.root.recording_events_path(r)))
         .unwrap_or_default();
-    let replay = read_nodes(st.root.graph_replay_dir(&id).join("execution-graph.jsonl"));
+    let replay = read_nodes(st.root.observed_path(&id));
     json_ok(serde_json::json!({ "record": record, "replay": replay }))
 }
 

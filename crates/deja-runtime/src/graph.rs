@@ -1,22 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use deja_core::{
-    ExecutionGraphNode, ExecutionGraphRecord, DEJA_GRAPH_DIR_ENV_VAR, EXECUTION_GRAPH_FILE_NAME,
-};
+use deja_core::ExecutionGraphNode;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::{
-    current_recording_run_id, now_ns, AsyncRecordWriter, JsonlSink, WriterConfig,
-    WriterStatsSnapshot,
-};
+use crate::{now_ns, DejaRecord};
 
 static GRAPH_NODE_BY_TRACING_SPAN_ID: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
 
@@ -39,41 +34,36 @@ pub fn current_execution_graph_context() -> (Option<u64>, Option<u64>) {
     (tracing_span_id, graph_node_id)
 }
 
-/// Tracing subscriber layer that records span lifecycle data as an execution graph.
+/// Where tape-carried graph nodes land. Implemented by the record-mode
+/// [`crate::RecordingHook`] (nodes ride the recording tape next to boundary
+/// events) and the replay-mode [`crate::replay::LookupTableHook`] (nodes ride
+/// the observed stream). The sink owns the stream identity: it stamps
+/// `global_sequence` and `recording_run_id`; the layer leaves both unset.
+///
+/// There is deliberately no file-based sink: sandboxed deployments have no
+/// writable graph path, so graph capture uses the one data pipeline or
+/// nothing.
+pub trait GraphNodeSink: Send + Sync {
+    fn graph_node(&self, node: ExecutionGraphNode);
+}
+
+/// Tracing subscriber layer that records span lifecycle data as execution-graph
+/// nodes on the mode's record stream.
 pub struct ExecutionGraphLayer {
-    writer: AsyncRecordWriter<ExecutionGraphRecord>,
+    sink: Arc<dyn GraphNodeSink>,
     node_ids: AtomicU64,
     sequence: AtomicU64,
 }
 
 impl ExecutionGraphLayer {
-    /// Create a graph layer writing `execution-graph.jsonl` under `artifact_dir`.
-    pub fn new(artifact_dir: impl AsRef<Path>) -> std::io::Result<Self> {
-        Self::new_with_writer_config(artifact_dir, WriterConfig::from_env())
-    }
-
-    /// Create a graph layer with caller-supplied async writer settings.
-    pub fn new_with_writer_config(
-        artifact_dir: impl AsRef<Path>,
-        writer_config: WriterConfig,
-    ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(artifact_dir.as_ref())?;
-        let sink = JsonlSink::new(&execution_graph_path(artifact_dir.as_ref()))?;
-
-        Ok(Self {
-            writer: AsyncRecordWriter::new(sink, writer_config),
+    /// Create a graph layer emitting through the given sink (the installed
+    /// runtime hook).
+    pub fn new(sink: Arc<dyn GraphNodeSink>) -> Self {
+        Self {
+            sink,
             node_ids: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
-        })
-    }
-
-    /// Create a graph layer from `DEJA_GRAPH_DIR`.
-    ///
-    /// Returns `None` when the environment variable is unset.
-    pub fn from_env() -> Option<std::io::Result<Self>> {
-        std::env::var(DEJA_GRAPH_DIR_ENV_VAR)
-            .ok()
-            .map(|dir| Self::new(Path::new(&dir)))
+        }
     }
 
     fn next_node_id(&self) -> u64 {
@@ -82,20 +72,6 @@ impl ExecutionGraphLayer {
 
     fn next_sequence(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn write_record(&self, node: ExecutionGraphNode) {
-        let _ = self.writer.record(ExecutionGraphRecord { node });
-    }
-
-    /// Flush queued graph records through the configured sink.
-    pub fn flush(&self) -> std::io::Result<()> {
-        self.writer.flush()
-    }
-
-    /// Snapshot health counters for graph recording.
-    pub fn writer_stats(&self) -> WriterStatsSnapshot {
-        self.writer.stats()
     }
 }
 
@@ -168,7 +144,7 @@ where
         }
 
         let closed_ns = now_ns().max(state.started_ns);
-        self.write_record(state.into_node(Some(closed_ns)));
+        self.sink.graph_node(state.into_node(Some(closed_ns)));
     }
 }
 
@@ -204,26 +180,22 @@ where
     })
 }
 
-/// Path to the execution graph file within an artifact directory.
-pub fn execution_graph_path(artifact_dir: &Path) -> PathBuf {
-    artifact_dir.join(EXECUTION_GRAPH_FILE_NAME)
-}
-
-/// Read all execution graph records from the JSONL graph file.
+/// Read the execution-graph nodes carried on an artifact directory's record
+/// stream (`semantic-events.jsonl`), in stream order.
 pub fn read_execution_graph_records(
     artifact_dir: &Path,
-) -> std::io::Result<Vec<ExecutionGraphRecord>> {
-    let content = std::fs::read_to_string(execution_graph_path(artifact_dir))?;
-    let mut records = Vec::new();
+) -> std::io::Result<Vec<ExecutionGraphNode>> {
+    let content = std::fs::read_to_string(artifact_dir.join("semantic-events.jsonl"))?;
+    let mut nodes = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(record) = serde_json::from_str::<ExecutionGraphRecord>(line) {
-            records.push(record);
+        if let Ok(DejaRecord::GraphNode(node)) = serde_json::from_str::<DejaRecord>(line) {
+            nodes.push(node);
         }
     }
-    Ok(records)
+    Ok(nodes)
 }
 
 #[derive(Debug)]
@@ -243,13 +215,13 @@ impl GraphSpanState {
     fn into_node(self, closed_ns: Option<u64>) -> ExecutionGraphNode {
         ExecutionGraphNode {
             node_id: self.node_id,
-            // Stamped by the recording hook when the node is tape-carried;
-            // the file-sink path predating graph-as-events leaves it 0.
+            // Stream identity (global_sequence, recording_run_id) is stamped
+            // by the GraphNodeSink that owns the stream.
             global_sequence: 0,
             parent_id: self.parent_id,
             causal_parent_ids: self.causal_parent_ids,
             sequence: self.sequence,
-            recording_run_id: current_recording_run_id(),
+            recording_run_id: None,
             span_name: self.span_name,
             target: self.target,
             level: self.level,

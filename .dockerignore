@@ -6,6 +6,12 @@ vendor/hyperswitch-deja-clean/target/*
 vendor/hyperswitch-deja-clean/target/release/*
 !vendor/hyperswitch-deja-clean/target/release/router
 vendor/hyperswitch-deja-clean/.git/
+# Same rule for the graph-events worktree (soak with DEJA_VENDOR_PATH=vendor/hyperswitch-w3).
+vendor/hyperswitch-w3/target/*
+!vendor/hyperswitch-w3/target/release/
+vendor/hyperswitch-w3/target/release/*
+!vendor/hyperswitch-w3/target/release/router
+vendor/hyperswitch-w3/.git/
 target/
 demo/harness-state/
 artifacts/

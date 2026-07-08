@@ -52,6 +52,16 @@ schema = { type = "boolean" }
 description = "Whether CVV is required for payments"
 change_reason = "Initial setup"
 
+# Deja recording sampler gate (deja.sampler.record_key = "deja_record"). Seed it
+# TRUE so the record baseline deterministically captures EVERY request. Without
+# it, the sampler's Superposition lookup returns Ok(false) once warm and drops
+# the payment flow, leaving only the fail-open /health probe — a flaky tape.
+[default-configs.deja_record]
+value = true
+schema = { type = "boolean" }
+description = "Record every request into the Deja golden baseline (demo rig)"
+change_reason = "Deterministic demo recording"
+
 [default-configs.implicit_customer_update]
 value = false
 schema = { type = "boolean" }

@@ -155,15 +155,6 @@ impl HarnessRoot {
     pub fn http_diff_path(&self, run_id: &str) -> PathBuf {
         self.root.join("http-diffs").join(format!("{run_id}.jsonl"))
     }
-    /// Record-side execution graph dir (bind-mounted into the record router as
-    /// `DEJA_GRAPH_DIR`); the layer writes `execution-graph.jsonl` inside it.
-    pub fn graph_record_dir(&self, recording_id: &str) -> PathBuf {
-        self.root.join("graph").join(recording_id)
-    }
-    /// Replay-side execution graph dir for one run.
-    pub fn graph_replay_dir(&self, run_id: &str) -> PathBuf {
-        self.root.join("graph-replay").join(run_id)
-    }
     /// Per-run docker build context for `local_binary` candidates.
     pub fn candidate_stage_dir(&self, run_id: &str) -> PathBuf {
         self.root.join("candidates").join(run_id)

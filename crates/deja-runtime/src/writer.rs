@@ -10,12 +10,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub const DEJA_QUEUE_CAPACITY_ENV_VAR: &str = "DEJA_QUEUE_CAPACITY";
-pub const DEJA_BATCH_SIZE_ENV_VAR: &str = "DEJA_BATCH_SIZE";
-pub const DEJA_FLUSH_INTERVAL_MS_ENV_VAR: &str = "DEJA_FLUSH_INTERVAL_MS";
-pub const DEJA_FLUSH_AFTER_RECORDS_ENV_VAR: &str = "DEJA_FLUSH_AFTER_RECORDS";
-pub const DEJA_SINK_POLICY_ENV_VAR: &str = "DEJA_SINK_POLICY";
-
 const DEFAULT_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_BATCH_SIZE: usize = 256;
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 100;
@@ -29,26 +23,15 @@ const FATAL_CONSECUTIVE_SINK_ERRORS: u32 = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkPolicy {
     /// No-drop backpressure: the producing thread blocks until the writer
-    /// catches up. **Opt-in only** (`DEJA_SINK_POLICY=block`) — for offline/demo
-    /// rigs where a byte-exact fixture matters more than latency. Never use in a
-    /// request-serving process: a slow sink would stall real requests, breaking
-    /// the shadow guarantee.
+    /// catches up. **Opt-in only** — for offline/demo rigs where a byte-exact
+    /// fixture matters more than latency. Never use in a request-serving
+    /// process: a slow sink would stall real requests, breaking the shadow
+    /// guarantee.
     Block,
     /// Never stall request threads: drop the record, count it, and remember its
     /// sequence range for the `dropped` sink marker. **The default** — recording
     /// is a shadow, so backpressure drops events rather than blocking the request.
     FailOpen,
-}
-
-impl SinkPolicy {
-    pub fn from_env() -> Self {
-        match std::env::var(DEJA_SINK_POLICY_ENV_VAR).as_deref() {
-            // Explicit opt-in to no-drop backpressure (offline/demo fidelity).
-            Ok("block") => SinkPolicy::Block,
-            // Default (unset or "fail_open"): never block the request thread.
-            _ => SinkPolicy::FailOpen,
-        }
-    }
 }
 
 /// Runtime configuration for the async recorder pipeline.
@@ -64,24 +47,8 @@ pub struct WriterConfig {
     /// disables this policy and relies only on the periodic timer or explicit
     /// `Flush`/`Shutdown` messages.
     pub flush_after_records: Option<usize>,
-    /// Queue-full behavior at the enqueue layer (`DEJA_SINK_POLICY`).
+    /// Queue-full behavior at the enqueue layer.
     pub policy: SinkPolicy,
-}
-
-impl WriterConfig {
-    pub fn from_env() -> Self {
-        Self {
-            queue_capacity: env_usize(DEJA_QUEUE_CAPACITY_ENV_VAR, DEFAULT_QUEUE_CAPACITY),
-            batch_size: env_usize(DEJA_BATCH_SIZE_ENV_VAR, DEFAULT_BATCH_SIZE).max(1),
-            flush_interval: Duration::from_millis(env_u64(
-                DEJA_FLUSH_INTERVAL_MS_ENV_VAR,
-                DEFAULT_FLUSH_INTERVAL_MS,
-            )),
-            flush_timeout: Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
-            flush_after_records: env_optional_usize(DEJA_FLUSH_AFTER_RECORDS_ENV_VAR),
-            policy: SinkPolicy::from_env(),
-        }
-    }
 }
 
 impl Default for WriterConfig {
@@ -95,26 +62,6 @@ impl Default for WriterConfig {
             policy: SinkPolicy::FailOpen,
         }
     }
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_optional_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
 }
 
 /// Loss-accounting markers the writer threads through the sink so a

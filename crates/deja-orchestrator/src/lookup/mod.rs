@@ -17,7 +17,8 @@ use std::io;
 use std::path::Path;
 
 use deja::{
-    addresses_for, canonical_args_hash, BoundaryEvent, KeyStamper, LookupEntry, LookupTable,
+    addresses_for, canonical_args_hash, BoundaryEvent, DejaRecord, KeyStamper, LookupEntry,
+    LookupTable,
 };
 
 /// Walk a recording (JSONL on disk) and produce a `LookupTable`.
@@ -46,14 +47,17 @@ pub fn render_lookup_table(
         if line.trim().is_empty() {
             continue;
         }
-        let event: BoundaryEvent = match serde_json::from_str(&line) {
-            Ok(event) => {
+        // Tagged one-stream tape: let the shared wire enum route each line.
+        // Graph nodes and replay observations can cohabit the stream but are
+        // never lookup material, so they skip WITHOUT counting as dropped
+        // boundary events. Malformed/unknown records still count against
+        // coverage (the guard below).
+        let event: BoundaryEvent = match serde_json::from_str::<DejaRecord>(&line) {
+            Ok(DejaRecord::BoundaryEvent(event)) => {
                 dbg_ok += 1;
-                event
+                *event
             }
-            // Tolerate non-event lines (e.g. headers from a mixed stream); the
-            // detector reports coverage so silent drops here don't masquerade
-            // as a clean run.
+            Ok(DejaRecord::GraphNode(_) | DejaRecord::Observed(_)) => continue,
             Err(e) => {
                 dbg_skip += 1;
                 if dbg_first_err.is_none() {
@@ -146,6 +150,7 @@ mod tests {
 
     fn event(boundary: &str, seq: u64, identity: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
+            "record_kind": "boundary_event",
             "global_sequence": seq,
             "request_sequence": seq,
             "correlation_id": "c-1",

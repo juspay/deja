@@ -11,7 +11,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use deja_core::ExecutionGraphRecord;
+use deja_core::ExecutionGraphNode;
 use deja_runtime::BoundaryEvent;
 use deja_tui::{
     boundary_substitution_counts, build_diff_rows, graph_record_has_error, graph_record_text,
@@ -334,7 +334,7 @@ impl App {
             .collect()
     }
 
-    fn filtered_graph_records(&self) -> Vec<&ExecutionGraphRecord> {
+    fn filtered_graph_records(&self) -> Vec<&ExecutionGraphNode> {
         let search = self.search.to_ascii_lowercase();
         self.artifacts
             .graph_records
@@ -393,7 +393,7 @@ impl App {
             .and_then(|index| events.get(index).copied())
     }
 
-    fn selected_graph(&self) -> Option<&ExecutionGraphRecord> {
+    fn selected_graph(&self) -> Option<&ExecutionGraphNode> {
         let records = self.filtered_graph_records();
         self.graph_table
             .selected()
@@ -534,7 +534,7 @@ impl App {
             && (!self.error_only || event.is_error)
     }
 
-    fn graph_record_visible(&self, record: &ExecutionGraphRecord) -> bool {
+    fn graph_record_visible(&self, record: &ExecutionGraphNode) -> bool {
         let search = self.search.to_ascii_lowercase();
         (search.is_empty()
             || graph_record_text(record)
@@ -675,57 +675,46 @@ impl App {
     }
 
     fn build_graph_tree(&self) -> Vec<GraphNode> {
-        let records: Vec<&ExecutionGraphRecord> = self.artifacts.graph_records.iter().collect();
+        let records: Vec<&ExecutionGraphNode> = self.artifacts.graph_records.iter().collect();
         if records.is_empty() {
             return Vec::new();
         }
-        let in_request: HashSet<u64> = records.iter().map(|r| r.node.node_id).collect();
+        let in_request: HashSet<u64> = records.iter().map(|r| r.node_id).collect();
 
         // Map node_id -> (original artifact index, record ref)
-        let mut id_to_info: HashMap<u64, (usize, &ExecutionGraphRecord)> = HashMap::new();
+        let mut id_to_info: HashMap<u64, (usize, &ExecutionGraphNode)> = HashMap::new();
         let mut children: HashMap<Option<u64>, Vec<u64>> = HashMap::new();
 
         for (art_idx, record) in self.artifacts.graph_records.iter().enumerate() {
-            id_to_info.insert(record.node.node_id, (art_idx, record));
+            id_to_info.insert(record.node_id, (art_idx, record));
             children
-                .entry(record.node.parent_id)
+                .entry(record.parent_id)
                 .or_default()
-                .push(record.node.node_id);
+                .push(record.node_id);
         }
 
         // Sort children by sequence (but we'll filter by in_request later)
         for child_ids in children.values_mut() {
-            child_ids.sort_by_key(|id| {
-                id_to_info
-                    .get(id)
-                    .map(|(_, r)| r.node.sequence)
-                    .unwrap_or(0)
-            });
+            child_ids.sort_by_key(|id| id_to_info.get(id).map(|(_, r)| r.sequence).unwrap_or(0));
         }
 
         // Find roots: parent is None OR parent is NOT in the current request's records
         let mut root_ids: Vec<u64> = records
             .iter()
             .filter(|r| {
-                r.node.parent_id.is_none()
-                    || r.node
-                        .parent_id
+                r.parent_id.is_none()
+                    || r.parent_id
                         .map(|pid| !in_request.contains(&pid))
                         .unwrap_or(true)
             })
-            .map(|r| r.node.node_id)
+            .map(|r| r.node_id)
             .collect();
         // If no roots found (e.g. all records have parents inside the set),
         // treat every record as a disconnected root so we still render something.
         if root_ids.is_empty() {
-            root_ids = records.iter().map(|r| r.node.node_id).collect();
+            root_ids = records.iter().map(|r| r.node_id).collect();
         }
-        root_ids.sort_by_key(|id| {
-            id_to_info
-                .get(id)
-                .map(|(_, r)| r.node.sequence)
-                .unwrap_or(0)
-        });
+        root_ids.sort_by_key(|id| id_to_info.get(id).map(|(_, r)| r.sequence).unwrap_or(0));
 
         let mut result = Vec::new();
         let mut emitted = 0;
@@ -750,7 +739,7 @@ impl App {
     #[allow(clippy::only_used_in_recursion)]
     fn build_graph_subtree(
         &self,
-        id_to_info: &HashMap<u64, (usize, &ExecutionGraphRecord)>,
+        id_to_info: &HashMap<u64, (usize, &ExecutionGraphNode)>,
         children: &HashMap<Option<u64>, Vec<u64>>,
         in_request: &HashSet<u64>,
         node_id: u64,
@@ -764,7 +753,7 @@ impl App {
         let Some(&(art_idx, record)) = id_to_info.get(&node_id) else {
             return;
         };
-        let node = &record.node;
+        let node = record;
 
         let level_icon = match node.level.to_ascii_lowercase().as_str() {
             "error" => "[ERR]",
@@ -832,7 +821,7 @@ impl App {
         }
     }
 
-    fn selected_graph_record(&self) -> Option<&ExecutionGraphRecord> {
+    fn selected_graph_record(&self) -> Option<&ExecutionGraphNode> {
         self.graph_nodes
             .get(self.graph_selected)
             .and_then(|node| self.artifacts.graph_records.get(node.record_index))
@@ -1341,7 +1330,7 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let records = app.filtered_graph_records();
     let title = format!("Graph Spans ({})", records.len());
     let rows = records.iter().map(|record| {
-        let node = &record.node;
+        let node = record;
         Row::new(vec![
             Cell::from(node.sequence.to_string()),
             Cell::from(node.node_id.to_string()),
@@ -1482,7 +1471,7 @@ fn render_graph_detail_popup(frame: &mut Frame<'_>, app: &App) {
     let detail = app
         .selected_graph_record()
         .map(|record| {
-            let node = &record.node;
+            let node = record;
             let pretty = serde_json::to_string_pretty(record)
                 .unwrap_or_else(|e| format!("failed to render JSON: {e}"));
             let semantic_pay = semantic_payloads_for_graph_span(app, record);
@@ -2736,8 +2725,8 @@ fn append_semantic_tree_items(
 
 fn append_graph_tree_items(
     items: &mut Vec<RequestTreeItem>,
-    all_records: &[ExecutionGraphRecord],
-    records: Vec<&ExecutionGraphRecord>,
+    all_records: &[ExecutionGraphNode],
+    records: Vec<&ExecutionGraphNode>,
 ) {
     items.push(RequestTreeItem {
         label: "graph".to_owned(),
@@ -2752,26 +2741,25 @@ fn append_graph_tree_items(
     }
 
     let mut by_id = HashMap::new();
-    let mut children: BTreeMap<Option<u64>, Vec<&ExecutionGraphRecord>> = BTreeMap::new();
+    let mut children: BTreeMap<Option<u64>, Vec<&ExecutionGraphNode>> = BTreeMap::new();
     for record in &records {
-        by_id.insert(record.node.node_id, *record);
+        by_id.insert(record.node_id, *record);
     }
     for record in &records {
         let parent = record
-            .node
             .parent_id
             .filter(|parent_id| by_id.contains_key(parent_id));
         children.entry(parent).or_default().push(*record);
     }
     for records in children.values_mut() {
-        records.sort_by_key(|record| record.node.sequence);
+        records.sort_by_key(|record| record.sequence);
     }
 
     let mut emitted = 0;
     append_graph_child_items(items, all_records, &children, None, 1, &mut emitted);
     if emitted == 0 {
         let mut records = records;
-        records.sort_by_key(|record| record.node.sequence);
+        records.sort_by_key(|record| record.sequence);
         for record in records {
             append_graph_item(items, all_records, record, 1);
         }
@@ -2780,8 +2768,8 @@ fn append_graph_tree_items(
 
 fn append_graph_child_items(
     items: &mut Vec<RequestTreeItem>,
-    all_records: &[ExecutionGraphRecord],
-    children: &BTreeMap<Option<u64>, Vec<&ExecutionGraphRecord>>,
+    all_records: &[ExecutionGraphNode],
+    children: &BTreeMap<Option<u64>, Vec<&ExecutionGraphNode>>,
     parent: Option<u64>,
     depth: usize,
     emitted: &mut usize,
@@ -2806,7 +2794,7 @@ fn append_graph_child_items(
             items,
             all_records,
             children,
-            Some(record.node.node_id),
+            Some(record.node_id),
             depth + 1,
             emitted,
         );
@@ -2815,19 +2803,18 @@ fn append_graph_child_items(
 
 fn append_graph_item(
     items: &mut Vec<RequestTreeItem>,
-    all_records: &[ExecutionGraphRecord],
-    record: &ExecutionGraphRecord,
+    all_records: &[ExecutionGraphNode],
+    record: &ExecutionGraphNode,
     depth: usize,
 ) {
     let index = all_records
         .iter()
         .position(|candidate| {
-            candidate.node.node_id == record.node.node_id
-                && candidate.node.sequence == record.node.sequence
+            candidate.node_id == record.node_id && candidate.sequence == record.sequence
         })
         .unwrap_or(0);
     let indent = "  ".repeat(depth);
-    let node = &record.node;
+    let node = record;
     items.push(RequestTreeItem {
         label: format!(
             "{indent}+-- #{:>5}.{:>3} {} [{}] {}",
@@ -2876,7 +2863,7 @@ fn selected_item_detail(app: &App, item: RequestTreeItem) -> String {
             let Some(record) = app.artifacts.graph_records.get(index) else {
                 return "graph span is no longer available".to_owned();
             };
-            let node = &record.node;
+            let node = record;
             let pretty = serde_json::to_string_pretty(record)
                 .unwrap_or_else(|error| format!("failed to render span JSON: {error}"));
             let semantic_payloads = semantic_payloads_for_graph_span(app, record);
@@ -2898,12 +2885,12 @@ fn selected_item_detail(app: &App, item: RequestTreeItem) -> String {
     }
 }
 
-fn semantic_payloads_for_graph_span(app: &App, record: &ExecutionGraphRecord) -> String {
+fn semantic_payloads_for_graph_span(app: &App, record: &ExecutionGraphNode) -> String {
     let exact_matches = app
         .artifacts
         .semantic_events
         .iter()
-        .filter(|event| event.graph_node_id == Some(record.node.node_id))
+        .filter(|event| event.graph_node_id == Some(record.node_id))
         .collect::<Vec<_>>();
 
     if !exact_matches.is_empty() {
@@ -2986,7 +2973,7 @@ fn format_semantic_payload_matches(reason: &str, mut matches: Vec<&BoundaryEvent
     output
 }
 
-fn infer_semantic_boundary_for_graph(record: &ExecutionGraphRecord) -> Option<&'static str> {
+fn infer_semantic_boundary_for_graph(record: &ExecutionGraphNode) -> Option<&'static str> {
     let haystack = graph_record_text(record).to_ascii_lowercase();
     if haystack.contains("redis") || haystack.contains("fred::") || haystack.contains("api_lock") {
         Some("redis")

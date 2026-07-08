@@ -9,6 +9,9 @@ description = "Orchestrator service for the Deja replay test harness: run lifecy
 
 [dependencies]
 deja = { path = "../deja", default-features = false }
+# Wire types shared with the recording streams (`ExecutionGraphNode` rides the
+# tagged one-stream artifacts next to the boundary events).
+deja-core = { path = "../deja-core" }
 # Depended on for the shared wire types (`HttpDiff`, `JsonFieldDiff`) and the
 # `diff_json` helper the divergence detector reuses. The kernel lib is
 # dependency-light (deja + serde) and does not depend back on this crate, so
