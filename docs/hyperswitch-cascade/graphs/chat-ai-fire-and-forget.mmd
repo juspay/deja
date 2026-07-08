@@ -1,0 +1,63 @@
+%% Fire-and-forget call graph for POST /chat/ai/data
+%% Validated with live rust-brain MCP + local source on 2026-05-15
+flowchart TD
+    %% Legend
+    L0["Legend"]:::legend
+    L1["Route registration"]:::route
+    L2["Awaited request future"]:::awaited
+    L3["Detached tokio::spawn child"]:::detached
+    L4["DB write side effect"]:::db
+    L5["Response returned"]:::response
+
+    %% Route setup
+    A["routes/app.rs<br/>Chat::server<br/>web::scope('/chat')"]:::route
+    B["POST /chat/ai/data<br/>routes/chat.rs<br/>get_data_from_hyperswitch_ai_workflow"]:::route
+
+    %% Main awaited request future
+    C["api::server_wrap(...,<br/>LockAction::NotApplicable)"]:::awaited
+    D["JWTAuth<br/>MerchantPaymentRead"]:::awaited
+    E["core/chat.rs<br/>get_data_from_hyperswitch_ai_workflow"]:::awaited
+    F["roles::RoleInfo::from_role_id_org_id_tenant_id(...).await"]:::awaited
+    G["http_client::send_request(... AI /webhook).await<br/>parse ChatResponse.await"]:::awaited
+    H["response_to_return = response.clone()"]:::awaited
+
+    %% Detached child
+    I["tokio::spawn(async move { ... }.in_current_span())<br/>join handle discarded"]:::detached
+    J["utils::chat::construct_hyperswitch_ai_interaction(...).await"]:::detached
+    K["state.store.as_ref()<br/>db.insert_hyperswitch_ai_interaction(interaction).await"]:::detached
+    M["db/hyperswitch_ai_interaction.rs<br/>Store::insert_hyperswitch_ai_interaction"]:::db
+    N["connection::pg_connection_write(self).await"]:::db
+    O["diesel_models/query/hyperswitch_ai_interaction.rs<br/>HyperswitchAiInteractionNew::insert"]:::db
+    P["generics::generic_insert(conn, self).await<br/>INSERT hyperswitch_ai_interaction"]:::db
+
+    %% Response path
+    Q["Ok(ApplicationResponse::Json(response_to_return))"]:::response
+    R["HTTP response can complete before child DB insert"]:::risk
+    S["Later GET /chat/ai/list may race async insert"]:::risk
+
+    A -->|registers if chat enabled| B
+    B -->|awaits| C
+    C -->|authenticates| D
+    C -->|invokes closure| E
+    E -->|awaits| F
+    E -->|awaits| G
+    G --> H
+    H -->|spawn without awaiting JoinHandle| I
+    I -->|child task| J
+    J --> K
+    K --> M
+    M --> N
+    M --> O
+    O --> P
+    H -->|parent continues immediately| Q
+    Q --> R
+    I -.->|side effect may finish after response| R
+    P -.->|visibility affects later list route| S
+
+    classDef route fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#0f172a;
+    classDef awaited fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#0f172a;
+    classDef detached fill:#fee2e2,stroke:#dc2626,stroke-width:3px,color:#0f172a;
+    classDef db fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#0f172a;
+    classDef response fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#0f172a;
+    classDef risk fill:#f3e8ff,stroke:#7e22ce,stroke-width:2px,color:#0f172a;
+    classDef legend fill:#f8fafc,stroke:#64748b,stroke-width:1px,color:#0f172a;

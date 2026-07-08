@@ -1,0 +1,23 @@
+[package]
+name = "deja-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Workload player for the Deja replay test harness: loads a recording, reconstructs incoming HTTP requests per correlation, drives a candidate Hyperswitch, and reports per-correlation response diffs."
+
+[dependencies]
+deja = { path = "../deja", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "deja-kernel"
+path = "src/main.rs"
+
+[lints]
+workspace = true

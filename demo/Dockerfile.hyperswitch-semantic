@@ -1,0 +1,33 @@
+# Déjà × Hyperswitch record/replay candidate image.
+#
+# Runs the router binary produced from the vendor worktree selected by
+# DEJA_VENDOR_PATH (default: vendor/hyperswitch-deja-clean), so the container
+# runs the same code under test as this worktree. Built by the demo drivers via
+# docker-compose.deja.yml (`pull_policy: build`); the host binary is compiled
+# first by demo/lib.sh:
+#
+#   (cd "${DEJA_VENDOR_PATH:-vendor/hyperswitch-deja-clean}" && cargo build -p router --features deja,v1 --release --bin router)
+#
+FROM --platform=linux/amd64 debian:trixie-slim
+
+ARG DEJA_VENDOR_PATH=vendor/hyperswitch-deja-clean
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libpq5 libssl3 zlib1g ca-certificates curl jq bc procps openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${DEJA_VENDOR_PATH}/target/release/router /local/bin/router
+RUN chmod +x /local/bin/router
+
+# The 9-step payment workload; the orchestrator drives it in-container via
+# `docker compose exec … /workload.sh`.
+COPY demo/workload.sh /workload.sh
+RUN chmod +x /workload.sh
+
+# Fallback config used when the Superposition service is cold/unseeded.
+COPY demo/superposition_seed.toml /local/config/superposition_seed.toml
+
+WORKDIR /local
+ENTRYPOINT ["/local/bin/router"]
+CMD ["-f", "/local/config/docker_compose.toml"]

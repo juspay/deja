@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the toolchain (and rustfmt/clippy components);
+      # rustup resolves it automatically on the first cargo invocation.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  # The runtime crates Hyperswitch consumes must keep building on its MSRV,
+  # independent of the (newer) workspace toolchain above.
+  msrv-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1850
+      - name: Check runtime crates on 1.85.0
+        run: cargo +1.85.0 check -p deja -p deja-context -p deja-core -p deja-derive -p deja-record

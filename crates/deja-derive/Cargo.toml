@@ -1,0 +1,23 @@
+[package]
+description = "Attribute macros for Deja record/replay boundaries (boundary/instrument family and the recordable trait decorator)."
+name = "deja-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+# Proc-macro crate doesn't inherit workspace lints because it has
+# different needs (no unsafe concern, different patterns)
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
