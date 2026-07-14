@@ -7,8 +7,8 @@
 //! 1. read the manifest; if the session is unsealed, compact it first
 //!    (the record lifecycle's quiesce wait has already settled the landing)
 //! 2. stream the data parts (full envelope lines, already deduped + sorted)
-//! 3. unwrap envelopes — raw event bytes preserved via `RawValue`, no
-//!    reserialization — and re-verify dedup/order by
+//! 3. unwrap envelopes into typed [`deja::DejaRecord`]s (unknown payload
+//!    fields ride the extras maps) — re-verify dedup/order by
 //!    `(recording_run_id, global_sequence)` while materializing the
 //!    canonical `events.jsonl` the kernel + renderer read
 //!
@@ -79,52 +79,137 @@ pub struct PulledRecording {
     pub manifest: Option<deja_compactor::SessionManifest>,
 }
 
-/// Minimal probe of an event for identity (dedup/sort key) — everything else
-/// stays raw.
+/// Landing-line envelope, typed. Unknown envelope metadata (`instance_id`,
+/// `capture`, `code`, envelope-level `schema_version` — v1 and v2 both occur)
+/// is intentionally ignored; only the payload reaches `events.jsonl`.
 #[derive(serde::Deserialize)]
-struct EventProbe {
+struct LandingEnvelope<'a> {
     #[serde(default)]
-    recording_run_id: Option<String>,
-    #[serde(default, deserialize_with = "de_u64_lenient")]
-    global_sequence: u64,
-    #[serde(default)]
-    correlation_id: Option<String>,
-}
-
-/// Envelope shape (v2): the payload is kept as raw bytes.
-#[derive(serde::Deserialize)]
-struct EnvelopeProbe<'a> {
-    #[serde(default)]
-    artifact_type: Option<String>,
-    #[serde(borrow)]
+    artifact_type: Option<ArtifactType>,
+    #[serde(borrow, default)]
     event: Option<&'a serde_json::value::RawValue>,
-    #[serde(borrow)]
+    #[serde(borrow, default)]
     node: Option<&'a serde_json::value::RawValue>,
-}
-
-/// Marker/checkpoint lines are transport bookkeeping, not replay material.
-#[derive(serde::Deserialize)]
-struct LineKindProbe {
-    #[serde(default)]
-    artifact_type: Option<String>,
+    /// Top-level `record_kind` on raw (non-enveloped) marker lines.
     #[serde(default)]
     record_kind: Option<String>,
+    /// Presence alone marks a sink marker line.
     #[serde(default)]
-    marker_kind: Option<String>,
+    marker_kind: Option<serde_json::Value>,
 }
 
+impl LandingEnvelope<'_> {
+    fn is_raw_line(&self) -> bool {
+        self.artifact_type.is_none() && self.event.is_none() && self.node.is_none()
+    }
+
+    fn is_sink_marker(&self) -> bool {
+        self.marker_kind.is_some()
+            || self.artifact_type == Some(ArtifactType::SinkMarker)
+            || self
+                .record_kind
+                .as_deref()
+                .is_some_and(|kind| ArtifactType::from_wire(kind) == ArtifactType::SinkMarker)
+    }
+}
+
+/// Artifact routing kind. Spelling-tolerant: `DejaGraph`, `deja_graph_node`,
+/// and `GRAPH-NODE` all normalize to the same kind. Unrecognized types become
+/// `Unknown` so the envelope still parses and the line is dropped WITH
+/// accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactType {
+    BoundaryEvent,
+    GraphNode,
+    SinkMarker,
+    Unknown,
+}
+
+impl ArtifactType {
+    fn from_wire(kind: &str) -> Self {
+        let normalized: String = kind
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        match normalized.as_str() {
+            "dejasinkmarker" | "sinkmarker" => Self::SinkMarker,
+            "dejagraph" | "dejagraphnode" | "graph" | "graphnode" => Self::GraphNode,
+            "dejarecord" | "dejaartifactrecord" | "artifactrecord" | "record" => {
+                Self::BoundaryEvent
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ArtifactType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_wire(&String::deserialize(d)?))
+    }
+}
+
+/// Typed routing probe: does the payload carry the `record_kind` tag? When it
+/// does, `DejaRecord`'s internal tag wins over the envelope's artifact type.
 #[derive(serde::Deserialize)]
-struct RecordKindProbe {
+struct PayloadTag {
     #[serde(default)]
     record_kind: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct EventBreakdownProbe {
-    #[serde(default)]
-    record_kind: Option<String>,
-    #[serde(default)]
-    boundary: Option<String>,
+/// One collated output line: the typed record plus its canonical serialized
+/// form (serialized exactly once; dedup compares the canonical form because
+/// graph and boundary records share the gseq counter space).
+pub struct CollatedRecord {
+    pub record: deja::DejaRecord,
+    pub json: String,
+}
+
+impl CollatedRecord {
+    fn new(record: deja::DejaRecord) -> Result<Self, serde_json::Error> {
+        let json = serde_json::to_string(&record)?;
+        Ok(Self { record, json })
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        match &self.record {
+            deja::DejaRecord::BoundaryEvent(event) => event.recording_run_id.as_deref(),
+            deja::DejaRecord::GraphNode(node) => node.recording_run_id.as_deref(),
+            deja::DejaRecord::Observed(_) => None,
+        }
+    }
+
+    pub fn global_sequence(&self) -> u64 {
+        self.record.global_sequence()
+    }
+}
+
+mod legacy {
+    //! The one quarantined `serde_json::Value` shim: old direct-S3 tapes can
+    //! omit `global_sequence`/`request_sequence` entirely. Both are required
+    //! fields and `0` is a legitimate value (real tapes carry
+    //! `request_sequence: 0`), so "missing" cannot be expressed by a serde
+    //! default. Attempted only after a typed boundary parse fails.
+
+    pub(super) fn rescue_missing_sequences(payload: &str, fallback: u64) -> Option<String> {
+        let mut value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let object = value.as_object_mut()?;
+        let missing = |object: &serde_json::Map<String, serde_json::Value>, field: &str| {
+            object.get(field).is_none_or(serde_json::Value::is_null)
+        };
+        if missing(object, "global_sequence") {
+            object.insert("global_sequence".to_owned(), fallback.into());
+        }
+        let sequence = match object.get("global_sequence") {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(fallback),
+            Some(serde_json::Value::String(s)) => s.parse().unwrap_or(fallback),
+            _ => fallback,
+        };
+        if missing(object, "request_sequence") {
+            object.insert("request_sequence".to_owned(), sequence.into());
+        }
+        serde_json::to_string(&value).ok()
+    }
 }
 
 /// Count landing objects for a recording (the "did Vector land anything yet /
@@ -283,223 +368,43 @@ fn records_from_chunk(chunk: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn is_sink_marker_line(line: &str) -> bool {
-    let Ok(probe) = serde_json::from_str::<LineKindProbe>(line) else {
-        return false;
-    };
-
-    probe
-        .artifact_type
-        .as_deref()
-        .is_some_and(is_sink_marker_kind)
-        || probe
-            .record_kind
-            .as_deref()
-            .is_some_and(is_sink_marker_kind)
-        || probe.marker_kind.is_some()
-}
-
-fn normalized_kind(kind: &str) -> String {
-    kind.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArtifactKind {
-    BoundaryEvent,
-    GraphNode,
-    SinkMarker,
-}
-
-impl ArtifactKind {
-    fn parse(artifact_type: Option<&str>) -> Option<Self> {
-        let Some(artifact_type) = artifact_type else {
-            return Some(Self::BoundaryEvent);
-        };
-        match normalized_kind(artifact_type).as_str() {
-            "dejasinkmarker" | "sinkmarker" => Some(Self::SinkMarker),
-            "dejagraph" | "dejagraphnode" | "graph" | "graphnode" => Some(Self::GraphNode),
-            "dejarecord" | "dejaartifactrecord" | "artifactrecord" | "record" => {
-                Some(Self::BoundaryEvent)
-            }
-            _ => None,
-        }
-    }
-
-    fn record_kind(self) -> Option<&'static str> {
-        match self {
-            Self::BoundaryEvent => Some("boundary_event"),
-            Self::GraphNode => Some("graph_node"),
-            Self::SinkMarker => None,
-        }
-    }
-}
-
-fn is_sink_marker_kind(kind: &str) -> bool {
-    ArtifactKind::parse(Some(kind)).is_some_and(|kind| kind == ArtifactKind::SinkMarker)
-}
-
-fn payload_from_envelope(
-    artifact_type: Option<&str>,
-    event: Option<&serde_json::value::RawValue>,
-    node: Option<&serde_json::value::RawValue>,
-) -> Option<String> {
-    let Some(kind) = ArtifactKind::parse(artifact_type) else {
-        eprintln!(
-            "ingest: dropping envelope with unknown artifact_type {:?}",
-            artifact_type.unwrap_or("<missing>")
-        );
-        return None;
-    };
-    let Some(record_kind) = kind.record_kind() else {
-        return None;
-    };
-    let payload = match kind {
-        ArtifactKind::BoundaryEvent => event.or(node),
-        ArtifactKind::GraphNode => node.or(event),
-        ArtifactKind::SinkMarker => None,
-    }?;
-    Some(ensure_record_kind(payload.get(), record_kind))
-}
-
-fn has_record_kind(event_json: &str) -> bool {
-    if !event_json.contains("\"record_kind\"") {
-        return false;
-    }
-    serde_json::from_str::<RecordKindProbe>(event_json)
+/// Parse one payload into a typed record. When the payload carries the
+/// `record_kind` tag, `DejaRecord`'s internal tag wins over the envelope's
+/// artifact type; otherwise the artifact type picks the route. Boundary
+/// payloads that fail to parse get one legacy rescue for missing sequence
+/// fields before being dropped.
+fn parse_payload(
+    payload: &str,
+    artifact_type: ArtifactType,
+    fallback_sequence: u64,
+) -> Option<deja::DejaRecord> {
+    let tagged = serde_json::from_str::<PayloadTag>(payload)
         .ok()
-        .and_then(|probe| probe.record_kind)
-        .is_some()
-}
-
-fn ensure_record_kind(event_json: &str, default_record_kind: &str) -> String {
-    if has_record_kind(event_json) {
-        event_json.to_owned()
-    } else {
-        stamp_record_kind(event_json, default_record_kind)
-    }
-}
-
-fn de_u64_lenient<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-
-    match Option::<serde_json::Value>::deserialize(deserializer)? {
-        None | Some(serde_json::Value::Null) => Ok(0),
-        Some(serde_json::Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| serde::de::Error::custom(format!("expected u64, got {n}"))),
-        Some(serde_json::Value::String(s)) => s.parse::<u64>().map_err(serde::de::Error::custom),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected u64 number or string, got {other}"
-        ))),
-    }
-}
-
-fn coerce_u64_string(value: &mut serde_json::Value) {
-    let serde_json::Value::String(raw) = value else {
-        return;
-    };
-    let Ok(parsed) = raw.parse::<u64>() else {
-        return;
-    };
-    *value = serde_json::Value::Number(serde_json::Number::from(parsed));
-}
-
-fn coerce_u64_field(object: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
-    if let Some(value) = object.get_mut(field) {
-        coerce_u64_string(value);
-    }
-}
-
-fn coerce_u64_array_field(object: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
-    let Some(serde_json::Value::Array(values)) = object.get_mut(field) else {
-        return;
-    };
-    for value in values {
-        coerce_u64_string(value);
-    }
-}
-
-/// Vector/string-preserving JSON pipelines stringify large unsigned integers
-/// (notably values above i64::MAX). Canonical replay JSONL keeps those Deja
-/// metadata fields typed as numbers so the agent and lookup renderer can parse
-/// the tape normally. Payload fields (`request`, `response`, `args`, `result`)
-/// are intentionally not inspected.
-fn missing_or_null(object: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
-    object
-        .get(field)
-        .is_none_or(|value| matches!(value, serde_json::Value::Null))
-}
-
-fn normalize_event_numbers(event_json: &str, fallback_sequence: u64) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(event_json) else {
-        return event_json.to_owned();
-    };
-    let Some(object) = value.as_object_mut() else {
-        return event_json.to_owned();
-    };
-
-    for field in [
-        "global_sequence",
-        "request_sequence",
-        "timestamp_ns",
-        "graph_node_id",
-        "tracing_span_id",
-        "fork_seq",
-        "call_line",
-        "call_column",
-        "duration_us",
-        "event_schema_version",
-        "value_digest",
-        "end_timestamp_ns",
-        "source_event_global_sequence",
-        "node_id",
-        "parent_id",
-        "sequence",
-        "started_ns",
-        "closed_ns",
-        "policy_version",
-    ] {
-        coerce_u64_field(object, field);
-    }
-    coerce_u64_array_field(object, "causal_parent_ids");
-
-    if matches!(
-        object
-            .get("record_kind")
-            .and_then(serde_json::Value::as_str),
-        Some("boundary_event")
-    ) {
-        if missing_or_null(object, "global_sequence") {
-            object.insert(
-                "global_sequence".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(fallback_sequence)),
-            );
+        .and_then(|tag| tag.record_kind)
+        .is_some();
+    if tagged {
+        if let Ok(record) = serde_json::from_str::<deja::DejaRecord>(payload) {
+            return Some(record);
         }
-        let sequence = object
-            .get("global_sequence")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(fallback_sequence);
-        if missing_or_null(object, "request_sequence") {
-            object.insert(
-                "request_sequence".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(sequence)),
-            );
-        }
+        // A tagged boundary payload may still be missing its sequences.
+        let rescued = legacy::rescue_missing_sequences(payload, fallback_sequence)?;
+        return serde_json::from_str::<deja::DejaRecord>(&rescued).ok();
     }
-
-    if let Some(serde_json::Value::Object(identity)) = object.get_mut("callsite_identity") {
-        for field in ["version", "occurrence", "syntax_hash"] {
-            coerce_u64_field(identity, field);
+    match artifact_type {
+        ArtifactType::BoundaryEvent => {
+            if let Ok(event) = serde_json::from_str::<deja::BoundaryEvent>(payload) {
+                return Some(deja::DejaRecord::BoundaryEvent(Box::new(event)));
+            }
+            let rescued = legacy::rescue_missing_sequences(payload, fallback_sequence)?;
+            serde_json::from_str::<deja::BoundaryEvent>(&rescued)
+                .ok()
+                .map(|event| deja::DejaRecord::BoundaryEvent(Box::new(event)))
         }
+        ArtifactType::GraphNode => serde_json::from_str::<deja::ExecutionGraphNode>(payload)
+            .ok()
+            .map(deja::DejaRecord::GraphNode),
+        ArtifactType::SinkMarker | ArtifactType::Unknown => None,
     }
-
-    serde_json::to_string(&value).unwrap_or_else(|_| event_json.to_owned())
 }
 
 fn pull_direct_s3_recording(
@@ -551,7 +456,7 @@ fn pull_direct_s3_recording(
     })
 }
 
-fn write_events(dest: &Path, events: &[(Option<String>, u64, String)]) -> Result<(), IngestError> {
+fn write_events(dest: &Path, events: &[CollatedRecord]) -> Result<(), IngestError> {
     let io_err = |context: String| move |source: std::io::Error| IngestError::Io { context, source };
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -560,147 +465,219 @@ fn write_events(dest: &Path, events: &[(Option<String>, u64, String)]) -> Result
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(io_err(format!("create {}", dest.display())))?,
     );
-    for (_, _, line) in events {
-        out.write_all(line.as_bytes())
+    for event in events {
+        out.write_all(event.json.as_bytes())
             .and_then(|_| out.write_all(b"\n"))
             .map_err(io_err(format!("write {}", dest.display())))?;
     }
     out.flush().map_err(io_err("flush".to_owned()))
 }
 
-fn correlation_count(events: &[(Option<String>, u64, String)]) -> usize {
+fn correlation_count(events: &[CollatedRecord]) -> usize {
     events
         .iter()
-        .filter(|(_, _, line)| {
-            serde_json::from_str::<RecordKindProbe>(line)
-                .ok()
-                .and_then(|probe| probe.record_kind)
-                .is_none_or(|kind| kind == "boundary_event")
+        .filter_map(|event| match &event.record {
+            deja::DejaRecord::BoundaryEvent(inner) => inner.correlation_id.as_deref(),
+            _ => None,
         })
-        .filter_map(|(_, _, line)| serde_json::from_str::<EventProbe>(line).ok())
-        .filter_map(|probe| probe.correlation_id)
         .collect::<BTreeSet<_>>()
         .len()
 }
 
-fn ingest_breakdown(events: &[(Option<String>, u64, String)]) -> IngestBreakdown {
+fn ingest_breakdown(events: &[CollatedRecord]) -> IngestBreakdown {
     let mut breakdown = IngestBreakdown::default();
-    for (_, _, line) in events {
-        let Ok(probe) = serde_json::from_str::<EventBreakdownProbe>(line) else {
-            continue;
+    for event in events {
+        let kind = match &event.record {
+            deja::DejaRecord::BoundaryEvent(_) => "boundary_event",
+            deja::DejaRecord::GraphNode(_) => "graph_node",
+            deja::DejaRecord::Observed(_) => "observed",
         };
-        let kind = probe
-            .record_kind
-            .unwrap_or_else(|| "boundary_event".to_owned());
-        *breakdown.record_kinds.entry(kind.clone()).or_insert(0) += 1;
-        if kind == "boundary_event" {
-            let boundary = probe.boundary.unwrap_or_else(|| "<missing>".to_owned());
-            *breakdown.boundaries.entry(boundary).or_insert(0) += 1;
+        *breakdown.record_kinds.entry(kind.to_owned()).or_insert(0) += 1;
+        if let deja::DejaRecord::BoundaryEvent(inner) = &event.record {
+            *breakdown
+                .boundaries
+                .entry(inner.boundary.clone())
+                .or_insert(0) += 1;
         }
     }
     breakdown
 }
-
-/// Inject the internally-tagged `record_kind` as the first field of a raw JSON
-/// event object, so the unwrapped line deserializes as a `DejaRecord`. Preserves
 /// the original payload bytes verbatim (no reparse of the event body).
-fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
-    match event_json.trim_start().strip_prefix('{') {
-        Some(rest) if rest.trim_start().starts_with('}') => {
-            format!("{{\"record_kind\":\"{record_kind}\"{rest}")
-        }
-        Some(rest) => format!("{{\"record_kind\":\"{record_kind}\",{rest}"),
-        None => event_json.to_owned(),
-    }
-}
-
-/// Unwrap envelopes (raw event bytes preserved), probe the sort key, drop
-/// exact normalized duplicates and sink markers, then sort canonically. The
-/// event stream can contain graph and boundary records whose sequence spaces
-/// are not globally unique in older tapes, so dedupe must not collapse records
-/// solely by `(recording_run_id, global_sequence)`.
 #[allow(clippy::type_complexity)]
-fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize, usize, usize) {
+/// Unwrap envelopes into typed records, drop sink markers and unparseable
+/// lines (counting the drops), dedup on the canonical serialized form, then
+/// sort by `(recording_run_id, global_sequence)`. Graph and boundary records
+/// share the gseq counter space in older tapes, so dedup must never collapse
+/// records on the sequence key alone.
+fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<CollatedRecord>, usize, usize, usize) {
     let mut seen = std::collections::HashSet::new();
-    let mut events: Vec<(Option<String>, u64, String)> = Vec::new();
+    let mut events: Vec<CollatedRecord> = Vec::new();
     let mut lines_in = 0usize;
     let mut duplicates = 0usize;
     let mut dropped = 0usize;
     for chunk in raw_chunks {
         for line_str in records_from_chunk(chunk) {
             lines_in += 1;
-            if is_sink_marker_line(&line_str) {
+            let Ok(envelope) = serde_json::from_str::<LandingEnvelope>(&line_str) else {
+                eprintln!("ingest: dropping non-JSON line");
+                dropped += 1;
+                continue;
+            };
+            if envelope.is_sink_marker() {
                 continue;
             }
-            // Landing lines are envelopes; the payload's raw bytes are kept.
-            let event_raw: String = match serde_json::from_str::<EnvelopeProbe>(&line_str) {
-                Ok(EnvelopeProbe {
-                    artifact_type: None,
-                    event: None,
-                    node: None,
-                }) => match serde_json::from_str::<EventProbe>(&line_str) {
-                    Ok(_) if line_str.contains("\"record_kind\"") => line_str,
-                    Ok(_) => stamp_record_kind(&line_str, "boundary_event"),
-                    Err(_) => {
-                        eprintln!("ingest: dropping non-envelope line");
-                        dropped += 1;
-                        continue;
-                    }
-                },
-                Ok(EnvelopeProbe {
-                    artifact_type,
-                    event,
-                    node,
-                }) => match payload_from_envelope(artifact_type.as_deref(), event, node) {
-                    Some(payload) => payload,
-                    None => {
-                        if ArtifactKind::parse(artifact_type.as_deref())
-                            .is_none_or(|kind| kind != ArtifactKind::SinkMarker)
-                        {
-                            dropped += 1;
-                        }
-                        continue;
-                    }
-                },
-                _ => match serde_json::from_str::<EventProbe>(&line_str) {
-                    Ok(_) if line_str.contains("\"record_kind\"") => line_str,
-                    Ok(_) => stamp_record_kind(&line_str, "boundary_event"),
-                    Err(_) => {
-                        eprintln!("ingest: dropping non-envelope line");
-                        dropped += 1;
-                        continue;
-                    }
-                },
-            };
             let fallback_sequence = events.len() as u64 + 1;
-            let event_raw = normalize_event_numbers(&event_raw, fallback_sequence);
-            let probe: EventProbe = match serde_json::from_str(&event_raw) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("ingest: dropping unparseable line ({e})");
+            let record = if envelope.is_raw_line() {
+                // Raw (non-enveloped) event line: route by its own tag, or
+                // default to the boundary route like the old pipeline.
+                parse_payload(&line_str, ArtifactType::BoundaryEvent, fallback_sequence)
+            } else {
+                let artifact_type = envelope.artifact_type.unwrap_or(ArtifactType::BoundaryEvent);
+                if artifact_type == ArtifactType::Unknown {
+                    eprintln!("ingest: dropping envelope with unknown artifact_type");
                     dropped += 1;
                     continue;
                 }
+                let payload = match artifact_type {
+                    ArtifactType::BoundaryEvent => envelope.event.or(envelope.node),
+                    ArtifactType::GraphNode => envelope.node.or(envelope.event),
+                    ArtifactType::SinkMarker | ArtifactType::Unknown => None,
+                };
+                payload.and_then(|payload| {
+                    parse_payload(payload.get(), artifact_type, fallback_sequence)
+                })
             };
-            if !seen.insert(event_raw.clone()) {
+            let Some(record) = record else {
+                eprintln!("ingest: dropping unparseable line");
+                dropped += 1;
+                continue;
+            };
+            let Ok(collated) = CollatedRecord::new(record) else {
+                eprintln!("ingest: dropping unserializable record");
+                dropped += 1;
+                continue;
+            };
+            if !seen.insert(collated.json.clone()) {
                 duplicates += 1;
                 continue;
             }
-            events.push((probe.recording_run_id, probe.global_sequence, event_raw));
+            events.push(collated);
         }
     }
-    events.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    events.sort_by(|a, b| {
+        (a.run_id().map(str::to_owned), a.global_sequence())
+            .cmp(&(b.run_id().map(str::to_owned), b.global_sequence()))
+    });
     (events, lines_in, duplicates, dropped)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Full valid boundary payload: the typed pipeline rejects skeleton events
+    /// (that rejection is itself under test in
+    /// `junk_object_lines_are_dropped_not_minted_as_events`).
+    fn boundary_payload(rid: &str, gseq: u64, payload_extra: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"recording_run_id":"{rid}","global_sequence":{gseq},"#,
+                r#""request_sequence":{gseq},"correlation_id":"c1","timestamp_ns":1,"#,
+                r#""boundary":"db","trait_name":"T","method_name":"m","#,
+                r#""call_file":"f","call_line":1,"call_column":1,"#,
+                r#""request":{{}},"args":{{}},"response":{{}},"result":{{}},"#,
+                r#""is_error":false,"duration_us":1,"event_schema_version":{schema},"#,
+                r#""provenance":"recorded","recon":"lossless","#,
+                r#""replay_strategy":"substitute"{payload_extra}}}"#
+            ),
+            rid = rid,
+            gseq = gseq,
+            schema = deja::CURRENT_EVENT_SCHEMA_VERSION,
+            payload_extra = payload_extra,
+        )
+    }
+
     fn envelope(rid: &str, gseq: u64, payload_extra: &str) -> String {
         format!(
-            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"router-h-1","event":{{"recording_run_id":"{rid}","global_sequence":{gseq}{payload_extra}}}}}"#
+            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"router-h-1","event":{}}}"#,
+            boundary_payload(rid, gseq, payload_extra)
         )
+    }
+
+    #[test]
+    fn artifact_type_spelling_variants_all_route() {
+        for spelling in ["deja_graph_node", "DejaGraph", "GRAPH-NODE", "graphnode"] {
+            let envelope = serde_json::json!({
+                "artifact_type": spelling,
+                "node": {"node_id": 1, "sequence": 0, "span_name": "s",
+                          "target": "t", "level": "INFO", "started_ns": 5}
+            })
+            .to_string();
+            let (events, _, _, dropped) = collate(&[envelope.into_bytes()]);
+            assert_eq!(events.len(), 1, "spelling {spelling:?} must route");
+            assert_eq!(dropped, 0);
+            assert!(matches!(events[0].record, deja::DejaRecord::GraphNode(_)));
+        }
+    }
+
+    #[test]
+    fn unknown_payload_fields_survive_ingest() {
+        let envelope = serde_json::json!({
+            "artifact_type": "deja_artifact_record",
+            "event": {
+                "global_sequence": 1, "request_sequence": 1, "correlation_id": "c1",
+                "timestamp_ns": 1, "boundary": "db", "trait_name": "T",
+                "method_name": "m", "call_file": "f", "call_line": 1, "call_column": 1,
+                "request": {}, "args": {}, "response": {}, "result": {},
+                "is_error": false, "duration_us": 1,
+                "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                "provenance": "recorded", "recon": "lossless",
+                "replay_strategy": "substitute",
+                "brand_new_field": "must-survive"
+            }
+        })
+        .to_string();
+        let (events, _, _, dropped) = collate(&[envelope.into_bytes()]);
+        assert_eq!(dropped, 0);
+        let v: serde_json::Value = serde_json::from_str(&events[0].json).unwrap();
+        assert_eq!(v["brand_new_field"], "must-survive");
+    }
+
+    #[test]
+    fn rescue_applies_only_to_missing_sequences_not_present_zero() {
+        // request_sequence present as 0 must stay 0 (real tapes carry it).
+        let with_zero = serde_json::json!({
+            "artifact_type": "deja_artifact_record",
+            "event": {
+                "global_sequence": 979, "request_sequence": 0, "timestamp_ns": 1,
+                "boundary": "http_incoming", "trait_name": "T", "method_name": "m",
+                "call_file": "f", "call_line": 1, "call_column": 1,
+                "request": {}, "args": {}, "response": {}, "result": {},
+                "is_error": false, "duration_us": 1,
+                "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                "provenance": "recorded", "recon": "lossless",
+                "replay_strategy": "substitute"
+            }
+        })
+        .to_string();
+        let (events, _, _, _) = collate(&[with_zero.into_bytes()]);
+        match &events[0].record {
+            deja::DejaRecord::BoundaryEvent(e) => {
+                assert_eq!(e.global_sequence, 979);
+                assert_eq!(e.request_sequence, 0);
+            }
+            other => panic!("expected boundary event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn junk_object_lines_are_dropped_not_minted_as_events() {
+        // Previously any JSON object was stamped boundary_event; typed parse
+        // rejects it and counts the drop.
+        let raw = br#"{"foo": 1}"#.to_vec();
+        let (events, lines_in, _, dropped) = collate(&[raw]);
+        assert!(events.is_empty());
+        assert_eq!(lines_in, 1);
+        assert_eq!(dropped, 1);
     }
 
     #[test]
@@ -742,10 +719,12 @@ mod tests {
         let (events, lines_in, dupes, _dropped) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
         assert_eq!(lines_in, 6);
         assert_eq!(dupes, 1);
-        let gseqs: Vec<u64> = events.iter().map(|(_, g, _)| *g).collect();
+        let gseqs: Vec<u64> = events.iter().map(CollatedRecord::global_sequence).collect();
         assert_eq!(gseqs, vec![1, 2, 3]);
-        // Raw event bytes preserved verbatim (no key reordering).
-        assert!(events[0].2.contains(r#""global_sequence":1,"k":"a""#));
+        // Unknown payload fields survive the typed round-trip.
+        let value: serde_json::Value = serde_json::from_str(&events[0].json).unwrap();
+        assert_eq!(value["global_sequence"], 1);
+        assert_eq!(value["k"], "a");
     }
 
     #[test]
@@ -755,7 +734,7 @@ mod tests {
         let (events, _, dupes, _dropped) = collate(&chunks);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0.as_deref(), Some("r1")); // sorted by (rid, gseq)
+        assert_eq!(events[0].run_id(), Some("r1")); // sorted by (rid, gseq)
     }
 
     #[test]
@@ -772,12 +751,12 @@ mod tests {
 
     #[test]
     fn collate_accepts_raw_event_lines() {
-        let raw = br#"{"recording_run_id":"r1","global_sequence":7,"correlation_id":"c1"}"#;
-        let (events, lines_in, dupes, _dropped) = collate(&[raw.to_vec()]);
+        let raw = boundary_payload("r1", 7, "").into_bytes();
+        let (events, lines_in, dupes, _dropped) = collate(&[raw]);
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 1);
-        let value: serde_json::Value = serde_json::from_str(&events[0].2).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&events[0].json).unwrap();
         assert_eq!(value["record_kind"], "boundary_event");
         assert_eq!(correlation_count(&events), 1);
     }
@@ -785,7 +764,7 @@ mod tests {
     #[test]
     fn collate_skips_raw_sink_marker_lines() {
         let marker = br#"{"artifact_type":"deja_sink_marker","record_kind":"sink_marker","recording_run_id":"r1","global_sequence":1,"marker_kind":"flush","records_written":10,"records_dropped":0}"#;
-        let raw = br#"{"recording_run_id":"r1","global_sequence":2,"correlation_id":"c1"}"#;
+        let raw = boundary_payload("r1", 2, "").into_bytes();
         let chunk = [marker.as_slice(), b"\n", raw.as_slice()].concat();
 
         let (events, lines_in, dupes, _dropped) = collate(&[chunk]);
@@ -793,8 +772,8 @@ mod tests {
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, 2);
-        assert!(events[0].2.contains(r#""record_kind":"boundary_event""#));
+        assert_eq!(events[0].global_sequence(), 2);
+        assert!(events[0].json.contains(r#""record_kind":"boundary_event""#));
     }
 
     #[test]
@@ -809,9 +788,9 @@ mod tests {
 
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
-        let gseqs: Vec<u64> = events.iter().map(|(_, g, _)| *g).collect();
+        let gseqs: Vec<u64> = events.iter().map(CollatedRecord::global_sequence).collect();
         assert_eq!(gseqs, vec![1, 2]);
-        assert!(events[0].2.contains(r#""global_sequence":1"#));
+        assert!(events[0].json.contains(r#""global_sequence":1"#));
     }
 
     #[test]
@@ -863,7 +842,7 @@ mod tests {
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 1);
-        let record: deja::DejaRecord = serde_json::from_str(&events[0].2).unwrap();
+        let record: deja::DejaRecord = serde_json::from_str(&events[0].json).unwrap();
         match record {
             deja::DejaRecord::BoundaryEvent(event) => {
                 assert_eq!(event.global_sequence, 1);
@@ -942,7 +921,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         let records = events
             .iter()
-            .map(|(_, _, line)| serde_json::from_str::<deja::DejaRecord>(line).unwrap())
+            .map(|event| serde_json::from_str::<deja::DejaRecord>(&event.json).unwrap())
             .collect::<Vec<_>>();
         assert!(matches!(records[0], deja::DejaRecord::GraphNode(_)));
         assert!(matches!(records[1], deja::DejaRecord::BoundaryEvent(_)));
@@ -1012,7 +991,7 @@ mod tests {
         assert_eq!(correlation_count(&events), 1);
         let records = events
             .iter()
-            .map(|(_, _, line)| serde_json::from_str::<deja::DejaRecord>(line).unwrap())
+            .map(|event| serde_json::from_str::<deja::DejaRecord>(&event.json).unwrap())
             .collect::<Vec<_>>();
         assert!(matches!(records[0], deja::DejaRecord::BoundaryEvent(_)));
         assert!(matches!(records[1], deja::DejaRecord::GraphNode(_)));
@@ -1048,7 +1027,7 @@ mod tests {
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 1);
-        let record: deja::DejaRecord = serde_json::from_str(&events[0].2).unwrap();
+        let record: deja::DejaRecord = serde_json::from_str(&events[0].json).unwrap();
         match record {
             deja::DejaRecord::GraphNode(node) => {
                 assert_eq!(node.node_id, 7);
@@ -1116,7 +1095,7 @@ mod tests {
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 1);
-        let record: deja::DejaRecord = serde_json::from_str(&events[0].2).unwrap();
+        let record: deja::DejaRecord = serde_json::from_str(&events[0].json).unwrap();
         match record {
             deja::DejaRecord::BoundaryEvent(event) => {
                 assert_eq!(event.global_sequence, 1);
@@ -1153,7 +1132,7 @@ mod tests {
         let (events, _, _, _) = collate(&[envelope.into_bytes()]);
 
         assert_eq!(events.len(), 1);
-        let record: deja::DejaRecord = serde_json::from_str(&events[0].2).unwrap();
+        let record: deja::DejaRecord = serde_json::from_str(&events[0].json).unwrap();
         match record {
             deja::DejaRecord::GraphNode(node) => {
                 assert_eq!(node.node_id, 7);

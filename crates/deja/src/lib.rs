@@ -16,6 +16,7 @@
 //! expand against ([`value`], [`http`], [`db`]). Generated code reaches the
 //! runtime through [`__private`].
 
+pub use deja_core::ExecutionGraphNode;
 pub use deja_derive::recordable;
 pub use deja_derive::{boundary, http, id, instrument, redis, time};
 
