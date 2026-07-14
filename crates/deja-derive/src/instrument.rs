@@ -240,6 +240,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
             lexical_path: ::std::option::Option::Some(::std::module_path!().to_string()),
             syntax_hash: ::std::option::Option::Some(#syntax_hash_value),
             span_path: ::deja::__private::current_span_path(),
+            extras: ::std::default::Default::default(),
         };
     };
 

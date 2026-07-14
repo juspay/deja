@@ -1107,16 +1107,28 @@ pub struct ObservedCall {
     pub resolved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_rank: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub source_event_global_sequence: Option<u64>,
     /// Replay-side wall-clock start timestamp for this observed call. This is
     /// stamped by the candidate, not copied from the recording, so the scorer can
     /// identify work that fires after the router response finalizer.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u64",
+        deserialize_with = "deja_core::serde_lenient::u64_lenient"
+    )]
     pub timestamp_ns: u64,
     /// Replay-side wall-clock completion timestamp, when the observed row is a
     /// finalizer marker (`http_incoming`) or another boundary can provide it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub end_timestamp_ns: Option<u64>,
     /// Stable replay task id stamped by the runtime kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1132,7 +1144,7 @@ pub struct ObservedCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_id: Option<String>,
     /// Monotonic fork sequence for the task lineage that made this call.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deja_core::serde_lenient::u64_lenient")]
     pub fork_seq: u64,
     /// Where the candidate made this call, captured at replay time so a
     /// divergence (especially a NOVEL call with no recorded counterpart) can be
@@ -1140,9 +1152,17 @@ pub struct ObservedCall {
     /// `#[serde(default)]` so pre-enrichment artifacts still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u32_lenient"
+    )]
     pub call_line: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u32_lenient"
+    )]
     pub call_column: Option<u32>,
     /// Root→leaf tracing span-name chain the call fired within — the same
     /// span-path address used for lookup (rank 2), so a UI can align this
@@ -1154,7 +1174,11 @@ pub struct ObservedCall {
     /// Replay-side execution-graph node id the call fired under (joins to
     /// `ExecutionGraphNode.node_id` in the replay graph) — lets a novel call
     /// self-place on the replay tree even though it has no recorded event.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub graph_node_id: Option<u64>,
     /// V2 scaffold (Tier 2): set when the hook synthesized a safe default on a
     /// miss. Always false in V1 (full mock) — the hook never synthesizes yet.
@@ -2895,6 +2919,7 @@ mod tests {
         is_error: bool,
     ) -> BoundaryEvent {
         BoundaryEvent {
+            extras: serde_json::Map::new(),
             global_sequence: req_seq,
             request_sequence: req_seq,
             correlation_id: correlation_id.map(String::from),
@@ -3177,6 +3202,7 @@ mod tests {
 
     fn lexical_identity(path: &str) -> CallsiteIdentity {
         CallsiteIdentity {
+            extras: serde_json::Map::new(),
             version: 1,
             source: CallsiteSource::LexicalPath,
             id: None,
@@ -3191,6 +3217,7 @@ mod tests {
 
     fn explicit_identity(tag: &str) -> CallsiteIdentity {
         CallsiteIdentity {
+            extras: serde_json::Map::new(),
             version: 1,
             source: CallsiteSource::Explicit,
             id: Some(tag.to_owned()),
@@ -3481,6 +3508,7 @@ mod tests {
     /// `lexical_path` (rank 4), with a per-callsite `occurrence`.
     fn boundary_identity(scope: &str, occurrence: u32) -> CallsiteIdentity {
         CallsiteIdentity {
+            extras: serde_json::Map::new(),
             version: 1,
             source: CallsiteSource::SyntacticHash,
             id: None,
@@ -3766,6 +3794,7 @@ mod tests {
         // in DISTINCT buckets (occ 0 each), so the match is order-independent.
         let scope = "db::Store::update";
         let make = |logical: &str| CallsiteIdentity {
+            extras: serde_json::Map::new(),
             version: 1,
             source: CallsiteSource::SyntacticHash,
             id: None,
@@ -3998,6 +4027,7 @@ mod tests {
         occurrence: u32,
     ) -> CallsiteIdentity {
         CallsiteIdentity {
+            extras: serde_json::Map::new(),
             version: 1,
             source: CallsiteSource::SyntacticHash,
             id: None, // <-- macro ALWAYS sets id: None (see instrument.rs)

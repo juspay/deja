@@ -289,6 +289,17 @@ fn summarize_objects(objects: &[String], limit: usize) -> String {
 fn prepare_loaded(cfg: &AgentConfig, root: &HarnessRoot) -> Result<(), AgentError> {
     let reporter = StateReporter { cfg, post: true };
     let events_path = root.recording_events_path(&cfg.run.recording_id);
+    let split = deja_orchestrator::split_recording_artifacts(
+        &events_path,
+        &root.recording_graph_path(&cfg.run.recording_id),
+    )
+    .map_err(|e| AgentError::new(format!("split recording artifacts: {e}")))?;
+    if split.graph_nodes > 0 {
+        eprintln!(
+            "deja-replay-agent: split recording stream into {} boundary event(s) and {} graph node(s)",
+            split.boundary_events, split.graph_nodes
+        );
+    }
     let events = load_events(&events_path)?;
     let health_correlations = health_correlation_ids(&events);
     if !health_correlations.is_empty() {
@@ -315,6 +326,7 @@ fn prepare_loaded(cfg: &AgentConfig, root: &HarnessRoot) -> Result<(), AgentErro
     write_json_file(&root.lookup_table_path(&cfg.run.run_id), &table)?;
     reset_file(&root.observed_path(&cfg.run.run_id))?;
     reset_file(&root.http_diff_path(&cfg.run.run_id))?;
+    remove_file_if_exists(&root.replay_graph_path(&cfg.run.run_id))?;
     Ok(())
 }
 
@@ -480,6 +492,14 @@ fn run_loaded_recording_with_root<C: SandboxClient>(
     );
     let scorecard = deja_orchestrator::divergence::detect_and_score(root, &cfg.run.run_id)
         .map_err(|e| AgentError::new(format!("score: {e}")))?;
+    let replay_graph_count = deja_orchestrator::materialize_graph_artifact(
+        &root.observed_path(&cfg.run.run_id),
+        &root.replay_graph_path(&cfg.run.run_id),
+    )
+    .map_err(|e| AgentError::new(format!("materialize replay graph: {e}")))?;
+    if replay_graph_count > 0 {
+        eprintln!("deja-replay-agent: materialized {replay_graph_count} replay graph node(s)");
+    }
     let verdict = if scorecard.verdict.inconclusive {
         "inconclusive"
     } else if scorecard.verdict.pass {
@@ -752,6 +772,14 @@ fn reset_file(path: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
+fn remove_file_if_exists(path: &Path) -> Result<(), AgentError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AgentError::new(format!("remove {}: {e}", path.display()))),
+    }
+}
+
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), AgentError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -788,8 +816,13 @@ fn upload_artifacts(
             "events.jsonl",
             root.recording_events_path(&cfg.run.recording_id),
         ),
+        (
+            "graph.jsonl",
+            root.recording_graph_path(&cfg.run.recording_id),
+        ),
         ("lookup-table.json", root.lookup_table_path(run_id)),
         ("observed.jsonl", root.observed_path(run_id)),
+        ("graph-replay.jsonl", root.replay_graph_path(run_id)),
         ("http-diffs.jsonl", root.http_diff_path(run_id)),
         ("scorecard.json", root.scorecard_path(run_id)),
         ("call-ledger.jsonl", root.call_ledger_path(run_id)),
@@ -1184,6 +1217,7 @@ mod tests {
             global_sequence: seq,
             request_sequence: seq,
             correlation_id: correlation_id.map(str::to_owned),
+            extras: serde_json::Map::new(),
             timestamp_ns: 0,
             recording_run_id: Some("rec-1".to_owned()),
             graph_node_id: None,
@@ -1327,6 +1361,9 @@ mod tests {
         // prepare: renders the FULL table once and resets artifact files
         prepare_loaded(&cfg, &root).unwrap();
         assert!(root.lookup_table_path(&cfg.run.run_id).exists());
+        assert!(root.recording_graph_path(&cfg.run.recording_id).exists());
+        let prepared_events = fs::read_to_string(&events_path).unwrap();
+        assert!(!prepared_events.contains("\"record_kind\":\"graph_node\""));
         let lookup_table: deja::LookupTable =
             serde_json::from_slice(&fs::read(root.lookup_table_path(&cfg.run.run_id)).unwrap())
                 .unwrap();

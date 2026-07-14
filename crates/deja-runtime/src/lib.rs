@@ -97,21 +97,32 @@ fn env_value(name: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryEvent {
     /// Monotonically increasing counter across all requests (no gaps).
+    #[serde(deserialize_with = "deja_core::serde_lenient::u64_lenient")]
     pub global_sequence: u64,
     /// Per-request ordering (1st, 2nd, 3rd call within this correlation scope).
+    #[serde(deserialize_with = "deja_core::serde_lenient::u64_lenient")]
     pub request_sequence: u64,
     /// Correlation ID from `deja_context::current_correlation_id()`.
     pub correlation_id: Option<String>,
     /// Nanoseconds since UNIX epoch.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u64_lenient")]
     pub timestamp_ns: u64,
     /// Process/run identity for append-only recordings that contain many router runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_run_id: Option<String>,
     /// Active execution graph node id, when the execution graph layer is installed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub graph_node_id: Option<u64>,
     /// Active `tracing` span id. Useful for diagnosing missing graph-node joins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub tracing_span_id: Option<u64>,
     /// Stable replay task id for lineage/canonicalization consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,7 +137,11 @@ pub struct BoundaryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_id: Option<String>,
     /// Monotonic fork sequence for the task bucket (`0` for root lineage).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub fork_seq: Option<u64>,
     /// Boundary layer: "storage", "redis", "http_client", "grpc".
     pub boundary: String,
@@ -137,8 +152,10 @@ pub struct BoundaryEvent {
     /// Source file of the caller (from `#[track_caller]`).
     pub call_file: String,
     /// Source line of the caller.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u32_lenient")]
     pub call_line: u32,
     /// Source column of the caller.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u32_lenient")]
     pub call_column: u32,
     /// Receiver/decorator context captured before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,9 +171,11 @@ pub struct BoundaryEvent {
     /// Whether the operation returned an error.
     pub is_error: bool,
     /// Wall-clock duration in microseconds.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u64_lenient")]
     pub duration_us: u64,
     /// Wire-format schema version for this event. Fresh events are stamped with
     /// [`CURRENT_EVENT_SCHEMA_VERSION`]; recordings must carry the field.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u16_lenient")]
     pub event_schema_version: u16,
     /// Optional structured call-site identity (syntactic hash, lexical path,
     /// operation occurrence, etc.) used for stable replay matching when source
@@ -200,7 +219,7 @@ pub struct BoundaryEvent {
     /// carrying a large digest fails to parse and is dropped from replay.
     #[serde(
         default,
-        deserialize_with = "de_u64_opt_lenient",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient",
         skip_serializing_if = "Option::is_none"
     )]
     pub value_digest: Option<u64>,
@@ -230,8 +249,16 @@ pub struct BoundaryEvent {
     /// Wall-clock completion time (ns since epoch). Paired with `timestamp_ns`
     /// it gives the true span without collapsing it into `duration_us`;
     /// un-back-fillable, so captured now for latency/interleaving replay modes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub end_timestamp_ns: Option<u64>,
+    /// Unknown sibling fields from newer/older recorders, preserved so typed
+    /// round-trips (notably replay ingest) never drop cross-version data.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One record on the recording stream. The tape carries every record kind
@@ -681,6 +708,7 @@ pub enum CallsiteSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallsiteIdentity {
     /// Wire-format version for this `CallsiteIdentity`.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u16_lenient")]
     pub version: u16,
     /// How this identity was derived.
     pub source: CallsiteSource,
@@ -689,6 +717,7 @@ pub struct CallsiteIdentity {
     /// Logical scope (module path, function path, etc.).
     pub scope: Option<String>,
     /// Per-source occurrence index within `scope`.
+    #[serde(deserialize_with = "deja_core::serde_lenient::u32_lenient")]
     pub occurrence: u32,
     /// Enclosing function name when known.
     pub caller_function: Option<String>,
@@ -701,7 +730,7 @@ pub struct CallsiteIdentity {
     /// Kafka→S3 recording path) serialize such values as STRINGS to preserve
     /// precision. Accepting both keeps the recording round-trippable regardless of
     /// which sink wrote it.
-    #[serde(default, deserialize_with = "de_u64_opt_lenient")]
+    #[serde(default, deserialize_with = "deja_core::serde_lenient::opt_u64_lenient")]
     pub syntax_hash: Option<u64>,
     /// Logical span-path (root→leaf `tracing` span names, joined by `>`) the call
     /// fired within — the SOURCE for the rank-2 `Address::SpanPath`. Stable
@@ -713,25 +742,10 @@ pub struct CallsiteIdentity {
     #[serde(default)]
     #[serde(rename = "logical_context")]
     pub span_path: Option<String>,
-}
-
-/// Deserialize an `Option<u64>` from either a JSON number or a JSON string,
-/// tolerating transports that stringify large (>2^53) integers.
-fn de_u64_opt_lenient<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    match Option::<serde_json::Value>::deserialize(deserializer)? {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::Number(n)) => Ok(n.as_u64()),
-        Some(serde_json::Value::String(s)) => {
-            s.parse::<u64>().map(Some).map_err(serde::de::Error::custom)
-        }
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "syntax_hash: expected u64 number or string, got {other}"
-        ))),
-    }
+    /// Unknown sibling fields from newer/older recorders, preserved so typed
+    /// round-trips (notably replay ingest) never drop cross-version data.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Lookup query carrying replay context (boundary, args, optional callsite
@@ -2069,6 +2083,7 @@ impl EventBuilder {
         } = current_task_metadata(correlation_id.as_deref());
 
         let event = BoundaryEvent {
+            extras: serde_json::Map::new(),
             global_sequence,
             request_sequence,
             correlation_id,
@@ -4069,6 +4084,79 @@ mod tests {
     use super::*;
     use std::panic::Location;
 
+    #[test]
+    fn boundary_event_parses_stringified_numbers_and_keeps_unknown_fields() {
+        let json = serde_json::json!({
+            "global_sequence": "1", "request_sequence": "0", "correlation_id": "c1",
+            "timestamp_ns": "1783029410812345678",
+            "tracing_span_id": "9223372586610589699",
+            "graph_node_id": "29751", "fork_seq": "0",
+            "boundary": "db", "trait_name": "T", "method_name": "m",
+            "call_file": "lib.rs", "call_line": "1", "call_column": "1",
+            "request": {}, "args": {}, "response": {"ok": true}, "result": {"ok": true},
+            "is_error": false, "duration_us": "5",
+            "event_schema_version": CURRENT_EVENT_SCHEMA_VERSION.to_string(),
+            "callsite_identity": {
+                "version": "1", "source": "SyntacticHash", "id": null, "scope": null,
+                "occurrence": "3", "caller_function": null, "lexical_path": null,
+                "syntax_hash": "13069351011358544953",
+                "logical_context": "a>b>c",
+                "identity_future_field": true
+            },
+            "provenance": "recorded", "recon": "lossless",
+            "value_digest": "958161998582843277",
+            "end_timestamp_ns": "1783029410812345999",
+            "replay_strategy": "substitute",
+            "event_future_field": {"nested": 1}
+        })
+        .to_string();
+        let event: BoundaryEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event.global_sequence, 1);
+        assert_eq!(event.timestamp_ns, 1_783_029_410_812_345_678);
+        assert_eq!(event.tracing_span_id, Some(9_223_372_586_610_589_699));
+        assert_eq!(event.graph_node_id, Some(29_751));
+        assert_eq!(event.call_line, 1);
+        assert_eq!(event.duration_us, 5);
+        assert_eq!(event.value_digest, Some(958_161_998_582_843_277));
+        assert_eq!(event.end_timestamp_ns, Some(1_783_029_410_812_345_999));
+        let identity = event.callsite_identity.as_ref().unwrap();
+        assert_eq!(identity.version, 1);
+        assert_eq!(identity.occurrence, 3);
+        assert_eq!(identity.syntax_hash, Some(13_069_351_011_358_544_953));
+        assert_eq!(identity.span_path.as_deref(), Some("a>b>c"));
+        assert_eq!(identity.extras["identity_future_field"], true);
+        assert_eq!(event.extras["event_future_field"]["nested"], 1);
+
+        // Round-trip: unknown fields survive; span_path re-emits as
+        // logical_context.
+        let out = serde_json::to_string(&event).unwrap();
+        let reparsed: BoundaryEvent = serde_json::from_str(&out).unwrap();
+        assert_eq!(reparsed.extras["event_future_field"]["nested"], 1);
+        assert_eq!(
+            reparsed.callsite_identity.unwrap().extras["identity_future_field"],
+            true
+        );
+        assert!(out.contains("\"logical_context\":\"a>b>c\""));
+    }
+
+    #[test]
+    fn boundary_event_without_extras_serializes_no_extras_key() {
+        let json = serde_json::json!({
+            "global_sequence": 1, "request_sequence": 1, "correlation_id": "c1",
+            "timestamp_ns": 1, "boundary": "db", "trait_name": "T",
+            "method_name": "m", "call_file": "f", "call_line": 1, "call_column": 1,
+            "request": {}, "args": {}, "response": {}, "result": {},
+            "is_error": false, "duration_us": 1,
+            "event_schema_version": CURRENT_EVENT_SCHEMA_VERSION,
+            "provenance": "recorded", "recon": "lossless",
+            "replay_strategy": "substitute"
+        })
+        .to_string();
+        let event: BoundaryEvent = serde_json::from_str(&json).unwrap();
+        let out = serde_json::to_string(&event).unwrap();
+        assert!(!out.contains("extras"));
+    }
+
     // -----------------------------------------------------------------------
     // Lookup-replay hook selection (ROUTER__DEJA__REPLAY__SOURCE et al.)
     // -----------------------------------------------------------------------
@@ -4673,6 +4761,7 @@ mod tests {
     #[test]
     fn current_schema_events_round_trip_v8_fields_and_wire_names() {
         let event = BoundaryEvent {
+            extras: serde_json::Map::new(),
             global_sequence: 1,
             request_sequence: 1,
             correlation_id: Some("c1".to_string()),
@@ -4792,6 +4881,7 @@ mod tests {
     fn compute_metrics_from_events() {
         let events = vec![
             BoundaryEvent {
+                extras: serde_json::Map::new(),
                 global_sequence: 0,
                 request_sequence: 0,
                 correlation_id: Some("req-1".into()),
@@ -4834,6 +4924,7 @@ mod tests {
                 end_timestamp_ns: None,
             },
             BoundaryEvent {
+                extras: serde_json::Map::new(),
                 global_sequence: 1,
                 request_sequence: 0,
                 correlation_id: None,
@@ -4892,6 +4983,7 @@ mod tests {
     fn replay_index_uses_strict_to_loose_matching() {
         let events = vec![
             BoundaryEvent {
+                extras: serde_json::Map::new(),
                 global_sequence: 0,
                 request_sequence: 0,
                 correlation_id: Some("req-1".into()),
@@ -4934,6 +5026,7 @@ mod tests {
                 end_timestamp_ns: None,
             },
             BoundaryEvent {
+                extras: serde_json::Map::new(),
                 global_sequence: 1,
                 request_sequence: 1,
                 correlation_id: Some("req-1".into()),
@@ -5129,6 +5222,7 @@ mod tests {
 
     fn test_identity() -> CallsiteIdentity {
         CallsiteIdentity {
+            extras: serde_json::Map::new(),
             version: 1,
             source: CallsiteSource::SyntacticHash,
             id: None,
