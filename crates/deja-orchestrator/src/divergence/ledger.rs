@@ -453,6 +453,7 @@ mod tests {
 
     fn event(seq: u64, boundary: &str, corr: Option<&str>) -> BoundaryEvent {
         BoundaryEvent {
+            extras: serde_json::Map::new(),
             global_sequence: seq,
             request_sequence: 0,
             correlation_id: corr.map(str::to_owned),

@@ -297,6 +297,7 @@ mod tests {
 
     fn json_event(req: serde_json::Value, resp: serde_json::Value, seq: u64) -> BoundaryEvent {
         BoundaryEvent {
+            extras: serde_json::Map::new(),
             global_sequence: seq,
             request_sequence: seq,
             correlation_id: Some("c-1".to_owned()),
