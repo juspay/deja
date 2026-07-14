@@ -226,11 +226,11 @@ pub fn pull_recording(
     recording_id: &str,
     dest: &Path,
 ) -> Result<(IngestReport, deja_compactor::SessionManifest), IngestError> {
-    let manifest = match deja_compactor::read_manifest(cfg, recording_id).map_err(IngestError::S3)?
-    {
-        Some(m) => m,
-        None => deja_compactor::compact_session(cfg, recording_id).map_err(IngestError::S3)?,
-    };
+    let manifest =
+        match deja_compactor::read_manifest(cfg, recording_id).map_err(IngestError::S3)? {
+            Some(m) => m,
+            None => deja_compactor::compact_session(cfg, recording_id).map_err(IngestError::S3)?,
+        };
     let lines = deja_compactor::read_session_lines(cfg, &manifest).map_err(IngestError::S3)?;
     let chunk = lines.join("\n").into_bytes();
     let (events, lines_in, duplicates, dropped) = collate(&[chunk]);
@@ -302,7 +302,9 @@ fn parse_s3_uri(uri: &str) -> Result<S3Uri, IngestError> {
         .strip_prefix("s3://")
         .ok_or_else(|| IngestError::Decode(format!("recording source is not an s3 URI: {uri}")))?;
     let (bucket, key) = without_scheme.split_once('/').ok_or_else(|| {
-        IngestError::Decode(format!("s3 URI must include a bucket and key/prefix: {uri}"))
+        IngestError::Decode(format!(
+            "s3 URI must include a bucket and key/prefix: {uri}"
+        ))
     })?;
     if bucket.trim().is_empty() || key.trim().is_empty() {
         return Err(IngestError::Decode(format!(
@@ -402,7 +404,7 @@ fn parse_payload(
         }
         ArtifactType::GraphNode => serde_json::from_str::<deja::ExecutionGraphNode>(payload)
             .ok()
-            .map(deja::DejaRecord::GraphNode),
+            .map(|node| deja::DejaRecord::GraphNode(Box::new(node))),
         ArtifactType::SinkMarker | ArtifactType::Unknown => None,
     }
 }
@@ -457,10 +459,10 @@ fn pull_direct_s3_recording(
 }
 
 fn write_events(dest: &Path, events: &[CollatedRecord]) -> Result<(), IngestError> {
-    let io_err = |context: String| move |source: std::io::Error| IngestError::Io { context, source };
+    let io_err =
+        |context: String| move |source: std::io::Error| IngestError::Io { context, source };
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(io_err(format!("mkdir {}", parent.display())))?;
+        std::fs::create_dir_all(parent).map_err(io_err(format!("mkdir {}", parent.display())))?;
     }
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(io_err(format!("create {}", dest.display())))?,
@@ -532,7 +534,9 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<CollatedRecord>, usize, usize, usize)
                 // default to the boundary route like the old pipeline.
                 parse_payload(&line_str, ArtifactType::BoundaryEvent, fallback_sequence)
             } else {
-                let artifact_type = envelope.artifact_type.unwrap_or(ArtifactType::BoundaryEvent);
+                let artifact_type = envelope
+                    .artifact_type
+                    .unwrap_or(ArtifactType::BoundaryEvent);
                 if artifact_type == ArtifactType::Unknown {
                     eprintln!("ingest: dropping envelope with unknown artifact_type");
                     dropped += 1;
@@ -572,6 +576,8 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<CollatedRecord>, usize, usize, usize)
 }
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     /// Full valid boundary payload: the typed pipeline rejects skeleton events

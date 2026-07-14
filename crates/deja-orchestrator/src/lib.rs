@@ -380,7 +380,7 @@ pub fn materialize_graph_artifact(source: &Path, dest: &Path) -> io::Result<usiz
             continue;
         }
         let node = match serde_json::from_str::<deja::DejaRecord>(&line) {
-            Ok(deja::DejaRecord::GraphNode(node)) => Some(node),
+            Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
             Ok(deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::Observed(_)) => None,
             Err(_) => serde_json::from_str::<deja_core::ExecutionGraphNode>(&line).ok(),
         };
@@ -499,7 +499,7 @@ mod tests {
             closed_ns: Some(20),
             extras: serde_json::Map::new(),
         };
-        let graph_record = deja::DejaRecord::GraphNode(node.clone());
+        let graph_record = deja::DejaRecord::GraphNode(Box::new(node.clone()));
         std::fs::write(
             &source,
             format!(
@@ -583,7 +583,8 @@ mod tests {
             &source,
             format!(
                 "{}\n{}\n",
-                serde_json::to_string(&deja::DejaRecord::GraphNode(node.clone())).unwrap(),
+                serde_json::to_string(&deja::DejaRecord::GraphNode(Box::new(node.clone())))
+                    .unwrap(),
                 boundary
             ),
         )
@@ -605,7 +606,7 @@ mod tests {
         assert_eq!(graph_lines.lines().count(), 1);
         assert!(matches!(
             serde_json::from_str::<deja::DejaRecord>(graph_lines.trim()).unwrap(),
-            deja::DejaRecord::GraphNode(parsed) if parsed == node
+            deja::DejaRecord::GraphNode(parsed) if *parsed == node
         ));
     }
 }

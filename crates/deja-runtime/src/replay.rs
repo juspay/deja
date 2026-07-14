@@ -1853,7 +1853,7 @@ impl ObservedCallSink for FileObservedSink {
         self.write_record(&crate::DejaRecord::Observed(Box::new(call)));
     }
     fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
-        self.write_record(&crate::DejaRecord::GraphNode(node));
+        self.write_record(&crate::DejaRecord::GraphNode(Box::new(node)));
     }
     fn flush(&self) -> std::io::Result<()> {
         use std::io::Write;

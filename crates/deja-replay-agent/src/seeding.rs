@@ -561,13 +561,24 @@ fn seed_db(
             );
         }
     };
-    let rows = image
-        .and_then(|image| db_row_images_from_typed_payload(&target.table, image, catalog))
-        .unwrap_or_else(|| {
-            db_seed_value(envelope)
+    let rows = match image {
+        Some(image) => match db_row_images_from_typed_payload(&target.table, image, catalog) {
+            Ok(Some(rows)) => rows,
+            Ok(None) => db_seed_value(envelope)
                 .map(|value| target.filter_rows(db_row_images(&target.table, &value, catalog)))
-                .unwrap_or_default()
-        });
+                .unwrap_or_default(),
+            Err(message) => {
+                eprintln!("deja-replay-agent: {message}; skipping typed db seed entry");
+                return (
+                    SeedMaterializationStatus::Failed,
+                    SeedReadback::error(message),
+                );
+            }
+        },
+        None => db_seed_value(envelope)
+            .map(|value| target.filter_rows(db_row_images(&target.table, &value, catalog)))
+            .unwrap_or_default(),
+    };
     if rows.is_empty() {
         let message = format!(
             "seed_db {} key {} carried no seedable row payload; skipping",
@@ -1140,35 +1151,75 @@ fn db_row_images_from_typed_payload(
     expected_table: &str,
     image: &serde_json::Value,
     catalog: &DbCatalog,
-) -> Option<Vec<DbRowImage>> {
+) -> Result<Option<Vec<DbRowImage>>, String> {
+    if !looks_like_typed_db_payload(image) {
+        return Ok(None);
+    }
+
     let typed_rows = match image {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .filter_map(|value| typed_db_row_image(expected_table, value, catalog))
-            .collect::<Vec<_>>(),
-        _ => typed_db_row_image(expected_table, image, catalog)
-            .into_iter()
-            .collect(),
+        serde_json::Value::Array(values) => {
+            let mut rows = Vec::with_capacity(values.len());
+            for (idx, value) in values.iter().enumerate() {
+                rows.push(typed_db_row_image(expected_table, value, catalog).map_err(
+                    |message| {
+                        format!(
+                            "typed db row image[{idx}] for {expected_table} could not be used: {message}"
+                        )
+                    },
+                )?);
+            }
+            rows
+        }
+        _ => vec![
+            typed_db_row_image(expected_table, image, catalog).map_err(|message| {
+                format!("typed db row image for {expected_table} could not be used: {message}")
+            })?,
+        ],
     };
 
-    if typed_rows.is_empty() {
-        return None;
+    Ok(Some(typed_rows))
+}
+
+fn looks_like_typed_db_payload(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(looks_like_typed_db_payload),
+        serde_json::Value::Object(map) => {
+            map.get("deja_image")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == deja::db::DbRowImage::KIND)
+                || (map.contains_key("deja_image")
+                    && map.contains_key("version")
+                    && map.contains_key("table")
+                    && map.contains_key("columns"))
+        }
+        _ => false,
     }
-    Some(typed_rows)
 }
 
 fn typed_db_row_image(
     expected_table: &str,
     value: &serde_json::Value,
     catalog: &DbCatalog,
-) -> Option<DbRowImage> {
-    let payload: deja::db::DbRowImage = serde_json::from_value(value.clone()).ok()?;
-    if payload.deja_image != deja::db::DbRowImage::KIND
-        || payload.version != deja::db::DbRowImage::VERSION
-        || payload.table != expected_table
-        || payload.columns.is_empty()
-    {
-        return None;
+) -> Result<DbRowImage, String> {
+    let payload: deja::db::DbRowImage = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid db row image shape: {error}"))?;
+    if payload.deja_image != deja::db::DbRowImage::KIND {
+        return Err(format!("unsupported image kind {}", payload.deja_image));
+    }
+    if payload.version != deja::db::DbRowImage::VERSION {
+        return Err(format!(
+            "unsupported db row image version {}",
+            payload.version
+        ));
+    }
+    if payload.table != expected_table {
+        return Err(format!(
+            "image table {} did not match expected table {expected_table}",
+            payload.table
+        ));
+    }
+    if payload.columns.is_empty() {
+        return Err("image carried no columns".to_owned());
     }
     let columns = payload
         .columns
@@ -1180,7 +1231,7 @@ fn typed_db_row_image(
             value: column.value.clone(),
         })
         .collect();
-    Some(DbRowImage {
+    Ok(DbRowImage {
         table: payload.table,
         columns,
     })
@@ -1435,6 +1486,7 @@ mod tests {
         );
 
         let rows = db_row_images_from_typed_payload("business_profile", &typed_image, &catalog)
+            .expect("typed image parse")
             .expect("typed image should seed with catalog-backed metadata");
         let sql = build_insert_sql(Some("deja_test"), &rows[0]).expect("insert sql");
 
@@ -1443,6 +1495,75 @@ mod tests {
         assert!(
             sql.contains("'\\x010203'::bytea"),
             "catalog bytea metadata should render the typed value as bytea: {sql}"
+        );
+    }
+
+    #[test]
+    fn typed_db_image_table_mismatch_does_not_use_legacy_fallback() {
+        let typed_image = deja::db::DbRowImage::new(
+            "other_table",
+            vec![deja::db::DbColumnImage {
+                name: "profile_id".to_owned(),
+                type_oid: None,
+                type_name: None,
+                nullable: None,
+                value: serde_json::json!("pro_123"),
+            }],
+        )
+        .to_value();
+
+        let error = db_row_images_from_typed_payload(
+            "business_profile",
+            &typed_image,
+            &DbCatalog::default(),
+        )
+        .expect_err("typed image mismatch should be a hard typed-path error");
+
+        assert!(
+            error.contains("did not match expected table business_profile"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn catalog_metadata_renders_typed_json_array_column_without_producer_types() {
+        let typed_image = deja::db::DbRowImage::new(
+            "merchant_connector_account",
+            vec![deja::db::DbColumnImage {
+                name: "payment_methods_enabled".to_owned(),
+                type_oid: None,
+                type_name: None,
+                nullable: None,
+                value: serde_json::Value::String(
+                    r#"[{"payment_method":"card","payment_method_types":[{"payment_method_type":"credit"}]}]"#
+                        .to_owned(),
+                ),
+            }],
+        )
+        .to_value();
+        let mut catalog = DbCatalog::default();
+        catalog.insert(
+            "merchant_connector_account".to_owned(),
+            DbColumnMetadata {
+                name: "payment_methods_enabled".to_owned(),
+                type_oid: None,
+                type_name: Some("_json".to_owned()),
+                nullable: Some(true),
+            },
+        );
+
+        let rows =
+            db_row_images_from_typed_payload("merchant_connector_account", &typed_image, &catalog)
+                .expect("typed image parse")
+                .expect("typed image rows");
+        let sql = build_insert_sql(Some("deja_test"), &rows[0]).expect("insert sql");
+
+        assert!(sql.contains("ARRAY["));
+        assert!(sql.contains("\"payment_method\":\"card\""));
+        assert!(sql.contains("::json[]"));
+        assert!(
+            !sql.contains(r#"'[{"payment_method""#),
+            "catalog-backed typed json[] column must not render one quoted JSON array string: {sql}"
         );
     }
 

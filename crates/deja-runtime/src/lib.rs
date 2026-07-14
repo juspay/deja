@@ -280,7 +280,9 @@ pub enum DejaRecord {
     BoundaryEvent(Box<BoundaryEvent>),
     /// An execution-graph span node (open/close lifecycle with parent and
     /// `follows_from` edges).
-    GraphNode(deja_core::ExecutionGraphNode),
+    /// Boxed for the same reason: the extras map growth made it the next
+    /// largest variant.
+    GraphNode(Box<deja_core::ExecutionGraphNode>),
     /// A replay-side observation (lookup resolution or shadow execution);
     /// carried on the replay observed stream, never on record-mode tapes.
     /// Boxed for the same reason as `BoundaryEvent` — it is the largest of the
@@ -730,7 +732,10 @@ pub struct CallsiteIdentity {
     /// Kafka→S3 recording path) serialize such values as STRINGS to preserve
     /// precision. Accepting both keeps the recording round-trippable regardless of
     /// which sink wrote it.
-    #[serde(default, deserialize_with = "deja_core::serde_lenient::opt_u64_lenient")]
+    #[serde(
+        default,
+        deserialize_with = "deja_core::serde_lenient::opt_u64_lenient"
+    )]
     pub syntax_hash: Option<u64>,
     /// Logical span-path (root→leaf `tracing` span names, joined by `>`) the call
     /// fired within — the SOURCE for the rank-2 `Address::SpanPath`. Stable
@@ -1087,7 +1092,7 @@ impl crate::graph::GraphNodeSink for RecordingHook {
     fn graph_node(&self, mut node: deja_core::ExecutionGraphNode) {
         node.global_sequence = self.graph_counter.fetch_add(1, Ordering::SeqCst);
         node.recording_run_id = Some(self.recording_run_id.clone());
-        let _ = self.writer.record(DejaRecord::GraphNode(node));
+        let _ = self.writer.record(DejaRecord::GraphNode(Box::new(node)));
     }
 }
 
@@ -4261,7 +4266,7 @@ mod tests {
             closed_ns: Some(20),
             extras: serde_json::Map::new(),
         };
-        let json = serde_json::to_value(DejaRecord::GraphNode(node.clone())).unwrap();
+        let json = serde_json::to_value(DejaRecord::GraphNode(Box::new(node.clone()))).unwrap();
         // One flat object: the tag sits beside the node's own fields.
         assert_eq!(json["record_kind"], "graph_node");
         assert_eq!(json["node_id"], 7);
@@ -4270,7 +4275,7 @@ mod tests {
         let back: DejaRecord = serde_json::from_value(json).unwrap();
         assert_eq!(back.global_sequence(), 42);
         match back {
-            DejaRecord::GraphNode(n) => assert_eq!(n, node),
+            DejaRecord::GraphNode(n) => assert_eq!(*n, node),
             other => panic!("expected GraphNode, got {other:?}"),
         }
     }

@@ -60,6 +60,8 @@ pub fn vec_u64_lenient<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u64>, D::E
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use serde::Deserialize;
 
     #[derive(Deserialize)]

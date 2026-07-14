@@ -9,6 +9,7 @@
 //!   POST /api/v1/runs                     → create a run (spawns the worker)
 //!   GET  /api/v1/runs                     → run list
 //!   GET  /api/v1/runs/{id}                → store row + live worker snapshot
+//!   POST /api/v1/runs/{id}/rerun          → clone a previous run spec
 //!   POST /api/v1/runs/{id}/kill           → kill/delete that run's sandbox namespace
 //!   GET  /api/v1/runs/{id}/stages         → stage history
 //!   GET  /api/v1/runs/{id}/logs           → persisted worker logs
@@ -153,12 +154,17 @@ fn app_router(state: AppState) -> Router {
         state.mutation_auth.clone(),
         require_mutation_auth,
     ));
+    let rerun = post(v1_rerun).route_layer(middleware::from_fn_with_state(
+        state.mutation_auth.clone(),
+        require_mutation_auth,
+    ));
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
         .route("/recordings", get(v1_list_recordings))
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}", get(v1_get_run))
+        .route("/runs/{run_id}/rerun", rerun)
         .route("/runs/{run_id}/kill", kill_run)
         .route("/runs/{run_id}/stage", stage_callback)
         .route("/runs/{run_id}/verdict", verdict_callback)
@@ -281,16 +287,43 @@ async fn v1_create_run(
         Ok(s) => s,
         Err(e) => return error_resp(400, &format!("parse RunSpec: {e}")),
     };
+    match persist_and_start_run(
+        &st,
+        &actor,
+        spec,
+        expectation,
+        "run.create",
+        serde_json::Value::Null,
+    )
+    .await
+    {
+        Ok(run) => json_ok(
+            serde_json::to_value(&runs::CreateRunResponse {
+                run_id: run.run_id,
+                status: run.status,
+            })
+            .unwrap_or_default(),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+async fn persist_and_start_run(
+    st: &AppState,
+    actor: &str,
+    spec: deja_orchestrator::RunSpec,
+    expectation: Option<String>,
+    audit_action: &'static str,
+    audit_extra: serde_json::Value,
+) -> Result<Run, Response> {
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
-        Err(e) => return error_resp(500, &format!("create run: {e}")),
+        Err(e) => return Err(error_resp(500, &format!("create run: {e}"))),
     };
     // Store row + audit BEFORE the worker spawns (stage rows FK the run row).
     let ctx = if let Some(store) = &st.store {
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
-        let params = serde_json::json!({
-            "workload": run.spec.workload,
-        });
+        let params = serde_json::to_value(&run.spec).unwrap_or_default();
         if let Err(e) = store
             .insert_run(
                 &run.run_id,
@@ -299,20 +332,18 @@ async fn v1_create_run(
                 &candidate,
                 &params,
                 expectation.as_deref(),
-                &actor,
+                actor,
             )
             .await
         {
             eprintln!("deja-orchestrator: store insert_run failed: {e}");
         }
+        let mut audit_params = serde_json::json!({ "spec": &run.spec, "expectation": expectation });
+        if !audit_extra.is_null() {
+            audit_params["context"] = audit_extra;
+        }
         let _ = store
-            .audit(
-                &actor,
-                "run.create",
-                "run",
-                &run.run_id,
-                &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
-            )
+            .audit(actor, audit_action, "run", &run.run_id, &audit_params)
             .await;
         deja_orchestrator::lifecycle::StoreCtx::new(
             &run.run_id,
@@ -322,13 +353,50 @@ async fn v1_create_run(
         deja_orchestrator::lifecycle::StoreCtx::disabled(&run.run_id)
     };
     runs::spawn_worker(&st.root, &run.run_id, ctx);
-    json_ok(
-        serde_json::to_value(&runs::CreateRunResponse {
-            run_id: run.run_id,
-            status: run.status,
-        })
-        .unwrap_or_default(),
+    Ok(run)
+}
+
+/// `POST /api/v1/runs/{id}/rerun` — clone a previous run's full RunSpec and
+/// start it as a brand-new run row. The old run remains immutable.
+async fn v1_rerun(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(id): Path<String>,
+) -> Response {
+    let source = match runs::get(&st.root, &id) {
+        Ok(run) => run,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_resp(404, "run not found");
+        }
+        Err(e) => return error_resp(500, &format!("read run: {e}")),
+    };
+    let expectation = match &st.store {
+        Some(store) => match store.get_run(&id).await {
+            Ok(row) => row.and_then(|row| row.expectation),
+            Err(e) => {
+                eprintln!("deja-orchestrator: store get_run for rerun failed: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    match persist_and_start_run(
+        &st,
+        &actor.0,
+        source.spec.clone(),
+        expectation,
+        "run.rerun",
+        serde_json::json!({ "source_run_id": id }),
     )
+    .await
+    {
+        Ok(run) => json_ok(serde_json::json!({
+            "run_id": run.run_id,
+            "status": run.status,
+            "source_run_id": id,
+        })),
+        Err(resp) => resp,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -726,9 +794,8 @@ async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
 /// graphs (raw nodes) for the cascade/tree view. The UI builds the tree from
 /// node_id/parent_id and hangs boundary events off nodes via graph_node_id
-/// (recorded events + the call ledger's observed side). Graph nodes ride the
-/// shared `DejaRecord` stream: record-side in the recording tape, replay-side
-/// in the run's observed stream.
+/// (recorded events + the call ledger's observed side). New runs store graph
+/// nodes in sidecars; old runs can still be read from the mixed streams.
 async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     // recording_id comes from the run record (replay) or the run itself.
     let rec = runs::get(&st.root, &id)
@@ -745,16 +812,31 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
                 |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
                     Ok(deja::DejaRecord::GraphNode(node)) => serde_json::to_value(node).ok(),
                     Ok(deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::Observed(_)) => None,
-                    Err(_) => None,
+                    Err(_) => serde_json::from_str::<deja_core::ExecutionGraphNode>(&line)
+                        .ok()
+                        .and_then(|node| serde_json::to_value(node).ok()),
                 },
             )
             .collect()
     };
+    let read_sidecar_or_stream = |sidecar: std::path::PathBuf, stream: std::path::PathBuf| {
+        let nodes = read_nodes(sidecar);
+        if nodes.is_empty() {
+            read_nodes(stream)
+        } else {
+            nodes
+        }
+    };
     let record = rec
         .as_deref()
-        .map(|r| read_nodes(st.root.recording_events_path(r)))
+        .map(|r| {
+            read_sidecar_or_stream(
+                st.root.recording_graph_path(r),
+                st.root.recording_events_path(r),
+            )
+        })
         .unwrap_or_default();
-    let replay = read_nodes(st.root.observed_path(&id));
+    let replay = read_sidecar_or_stream(st.root.replay_graph_path(&id), st.root.observed_path(&id));
     json_ok(serde_json::json!({ "record": record, "replay": replay }))
 }
 
@@ -872,9 +954,7 @@ fn normalize_artifact_kind(raw: &str) -> Option<&'static str> {
             Some("lookup_table")
         }
         "observed" | "observed.jsonl" => Some("observed"),
-        "http_diffs" | "http-diffs" | "http-diffs.jsonl" | "http_diffs.jsonl" => {
-            Some("http_diffs")
-        }
+        "http_diffs" | "http-diffs" | "http-diffs.jsonl" | "http_diffs.jsonl" => Some("http_diffs"),
         "scorecard" | "scorecard.json" => Some("scorecard"),
         "graph" | "graph.jsonl" => Some("graph"),
         "graph_replay" | "graph-replay" | "graph-replay.jsonl" | "graph_replay.jsonl" => {
@@ -1245,6 +1325,8 @@ mod tests {
             ("observed.jsonl", Some("observed")),
             ("http-diffs.jsonl", Some("http_diffs")),
             ("scorecard.json", Some("scorecard")),
+            ("graph.jsonl", Some("graph")),
+            ("graph-replay.jsonl", Some("graph_replay")),
             ("call-ledger.jsonl", Some("call_ledger")),
             ("seed-certificate.json", Some("seed_certificate")),
             ("lookup_table", Some("lookup_table")),

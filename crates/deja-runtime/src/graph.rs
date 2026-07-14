@@ -192,7 +192,7 @@ pub fn read_execution_graph_records(
             continue;
         }
         if let Ok(DejaRecord::GraphNode(node)) = serde_json::from_str::<DejaRecord>(line) {
-            nodes.push(node);
+            nodes.push(*node);
         }
     }
     Ok(nodes)
