@@ -3,25 +3,6 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 
-// The fast-iteration build profile demo/lib.sh uses (DEMO_CARGO_PROFILE).
-const BUILD_CMD = (patch: string) => `# 1. apply the candidate patch to the vendored Hyperswitch tree
-git -C vendor/hyperswitch-deja-clean apply ${patch}
-
-# 2. build the candidate router with the fast profile
-( cd vendor/hyperswitch-deja-clean && \\
-  env CARGO_PROFILE_RELEASE_LTO=false \\
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \\
-      CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \\
-      CARGO_PROFILE_RELEASE_INCREMENTAL=true \\
-  cargo build --release -p router --features deja,v1 --bin router )
-
-# 3. copy the binary somewhere stable and paste its path below
-cp vendor/hyperswitch-deja-clean/target/release/router /tmp/router-candidate
-# → candidate binary path: /tmp/router-candidate
-
-# 4. revert the patch (the vendor tree goes back to V1)
-git -C vendor/hyperswitch-deja-clean apply -R ${patch}`;
-
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -43,28 +24,92 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   );
 }
 
+function recordingIdFromUri(uri: string): string {
+  const clean = uri.trim().replace(/\/+$/, "");
+  if (!clean) return "";
+  const last = clean.split("/").filter(Boolean).pop() ?? "";
+  return last
+    .replace(/\.log\.gz$/i, "")
+    .replace(/\.jsonl\.gz$/i, "")
+    .replace(/\.jsonl$/i, "")
+    .replace(/\.gz$/i, "");
+}
+
+type RefType = "branch" | "commit" | "tag" | "image";
+
+const REF_HINT: Record<RefType, string> = {
+  branch: "CI must have pushed the router image for this branch to ECR; migrations + superposition seed run from the branch",
+  commit: "full or short commit SHA; migrations are pinned to the same commit",
+  tag: "release tag (e.g. v1.121.0); migrations are pinned to the same tag",
+  image: "full image reference, e.g. 123.dkr.ecr.us-east-1.amazonaws.com/router:abc1234",
+};
+
 export default function NewRunPage() {
   const nav = useNavigate();
   const [params] = useSearchParams();
   const [mode, setMode] = React.useState<"record" | "replay">("replay");
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
-  const [binaryPath, setBinaryPath] = React.useState("");
+  const [recordingUri, setRecordingUri] = React.useState(
+    params.get("recording_uri") ?? params.get("uri") ?? "",
+  );
+  const [refType, setRefType] = React.useState<RefType>("commit");
+  const [refValue, setRefValue] = React.useState("");
+  const [repo, setRepo] = React.useState("juspay/hyperswitch");
+  const [postgresTag, setPostgresTag] = React.useState("17-alpine");
+  const [redisTag, setRedisTag] = React.useState("7.2-alpine");
+  const [superpositionTag, setSuperpositionTag] = React.useState("0.112.0");
   const [iterations, setIterations] = React.useState(1);
   const [expectation, setExpectation] = React.useState("");
-  const [scenario, setScenario] = React.useState("benign-line-shift");
-
+  const effectiveRecordingId = React.useMemo(
+    () => recordingId.trim() || recordingIdFromUri(recordingUri),
+    [recordingId, recordingUri],
+  );
 
   const triggerSpec = React.useMemo(() => {
-    const candidate = binaryPath
-      ? { kind: "local_path", binary_or_source: binaryPath }
-      : { kind: "prebuilt_image", image: "deja-demo" };
+    const candidate =
+      mode === "record"
+        ? { kind: "prebuilt_image", image: "deja-demo" }
+        : refType === "image"
+          ? { kind: "prebuilt_image", image: refValue || "<image>" }
+          : refType === "branch"
+            ? { kind: "repo_branch", repo, branch: refValue || "<branch>" }
+            : refType === "commit"
+              ? { kind: "repo_sha", repo, sha: refValue || "<sha>" }
+              : { kind: "repo_tag", repo, tag: refValue || "<tag>" };
+    const runtimeVersions = {
+      postgres: postgresTag.trim(),
+      redis: redisTag.trim(),
+      superposition: superpositionTag.trim(),
+    };
     const spec: Record<string, unknown> =
       mode === "record"
         ? { mode, candidate_spec: candidate, recording_id: null, workload: { iterations } }
-        : { mode, candidate_spec: candidate, recording_id: recordingId || "<recording_id>" };
+        : {
+            mode,
+            candidate_spec: candidate,
+            recording_id: effectiveRecordingId || "<recording_id>",
+            runtime_versions: Object.fromEntries(
+              Object.entries(runtimeVersions).filter(([, value]) => value),
+            ),
+          };
+    if (mode === "replay" && recordingUri.trim()) {
+      spec.recording_uri = recordingUri.trim();
+    }
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [binaryPath, expectation, iterations, mode, recordingId]);
+  }, [
+    effectiveRecordingId,
+    expectation,
+    iterations,
+    mode,
+    postgresTag,
+    recordingUri,
+    redisTag,
+    refType,
+    refValue,
+    repo,
+    superpositionTag,
+  ]);
 
   const curlCommand = React.useMemo(() => {
     const body = JSON.stringify(triggerSpec);
@@ -72,6 +117,7 @@ export default function NewRunPage() {
       `curl -sS -X POST ${window.location.origin}/api/v1/runs`,
       "  -H 'content-type: application/json'",
       `  -H ${shellQuote("X-Deja-Actor: user:<name>")}`,
+      `  -H ${shellQuote("Authorization: Bearer <service-token>")}`,
       `  --data ${shellQuote(body)}`,
     ].join(" \\\n");
   }, [triggerSpec]);
@@ -81,30 +127,33 @@ export default function NewRunPage() {
       [
         "### Deja replay request",
         "",
-        `- Recording: \`${recordingId || "<recording_id>"}\``,
-        `- Candidate binary: \`${binaryPath || "/tmp/router-candidate"}\``,
+        `- Recording: \`${effectiveRecordingId || "<recording_id>"}\``,
+        `- Recording URI: \`${recordingUri || "<catalog/S3 source>"}\``,
+        `- Candidate ${refType}: \`${refValue || "<ref>"}\``,
+        `- Postgres: \`${postgresTag || "<postgres_tag>"}\``,
+        `- Redis: \`${redisTag || "<redis_tag>"}\``,
+        `- Superposition: \`${superpositionTag || "<superposition_tag>"}\``,
         `- Expected result: \`${expectation || "pass/diverge"}\``,
-        "",
-        "Trigger locally from the orchestrator worktree:",
-        "",
-        "```sh",
-        curlCommand,
-        "```",
         "",
         "After it finishes, update this comment with:",
         `- Run: ${window.location.origin}/runs/<run_id>`,
         `- Scorecard: ${window.location.origin}/runs/<run_id>/scorecard`,
-        "- Artifact URL(s): copy from the run Artifacts tab",
       ].join("\n"),
-    [binaryPath, curlCommand, expectation, recordingId],
+    [
+      effectiveRecordingId,
+      expectation,
+      postgresTag,
+      recordingUri,
+      redisTag,
+      refType,
+      refValue,
+      superpositionTag,
+    ],
   );
   const recordings = useQuery({ queryKey: ["recordings"], queryFn: api.recordings });
 
   const create = useMutation({
-    mutationFn: () => {
-      const spec = triggerSpec;
-      return api.createRun(spec);
-    },
+    mutationFn: () => api.createRun(triggerSpec),
     onSuccess: (resp) => nav(`/runs/${resp.run_id}`),
   });
 
@@ -141,27 +190,96 @@ export default function NewRunPage() {
         {mode === "replay" && (
           <>
             <label>
-              recording
-              <select value={recordingId} onChange={(e) => setRecordingId(e.target.value)}>
-                <option value="">— pick a recording —</option>
+              recording id{" "}
+              <span className="hint">
+                (logical label; auto-derived from the S3 URI if left empty)
+              </span>
+              <input
+                list="recording-options"
+                type="text"
+                placeholder="1783608630-c0c03516-30ea-47aa-88ca-8f3106aaf25d"
+                value={recordingId}
+                onChange={(e) => setRecordingId(e.target.value)}
+              />
+              <datalist id="recording-options">
                 {recordings.data?.map((r) => (
                   <option key={r.recording_id} value={r.recording_id}>
                     {r.recording_id} ({r.event_count ?? "?"} events)
                   </option>
                 ))}
-              </select>
+              </datalist>
             </label>
             <label>
-              candidate router binary path{" "}
+              S3 recording URI or prefix{" "}
               <span className="hint">
-                (empty = the default local build, i.e. self-replay; later this
-                field becomes PR/branch/commit/tag)
+                (object or prefix; the agent merges all matching files before replay)
               </span>
               <input
                 type="text"
-                placeholder="/tmp/router-candidate"
-                value={binaryPath}
-                onChange={(e) => setBinaryPath(e.target.value)}
+                placeholder="s3://hyperswitch-art/2026/07/09/1783608630-c0c03516-30ea-47aa-88ca-8f3106aaf25d.log.gz"
+                value={recordingUri}
+                onChange={(e) => setRecordingUri(e.target.value)}
+              />
+            </label>
+            <label>
+              candidate ref type
+              <select value={refType} onChange={(e) => setRefType(e.target.value as RefType)}>
+                <option value="branch">branch</option>
+                <option value="commit">commit</option>
+                <option value="tag">tag</option>
+                <option value="image">image (direct reference)</option>
+              </select>
+            </label>
+            <label>
+              {refType === "image" ? "candidate image" : `candidate ${refType}`}{" "}
+              <span className="hint">({REF_HINT[refType]})</span>
+              <input
+                type="text"
+                placeholder={
+                  refType === "branch"
+                    ? "feature/my-change"
+                    : refType === "commit"
+                      ? "abc1234"
+                      : refType === "tag"
+                        ? "v1.121.0"
+                        : "…amazonaws.com/router:abc1234"
+                }
+                value={refValue}
+                onChange={(e) => setRefValue(e.target.value)}
+              />
+            </label>
+            {refType !== "image" && (
+              <label>
+                source repository{" "}
+                <span className="hint">(migrations + superposition seed are fetched from it)</span>
+                <input type="text" value={repo} onChange={(e) => setRepo(e.target.value)} />
+              </label>
+            )}
+            <label>
+              Postgres tag <span className="hint">(Docker Hub tag)</span>
+              <input
+                type="text"
+                placeholder="17-alpine"
+                value={postgresTag}
+                onChange={(e) => setPostgresTag(e.target.value)}
+              />
+            </label>
+            <label>
+              Redis tag <span className="hint">(Docker Hub tag)</span>
+              <input
+                type="text"
+                placeholder="7.2-alpine"
+                value={redisTag}
+                onChange={(e) => setRedisTag(e.target.value)}
+              />
+            </label>
+            <label>
+              Superposition tag <span className="hint">(GHCR tag under ghcr.io/juspay/superposition)</span>
+              <input
+                type="text"
+                placeholder="0.112.0"
+                value={superpositionTag}
+                onChange={(e) => setSuperpositionTag(e.target.value)}
               />
             </label>
             <label>
@@ -176,7 +294,12 @@ export default function NewRunPage() {
           </>
         )}
 
-        <button disabled={create.isPending || (mode === "replay" && !recordingId)}>
+        <button
+          disabled={
+            create.isPending ||
+            (mode === "replay" && (!refValue.trim() || (!recordingId.trim() && !recordingUri.trim())))
+          }
+        >
           {create.isPending ? "scheduling…" : "schedule run"}
         </button>
         {create.error && <p className="err">{String(create.error)}</p>}
@@ -184,26 +307,12 @@ export default function NewRunPage() {
 
       {mode === "replay" && (
         <>
-          <h2>Build a candidate binary (copy into a terminal)</h2>
-          <label>
-            cross-version scenario
-            <select value={scenario} onChange={(e) => setScenario(e.target.value)}>
-              <option value="benign-line-shift">benign-line-shift (expect pass)</option>
-              <option value="real-change">real-change (expect diverge)</option>
-            </select>
-          </label>
-          <pre className="cmd">{BUILD_CMD(`demo/cross-version/${scenario}.patch`)}</pre>
-          <p className="hint">
-            If the new binary's sha256 equals the previous candidate's, the patch
-            was compile-neutral — the run page shows the sha for comparison.
-          </p>
-
           <h2>Manual trigger curl</h2>
           <p className="hint">
-            This is the real v1 path: build or copy a local router binary, then
-            POST the run spec with <code>candidate_spec.kind=local_path</code>.
-            PR/branch/SHA resolution is a later candidate-resolver step, not a
-            dashboard gate yet.
+            The dashboard resolves the ref to the candidate router image in ECR
+            (tag = ref with <code>/</code> → <code>-</code>), installs a
+            per-run sandbox, and the in-sandbox agent replays the recording
+            against it. Its verdict lands back on this run automatically.
           </p>
           <div className="copyhead">
             <span className="hint">Uses the current form values.</span>
@@ -212,10 +321,6 @@ export default function NewRunPage() {
           <pre className="cmd">{curlCommand}</pre>
 
           <h2>PR comment snippet</h2>
-          <p className="hint">
-            Paste this into a PR while v1 remains manual. No webhook is implied;
-            update the run and scorecard links after the replay completes.
-          </p>
           <div className="copyhead">
             <span className="hint">Manual posting only.</span>
             <CopyButton text={prSnippet} label="copy snippet" />

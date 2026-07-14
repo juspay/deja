@@ -9,6 +9,8 @@ members = [
     "crates/deja-tui",
     "crates/deja-kernel",
     "crates/deja-orchestrator",
+    "crates/deja-replay-agent",
+    "crates/deja-replay-core",
     "crates/deja-store",
 ]
 resolver = "2"

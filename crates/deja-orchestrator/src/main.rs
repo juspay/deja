@@ -9,6 +9,7 @@
 //!   POST /api/v1/runs                     → create a run (spawns the worker)
 //!   GET  /api/v1/runs                     → run list
 //!   GET  /api/v1/runs/{id}                → store row + live worker snapshot
+//!   POST /api/v1/runs/{id}/kill           → kill/delete that run's sandbox namespace
 //!   GET  /api/v1/runs/{id}/stages         → stage history
 //!   GET  /api/v1/runs/{id}/logs           → persisted worker logs
 //!   GET  /api/v1/runs/{id}/artifacts      → registered artifacts
@@ -21,6 +22,7 @@
 //! spawned per run by the create handler; this binary hosts the API and
 //! persists/serves run state.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunStatus};
@@ -99,7 +101,8 @@ async fn main() {
         Err(err) => {
             eprintln!(
                 "deja-orchestrator: store unavailable ({db_url}): {err} — running file-only; \
-                 start it with: docker compose -p deja-orchestrator -f demo/docker-compose.orchestrator.yml up -d"
+                 for local runs use demo/docker-compose.dashboard.yml (DEJA_DB_URL=postgres://deja:deja@pg:5432/deja); \
+                 for in-cluster runs apply replay-sandbox/orchestrator/postgres.yaml before the dashboard deployment"
             );
             None
         }
@@ -138,12 +141,27 @@ fn app_router(state: AppState) -> Router {
         state.mutation_auth.clone(),
         require_mutation_auth,
     ));
+    let stage_callback = patch(v1_run_stage).route_layer(middleware::from_fn_with_state(
+        state.mutation_auth.clone(),
+        require_mutation_auth,
+    ));
+    let verdict_callback = post(v1_run_verdict).route_layer(middleware::from_fn_with_state(
+        state.mutation_auth.clone(),
+        require_mutation_auth,
+    ));
+    let kill_run = post(v1_run_kill).route_layer(middleware::from_fn_with_state(
+        state.mutation_auth.clone(),
+        require_mutation_auth,
+    ));
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
         .route("/recordings", get(v1_list_recordings))
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}", get(v1_get_run))
+        .route("/runs/{run_id}/kill", kill_run)
+        .route("/runs/{run_id}/stage", stage_callback)
+        .route("/runs/{run_id}/verdict", verdict_callback)
         .route("/runs/{run_id}/stages", get(v1_run_stages))
         .route("/runs/{run_id}/logs", get(v1_run_logs))
         .route("/runs/{run_id}/artifacts", get(v1_run_artifacts))
@@ -183,7 +201,7 @@ fn require_store(st: &AppState) -> Result<Arc<Store>, Response> {
     st.store.clone().ok_or_else(|| {
         error_resp(
             503,
-            "store unavailable — start it: docker compose -p deja-orchestrator -f demo/docker-compose.orchestrator.yml up -d",
+            "store unavailable — for local runs use docker compose -f demo/docker-compose.dashboard.yml up -d --build; for in-cluster runs apply replay-sandbox/orchestrator/postgres.yaml before the dashboard deployment",
         )
     })
 }
@@ -313,6 +331,300 @@ async fn v1_create_run(
     )
 }
 
+#[derive(serde::Deserialize)]
+struct StageCallback {
+    stage: String,
+    step: Option<u32>,
+    steps_total: Option<u32>,
+    detail: Option<String>,
+}
+
+/// `PATCH /api/v1/runs/{id}/stage` — progress callback from a sandbox agent.
+async fn v1_run_stage(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let payload: StageCallback = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(e) => return error_resp(400, &format!("parse stage callback: {e}")),
+    };
+    if payload.stage.trim().is_empty() {
+        return error_resp(400, "stage must not be empty");
+    }
+
+    let mut run = match runs::get(&st.root, &id) {
+        Ok(run) => run,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_resp(404, "run not found");
+        }
+        Err(e) => return error_resp(500, &format!("read run: {e}")),
+    };
+    run.status = RunStatus::Running;
+    run.stage = Some(payload.stage.clone());
+    if let Some(step) = payload.step {
+        run.step = step;
+    }
+    if let Some(total) = payload.steps_total {
+        run.steps_total = total;
+    }
+    run.stage_updated_ms = deja_orchestrator::now_ms();
+    if let Err(e) = deja_orchestrator::write_json(&st.root.run_path(&id), &run) {
+        return error_resp(500, &format!("write run: {e}"));
+    }
+
+    if let Some(store) = &st.store {
+        let step = payload.step.and_then(|value| i32::try_from(value).ok());
+        let total = payload
+            .steps_total
+            .and_then(|value| i32::try_from(value).ok());
+        if let Err(e) = store
+            .stage_transition(&id, &payload.stage, step, total, "ok")
+            .await
+        {
+            eprintln!("deja-orchestrator: stage callback store update failed: {e}");
+        }
+        if let Some(detail) = payload.detail.as_deref() {
+            let seq = i64::try_from(run.stage_updated_ms).unwrap_or(i64::MAX);
+            if let Err(e) = store.append_log(&id, &payload.stage, seq, detail).await {
+                eprintln!("deja-orchestrator: stage callback log append failed: {e}");
+            }
+        }
+        let _ = store
+            .audit(
+                &actor.0,
+                "run.stage",
+                "run",
+                &id,
+                &serde_json::json!({
+                    "stage": payload.stage,
+                    "step": payload.step,
+                    "steps_total": payload.steps_total,
+                }),
+            )
+            .await;
+    }
+
+    json_ok(serde_json::json!({ "ok": true, "run_id": id }))
+}
+
+#[derive(serde::Deserialize)]
+struct VerdictCallback {
+    run_id: Option<String>,
+    verdict: String,
+    reason: Option<String>,
+    #[serde(default)]
+    artifacts: BTreeMap<String, String>,
+    #[serde(default)]
+    scorecard: Option<serde_json::Value>,
+}
+
+/// `POST /api/v1/runs/{id}/verdict` — terminal result callback from a sandbox
+/// agent. A divergence verdict (`fail`) is a completed run; only agent/runtime
+/// errors mark the run itself as failed.
+async fn v1_run_verdict(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let payload: VerdictCallback = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(e) => return error_resp(400, &format!("parse verdict callback: {e}")),
+    };
+    if payload.run_id.as_deref().is_some_and(|run_id| run_id != id) {
+        return error_resp(400, "payload run_id does not match route");
+    }
+    if payload.verdict.trim().is_empty() {
+        return error_resp(400, "verdict must not be empty");
+    }
+
+    let mut run = match runs::get(&st.root, &id) {
+        Ok(run) => run,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_resp(404, "run not found");
+        }
+        Err(e) => return error_resp(500, &format!("read run: {e}")),
+    };
+    let agent_failed = matches!(payload.verdict.as_str(), "error" | "failed");
+    run.status = if agent_failed {
+        RunStatus::Failed
+    } else {
+        RunStatus::Completed
+    };
+    run.stage = Some("completed".to_owned());
+    run.stage_updated_ms = deja_orchestrator::now_ms();
+    run.failure_reason = if agent_failed {
+        payload.reason.clone()
+    } else {
+        None
+    };
+    if let Err(e) = deja_orchestrator::write_json(&st.root.run_path(&id), &run) {
+        return error_resp(500, &format!("write run: {e}"));
+    }
+
+    if let Some(store) = &st.store {
+        let state = if agent_failed { "failed" } else { "completed" };
+        let failure = if agent_failed {
+            Some(serde_json::json!({ "reason": payload.reason.clone() }))
+        } else {
+            None
+        };
+        if let Err(e) = store
+            .set_run_result(&id, Some(&payload.verdict), payload.scorecard.as_ref())
+            .await
+        {
+            eprintln!("deja-orchestrator: verdict store result failed: {e}");
+        }
+        if let Err(e) = store.update_run_state(&id, state, failure.as_ref()).await {
+            eprintln!("deja-orchestrator: verdict store state failed: {e}");
+        }
+        if let Err(e) = store
+            .stage_finish(&id, if agent_failed { "failed" } else { "ok" })
+            .await
+        {
+            eprintln!("deja-orchestrator: verdict stage finish failed: {e}");
+        }
+        for (artifact_name, uri) in &payload.artifacts {
+            let Some(kind) = normalize_artifact_kind(artifact_name) else {
+                eprintln!(
+                    "deja-orchestrator: skipping unsupported artifact kind/name {artifact_name}"
+                );
+                continue;
+            };
+            if let Err(e) = store
+                .register_artifact(
+                    Some(&id),
+                    run.recording_id.as_deref(),
+                    kind,
+                    uri,
+                    None,
+                    None,
+                )
+                .await
+            {
+                eprintln!(
+                    "deja-orchestrator: artifact register failed for {artifact_name} as {kind}: {e}"
+                );
+            }
+        }
+        let _ = store
+            .audit(
+                &actor.0,
+                "run.verdict",
+                "run",
+                &id,
+                &serde_json::json!({
+                    "verdict": payload.verdict,
+                    "reason": payload.reason,
+                    "artifacts": payload.artifacts,
+                }),
+            )
+            .await;
+    }
+
+    json_ok(serde_json::json!({ "ok": true, "run_id": id }))
+}
+
+/// `POST /api/v1/runs/{id}/kill` — operator-initiated sandbox teardown.
+/// Active runs are marked failed/terminated; terminal runs keep their result
+/// and only get a best-effort namespace deletion.
+async fn v1_run_kill(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut run = match runs::get(&st.root, &id) {
+        Ok(run) => run,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_resp(404, "run not found");
+        }
+        Err(e) => return error_resp(500, &format!("read run: {e}")),
+    };
+    let was_terminal = matches!(run.status, RunStatus::Completed | RunStatus::Failed);
+    let kill_run_id = id.clone();
+    let kill_result = tokio::task::spawn_blocking(move || {
+        deja_orchestrator::lifecycle::sandbox::terminate_namespace_for_run(&kill_run_id)
+    })
+    .await;
+    let (namespace, details) = match kill_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => return error_resp(500, &format!("kill sandbox: {e}")),
+        Err(e) => return error_resp(500, &format!("kill sandbox task: {e}")),
+    };
+
+    let actor_name = actor.0;
+    let now = deja_orchestrator::now_ms();
+    let terminated = !was_terminal;
+    let message = if terminated {
+        format!("terminated by {actor_name}; sandbox namespace {namespace} deletion requested")
+    } else {
+        format!("sandbox namespace {namespace} deletion requested by {actor_name}")
+    };
+    if terminated {
+        run.status = RunStatus::Failed;
+        run.stage = Some("terminated".to_owned());
+        run.stage_updated_ms = now;
+        run.failure_reason = Some(message.clone());
+        if let Err(e) = deja_orchestrator::write_json(&st.root.run_path(&id), &run) {
+            return error_resp(500, &format!("write run: {e}"));
+        }
+    }
+
+    if let Some(store) = &st.store {
+        let detail_text = if details.is_empty() {
+            message.clone()
+        } else {
+            format!("{message}\n{}", details.join("\n"))
+        };
+        if terminated {
+            if let Err(e) = store
+                .stage_transition(&id, "terminated", None, None, "failed")
+                .await
+            {
+                eprintln!("deja-orchestrator: kill stage transition failed: {e}");
+            }
+            if let Err(e) = store.stage_finish(&id, "failed").await {
+                eprintln!("deja-orchestrator: kill stage finish failed: {e}");
+            }
+            let failure = serde_json::json!({ "message": message.clone() });
+            if let Err(e) = store.update_run_state(&id, "failed", Some(&failure)).await {
+                eprintln!("deja-orchestrator: kill state update failed: {e}");
+            }
+        }
+        let seq = i64::try_from(now).unwrap_or(i64::MAX);
+        if let Err(e) = store
+            .append_log(&id, "sandbox-kill", seq, &detail_text)
+            .await
+        {
+            eprintln!("deja-orchestrator: kill log append failed: {e}");
+        }
+        let _ = store
+            .audit(
+                &actor_name,
+                "run.kill_sandbox",
+                "run",
+                &id,
+                &serde_json::json!({
+                    "namespace": namespace.clone(),
+                    "terminated_run": terminated,
+                    "details": details.clone(),
+                }),
+            )
+            .await;
+    }
+
+    json_ok(serde_json::json!({
+        "ok": true,
+        "run_id": id,
+        "namespace": namespace,
+        "terminated": terminated,
+        "message": message,
+        "details": details,
+    }))
+}
+
 /// `GET /api/v1/recordings` — the recordings catalog (Postgres-backed).
 async fn v1_list_recordings(State(st): State<AppState>) -> Response {
     let store = match require_store(&st) {
@@ -414,27 +726,35 @@ async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
 /// graphs (raw nodes) for the cascade/tree view. The UI builds the tree from
 /// node_id/parent_id and hangs boundary events off nodes via graph_node_id
-/// (recorded events + the call ledger's observed side).
+/// (recorded events + the call ledger's observed side). Graph nodes ride the
+/// shared `DejaRecord` stream: record-side in the recording tape, replay-side
+/// in the run's observed stream.
 async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     // recording_id comes from the run record (replay) or the run itself.
     let rec = runs::get(&st.root, &id)
         .ok()
         .and_then(|r| r.recording_id.or(r.spec.recording_id));
     let read_nodes = |path: std::path::PathBuf| -> Vec<serde_json::Value> {
-        std::fs::read_to_string(&path)
-            .map(|c| {
-                c.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufRead::lines(std::io::BufReader::new(file))
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(
+                |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                    Ok(deja::DejaRecord::GraphNode(node)) => serde_json::to_value(node).ok(),
+                    Ok(deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::Observed(_)) => None,
+                    Err(_) => None,
+                },
+            )
+            .collect()
     };
     let record = rec
         .as_deref()
-        .map(|r| read_nodes(st.root.graph_record_dir(r).join("execution-graph.jsonl")))
+        .map(|r| read_nodes(st.root.recording_events_path(r)))
         .unwrap_or_default();
-    let replay = read_nodes(st.root.graph_replay_dir(&id).join("execution-graph.jsonl"));
+    let replay = read_nodes(st.root.observed_path(&id));
     json_ok(serde_json::json!({ "record": record, "replay": replay }))
 }
 
@@ -512,14 +832,70 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
     } else {
         "application/x-ndjson"
     };
-    match std::fs::read(&art.uri) {
-        Ok(bytes) => (
+    let uri = art.uri.clone();
+    match tokio::task::spawn_blocking(move || read_artifact_bytes(&uri)).await {
+        Ok(Ok(bytes)) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, content_type)],
             bytes,
         )
             .into_response(),
-        Err(e) => error_resp(404, &format!("artifact file unreadable: {e}")),
+        Ok(Err(e)) => error_resp(404, &format!("artifact file unreadable: {e}")),
+        Err(e) => error_resp(500, &format!("artifact read task failed: {e}")),
+    }
+}
+
+fn read_artifact_bytes(uri: &str) -> std::io::Result<Vec<u8>> {
+    if let Some((bucket, key)) = parse_s3_uri(uri) {
+        let mut cfg = deja_compactor::S3Config::from_env();
+        cfg.bucket = bucket.to_owned();
+        return deja_compactor::get_object(&cfg, key).map_err(std::io::Error::other);
+    }
+    std::fs::read(uri)
+}
+
+fn parse_s3_uri(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.strip_prefix("s3://")?;
+    let (bucket, key) = rest.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        None
+    } else {
+        Some((bucket, key))
+    }
+}
+
+fn normalize_artifact_kind(raw: &str) -> Option<&'static str> {
+    let name = raw.rsplit('/').next().unwrap_or(raw).trim();
+    match name {
+        "events" | "events.jsonl" => Some("events"),
+        "lookup_table" | "lookup-table" | "lookup-table.json" | "lookup_table.json" => {
+            Some("lookup_table")
+        }
+        "observed" | "observed.jsonl" => Some("observed"),
+        "http_diffs" | "http-diffs" | "http-diffs.jsonl" | "http_diffs.jsonl" => {
+            Some("http_diffs")
+        }
+        "scorecard" | "scorecard.json" => Some("scorecard"),
+        "graph" | "graph.jsonl" => Some("graph"),
+        "graph_replay" | "graph-replay" | "graph-replay.jsonl" | "graph_replay.jsonl" => {
+            Some("graph_replay")
+        }
+        "visualization_html" | "visualization-html" | "visualization.html" => {
+            Some("visualization_html")
+        }
+        "log" | "log.txt" => Some("log"),
+        "ingest_report" | "ingest-report" | "ingest-report.json" | "ingest_report.json" => {
+            Some("ingest_report")
+        }
+        "manifest" | "manifest.json" => Some("manifest"),
+        "call_ledger" | "call-ledger" | "call-ledger.jsonl" | "call_ledger.jsonl" => {
+            Some("call_ledger")
+        }
+        "seed_certificate"
+        | "seed-certificate"
+        | "seed-certificate.json"
+        | "seed_certificate.json" => Some("seed_certificate"),
+        _ => None,
     }
 }
 
@@ -647,6 +1023,53 @@ mod tests {
         Router::new().route("/runs", create_run.get(read_ok))
     }
 
+    fn callback_router(root: Arc<HarnessRoot>) -> Router {
+        let auth = MutationAuth {
+            service_token: None,
+        };
+        let state = AppState {
+            root,
+            store: None,
+            mutation_auth: auth.clone(),
+        };
+        let stage = patch(v1_run_stage).route_layer(middleware::from_fn_with_state(
+            auth.clone(),
+            require_mutation_auth,
+        ));
+        let verdict = post(v1_run_verdict)
+            .route_layer(middleware::from_fn_with_state(auth, require_mutation_auth));
+        Router::new()
+            .route("/api/v1/runs/{run_id}/stage", stage)
+            .route("/api/v1/runs/{run_id}/verdict", verdict)
+            .with_state(state)
+    }
+
+    fn write_run(root: &HarnessRoot, run_id: &str) {
+        let run = deja_orchestrator::Run {
+            run_id: run_id.to_owned(),
+            spec: deja_orchestrator::RunSpec {
+                mode: deja_orchestrator::RunMode::Replay,
+                candidate_spec: deja_orchestrator::CandidateSpec::PrebuiltImage {
+                    image: "router:test".to_owned(),
+                },
+                migration_source: None,
+                recording_id: Some("rec-1".to_owned()),
+                recording_uri: None,
+                runtime_versions: Default::default(),
+                workload: serde_json::Value::Null,
+            },
+            status: RunStatus::Pending,
+            recording_id: Some("rec-1".to_owned()),
+            candidate_image: None,
+            failure_reason: None,
+            stage: Some("queued".to_owned()),
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        deja_orchestrator::write_json(&root.run_path(run_id), &run).unwrap();
+    }
+
     async fn request_status(
         auth: MutationAuth,
         method: Method,
@@ -733,5 +1156,103 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stage_callback_updates_file_snapshot_without_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(HarnessRoot::new(dir.path()).unwrap());
+        write_run(&root, "run-1");
+
+        let response = callback_router(root.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/api/v1/runs/run-1/stage")
+                    .header("X-Deja-Actor", "agent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "stage": "driving requests",
+                            "step": 3,
+                            "steps_total": 7
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let run: Run = deja_orchestrator::read_json(&root.run_path("run-1")).unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.stage.as_deref(), Some("driving requests"));
+        assert_eq!(run.step, 3);
+        assert_eq!(run.steps_total, 7);
+    }
+
+    #[tokio::test]
+    async fn verdict_callback_completes_file_snapshot_without_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(HarnessRoot::new(dir.path()).unwrap());
+        write_run(&root, "run-1");
+
+        let response = callback_router(root.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs/run-1/verdict")
+                    .header("X-Deja-Actor", "agent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "run_id": "run-1",
+                            "verdict": "fail",
+                            "reason": "value divergence",
+                            "artifacts": { "scorecard.json": "s3://bucket/runs/run-1/scorecard.json" },
+                            "scorecard": { "verdict": { "pass": false } }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let run: Run = deja_orchestrator::read_json(&root.run_path("run-1")).unwrap();
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.stage.as_deref(), Some("completed"));
+        assert_eq!(run.failure_reason, None);
+    }
+
+    #[test]
+    fn parse_s3_artifact_uri_splits_bucket_and_key() {
+        assert_eq!(
+            parse_s3_uri("s3://deja-recordings/runs/run-1/scorecard.json"),
+            Some(("deja-recordings", "runs/run-1/scorecard.json"))
+        );
+        assert_eq!(parse_s3_uri("file:///tmp/scorecard.json"), None);
+        assert_eq!(parse_s3_uri("s3://bucket"), None);
+    }
+
+    #[test]
+    fn artifact_callback_names_map_to_store_kinds() {
+        let cases = [
+            ("events.jsonl", Some("events")),
+            ("lookup-table.json", Some("lookup_table")),
+            ("observed.jsonl", Some("observed")),
+            ("http-diffs.jsonl", Some("http_diffs")),
+            ("scorecard.json", Some("scorecard")),
+            ("call-ledger.jsonl", Some("call_ledger")),
+            ("seed-certificate.json", Some("seed_certificate")),
+            ("lookup_table", Some("lookup_table")),
+            ("runs/run-1/scorecard.json", Some("scorecard")),
+            ("mystery.bin", None),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(normalize_artifact_kind(raw), expected, "{raw}");
+        }
     }
 }

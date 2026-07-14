@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -1096,10 +1096,6 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "ObservedCallWire")]
 pub struct ObservedCall {
@@ -1122,10 +1118,6 @@ pub struct ObservedCall {
     /// finalizer marker (`http_incoming`) or another boundary can provide it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_timestamp_ns: Option<u64>,
-    /// True when this observed call was emitted while draining declared detached
-    /// work; post-finalization detached work is expected and non-diagnostic.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub detached: bool,
     /// Stable replay task id stamped by the runtime kernel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -1195,16 +1187,6 @@ pub struct ObservedCall {
     /// rather than a false positive. Always false in M1 lookup mode.
     #[serde(default)]
     pub seed_gap: bool,
-    /// DEAD pre-image field — always `None`. The StateProbe machinery that once
-    /// populated it was removed (the divergence catch reads only
-    /// `recorded_result`/`observed_result`, never images). Kept `#[serde(default)]`
-    /// so OLD `observed.jsonl` tapes carrying a `pre_image` still deserialize.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pre_image: Option<serde_json::Value>,
-    /// DEAD post-image field — always `None`. See [`Self::pre_image`]. Kept
-    /// `#[serde(default)]` for backward tape compatibility only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_image: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1223,8 +1205,6 @@ struct ObservedCallWire {
     timestamp_ns: u64,
     #[serde(default)]
     end_timestamp_ns: Option<u64>,
-    #[serde(default)]
-    detached: bool,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -1257,10 +1237,6 @@ struct ObservedCallWire {
     provenance: crate::Provenance,
     #[serde(default)]
     seed_gap: bool,
-    #[serde(default)]
-    pre_image: Option<serde_json::Value>,
-    #[serde(default)]
-    result_image: Option<serde_json::Value>,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1278,7 +1254,6 @@ impl From<ObservedCallWire> for ObservedCall {
             source_event_global_sequence: wire.source_event_global_sequence,
             timestamp_ns: wire.timestamp_ns,
             end_timestamp_ns: wire.end_timestamp_ns,
-            detached: wire.detached,
             task_id: wire.task_id,
             parent_task_id: wire.parent_task_id,
             task_bucket,
@@ -1295,8 +1270,6 @@ impl From<ObservedCallWire> for ObservedCall {
             observed_result: wire.observed_result,
             provenance: wire.provenance,
             seed_gap: wire.seed_gap,
-            pre_image: wire.pre_image,
-            result_image: wire.result_image,
         }
     }
 }
@@ -1490,6 +1463,223 @@ pub trait LookupTableSource: Send {
     fn load(&mut self) -> std::io::Result<LookupTable>;
 }
 
+/// In-process lookup table store used by replay sandboxes.
+///
+/// Each correlation lives in its own partition with its lookup entries and
+/// counters. Dropping a partition therefore removes both the pushed mock data
+/// and the sequence/occurrence state derived while driving that request.
+#[derive(Clone, Default)]
+pub struct ImcLookupStore {
+    inner: Arc<RwLock<ImcLookupState>>,
+}
+
+#[derive(Default)]
+struct ImcLookupState {
+    partitions: HashMap<Option<String>, ImcLookupPartition>,
+    observed: HashMap<Option<String>, Vec<ObservedCall>>,
+}
+
+struct ImcLookupPartition {
+    entries: HashMap<LookupKey, LookupEntry>,
+    next_sequence: u64,
+    stamper: KeyStamper,
+    callsite_occurrence: crate::CallsiteOccurrenceMap,
+}
+
+impl ImcLookupPartition {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_sequence: 0,
+            stamper: KeyStamper::new(),
+            callsite_occurrence: HashMap::new(),
+        }
+    }
+
+    fn from_entries(correlation_id: Option<String>, entries: Vec<LookupEntry>) -> Self {
+        let mut partition = Self::new();
+        for mut entry in entries {
+            entry.key.correlation_id = correlation_id.clone();
+            partition.entries.insert(entry.key.clone(), entry);
+        }
+        partition
+    }
+}
+
+impl ImcLookupStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn partition_key(correlation_id: Option<&str>) -> Option<String> {
+        correlation_id.map(str::to_owned)
+    }
+
+    /// Install a complete lookup table, preserving each entry's own
+    /// correlation. This is useful for tests and local harnesses; sandbox admin
+    /// routes normally call [`Self::install_entries`] with the route
+    /// correlation.
+    pub fn install_table(&self, table: LookupTable) -> usize {
+        let mut grouped: HashMap<Option<String>, Vec<LookupEntry>> = HashMap::new();
+        for entry in table.entries {
+            grouped
+                .entry(entry.key.correlation_id.clone())
+                .or_default()
+                .push(entry);
+        }
+        let mut installed = 0;
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        for (correlation_id, entries) in grouped {
+            installed += entries.len();
+            guard.partitions.insert(
+                correlation_id.clone(),
+                ImcLookupPartition::from_entries(correlation_id, entries),
+            );
+        }
+        installed
+    }
+
+    /// Replace the partition for `correlation_id` with `entries`, resetting its
+    /// request-sequence and occurrence counters in the same operation.
+    pub fn install_entries(
+        &self,
+        correlation_id: Option<&str>,
+        entries: Vec<LookupEntry>,
+    ) -> usize {
+        let key = Self::partition_key(correlation_id);
+        let installed = entries.len();
+        let partition = ImcLookupPartition::from_entries(key.clone(), entries);
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        guard.partitions.insert(key, partition);
+        installed
+    }
+
+    /// Drop lookup entries and counters for `correlation_id`.
+    pub fn clear_correlation(&self, correlation_id: Option<&str>) -> bool {
+        let key = Self::partition_key(correlation_id);
+        match self.inner.write() {
+            Ok(mut guard) => guard.partitions.remove(&key).is_some(),
+            Err(poisoned) => poisoned.into_inner().partitions.remove(&key).is_some(),
+        }
+    }
+
+    pub fn partition_entry_count(&self, correlation_id: Option<&str>) -> usize {
+        let key = Self::partition_key(correlation_id);
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        guard
+            .partitions
+            .get(&key)
+            .map(|partition| partition.entries.len())
+            .unwrap_or(0)
+    }
+
+    pub fn total_entry_count(&self) -> usize {
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        guard
+            .partitions
+            .values()
+            .map(|partition| partition.entries.len())
+            .sum()
+    }
+
+    pub fn drain_observed(&self, correlation_id: Option<&str>) -> Vec<ObservedCall> {
+        let key = Self::partition_key(correlation_id);
+        match self.inner.write() {
+            Ok(mut guard) => guard.observed.remove(&key).unwrap_or_default(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .observed
+                .remove(&key)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn observed_count(&self, correlation_id: Option<&str>) -> usize {
+        let key = Self::partition_key(correlation_id);
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        guard.observed.get(&key).map(Vec::len).unwrap_or(0)
+    }
+
+    pub fn total_observed_count(&self) -> usize {
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        guard.observed.values().map(Vec::len).sum()
+    }
+
+    fn bump_request_sequence(&self, correlation_id: Option<&str>) -> u64 {
+        let key = Self::partition_key(correlation_id);
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let partition = guard
+            .partitions
+            .entry(key)
+            .or_insert_with(ImcLookupPartition::new);
+        let sequence = partition.next_sequence;
+        partition.next_sequence += 1;
+        sequence
+    }
+
+    fn stamp_lookup_keys(
+        &self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<&str>,
+        fork_seq: u64,
+        addresses: &[Address],
+        args_hash: u64,
+    ) -> Vec<LookupKey> {
+        let key = Self::partition_key(correlation_id);
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let partition = guard
+            .partitions
+            .entry(key)
+            .or_insert_with(ImcLookupPartition::new);
+        partition
+            .stamper
+            .stamp(correlation_id, bucket_id, fork_seq, addresses, args_hash)
+    }
+
+    fn lookup(&self, keys: &[LookupKey]) -> Option<(LookupEntry, u8)> {
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        for key in keys {
+            if let Some(partition) = guard.partitions.get(&key.correlation_id) {
+                if let Some(entry) = partition.entries.get(key) {
+                    return Some((entry.clone(), key.address.rank()));
+                }
+            }
+        }
+        None
+    }
+
+    fn next_callsite_occurrence(
+        &self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<String>,
+        source: CallsiteSource,
+        scope: Option<&str>,
+    ) -> u32 {
+        let partition_key = Self::partition_key(correlation_id);
+        let key = (
+            partition_key.clone(),
+            bucket_id,
+            source,
+            scope.map(String::from),
+        );
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let partition = guard
+            .partitions
+            .entry(partition_key)
+            .or_insert_with(ImcLookupPartition::new);
+        let entry = partition.callsite_occurrence.entry(key).or_insert(0);
+        let value = *entry;
+        *entry += 1;
+        value
+    }
+
+    fn record_observed(&self, call: ObservedCall) {
+        let key = call.correlation_id.clone();
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        guard.observed.entry(key).or_default().push(call);
+    }
+}
+
 /// Sink for `ObservedCall` records emitted by the candidate hook.
 ///
 /// Implementations must be cheap on the hot path: `observed` runs inside
@@ -1498,6 +1688,10 @@ pub trait LookupTableSource: Send {
 /// inline.
 pub trait ObservedCallSink: Send + Sync {
     fn observed(&self, call: ObservedCall);
+    /// Execution-graph node captured during replay; rides the observed
+    /// stream. Default no-op: sinks that persist the stream must override,
+    /// assertion-only test sinks may ignore graph traffic.
+    fn graph_node(&self, _node: deja_core::ExecutionGraphNode) {}
     fn flush(&self) -> std::io::Result<()>;
 }
 
@@ -1542,6 +1736,7 @@ impl LookupTableSource for LocalFileLookupSource {
 /// In-memory `ObservedCallSink` for tests and standalone harness use.
 pub struct InMemoryObservedSink {
     calls: std::sync::Arc<Mutex<Vec<ObservedCall>>>,
+    graph_nodes: std::sync::Arc<Mutex<Vec<deja_core::ExecutionGraphNode>>>,
 }
 
 impl Default for InMemoryObservedSink {
@@ -1554,7 +1749,16 @@ impl InMemoryObservedSink {
     pub fn new() -> Self {
         Self {
             calls: std::sync::Arc::new(Mutex::new(Vec::new())),
+            graph_nodes: std::sync::Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Graph nodes captured so far; useful for assertions in tests.
+    pub fn graph_nodes(&self) -> Vec<deja_core::ExecutionGraphNode> {
+        self.graph_nodes
+            .lock()
+            .map(|buf| buf.clone())
+            .unwrap_or_default()
     }
 
     /// Clone of the underlying buffer; useful for assertions in tests.
@@ -1574,6 +1778,11 @@ impl ObservedCallSink for InMemoryObservedSink {
     fn observed(&self, call: ObservedCall) {
         if let Ok(mut buf) = self.calls.lock() {
             buf.push(call);
+        }
+    }
+    fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
+        if let Ok(mut buf) = self.graph_nodes.lock() {
+            buf.push(node);
         }
     }
     fn flush(&self) -> std::io::Result<()> {
@@ -1603,15 +1812,24 @@ impl FileObservedSink {
     }
 }
 
-impl ObservedCallSink for FileObservedSink {
-    fn observed(&self, call: ObservedCall) {
+impl FileObservedSink {
+    fn write_record(&self, record: &crate::DejaRecord) {
         use std::io::Write;
         if let Ok(mut guard) = self.file.lock() {
-            if let Ok(line) = serde_json::to_string(&call) {
+            if let Ok(line) = serde_json::to_string(record) {
                 let _ = guard.write_all(line.as_bytes());
                 let _ = guard.write_all(b"\n");
             }
         }
+    }
+}
+
+impl ObservedCallSink for FileObservedSink {
+    fn observed(&self, call: ObservedCall) {
+        self.write_record(&crate::DejaRecord::Observed(Box::new(call)));
+    }
+    fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
+        self.write_record(&crate::DejaRecord::GraphNode(node));
     }
     fn flush(&self) -> std::io::Result<()> {
         use std::io::Write;
@@ -1622,13 +1840,33 @@ impl ObservedCallSink for FileObservedSink {
     }
 }
 
+struct ImcObservedSink {
+    store: ImcLookupStore,
+}
+
+impl ImcObservedSink {
+    fn new(store: ImcLookupStore) -> Self {
+        Self { store }
+    }
+}
+
+impl ObservedCallSink for ImcObservedSink {
+    fn observed(&self, call: ObservedCall) {
+        self.store.record_observed(call);
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// In-process side-effect player driven by a frozen `LookupTable`.
 ///
 /// Does NOT run a cascade and does NOT classify divergences. It looks up a key
 /// by (correlation, boundary, trait, method, occurrence) — with optional
 /// `callsite_identity_id` fallback — emits an `ObservedCall`, and returns the
 /// result if found.
-pub struct LookupTableHook {
+struct StaticLookupBackend {
     table: HashMap<LookupKey, LookupEntry>,
     /// Per-correlation request_sequence counter; bumps on each lookup. Feeds
     /// the rank-6 `Address::Sequence` and mirrors the recorder's own
@@ -1637,20 +1875,165 @@ pub struct LookupTableHook {
     /// Shared occurrence assigner; advanced for every rank on every call so its
     /// numbering stays in lockstep with the renderer's.
     stamper: Mutex<KeyStamper>,
+    /// Per-(correlation, bucket, source, scope) occurrence counter mirroring
+    /// `RecordingHook::next_callsite_occurrence`.
+    callsite_occurrence: Mutex<crate::CallsiteOccurrenceMap>,
+}
+
+impl StaticLookupBackend {
+    fn new(table: HashMap<LookupKey, LookupEntry>) -> Self {
+        Self {
+            table,
+            next_sequence: Mutex::new(HashMap::new()),
+            stamper: Mutex::new(KeyStamper::new()),
+            callsite_occurrence: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn entry_count(&self) -> usize {
+        self.table.len()
+    }
+
+    fn bump_request_sequence(&self, correlation_id: Option<&str>) -> u64 {
+        let key = correlation_id.map(str::to_owned);
+        if let Ok(mut map) = self.next_sequence.lock() {
+            let counter = map.entry(key).or_insert(0);
+            let seq = *counter;
+            *counter += 1;
+            seq
+        } else {
+            0
+        }
+    }
+
+    fn stamp_lookup_keys(
+        &self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<&str>,
+        fork_seq: u64,
+        addresses: &[Address],
+        args_hash: u64,
+    ) -> Vec<LookupKey> {
+        match self.stamper.lock() {
+            Ok(mut stamper) => {
+                stamper.stamp(correlation_id, bucket_id, fork_seq, addresses, args_hash)
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn lookup(&self, keys: &[LookupKey]) -> Option<(LookupEntry, u8)> {
+        for key in keys {
+            if let Some(entry) = self.table.get(key) {
+                return Some((entry.clone(), key.address.rank()));
+            }
+        }
+        None
+    }
+
+    fn next_callsite_occurrence(
+        &self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<String>,
+        source: CallsiteSource,
+        scope: Option<&str>,
+    ) -> u32 {
+        let key = (
+            correlation_id.map(String::from),
+            bucket_id,
+            source,
+            scope.map(String::from),
+        );
+        let mut guard = self
+            .callsite_occurrence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = guard.entry(key).or_insert(0);
+        let value = *entry;
+        *entry += 1;
+        value
+    }
+}
+
+enum LookupBackend {
+    Static(Box<StaticLookupBackend>),
+    Imc(ImcLookupStore),
+}
+
+impl LookupBackend {
+    fn entry_count(&self) -> usize {
+        match self {
+            LookupBackend::Static(backend) => backend.entry_count(),
+            LookupBackend::Imc(store) => store.total_entry_count(),
+        }
+    }
+
+    fn imc_store(&self) -> Option<ImcLookupStore> {
+        match self {
+            LookupBackend::Static(_) => None,
+            LookupBackend::Imc(store) => Some(store.clone()),
+        }
+    }
+
+    fn bump_request_sequence(&self, correlation_id: Option<&str>) -> u64 {
+        match self {
+            LookupBackend::Static(backend) => backend.bump_request_sequence(correlation_id),
+            LookupBackend::Imc(store) => store.bump_request_sequence(correlation_id),
+        }
+    }
+
+    fn stamp_lookup_keys(
+        &self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<&str>,
+        fork_seq: u64,
+        addresses: &[Address],
+        args_hash: u64,
+    ) -> Vec<LookupKey> {
+        match self {
+            LookupBackend::Static(backend) => {
+                backend.stamp_lookup_keys(correlation_id, bucket_id, fork_seq, addresses, args_hash)
+            }
+            LookupBackend::Imc(store) => {
+                store.stamp_lookup_keys(correlation_id, bucket_id, fork_seq, addresses, args_hash)
+            }
+        }
+    }
+
+    fn lookup(&self, keys: &[LookupKey]) -> Option<(LookupEntry, u8)> {
+        match self {
+            LookupBackend::Static(backend) => backend.lookup(keys),
+            LookupBackend::Imc(store) => store.lookup(keys),
+        }
+    }
+
+    fn next_callsite_occurrence(
+        &self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<String>,
+        source: CallsiteSource,
+        scope: Option<&str>,
+    ) -> u32 {
+        match self {
+            LookupBackend::Static(backend) => {
+                backend.next_callsite_occurrence(correlation_id, bucket_id, source, scope)
+            }
+            LookupBackend::Imc(store) => {
+                store.next_callsite_occurrence(correlation_id, bucket_id, source, scope)
+            }
+        }
+    }
+}
+
+pub struct LookupTableHook {
+    backend: LookupBackend,
     /// Per-correlation global-event counter; sourced from `next_global_sequence`.
     global_counter: std::sync::atomic::AtomicU64,
-    /// Per-(correlation, bucket, source, scope) occurrence counter mirroring
-    /// `RecordingHook::next_callsite_occurrence`. The boundary macro re-derives
-    /// the per-callsite occurrence at REPLAY time by calling
-    /// `next_callsite_occurrence` on this hook (the same hook that does the
-    /// lookup). It MUST advance in lock-step with recording — one bump per call
-    /// per scope and lineage bucket — so that the `CallsiteIdentity::occurrence`
-    /// the macro stamps into the rank-4 `Address::LexicalPath { scope_occurrence }` matches the
-    /// occurrence the renderer read off the recorded event. Without this the
-    /// macro would receive the default `0` for every call and only the first
-    /// (occurrence-0) call at each callsite would resolve.
-    callsite_occurrence: Mutex<crate::CallsiteOccurrenceMap>,
     observed_sink: Box<dyn ObservedCallSink>,
+    /// Sequence space for replay-side graph nodes on the observed stream;
+    /// separate from the lookup counters so replay addressing stays in
+    /// lockstep with the recorder whether or not graph capture is on.
+    graph_counter: std::sync::atomic::AtomicU64,
 }
 
 impl LookupTableHook {
@@ -1669,18 +2052,32 @@ impl LookupTableHook {
             map.insert(entry.key.clone(), entry);
         }
         Ok(Self {
-            table: map,
-            next_sequence: Mutex::new(HashMap::new()),
-            stamper: Mutex::new(KeyStamper::new()),
+            backend: LookupBackend::Static(Box::new(StaticLookupBackend::new(map))),
             global_counter: std::sync::atomic::AtomicU64::new(0),
-            callsite_occurrence: Mutex::new(HashMap::new()),
             observed_sink: Box::new(sink),
+            graph_counter: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Construct a replay hook backed by an in-process, dynamically loaded IMC
+    /// store. Observations are buffered in the same store for admin draining.
+    pub fn from_imc_store(store: ImcLookupStore) -> Self {
+        Self {
+            backend: LookupBackend::Imc(store.clone()),
+            global_counter: std::sync::atomic::AtomicU64::new(0),
+            observed_sink: Box::new(ImcObservedSink::new(store)),
+            graph_counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Return the IMC store when this hook was built for `DEJA_LOOKUP_MODE=imc`.
+    pub fn imc_store(&self) -> Option<ImcLookupStore> {
+        self.backend.imc_store()
     }
 
     /// Number of entries loaded. Useful for assertions.
     pub fn entry_count(&self) -> usize {
-        self.table.len()
+        self.backend.entry_count()
     }
 
     /// Force-flush the underlying observed-call sink. The hook does NOT
@@ -1689,16 +2086,12 @@ impl LookupTableHook {
         self.observed_sink.flush()
     }
 
-    fn bump_request_sequence(&self, correlation_id: Option<&str>) -> u64 {
-        let key = correlation_id.map(str::to_owned);
-        if let Ok(mut map) = self.next_sequence.lock() {
-            let counter = map.entry(key).or_insert(0);
-            let seq = *counter;
-            *counter += 1;
-            seq
-        } else {
-            0
-        }
+    /// Replay-side execution-graph capture: nodes ride the observed stream.
+    pub fn record_graph_node(&self, mut node: deja_core::ExecutionGraphNode) {
+        node.global_sequence = self
+            .graph_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.observed_sink.graph_node(node);
     }
 
     /// Resolve one replay call to its recorded baseline.
@@ -1729,7 +2122,9 @@ impl LookupTableHook {
         let fork_seq = fork_seq.unwrap_or(0);
         // Bumped once per call for the rank-6 positional address; mirrors the
         // recorder's per-correlation request_sequence.
-        let request_sequence = self.bump_request_sequence(correlation_id.as_deref());
+        let request_sequence = self
+            .backend
+            .bump_request_sequence(correlation_id.as_deref());
         let args_hash = canonical_args_hash(query.args);
 
         let location = query
@@ -1746,23 +2141,14 @@ impl LookupTableHook {
         // Stamp occurrences for EVERY rank (not just the one that resolves) so
         // the numbering stays aligned with the renderer, then query
         // strongest-first and take the first hit.
-        let keys = match self.stamper.lock() {
-            Ok(mut stamper) => stamper.stamp(
-                correlation_id.as_deref(),
-                bucket_id.as_deref(),
-                fork_seq,
-                &addresses,
-                args_hash,
-            ),
-            Err(_) => Vec::new(),
-        };
-        let mut hit: Option<(&LookupEntry, u8)> = None;
-        for key in &keys {
-            if let Some(entry) = self.table.get(key) {
-                hit = Some((entry, key.address.rank()));
-                break;
-            }
-        }
+        let keys = self.backend.stamp_lookup_keys(
+            correlation_id.as_deref(),
+            bucket_id.as_deref(),
+            fork_seq,
+            &addresses,
+            args_hash,
+        );
+        let hit = self.backend.lookup(&keys);
 
         // There is intentionally no arg-tolerant args-free fallback. Serving a
         // re-keyed call its recorded value was the partial-derivative substitution
@@ -1785,9 +2171,11 @@ impl LookupTableHook {
             fork_seq,
             location: location.map(|(f, l, c)| (f.to_owned(), l, c)),
             graph_node_id,
-            resolved_rank: hit.map(|(_, rank)| rank),
-            source_event_global_sequence: hit.map(|(entry, _)| entry.source_event_global_sequence),
-            recorded_result: hit.map(|(entry, _)| entry.result.clone()),
+            resolved_rank: hit.as_ref().map(|(_, rank)| *rank),
+            source_event_global_sequence: hit
+                .as_ref()
+                .map(|(entry, _)| entry.source_event_global_sequence),
+            recorded_result: hit.map(|(entry, _)| entry.result),
         }
     }
 }
@@ -1834,7 +2222,6 @@ impl Resolution {
             source_event_global_sequence: self.source_event_global_sequence,
             timestamp_ns: crate::now_ns(),
             end_timestamp_ns: None,
-            detached: crate::current_task_is_detached(),
             task_id: self.task_id,
             parent_task_id: self.parent_task_id,
             task_bucket: self.task_bucket,
@@ -1853,13 +2240,13 @@ impl Resolution {
             observed_result,
             provenance,
             seed_gap: false,
-            // Dead pre/post-image fields, kept `#[serde(default)]` so OLD
-            // `observed.jsonl` tapes still deserialize; always `None` now (the
-            // StateProbe machinery that once populated them was removed — the
-            // divergence catch reads only recorded/observed result, never images).
-            pre_image: None,
-            result_image: None,
         }
+    }
+}
+
+impl crate::graph::GraphNodeSink for LookupTableHook {
+    fn graph_node(&self, node: deja_core::ExecutionGraphNode) {
+        self.record_graph_node(node);
     }
 }
 
@@ -1884,6 +2271,10 @@ impl DejaHook for LookupTableHook {
             crate::Provenance::Recorded,
         ));
         recorded
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        LookupTableHook::flush(self)
     }
 
     fn execute_shadow_peek(&self, query: ReplayLookup<'_>) -> Option<crate::ExecuteShadowToken> {
@@ -1986,7 +2377,6 @@ impl DejaHook for LookupTableHook {
             source_event_global_sequence: None,
             timestamp_ns: event.timestamp_ns,
             end_timestamp_ns: event.end_timestamp_ns,
-            detached: event.detached,
             task_id: event.task_id,
             parent_task_id: event.parent_task_id,
             task_bucket,
@@ -2003,8 +2393,6 @@ impl DejaHook for LookupTableHook {
             observed_result: Some(event.result),
             provenance: crate::Provenance::Recorded,
             seed_gap: false,
-            pre_image: None,
-            result_image: None,
         });
     }
 
@@ -2044,20 +2432,8 @@ impl DejaHook for LookupTableHook {
         let bucket_id = bucket_id
             .or(task_bucket)
             .or_else(|| Some(crate::ROOT_TASK_ID.to_string()));
-        let key = (
-            correlation_id.map(String::from),
-            bucket_id,
-            source,
-            scope.map(String::from),
-        );
-        let mut guard = self
-            .callsite_occurrence
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let entry = guard.entry(key).or_insert(0);
-        let value = *entry;
-        *entry += 1;
-        value
+        self.backend
+            .next_callsite_occurrence(correlation_id, bucket_id, source, scope)
     }
 }
 
@@ -2526,7 +2902,6 @@ mod tests {
             recording_run_id: None,
             graph_node_id: None,
             tracing_span_id: None,
-            detached: false,
             task_id: Some(crate::ROOT_TASK_ID.to_string()),
             parent_task_id: None,
             task_bucket: Some(crate::ROOT_TASK_ID.to_string()),
@@ -2862,6 +3237,94 @@ mod tests {
         let table = source.load().expect("load");
         assert_eq!(table.entries.len(), 1);
         assert_eq!(table.entries[0].result, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn imc_lookup_store_push_lookup_drain_and_clear_cycle() {
+        let args = serde_json::json!({ "id": "pi_123" });
+        let store = ImcLookupStore::new();
+        let hook = LookupTableHook::from_imc_store(store.clone());
+        let entry = entry_with(
+            Some("wrong-correlation"),
+            explicit("find_pi"),
+            &args,
+            0,
+            serde_json::json!({ "Ok": "row_recorded" }),
+            9,
+        );
+
+        assert_eq!(
+            store.install_entries(Some("corr-1"), vec![entry.clone()]),
+            1
+        );
+        assert_eq!(store.partition_entry_count(Some("corr-1")), 1);
+        assert_eq!(hook.entry_count(), 1);
+
+        let identity = explicit_identity("find_pi");
+        let _guard = deja_context::enter_correlation_id("corr-1");
+        let value = hook.try_replay_with_context(ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentIntentInterface",
+            method_name: "find_payment_intent_by_id",
+            args: &args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        });
+        assert_eq!(value, Some(serde_json::json!({ "Ok": "row_recorded" })));
+
+        let observed = store.drain_observed(Some("corr-1"));
+        assert_eq!(observed.len(), 1);
+        assert!(observed[0].resolved);
+        assert_eq!(observed[0].resolved_rank, Some(1));
+        assert_eq!(store.observed_count(Some("corr-1")), 0);
+
+        assert!(store.clear_correlation(Some("corr-1")));
+        assert_eq!(store.partition_entry_count(Some("corr-1")), 0);
+
+        assert_eq!(store.install_entries(Some("corr-1"), vec![entry]), 1);
+        let value_after_counter_reset = hook.try_replay_with_context(ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentIntentInterface",
+            method_name: "find_payment_intent_by_id",
+            args: &args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        });
+        assert_eq!(
+            value_after_counter_reset,
+            Some(serde_json::json!({ "Ok": "row_recorded" }))
+        );
+    }
+
+    #[test]
+    fn imc_lookup_clear_preserves_ambient_partition() {
+        let args = serde_json::json!({});
+        let store = ImcLookupStore::new();
+        let ambient = entry_with(
+            None,
+            explicit("ambient-config"),
+            &args,
+            0,
+            serde_json::json!("ambient"),
+            1,
+        );
+        let correlated = entry_with(
+            Some("corr-1"),
+            explicit("request-row"),
+            &args,
+            0,
+            serde_json::json!("request"),
+            2,
+        );
+
+        store.install_entries(None, vec![ambient]);
+        store.install_entries(Some("corr-1"), vec![correlated]);
+        assert_eq!(store.total_entry_count(), 2);
+
+        assert!(store.clear_correlation(Some("corr-1")));
+        assert_eq!(store.partition_entry_count(None), 1);
+        assert_eq!(store.partition_entry_count(Some("corr-1")), 0);
+        assert_eq!(store.total_entry_count(), 1);
     }
 
     #[test]
@@ -3816,7 +4279,6 @@ mod tests {
         finalizer.trait_name = "router_env::request".to_owned();
         finalizer.timestamp_ns = 1_000;
         finalizer.end_timestamp_ns = Some(12_345);
-        finalizer.detached = true;
         finalizer.graph_node_id = Some(42);
         hook.record(finalizer);
 
@@ -3832,7 +4294,6 @@ mod tests {
         assert!(!call.resolved);
         assert_eq!(call.timestamp_ns, 1_000);
         assert_eq!(call.end_timestamp_ns, Some(12_345));
-        assert!(call.detached);
         assert_eq!(call.graph_node_id, Some(42));
         assert_eq!(
             call.observed_result,
@@ -3869,7 +4330,6 @@ mod tests {
             "method_name": "find",
             "args": {"id": 1},
             "resolved": false,
-            "detached": true,
             "task_id": "detached-7",
             "parent_task_id": "root",
             "task_bucket": "corr-2",
@@ -3878,7 +4338,6 @@ mod tests {
         });
         let call: ObservedCall =
             serde_json::from_value(current).expect("current observed call must deserialize");
-        assert!(call.detached);
         assert_eq!(call.task_id.as_deref(), Some("detached-7"));
         assert_eq!(call.parent_task_id.as_deref(), Some("root"));
         assert_eq!(call.task_bucket.as_deref(), Some("corr-2"));
@@ -3909,7 +4368,6 @@ mod tests {
             "method_name": "get_key",
             "args": {"key": "k"},
             "resolved": true,
-            "detached": true,
             "task_id": "detached-legacy",
             "parent_task_id": "root",
             "task_bucket": "legacy-bucket",
@@ -3937,7 +4395,6 @@ mod tests {
             "method_name": "find",
             "args": {"id": 1},
             "resolved": false,
-            "detached": true,
             "task_id": "detached-7",
             "parent_task_id": "root",
             "task_bucket": "detached-bucket-7",
@@ -5031,8 +5488,7 @@ redis\tcurrency\tusd
     /// recorded baseline at peek (advancing the stampers in lock-step with the
     /// lookup path) and stamps the REAL boundary result at observe, emitting one
     /// `Shadow` observation whose `recorded_result`/`observed_result` are
-    /// what the post-hoc divergence tally diffs. The dead `pre_image`/`result_image`
-    /// fields stay `None` (the StateProbe machinery was removed).
+    /// what the post-hoc divergence tally diffs.
     #[test]
     fn hook_execute_shadow_emits_observation_with_real_result() {
         let table = LookupTable {
@@ -5076,9 +5532,6 @@ redis\tcurrency\tusd
         assert_eq!(call.provenance, crate::Provenance::Shadow);
         assert_eq!(call.recorded_result, Some(serde_json::json!(2)));
         assert_eq!(call.observed_result, Some(serde_json::json!(3)));
-        // The dead image fields stay None (StateProbe machinery removed).
-        assert_eq!(call.pre_image, None);
-        assert_eq!(call.result_image, None);
     }
 
     /// REGRESSION (#28 extra-call): a declared-`Execute` boundary CALL with NO

@@ -37,6 +37,13 @@ pub struct BaselineResponse {
     pub body_text: Option<String>,
 }
 
+/// Whether an incoming HTTP path is the router health endpoint, which is
+/// harness noise rather than replay workload.
+pub fn is_health_request_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    path.trim_end_matches('/') == "/health"
+}
+
 /// Per-request comparison output, posted to the orchestrator's HTTP diff sink.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpDiff {
@@ -297,7 +304,6 @@ mod tests {
             recording_run_id: Some("run".to_owned()),
             graph_node_id: None,
             tracing_span_id: None,
-            detached: false,
             task_id: Some("root".to_owned()),
             parent_task_id: None,
             task_bucket: Some("c-1".to_owned()),
@@ -363,6 +369,16 @@ mod tests {
             drv.baseline_response.body_json,
             Some(serde_json::json!({ "id": "pay_1", "status": "succeeded" }))
         );
+    }
+
+    #[test]
+    fn health_request_path_matches_only_health_endpoint() {
+        assert!(is_health_request_path("/health"));
+        assert!(is_health_request_path("/health/"));
+        assert!(is_health_request_path("/health?probe=1"));
+        assert!(!is_health_request_path("/healthz"));
+        assert!(!is_health_request_path("/payments/health"));
+        assert!(!is_health_request_path("/"));
     }
 
     #[test]

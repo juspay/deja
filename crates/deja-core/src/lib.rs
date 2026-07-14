@@ -12,7 +12,6 @@ pub const ARTIFACT_SCHEMA_VERSION_V1: ArtifactSchemaVersion = ArtifactSchemaVers
 pub const ARTIFACT_STORAGE_KIND_DIRECTORY: ArtifactStorageKind = ArtifactStorageKind::Directory;
 pub const METADATA_FILE_NAME: &str = "metadata.json";
 pub const EVENTS_FILE_NAME: &str = "events.jsonl";
-pub const EXECUTION_GRAPH_FILE_NAME: &str = "execution-graph.jsonl";
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 pub const INSPECTION_SUMMARY_FILE_NAME: &str = "inspection-summary.json";
 // Legacy v1 (preload-era) artifact-manifest protocol. The semantic pipeline
@@ -27,7 +26,6 @@ pub const PRELOAD_ARTIFACT_ROOT_ENV_VAR: &str = "DEJA_PRELOAD_ARTIFACT_ROOT";
 pub const PRELOAD_LIBRARY_PATH_ENV_VAR: &str = "DEJA_PRELOAD_LIBRARY_PATH";
 pub const REGRESSION_REPORT_FILE_NAME: &str = "regression-report.json";
 pub const BEHAVIOR_DIFF_FILE_NAME: &str = "behavior-diff.json";
-pub const DEJA_GRAPH_DIR_ENV_VAR: &str = "DEJA_GRAPH_DIR";
 
 pub const EXECUTION_GRAPH_SELECTED_FIELDS: &[&str] = &[
     "request_id",
@@ -122,14 +120,13 @@ impl ArtifactLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionGraphRecord {
-    #[serde(flatten)]
-    pub node: ExecutionGraphNode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionGraphNode {
     pub node_id: u64,
+    /// Global stream sequence stamped by the recording hook when the node is
+    /// tape-carried: graph nodes share the boundary-event counter, so drop
+    /// accounting and ordering cover one totally-ordered stream.
+    #[serde(default)]
+    pub global_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<u64>,
     #[serde(default)]

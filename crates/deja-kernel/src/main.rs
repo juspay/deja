@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use deja_kernel::{
-    compare_response, group_by_correlation, reconstruct_driver_request, BoundaryEvent,
-    DriverRequest, HttpDiff,
+    compare_response, group_by_correlation, is_health_request_path, reconstruct_driver_request,
+    BoundaryEvent, DriverRequest, HttpDiff,
 };
 
 fn main() -> ExitCode {
@@ -98,44 +98,49 @@ fn run() -> Result<(), String> {
             .unwrap_or(u64::MAX)
     });
 
-    let mut driven = 0usize;
     let mut skipped = 0usize;
+    let mut health_filtered = 0usize;
+    let mut replay_cases = Vec::new();
     for (cid, events) in ordered {
         match reconstruct_driver_request(events) {
-            // Skip liveness probes — they're harness noise, not workload, and
-            // replaying them tells us nothing about candidate behavior.
-            Some(driver) if driver.path == "/health" => {
-                skipped += 1;
+            Some(driver) if is_health_request_path(&driver.path) => {
+                health_filtered += 1;
             }
-            Some(mut driver) => {
-                // Anchor the controlled environment: the replay router runs with
-                // IdReuse::UseIncoming, so feed the recorded correlation_id back
-                // as the x-request-id header. The candidate adopts it as its
-                // request/correlation id, so its time/id/db replay lookups key
-                // off the SAME correlation that was recorded — the prerequisite
-                // for deterministic, byte-exact self-replay.
-                driver
-                    .headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("x-request-id"));
-                driver
-                    .headers
-                    .push(("x-request-id".to_string(), cid.clone()));
-                let diff = drive(&target_host, target_port, &driver, &allowlist);
-                write_diff(&mut sink_file, &diff).map_err(|e| format!("write diff: {e}"))?;
-                driven += 1;
-                eprintln!(
-                    "deja-kernel: drove {cid} → {}{} (status {} vs {}, body diffs {})",
-                    driver.method,
-                    driver.path,
-                    diff.status_candidate,
-                    diff.status_baseline,
-                    diff.body_diff.len(),
-                );
-            }
+            Some(driver) => replay_cases.push((cid, driver)),
             None => {
                 skipped += 1;
             }
         }
+    }
+    if health_filtered > 0 {
+        eprintln!("deja-kernel: removed {health_filtered} /health correlation(s) from replay set");
+    }
+
+    let mut driven = 0usize;
+    for (cid, mut driver) in replay_cases {
+        // Anchor the controlled environment: the replay router runs with
+        // IdReuse::UseIncoming, so feed the recorded correlation_id back
+        // as the x-request-id header. The candidate adopts it as its
+        // request/correlation id, so its time/id/db replay lookups key
+        // off the SAME correlation that was recorded — the prerequisite
+        // for deterministic, byte-exact self-replay.
+        driver
+            .headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("x-request-id"));
+        driver
+            .headers
+            .push(("x-request-id".to_string(), cid.clone()));
+        let diff = drive(&target_host, target_port, &driver, &allowlist);
+        write_diff(&mut sink_file, &diff).map_err(|e| format!("write diff: {e}"))?;
+        driven += 1;
+        eprintln!(
+            "deja-kernel: drove {cid} → {}{} (status {} vs {}, body diffs {})",
+            driver.method,
+            driver.path,
+            diff.status_candidate,
+            diff.status_baseline,
+            diff.body_diff.len(),
+        );
     }
     eprintln!("deja-kernel: complete (driven {driven}, skipped {skipped})");
     Ok(())
@@ -145,17 +150,38 @@ fn load_recording(path: &PathBuf) -> std::io::Result<Vec<BoundaryEvent>> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
+    let mut graph_nodes = 0usize;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<BoundaryEvent>(&line) {
-            Ok(ev) => events.push(ev),
+        // Tagged one-stream tape: `record_kind` routes each line. Boundary
+        // events deserialize with the tag beside their flat fields (serde
+        // ignores the extra key); graph nodes ride the same stream but are
+        // not driveable, so they skip silently.
+        let value = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(value) => value,
             Err(err) => {
                 eprintln!("deja-kernel: skipping unparseable line: {err}");
+                continue;
+            }
+        };
+        match value.get("record_kind").and_then(|k| k.as_str()) {
+            Some("boundary_event") => match serde_json::from_value::<BoundaryEvent>(value) {
+                Ok(ev) => events.push(ev),
+                Err(err) => {
+                    eprintln!("deja-kernel: skipping unparseable boundary_event: {err}");
+                }
+            },
+            Some("graph_node") => graph_nodes += 1,
+            other => {
+                eprintln!("deja-kernel: skipping line with record_kind {other:?}");
             }
         }
+    }
+    if graph_nodes > 0 {
+        eprintln!("deja-kernel: skipped {graph_nodes} graph_node record(s) riding the tape");
     }
     Ok(events)
 }

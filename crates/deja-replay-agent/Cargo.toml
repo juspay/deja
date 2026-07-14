@@ -1,0 +1,28 @@
+[package]
+name = "deja-replay-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-sandbox replay agent: pulls recordings, pushes per-correlation lookup tables, drives the router, scores, uploads artifacts, and posts verdicts."
+
+[dependencies]
+deja = { path = "../deja", default-features = false }
+deja-compactor = { path = "../deja-compactor" }
+deja-kernel = { path = "../deja-kernel" }
+deja-orchestrator = { path = "../deja-orchestrator" }
+deja-replay-core = { path = "../deja-replay-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"
+
+[[bin]]
+name = "deja-replay-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true

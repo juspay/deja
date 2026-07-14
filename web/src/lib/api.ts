@@ -195,6 +195,14 @@ export function setActor(name: string) {
   localStorage.setItem("deja-actor", name);
 }
 
+export function serviceToken(): string {
+  return localStorage.getItem("deja-service-token") || "";
+}
+
+export function setServiceToken(token: string) {
+  localStorage.setItem("deja-service-token", token);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
@@ -208,6 +216,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(detail);
   }
   return (await resp.json()) as T;
+}
+
+function mutationHeaders(): Record<string, string> {
+  const who = actor();
+  if (!who) throw new Error("set your actor name first (top right)");
+  const token = serviceToken();
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "X-Deja-Actor": who,
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
 }
 
 export const api = {
@@ -227,15 +247,22 @@ export const api = {
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
   createRun: (spec: Record<string, unknown>) => {
-    const who = actor();
-    if (!who) throw new Error("set your actor name first (top right)");
     return request<{ run_id: string; status: string }>("/api/v1/runs", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "X-Deja-Actor": who,
-      },
+      headers: mutationHeaders(),
       body: JSON.stringify(spec),
     });
   },
+  killRun: (id: string) =>
+    request<{
+      ok: boolean;
+      run_id: string;
+      namespace: string;
+      terminated: boolean;
+      message: string;
+      details: string[];
+    }>(`/api/v1/runs/${id}/kill`, {
+      method: "POST",
+      headers: mutationHeaders(),
+    }),
 };

@@ -9,7 +9,7 @@ PROJECT="deja-demo"
 # Reuse Hyperswitch's OWN compose + the thin deja overlay.
 VENDOR="${VENDOR:-vendor/hyperswitch-deja-clean}"
 BASE="${VENDOR}/docker-compose.yml"
-OVERLAY="${VENDOR}/docker-compose.deja.yml"
+OVERLAY="$(pwd)/demo/overlays/hyperswitch/docker-compose.deja.yml"
 # Compose build args read process environment, not shell locals; export the
 # selected vendor path so direct driver `docker compose ... --build` calls and
 # deja-orchestrator worker compose calls bake the same router binary.
@@ -103,7 +103,7 @@ start_api() {
   DEMO_KERNEL_BIN="$(pwd)/target/release/deja-kernel" \
   DEMO_KAFKA_TOPIC="hyperswitch-deja-recording-events" \
   DEJA_VENDOR_PATH="$VENDOR" \
-  DEJA_CODE_REF="$(git -C "$VENDOR" rev-parse HEAD 2>/dev/null || echo unknown)" \
+  VERGEN_GIT_SHA="$(git -C "$VENDOR" rev-parse HEAD 2>/dev/null || echo unknown)" \
   STRIPE_API_KEY="$STRIPE_API_KEY" \
     ./target/release/deja-orchestrator &
   API_PID=$!

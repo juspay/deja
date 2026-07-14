@@ -1,0 +1,77 @@
+services:
+  replay-agent-image:
+    image: ${DEJA_AGENT_IMAGE:-deja-replay-agent:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile.replay-agent
+    # Build/tag the image as part of the dashboard stack. The agent itself runs
+    # later as a Kubernetes Job inside each replay namespace.
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  pg:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: deja
+      POSTGRES_PASSWORD: deja
+      POSTGRES_DB: deja
+    volumes:
+      - deja-dashboard-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deja -d deja"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: Dockerfile.orchestrator
+    restart: always
+    depends_on:
+      pg:
+        condition: service_healthy
+    ports:
+      - "${DEJA_DASHBOARD_PORT:-8070}:8070"
+    environment:
+      HARNESS_BIND: 0.0.0.0:8070
+      HARNESS_STATE_DIR: /var/lib/deja
+      DEJA_DB_URL: postgres://deja:deja@pg:5432/deja
+      DEJA_SANDBOX: helm
+      DEJA_API_SERVICE_TOKEN: ${DEJA_API_SERVICE_TOKEN:-deja-local-token}
+      KUBECONFIG: /kube/config
+      DEJA_S3_REGION: ${DEJA_S3_REGION:-us-east-1}
+      DEJA_S3_BUCKET: ${DEJA_S3_BUCKET:-deja-recordings}
+      DEJA_S3_PREFIX: ${DEJA_S3_PREFIX:-}
+      DEJA_S3_ENDPOINT: ${DEJA_S3_ENDPOINT:-}
+      DEJA_S3_ACCESS_KEY: ${DEJA_S3_ACCESS_KEY:-}
+      DEJA_S3_SECRET_KEY: ${DEJA_S3_SECRET_KEY:-}
+      DEJA_S3_SESSION_TOKEN: ${DEJA_S3_SESSION_TOKEN:-}
+      # Sandbox driver: where pods reach this dashboard, and the ECR repo CI
+      # pushes candidate router images to (tag = git ref, / mapped to -).
+      DEJA_CALLBACK_BASE_URL: ${DEJA_CALLBACK_BASE_URL:-http://host.docker.internal:8070}
+      DEJA_CANDIDATE_IMAGE_REPO: ${DEJA_CANDIDATE_IMAGE_REPO:-}
+      DEJA_CANDIDATE_IMAGE_TAG_TEMPLATE: ${DEJA_CANDIDATE_IMAGE_TAG_TEMPLATE:-{ref}}
+      DEJA_ECR_REGISTRY: ${DEJA_ECR_REGISTRY:-}
+      DEJA_AGENT_IMAGE: ${DEJA_AGENT_IMAGE:-}
+      DEJA_SANDBOX_EXTRA_VALUES: ${DEJA_SANDBOX_EXTRA_VALUES:-}
+      # AWS credentials for minting ECR pull tokens per run (needed on
+      # clusters whose nodes lack IAM pull rights; leave empty on EKS).
+      DEJA_ECR_ACCESS_KEY_ID: ${DEJA_ECR_ACCESS_KEY_ID:-}
+      DEJA_ECR_SECRET_ACCESS_KEY: ${DEJA_ECR_SECRET_ACCESS_KEY:-}
+      DEJA_ECR_SESSION_TOKEN: ${DEJA_ECR_SESSION_TOKEN:-}
+      DEJA_ECR_REGION: ${DEJA_ECR_REGION:-}
+      DEJA_KMS_ENABLED: ${DEJA_KMS_ENABLED:-false}
+      DEJA_SANDBOX_RUN_DEADLINE_SECS: ${DEJA_SANDBOX_RUN_DEADLINE_SECS:-1800}
+      DEJA_SANDBOX_KEEP: ${DEJA_SANDBOX_KEEP:-}
+    volumes:
+      - deja-dashboard-state:/var/lib/deja
+      # Container-reachable kubeconfig: a host kubeconfig usually points at
+      # 127.0.0.1, which inside the container is the container itself. Point
+      # DEJA_KUBECONFIG at a copy whose server is host.docker.internal.
+      - ${DEJA_KUBECONFIG:-${HOME}/.kube/config}:/kube/config:ro
+
+volumes:
+  deja-dashboard-pg:
+  deja-dashboard-state:

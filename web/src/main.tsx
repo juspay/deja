@@ -14,7 +14,7 @@ import "@fontsource/inter/latin-500.css";
 import "@fontsource/inter/latin-600.css";
 import "json-diff-kit/dist/viewer.css";
 import "./styles.css";
-import { actor, setActor } from "./lib/api";
+import { actor, serviceToken, setActor, setServiceToken } from "./lib/api";
 import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
 import RunsPage from "./pages/RunsPage";
@@ -42,6 +42,23 @@ function ActorBox() {
   );
 }
 
+function TokenBox() {
+  const [token, setToken] = React.useState(serviceToken());
+  return (
+    <input
+      className="actor token"
+      type="password"
+      placeholder="service token"
+      value={token}
+      onChange={(e) => {
+        setToken(e.target.value);
+        setServiceToken(e.target.value);
+      }}
+      title="Bearer token for scheduling runs when DEJA_API_SERVICE_TOKEN is set"
+    />
+  );
+}
+
 function Shell() {
   const loc = useLocation();
   const tab = (path: string, label: string) => (
@@ -60,6 +77,7 @@ function Shell() {
           {tab("/audit", "Audit")}
         </nav>
         <ActorBox />
+        <TokenBox />
       </header>
       <main>
         <Outlet />

@@ -744,6 +744,16 @@ fn observed_end_timestamp_ns(obs: &ObservedCall) -> u64 {
     obs.end_timestamp_ns.unwrap_or(obs.timestamp_ns)
 }
 
+/// Whether an observed call ran inside a spawned fork region — a non-root
+/// lineage bucket minted by the correlation layer for a `deja.fork` span. Such
+/// buckets are `{parent}::fork-{seq}`, so their id carries the `::fork-` marker.
+/// Fork regions are unordered relative to the request's synchronous path.
+fn is_fork_region(obs: &ObservedCall) -> bool {
+    obs.bucket_id
+        .as_deref()
+        .is_some_and(|bucket| bucket.contains("::fork-"))
+}
+
 fn undeclared_concurrency_warnings(observed: &[ObservedCall]) -> Vec<UndeclaredConcurrencyWarning> {
     let mut finalization_by_correlation: HashMap<String, u64> = HashMap::new();
     for obs in observed {
@@ -763,7 +773,10 @@ fn undeclared_concurrency_warnings(observed: &[ObservedCall]) -> Vec<UndeclaredC
     observed
         .iter()
         .filter_map(|obs| {
-            if obs.detached || obs.boundary == "http_incoming" || obs.timestamp_ns == 0 {
+            // Fork work (a non-root lineage bucket) is an unordered region —
+            // expected to run past the HTTP response finalization — so it is
+            // excluded here, exactly the role the removed `detached` flag played.
+            if is_fork_region(obs) || obs.boundary == "http_incoming" || obs.timestamp_ns == 0 {
                 return None;
             }
             let correlation_id = obs.correlation_id.as_ref()?;
@@ -1982,12 +1995,10 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 
     let mut warnings = Vec::new();
     let table = load_table(&root.lookup_table_path(run_id), &mut warnings);
-    let observed = load_jsonl::<ObservedCall>(&root.observed_path(run_id), &mut warnings);
+    let observed = load_observed_calls(&root.observed_path(run_id), &mut warnings);
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
     let events = match &recording_id {
-        Some(rec) => {
-            load_jsonl::<deja::BoundaryEvent>(&root.recording_events_path(rec), &mut warnings)
-        }
+        Some(rec) => load_boundary_events(&root.recording_events_path(rec), &mut warnings),
         None => Vec::new(),
     };
 
@@ -2035,11 +2046,9 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 /// Build the per-call ledger for a run: join the recording's events (recorded
 /// side) to the candidate's observed calls, classified like `detect()`.
 pub fn build_ledger(root: &HarnessRoot, art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
+    let mut warnings = Vec::new();
     let events = match &art.recording_id {
-        Some(rec) => {
-            let mut warnings = Vec::new();
-            load_jsonl::<deja::BoundaryEvent>(&root.recording_events_path(rec), &mut warnings)
-        }
+        Some(rec) => load_boundary_events(&root.recording_events_path(rec), &mut warnings),
         None => Vec::new(),
     };
     let expected = ledger::expected_sequences(&art.table);
@@ -2106,6 +2115,9 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
         entries: Vec::new(),
     };
     if !path.exists() {
+        // Never silent: a missing lookup table means the run never rendered
+        // one — scoring against an empty table produces a misleading card.
+        warnings.push(format!("lookup table missing: {}", path.display()));
         return empty();
     }
     let mut source = LocalFileLookupSource::new(path);
@@ -2127,7 +2139,12 @@ fn load_jsonl<T: for<'de> Deserialize<'de>>(
 ) -> Vec<T> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Never silent: a wrong OBSERVED_SINK path used to score as zero
+            // observed calls with no trace (false full-red verdict).
+            warnings.push(format!("artifact missing: {}", path.display()));
+            return Vec::new();
+        }
         Err(e) => {
             warnings.push(format!("read {} failed: {e}", path.display()));
             return Vec::new();
@@ -2144,6 +2161,54 @@ fn load_jsonl<T: for<'de> Deserialize<'de>>(
         }
     }
     out
+}
+
+/// Load the shared graph-as-events wire stream from JSONL. The stream is
+/// internally tagged as [`deja::DejaRecord`], so callers match variants instead
+/// of routing by raw `record_kind` strings.
+fn load_deja_records(path: &std::path::Path, warnings: &mut Vec<String>) -> Vec<deja::DejaRecord> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warnings.push(format!("read {} failed: {e}", path.display()));
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<deja::DejaRecord>(line) {
+            Ok(record) => out.push(record),
+            Err(e) => warnings.push(format!("{}:{}: parse error: {e}", path.display(), i + 1)),
+        }
+    }
+    out
+}
+
+fn load_boundary_events(
+    path: &std::path::Path,
+    warnings: &mut Vec<String>,
+) -> Vec<deja::BoundaryEvent> {
+    load_deja_records(path, warnings)
+        .into_iter()
+        .filter_map(|record| match record {
+            deja::DejaRecord::BoundaryEvent(event) => Some(*event),
+            deja::DejaRecord::GraphNode(_) | deja::DejaRecord::Observed(_) => None,
+        })
+        .collect()
+}
+
+fn load_observed_calls(path: &std::path::Path, warnings: &mut Vec<String>) -> Vec<ObservedCall> {
+    load_deja_records(path, warnings)
+        .into_iter()
+        .filter_map(|record| match record {
+            deja::DejaRecord::Observed(call) => Some(*call),
+            deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::GraphNode(_) => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2282,7 +2347,6 @@ mod tests {
             source_event_global_sequence: src,
             timestamp_ns: 0,
             end_timestamp_ns: None,
-            detached: false,
             task_id: Some("root".to_owned()),
             parent_task_id: None,
             task_bucket: Some("root".to_owned()),
@@ -2299,8 +2363,6 @@ mod tests {
             observed_result: None,
             provenance: deja::Provenance::default(),
             seed_gap: false,
-            pre_image: None,
-            result_image: None,
         }
     }
 
@@ -2366,6 +2428,17 @@ mod tests {
             use std::io::Write;
             file.write_all(b"\n").unwrap();
         }
+    }
+
+    /// Write a recording tape fixture in the tagged one-stream wire shape
+    /// (each boundary event flat beside its `record_kind` tag).
+    fn write_recording_tape(path: &std::path::Path, events: &[deja::BoundaryEvent]) {
+        let rows: Vec<deja::DejaRecord> = events
+            .iter()
+            .cloned()
+            .map(|event| deja::DejaRecord::BoundaryEvent(Box::new(event)))
+            .collect();
+        write_jsonl_rows(path, &rows);
     }
 
     /// An execute-shadow observed call: the candidate ran the REAL boundary
@@ -2659,7 +2732,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = HarnessRoot::new(dir.path()).unwrap();
-        write_jsonl_rows(&root.recording_events_path("rec-1"), &events);
+        write_recording_tape(&root.recording_events_path("rec-1"), &events);
         let rows = build_ledger(
             &root,
             &RunArtifacts {
@@ -2879,12 +2952,10 @@ mod tests {
         method: &str,
         src: Option<u64>,
         timestamp_ns: u64,
-        detached: bool,
     ) -> ObservedCall {
         let mut o = obs(boundary, corr, src.is_some(), src.map(|_| 3), src);
         o.method_name = method.to_owned();
         o.timestamp_ns = timestamp_ns;
-        o.detached = detached;
         o
     }
 
@@ -2894,7 +2965,7 @@ mod tests {
             vec![seq_entry(Some("c1"), "redis", 2)],
             vec![
                 observed_finalizer("c1", 11_000),
-                observed_at("redis", Some("c1"), "set_key", Some(2), 11_001, false),
+                observed_at("redis", Some("c1"), "set_key", Some(2), 11_001),
             ],
             vec![http("c1", true, vec![])],
         ));
@@ -2918,13 +2989,15 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_concurrency_ignores_detached_post_finalization_work() {
+    fn undeclared_concurrency_ignores_fork_region_post_finalization_work() {
+        // Work in a spawned fork region (a non-root `::fork-` bucket) is an
+        // unordered region — expected to run past finalization — so it must not
+        // be flagged as undeclared concurrency.
+        let mut forked = observed_at("redis", Some("c1"), "set_key", Some(2), 11_001);
+        forked.bucket_id = Some("root::fork-1".to_owned());
         let card = detect(&art(
             vec![seq_entry(Some("c1"), "redis", 2)],
-            vec![
-                observed_finalizer("c1", 11_000),
-                observed_at("redis", Some("c1"), "set_key", Some(2), 11_001, true),
-            ],
+            vec![observed_finalizer("c1", 11_000), forked],
             vec![http("c1", true, vec![])],
         ));
 
@@ -4280,7 +4353,7 @@ mod tests {
             "root",
             0,
         );
-        write_jsonl_rows(
+        write_recording_tape(
             &root.recording_events_path(recording_id),
             &[read_event, conflicting_write],
         );

@@ -41,11 +41,19 @@ const ZSTD_LEVEL: i32 = 3;
 /// Connection settings; defaults match the demo overlay's MinIO
 /// (host-published on 9100, minioadmin credentials, bucket created by
 /// minio-setup).
+#[derive(Debug, Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
+    /// AWS STS session token for temporary credentials.
+    pub session_token: String,
+    /// AWS region; ignored by MinIO but required by real S3.
+    pub region: String,
+    /// Whether plaintext HTTP endpoints are allowed. Used for MinIO/localstack;
+    /// real AWS S3 normally leaves `endpoint` empty and does not use this.
+    pub allow_http: bool,
 }
 
 impl S3Config {
@@ -56,19 +64,39 @@ impl S3Config {
             bucket: env("DEJA_S3_BUCKET", "deja-recordings"),
             access_key: env("DEJA_S3_ACCESS_KEY", "minioadmin"),
             secret_key: env("DEJA_S3_SECRET_KEY", "minioadmin"),
+            session_token: env("DEJA_S3_SESSION_TOKEN", ""),
+            region: env("DEJA_S3_REGION", "us-east-1"),
+            // Default true for the demo MinIO (plaintext); a real S3 endpoint
+            // sets DEJA_S3_ALLOW_HTTP=false to require TLS.
+            allow_http: env("DEJA_S3_ALLOW_HTTP", "true") != "false",
         }
     }
 
+    fn has_static_credentials(&self) -> bool {
+        !self.access_key.trim().is_empty() && !self.secret_key.trim().is_empty()
+    }
+
     pub fn build(&self) -> Result<DynStore, String> {
-        let store = AmazonS3Builder::new()
-            .with_endpoint(&self.endpoint)
+        let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&self.bucket)
-            .with_access_key_id(&self.access_key)
-            .with_secret_access_key(&self.secret_key)
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .build()
-            .map_err(|e| format!("s3 client: {e}"))?;
+            .with_region(&self.region);
+
+        if !self.endpoint.is_empty() {
+            builder = builder
+                .with_endpoint(&self.endpoint)
+                .with_allow_http(self.allow_http);
+        }
+
+        if self.has_static_credentials() {
+            builder = builder
+                .with_access_key_id(&self.access_key)
+                .with_secret_access_key(&self.secret_key);
+            if !self.session_token.trim().is_empty() {
+                builder = builder.with_token(&self.session_token);
+            }
+        }
+
+        let store = builder.build().map_err(|e| format!("s3 client: {e}"))?;
         Ok(Arc::new(store))
     }
 }
@@ -236,6 +264,40 @@ async fn put(store: &DynStore, key: &str, bytes: Vec<u8>) -> Result<(), String> 
         .await
         .map(|_| ())
         .map_err(|e| format!("s3 put {key}: {e}"))
+}
+
+/// Put one uncompressed object into the configured bucket.
+pub fn put_object(cfg: &S3Config, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let store = cfg.build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(put(&store, key, bytes))
+}
+
+/// Get one object from the configured bucket. `.zst` objects are decoded to
+/// match the read helpers used by session ingestion.
+pub fn get_object(cfg: &S3Config, key: &str) -> Result<Vec<u8>, String> {
+    let store = cfg.build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(get_decoded(&store, &object_store::path::Path::from(key)))
+}
+
+/// List object keys under a prefix in lexical order.
+pub fn list_objects(cfg: &S3Config, prefix: &str) -> Result<Vec<String>, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(async {
+        Ok(list_keys(&store, prefix)
+            .await?
+            .into_iter()
+            .map(|key| key.to_string())
+            .collect())
+    })
 }
 
 fn zstd_encode(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -563,6 +625,27 @@ mod tests {
     }
 
     #[test]
+    fn s3_config_requires_both_static_credentials() {
+        let mut cfg = S3Config {
+            endpoint: "http://127.0.0.1:9100".to_owned(),
+            bucket: "deja-recordings".to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            session_token: String::new(),
+            region: "us-east-1".to_owned(),
+            allow_http: true,
+        };
+
+        assert!(!cfg.has_static_credentials());
+        cfg.access_key = "access".to_owned();
+        assert!(!cfg.has_static_credentials());
+        cfg.secret_key = "secret".to_owned();
+        assert!(cfg.has_static_credentials());
+        cfg.access_key = " ".to_owned();
+        assert!(!cfg.has_static_credentials());
+    }
+
+    #[test]
     fn collate_builds_coverage_and_correlations() {
         let chunk = [
             envelope("i1", 1, Some("c1"), "http_incoming"),
@@ -615,5 +698,35 @@ mod tests {
         assert_eq!(c.events.len(), 2);
         assert_eq!(c.instances.len(), 2);
         assert_eq!(c.events[0].instance_id, "i1"); // sorted by (instance, gseq)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod s3_config_tests {
+    use super::*;
+
+    #[test]
+    fn from_env_defaults_region() {
+        // DEJA_S3_REGION is never set by other tests; default must apply.
+        let cfg = S3Config::from_env();
+        assert_eq!(cfg.region, "us-east-1");
+    }
+
+    #[test]
+    fn endpointless_config_builds_store() {
+        let cfg = S3Config {
+            endpoint: String::new(),
+            bucket: "b".into(),
+            access_key: "a".into(),
+            secret_key: "s".into(),
+            session_token: "token".into(),
+            region: "eu-west-1".into(),
+            allow_http: false,
+        };
+        assert!(
+            cfg.build().is_ok(),
+            "empty endpoint must mean real AWS, not an error"
+        );
     }
 }

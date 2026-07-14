@@ -31,9 +31,10 @@ pub use deja_context::{
 /// Re-export lookup-table replay primitives (hybrid architecture: in-process
 /// lookup with per-site ReplayStrategy selecting Execute vs Substitute).
 pub use deja_runtime::replay::{
-    addresses_for, canonical_args_hash, Address, FileObservedSink, InMemoryObservedSink,
-    KeyStamper, LocalFileLookupSource, LookupEntry, LookupKey, LookupTable, LookupTableHook,
-    LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
+    addresses_for, canonical_args_hash, Address, FileObservedSink, ImcLookupStore,
+    InMemoryObservedSink, KeyStamper, LocalFileLookupSource, LookupEntry, LookupKey, LookupTable,
+    LookupTableHook, LookupTableSource, ObservedCall, ObservedCallSink, StateKey,
+    StateKeyParseError,
 };
 pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_execute_mode};
 /// Re-export the generic seed-plan pipeline (pure builder, diverged-read
@@ -50,23 +51,28 @@ pub use deja_runtime::DejaCorrelationLayer;
 pub use deja_runtime::DejaHook;
 /// Re-export the execution graph tracing layer for framework logger setup.
 pub use deja_runtime::ExecutionGraphLayer;
+pub use deja_runtime::{
+    clear_imc_lookup, drain_imc_observed, imc_lookup_health, install_imc_lookup_entries,
+    install_imc_lookup_entries_json, install_imc_lookup_table, DEJA_LOOKUP_MODE_ENV_VAR,
+    DEJA_LOOKUP_TABLE_ENV_VAR, DEJA_OBSERVED_SINK_ENV_VAR, ROUTER_DEJA_MODE_ENV_VAR,
+    ROUTER_DEJA_REPLAY_SOURCE_ENV_VAR, ROUTER_DEJA_RUN_ID_ENV_VAR,
+};
 /// Re-export semantic recording primitives so downstream crates only need
 /// one `deja` dependency.
 pub use deja_runtime::{
-    current_task_is_detached, flush_global_hook, global_hook_from_env, hook_from_env,
-    spawn_detached, AsyncRecordWriter, BoundaryEvent, CompositeSink, DisabledHook, EventBuilder,
-    Fidelity, JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink, RecordedOutput,
+    flush_global_hook, fork_span, global_hook_from_env, graph_recording_enabled, hook_from_env,
+    installed_runtime_hook, set_graph_recording_enabled, spawn_fork, AsyncRecordWriter,
+    BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder, Fidelity, GraphNodeSink,
+    JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink, RecordedOutput,
     RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot, CURRENT_EVENT_SCHEMA_VERSION,
-    DEJA_BATCH_SIZE_ENV_VAR, DEJA_GRAPH_DIR_ENV_VAR, DEJA_QUEUE_CAPACITY_ENV_VAR,
-    DEJA_SINK_POLICY_ENV_VAR,
 };
 /// Re-export callsite identity and runtime hook primitives for the
 /// `DEJA_MODE=record|replay` foundation.
 pub use deja_runtime::{
     flush_global_runtime_hook, global_runtime_hook_from_env, replay_is_active,
     runtime_hook_from_env, runtime_mode, set_global_runtime_hook, stable_callsite_hash,
-    CallsiteIdentity, CallsiteSource, ExecuteMode, ExecuteShadowToken, ReplayLookup, RuntimeHook,
-    RuntimeMode,
+    CallsiteIdentity, CallsiteSource, ExecuteMode, ExecuteShadowToken, ImcLookupAdminError,
+    ImcLookupInstallRequest, ImcLookupStatus, ReplayLookup, RuntimeHook, RuntimeMode,
 };
 /// Re-export replay primitives so `deja::*` consumers get the full replay API.
 pub use deja_runtime::{
@@ -873,9 +879,6 @@ pub mod db {
 /// Not part of the public API — the `deja::*` attribute macros call these.
 pub mod __private {
     pub use deja_context::current_correlation_id;
-    /// Scope a closure to a correlation id (used by integration middleware to
-    /// bind the request id around handler execution).
-    pub use deja_context::scope as scope_correlation;
     // The single boundary-crossing seam the `#[deja::boundary]` family emits.
     // `dispatch` owns ALL replay/record/execute control flow internally, so the
     // macro names no replay-only operation. The older `replay_boundary` /

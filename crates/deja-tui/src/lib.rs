@@ -4,13 +4,12 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use deja_core::ExecutionGraphRecord;
-use deja_runtime::BoundaryEvent;
+use deja_core::ExecutionGraphNode;
+use deja_runtime::{BoundaryEvent, DejaRecord};
 use serde::Deserialize;
 use serde_json::Value;
 
 pub const SEMANTIC_FILE_NAME: &str = "semantic-events.jsonl";
-pub const GRAPH_FILE_NAME: &str = "execution-graph.jsonl";
 pub const OBSERVED_DIR_NAME: &str = "observed";
 pub const RUNS_DIR_NAME: &str = "runs";
 pub const HTTP_DIFFS_DIR_NAME: &str = "http-diffs";
@@ -18,8 +17,9 @@ pub const HTTP_DIFFS_DIR_NAME: &str = "http-diffs";
 #[derive(Debug, Clone)]
 pub struct ArtifactPaths {
     pub root: PathBuf,
+    /// The recording tape — a tagged one-stream JSONL where boundary events
+    /// and execution-graph nodes interleave (`record_kind` routes each line).
     pub semantic: Option<PathBuf>,
-    pub graph: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +33,7 @@ pub struct JsonlStats {
 pub struct LoadedArtifacts {
     pub paths: ArtifactPaths,
     pub semantic_events: Vec<BoundaryEvent>,
-    pub graph_records: Vec<ExecutionGraphRecord>,
+    pub graph_records: Vec<ExecutionGraphNode>,
     pub semantic_stats: Option<JsonlStats>,
     pub graph_stats: Option<JsonlStats>,
     pub replay: Option<ReplayArtifacts>,
@@ -238,9 +238,6 @@ pub fn discover_artifacts(input: impl AsRef<Path>) -> ArtifactPaths {
             semantic: (file_name == Some(SEMANTIC_FILE_NAME))
                 .then(|| input.to_path_buf())
                 .or_else(|| find_semantic_artifact(&root)),
-            graph: (file_name == Some(GRAPH_FILE_NAME))
-                .then(|| input.to_path_buf())
-                .or_else(|| find_graph_artifact(&root)),
             root,
         };
     }
@@ -251,14 +248,13 @@ pub fn discover_artifacts(input: impl AsRef<Path>) -> ArtifactPaths {
     ArtifactPaths {
         semantic: find_semantic_artifact(&input_root)
             .or_else(|| find_semantic_artifact(&artifact_root)),
-        graph: find_graph_artifact(&input_root).or_else(|| find_graph_artifact(&artifact_root)),
         root: artifact_root,
     }
 }
 
 fn artifact_root_for(path: &Path) -> PathBuf {
     match path.file_name().and_then(|name| name.to_str()) {
-        Some("semantic" | "recording" | "graph") => path
+        Some("semantic" | "recording") => path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| path.to_path_buf()),
@@ -290,11 +286,6 @@ fn newest_pulled_recording(root: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
-}
-
-fn find_graph_artifact(root: &Path) -> Option<PathBuf> {
-    existing_file(&root.join(GRAPH_FILE_NAME))
-        .or_else(|| existing_file(&root.join("graph").join(GRAPH_FILE_NAME)))
 }
 
 /// When `base` itself holds no artifacts but contains run directories that do
@@ -332,21 +323,18 @@ pub fn load_artifacts(input: impl AsRef<Path>) -> Result<LoadedArtifacts> {
     let input = input.as_ref();
     let input = discover_latest_run(input).unwrap_or_else(|| input.to_path_buf());
     let paths = discover_artifacts(input);
-    let (semantic_events, semantic_stats) = match &paths.semantic {
+    let (semantic_events, graph_records, semantic_stats, graph_stats) = match &paths.semantic {
         Some(path) => {
-            let loaded = read_jsonl(path, parse_semantic_event)
-                .with_context(|| format!("reading semantic events from {}", path.display()))?;
-            (loaded.records, Some(loaded.stats))
+            let loaded = read_tape(path)
+                .with_context(|| format!("reading recording tape from {}", path.display()))?;
+            (
+                loaded.events,
+                loaded.graph_records,
+                Some(loaded.semantic_stats),
+                Some(loaded.graph_stats),
+            )
         }
-        None => (Vec::new(), None),
-    };
-    let (graph_records, graph_stats) = match &paths.graph {
-        Some(path) => {
-            let loaded = read_jsonl(path, parse_graph_record)
-                .with_context(|| format!("reading execution graph from {}", path.display()))?;
-            (loaded.records, Some(loaded.stats))
-        }
-        None => (Vec::new(), None),
+        None => (Vec::new(), Vec::new(), None, None),
     };
 
     let replay = load_replay(&paths.root);
@@ -673,10 +661,9 @@ pub fn summarize(artifacts: &LoadedArtifacts) -> Summary {
     }
 
     let graph_counts = graph_request_counts(&artifacts.graph_records);
-    for record in &artifacts.graph_records {
-        let node = &record.node;
+    for node in &artifacts.graph_records {
         *span_counts.entry(node.span_name.clone()).or_insert(0) += 1;
-        if graph_record_has_error(record) {
+        if graph_record_has_error(node) {
             graph_errors += 1;
         }
     }
@@ -727,17 +714,17 @@ pub fn semantic_event_text(event: &BoundaryEvent) -> String {
     )
 }
 
-pub fn graph_record_text(record: &ExecutionGraphRecord) -> String {
-    let node = &record.node;
+pub fn graph_record_text(record: &ExecutionGraphNode) -> String {
     format!(
         "{} {} {} {} {} {}",
-        node.sequence,
-        node.span_name,
-        node.target,
-        node.level,
-        node.node_id,
+        record.sequence,
+        record.span_name,
+        record.target,
+        record.level,
+        record.node_id,
         Value::Object(
-            node.fields
+            record
+                .fields
                 .clone()
                 .into_iter()
                 .collect::<serde_json::Map<String, Value>>()
@@ -749,25 +736,19 @@ pub fn semantic_event_request_id(event: &BoundaryEvent) -> Option<&str> {
     event.correlation_id.as_deref()
 }
 
-pub fn graph_request_id(record: &ExecutionGraphRecord) -> Option<&str> {
+pub fn graph_request_id(record: &ExecutionGraphNode) -> Option<&str> {
     record
-        .node
-        .fields
-        .get("request_id")
-        .or_else(|| record.node.fields.get("correlation_id"))
-        .and_then(Value::as_str)
+        .request_id()
+        .or_else(|| record.fields.get("correlation_id").and_then(Value::as_str))
 }
 
 pub fn graph_records_for_request<'a>(
-    records: &'a [ExecutionGraphRecord],
+    records: &'a [ExecutionGraphNode],
     request_id: &str,
-) -> Vec<&'a ExecutionGraphRecord> {
-    let mut children: HashMap<Option<u64>, Vec<&ExecutionGraphRecord>> = HashMap::new();
+) -> Vec<&'a ExecutionGraphNode> {
+    let mut children: HashMap<Option<u64>, Vec<&ExecutionGraphNode>> = HashMap::new();
     for record in records {
-        children
-            .entry(record.node.parent_id)
-            .or_default()
-            .push(record);
+        children.entry(record.parent_id).or_default().push(record);
     }
 
     let mut selected = Vec::new();
@@ -778,11 +759,11 @@ pub fn graph_records_for_request<'a>(
     {
         collect_graph_subtree(record, &children, request_id, &mut visited, &mut selected);
     }
-    selected.sort_by_key(|record| record.node.sequence);
+    selected.sort_by_key(|record| record.sequence);
     selected
 }
 
-pub fn graph_request_counts(records: &[ExecutionGraphRecord]) -> BTreeMap<String, usize> {
+pub fn graph_request_counts(records: &[ExecutionGraphNode]) -> BTreeMap<String, usize> {
     let request_ids = records
         .iter()
         .filter_map(graph_request_id)
@@ -798,12 +779,12 @@ pub fn graph_request_counts(records: &[ExecutionGraphRecord]) -> BTreeMap<String
         .collect()
 }
 
-pub fn graph_record_has_error(record: &ExecutionGraphRecord) -> bool {
-    if record.node.level.eq_ignore_ascii_case("error") {
+pub fn graph_record_has_error(record: &ExecutionGraphNode) -> bool {
+    if record.level.eq_ignore_ascii_case("error") {
         return true;
     }
 
-    record.node.fields.iter().any(|(key, value)| {
+    record.fields.iter().any(|(key, value)| {
         key.to_ascii_lowercase().contains("error")
             || value
                 .as_str()
@@ -813,18 +794,18 @@ pub fn graph_record_has_error(record: &ExecutionGraphRecord) -> bool {
 }
 
 fn collect_graph_subtree<'a>(
-    record: &'a ExecutionGraphRecord,
-    children: &HashMap<Option<u64>, Vec<&'a ExecutionGraphRecord>>,
+    record: &'a ExecutionGraphNode,
+    children: &HashMap<Option<u64>, Vec<&'a ExecutionGraphNode>>,
     request_id: &str,
     visited: &mut BTreeSet<u64>,
-    selected: &mut Vec<&'a ExecutionGraphRecord>,
+    selected: &mut Vec<&'a ExecutionGraphNode>,
 ) {
-    if !visited.insert(record.node.node_id) {
+    if !visited.insert(record.node_id) {
         return;
     }
     selected.push(record);
 
-    if let Some(child_records) = children.get(&Some(record.node.node_id)) {
+    if let Some(child_records) = children.get(&Some(record.node_id)) {
         for child in child_records {
             if graph_request_id(child).is_none() || graph_request_id(child) == Some(request_id) {
                 collect_graph_subtree(child, children, request_id, visited, selected);
@@ -842,9 +823,59 @@ pub fn unique_boundaries(events: &[BoundaryEvent]) -> Vec<String> {
         .collect()
 }
 
+struct TapeLoad {
+    events: Vec<BoundaryEvent>,
+    graph_records: Vec<ExecutionGraphNode>,
+    semantic_stats: JsonlStats,
+    graph_stats: JsonlStats,
+}
+
+fn read_tape(path: &Path) -> Result<TapeLoad> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    let mut graph_records = Vec::new();
+    let mut lines = 0;
+    let mut skipped = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines += 1;
+
+        match serde_json::from_str::<DejaRecord>(&line) {
+            Ok(DejaRecord::BoundaryEvent(event)) => events.push(*event),
+            Ok(DejaRecord::GraphNode(node)) => graph_records.push(node),
+            Ok(DejaRecord::Observed(_)) | Err(_) => {
+                if let Some(event) = parse_semantic_event(&line) {
+                    events.push(event);
+                } else if let Some(node) = parse_graph_record(&line) {
+                    graph_records.push(node);
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
+    let stats = JsonlStats {
+        path: path.to_path_buf(),
+        lines,
+        skipped,
+    };
+
+    Ok(TapeLoad {
+        events,
+        graph_records,
+        semantic_stats: stats.clone(),
+        graph_stats: stats,
+    })
+}
+
 struct JsonlLoad<T> {
     records: Vec<T>,
-    stats: JsonlStats,
 }
 
 fn existing_file(path: &Path) -> Option<PathBuf> {
@@ -855,44 +886,45 @@ fn read_jsonl<T>(path: &Path, parse: impl Fn(&str) -> Option<T>) -> Result<Jsonl
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut records = Vec::new();
-    let mut lines = 0;
-    let mut skipped = 0;
 
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        lines += 1;
-        match parse(&line) {
-            Some(record) => records.push(record),
-            None => skipped += 1,
+        if let Some(record) = parse(&line) {
+            records.push(record);
         }
     }
 
-    Ok(JsonlLoad {
-        records,
-        stats: JsonlStats {
-            path: path.to_path_buf(),
-            lines,
-            skipped,
-        },
-    })
+    Ok(JsonlLoad { records })
 }
 
 fn parse_semantic_event(line: &str) -> Option<BoundaryEvent> {
-    serde_json::from_str(line).ok()
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    serde_json::from_value::<DejaRecord>(value.clone())
+        .ok()
+        .and_then(|record| match record {
+            DejaRecord::BoundaryEvent(event) => Some(*event),
+            _ => None,
+        })
+        .or_else(|| serde_json::from_value::<BoundaryEvent>(value).ok())
 }
 
-fn parse_graph_record(line: &str) -> Option<ExecutionGraphRecord> {
+fn parse_graph_record(line: &str) -> Option<ExecutionGraphNode> {
     let value = serde_json::from_str::<Value>(line).ok()?;
-    serde_json::from_value::<ExecutionGraphRecord>(value.clone())
+    serde_json::from_value::<DejaRecord>(value.clone())
         .ok()
+        .and_then(|record| match record {
+            DejaRecord::GraphNode(node) => Some(node),
+            _ => None,
+        })
+        .or_else(|| serde_json::from_value::<ExecutionGraphNode>(value.clone()).ok())
         .or_else(|| {
             value
                 .get("node")
                 .cloned()
-                .and_then(|node| serde_json::from_value::<ExecutionGraphRecord>(node).ok())
+                .and_then(|node| serde_json::from_value::<ExecutionGraphNode>(node).ok())
         })
 }
 
@@ -1369,29 +1401,24 @@ mod tests {
     fn loads_nested_artifacts_and_counts_skipped_lines() {
         let dir = temp_artifact_dir("nested");
         let semantic_dir = dir.join("semantic");
-        let graph_dir = dir.join("graph");
         fs::create_dir_all(&semantic_dir).expect("semantic dir");
-        fs::create_dir_all(&graph_dir).expect("graph dir");
 
+        // One tagged DejaRecord stream: a boundary event, two graph nodes, and
+        // one unparseable line (counted as skipped). Graph nodes ride the tape
+        // — there is no separate graph file.
         fs::write(
             semantic_dir.join(SEMANTIC_FILE_NAME),
             concat!(
-                r#"{"global_sequence":0,"request_sequence":0,"correlation_id":"req-1","timestamp_ns":1,"boundary":"storage","trait_name":"Store","method_name":"find","call_file":"store.rs","call_line":7,"call_column":1,"request":{},"args":{},"response":{},"result":{},"is_error":false,"duration_us":10,"event_schema_version":7,"provenance":"recorded","recon":"lossless","replay_strategy":"substitute"}"#,
+                r#"{"record_kind":"boundary_event","global_sequence":0,"request_sequence":0,"correlation_id":"req-1","timestamp_ns":1,"boundary":"storage","trait_name":"Store","method_name":"find","call_file":"store.rs","call_line":7,"call_column":1,"request":{},"args":{},"response":{},"result":{},"is_error":false,"duration_us":10,"event_schema_version":7,"provenance":"recorded","recon":"lossless","replay_strategy":"substitute"}"#,
+                "\n",
+                r#"{"record_kind":"graph_node","node_id":1,"sequence":1,"span_name":"root","target":"router","level":"INFO","fields":{"request_id":"req-1"},"started_ns":1,"closed_ns":2}"#,
+                "\n",
+                r#"{"record_kind":"graph_node","node_id":2,"parent_id":1,"sequence":2,"span_name":"child","target":"router","level":"INFO","fields":{},"started_ns":2,"closed_ns":3}"#,
                 "\n",
                 "not json\n"
             ),
         )
         .expect("semantic file");
-        fs::write(
-            graph_dir.join(GRAPH_FILE_NAME),
-            concat!(
-                r#"{"node_id":1,"sequence":1,"span_name":"root","target":"router","level":"INFO","fields":{"request_id":"req-1"},"started_ns":1,"closed_ns":2}"#,
-                "\n",
-                r#"{"node_id":2,"parent_id":1,"sequence":2,"span_name":"child","target":"router","level":"INFO","fields":{},"started_ns":2,"closed_ns":3}"#,
-                "\n"
-            ),
-        )
-        .expect("graph file");
 
         let loaded = load_artifacts(&dir).expect("load artifacts");
         assert_eq!(loaded.semantic_events.len(), 1);

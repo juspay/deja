@@ -5,7 +5,7 @@
 //!
 //! Replay is fully wired: the orchestrator renders a `LookupTable` from a
 //! recording, and the candidate runs a `LookupTableHook` (installed via
-//! `RuntimeHook`/`DEJA_MODE=replay`) that substitutes recorded results
+//! `RuntimeHook`/`ROUTER__DEJA__MODE=replay`) that substitutes recorded results
 //! per-boundary and emits an `ObservedCall` per lookup for post-hoc
 //! divergence scoring.
 //!
@@ -28,15 +28,12 @@
 //! - `correlation_id`: from `deja_context::current_correlation_id()`
 //! - `timestamp_ns`: nanoseconds since UNIX epoch
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -47,27 +44,49 @@ pub mod graph;
 pub mod replay;
 pub mod writer;
 pub use correlation_layer::{current_span_path, DejaCorrelationLayer};
-pub use deja_core::DEJA_GRAPH_DIR_ENV_VAR;
 pub use graph::{
-    current_execution_graph_context, execution_graph_path, read_execution_graph_records,
-    ExecutionGraphLayer,
+    current_execution_graph_context, read_execution_graph_records, ExecutionGraphLayer,
+    GraphNodeSink,
 };
 pub use replay::{
     ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
 };
 pub use writer::{
     AsyncRecordWriter, CompositeSink, JsonlSink, MarkerKind, RecordSink, SinkPolicy, WriterConfig,
-    WriterStatsSnapshot, DEJA_BATCH_SIZE_ENV_VAR, DEJA_FLUSH_INTERVAL_MS_ENV_VAR,
-    DEJA_QUEUE_CAPACITY_ENV_VAR, DEJA_SINK_POLICY_ENV_VAR,
+    WriterStatsSnapshot,
 };
 
 /// Optional stable identifier for one process/run inside an appended artifact.
 pub const DEJA_RUN_ID_ENV_VAR: &str = "DEJA_RUN_ID";
+/// Router-prefixed stable identifier for one process/run.
+pub const ROUTER_DEJA_RUN_ID_ENV_VAR: &str = "ROUTER__DEJA__RUN_ID";
+/// Router-prefixed Deja runtime mode.
+pub const ROUTER_DEJA_MODE_ENV_VAR: &str = "ROUTER__DEJA__MODE";
+/// Replay lookup backend selector. `imc` enables the sandbox in-memory store.
+pub const DEJA_LOOKUP_MODE_ENV_VAR: &str = "DEJA_LOOKUP_MODE";
+/// Router-prefixed replay source selector. `imc` enables the sandbox in-memory
+/// store; any other non-empty value is a lookup-table file path.
+pub const ROUTER_DEJA_REPLAY_SOURCE_ENV_VAR: &str = "ROUTER__DEJA__REPLAY__SOURCE";
+/// Router-prefixed observed-call sink path used by file-source replay.
+pub const ROUTER_DEJA_REPLAY_OBSERVED_SINK_ENV_VAR: &str = "ROUTER__DEJA__REPLAY__OBSERVED_SINK";
+/// File-backed lookup table path used by local and docker-compose replay loops.
+pub const DEJA_LOOKUP_TABLE_ENV_VAR: &str = "DEJA_LOOKUP_TABLE";
+/// File-backed observed-call sink path used by non-IMC replay loops.
+pub const DEJA_OBSERVED_SINK_ENV_VAR: &str = "DEJA_OBSERVED_SINK";
 
 pub(crate) fn current_recording_run_id() -> Option<String> {
-    std::env::var(DEJA_RUN_ID_ENV_VAR)
+    std::env::var(ROUTER_DEJA_RUN_ID_ENV_VAR)
         .ok()
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var(DEJA_RUN_ID_ENV_VAR)
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -94,9 +113,6 @@ pub struct BoundaryEvent {
     /// Active `tracing` span id. Useful for diagnosing missing graph-node joins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracing_span_id: Option<u64>,
-    /// True when this event was emitted from immediately spawned detached work.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub detached: bool,
     /// Stable replay task id for lineage/canonicalization consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -218,8 +234,42 @@ pub struct BoundaryEvent {
     pub end_timestamp_ns: Option<u64>,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+/// One record on the recording stream. The tape carries every record kind
+/// through the ONE transport — the JSONL file or the application-owned sink
+/// (Kafka in the vendor integration): boundary events are the judgment
+/// stream; execution-graph nodes are the causal enrichment stream powering
+/// fork trees, span timelines, and record-vs-replay graph alignment.
+///
+/// Internally tagged so each JSONL line / message stays one flat object and
+/// consumers route on `record_kind` alone. Both kinds share the hook's
+/// global sequence counter, so drop accounting and ordering describe one
+/// totally-ordered stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "record_kind", rename_all = "snake_case")]
+pub enum DejaRecord {
+    /// A semantic boundary crossing. Boxed: it is by far the largest variant
+    /// (~1 KiB), so keeping it inline would bloat every queued `DejaRecord` in
+    /// the writer channel and every `GraphNode`/`Observed` line to match.
+    BoundaryEvent(Box<BoundaryEvent>),
+    /// An execution-graph span node (open/close lifecycle with parent and
+    /// `follows_from` edges).
+    GraphNode(deja_core::ExecutionGraphNode),
+    /// A replay-side observation (lookup resolution or shadow execution);
+    /// carried on the replay observed stream, never on record-mode tapes.
+    /// Boxed for the same reason as `BoundaryEvent` — it is the largest of the
+    /// remaining variants, so inlining it would size the enum to it.
+    Observed(Box<crate::replay::ObservedCall>),
+}
+
+impl DejaRecord {
+    /// Global stream sequence of the record, whichever kind it is.
+    pub fn global_sequence(&self) -> u64 {
+        match self {
+            Self::BoundaryEvent(event) => event.global_sequence,
+            Self::GraphNode(node) => node.global_sequence,
+            Self::Observed(call) => call.source_event_global_sequence.unwrap_or(0),
+        }
+    }
 }
 
 /// Wire-format schema version stamped on freshly recorded events. Bumped in
@@ -823,6 +873,15 @@ pub trait DejaHook: Send + Sync {
     fn recording_run_id(&self) -> Option<&str> {
         None
     }
+
+    /// Flush buffered hook output when the implementation owns an async sink.
+    ///
+    /// Default no-ops for disabled/replay cursor hooks; recording/lookup hooks
+    /// override this so late request-boundary finalizers can make their driver
+    /// rows durable before harness shutdown.
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -889,8 +948,12 @@ pub fn now_ns() -> u64 {
 
 /// Records semantic events to a JSONL file with atomic sequencing.
 pub struct RecordingHook {
-    writer: AsyncRecordWriter<BoundaryEvent>,
+    writer: AsyncRecordWriter<DejaRecord>,
     global_counter: AtomicU64,
+    /// Sequence space for tape-carried graph nodes — deliberately separate
+    /// from `global_counter` so boundary-event numbering is graph-invariant
+    /// (replay lookup addressing mirrors it).
+    graph_counter: AtomicU64,
     request_counters: Mutex<HashMap<String, u64>>,
     /// Counter for events with no correlation ID.
     uncorrelated_counter: AtomicU64,
@@ -914,58 +977,59 @@ pub(crate) type CallsiteOccurrenceMap = HashMap<
 
 impl RecordingHook {
     /// Resolve `recording_run_id` from the environment, falling back to a
-    /// time-based id when neither `DEJA_RECORDING_RUN_ID` nor
-    /// `DEJA_RUN_ID_ENV_VAR` is set.
+    /// time-based id when neither `ROUTER__DEJA__RUN_ID` nor the legacy run id
+    /// variables are set.
     fn resolve_recording_run_id() -> String {
-        std::env::var("DEJA_RECORDING_RUN_ID")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                std::env::var(DEJA_RUN_ID_ENV_VAR)
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            })
+        env_value(ROUTER_DEJA_RUN_ID_ENV_VAR)
+            .or_else(|| env_value("DEJA_RECORDING_RUN_ID"))
+            .or_else(|| env_value(DEJA_RUN_ID_ENV_VAR))
             .unwrap_or_else(|| format!("run-{}", now_ns()))
     }
 
     /// Create a new recording hook writing to the given directory.
     ///
-    /// Creates `semantic-events.jsonl` in the specified directory. This is
-    /// the JSONL-only convenience constructor; applications that want to
-    /// fan out to additional transports (e.g. Kafka) should construct a
-    /// `CompositeSink` and use [`RecordingHook::with_sink`] instead.
+    /// Creates `semantic-events.jsonl` in the specified directory with default
+    /// writer settings. This is the JSONL-only convenience constructor;
+    /// applications with their own transport use [`RecordingHook::with_sink`].
     pub fn new(artifact_dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(artifact_dir)?;
         let path = artifact_dir.join("semantic-events.jsonl");
         let sink = JsonlSink::new(&path)?;
-        Ok(Self::with_sink(sink, Self::resolve_recording_run_id()))
+        Ok(Self::with_sink(
+            sink,
+            Self::resolve_recording_run_id(),
+            WriterConfig::default(),
+        ))
     }
 
-    /// Create a recording hook backed by a caller-supplied sink.
+    /// Create a recording hook backed by a caller-supplied sink and writer
+    /// config.
     ///
-    /// This is the dependency-inversion entry point: the application owns
+    /// This is the dependency-inversion entry point: the application owns both
     /// transport choice (JSONL alone, Kafka, S3, a fan-out via
-    /// [`crate::writer::CompositeSink`], etc.) and hands the resulting sink
-    /// to `deja-record`. The library no longer needs to know about Kafka,
-    /// S3, or any other transport.
+    /// [`crate::writer::CompositeSink`], etc.) and the async writer settings
+    /// (`queue_capacity`, `batch_size`, flush interval, flush timeout, and
+    /// sink policy). The sink receives [`DejaRecord`]s: boundary events and —
+    /// when the execution-graph layer is installed — graph nodes, one
+    /// totally-ordered stream.
     ///
-    /// `recording_run_id` is the stable identifier attached to every event
+    /// `recording_run_id` is the stable identifier attached to every record
     /// emitted through this hook. Callers that want the standard env-var
     /// resolution can pass `RecordingHook::resolve_recording_run_id_default()`.
-    pub fn with_sink<S>(sink: S, recording_run_id: String) -> Self
+    pub fn with_sink<S>(sink: S, recording_run_id: String, writer_config: WriterConfig) -> Self
     where
-        S: RecordSink<BoundaryEvent>,
+        S: RecordSink<DejaRecord>,
     {
         Self {
             // The seq extractor lets the writer account drops and stamp the
-            // sink markers (checkpoint/eof/dropped) with real global
-            // sequences (`DEJA_SINK_POLICY` fail-open accounting).
+            // sink markers (checkpoint/eof/dropped) with real global sequences.
             writer: AsyncRecordWriter::with_seq_of(
                 sink,
-                WriterConfig::from_env(),
-                Some(std::sync::Arc::new(|e: &BoundaryEvent| e.global_sequence)),
+                writer_config,
+                Some(std::sync::Arc::new(DejaRecord::global_sequence)),
             ),
             global_counter: AtomicU64::new(0),
+            graph_counter: AtomicU64::new(0),
             request_counters: Mutex::new(HashMap::new()),
             uncorrelated_counter: AtomicU64::new(0),
             recording_run_id,
@@ -1001,6 +1065,18 @@ impl RecordingHook {
     }
 }
 
+impl crate::graph::GraphNodeSink for RecordingHook {
+    /// Graph nodes ride the recording tape next to boundary events. They get
+    /// a DEDICATED sequence space: boundary-event `global_sequence` numbering
+    /// must stay identical whether or not graph capture is on, because replay
+    /// lookup addressing mirrors the recorder's sequence allocation.
+    fn graph_node(&self, mut node: deja_core::ExecutionGraphNode) {
+        node.global_sequence = self.graph_counter.fetch_add(1, Ordering::SeqCst);
+        node.recording_run_id = Some(self.recording_run_id.clone());
+        let _ = self.writer.record(DejaRecord::GraphNode(node));
+    }
+}
+
 impl DejaHook for RecordingHook {
     fn mode(&self) -> RuntimeMode {
         // Process-level recording state AND the per-request sampling gate. The
@@ -1019,7 +1095,9 @@ impl DejaHook for RecordingHook {
     }
 
     fn record(&self, event: BoundaryEvent) {
-        let _ = self.writer.record(event);
+        let _ = self
+            .writer
+            .record(DejaRecord::BoundaryEvent(Box::new(event)));
     }
 
     fn next_global_sequence(&self) -> u64 {
@@ -1064,6 +1142,10 @@ impl DejaHook for RecordingHook {
         let value = *entry;
         *entry += 1;
         value
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        RecordingHook::flush(self)
     }
 
     fn recording_run_id(&self) -> Option<&str> {
@@ -1118,6 +1200,15 @@ impl RuntimeHook {
         match self {
             RuntimeHook::Recording(h) => Some(h.writer_stats()),
             _ => None,
+        }
+    }
+
+    /// Return the active IMC lookup store when this process is running sandbox
+    /// replay (`DEJA_LOOKUP_MODE=imc`).
+    pub fn imc_lookup_store(&self) -> Option<crate::replay::ImcLookupStore> {
+        match self {
+            RuntimeHook::LookupReplay(h) => h.imc_store(),
+            RuntimeHook::Recording(_) | RuntimeHook::Replay(_) | RuntimeHook::Disabled(_) => None,
         }
     }
 
@@ -1242,6 +1333,10 @@ impl DejaHook for RuntimeHook {
         }
     }
 
+    fn flush(&self) -> std::io::Result<()> {
+        RuntimeHook::flush(self)
+    }
+
     fn recording_run_id(&self) -> Option<&str> {
         match self {
             RuntimeHook::Recording(h) => Some(h.recording_run_id()),
@@ -1252,22 +1347,36 @@ impl DejaHook for RuntimeHook {
     }
 }
 
-/// Construct an `Option<RuntimeHook::LookupReplay>` from
-/// `DEJA_LOOKUP_TABLE` (path to a JSONL or JSON `LookupTable`) and
-/// optionally `DEJA_OBSERVED_SINK` (path to a JSONL file the candidate
-/// writes per-call `ObservedCall` records to). When the sink env var is
-/// unset, observations accumulate in memory and are lost unless the
-/// application drains them explicitly via the hook's underlying sink.
-fn lookup_replay_hook_from_env() -> Option<RuntimeHook> {
-    let table_path = std::env::var("DEJA_LOOKUP_TABLE").ok()?;
-    let hook = match std::env::var("DEJA_OBSERVED_SINK").ok() {
+/// Selector inputs for the lookup-replay hook. Extracted from process env by
+/// [`lookup_replay_hook_from_env`]; a separate struct so unit tests can drive
+/// the selection without mutating process env.
+struct LookupReplaySelection {
+    replay_source: Option<String>,
+    legacy_lookup_mode: Option<String>,
+    legacy_table: Option<String>,
+    observed_sink: Option<String>,
+}
+
+fn lookup_replay_hook_from(sel: LookupReplaySelection) -> Option<RuntimeHook> {
+    if sel.replay_source.as_deref() == Some("imc")
+        || sel.legacy_lookup_mode.as_deref() == Some("imc")
+    {
+        return Some(RuntimeHook::LookupReplay(
+            crate::replay::LookupTableHook::from_imc_store(crate::replay::ImcLookupStore::new()),
+        ));
+    }
+
+    // A non-`imc` replay source is a lookup-table file path; the legacy
+    // DEJA_LOOKUP_TABLE variable remains as the fallback selector.
+    let table_path = sel.replay_source.or(sel.legacy_table)?;
+    let hook = match sel.observed_sink {
         Some(observed_path) => match crate::replay::FileObservedSink::create(&observed_path) {
             Ok(sink) => crate::replay::LookupTableHook::from_source(
                 crate::replay::LocalFileLookupSource::new(&table_path),
                 sink,
             ),
             Err(err) => {
-                eprintln!("deja: failed to open DEJA_OBSERVED_SINK={observed_path}: {err}");
+                eprintln!("deja: failed to open observed sink {observed_path}: {err}");
                 return None;
             }
         },
@@ -1279,19 +1388,36 @@ fn lookup_replay_hook_from_env() -> Option<RuntimeHook> {
     match hook {
         Ok(h) => Some(RuntimeHook::LookupReplay(h)),
         Err(err) => {
-            eprintln!("deja: failed to load DEJA_LOOKUP_TABLE={table_path}: {err}");
+            eprintln!("deja: failed to load lookup table {table_path}: {err}");
             None
         }
     }
 }
 
+/// Construct an `Option<RuntimeHook::LookupReplay>` from the router-prefixed
+/// replay source (`ROUTER__DEJA__REPLAY__SOURCE`, either `imc` or a lookup
+/// table file path) or the legacy `DEJA_LOOKUP_MODE=imc` /
+/// `DEJA_LOOKUP_TABLE` selectors. Observed calls go to
+/// `ROUTER__DEJA__REPLAY__OBSERVED_SINK` (or legacy `DEJA_OBSERVED_SINK`)
+/// when set, else an in-memory sink.
+fn lookup_replay_hook_from_env() -> Option<RuntimeHook> {
+    lookup_replay_hook_from(LookupReplaySelection {
+        replay_source: env_value(ROUTER_DEJA_REPLAY_SOURCE_ENV_VAR),
+        legacy_lookup_mode: env_value(DEJA_LOOKUP_MODE_ENV_VAR),
+        legacy_table: env_value(DEJA_LOOKUP_TABLE_ENV_VAR),
+        observed_sink: env_value(ROUTER_DEJA_REPLAY_OBSERVED_SINK_ENV_VAR)
+            .or_else(|| env_value(DEJA_OBSERVED_SINK_ENV_VAR)),
+    })
+}
+
 /// Construct a [`RuntimeHook`] from environment variables.
 ///
-/// Reads `DEJA_MODE` (`record` | `replay` | `disabled`) and
-/// `DEJA_ARTIFACT_DIR`. Returns `None` when disabled or misconfigured.
+/// Reads `ROUTER__DEJA__MODE` (`record` | `replay` | `disabled`) and
+/// `DEJA_ARTIFACT_DIR`. Falls back to legacy `DEJA_MODE` for local loops.
+/// Returns `None` when disabled or misconfigured.
 pub fn runtime_hook_from_env() -> Option<RuntimeHook> {
-    let mode = std::env::var("DEJA_MODE").ok();
-    let artifact_dir = std::env::var("DEJA_ARTIFACT_DIR").ok();
+    let mode = env_value(ROUTER_DEJA_MODE_ENV_VAR).or_else(|| env_value("DEJA_MODE"));
+    let artifact_dir = env_value("DEJA_ARTIFACT_DIR");
 
     match mode.as_deref() {
         Some("record") => artifact_dir.and_then(|dir| {
@@ -1300,7 +1426,8 @@ pub fn runtime_hook_from_env() -> Option<RuntimeHook> {
                 .map(|h| RuntimeHook::Recording(Arc::new(h)))
         }),
         Some("replay") => {
-            // Prefer the lookup-table path when DEJA_LOOKUP_TABLE is set
+            // Prefer the ROUTER__DEJA__REPLAY__SOURCE selector (a lookup-table
+            // file path, or `imc`) or the legacy DEJA_LOOKUP_TABLE variable
             // (harness-driven runs); fall back to the classic in-process
             // ReplayHook for standalone use (local development loops).
             if let Some(hook) = lookup_replay_hook_from_env() {
@@ -1314,15 +1441,12 @@ pub fn runtime_hook_from_env() -> Option<RuntimeHook> {
             }
         }
         Some("disabled") | Some("off") | Some("none") => None,
-        None => artifact_dir.and_then(|dir| {
-            // Default: if artifact dir is set but mode isn't, assume record.
-            RecordingHook::new(Path::new(&dir))
-                .ok()
-                .map(|h| RuntimeHook::Recording(Arc::new(h)))
-        }),
+        // Mode must be explicit: an artifact dir alone never turns recording
+        // on (recording live traffic is an opt-in switch, not an inference).
+        None => None,
         Some(other) => {
             eprintln!(
-                "deja: unknown DEJA_MODE='{}', expected record|replay|disabled",
+                "deja: unknown Deja runtime mode '{}', expected record|replay|disabled",
                 other
             );
             None
@@ -1360,6 +1484,167 @@ pub fn flush_global_runtime_hook() -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// JSON body accepted by the IMC lookup admin install route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImcLookupInstallRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    #[serde(default)]
+    pub entries: Vec<crate::replay::LookupEntry>,
+}
+
+impl From<crate::replay::LookupTable> for ImcLookupInstallRequest {
+    fn from(table: crate::replay::LookupTable) -> Self {
+        Self {
+            recording_id: Some(table.recording_id),
+            policy_version: Some(table.policy_version),
+            entries: table.entries,
+        }
+    }
+}
+
+/// Small JSON-friendly status payload returned by IMC admin helpers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImcLookupStatus {
+    pub ok: bool,
+    pub entries: usize,
+    pub observed: usize,
+}
+
+/// Error returned by framework-neutral IMC admin helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImcLookupAdminError {
+    NotConfigured,
+    InvalidJson(String),
+}
+
+impl ImcLookupAdminError {
+    pub fn http_status_code(&self) -> u16 {
+        match self {
+            ImcLookupAdminError::NotConfigured => 503,
+            ImcLookupAdminError::InvalidJson(_) => 400,
+        }
+    }
+}
+
+impl std::fmt::Display for ImcLookupAdminError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImcLookupAdminError::NotConfigured => f.write_str("IMC lookup store is not configured"),
+            ImcLookupAdminError::InvalidJson(err) => {
+                write!(f, "invalid IMC lookup install body: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImcLookupAdminError {}
+
+fn global_imc_lookup_store() -> Result<crate::replay::ImcLookupStore, ImcLookupAdminError> {
+    let hook = global_runtime_hook_from_env().ok_or(ImcLookupAdminError::NotConfigured)?;
+    hook.imc_lookup_store()
+        .ok_or(ImcLookupAdminError::NotConfigured)
+}
+
+fn imc_partition_status(
+    store: &crate::replay::ImcLookupStore,
+    correlation_id: Option<&str>,
+) -> ImcLookupStatus {
+    ImcLookupStatus {
+        ok: true,
+        entries: store.partition_entry_count(correlation_id),
+        observed: store.observed_count(correlation_id),
+    }
+}
+
+fn imc_total_status(store: &crate::replay::ImcLookupStore) -> ImcLookupStatus {
+    ImcLookupStatus {
+        ok: true,
+        entries: store.total_entry_count(),
+        observed: store.total_observed_count(),
+    }
+}
+
+/// Install lookup entries for one correlation partition.
+///
+/// The supplied route correlation is authoritative: every entry's
+/// `key.correlation_id` is rewritten to that value before insertion.
+pub fn install_imc_lookup_entries(
+    correlation_id: Option<&str>,
+    entries: Vec<crate::replay::LookupEntry>,
+) -> Result<ImcLookupStatus, ImcLookupAdminError> {
+    let store = global_imc_lookup_store()?;
+    store.install_entries(correlation_id, entries);
+    Ok(imc_partition_status(&store, correlation_id))
+}
+
+/// Install a lookup table into one correlation partition.
+pub fn install_imc_lookup_table(
+    correlation_id: Option<&str>,
+    table: crate::replay::LookupTable,
+) -> Result<ImcLookupStatus, ImcLookupAdminError> {
+    install_imc_lookup_entries(correlation_id, table.entries)
+}
+
+/// Parse a `{ "entries": [...] }` JSON body and install it into one IMC
+/// correlation partition.
+pub fn install_imc_lookup_entries_json(
+    correlation_id: Option<&str>,
+    body: &[u8],
+) -> Result<ImcLookupStatus, ImcLookupAdminError> {
+    let request = serde_json::from_slice::<ImcLookupInstallRequest>(body)
+        .map_err(|err| ImcLookupAdminError::InvalidJson(err.to_string()))?;
+    install_imc_lookup_entries(correlation_id, request.entries)
+}
+
+/// Drop lookup entries and counters for one correlation partition.
+pub fn clear_imc_lookup(
+    correlation_id: Option<&str>,
+) -> Result<ImcLookupStatus, ImcLookupAdminError> {
+    let store = global_imc_lookup_store()?;
+    store.clear_correlation(correlation_id);
+    Ok(imc_partition_status(&store, correlation_id))
+}
+
+/// Drain observed calls for one correlation partition.
+pub fn drain_imc_observed(
+    correlation_id: Option<&str>,
+) -> Result<Vec<crate::replay::ObservedCall>, ImcLookupAdminError> {
+    let store = global_imc_lookup_store()?;
+    Ok(store.drain_observed(correlation_id))
+}
+
+/// Return total IMC readiness and occupancy for health checks.
+pub fn imc_lookup_health() -> Result<ImcLookupStatus, ImcLookupAdminError> {
+    let store = global_imc_lookup_store()?;
+    Ok(imc_total_status(&store))
+}
+
+/// Peek the explicitly installed runtime hook WITHOUT initializing anything:
+/// `None` both before install and when the installed hook is disabled-by-config.
+/// This is the seam logger/layer setup uses to wire the execution-graph layer
+/// to the mode's record stream after boot has installed the hook.
+pub fn installed_runtime_hook() -> Option<Arc<RuntimeHook>> {
+    GLOBAL_RUNTIME_HOOK.get().and_then(Clone::clone)
+}
+
+static GRAPH_RECORDING_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Declare (set-once, at boot, before logger setup) whether execution-graph
+/// nodes should be captured onto the mode's record stream. Defaults to off:
+/// graph capture is an opt-in volume dial, not ambient behavior.
+pub fn set_graph_recording_enabled(enabled: bool) {
+    let _ = GRAPH_RECORDING_ENABLED.set(enabled);
+}
+
+/// Whether boot declared execution-graph capture on (see
+/// [`set_graph_recording_enabled`]).
+pub fn graph_recording_enabled() -> bool {
+    GRAPH_RECORDING_ENABLED.get().copied().unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,7 +2076,6 @@ impl EventBuilder {
             recording_run_id,
             graph_node_id,
             tracing_span_id,
-            detached: current_task_is_detached(),
             task_id,
             parent_task_id,
             task_bucket,
@@ -1925,7 +2209,8 @@ impl LazyEventFinalizer {
         inject_body_json(&mut result, std::mem::take(&mut self.body));
 
         builder.finish(&*hook, result, self.is_error);
-        clear_detached_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
+        let _ = hook.flush();
+        clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
         correlation_id
     }
 }
@@ -1942,7 +2227,7 @@ impl Drop for LazyEventFinalizer {
         // escalates to `abort()` and kills the whole process. Drop the event instead.
         if std::thread::panicking() {
             if let Some(correlation_id) = cleanup_correlation_id {
-                clear_detached_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
+                clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
             }
             return;
         }
@@ -1956,10 +2241,11 @@ impl Drop for LazyEventFinalizer {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     builder.finish(&*hook, result, self.is_error);
                 }));
+                let _ = hook.flush();
             }
         }
         if let Some(correlation_id) = cleanup_correlation_id {
-            clear_detached_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
+            clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
         }
     }
 }
@@ -2010,14 +2296,21 @@ static GLOBAL_RECORDING_HOOK: OnceLock<Option<Arc<RecordingHook>>> = OnceLock::n
 ///
 /// The runtime hook is only PEEKED (`get`, never `get_or_init`): we must not
 /// pre-empt the install-before-getter ordering contract documented on
-/// [`set_global_runtime_hook`]. When no runtime hook is installed (standalone
-/// recording, tests), this falls back to the env-derived `GLOBAL_RECORDING_HOOK`
-/// exactly as before.
+/// [`set_global_runtime_hook`]. When an explicit runtime hook has been installed,
+/// that typed hook is authoritative: non-recording hooks suppress the legacy
+/// standalone env recorder. Only when no runtime hook has been initialized does
+/// this fall back to the env-derived `GLOBAL_RECORDING_HOOK`.
 pub fn global_hook_from_env() -> Option<Arc<RecordingHook>> {
-    if let Some(Some(runtime)) = GLOBAL_RUNTIME_HOOK.get() {
-        if let RuntimeHook::Recording(hook) = runtime.as_ref() {
-            return Some(Arc::clone(hook));
-        }
+    if let Some(runtime) = GLOBAL_RUNTIME_HOOK.get() {
+        return match runtime {
+            Some(hook) => match hook.as_ref() {
+                RuntimeHook::Recording(hook) => Some(Arc::clone(hook)),
+                RuntimeHook::Replay(_)
+                | RuntimeHook::LookupReplay(_)
+                | RuntimeHook::Disabled(_) => None,
+            },
+            None => None,
+        };
     }
     GLOBAL_RECORDING_HOOK
         .get_or_init(|| hook_from_env().map(Arc::new))
@@ -2068,8 +2361,6 @@ pub fn replay_is_active() -> bool {
     runtime_mode().is_replay()
 }
 
-type DetachedTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
 const ROOT_TASK_ID: &str = "root";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2090,12 +2381,15 @@ impl TaskLineage {
         }
     }
 
-    fn detached_child_of(parent: Self, correlation_id: Option<&str>) -> Self {
-        let fork_seq = next_detached_fork_seq(correlation_id, &parent.bucket_id);
+    /// Lineage for a spawned-task fork: a fresh bucket under the parent, keyed by
+    /// a `(correlation, parent bucket)`-local sequence. Called by the correlation
+    /// layer when it sees a `deja.fork`-marked span — never from a task-local.
+    fn forked_child_of(parent: Self, correlation_id: Option<&str>) -> Self {
+        let fork_seq = next_fork_seq(correlation_id, &parent.bucket_id);
         Self {
-            task_id: format!("{}::detached-{fork_seq}", parent.task_id),
+            task_id: format!("{}::fork-{fork_seq}", parent.task_id),
             parent_task_id: Some(parent.task_id),
-            bucket_id: format!("{}::detached-{fork_seq}", parent.bucket_id),
+            bucket_id: format!("{}::fork-{fork_seq}", parent.bucket_id),
             fork_seq,
         }
     }
@@ -2104,15 +2398,15 @@ impl TaskLineage {
 /// Per-(correlation, parent bucket) counter key for detached fork sequences.
 type ForkCounterKey = (Option<String>, String);
 
-static DETACHED_FORK_COUNTERS: LazyLock<Mutex<HashMap<ForkCounterKey, u64>>> =
+static FORK_COUNTERS: LazyLock<Mutex<HashMap<ForkCounterKey, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn next_detached_fork_seq(correlation_id: Option<&str>, parent_bucket_id: &str) -> u64 {
+fn next_fork_seq(correlation_id: Option<&str>, parent_bucket_id: &str) -> u64 {
     let key = (
         correlation_id.map(str::to_owned),
         parent_bucket_id.to_owned(),
     );
-    let mut counters = DETACHED_FORK_COUNTERS
+    let mut counters = FORK_COUNTERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let next = counters.entry(key).or_insert(1);
@@ -2121,8 +2415,8 @@ fn next_detached_fork_seq(correlation_id: Option<&str>, parent_bucket_id: &str) 
     fork_seq
 }
 
-fn clear_detached_fork_counter(correlation_id: Option<&str>, parent_bucket_id: &str) {
-    if let Ok(mut counters) = DETACHED_FORK_COUNTERS.lock() {
+fn clear_fork_counter(correlation_id: Option<&str>, parent_bucket_id: &str) {
+    if let Ok(mut counters) = FORK_COUNTERS.lock() {
         counters.remove(&(
             correlation_id.map(str::to_owned),
             parent_bucket_id.to_owned(),
@@ -2130,19 +2424,11 @@ fn clear_detached_fork_counter(correlation_id: Option<&str>, parent_bucket_id: &
     }
 }
 
-thread_local! {
-    static DETACHED_POLL_ACTIVE: Cell<bool> = const { Cell::new(false) };
-    static CURRENT_TASK_LINEAGE: RefCell<TaskLineage> = RefCell::new(TaskLineage::root());
-}
-
-/// Whether the current boundary event is being emitted from a spawned detached task.
-#[must_use]
-pub fn current_task_is_detached() -> bool {
-    DETACHED_POLL_ACTIVE.with(Cell::get)
-}
-
+/// The task lineage active on this thread, derived from the entered `tracing`
+/// span tree by [`crate::correlation_layer`] — the span-based replacement for the
+/// former `CURRENT_TASK_LINEAGE` task-local and its `spawn_detached` writer.
 pub(crate) fn current_task_lineage() -> TaskLineage {
-    CURRENT_TASK_LINEAGE.with(|lineage| lineage.borrow().clone())
+    crate::correlation_layer::current_span_lineage()
 }
 
 /// Lineage facts stamped on every event, named so call sites cannot swap the
@@ -2168,100 +2454,34 @@ pub(crate) fn current_task_metadata(_correlation_id: Option<&str>) -> TaskMetada
     }
 }
 
-struct DetachedPollFuture {
-    inner: DetachedTaskFuture,
-    lineage: TaskLineage,
-}
-
-impl DetachedPollFuture {
-    fn new(inner: DetachedTaskFuture, lineage: TaskLineage) -> Self {
-        Self { inner, lineage }
-    }
-}
-
-struct DetachedContextReset<'a> {
-    flag: &'a Cell<bool>,
-    previous_detached: bool,
-    lineage: &'a RefCell<TaskLineage>,
-    previous_lineage: TaskLineage,
-}
-
-impl Drop for DetachedContextReset<'_> {
-    fn drop(&mut self) {
-        self.flag.set(self.previous_detached);
-        self.lineage.replace(self.previous_lineage.clone());
-    }
-}
-
-impl Future for DetachedPollFuture {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        DETACHED_POLL_ACTIVE.with(|flag| {
-            CURRENT_TASK_LINEAGE.with(|lineage| {
-                let previous_detached = flag.replace(true);
-                let previous_lineage = lineage.replace(self.lineage.clone());
-                let _reset = DetachedContextReset {
-                    flag,
-                    previous_detached,
-                    lineage,
-                    previous_lineage,
-                };
-                let bucket_id = self.lineage.bucket_id.clone();
-                match self.inner.as_mut().poll(cx) {
-                    Poll::Ready(()) => {
-                        let correlation_id = deja_context::current_correlation_id();
-                        clear_detached_fork_counter(correlation_id.as_deref(), &bucket_id);
-                        Poll::Ready(())
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            })
-        })
-    }
-}
-
-fn spawn_detached_with_context<F, T>(
-    future: F,
-    context: deja_context::ContextSnapshot,
-    span: tracing::Span,
-    lineage: TaskLineage,
-) where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let future = Box::pin(
-        async move {
-            let _ = future.await;
-        }
-        .instrument(span),
-    );
-    let detached = DetachedPollFuture::new(future, lineage);
-
-    // Dropping the JoinHandle is deliberate — fire-and-forget by contract.
-    drop(tokio::spawn(deja_context::scope_snapshot(
-        context, detached,
-    )));
-}
-
-/// Spawn fire-and-forget work while stamping Déjà detached lineage.
-///
-/// This always delegates immediately to [`tokio::spawn`] in every runtime mode.
-/// The current Déjà context, tracing span, and task lineage are captured at spawn
-/// time and re-entered while the child future is polled, so boundary events inside
-/// the child keep their correlation/span while stamping `detached = true`, a child
-/// `task_id`, its parent id, a lineage `bucket_id`, the legacy `task_bucket` alias,
-/// and a fork sequence local to `(correlation, parent bucket)`.
-pub fn spawn_detached<F, T>(future: F)
+/// Spawn a fork boundary for fire-and-forget work: `tokio::spawn` the future
+/// instrumented with [`fork_span`], so the execution-graph/correlation layer sees
+/// a `deja.fork`-marked span, opens a fresh lineage bucket for the child, and
+/// derives its `task_id`/`bucket_id`/`fork_seq` from the span tree — no captured
+/// task-locals. Boundary events inside the child inherit the request correlation
+/// via the same layer. Provided so callers keep one obvious spelling; a bare
+/// `tokio::spawn(fut.instrument(deja::fork_span()))` is equivalent.
+pub fn spawn_fork<F, T>(future: F)
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let correlation_id = deja_context::current_correlation_id();
-    let context = deja_context::capture_current();
-    let span = tracing::Span::current();
-    let lineage = TaskLineage::detached_child_of(current_task_lineage(), correlation_id.as_deref());
-    spawn_detached_with_context(future, context, span, lineage);
+    // Dropping the JoinHandle is deliberate — fire-and-forget by contract.
+    drop(tokio::spawn(
+        async move {
+            let _ = future.await;
+        }
+        .instrument(fork_span()),
+    ));
+}
+
+/// The span that marks a spawned-task fork boundary for the correlation/graph
+/// layer (`deja.fork = true`). Instrument a spawned future with it —
+/// `tokio::spawn(fut.instrument(deja::fork_span()))` — to open a fresh lineage
+/// bucket for that task.
+#[must_use]
+pub fn fork_span() -> tracing::Span {
+    tracing::info_span!("deja.fork", deja.fork = true)
 }
 
 /// Flush the global recording hook, when one is configured.
@@ -3543,8 +3763,10 @@ pub fn read_events(artifact_dir: &Path) -> std::io::Result<Vec<BoundaryEvent>> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<BoundaryEvent>(line) {
-            events.push(event);
+        // The stream is tagged DejaRecords; other kinds (graph nodes) and
+        // non-record lines (sink markers) are someone else's to read.
+        if let Ok(DejaRecord::BoundaryEvent(event)) = serde_json::from_str::<DejaRecord>(line) {
+            events.push(*event);
         }
     }
     Ok(events)
@@ -3787,6 +4009,153 @@ mod tests {
 
     use super::*;
     use std::panic::Location;
+
+    // -----------------------------------------------------------------------
+    // Lookup-replay hook selection (ROUTER__DEJA__REPLAY__SOURCE et al.)
+    // -----------------------------------------------------------------------
+
+    fn selection(
+        replay_source: Option<&str>,
+        legacy_lookup_mode: Option<&str>,
+        legacy_table: Option<&str>,
+        observed_sink: Option<&str>,
+    ) -> LookupReplaySelection {
+        LookupReplaySelection {
+            replay_source: replay_source.map(str::to_owned),
+            legacy_lookup_mode: legacy_lookup_mode.map(str::to_owned),
+            legacy_table: legacy_table.map(str::to_owned),
+            observed_sink: observed_sink.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn imc_replay_source_selects_the_imc_store() {
+        let hook = lookup_replay_hook_from(selection(Some("imc"), None, None, None));
+        assert!(matches!(hook, Some(RuntimeHook::LookupReplay(_))));
+        // legacy DEJA_LOOKUP_MODE=imc keeps working too
+        let hook = lookup_replay_hook_from(selection(None, Some("imc"), None, None));
+        assert!(matches!(hook, Some(RuntimeHook::LookupReplay(_))));
+    }
+
+    #[test]
+    fn path_valued_replay_source_loads_the_file_table_and_creates_the_observed_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_path = dir.path().join("lookup-tables").join("run-1.jsonl");
+        std::fs::create_dir_all(table_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &table_path,
+            r#"{"recording_id":"rec-1","policy_version":1,"entries":[]}"#,
+        )
+        .unwrap();
+        let observed_path = dir.path().join("observed").join("run-1.jsonl");
+        let hook = lookup_replay_hook_from(selection(
+            Some(table_path.to_str().unwrap()),
+            None,
+            None,
+            Some(observed_path.to_str().unwrap()),
+        ));
+        assert!(matches!(hook, Some(RuntimeHook::LookupReplay(_))));
+        // FileObservedSink::create made the parent dir and the file
+        assert!(observed_path.exists());
+    }
+
+    #[test]
+    fn missing_table_file_disables_the_lookup_hook() {
+        let hook = lookup_replay_hook_from(selection(
+            Some("/nonexistent/deja/lookup.jsonl"),
+            None,
+            None,
+            None,
+        ));
+        assert!(hook.is_none());
+    }
+
+    #[test]
+    fn legacy_lookup_table_var_still_selects_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_path = dir.path().join("table.jsonl");
+        std::fs::write(
+            &table_path,
+            r#"{"recording_id":"rec-1","policy_version":1,"entries":[]}"#,
+        )
+        .unwrap();
+        let hook = lookup_replay_hook_from(selection(
+            None,
+            None,
+            Some(table_path.to_str().unwrap()),
+            None,
+        ));
+        assert!(matches!(hook, Some(RuntimeHook::LookupReplay(_))));
+    }
+
+    #[test]
+    fn no_replay_selectors_means_no_lookup_hook() {
+        assert!(lookup_replay_hook_from(selection(None, None, None, None)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // DejaRecord — the one-stream wire shape (tag routes, fields stay flat).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deja_record_wire_shape_is_flat_and_tagged() {
+        let node = deja_core::ExecutionGraphNode {
+            node_id: 7,
+            global_sequence: 42,
+            parent_id: Some(3),
+            causal_parent_ids: vec![1],
+            sequence: 5,
+            recording_run_id: Some("run-x".to_owned()),
+            span_name: "payment.request".to_owned(),
+            target: "router".to_owned(),
+            level: "INFO".to_owned(),
+            fields: std::collections::BTreeMap::new(),
+            started_ns: 10,
+            closed_ns: Some(20),
+        };
+        let json = serde_json::to_value(DejaRecord::GraphNode(node.clone())).unwrap();
+        // One flat object: the tag sits beside the node's own fields.
+        assert_eq!(json["record_kind"], "graph_node");
+        assert_eq!(json["node_id"], 7);
+        assert_eq!(json["global_sequence"], 42);
+
+        let back: DejaRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.global_sequence(), 42);
+        match back {
+            DejaRecord::GraphNode(n) => assert_eq!(n, node),
+            other => panic!("expected GraphNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deja_record_boundary_event_round_trips_with_tag() {
+        let event: BoundaryEvent = serde_json::from_value(serde_json::json!({
+            "global_sequence": 9,
+            "request_sequence": 1,
+            "correlation_id": "c1",
+            "timestamp_ns": 1,
+            "boundary": "db",
+            "trait_name": "T",
+            "method_name": "m",
+            "request": {}, "args": {},
+            "response": {"ok": true}, "result": {"ok": true},
+            "is_error": false,
+            "duration_us": 5,
+            "event_schema_version": CURRENT_EVENT_SCHEMA_VERSION,
+            "provenance": "recorded",
+            "recon": "lossless",
+            "replay_strategy": "substitute",
+            "call_file": "lib.rs",
+            "call_line": 1,
+            "call_column": 1,
+        }))
+        .expect("minimal boundary event");
+        let json = serde_json::to_value(DejaRecord::BoundaryEvent(Box::new(event))).unwrap();
+        assert_eq!(json["record_kind"], "boundary_event");
+        assert_eq!(json["boundary"], "db");
+        let back: DejaRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.global_sequence(), 9);
+    }
 
     // -----------------------------------------------------------------------
     // Declarative boundary model (#28) — the `replay_strategy` knob serde + spec.
@@ -4251,7 +4620,6 @@ mod tests {
             recording_run_id: Some("run-1".to_string()),
             graph_node_id: Some(7),
             tracing_span_id: Some(9),
-            detached: true,
             task_id: Some("detached-1".to_string()),
             parent_task_id: Some("root".to_string()),
             task_bucket: Some("detached-bucket-1".to_string()),
@@ -4301,7 +4669,6 @@ mod tests {
         assert_eq!(round.entropy_source.as_deref(), Some("id"));
         assert_eq!(round.timestamp_ns, 1_780_000_000_000_000_000u64);
         assert_eq!(round.end_timestamp_ns, Some(1_780_000_000_000_000_123u64));
-        assert!(round.detached);
         assert_eq!(round.fidelity, Fidelity::Structured);
         assert_eq!(round.task_id.as_deref(), Some("detached-1"));
         assert_eq!(round.parent_task_id.as_deref(), Some("root"));
@@ -4372,7 +4739,6 @@ mod tests {
                 recording_run_id: None,
                 graph_node_id: None,
                 tracing_span_id: None,
-                detached: false,
                 task_id: Some(ROOT_TASK_ID.to_string()),
                 parent_task_id: None,
                 task_bucket: Some(ROOT_TASK_ID.to_string()),
@@ -4415,7 +4781,6 @@ mod tests {
                 recording_run_id: None,
                 graph_node_id: None,
                 tracing_span_id: None,
-                detached: false,
                 task_id: Some(ROOT_TASK_ID.to_string()),
                 parent_task_id: None,
                 task_bucket: Some(ROOT_TASK_ID.to_string()),
@@ -4474,7 +4839,6 @@ mod tests {
                 recording_run_id: None,
                 graph_node_id: None,
                 tracing_span_id: None,
-                detached: false,
                 task_id: Some(ROOT_TASK_ID.to_string()),
                 parent_task_id: None,
                 task_bucket: Some(ROOT_TASK_ID.to_string()),
@@ -4517,7 +4881,6 @@ mod tests {
                 recording_run_id: None,
                 graph_node_id: None,
                 tracing_span_id: None,
-                detached: false,
                 task_id: Some(ROOT_TASK_ID.to_string()),
                 parent_task_id: None,
                 task_bucket: Some(ROOT_TASK_ID.to_string()),
@@ -4676,7 +5039,6 @@ mod tests {
                 source_event_global_sequence: None,
                 timestamp_ns: now_ns(),
                 end_timestamp_ns: None,
-                detached: current_task_is_detached(),
                 task_id: Some(ROOT_TASK_ID.to_string()),
                 parent_task_id: None,
                 task_bucket: Some(ROOT_TASK_ID.to_string()),
@@ -4693,8 +5055,6 @@ mod tests {
                 observed_result: None,
                 provenance: crate::Provenance::Shadow,
                 seed_gap: false,
-                pre_image: None,
-                result_image: None,
             }))
         }
         fn execute_shadow_observe(
@@ -5304,168 +5664,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawn_detached_always_spawns_immediately() {
+    async fn spawn_fork_always_spawns_immediately() {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        spawn_detached(async move {
+        spawn_fork(async move {
             tx.send(()).expect("test receiver alive");
         });
 
         rx.recv_timeout(std::time::Duration::from_secs(1))
-            .expect("detached spawn did not run immediately like tokio::spawn");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn spawn_detached_events_stamp_captured_context_and_child_lineage() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
-        let correlation_id = "detached-stamp-req".to_string();
-
-        EventBuilder::start_with_correlation_id(
-            &*hook,
-            "unit",
-            "DetachedTests",
-            "main_path",
-            Location::caller(),
-            Some(correlation_id.clone()),
-            serde_json::json!({"path": "main"}),
-        )
-        .finish(&*hook, serde_json::json!({"ok": "main"}), false);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        deja_context::scope(correlation_id.clone(), {
-            let detached_hook = Arc::clone(&hook);
-            async move {
-                spawn_detached(async move {
-                    EventBuilder::start(
-                        &*detached_hook,
-                        "unit",
-                        "DetachedTests",
-                        "detached_path",
-                        Location::caller(),
-                        serde_json::json!({"path": "detached"}),
-                    )
-                    .finish(
-                        &*detached_hook,
-                        serde_json::json!({"ok": "detached"}),
-                        false,
-                    );
-                    tx.send(()).expect("test receiver alive");
-                });
-            }
-        })
-        .await;
-
-        rx.recv_timeout(std::time::Duration::from_secs(1))
-            .expect("detached child did not run immediately");
-        hook.flush().expect("flush detached test events");
-        drop(hook);
-
-        let events = read_events(dir.path()).expect("read events");
-        assert_eq!(events.len(), 2);
-        let main = events
-            .iter()
-            .find(|event| event.method_name == "main_path")
-            .expect("main-path event");
-        let detached = events
-            .iter()
-            .find(|event| event.method_name == "detached_path")
-            .expect("detached event");
-
-        assert!(
-            !main.detached,
-            "main-path events must not inherit the detached marker"
-        );
-        assert_eq!(main.task_id.as_deref(), Some(ROOT_TASK_ID));
-        assert_eq!(main.parent_task_id, None);
-        assert_eq!(main.bucket_id.as_deref(), Some(ROOT_TASK_ID));
-        assert_eq!(main.task_bucket, main.bucket_id);
-        assert_eq!(main.fork_seq, Some(0));
-
-        assert!(
-            detached.detached,
-            "events emitted by immediately spawned detached work must be marked"
-        );
-        assert_eq!(
-            detached.correlation_id.as_deref(),
-            Some("detached-stamp-req"),
-            "detached events must preserve the captured correlation context"
-        );
-        assert_eq!(
-            detached.parent_task_id.as_deref(),
-            Some(ROOT_TASK_ID),
-            "detached events must point back to the parent task lineage"
-        );
-        assert!(
-            detached
-                .task_id
-                .as_deref()
-                .is_some_and(|task_id| task_id.starts_with("root::detached-")),
-            "detached events must carry a generated child task id"
-        );
-        assert!(
-            detached
-                .bucket_id
-                .as_deref()
-                .is_some_and(|bucket_id| bucket_id.starts_with("root::detached-")),
-            "detached events must carry a generated detached bucket id"
-        );
-        assert_eq!(detached.task_bucket, detached.bucket_id);
-        assert_eq!(
-            detached.fork_seq,
-            Some(1),
-            "first child fork sequence is deterministic per correlation/parent bucket"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn callsite_occurrences_are_partitioned_by_current_lineage_bucket() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
-        let correlation_id = Some("occurrence-req");
-        let scope = Some("DetachedTests::same_callsite");
-
-        assert_eq!(
-            hook.next_callsite_occurrence(correlation_id, CallsiteSource::SyntacticHash, scope),
-            0
-        );
-        assert_eq!(
-            hook.next_callsite_occurrence(correlation_id, CallsiteSource::SyntacticHash, scope),
-            1,
-            "root bucket still increments repeated same-callsite occurrences"
-        );
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        deja_context::scope("occurrence-req", {
-            let first_hook = Arc::clone(&hook);
-            let second_hook = Arc::clone(&hook);
-            async move {
-                for detached_hook in [first_hook, second_hook] {
-                    let tx = tx.clone();
-                    spawn_detached(async move {
-                        let occurrence = detached_hook.next_callsite_occurrence(
-                            Some("occurrence-req"),
-                            CallsiteSource::SyntacticHash,
-                            Some("DetachedTests::same_callsite"),
-                        );
-                        tx.send(occurrence).expect("test receiver alive");
-                    });
-                }
-            }
-        })
-        .await;
-
-        let mut occurrences = vec![
-            rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("first detached occurrence"),
-            rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("second detached occurrence"),
-        ];
-        occurrences.sort_unstable();
-        assert_eq!(
-            occurrences,
-            vec![0, 0],
-            "same callsite under separate detached buckets must not collide"
-        );
+            .expect("fork spawn did not run immediately like tokio::spawn");
     }
 }

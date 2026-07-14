@@ -8,7 +8,8 @@
 #   2. POST a RECORD run  → Hyperswitch(record) drives workload.sh; events flow
 #      HS → Kafka → Vector → MinIO  (S3-compatible)
 #   3. POST a REPLAY run  → orchestrator pulls the recording back OUT of MinIO,
-#      renders the lookup table, boots the SAME image under DEJA_MODE=replay,
+#      renders the lookup table, boots the SAME image in typed replay mode
+#      (ROUTER__DEJA__MODE=replay),
 #      drives the recorded requests, and scores byte-exact divergence
 #   4. print the PASS/FAIL verdict
 #

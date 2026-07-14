@@ -17,7 +17,8 @@
 #
 # Pipeline: HS(record) → Kafka → Vector → MinIO (recorded once); then for each
 # candidate: rebuild the host router → orchestrator renders the lookup table from
-# the SAME recording, boots the candidate under DEJA_MODE=replay, drives the
+# the SAME recording, boots the candidate in typed replay mode
+# (ROUTER__DEJA__MODE=replay), drives the
 # recorded requests, scores byte-exact divergence.
 #
 # Run from the repo root. Requires: docker (+ compose), cargo, curl, jq.

@@ -1,0 +1,62 @@
+# Dashboard (deja-orchestrator) configuration — development profile.
+#
+# This file is the single source the dashboard reads at startup and the one
+# scripts/sandbox-create.sh reads when it creates a replay sandbox: the [s3]
+# table (recording bucket + keys) is forwarded into each sandbox's Helm
+# values, so the replay agent inside the sandbox can pull recordings.
+#
+# Secrets: leave access_key/secret_key empty here and export DEJA_S3__* env
+# vars instead (DEJA_S3__ACCESS_KEY, DEJA_S3__SECRET_KEY, DEJA_S3__BUCKET,
+# DEJA_S3__PREFIX, DEJA_S3__REGION, DEJA_S3__ENDPOINT). Both the Rust loader
+# (deja_replay_core::config::load_dashboard_config) and sandbox-create.sh
+# apply the same overrides on top of this file.
+
+[api]
+bind = "0.0.0.0:8070"
+state_dir = "./harness-state"
+
+[database]
+url = "sqlite://harness-state/dashboard.db"
+
+# Recording storage. Dev default points at a local MinIO; production uses
+# real AWS values (endpoint empty) injected via DEJA_S3__* env.
+# The endpoint must be reachable FROM INSIDE sandbox pods — for a MinIO on
+# the host with OrbStack/Docker Desktop that is host.docker.internal, not
+# localhost (which inside a pod is the pod itself).
+[s3]
+region = "us-east-1"
+access_key = ""
+secret_key = ""
+bucket = "deja-recordings"
+prefix = "deja/v1"
+endpoint = "http://host.docker.internal:9000"
+
+# Presence of this table enables the Helm-sandbox replay driver.
+[sandbox]
+chart = "replay-sandbox/chart"
+namespace_prefix = "deja-run-"
+run_deadline_secs = 1800
+watchdog_interval_secs = 30
+# Address sandbox pods use to reach the dashboard for verdict/stage callbacks.
+# OrbStack/k3d pods reach the host via host.docker.internal / host.k3d.internal.
+callback_base_url = "http://host.docker.internal:8070"
+# Bearer token agents present on callbacks. MUST equal the dashboard's
+# DEJA_API_SERVICE_TOKEN or stage/verdict callbacks are rejected with 401.
+callback_token = "deja-local-token"
+# ECR repository CI pushes candidate router images to; tag = git ref with
+# '/' mapped to '-' (see image_tag_template).
+candidate_image_repo = ""
+candidate_image_tag_template = "{ref}"
+
+# AWS credentials the sandbox driver uses to mint 12h ECR pull tokens per
+# run, delivered into each run namespace as a dockerconfigjson Secret.
+# Needed only when the cluster's nodes lack IAM pull rights (non-EKS or
+# cross-account); leave empty on EKS. Region defaults to the one parsed
+# from candidate_image_repo. Prefer env overrides for the secrets
+# (DEJA_ECR_ACCESS_KEY_ID / DEJA_ECR_SECRET_ACCESS_KEY /
+# DEJA_ECR_SESSION_TOKEN / DEJA_ECR_REGION).
+[ecr]
+access_key_id = ""
+secret_access_key = ""
+session_token = ""
+region = ""

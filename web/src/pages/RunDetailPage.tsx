@@ -1,5 +1,5 @@
 import React from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactRow, Scorecard, StageRow } from "../lib/api";
 import DiffView from "../components/DiffView";
@@ -69,6 +69,10 @@ function ScorecardSummary({ runId }: { runId: string }) {
 
 function Artifacts({ list }: { list: ArtifactRow[] }) {
   const viz = list.find((a) => a.kind === "visualization_html");
+  const fileName = (a: ArtifactRow) => {
+    const last = a.uri.split("/").filter(Boolean).pop();
+    return last || `${a.kind}.json`;
+  };
   return (
     <>
       <table>
@@ -81,7 +85,10 @@ function Artifacts({ list }: { list: ArtifactRow[] }) {
               <td>{a.kind}</td>
               <td>{a.bytes?.toLocaleString() ?? "—"}</td>
               <td className="hint" title={a.uri}>{a.uri.length > 60 ? `…${a.uri.slice(-60)}` : a.uri}</td>
-              <td><a href={`/api/v1/artifacts/${a.id}/raw`} target="_blank" rel="noreferrer">open</a></td>
+              <td className="actions">
+                <a href={`/api/v1/artifacts/${a.id}/raw`} target="_blank" rel="noreferrer">open</a>
+                <a href={`/api/v1/artifacts/${a.id}/raw`} download={fileName(a)}>download</a>
+              </td>
             </tr>
           ))}
           {list.length === 0 && (
@@ -115,6 +122,7 @@ type Tab = (typeof TABS)[number];
 export default function RunDetailPage() {
   const { runId = "" } = useParams();
   const [params, setParams] = useSearchParams();
+  const queryClient = useQueryClient();
   const tab = (params.get("tab") as Tab) || "overview";
   const setTab = (t: Tab) => setParams(t === "overview" ? {} : { tab: t }, { replace: true });
 
@@ -135,12 +143,25 @@ export default function RunDetailPage() {
     queryFn: () => api.artifacts(runId),
     enabled: terminal,
   });
+  const killSandbox = useMutation({
+    mutationFn: () => api.killRun(runId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["run", runId] });
+      queryClient.invalidateQueries({ queryKey: ["stages", runId] });
+      queryClient.invalidateQueries({ queryKey: ["logs", runId] });
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
 
   if (run.isLoading) return <p className="hint">loading…</p>;
   if (run.error || !run.data) return <p className="err">{String(run.error)}</p>;
   const r = run.data;
   const active = !terminal;
   const isReplay = r.mode === "replay";
+  const onKillSandbox = () => {
+    const label = terminal ? "delete any leftover sandbox namespace" : "kill this run and delete its sandbox namespace";
+    if (window.confirm(`Really ${label}?`)) killSandbox.mutate();
+  };
 
   return (
     <>
@@ -148,11 +169,19 @@ export default function RunDetailPage() {
         <Link to="/runs">Runs</Link> <span>/</span> <span className="hint">{r.run_id}</span>{" "}
         <span>/</span> <span>{tab}</span>
       </div>
-      <h1>
-        {r.mode} run{" "}
-        <span className={`chip ${r.state}`}>{r.state}</span>{" "}
-        {r.verdict && <span className={`chip solid ${r.verdict}`}>{r.verdict}</span>}
-      </h1>
+      <div className="titlebar">
+        <h1>
+          {r.mode} run{" "}
+          <span className={`chip ${r.state}`}>{r.state}</span>{" "}
+          {r.verdict && <span className={`chip solid ${r.verdict}`}>{r.verdict}</span>}
+        </h1>
+        {isReplay && (
+          <button className="danger" type="button" onClick={onKillSandbox} disabled={killSandbox.isPending}>
+            {killSandbox.isPending ? "killing…" : terminal ? "clean sandbox" : "kill sandbox"}
+          </button>
+        )}
+      </div>
+      {killSandbox.error && <p className="err">{String(killSandbox.error)}</p>}
 
       <nav className="subtabs">
         {TABS.map((t) => {

@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 
 use crate::{read_json, write_json, CandidateSpec, HarnessRoot, Run, RunMode, RunStatus};
 
+pub mod ecr;
+pub mod sandbox;
 pub mod store_ctx;
 pub use store_ctx::StoreCtx;
 
@@ -104,10 +106,12 @@ impl Demo {
                     .unwrap_or_else(|| "deja-router-local:latest".to_owned()),
             ),
             // Code identity for the envelope's `code.sha` (resolved by the
-            // demo script from the vendor git head; empty when unknown).
+            // demo script from the vendor git head; empty when unknown). The
+            // router reads it through the standard Vergen identity env, per
+            // the typed `deja.identity.git_sha_env` setting.
             (
-                "DEJA_CODE_REF".into(),
-                std::env::var("DEJA_CODE_REF").unwrap_or_default(),
+                "VERGEN_GIT_SHA".into(),
+                std::env::var("VERGEN_GIT_SHA").unwrap_or_default(),
             ),
         ]
     }
@@ -183,6 +187,12 @@ pub fn drive(root: &HarnessRoot, run_id: &str, ctx: &StoreCtx) {
             return;
         }
     };
+    // The Dockerized dashboard (DEJA_SANDBOX=helm) replays through per-run
+    // Helm sandboxes; the compose-based local flow below stays for dev.
+    if sandbox::enabled() && run.spec.mode == RunMode::Replay {
+        sandbox::drive(root, &mut run, ctx);
+        return;
+    }
     let mut demo = Demo::from_env(root);
     if let Err(e) = resolve_candidate(&mut demo, root, &mut run, ctx) {
         eprintln!("lifecycle: run {run_id} failed: {e}");
@@ -422,7 +432,6 @@ fn drive_record(
         .unwrap_or_else(|| run.run_id.clone());
     run.recording_id = Some(recording_id.clone());
     ctx.run_recording(&recording_id);
-    let _ = std::fs::create_dir_all(root.graph_record_dir(&recording_id));
 
     let total = 6;
     set_status(root, run, RunStatus::Building, None);
@@ -547,19 +556,13 @@ fn drive_record(
     );
     pull_recording(root, ctx, &recording_id)?;
 
-    // Register what this run produced. The execution graph lands directly in
-    // the bind-mounted state dir (DEJA_GRAPH_DIR=/harness-state/graph/<id>).
+    // Register what this run produced. Execution-graph nodes ride the tape
+    // itself as `DejaRecord::GraphNode` lines, so the events artifact is the
+    // whole recording.
     ctx.artifact(
         Some(&recording_id),
         "events",
         &root.recording_events_path(&recording_id),
-    );
-    ctx.artifact(
-        Some(&recording_id),
-        "graph",
-        &root
-            .graph_record_dir(&recording_id)
-            .join("execution-graph.jsonl"),
     );
     Ok(())
 }
@@ -582,7 +585,6 @@ fn drive_replay(
         .ok_or_else(|| "replay run requires recording_id".to_string())?;
     run.recording_id = Some(recording_id.clone());
     ctx.run_recording(&recording_id);
-    let _ = std::fs::create_dir_all(root.graph_replay_dir(&run.run_id));
 
     let total = 6;
     set_status(root, run, RunStatus::Resolving, None);
@@ -732,13 +734,8 @@ fn drive_replay(
         "call_ledger",
         &root.call_ledger_path(&run.run_id),
     );
-    ctx.artifact(
-        Some(&recording_id),
-        "graph_replay",
-        &root
-            .graph_replay_dir(&run.run_id)
-            .join("execution-graph.jsonl"),
-    );
+    // Replay-side execution-graph nodes ride the observed stream as
+    // `DejaRecord::GraphNode` lines, already registered above.
     // Static HTML visualization (the demo's existing visualize-replay.py);
     // best-effort — python3 may be absent.
     let viz = root
@@ -2316,11 +2313,10 @@ fn render_redis_seed_value(value: &serde_json::Value) -> String {
     }
 }
 
-/// Read a recording's events JSONL, tolerating non-event lines (headers from a
-/// mixed stream) exactly like the lookup renderer does. Returns an empty vec on
-/// any I/O failure (best-effort seeding).
+/// Read a recording's boundary events JSONL, tolerating non-event records from
+/// the shared `DejaRecord` stream exactly like the lookup renderer does.
+/// Returns an empty vec on any I/O failure (best-effort seeding).
 fn read_recording_events(path: &std::path::Path) -> Vec<deja::BoundaryEvent> {
-    use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else {
         eprintln!(
             "lifecycle: seed plan: recording {} not readable; skipping seeding",
@@ -2335,8 +2331,12 @@ fn read_recording_events(path: &std::path::Path) -> Vec<deja::BoundaryEvent> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(ev) = serde_json::from_str::<deja::BoundaryEvent>(&line) {
-            events.push(ev);
+        // The current wire format is a single `DejaRecord` stream. Boundary
+        // events feed seed planning; graph nodes and replay observations do not.
+        if let Ok(deja::DejaRecord::BoundaryEvent(ev)) =
+            serde_json::from_str::<deja::DejaRecord>(&line)
+        {
+            events.push(*ev);
         }
     }
     events
@@ -2757,8 +2757,6 @@ mod tests {
             [
                 "call_ledger",
                 "events",
-                "graph",
-                "graph_replay",
                 "http_diffs",
                 "ingest_report",
                 "lookup_table",
@@ -3210,7 +3208,10 @@ mod tests {
             spec: RunSpec {
                 mode: RunMode::Record,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
+                migration_source: None,
                 recording_id: None,
+                recording_uri: None,
+                runtime_versions: Default::default(),
                 workload,
             },
             status: RunStatus::Pending,
@@ -3289,6 +3290,7 @@ mod tests {
     /// many additive fields, so the test only states what it cares about).
     fn settlement_read_event_jsonl(correlation: &str, key: &str, value: &str) -> String {
         serde_json::json!({
+            "record_kind": "boundary_event",
             "global_sequence": 0,
             "request_sequence": 0,
             "correlation_id": correlation,
@@ -3319,9 +3321,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let body = format!(
-            "{}\n# a header / non-event line\n\n{}\n",
+            "{}\n# a header / non-event line\n\n{}\n{}\n",
             settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
-            "{not json at all}"
+            "{not json at all}",
+            // graph nodes ride the same tape; they are not seed-plan inputs
+            r#"{"record_kind":"graph_node","node_id":1,"global_sequence":1,"sequence":1,"span_name":"root","target":"router","level":"INFO","fields":{},"started_ns":1}"#,
         );
         std::fs::write(&path, body).unwrap();
         let events = read_recording_events(&path);

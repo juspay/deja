@@ -1,0 +1,36 @@
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p deja-orchestrator
+
+FROM debian:trixie-slim
+
+ARG HELM_VERSION=v3.15.4
+ARG KUBECTL_VERSION=v1.30.3
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tar gzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && arch="${TARGETARCH:-amd64}" \
+    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" -o /tmp/helm.tgz \
+    && tar -xzf /tmp/helm.tgz -C /tmp \
+    && mv "/tmp/linux-${arch}/helm" /usr/local/bin/helm \
+    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/helm /usr/local/bin/kubectl \
+    && rm -rf /tmp/helm.tgz "/tmp/linux-${arch}"
+
+COPY --from=builder /app/target/release/deja-orchestrator /usr/local/bin/deja-orchestrator
+# The per-run replay sandbox chart the helm driver installs (DEJA_SANDBOX_CHART).
+COPY replay-sandbox/chart /charts/replay-sandbox
+
+ENV HARNESS_BIND=0.0.0.0:8070
+ENV HARNESS_STATE_DIR=/var/lib/deja
+
+RUN mkdir -p /var/lib/deja /kube
+
+EXPOSE 8070
+VOLUME ["/var/lib/deja", "/kube"]
+
+ENTRYPOINT ["deja-orchestrator"]

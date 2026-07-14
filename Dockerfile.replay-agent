@@ -1,0 +1,15 @@
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p deja-replay-agent
+
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates postgresql-client redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/deja-replay-agent /usr/local/bin/deja-replay-agent
+
+ENTRYPOINT ["deja-replay-agent"]

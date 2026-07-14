@@ -79,6 +79,9 @@ cleanup() {
       | grep '^deja-run-' | while read -r p; do
           docker compose -p "$p" -f "$BASE" -f "$OVERLAY" down -v >/dev/null 2>&1 || true
         done || true
+    echo "── removing per-run candidate images (deja-candidate:*) ──"
+    docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+      | grep '^deja-candidate:' | xargs -r docker rmi >/dev/null 2>&1 || true
   else echo "── stacks left running (--keep); state in $STATE_DIR ──"; fi
 }
 trap cleanup EXIT

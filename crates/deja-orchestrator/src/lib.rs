@@ -26,15 +26,42 @@ pub mod store;
 pub enum CandidateSpec {
     LocalPath { binary_or_source: PathBuf },
     PrebuiltImage { image: String },
+    S3Build { build_ref: String },
     RepoSha { repo: String, sha: String },
     RepoBranch { repo: String, branch: String },
+    RepoTag { repo: String, tag: String },
     RepoPr { repo: String, pr: u32 },
+}
+
+/// Source ref used to run Hyperswitch schema migrations for a replay sandbox.
+/// This is separate from the router image identity because hosted replays may
+/// use an already-built image while still needing migrations from the branch,
+/// commit, or tag that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MigrationSource {
+    Branch { branch: String },
+    Sha { sha: String },
+    Tag { tag: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateImage {
     pub docker_image: String,
     pub source_ref: String,
+}
+
+/// Runtime dependency image tags supplied by the dashboard per replay run.
+/// Values are Docker tags, not full image references: e.g. `17-alpine`,
+/// `7.2-alpine`, `0.112.0`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeVersions {
+    #[serde(default)]
+    pub postgres: Option<String>,
+    #[serde(default)]
+    pub redis: Option<String>,
+    #[serde(default)]
+    pub superposition: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,8 +86,22 @@ pub enum RunStatus {
 pub struct RunSpec {
     pub mode: RunMode,
     pub candidate_spec: CandidateSpec,
+    /// Optional explicit source for replay database migrations. When omitted
+    /// for repo candidates, the sandbox driver uses the same branch/SHA/tag as
+    /// the candidate; prebuilt image sandbox runs must provide this explicitly.
+    #[serde(default)]
+    pub migration_source: Option<MigrationSource>,
     /// For mode=replay: which recording to drive.
     pub recording_id: Option<String>,
+    /// Optional direct S3 source for the recording, e.g.
+    /// `s3://bucket/prefix-or-object.log.gz`. When present, sandbox agents
+    /// fetch and merge the matching objects into the canonical events file
+    /// before replaying.
+    #[serde(default)]
+    pub recording_uri: Option<String>,
+    /// Optional dependency image tags chosen by the dashboard for this run.
+    #[serde(default)]
+    pub runtime_versions: RuntimeVersions,
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,
@@ -155,15 +196,6 @@ impl HarnessRoot {
     pub fn http_diff_path(&self, run_id: &str) -> PathBuf {
         self.root.join("http-diffs").join(format!("{run_id}.jsonl"))
     }
-    /// Record-side execution graph dir (bind-mounted into the record router as
-    /// `DEJA_GRAPH_DIR`); the layer writes `execution-graph.jsonl` inside it.
-    pub fn graph_record_dir(&self, recording_id: &str) -> PathBuf {
-        self.root.join("graph").join(recording_id)
-    }
-    /// Replay-side execution graph dir for one run.
-    pub fn graph_replay_dir(&self, run_id: &str) -> PathBuf {
-        self.root.join("graph-replay").join(run_id)
-    }
     /// Per-run docker build context for `local_binary` candidates.
     pub fn candidate_stage_dir(&self, run_id: &str) -> PathBuf {
         self.root.join("candidates").join(run_id)
@@ -195,4 +227,59 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     let bytes = fs::read(path)?;
     serde_json::from_slice::<T>(&bytes).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_spec_accepts_s3_build_ref() {
+        let spec: CandidateSpec = serde_json::from_value(serde_json::json!({
+            "kind": "s3_build",
+            "build_ref": "sha-abc123"
+        }))
+        .unwrap();
+        assert!(matches!(spec, CandidateSpec::S3Build { build_ref } if build_ref == "sha-abc123"));
+    }
+
+    #[test]
+    fn run_spec_accepts_explicit_migration_source() {
+        let spec: RunSpec = serde_json::from_value(serde_json::json!({
+            "mode": "replay",
+            "candidate_spec": {
+                "kind": "prebuilt_image",
+                "image": "registry/router:feature-pay-fix"
+            },
+            "migration_source": {
+                "kind": "branch",
+                "branch": "feature/pay-fix"
+            },
+            "recording_uri": "s3://hyperswitch-art/2026/07/09/",
+            "runtime_versions": {
+                "postgres": "17-alpine",
+                "redis": "7.2-alpine",
+                "superposition": "0.112.0"
+            },
+            "recording_id": "rec-1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            spec.migration_source,
+            Some(MigrationSource::Branch { branch }) if branch == "feature/pay-fix"
+        ));
+        assert_eq!(
+            spec.recording_uri.as_deref(),
+            Some("s3://hyperswitch-art/2026/07/09/")
+        );
+        assert_eq!(
+            spec.runtime_versions,
+            RuntimeVersions {
+                postgres: Some("17-alpine".into()),
+                redis: Some("7.2-alpine".into()),
+                superposition: Some("0.112.0".into()),
+            }
+        );
+    }
 }
