@@ -556,13 +556,17 @@ fn drive_record(
     );
     pull_recording(root, ctx, &recording_id)?;
 
-    // Register what this run produced. Execution-graph nodes ride the tape
-    // itself as `DejaRecord::GraphNode` lines, so the events artifact is the
-    // whole recording.
+    // Register what this run produced. `pull_recording` normalizes the pulled
+    // tape into replayable events plus a graph sidecar for traversal.
     ctx.artifact(
         Some(&recording_id),
         "events",
         &root.recording_events_path(&recording_id),
+    );
+    ctx.artifact(
+        Some(&recording_id),
+        "graph",
+        &root.recording_graph_path(&recording_id),
     );
     Ok(())
 }
@@ -607,6 +611,26 @@ fn drive_replay(
         return Err(format!(
             "recording {recording_id} not found in S3 or on disk"
         ));
+    }
+    match crate::split_recording_artifacts(
+        &recording_path,
+        &root.recording_graph_path(&recording_id),
+    ) {
+        Ok(split) if split.graph_nodes > 0 => {
+            let line = format!(
+                "split recording {recording_id}: {} boundary event(s), {} graph node(s)",
+                split.boundary_events, split.graph_nodes
+            );
+            eprintln!("lifecycle: {line}");
+            ctx.log("ingest", &line);
+            ctx.artifact(
+                Some(&recording_id),
+                "graph",
+                &root.recording_graph_path(&recording_id),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("split recording artifacts: {e}")),
     }
 
     // Render the lookup table (whole-document JSON; round-trips through both the
@@ -708,6 +732,24 @@ fn drive_replay(
     };
     ctx.result(Some(verdict), serde_json::to_value(&card).ok().as_ref());
 
+    ctx.artifact(
+        Some(&recording_id),
+        "graph",
+        &root.recording_graph_path(&recording_id),
+    );
+    match crate::materialize_graph_artifact(
+        &root.observed_path(&run.run_id),
+        &root.replay_graph_path(&run.run_id),
+    ) {
+        Ok(count) if count > 0 => ctx.artifact(
+            Some(&recording_id),
+            "graph_replay",
+            &root.replay_graph_path(&run.run_id),
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("lifecycle: replay graph materialization failed: {e}"),
+    }
+
     // Register replay artifacts (best-effort; absent files are skipped).
     ctx.artifact(
         Some(&recording_id),
@@ -734,8 +776,6 @@ fn drive_replay(
         "call_ledger",
         &root.call_ledger_path(&run.run_id),
     );
-    // Replay-side execution-graph nodes ride the observed stream as
-    // `DejaRecord::GraphNode` lines, already registered above.
     // Static HTML visualization (the demo's existing visualize-replay.py);
     // best-effort — python3 may be absent.
     let viz = root
@@ -2644,7 +2684,8 @@ fn wait_s3_objects(recording_id: &str, timeout: Duration) -> Result<(), String> 
 fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Result<(), String> {
     let cfg = crate::s3::S3Config::from_env();
     let dest = root.recording_events_path(recording_id);
-    let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &dest)?;
+    let (report, manifest) =
+        crate::s3::pull_recording(&cfg, recording_id, &dest).map_err(|e| e.to_string())?;
     let gaps: usize = manifest.instances.iter().map(|i| i.gaps.len()).sum();
     let line = format!(
         "ingested {recording_id}: {} landing object(s), {} line(s), {} duplicate(s) dropped → \
@@ -2661,16 +2702,6 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
     if report.events_out == 0 {
         return Err(format!("recording {recording_id} pulled empty from S3"));
     }
-    // Consumer shim: deja-tui / deja-semantic-metrics historically read the
-    // JSONL primary at {root}/recording/semantic-events.jsonl. Kafka is the
-    // only sink now, so materialize the pulled copy there too.
-    let legacy_copy = root.root.join("recording").join("semantic-events.jsonl");
-    if let Some(parent) = legacy_copy.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::copy(&dest, &legacy_copy) {
-        eprintln!("lifecycle: semantic-events.jsonl shim copy failed: {e}");
-    }
     let report_path = dest.with_file_name("ingest-report.json");
     if let Err(e) = write_json(&report_path, &report) {
         eprintln!("lifecycle: ingest report write failed: {e}");
@@ -2681,11 +2712,41 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
         eprintln!("lifecycle: manifest copy write failed: {e}");
     }
     ctx.artifact(Some(recording_id), "manifest", &manifest_path);
+    let split = crate::split_recording_artifacts(&dest, &root.recording_graph_path(recording_id))
+        .map_err(|e| format!("split recording artifacts: {e}"))?;
+    if split.graph_nodes > 0 {
+        let line = format!(
+            "split {recording_id}: {} boundary event(s), {} graph node(s)",
+            split.boundary_events, split.graph_nodes
+        );
+        eprintln!("lifecycle: {line}");
+        ctx.log("ingest", &line);
+        ctx.artifact(
+            Some(recording_id),
+            "graph",
+            &root.recording_graph_path(recording_id),
+        );
+    }
+    // Consumer shim: deja-tui / deja-semantic-metrics historically read the
+    // JSONL primary at {root}/recording/semantic-events.jsonl. Kafka is the
+    // only sink now, so materialize the normalized replay event stream there.
+    let legacy_copy = root.root.join("recording").join("semantic-events.jsonl");
+    if let Some(parent) = legacy_copy.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::copy(&dest, &legacy_copy) {
+        eprintln!("lifecycle: semantic-events.jsonl shim copy failed: {e}");
+    }
     let bytes = std::fs::metadata(&dest).ok().map(|m| m.len() as i64);
+    let event_count = if split.boundary_events > 0 {
+        split.boundary_events as i64
+    } else {
+        report.events_out as i64
+    };
     ctx.recording(
         recording_id,
         dest.to_str(),
-        Some(report.events_out as i64),
+        Some(event_count),
         Some(report.correlations as i64),
         bytes,
         serde_json::to_value(&manifest).ok().as_ref(),
@@ -2757,6 +2818,8 @@ mod tests {
             [
                 "call_ledger",
                 "events",
+                "graph",
+                "graph_replay",
                 "http_diffs",
                 "ingest_report",
                 "lookup_table",

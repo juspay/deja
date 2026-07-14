@@ -1137,6 +1137,7 @@ mod tests {
             landing_objects: 3,
             lines_in: 30,
             duplicates_dropped: 2,
+            lines_dropped: 0,
             events_out: 28,
             correlations: 4,
             sealed: false,

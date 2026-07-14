@@ -21,6 +21,30 @@ use std::path::Path;
 
 pub use deja_compactor::S3Config;
 
+/// Typed ingest failure. `S3` wraps the compactor's string errors at that
+/// crate boundary; everything downstream is structured.
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error("{0}")]
+    S3(String),
+    #[error("{0}")]
+    Decode(String),
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("unsupported recording source {0:?}; expected s3://bucket/key-or-prefix")]
+    UnsupportedSource(String),
+    #[error("recording {recording_id} produced no valid events ({lines_in} line(s) in, {lines_dropped} dropped)")]
+    NoEvents {
+        recording_id: String,
+        lines_in: usize,
+        lines_dropped: usize,
+    },
+}
+
 /// What `pull_recording` reports back (persisted next to the events file,
 /// registered as a run artifact, folded into the catalog row).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -29,6 +53,10 @@ pub struct IngestReport {
     pub landing_objects: usize,
     pub lines_in: usize,
     pub duplicates_dropped: usize,
+    /// Lines that failed to parse or carried an unknown artifact type. Sink
+    /// markers and blank lines are transport bookkeeping, not drops.
+    #[serde(default)]
+    pub lines_dropped: usize,
     pub events_out: usize,
     pub correlations: usize,
     pub sealed: bool,
@@ -101,8 +129,8 @@ struct EventBreakdownProbe {
 
 /// Count landing objects for a recording (the "did Vector land anything yet /
 /// has the flush settled" poll the lifecycle runs before compacting).
-pub fn count_session_objects(cfg: &S3Config, recording_id: &str) -> Result<usize, String> {
-    deja_compactor::count_landing_objects(cfg, recording_id)
+pub fn count_session_objects(cfg: &S3Config, recording_id: &str) -> Result<usize, IngestError> {
+    deja_compactor::count_landing_objects(cfg, recording_id).map_err(IngestError::S3)
 }
 
 /// Pull a session recording into `dest` (the canonical
@@ -112,14 +140,22 @@ pub fn pull_recording(
     cfg: &S3Config,
     recording_id: &str,
     dest: &Path,
-) -> Result<(IngestReport, deja_compactor::SessionManifest), String> {
-    let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
+) -> Result<(IngestReport, deja_compactor::SessionManifest), IngestError> {
+    let manifest = match deja_compactor::read_manifest(cfg, recording_id).map_err(IngestError::S3)?
+    {
         Some(m) => m,
-        None => deja_compactor::compact_session(cfg, recording_id)?,
+        None => deja_compactor::compact_session(cfg, recording_id).map_err(IngestError::S3)?,
     };
-    let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
+    let lines = deja_compactor::read_session_lines(cfg, &manifest).map_err(IngestError::S3)?;
     let chunk = lines.join("\n").into_bytes();
-    let (events, lines_in, duplicates) = collate(&[chunk]);
+    let (events, lines_in, duplicates, dropped) = collate(&[chunk]);
+    if events.is_empty() {
+        return Err(IngestError::NoEvents {
+            recording_id: recording_id.to_owned(),
+            lines_in,
+            lines_dropped: dropped,
+        });
+    }
 
     write_events(dest, &events)?;
 
@@ -128,6 +164,7 @@ pub fn pull_recording(
         landing_objects: manifest.counts.landing_objects,
         lines_in,
         duplicates_dropped: manifest.counts.duplicates_dropped + duplicates,
+        lines_dropped: dropped,
         events_out: events.len(),
         correlations: manifest.counts.correlations,
         sealed: true,
@@ -151,7 +188,7 @@ pub fn pull_recording_source(
     recording_id: &str,
     recording_source_uri: Option<&str>,
     dest: &Path,
-) -> Result<PulledRecording, String> {
+) -> Result<PulledRecording, IngestError> {
     let Some(source) = recording_source_uri.filter(|source| !source.trim().is_empty()) else {
         let (report, manifest) = pull_recording(cfg, recording_id, dest)?;
         return Ok(PulledRecording {
@@ -165,9 +202,7 @@ pub fn pull_recording_source(
             manifest: None,
         });
     }
-    Err(format!(
-        "unsupported recording source {source:?}; expected s3://bucket/key-or-prefix"
-    ))
+    Err(IngestError::UnsupportedSource(source.to_owned()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,18 +211,18 @@ struct S3Uri {
     key: String,
 }
 
-fn parse_s3_uri(uri: &str) -> Result<S3Uri, String> {
+fn parse_s3_uri(uri: &str) -> Result<S3Uri, IngestError> {
     let without_scheme = uri
         .trim()
         .strip_prefix("s3://")
-        .ok_or_else(|| format!("recording source is not an s3 URI: {uri}"))?;
-    let (bucket, key) = without_scheme
-        .split_once('/')
-        .ok_or_else(|| format!("s3 URI must include a bucket and key/prefix: {uri}"))?;
+        .ok_or_else(|| IngestError::Decode(format!("recording source is not an s3 URI: {uri}")))?;
+    let (bucket, key) = without_scheme.split_once('/').ok_or_else(|| {
+        IngestError::Decode(format!("s3 URI must include a bucket and key/prefix: {uri}"))
+    })?;
     if bucket.trim().is_empty() || key.trim().is_empty() {
-        return Err(format!(
+        return Err(IngestError::Decode(format!(
             "s3 URI must include a bucket and key/prefix: {uri}"
-        ));
+        )));
     }
     Ok(S3Uri {
         bucket: bucket.to_owned(),
@@ -208,13 +243,13 @@ fn is_supported_recording_key(key: &str) -> bool {
     )
 }
 
-fn decode_recording_object(key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+fn decode_recording_object(key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, IngestError> {
     if key.ends_with(".gz") {
         let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
         let mut decoded = Vec::new();
         decoder
             .read_to_end(&mut decoded)
-            .map_err(|e| format!("gzip {key}: {e}"))?;
+            .map_err(|e| IngestError::Decode(format!("gzip {key}: {e}")))?;
         Ok(decoded)
     } else {
         Ok(bytes)
@@ -271,23 +306,62 @@ fn normalized_kind(kind: &str) -> String {
         .collect()
 }
 
-fn is_sink_marker_kind(kind: &str) -> bool {
-    matches!(
-        normalized_kind(kind).as_str(),
-        "dejasinkmarker" | "sinkmarker"
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactKind {
+    BoundaryEvent,
+    GraphNode,
+    SinkMarker,
 }
 
-fn default_record_kind_for_artifact(artifact_type: Option<&str>) -> Option<&'static str> {
-    let Some(artifact_type) = artifact_type else {
-        return Some("boundary_event");
-    };
-    match normalized_kind(artifact_type).as_str() {
-        "dejasinkmarker" | "sinkmarker" => None,
-        "dejagraph" | "dejagraphnode" | "graph" | "graphnode" => Some("graph_node"),
-        "dejarecord" | "dejaartifactrecord" | "artifactrecord" | "record" => Some("boundary_event"),
-        _ => Some("boundary_event"),
+impl ArtifactKind {
+    fn parse(artifact_type: Option<&str>) -> Option<Self> {
+        let Some(artifact_type) = artifact_type else {
+            return Some(Self::BoundaryEvent);
+        };
+        match normalized_kind(artifact_type).as_str() {
+            "dejasinkmarker" | "sinkmarker" => Some(Self::SinkMarker),
+            "dejagraph" | "dejagraphnode" | "graph" | "graphnode" => Some(Self::GraphNode),
+            "dejarecord" | "dejaartifactrecord" | "artifactrecord" | "record" => {
+                Some(Self::BoundaryEvent)
+            }
+            _ => None,
+        }
     }
+
+    fn record_kind(self) -> Option<&'static str> {
+        match self {
+            Self::BoundaryEvent => Some("boundary_event"),
+            Self::GraphNode => Some("graph_node"),
+            Self::SinkMarker => None,
+        }
+    }
+}
+
+fn is_sink_marker_kind(kind: &str) -> bool {
+    ArtifactKind::parse(Some(kind)).is_some_and(|kind| kind == ArtifactKind::SinkMarker)
+}
+
+fn payload_from_envelope(
+    artifact_type: Option<&str>,
+    event: Option<&serde_json::value::RawValue>,
+    node: Option<&serde_json::value::RawValue>,
+) -> Option<String> {
+    let Some(kind) = ArtifactKind::parse(artifact_type) else {
+        eprintln!(
+            "ingest: dropping envelope with unknown artifact_type {:?}",
+            artifact_type.unwrap_or("<missing>")
+        );
+        return None;
+    };
+    let Some(record_kind) = kind.record_kind() else {
+        return None;
+    };
+    let payload = match kind {
+        ArtifactKind::BoundaryEvent => event.or(node),
+        ArtifactKind::GraphNode => node.or(event),
+        ArtifactKind::SinkMarker => None,
+    }?;
+    Some(ensure_record_kind(payload.get(), record_kind))
 }
 
 fn has_record_kind(event_json: &str) -> bool {
@@ -432,28 +506,35 @@ fn pull_direct_s3_recording(
     cfg: &S3Config,
     uri: &str,
     dest: &Path,
-) -> Result<IngestReport, String> {
+) -> Result<IngestReport, IngestError> {
     let source = parse_s3_uri(uri)?;
     let mut source_cfg = cfg.clone();
     source_cfg.bucket = source.bucket.clone();
-    let listed = deja_compactor::list_objects(&source_cfg, &source.key)?;
+    let listed = deja_compactor::list_objects(&source_cfg, &source.key).map_err(IngestError::S3)?;
     let keys: Vec<String> = listed
         .into_iter()
         .filter(|key| is_supported_recording_key(key))
         .collect();
     if keys.is_empty() {
-        return Err(format!(
+        return Err(IngestError::S3(format!(
             "no supported recording objects found under s3://{}/{}",
             source.bucket, source.key
-        ));
+        )));
     }
 
     let mut chunks = Vec::with_capacity(keys.len());
     for key in &keys {
-        let bytes = deja_compactor::get_object(&source_cfg, key)?;
+        let bytes = deja_compactor::get_object(&source_cfg, key).map_err(IngestError::S3)?;
         chunks.push(decode_recording_object(key, bytes)?);
     }
-    let (events, lines_in, duplicates) = collate(&chunks);
+    let (events, lines_in, duplicates, dropped) = collate(&chunks);
+    if events.is_empty() {
+        return Err(IngestError::NoEvents {
+            recording_id: format!("s3://{}/{}", source.bucket, source.key),
+            lines_in,
+            lines_dropped: dropped,
+        });
+    }
     write_events(dest, &events)?;
 
     Ok(IngestReport {
@@ -461,6 +542,7 @@ fn pull_direct_s3_recording(
         landing_objects: keys.len(),
         lines_in,
         duplicates_dropped: duplicates,
+        lines_dropped: dropped,
         events_out: events.len(),
         correlations: correlation_count(&events),
         sealed: false,
@@ -469,19 +551,21 @@ fn pull_direct_s3_recording(
     })
 }
 
-fn write_events(dest: &Path, events: &[(Option<String>, u64, String)]) -> Result<(), String> {
+fn write_events(dest: &Path, events: &[(Option<String>, u64, String)]) -> Result<(), IngestError> {
+    let io_err = |context: String| move |source: std::io::Error| IngestError::Io { context, source };
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(io_err(format!("mkdir {}", parent.display())))?;
     }
     let mut out = std::io::BufWriter::new(
-        std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
+        std::fs::File::create(dest).map_err(io_err(format!("create {}", dest.display())))?,
     );
     for (_, _, line) in events {
         out.write_all(line.as_bytes())
             .and_then(|_| out.write_all(b"\n"))
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+            .map_err(io_err(format!("write {}", dest.display())))?;
     }
-    out.flush().map_err(|e| format!("flush: {e}"))
+    out.flush().map_err(io_err("flush".to_owned()))
 }
 
 fn correlation_count(events: &[(Option<String>, u64, String)]) -> usize {
@@ -536,11 +620,12 @@ fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
 /// are not globally unique in older tapes, so dedupe must not collapse records
 /// solely by `(recording_run_id, global_sequence)`.
 #[allow(clippy::type_complexity)]
-fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize, usize) {
+fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize, usize, usize) {
     let mut seen = std::collections::HashSet::new();
     let mut events: Vec<(Option<String>, u64, String)> = Vec::new();
     let mut lines_in = 0usize;
     let mut duplicates = 0usize;
+    let mut dropped = 0usize;
     for chunk in raw_chunks {
         for line_str in records_from_chunk(chunk) {
             lines_in += 1;
@@ -550,45 +635,39 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize
             // Landing lines are envelopes; the payload's raw bytes are kept.
             let event_raw: String = match serde_json::from_str::<EnvelopeProbe>(&line_str) {
                 Ok(EnvelopeProbe {
-                    artifact_type,
-                    event: Some(event),
-                    ..
-                }) => {
-                    // The canonical events.jsonl is a `DejaRecord` stream,
-                    // internally tagged by `record_kind`. The wire envelope's
-                    // `artifact_type` is the record kind, but the sink omits
-                    // the tag from the raw event payload — stamp the matching
-                    // one as we unwrap so the renderer and kernel can
-                    // deserialize the line as a `DejaRecord`.
-                    let Some(record_kind) =
-                        default_record_kind_for_artifact(artifact_type.as_deref())
-                    else {
-                        continue;
-                    };
-                    ensure_record_kind(event.get(), record_kind)
-                }
-                Ok(EnvelopeProbe {
-                    artifact_type,
-                    node: Some(node),
-                    ..
-                }) => {
-                    let Some(record_kind) =
-                        default_record_kind_for_artifact(artifact_type.as_deref())
-                    else {
-                        continue;
-                    };
-                    ensure_record_kind(node.get(), record_kind)
-                }
-                Ok(EnvelopeProbe {
-                    artifact_type: Some(_),
+                    artifact_type: None,
                     event: None,
                     node: None,
-                }) => continue,
+                }) => match serde_json::from_str::<EventProbe>(&line_str) {
+                    Ok(_) if line_str.contains("\"record_kind\"") => line_str,
+                    Ok(_) => stamp_record_kind(&line_str, "boundary_event"),
+                    Err(_) => {
+                        eprintln!("ingest: dropping non-envelope line");
+                        dropped += 1;
+                        continue;
+                    }
+                },
+                Ok(EnvelopeProbe {
+                    artifact_type,
+                    event,
+                    node,
+                }) => match payload_from_envelope(artifact_type.as_deref(), event, node) {
+                    Some(payload) => payload,
+                    None => {
+                        if ArtifactKind::parse(artifact_type.as_deref())
+                            .is_none_or(|kind| kind != ArtifactKind::SinkMarker)
+                        {
+                            dropped += 1;
+                        }
+                        continue;
+                    }
+                },
                 _ => match serde_json::from_str::<EventProbe>(&line_str) {
                     Ok(_) if line_str.contains("\"record_kind\"") => line_str,
                     Ok(_) => stamp_record_kind(&line_str, "boundary_event"),
                     Err(_) => {
                         eprintln!("ingest: dropping non-envelope line");
+                        dropped += 1;
                         continue;
                     }
                 },
@@ -599,6 +678,7 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("ingest: dropping unparseable line ({e})");
+                    dropped += 1;
                     continue;
                 }
             };
@@ -610,7 +690,7 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize
         }
     }
     events.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    (events, lines_in, duplicates)
+    (events, lines_in, duplicates, dropped)
 }
 
 #[cfg(test)]
@@ -621,6 +701,28 @@ mod tests {
         format!(
             r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"router-h-1","event":{{"recording_run_id":"{rid}","global_sequence":{gseq}{payload_extra}}}}}"#
         )
+    }
+
+    #[test]
+    fn collate_counts_dropped_lines() {
+        let junk = b"not-json\n{\"artifact_type\":\"unexpected_record_type\",\"event\":{\"global_sequence\":1}}\n".to_vec();
+        let (events, lines_in, _dupes, dropped) = collate(&[junk]);
+        assert!(events.is_empty());
+        assert_eq!(lines_in, 2);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn no_events_error_reports_counts() {
+        let err = IngestError::NoEvents {
+            recording_id: "rec-1".into(),
+            lines_in: 5,
+            lines_dropped: 5,
+        };
+        assert_eq!(
+            err.to_string(),
+            "recording rec-1 produced no valid events (5 line(s) in, 5 dropped)"
+        );
     }
 
     #[test]
@@ -637,7 +739,7 @@ mod tests {
             envelope("r1", 1, r#","k":"a""#), // duplicate of obj1's gseq 1
             envelope("r1", 2, r#","k":"b""#),
         );
-        let (events, lines_in, dupes) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
         assert_eq!(lines_in, 6);
         assert_eq!(dupes, 1);
         let gseqs: Vec<u64> = events.iter().map(|(_, g, _)| *g).collect();
@@ -650,7 +752,7 @@ mod tests {
     fn collate_keeps_distinct_runs_apart() {
         let chunks =
             vec![format!("{}\n{}\n", envelope("r2", 1, ""), envelope("r1", 1, "")).into_bytes()];
-        let (events, _, dupes) = collate(&chunks);
+        let (events, _, dupes, _dropped) = collate(&chunks);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0.as_deref(), Some("r1")); // sorted by (rid, gseq)
@@ -671,7 +773,7 @@ mod tests {
     #[test]
     fn collate_accepts_raw_event_lines() {
         let raw = br#"{"recording_run_id":"r1","global_sequence":7,"correlation_id":"c1"}"#;
-        let (events, lines_in, dupes) = collate(&[raw.to_vec()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[raw.to_vec()]);
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 1);
@@ -686,7 +788,7 @@ mod tests {
         let raw = br#"{"recording_run_id":"r1","global_sequence":2,"correlation_id":"c1"}"#;
         let chunk = [marker.as_slice(), b"\n", raw.as_slice()].concat();
 
-        let (events, lines_in, dupes) = collate(&[chunk]);
+        let (events, lines_in, dupes, _dropped) = collate(&[chunk]);
 
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
@@ -703,7 +805,7 @@ mod tests {
             envelope("r1", 1, r#","k":"a""#),
         );
 
-        let (events, lines_in, dupes) = collate(&[array.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[array.into_bytes()]);
 
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
@@ -756,7 +858,7 @@ mod tests {
         })
         .to_string();
 
-        let (events, lines_in, dupes) = collate(&[envelope.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[envelope.into_bytes()]);
 
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
@@ -833,7 +935,7 @@ mod tests {
             })
         );
 
-        let (events, lines_in, dupes) = collate(&[chunk.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[chunk.into_bytes()]);
 
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
@@ -902,7 +1004,7 @@ mod tests {
             })
         );
 
-        let (events, lines_in, dupes) = collate(&[chunk.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[chunk.into_bytes()]);
 
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
@@ -941,7 +1043,7 @@ mod tests {
         })
         .to_string();
 
-        let (events, lines_in, dupes) = collate(&[envelope.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[envelope.into_bytes()]);
 
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
@@ -954,6 +1056,28 @@ mod tests {
             }
             other => panic!("expected graph node, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn collate_drops_unknown_envelope_artifact_type() {
+        let event = serde_json::json!({
+            "recording_run_id": "r1",
+            "global_sequence": 1,
+            "correlation_id": "c1"
+        });
+        let envelope = serde_json::json!({
+            "schema_version": 2,
+            "artifact_type": "unexpected_record_type",
+            "instance_id": "router-h-1",
+            "event": event
+        })
+        .to_string();
+
+        let (events, lines_in, dupes, _dropped) = collate(&[envelope.into_bytes()]);
+
+        assert_eq!(lines_in, 1);
+        assert_eq!(dupes, 0);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -987,7 +1111,7 @@ mod tests {
         })
         .to_string();
 
-        let (events, lines_in, dupes) = collate(&[envelope.into_bytes()]);
+        let (events, lines_in, dupes, _dropped) = collate(&[envelope.into_bytes()]);
 
         assert_eq!(lines_in, 1);
         assert_eq!(dupes, 0);
@@ -1026,7 +1150,7 @@ mod tests {
         })
         .to_string();
 
-        let (events, _, _) = collate(&[envelope.into_bytes()]);
+        let (events, _, _, _) = collate(&[envelope.into_bytes()]);
 
         assert_eq!(events.len(), 1);
         let record: deja::DejaRecord = serde_json::from_str(&events[0].2).unwrap();
@@ -1061,7 +1185,7 @@ mod tests {
         gz.write_all(array.as_bytes()).unwrap();
         let decoded = decode_recording_object("part.log.gz", gz.finish().unwrap()).unwrap();
 
-        let (events, lines_in, dupes) = collate(&[decoded]);
+        let (events, lines_in, dupes, _dropped) = collate(&[decoded]);
 
         assert_eq!(lines_in, 2);
         assert_eq!(dupes, 0);
