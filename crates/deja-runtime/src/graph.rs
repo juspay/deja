@@ -228,6 +228,7 @@ impl GraphSpanState {
             fields: self.fields,
             started_ns: self.started_ns,
             closed_ns,
+            extras: serde_json::Map::new(),
         }
     }
 }

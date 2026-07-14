@@ -121,18 +121,24 @@ impl ArtifactLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionGraphNode {
+    #[serde(deserialize_with = "crate::serde_lenient::u64_lenient")]
     pub node_id: u64,
     /// Global stream sequence stamped by the recording hook when the node is
     /// tape-carried: graph nodes share the boundary-event counter, so drop
     /// accounting and ordering cover one totally-ordered stream.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::serde_lenient::u64_lenient")]
     pub global_sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_lenient::opt_u64_lenient"
+    )]
     pub parent_id: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::serde_lenient::vec_u64_lenient")]
     pub causal_parent_ids: Vec<u64>,
+    #[serde(deserialize_with = "crate::serde_lenient::u64_lenient")]
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_run_id: Option<String>,
@@ -141,9 +147,18 @@ pub struct ExecutionGraphNode {
     pub level: String,
     #[serde(default)]
     pub fields: BTreeMap<String, serde_json::Value>,
+    #[serde(deserialize_with = "crate::serde_lenient::u64_lenient")]
     pub started_ns: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_lenient::opt_u64_lenient"
+    )]
     pub closed_ns: Option<u64>,
+    /// Unknown sibling fields from newer/older recorders, preserved so typed
+    /// round-trips (notably replay ingest) never drop cross-version data.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ExecutionGraphNode {
@@ -2209,4 +2224,43 @@ pub struct ArtifactManifest {
 
 impl ArtifactManifest {
     pub const SCHEMA_VERSION: &'static str = "deja.manifest/v1";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_graph_node_parses_stringified_numbers_and_keeps_unknown_fields() {
+        let json = r#"{
+            "node_id":"7","global_sequence":"2","parent_id":"1",
+            "causal_parent_ids":["1","6"],"sequence":"3",
+            "recording_run_id":"r1","span_name":"request","target":"router",
+            "level":"INFO","fields":{},"started_ns":"1783029410812345678",
+            "closed_ns":"1783029410812345999","future_field":{"x":1}
+        }"#;
+        let node: ExecutionGraphNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.node_id, 7);
+        assert_eq!(node.global_sequence, 2);
+        assert_eq!(node.parent_id, Some(1));
+        assert_eq!(node.causal_parent_ids, vec![1, 6]);
+        assert_eq!(node.sequence, 3);
+        assert_eq!(node.started_ns, 1_783_029_410_812_345_678);
+        assert_eq!(node.closed_ns, Some(1_783_029_410_812_345_999));
+        assert_eq!(node.extras["future_field"]["x"], 1);
+
+        // Unknown fields survive a typed round-trip.
+        let out = serde_json::to_string(&node).unwrap();
+        let reparsed: ExecutionGraphNode = serde_json::from_str(&out).unwrap();
+        assert_eq!(reparsed.extras["future_field"]["x"], 1);
+    }
+
+    #[test]
+    fn execution_graph_node_without_extras_serializes_no_extras_key() {
+        let json = r#"{"node_id":1,"sequence":0,"span_name":"s","target":"t",
+            "level":"INFO","started_ns":5}"#;
+        let node: ExecutionGraphNode = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&node).unwrap();
+        assert!(!out.contains("extras"));
+    }
 }

@@ -3182,6 +3182,49 @@ fn shadow_observe_loud<F: FnOnce()>(boundary: &str, method: &str, observe: F) {
     }
 }
 
+/// A deliberately tiny safety valve for deterministic local entropy misses.
+///
+/// AES-GCM encryption is pure once the nonce is chosen; the nonce seam is the
+/// only entropy. If an older or partial tape is missing this exact nonce event,
+/// continuing with a fresh nonce is better than aborting the whole request, and
+/// the lookup miss has already been emitted for the scorer. Keep this narrow:
+/// ordinary `id`, `time`, `http`, `db`, and `redis` Substitute misses still
+/// fail-stop.
+fn can_execute_substitute_miss(spec: &BoundarySpec) -> bool {
+    spec.boundary == "id" && spec.method_name == "GcmAes256::nonce"
+}
+
+fn execute_allowed_substitute_miss<T, F>(spec: &BoundarySpec, run: F) -> Option<T>
+where
+    F: FnOnce() -> T,
+{
+    if !can_execute_substitute_miss(spec) {
+        return None;
+    }
+    eprintln!(
+        "deja: Substitute boundary `{}::{}` missed the recording; executing the \
+         deterministic local entropy boundary instead of fail-stopping.",
+        spec.boundary, spec.method_name
+    );
+    Some(run())
+}
+
+async fn execute_allowed_substitute_miss_async<T, Fut, F>(spec: &BoundarySpec, run: F) -> Option<T>
+where
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+{
+    if !can_execute_substitute_miss(spec) {
+        return None;
+    }
+    eprintln!(
+        "deja: Substitute boundary `{}::{}` missed the recording; executing the \
+         deterministic local entropy boundary instead of fail-stopping.",
+        spec.boundary, spec.method_name
+    );
+    Some(run().await)
+}
+
 pub fn dispatch<T, A, F, C, R, O>(
     obs: CrossingObservation,
     args: A,
@@ -3244,6 +3287,9 @@ where
                             ),
                         },
                         None => {
+                            if let Some(out) = execute_allowed_substitute_miss(&obs.spec, run) {
+                                return out;
+                            }
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
                         }
                     }
@@ -3373,6 +3419,11 @@ where
                             ),
                         },
                         None => {
+                            if let Some(out) =
+                                execute_allowed_substitute_miss_async(&obs.spec, run).await
+                            {
+                                return out;
+                            }
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
                         }
                     }
@@ -3484,6 +3535,9 @@ where
                             ),
                         },
                         None => {
+                            if let Some(out) = execute_allowed_substitute_miss(&obs.spec, run) {
+                                return out;
+                            }
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
                         }
                     }
@@ -3557,6 +3611,11 @@ where
                             ),
                         },
                         None => {
+                            if let Some(out) =
+                                execute_allowed_substitute_miss_async(&obs.spec, run).await
+                            {
+                                return out;
+                            }
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
                         }
                     }
@@ -4112,6 +4171,7 @@ mod tests {
             fields: std::collections::BTreeMap::new(),
             started_ns: 10,
             closed_ns: Some(20),
+            extras: serde_json::Map::new(),
         };
         let json = serde_json::to_value(DejaRecord::GraphNode(node.clone())).unwrap();
         // One flat object: the tag sits beside the node's own fields.
@@ -5320,6 +5380,76 @@ mod tests {
         assert!(
             hook.recorded.lock().unwrap().is_empty(),
             "fail-stopped replay must not record a live fall-through result"
+        );
+    }
+
+    #[test]
+    fn dispatch_with_hook_lookup_miss_fail_stops_before_run() {
+        let mut hook = FakeHook::new(true);
+        hook.execute = true; // replay mode, but no lookup value
+        let ran = std::cell::Cell::new(false);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_with_hook(
+                delegate_obs_with_spec(&hook, BoundarySpec::new("unit", "T", "m")),
+                serde_json::json!({"k": "v"}),
+                || {
+                    ran.set(true);
+                    5u64
+                },
+                |v| match serde_json::from_value::<u64>(v) {
+                    Ok(value) => Reconstructed::Value(value),
+                    Err(_) => Reconstructed::Failed,
+                },
+                |r: &u64| (serde_json::json!(*r), false),
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "ordinary Substitute lookup misses must still fail-stop"
+        );
+        assert!(
+            !ran.get(),
+            "fail-stop must happen before the real delegate closure is called"
+        );
+    }
+
+    #[test]
+    fn dispatch_with_hook_gcm_nonce_lookup_miss_executes_live_boundary() {
+        let mut hook = FakeHook::new(true);
+        hook.execute = true; // replay mode, but no lookup value
+        let ran = std::cell::Cell::new(false);
+
+        let out = dispatch_with_hook(
+            delegate_obs_with_spec(
+                &hook,
+                BoundarySpec::new("id", "common_utils::crypto", "GcmAes256::nonce"),
+            ),
+            serde_json::json!([]),
+            || {
+                ran.set(true);
+                123u64
+            },
+            |v| match serde_json::from_value::<u64>(v) {
+                Ok(value) => Reconstructed::Value(value),
+                Err(_) => Reconstructed::Failed,
+            },
+            |r: &u64| (serde_json::json!(*r), false),
+        );
+
+        assert_eq!(out, 123);
+        assert!(
+            ran.get(),
+            "the GcmAes256 nonce miss should execute the real local entropy seam"
+        );
+        assert!(
+            hook.recorded.lock().unwrap().is_empty(),
+            "replay fallback must not write a fresh recording"
+        );
+        assert!(
+            hook.shadow_observed.lock().unwrap().is_empty(),
+            "the lookup miss observation is enough; this fallback must not double-observe"
         );
     }
 
