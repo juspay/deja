@@ -29,6 +29,12 @@ export type RunRow = {
   };
 };
 
+export type CreateRunResponse = {
+  run_id: string;
+  status: string;
+  source_run_id?: string;
+};
+
 export type SessionManifest = {
   status: string;
   counts: {
@@ -247,12 +253,17 @@ export const api = {
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
   createRun: (spec: Record<string, unknown>) => {
-    return request<{ run_id: string; status: string }>("/api/v1/runs", {
+    return request<CreateRunResponse>("/api/v1/runs", {
       method: "POST",
       headers: mutationHeaders(),
       body: JSON.stringify(spec),
     });
   },
+  rerunRun: (id: string) =>
+    request<CreateRunResponse>(`/api/v1/runs/${id}/rerun`, {
+      method: "POST",
+      headers: mutationHeaders(),
+    }),
   killRun: (id: string) =>
     request<{
       ok: boolean;

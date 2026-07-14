@@ -1,6 +1,6 @@
 import React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactRow, Scorecard, StageRow } from "../lib/api";
 import DiffView from "../components/DiffView";
 import GraphView from "../components/GraphView";
@@ -121,6 +121,7 @@ type Tab = (typeof TABS)[number];
 
 export default function RunDetailPage() {
   const { runId = "" } = useParams();
+  const nav = useNavigate();
   const [params, setParams] = useSearchParams();
   const queryClient = useQueryClient();
   const tab = (params.get("tab") as Tab) || "overview";
@@ -152,6 +153,13 @@ export default function RunDetailPage() {
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+  const rerun = useMutation({
+    mutationFn: () => api.rerunRun(runId),
+    onSuccess: (resp) => {
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+      nav(`/runs/${resp.run_id}`);
+    },
+  });
 
   if (run.isLoading) return <p className="hint">loading…</p>;
   if (run.error || !run.data) return <p className="err">{String(run.error)}</p>;
@@ -175,13 +183,24 @@ export default function RunDetailPage() {
           <span className={`chip ${r.state}`}>{r.state}</span>{" "}
           {r.verdict && <span className={`chip solid ${r.verdict}`}>{r.verdict}</span>}
         </h1>
-        {isReplay && (
-          <button className="danger" type="button" onClick={onKillSandbox} disabled={killSandbox.isPending}>
-            {killSandbox.isPending ? "killing…" : terminal ? "clean sandbox" : "kill sandbox"}
+        <div className="titlebar-actions">
+          <button
+            className="secondary"
+            type="button"
+            onClick={() => rerun.mutate()}
+            disabled={rerun.isPending}
+          >
+            {rerun.isPending ? "rerunning…" : "rerun"}
           </button>
-        )}
+          {isReplay && (
+            <button className="danger" type="button" onClick={onKillSandbox} disabled={killSandbox.isPending}>
+              {killSandbox.isPending ? "killing…" : terminal ? "clean sandbox" : "kill sandbox"}
+            </button>
+          )}
+        </div>
       </div>
       {killSandbox.error && <p className="err">{String(killSandbox.error)}</p>}
+      {rerun.error && <p className="err">{String(rerun.error)}</p>}
 
       <nav className="subtabs">
         {TABS.map((t) => {

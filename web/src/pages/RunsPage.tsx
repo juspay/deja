@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { api, RunRow } from "../lib/api";
 
@@ -29,10 +29,18 @@ function OutcomeBadge({ r }: { r: RunRow }) {
 
 export default function RunsPage() {
   const nav = useNavigate();
+  const queryClient = useQueryClient();
   const runs = useQuery({
     queryKey: ["runs"],
     queryFn: api.runs,
     refetchInterval: 5000,
+  });
+  const rerun = useMutation({
+    mutationFn: (runId: string) => api.rerunRun(runId),
+    onSuccess: (resp) => {
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+      nav(`/runs/${resp.run_id}`);
+    },
   });
 
   if (runs.isLoading) return <p className="hint">loading…</p>;
@@ -60,6 +68,7 @@ export default function RunsPage() {
             <th>candidate sha</th>
             <th>actor</th>
             <th>created</th>
+            <th />
           </tr>
         </thead>
         <tbody>
@@ -93,6 +102,20 @@ export default function RunsPage() {
               </td>
               <td>{r.created_by}</td>
               <td>{new Date(r.created_at).toLocaleTimeString()}</td>
+              <td className="actions">
+                <button
+                  className="secondary compact"
+                  type="button"
+                  disabled={rerun.isPending}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    rerun.mutate(r.run_id);
+                  }}
+                >
+                  rerun
+                </button>
+              </td>
             </tr>
           ))}
           {runs.data?.length === 0 && (
@@ -105,6 +128,7 @@ export default function RunsPage() {
           )}
         </tbody>
       </table>
+      {rerun.error && <p className="err">{String(rerun.error)}</p>}
     </>
   );
 }

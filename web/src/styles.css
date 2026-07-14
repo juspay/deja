@@ -194,6 +194,16 @@ button {
 }
 button:hover { background: var(--accent-hover); }
 button:disabled { opacity: 0.5; cursor: default; }
+button.secondary {
+  background: var(--surface-overlay);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+}
+button.secondary:hover { background: var(--border); }
+button.compact {
+  padding: 4px 10px;
+  font-size: var(--fs-12);
+}
 button.danger {
   background: rgba(248, 81, 73, 0.12);
   color: var(--red-fg);
@@ -228,6 +238,7 @@ iframe.viz { width: 100%; height: 70vh; border: 1px solid var(--border); border-
 .titlebar { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s3); margin-bottom: var(--s4); }
 .titlebar h1 { flex: 1; min-width: 0; flex-wrap: wrap; margin-bottom: 0; }
 .titlebar button { flex: 0 0 auto; }
+.titlebar-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); flex-wrap: wrap; }
 .subtabs { display: flex; gap: var(--s1); border-bottom: 1px solid var(--border); margin: var(--s1) 0 var(--s5); }
 .subtab {
   background: transparent; color: var(--text-subtle); border: 0; border-bottom: 2px solid transparent;
