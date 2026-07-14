@@ -8,6 +8,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod serde_lenient;
+
 pub const ARTIFACT_SCHEMA_VERSION_V1: ArtifactSchemaVersion = ArtifactSchemaVersion::V1;
 pub const ARTIFACT_STORAGE_KIND_DIRECTORY: ArtifactStorageKind = ArtifactStorageKind::Directory;
 pub const METADATA_FILE_NAME: &str = "metadata.json";
