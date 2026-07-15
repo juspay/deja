@@ -267,9 +267,10 @@ tr.ok td{background:#f2faf3}tr.bad td{background:#fdf0ee}tr.warn td{background:#
 tr.muted td{color:#888}tr.detail td{background:#fff}\
 .sbs{display:flex;gap:1rem}.sbs>div{flex:1;min-width:0}\
 .sbs pre{background:#f6f6f6;border:1px solid #e2e2e2;border-radius:4px;padding:6px;\
-overflow-x:auto;font-size:12px}\
+font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}\
 .sbs h4{margin:.3rem 0}\
-.dl{background:#ffe3a8;display:inline-block;width:100%}\
+.dl{background:#ffe3a8;display:inline-block;width:100%;white-space:pre-wrap;\
+overflow-wrap:anywhere}\
 ";
 
 /// Read the run's http-diffs + call-ledger JSONL files (tolerating a missing
