@@ -19,12 +19,22 @@ function spanOf(c: CallRecord): string {
 
 type Group = { key: string; boundary: string; method: string; span: string; novel?: CallRecord; omitted?: CallRecord };
 
+// The db table an args payload targets — part of the grouping key so a novel
+// payment_attempt update never visually merges with an omitted payment_intent
+// update that shares the generic method name (mirrors the detector's
+// table-aware args-free pairing).
+function tableOf(c: CallRecord): string {
+  const args = (c.observed?.args ?? c.recorded?.args) as Record<string, unknown> | undefined;
+  const t = args && typeof args === "object" ? args["table"] : undefined;
+  return typeof t === "string" ? t : "";
+}
+
 function groupDivergences(calls: CallRecord[]) {
   const by = new Map<string, Group>();
   for (const c of calls) {
     if (c.kind !== "novel" && c.kind !== "omitted") continue;
     const span = spanOf(c);
-    const key = `${span}|${c.boundary}|${c.method_name}`;
+    const key = `${span}|${c.boundary}|${c.method_name}|${tableOf(c)}`;
     const g = by.get(key) ?? { key, boundary: c.boundary, method: c.method_name, span };
     if (c.kind === "novel") g.novel = c;
     else g.omitted = c;

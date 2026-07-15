@@ -200,7 +200,10 @@ pub(crate) fn build_with_inconclusive(
     // twin). Pair them by call-site identity (correlation, boundary, method) in
     // FIFO source order so the ledger shows ONE value_diverged consequence row
     // carrying recorded 0.10 + observed 0.20 — parity with the scorecard.
-    type Identity = (Option<String>, String, String);
+    // Identity carries the db TABLE (from the recorded event's args) so
+    // same-method updates of different tables never share a FIFO queue —
+    // mirrors `detect()`.
+    type Identity = (Option<String>, String, String, Option<String>);
     let mut recorded_pairing: HashMap<Identity, std::collections::VecDeque<u64>> = HashMap::new();
     {
         let mut by_identity: Vec<(Identity, u64)> = expected_seqs
@@ -212,6 +215,7 @@ pub(crate) fn build_with_inconclusive(
                         ev.correlation_id.clone(),
                         ev.boundary.clone(),
                         ev.method_name.clone(),
+                        super::pairing_table(&ev.boundary, &ev.args),
                     ),
                     ev.global_sequence,
                 )
@@ -282,12 +286,11 @@ pub(crate) fn build_with_inconclusive(
             && !is_nonblocking_boundary(&obs.boundary)
             && tier_for(&obs.boundary) != Tier::Environmental
         {
-            let id: Identity = (
-                obs.correlation_id.clone(),
-                obs.boundary.clone(),
-                obs.method_name.clone(),
-            );
-            let twin = recorded_pairing.get_mut(&id).and_then(|q| {
+            fn pop_unconsumed(
+                queue: Option<&mut std::collections::VecDeque<u64>>,
+                consumed: &HashSet<u64>,
+            ) -> Option<u64> {
+                let q = queue?;
                 while let Some(seq) = q.front().copied() {
                     if consumed.contains(&seq) {
                         q.pop_front();
@@ -296,6 +299,27 @@ pub(crate) fn build_with_inconclusive(
                     }
                 }
                 None
+            }
+            // Exact table match first; table-less fallback mirrors detect().
+            let table = super::pairing_table(&obs.boundary, &obs.args);
+            let id: Identity = (
+                obs.correlation_id.clone(),
+                obs.boundary.clone(),
+                obs.method_name.clone(),
+                table,
+            );
+            let twin = pop_unconsumed(recorded_pairing.get_mut(&id), &consumed).or_else(|| {
+                if id.3.is_some() {
+                    let fallback: Identity = (
+                        obs.correlation_id.clone(),
+                        obs.boundary.clone(),
+                        obs.method_name.clone(),
+                        None,
+                    );
+                    pop_unconsumed(recorded_pairing.get_mut(&fallback), &consumed)
+                } else {
+                    None
+                }
             });
             if let Some(twin_seq) = twin {
                 paired_consumed.insert(twin_seq);

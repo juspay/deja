@@ -435,6 +435,22 @@ fn declared_value_equivalent(
     !matches!(canon, CanonPreset::AbsentAfter) && canon.equivalent(recorded, observed)
 }
 
+/// The db table an args payload targets, when derivable. Part of the
+/// args-free pairing identity (GOTCHA #1): a diverged write mutates its
+/// VALUES, never its table, so the table is the one args-derived
+/// discriminator that survives the divergence being recovered — without it,
+/// same-method updates of different tables (payment_intent vs
+/// payment_attempt through the diesel generics) share one FIFO queue and
+/// pair across tables. `None` for non-db boundaries and table-less args.
+pub(crate) fn pairing_table(boundary: &str, args: &serde_json::Value) -> Option<String> {
+    if !is_db_boundary(boundary) {
+        return None;
+    }
+    args.get("table")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 pub(crate) fn values_diverge_under_event(
     boundary: &str,
     recorded: &serde_json::Value,
@@ -1496,11 +1512,20 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // so they never enter this path and ValueDiverged stays inert.
 
     // Recorded side: unconsumed expected events grouped by args-free identity,
-    // ordered by source sequence, occurrence = position within the group.
-    type Identity = (Option<String>, String, String);
-    let identity_of = |corr: &Option<String>, boundary: &str, method: &str| -> Identity {
-        (corr.clone(), boundary.to_owned(), method.to_owned())
-    };
+    // ordered by source sequence, occurrence = position within the group. For
+    // db calls the identity carries the TABLE (from the recorded event's args)
+    // so same-method updates of different tables never share a queue; `None`
+    // when the tape is unavailable, with a matching fallback at consume time.
+    type Identity = (Option<String>, String, String, Option<String>);
+    let identity_of =
+        |corr: &Option<String>, boundary: &str, method: &str, table: Option<String>| -> Identity {
+            (corr.clone(), boundary.to_owned(), method.to_owned(), table)
+        };
+    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = art
+        .events
+        .iter()
+        .map(|ev| (ev.global_sequence, ev))
+        .collect();
     // (identity -> queue of (source_seq, recorded_result)); FIFO by source order.
     let mut recorded_pairing: BTreeMap<
         Identity,
@@ -1513,16 +1538,14 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         let (Some(boundary), Some(method)) = (&exp.boundary, &exp.method) else {
             continue;
         };
+        let table = events_by_seq
+            .get(seq)
+            .and_then(|ev| pairing_table(boundary, &ev.args));
         recorded_pairing
-            .entry(identity_of(&exp.correlation, boundary, method))
+            .entry(identity_of(&exp.correlation, boundary, method, table))
             .or_default()
             .push_back((*seq, exp.result.clone()));
     }
-    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = art
-        .events
-        .iter()
-        .map(|ev| (ev.global_sequence, ev))
-        .collect();
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
@@ -1678,17 +1701,16 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
             // Background-task call with no correlation — tolerated in V1.
             stats.bump_kind("NovelCall");
-        } else if let Some((twin_seq, recorded)) = recorded_pairing
-            .get_mut(&identity_of(
-                &obs.correlation_id,
-                &obs.boundary,
-                &obs.method_name,
-            ))
-            .and_then(|q| {
-                // Pop the next recorded twin for this identity, skipping any that a
-                // resolved (args-aligned) call already claimed — so a mixed run that
-                // resolves some calls normally and re-keys others never double-binds
-                // a single recorded event.
+        } else if let Some((twin_seq, recorded)) = {
+            // Pop the next recorded twin for this identity, skipping any that a
+            // resolved (args-aligned) call already claimed — so a mixed run that
+            // resolves some calls normally and re-keys others never double-binds
+            // a single recorded event.
+            fn pop_unconsumed(
+                queue: Option<&mut std::collections::VecDeque<(u64, serde_json::Value)>>,
+                consumed: &HashSet<u64>,
+            ) -> Option<(u64, serde_json::Value)> {
+                let q = queue?;
                 while let Some((seq, _)) = q.front() {
                     if consumed.contains(seq) {
                         q.pop_front();
@@ -1697,8 +1719,21 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     }
                 }
                 None
+            }
+            // Exact table match first; fall back to the table-less queue for
+            // tapes where the recorded events were unavailable at build time.
+            let table = pairing_table(&obs.boundary, &obs.args);
+            let exact = identity_of(&obs.correlation_id, &obs.boundary, &obs.method_name, table);
+            pop_unconsumed(recorded_pairing.get_mut(&exact), &consumed).or_else(|| {
+                if exact.3.is_some() {
+                    let fallback =
+                        identity_of(&obs.correlation_id, &obs.boundary, &obs.method_name, None);
+                    pop_unconsumed(recorded_pairing.get_mut(&fallback), &consumed)
+                } else {
+                    None
+                }
             })
-        {
+        } {
             // GOTCHA #1 resolution: this unresolved observed call pairs args-free
             // (correlation+boundary+method, FIFO occurrence) with a recorded twin
             // that the candidate "omitted" because its args were re-keyed. The
@@ -4840,6 +4875,133 @@ mod tests {
         assert_eq!(card.summary.value_divergences, 0);
         assert_eq!(card.summary.matched_side_effect_calls, 1);
         assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// Minimal db update event: table in args, plain scalar result, NO
+    /// declaration (so value comparison is plain equality, not canon-driven).
+    fn db_table_update_ev(corr: &str, table: &str, seq: u64) -> deja::BoundaryEvent {
+        serde_json::from_value(serde_json::json!({
+            "global_sequence": seq,
+            "request_sequence": 0,
+            "correlation_id": corr,
+            "timestamp_ns": 100,
+            "boundary": "db",
+            "trait_name": "diesel_models::query::generics",
+            "method_name": "m",
+            "call_file": "crates/diesel_models/src/query/generics.rs",
+            "call_line": 500,
+            "call_column": 0,
+            "request": {},
+            "args": {"table": table},
+            "response": {},
+            "result": {},
+            "is_error": false,
+            "duration_us": 0,
+            "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+            "provenance": "recorded",
+            "recon": "lossless",
+            "replay_strategy": "execute"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn args_free_pairing_keys_on_db_table() {
+        // The real-world mispair: intent (seq 10) and attempt (seq 20) updates
+        // share the args-free identity (correlation, db, "m"). The re-keyed
+        // observed call is an ATTEMPT write whose value matches the attempt
+        // twin's recorded result exactly. Without the table in the pairing key,
+        // FIFO hands it the INTENT twin (queue head) — values differ — and a
+        // bogus ValueDiverged appears. With the table in the key it pairs with
+        // the attempt twin (recovered match) and the intent event is the true
+        // Omitted.
+        let mut attempt_call =
+            exec_obs("db", Some("c1"), false, None, None, serde_json::json!(100));
+        attempt_call.args = serde_json::json!({"table": "payment_attempt"});
+        let card = detect(&art_with_events(
+            vec![
+                seq_entry_res(Some("c1"), "db", 10, serde_json::json!(999)),
+                seq_entry_res(Some("c1"), "db", 20, serde_json::json!(100)),
+            ],
+            vec![attempt_call],
+            vec![http("c1", true, vec![])],
+            vec![
+                db_table_update_ev("c1", "payment_intent", 10),
+                db_table_update_ev("c1", "payment_attempt", 20),
+            ],
+        ));
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "attempt call must pair with the attempt twin (identical value = recovered match), \
+             not the intent twin"
+        );
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(
+            card.summary.omitted_calls, 1,
+            "the intent event is the true omitted"
+        );
+    }
+
+    #[test]
+    fn ledger_args_free_pairing_keys_on_db_table() {
+        // Ledger mirror of args_free_pairing_keys_on_db_table: the
+        // value_diverged row's RECORDED side must be the same table as the
+        // observed call, never a cross-table gluing.
+        let mut attempt_call =
+            exec_obs("db", Some("c1"), false, None, None, serde_json::json!(200));
+        attempt_call.args = serde_json::json!({"table": "payment_attempt"});
+        let events = vec![
+            db_table_update_ev("c1", "payment_intent", 10),
+            db_table_update_ev("c1", "payment_attempt", 20),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        write_recording_tape(&root.recording_events_path("rec-1"), &events);
+        let rows = build_ledger(
+            &root,
+            &RunArtifacts {
+                run_id: "run-table-pairing".to_owned(),
+                recording_id: Some("rec-1".to_owned()),
+                table: LookupTable {
+                    recording_id: "rec-1".to_owned(),
+                    policy_version: 1,
+                    entries: vec![
+                        seq_entry_res(Some("c1"), "db", 10, serde_json::json!(999)),
+                        seq_entry_res(Some("c1"), "db", 20, serde_json::json!(100)),
+                    ],
+                },
+                observed: vec![attempt_call],
+                http_diffs: vec![http("c1", true, vec![])],
+                events: Vec::new(),
+                warnings: Vec::new(),
+            },
+        )
+        .unwrap();
+        let paired = rows
+            .iter()
+            .find(|row| row.kind == "value_diverged")
+            .expect("the attempt write's value differs (100 recorded vs 200 observed)");
+        let rec_table = paired
+            .recorded
+            .as_ref()
+            .and_then(|s| s.args.as_ref())
+            .and_then(|a| a.get("table"))
+            .and_then(|t| t.as_str());
+        assert_eq!(
+            rec_table,
+            Some("payment_attempt"),
+            "recorded twin must be the SAME table as the observed call"
+        );
+        assert_eq!(
+            paired.source_event_global_sequence,
+            Some(20),
+            "paired with the attempt event, not the intent event"
+        );
+        let omitted = rows
+            .iter()
+            .find(|row| row.kind == "omitted")
+            .expect("the intent event is the true omitted");
+        assert_eq!(omitted.source_event_global_sequence, Some(10));
     }
 
     #[test]
