@@ -1402,8 +1402,24 @@ pub fn addresses_for(
         // Rank 2 — logical span-path. Strongest non-explicit address: stable
         // across line/signature edits AND distinct per concurrent span, so the
         // occurrence tiebreak is span-scoped (no positional swap).
+        //
+        // Deja's own record-mode ingress wrapper span (`deja::http_incoming`)
+        // is plumbing, not application structure: record mode enters it,
+        // replay mode does not, so a path carrying it can never match a live
+        // replay path. Trim it here — the one seam shared by the renderer and
+        // the hook — so rank-2 addresses stay symmetric whichever side (or
+        // neither, or both) entered the wrapper. `deja.fork>` prefixes are
+        // deliberately kept: fork lineage is symmetric on both sides.
         if let Some(path) = &id.span_path {
-            out.push(Address::SpanPath { path: path.clone() });
+            let path = match path.strip_prefix("deja::http_incoming") {
+                Some(rest) => rest.strip_prefix('>').unwrap_or(rest),
+                None => path.as_str(),
+            };
+            if !path.is_empty() {
+                out.push(Address::SpanPath {
+                    path: path.to_owned(),
+                });
+            }
         }
         if let Some(hash) = id.syntax_hash {
             out.push(Address::SyntacticHash(hash));
@@ -3868,6 +3884,91 @@ mod tests {
                 .iter()
                 .map(|c| (c.resolved, c.resolved_rank))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ingress_wrapper_span_is_trimmed_from_rank2_addresses() {
+        // Record mode wraps every request in deja's own `deja::http_incoming`
+        // span, so recorded span paths carry that prefix; replay mode does not
+        // enter it. The rank-2 address must exclude deja's synthetic wrapper on
+        // BOTH sides (this fn is the shared renderer/hook seam), or every
+        // request-scoped lookup silently degrades to rank 3.
+        let scope = "db::Store::find";
+        let make = |logical: &str| CallsiteIdentity {
+            extras: serde_json::Map::new(),
+            version: 1,
+            source: CallsiteSource::SyntacticHash,
+            id: None,
+            scope: Some(scope.to_owned()),
+            occurrence: 0,
+            caller_function: Some("crate::module".to_owned()),
+            lexical_path: Some("crate::module".to_owned()),
+            syntax_hash: Some(crate::stable_callsite_hash(scope)),
+            span_path: Some(logical.to_owned()),
+        };
+        let recorded_id =
+            make("deja::http_incoming>HTTP request>ROOT_SPAN>payments_create>find_account");
+        let live_id = make("HTTP request>ROOT_SPAN>payments_create>find_account");
+
+        // Both sides must emit the SAME rank-2 address.
+        let rank2 = |id: &CallsiteIdentity| {
+            addresses_for("db", "find", Some(id), None, 0)
+                .into_iter()
+                .find(|a| matches!(a, Address::SpanPath { .. }))
+        };
+        assert_eq!(
+            rank2(&recorded_id),
+            Some(Address::SpanPath {
+                path: "HTTP request>ROOT_SPAN>payments_create>find_account".to_owned(),
+            }),
+            "renderer side must trim deja's ingress wrapper prefix"
+        );
+        assert_eq!(
+            rank2(&recorded_id),
+            rank2(&live_id),
+            "recorded (prefixed) and live (unprefixed) identities must produce \
+             the same rank-2 address"
+        );
+
+        // End to end: a table rendered from the prefixed recording must
+        // resolve a live unprefixed lookup at rank 2.
+        let args = serde_json::json!({ "id": 1 });
+        let mut event = make_event(
+            0,
+            Some("c1"),
+            "find",
+            args.clone(),
+            serde_json::json!({ "Ok": "account-row" }),
+            false,
+        );
+        event.boundary = "db".into();
+        event.callsite_identity = Some(recorded_id);
+        let table = render_table(&[event]);
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        let hook =
+            LookupTableHook::from_source(VecSource(Some(table)), observed).expect("from_source");
+        let _guard = deja_context::enter_correlation_id("c1");
+        assert_eq!(
+            hook.try_replay_with_context(ReplayLookup {
+                boundary: "db",
+                trait_name: "Store",
+                method_name: "find",
+                args: &args,
+                callsite_identity: Some(&live_id),
+                caller_location: None,
+            }),
+            Some(serde_json::json!({ "Ok": "account-row" })),
+        );
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.resolved, c.resolved_rank))
+                .collect::<Vec<_>>(),
+            vec![(true, Some(2))],
+            "must resolve at rank 2 (SpanPath), not fall through to rank 3"
         );
     }
 
