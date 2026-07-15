@@ -59,22 +59,149 @@ fn outcome(record: &CallRecord) -> (String, &'static str) {
     }
 }
 
-/// Side-by-side <pre> panels with differing lines highlighted by simple
-/// line-wise comparison of the pretty-printed JSON.
+/// One aligned output row of the side-by-side diff.
+enum DiffRow<'a> {
+    Same(&'a str),
+    Changed(&'a str, &'a str),
+    LeftOnly(&'a str),
+    RightOnly(&'a str),
+}
+
+/// Align two line sequences by LCS so an inserted/removed line doesn't
+/// cascade-mark everything after it; within a changed region, pair leftover
+/// lines positionally so they get intra-line highlighting. Falls back to
+/// positional pairing when the inputs are too large for the quadratic DP.
+fn diff_rows<'a>(l: &[&'a str], r: &[&'a str]) -> Vec<DiffRow<'a>> {
+    let (n, m) = (l.len(), r.len());
+    let mut rows = Vec::with_capacity(n.max(m));
+    let flush = |rows: &mut Vec<DiffRow<'a>>, dels: &mut Vec<&'a str>, inss: &mut Vec<&'a str>| {
+        let pairs = dels.len().min(inss.len());
+        for k in 0..pairs {
+            rows.push(DiffRow::Changed(dels[k], inss[k]));
+        }
+        for d in dels.iter().skip(pairs) {
+            rows.push(DiffRow::LeftOnly(d));
+        }
+        for a in inss.iter().skip(pairs) {
+            rows.push(DiffRow::RightOnly(a));
+        }
+        dels.clear();
+        inss.clear();
+    };
+    if n.saturating_mul(m) > 4_000_000 {
+        for i in 0..n.max(m) {
+            match (l.get(i), r.get(i)) {
+                (Some(a), Some(b)) if a == b => rows.push(DiffRow::Same(a)),
+                (Some(a), Some(b)) => rows.push(DiffRow::Changed(a, b)),
+                (Some(a), None) => rows.push(DiffRow::LeftOnly(a)),
+                (None, Some(b)) => rows.push(DiffRow::RightOnly(b)),
+                (None, None) => {}
+            }
+        }
+        return rows;
+    }
+    let idx = |i: usize, j: usize| i * (m + 1) + j;
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[idx(i, j)] = if l[i] == r[j] {
+                dp[idx(i + 1, j + 1)] + 1
+            } else {
+                dp[idx(i + 1, j)].max(dp[idx(i, j + 1)])
+            };
+        }
+    }
+    let (mut dels, mut inss): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if l[i] == r[j] {
+            flush(&mut rows, &mut dels, &mut inss);
+            rows.push(DiffRow::Same(l[i]));
+            i += 1;
+            j += 1;
+        } else if dp[idx(i + 1, j)] >= dp[idx(i, j + 1)] {
+            dels.push(l[i]);
+            i += 1;
+        } else {
+            inss.push(r[j]);
+            j += 1;
+        }
+    }
+    dels.extend(&l[i..]);
+    inss.extend(&r[j..]);
+    flush(&mut rows, &mut dels, &mut inss);
+    rows
+}
+
+/// Byte offsets of the longest common prefix and suffix (char-boundary safe,
+/// suffix computed over the post-prefix remainders so they never overlap).
+fn common_affixes(l: &str, r: &str) -> (usize, usize) {
+    let mut prefix = 0;
+    for (lc, rc) in l.chars().zip(r.chars()) {
+        if lc != rc {
+            break;
+        }
+        prefix += lc.len_utf8();
+    }
+    let mut suffix = 0;
+    for (lc, rc) in l[prefix..].chars().rev().zip(r[prefix..].chars().rev()) {
+        if lc != rc {
+            break;
+        }
+        suffix += lc.len_utf8();
+    }
+    (prefix, suffix)
+}
+
+/// Side-by-side <pre> panels: lines aligned by LCS, changed lines tinted with
+/// ONLY the differing segment strongly marked (del/ins), so a one-field change
+/// inside a huge Debug string reads at a glance.
 fn side_by_side(left: &serde_json::Value, right: &serde_json::Value) -> String {
     let left = pretty(left);
     let right = pretty(right);
     let l: Vec<&str> = left.lines().collect();
     let r: Vec<&str> = right.lines().collect();
-    let rows = l.len().max(r.len());
     let mut lb = String::new();
     let mut rb = String::new();
-    for i in 0..rows {
-        let lv = l.get(i).copied().unwrap_or("");
-        let rv = r.get(i).copied().unwrap_or("");
-        let class = if lv == rv { "" } else { " class=\"dl\"" };
-        lb.push_str(&format!("<span{class}>{}</span>\n", esc(lv)));
-        rb.push_str(&format!("<span{class}>{}</span>\n", esc(rv)));
+    for row in diff_rows(&l, &r) {
+        match row {
+            DiffRow::Same(line) => {
+                let line = esc(line);
+                lb.push_str(&format!("<span>{line}</span>\n"));
+                rb.push_str(&format!("<span>{line}</span>\n"));
+            }
+            DiffRow::Changed(lv, rv) => {
+                let (p, s) = common_affixes(lv, rv);
+                let lmid = &lv[p..lv.len() - s];
+                let rmid = &rv[p..rv.len() - s];
+                lb.push_str(&format!(
+                    "<span class=\"dl\">{}<mark class=\"del\">{}</mark>{}</span>\n",
+                    esc(&lv[..p]),
+                    esc(lmid),
+                    esc(&lv[lv.len() - s..]),
+                ));
+                rb.push_str(&format!(
+                    "<span class=\"dl\">{}<mark class=\"ins\">{}</mark>{}</span>\n",
+                    esc(&rv[..p]),
+                    esc(rmid),
+                    esc(&rv[rv.len() - s..]),
+                ));
+            }
+            DiffRow::LeftOnly(lv) => {
+                lb.push_str(&format!(
+                    "<span class=\"dl\"><mark class=\"del\">{}</mark></span>\n",
+                    esc(lv)
+                ));
+                rb.push_str("<span class=\"pad\"> </span>\n");
+            }
+            DiffRow::RightOnly(rv) => {
+                lb.push_str("<span class=\"pad\"> </span>\n");
+                rb.push_str(&format!(
+                    "<span class=\"dl\"><mark class=\"ins\">{}</mark></span>\n",
+                    esc(rv)
+                ));
+            }
+        }
     }
     format!(
         "<div class=\"sbs\"><div><h4>recorded</h4><pre>{lb}</pre></div>\
@@ -269,8 +396,11 @@ tr.muted td{color:#888}tr.detail td{background:#fff}\
 .sbs pre{background:#f6f6f6;border:1px solid #e2e2e2;border-radius:4px;padding:6px;\
 font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}\
 .sbs h4{margin:.3rem 0}\
-.dl{background:#ffe3a8;display:inline-block;width:100%;white-space:pre-wrap;\
+.dl{background:#fdf3dd;display:inline-block;width:100%;white-space:pre-wrap;\
 overflow-wrap:anywhere}\
+.pad{display:inline-block;width:100%;background:#f0f0f0}\
+mark.del{background:#f6c9c4;color:inherit;border-radius:2px}\
+mark.ins{background:#c4e8cc;color:inherit;border-radius:2px}\
 ";
 
 /// Read the run's http-diffs + call-ledger JSONL files (tolerating a missing
@@ -404,6 +534,38 @@ mod tests {
     #[allow(dead_code)]
     fn baseline_shape_guard(b: BaselineResponse) -> BaselineResponse {
         b
+    }
+
+    #[test]
+    fn side_by_side_marks_only_the_changed_segment() {
+        let left = serde_json::json!({"debug": "business_label: None, description: None"});
+        let right =
+            serde_json::json!({"debug": "business_label: Some(default), description: None"});
+        let html = side_by_side(&left, &right);
+        assert!(
+            html.contains("<mark class=\"del\">None</mark>"),
+            "left mid must be marked: {html}"
+        );
+        assert!(
+            html.contains("<mark class=\"ins\">Some(default)</mark>"),
+            "right mid must be marked: {html}"
+        );
+        // Shared context stays OUTSIDE the mark.
+        assert!(html.contains("business_label: <mark"));
+    }
+
+    #[test]
+    fn side_by_side_aligns_shifted_lines() {
+        // An extra field on one side must not cascade-mark every following
+        // line: "z" is identical on both sides and must render unmarked.
+        let left = serde_json::json!({"a": 1, "z": 9});
+        let right = serde_json::json!({"a": 1, "m": 5, "z": 9});
+        let html = side_by_side(&left, &right);
+        assert_eq!(
+            html.matches("class=\"dl").count(),
+            1,
+            "only the inserted line is marked: {html}"
+        );
     }
 
     #[test]
