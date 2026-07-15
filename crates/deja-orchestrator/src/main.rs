@@ -821,10 +821,7 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
         let record = rec
             .as_deref()
             .map(|r| {
-                read_sidecar_or_stream(
-                    root.recording_graph_path(r),
-                    root.recording_events_path(r),
-                )
+                read_sidecar_or_stream(root.recording_graph_path(r), root.recording_events_path(r))
             })
             .unwrap_or_default();
         let replay = read_sidecar_or_stream(root.replay_graph_path(&id), root.observed_path(&id));
