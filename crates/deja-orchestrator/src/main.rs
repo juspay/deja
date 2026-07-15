@@ -771,10 +771,20 @@ async fn v1_scorecard(State(st): State<AppState>, Path(id): Path<String>) -> Res
 /// observed, classified + located) that backs the interactive diff view.
 /// Read-through: recomputes from artifacts so it works for older runs too.
 async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    match divergence::call_ledger(&st.root, &id) {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => error_resp(500, &format!("call ledger: {e}")),
+    // Live computation needs the run's local lookup-table/observed files;
+    // sandbox runs don't have them, so fall back to the agent's uploaded
+    // call-ledger artifact (cached locally on first read).
+    if let Ok(rows) = divergence::call_ledger(&st.root, &id) {
+        if !rows.is_empty() {
+            return json_ok(serde_json::to_value(&rows).unwrap_or_default());
+        }
     }
+    let uri = artifact_uri_for(&st, &id, "call_ledger").await;
+    let local = st.root.call_ledger_path(&id);
+    let rows = tokio::task::spawn_blocking(move || hydrate_stream(&local, uri.as_deref()))
+        .await
+        .unwrap_or_default();
+    json_ok(serde_json::Value::Array(rows))
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
@@ -798,43 +808,66 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
     let rec = runs::get(&st.root, &id)
         .ok()
         .and_then(|r| r.recording_id.or(r.spec.recording_id));
-    let read_nodes = |path: std::path::PathBuf| -> Vec<serde_json::Value> {
-        let Ok(file) = std::fs::File::open(&path) else {
-            return Vec::new();
-        };
-        std::io::BufRead::lines(std::io::BufReader::new(file))
-            .map_while(Result::ok)
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(
-                |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
-                    Ok(deja::DejaRecord::GraphNode(node)) => serde_json::to_value(node).ok(),
-                    Ok(deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::Observed(_)) => None,
-                    Err(_) => serde_json::from_str::<deja_core::ExecutionGraphNode>(&line)
-                        .ok()
-                        .and_then(|node| serde_json::to_value(node).ok()),
-                },
-            )
-            .collect()
-    };
-    let read_sidecar_or_stream = |sidecar: std::path::PathBuf, stream: std::path::PathBuf| {
-        let nodes = read_nodes(sidecar);
-        if nodes.is_empty() {
-            read_nodes(stream)
-        } else {
-            nodes
+    // Hydrate sidecars from registered artifacts before reading (no-ops when
+    // the local files already have content).
+    let record_uri = artifact_uri_for(&st, &id, "graph").await;
+    let replay_uri = artifact_uri_for(&st, &id, "graph_replay").await;
+    let root = st.root.clone();
+    let (record, replay) = tokio::task::spawn_blocking(move || {
+        if let Some(r) = rec.as_deref() {
+            let _ = hydrate_stream(&root.recording_graph_path(r), record_uri.as_deref());
         }
-    };
-    let record = rec
-        .as_deref()
-        .map(|r| {
-            read_sidecar_or_stream(
-                st.root.recording_graph_path(r),
-                st.root.recording_events_path(r),
-            )
-        })
-        .unwrap_or_default();
-    let replay = read_sidecar_or_stream(st.root.replay_graph_path(&id), st.root.observed_path(&id));
+        let _ = hydrate_stream(&root.replay_graph_path(&id), replay_uri.as_deref());
+        let record = rec
+            .as_deref()
+            .map(|r| {
+                read_sidecar_or_stream(
+                    root.recording_graph_path(r),
+                    root.recording_events_path(r),
+                )
+            })
+            .unwrap_or_default();
+        let replay = read_sidecar_or_stream(root.replay_graph_path(&id), root.observed_path(&id));
+        (record, replay)
+    })
+    .await
+    .unwrap_or_default();
     json_ok(serde_json::json!({ "record": record, "replay": replay }))
+}
+
+/// Read graph nodes from a JSONL stream: tagged `DejaRecord` lines route by
+/// kind, bare `ExecutionGraphNode` lines are accepted for older artifacts.
+fn read_graph_nodes(path: std::path::PathBuf) -> Vec<serde_json::Value> {
+    let Ok(file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    std::io::BufRead::lines(std::io::BufReader::new(file))
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(
+            |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                Ok(deja::DejaRecord::GraphNode(node)) => serde_json::to_value(node).ok(),
+                Ok(deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::Observed(_)) => None,
+                Err(_) => serde_json::from_str::<deja_core::ExecutionGraphNode>(&line)
+                    .ok()
+                    .and_then(|node| serde_json::to_value(node).ok()),
+            },
+        )
+        .collect()
+}
+
+/// Prefer the dedicated graph sidecar; fall back to extracting graph nodes
+/// from the mixed record stream (older runs).
+fn read_sidecar_or_stream(
+    sidecar: std::path::PathBuf,
+    stream: std::path::PathBuf,
+) -> Vec<serde_json::Value> {
+    let nodes = read_graph_nodes(sidecar);
+    if nodes.is_empty() {
+        read_graph_nodes(stream)
+    } else {
+        nodes
+    }
 }
 
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.
