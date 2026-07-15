@@ -780,13 +780,10 @@ async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Respons
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
 /// (status + field-level body diff), parsed from the run's http-diff stream.
 async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    let rows: Vec<serde_json::Value> = std::fs::read_to_string(st.root.http_diff_path(&id))
-        .map(|c| {
-            c.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .collect()
-        })
+    let uri = artifact_uri_for(&st, &id, "http_diffs").await;
+    let local = st.root.http_diff_path(&id);
+    let rows = tokio::task::spawn_blocking(move || hydrate_stream(&local, uri.as_deref()))
+        .await
         .unwrap_or_default();
     json_ok(serde_json::Value::Array(rows))
 }
@@ -924,6 +921,72 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
             .into_response(),
         Ok(Err(e)) => error_resp(404, &format!("artifact file unreadable: {e}")),
         Err(e) => error_resp(500, &format!("artifact read task failed: {e}")),
+    }
+}
+
+/// Parse a run stream: JSONL lines (blank/bad lines skipped) or a whole-file
+/// JSON array (dashboard exports).
+fn parse_jsonl_or_array(content: &str) -> Vec<serde_json::Value> {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('[') {
+        if let Ok(serde_json::Value::Array(rows)) = serde_json::from_str(trimmed) {
+            return rows;
+        }
+    }
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Local file first; when it yields nothing and an artifact URI is known,
+/// fetch the artifact bytes, cache them to `local_path` (best-effort), and
+/// serve the fetched content. Sandbox runs write these files inside the agent
+/// container and upload them as artifacts — the dashboard host never has the
+/// local copy until this hydrates it.
+fn hydrate_stream(
+    local_path: &std::path::Path,
+    artifact_uri: Option<&str>,
+) -> Vec<serde_json::Value> {
+    if let Ok(content) = std::fs::read_to_string(local_path) {
+        let rows = parse_jsonl_or_array(&content);
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    let Some(uri) = artifact_uri else {
+        return Vec::new();
+    };
+    let bytes = match read_artifact_bytes(uri) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("deja-orchestrator: artifact hydrate failed for {uri}: {e}");
+            return Vec::new();
+        }
+    };
+    if let Some(parent) = local_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(local_path, &bytes) {
+        eprintln!(
+            "deja-orchestrator: artifact cache write failed for {}: {e}",
+            local_path.display()
+        );
+    }
+    parse_jsonl_or_array(&String::from_utf8_lossy(&bytes))
+}
+
+/// URI of the run's first registered artifact of `kind`, when a store is
+/// connected. `None` (with a log line on query errors) otherwise.
+async fn artifact_uri_for(st: &AppState, run_id: &str, kind: &str) -> Option<String> {
+    let store = st.store.as_ref()?;
+    match store.list_artifacts(run_id).await {
+        Ok(rows) => rows.into_iter().find(|a| a.kind == kind).map(|a| a.uri),
+        Err(e) => {
+            eprintln!("deja-orchestrator: list artifacts for {run_id}: {e}");
+            None
+        }
     }
 }
 
@@ -1091,6 +1154,47 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
+
+    #[test]
+    fn hydrate_stream_prefers_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("http-diffs.jsonl");
+        std::fs::write(&local, "{\"a\":1}\n\n{\"a\":2}\n").unwrap();
+        // artifact_uri points at a path that would fail loudly if read
+        let rows = hydrate_stream(&local, Some("/nonexistent/never-read.jsonl"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["a"], 1);
+    }
+
+    #[test]
+    fn hydrate_stream_falls_back_to_artifact_and_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("nested").join("http-diffs.jsonl"); // parent missing
+        let artifact = dir.path().join("uploaded.jsonl");
+        std::fs::write(&artifact, "{\"b\":1}\n").unwrap();
+
+        let rows = hydrate_stream(&local, Some(artifact.to_str().unwrap()));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["b"], 1);
+        // cached: second read works with the artifact gone
+        std::fs::remove_file(&artifact).unwrap();
+        let again = hydrate_stream(&local, None);
+        assert_eq!(again.len(), 1);
+    }
+
+    #[test]
+    fn hydrate_stream_missing_everything_is_empty_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(hydrate_stream(&dir.path().join("nope.jsonl"), None).is_empty());
+        assert!(hydrate_stream(&dir.path().join("nope.jsonl"), Some("/also/nope")).is_empty());
+    }
+
+    #[test]
+    fn parse_jsonl_or_array_accepts_both_shapes() {
+        assert_eq!(parse_jsonl_or_array("{\"x\":1}\n{\"x\":2}\n").len(), 2);
+        assert_eq!(parse_jsonl_or_array("[{\"x\":1},{\"x\":2}]").len(), 2);
+        assert!(parse_jsonl_or_array("").is_empty());
+    }
 
     async fn ok(Extension(actor): Extension<AuthenticatedActor>) -> String {
         actor.0
