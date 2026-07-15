@@ -384,3 +384,20 @@ h2.clicky:hover { color: var(--text); }
 .bbadge { background: var(--surface-overlay); color: var(--text-subtle); border-radius: var(--r-xs); padding: 0 6px; font-size: var(--fs-11); }
 .bbadge.fail { background: var(--diff-del-word); color: var(--red-fg); }
 .caret { color: var(--text-faint); cursor: pointer; width: 12px; display: inline-block; user-select: none; }
+
+/* Per-request side-effect timeline (diff tab Requests section) */
+.reqsection { border: 1px solid var(--border); border-radius: var(--r-sm, 6px); margin: 8px 0; padding: 4px 10px; }
+.reqsection > summary { cursor: pointer; display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.reqsection > summary .meta { color: var(--text-muted); font-size: var(--fs-12, 12px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip.warn { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
+.chip.bad { background: rgba(248,81,73,0.14); color: var(--red-fg); }
+.timeline { margin: 6px 0 8px; }
+.timeline h3 { margin: 6px 0 4px; font-size: var(--fs-12, 12px); color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+.tlrow { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; font-size: var(--fs-13, 13px); min-width: 0; }
+.tlrow.muted { color: var(--text-faint); }
+.tlseq { min-width: 3.2rem; text-align: right; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.tlboundary { min-width: 6.5rem; color: var(--text-subtle); }
+.tlcall { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tldetails > summary { list-style: none; cursor: pointer; }
+.tldetails > summary::-webkit-details-marker { display: none; }
+.tldetails .argdiff { margin: 4px 0 8px 3.2rem; }

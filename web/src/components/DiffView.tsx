@@ -114,6 +114,86 @@ function CascadeRow({ g, kind }: { g: Group; kind: "added" | "removed" }) {
   );
 }
 
+const OUTCOME_LABEL: Record<string, string> = {
+  matched: "matched",
+  recovered: "recovered",
+  value_diverged: "value diverged",
+  novel: "novel",
+  omitted: "omitted",
+  environmental: "environmental",
+  deterministic: "deterministic miss",
+};
+function outcomeClass(kind: string): string {
+  if (kind === "matched") return "ok";
+  if (kind === "omitted") return "muted";
+  if (kind === "environmental" || kind === "recovered") return "warn";
+  return "bad"; // value_diverged, novel, deterministic, anything unknown
+}
+function outcomeLabel(c: CallRecord): string {
+  const base = OUTCOME_LABEL[c.kind] ?? c.kind.replace(/_/g, " ");
+  if (c.kind === "matched" && c.resolved_rank != null) return `${base} (rank ${c.resolved_rank})`;
+  if (c.kind === "value_diverged" && c.origin) return `${base} (origin)`;
+  return base;
+}
+function groupCallsByCorrelation(calls: CallRecord[]): Map<string, CallRecord[]> {
+  const by = new Map<string, CallRecord[]>();
+  for (const c of calls) {
+    if (!c.correlation_id) continue;
+    (by.get(c.correlation_id) ?? by.set(c.correlation_id, []).get(c.correlation_id)!).push(c);
+  }
+  return by;
+}
+function outcomeCounts(calls: CallRecord[]): string {
+  const n = new Map<string, number>();
+  for (const c of calls) n.set(c.kind, (n.get(c.kind) ?? 0) + 1);
+  return [...n.entries()].map(([k, v]) => `${v} ${(OUTCOME_LABEL[k] ?? k).replace(/_/g, " ")}`).join(" · ");
+}
+
+function TimelineRow({ c }: { c: CallRecord }) {
+  const expandable = c.kind !== "matched" && (c.recorded?.args != null || c.observed?.args != null);
+  const diffs = expandable ? diffArgs(c.recorded?.args, c.observed?.args) : [];
+  const row = (
+    <div className={`tlrow ${outcomeClass(c.kind)}`}>
+      <span className="tlseq">{c.source_event_global_sequence ?? "—"}</span>
+      <span className="tlboundary">{c.boundary}</span>
+      <span className="tlcall"><code>{c.trait_name}::{c.method_name}</code></span>
+      <span className={`chip ${outcomeClass(c.kind)}`}>{outcomeLabel(c)}</span>
+    </div>
+  );
+  if (!expandable) return row;
+  return (
+    <details className="tldetails">
+      <summary>{row}</summary>
+      <div className="argdiff">
+        {diffs.length === 0 && <p className="hint">recorded vs replayed args structurally differ</p>}
+        {diffs.map((d, i) => <LeafDiffRow key={i} d={d} />)}
+      </div>
+    </details>
+  );
+}
+
+function RequestSection({ d, calls }: { d: HttpDiff; calls: CallRecord[] }) {
+  const ok = d.status_match && d.body_diff.length === 0;
+  return (
+    <details className={`reqsection ${ok ? "ok" : "bad"}`} open={!ok}>
+      <summary>
+        <span className="method">{d.request_path}</span>
+        <span className="statuspill">
+          <span className={ok ? "ok" : "bad"}>{d.status_baseline} → {d.status_candidate}</span>
+        </span>
+        <span className="meta">{d.correlation_id}{calls.length > 0 ? ` · ${outcomeCounts(calls)}` : ""}</span>
+      </summary>
+      {!ok && <HttpBlock d={d} />}
+      {calls.length > 0 && (
+        <div className="timeline">
+          <h3>side-effect timeline</h3>
+          {calls.map((c, i) => <TimelineRow key={i} c={c} />)}
+        </div>
+      )}
+    </details>
+  );
+}
+
 // Reconstruct a per-side body object from changed leaves, for older diffs that
 // predate the kernel persisting full bodies.
 function reconstruct(d: HttpDiff, side: "baseline" | "candidate"): unknown {
@@ -179,6 +259,9 @@ export default function DiffView({ runId }: { runId: string }) {
   const conf = s ? overallConfidence(s.resolved_by_rank ?? {}) : "unmatched";
 
   const clean = modified.length === 0 && cascadeCount === 0 && httpBad.length === 0;
+  const byCorr = groupCallsByCorrelation(all);
+  const drivenCorrs = new Set((https.data ?? []).map((d) => d.correlation_id));
+  const orphanCalls = all.filter((c) => c.correlation_id && !drivenCorrs.has(c.correlation_id));
 
   return (
     <>
@@ -216,6 +299,21 @@ export default function DiffView({ runId }: { runId: string }) {
         <section>
           <h2>Resulting response divergence</h2>
           {httpBad.map((d, i) => <HttpBlock key={i} d={d} />)}
+        </section>
+      )}
+
+      {(https.data ?? []).length > 0 && (
+        <section>
+          <h2>Requests</h2>
+          {(https.data ?? []).map((d, i) => (
+            <RequestSection key={i} d={d} calls={byCorr.get(d.correlation_id) ?? []} />
+          ))}
+          {orphanCalls.length > 0 && (
+            <details className="reqsection">
+              <summary>calls outside driven requests · {outcomeCounts(orphanCalls)}</summary>
+              <div className="timeline">{orphanCalls.map((c, i) => <TimelineRow key={i} c={c} />)}</div>
+            </details>
+          )}
         </section>
       )}
 
