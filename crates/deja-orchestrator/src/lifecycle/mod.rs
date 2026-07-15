@@ -2841,6 +2841,7 @@ mod tests {
             include_str!("../../../deja-store/migrations/0003_session_manifests.sql"),
             include_str!("../../../deja-store/migrations/0004_call_ledger_artifact.sql"),
             include_str!("../../../deja-store/migrations/0005_seed_certificate_artifact.sql"),
+            include_str!("../../../deja-store/migrations/0006_diff_report_artifact.sql"),
         ];
         let allowed_by_step = migrations
             .into_iter()

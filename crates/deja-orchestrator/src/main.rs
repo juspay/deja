@@ -975,6 +975,9 @@ fn normalize_artifact_kind(raw: &str) -> Option<&'static str> {
         | "seed-certificate"
         | "seed-certificate.json"
         | "seed_certificate.json" => Some("seed_certificate"),
+        "diff_report" | "diff-report" | "diff-report.html" | "diff_report.html" => {
+            Some("diff_report")
+        }
         _ => None,
     }
 }
@@ -1329,6 +1332,7 @@ mod tests {
             ("graph-replay.jsonl", Some("graph_replay")),
             ("call-ledger.jsonl", Some("call_ledger")),
             ("seed-certificate.json", Some("seed_certificate")),
+            ("diff-report.html", Some("diff_report")),
             ("lookup_table", Some("lookup_table")),
             ("runs/run-1/scorecard.json", Some("scorecard")),
             ("mystery.bin", None),
