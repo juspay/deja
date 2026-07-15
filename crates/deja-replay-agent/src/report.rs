@@ -256,6 +256,19 @@ fn ledger_row(record: &CallRecord) -> String {
     );
     // Expandable recorded-vs-observed detail only where it explains something.
     if record.kind != "matched" {
+        // The ledger carries an observed RESULT only when the executed
+        // boundary produced an independent value (shadow provenance) — for an
+        // origin row that result diff IS the divergence (the args matched by
+        // definition), so render it first and open by default.
+        let recorded_result = record.recorded.as_ref().and_then(|s| s.result.clone());
+        let observed_result = record.observed.as_ref().and_then(|s| s.result.clone());
+        if let (Some(rec_res), Some(obs_res)) = (&recorded_result, &observed_result) {
+            row.push_str(&format!(
+                "<tr class=\"detail\"><td colspan=\"4\"><details open><summary>recorded vs \
+                 replayed RESULT — the diverged value</summary>{}</details></td></tr>",
+                side_by_side(rec_res, obs_res),
+            ));
+        }
         let recorded = record
             .recorded
             .as_ref()
@@ -566,6 +579,29 @@ mod tests {
             1,
             "only the inserted line is marked: {html}"
         );
+    }
+
+    #[test]
+    fn origin_row_shows_the_result_diff() {
+        // An origin row's args are identical BY DEFINITION (args-aligned
+        // executed boundary whose real result differed); the report must show
+        // the RESULT diff or the row reads as "diverged with no diff".
+        let mut c = call("c1", "value_diverged", None);
+        let same_args = serde_json::json!({"table": "payment_intent"});
+        c.recorded = Some(CallSide {
+            args: Some(same_args.clone()),
+            result: Some(serde_json::json!({"business_label": null})),
+            ..CallSide::default()
+        });
+        c.observed = Some(CallSide {
+            args: Some(same_args),
+            result: Some(serde_json::json!({"business_label": "default"})),
+            ..CallSide::default()
+        });
+        let html = render_report("run-1", "rec-1", &[diff("c1", false)], &[c]);
+        assert!(html.contains("recorded vs replayed RESULT"));
+        assert!(html.contains("<mark class=\"del\">null</mark>"));
+        assert!(html.contains("<mark class=\"ins\">&quot;default&quot;</mark>"));
     }
 
     #[test]
