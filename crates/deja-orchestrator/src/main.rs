@@ -937,13 +937,7 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
         Ok(None) => return error_resp(404, "artifact not found"),
         Err(e) => return error_resp(500, &format!("get artifact: {e}")),
     };
-    let content_type = if art.kind == "visualization_html" {
-        "text/html; charset=utf-8"
-    } else if art.uri.ends_with(".json") {
-        "application/json"
-    } else {
-        "application/x-ndjson"
-    };
+    let content_type = artifact_content_type(&art.kind, &art.uri);
     let uri = art.uri.clone();
     match tokio::task::spawn_blocking(move || read_artifact_bytes(&uri)).await {
         Ok(Ok(bytes)) => (
@@ -1020,6 +1014,16 @@ async fn artifact_uri_for(st: &AppState, run_id: &str, kind: &str) -> Option<Str
             eprintln!("deja-orchestrator: list artifacts for {run_id}: {e}");
             None
         }
+    }
+}
+
+fn artifact_content_type(kind: &str, uri: &str) -> &'static str {
+    if kind == "visualization_html" || kind == "diff_report" || uri.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if uri.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/x-ndjson"
     }
 }
 
@@ -1220,6 +1224,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(hydrate_stream(&dir.path().join("nope.jsonl"), None).is_empty());
         assert!(hydrate_stream(&dir.path().join("nope.jsonl"), Some("/also/nope")).is_empty());
+    }
+
+    #[test]
+    fn artifact_content_type_covers_html_kinds() {
+        assert_eq!(
+            artifact_content_type("visualization_html", "x.html"),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            artifact_content_type("diff_report", "s3://b/runs/r/diff-report.html"),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            artifact_content_type("scorecard", "s3://b/runs/r/scorecard.json"),
+            "application/json"
+        );
+        assert_eq!(
+            artifact_content_type("http_diffs", "s3://b/runs/r/http-diffs.jsonl"),
+            "application/x-ndjson"
+        );
     }
 
     #[test]
