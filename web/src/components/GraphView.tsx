@@ -1,6 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, GraphNode } from "../lib/api";
+import { unwrapIngress } from "../lib/graphalign";
 
 type TreeNode = GraphNode & { children: TreeNode[] };
 
@@ -70,7 +71,13 @@ export default function GraphView({ runId }: { runId: string }) {
 
   const model = React.useMemo(() => {
     if (!graph.data) return null;
-    const merged = mergeLevel(buildForest(graph.data.record), buildForest(graph.data.replay), "");
+    // Record-mode wraps each request in deja's synthetic ingress span; replay
+    // does not. Unwrap so the two trees align at "HTTP request".
+    const merged = mergeLevel(
+      buildForest(unwrapIngress(graph.data.record)),
+      buildForest(graph.data.replay),
+      "",
+    );
     const cs = calls.data ?? [];
     // Mark divergence by graph_node_id (exact, per-side) — node ids are unique
     // WITHIN a side; observed ids index the replay tree, recorded ids the record
