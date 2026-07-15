@@ -219,6 +219,13 @@ impl HarnessRoot {
             .join("runs")
             .join(format!("{run_id}.call-ledger.jsonl"))
     }
+    /// Self-contained human-readable diff report (HTTP diffs + per-call
+    /// side-effect timeline), built by the agent after scoring.
+    pub fn diff_report_path(&self, run_id: &str) -> PathBuf {
+        self.root
+            .join("runs")
+            .join(format!("{run_id}.diff-report.html"))
+    }
     /// Replay-side execution graph extracted from the observed stream.
     pub fn replay_graph_path(&self, run_id: &str) -> PathBuf {
         self.root

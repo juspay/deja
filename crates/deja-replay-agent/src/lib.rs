@@ -8,6 +8,7 @@
 //! preconditions, then sends the request and lets the router write observed
 //! calls into the shared state dir for scoring/upload.
 
+pub mod report;
 mod seeding;
 
 use std::collections::{BTreeMap, HashSet};
@@ -36,6 +37,11 @@ impl AgentError {
         Self {
             message: message.into(),
         }
+    }
+
+    /// Public constructor for the thin CLI shell (offline `report` mode).
+    pub fn from_message(message: impl Into<String>) -> Self {
+        Self::new(message)
     }
 }
 
@@ -500,6 +506,18 @@ fn run_loaded_recording_with_root<C: SandboxClient>(
     if replay_graph_count > 0 {
         eprintln!("deja-replay-agent: materialized {replay_graph_count} replay graph node(s)");
     }
+    // Human-readable companion to http-diffs.jsonl + call-ledger.jsonl; a
+    // failed report never fails the run (the machine artifacts still upload).
+    if let Err(e) = report::write_report(
+        &cfg.run.run_id,
+        &cfg.run.recording_id,
+        &root.http_diff_path(&cfg.run.run_id),
+        &root.call_ledger_path(&cfg.run.run_id),
+        &root.diff_report_path(&cfg.run.run_id),
+    ) {
+        eprintln!("deja-replay-agent: diff report: {e}");
+    }
+
     let verdict = if scorecard.verdict.inconclusive {
         "inconclusive"
     } else if scorecard.verdict.pass {
@@ -826,6 +844,7 @@ fn upload_artifacts(
         ("http-diffs.jsonl", root.http_diff_path(run_id)),
         ("scorecard.json", root.scorecard_path(run_id)),
         ("call-ledger.jsonl", root.call_ledger_path(run_id)),
+        ("diff-report.html", root.diff_report_path(run_id)),
         ("seed-certificate.json", root.seed_certificate_path(run_id)),
     ];
 

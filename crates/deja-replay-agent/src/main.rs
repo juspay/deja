@@ -14,6 +14,31 @@ fn print_summary(summary: &deja_replay_agent::AgentSummary) {
     }
 }
 
+/// `report <http-diffs> <call-ledger> <out.html> [run-id] [recording-id]`:
+/// rebuild the human-readable diff report offline from downloaded artifacts
+/// (accepts dashboard JSON-array exports or agent JSONL).
+fn run_offline_report(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
+    let mut path_arg = |name: &str| {
+        args.next()
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("report: missing {name} argument"))
+    };
+    let diffs = path_arg("http-diffs")?;
+    let ledger = path_arg("call-ledger")?;
+    let out = path_arg("output")?;
+    let run_id = args
+        .next()
+        .and_then(|a| a.into_string().ok())
+        .unwrap_or_else(|| "offline".to_owned());
+    let recording_id = args
+        .next()
+        .and_then(|a| a.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_owned());
+    deja_replay_agent::report::write_report(&run_id, &recording_id, &diffs, &ledger, &out)?;
+    eprintln!("deja-replay-agent: wrote {}", out.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
@@ -27,6 +52,12 @@ fn main() -> ExitCode {
         Some("drive") => {
             deja_replay_agent::drive_from_config_path(&config_path(args.next())).map(Some)
         }
+        // `report <http-diffs> <call-ledger> <out.html> [run-id] [recording-id]`:
+        // rebuild the human-readable diff report offline from downloaded
+        // artifacts (accepts dashboard JSON-array exports or agent JSONL).
+        Some("report") => run_offline_report(&mut args)
+            .map(|()| None)
+            .map_err(deja_replay_agent::AgentError::from_message),
         // legacy: bare config path (or nothing) = prepare + drive in one process
         _ => deja_replay_agent::run_from_config_path(&config_path(first)).map(Some),
     };
