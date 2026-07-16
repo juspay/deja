@@ -106,6 +106,7 @@ export type Scorecard = {
     // Substitute boundaries serve recorded values.
     value_divergences?: number;
     inconclusive_seed_gaps?: number;
+    inconclusive_recording_errors?: number;
     environmental_misses?: number;
     recovered_rank5_calls?: number;
     resolved_by_rank: Record<string, number>;

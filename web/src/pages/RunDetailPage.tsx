@@ -54,6 +54,9 @@ function ScorecardSummary({ runId }: { runId: string }) {
       <div className="panel grid">
         <div className={`metric${caught ? " hot" : ""}`}><div className="v">{valueDivergences}</div><div className="k">value divergences (total-derivative catches)</div></div>
         <div className="metric"><div className="v">{s.inconclusive_seed_gaps ?? 0}</div><div className="k">inconclusive seed gaps</div></div>
+        {(s.inconclusive_recording_errors ?? 0) > 0 && (
+          <div className="metric" title="the recording captured an unexpected boundary error (e.g. a DB schema mismatch) — the recording, not the candidate, is at fault"><div className="v">{s.inconclusive_recording_errors}</div><div className="k">recording-baseline errors</div></div>
+        )}
         <div className="metric"><div className="v">{s.matched_correlations}/{s.total_correlations}</div><div className="k">correlations matched</div></div>
         <div className="metric"><div className="v">{s.http_status_mismatches}</div><div className="k">http status mismatches</div></div>
         <div className="metric"><div className="v">{s.http_body_mismatches}</div><div className="k">http body mismatches</div></div>

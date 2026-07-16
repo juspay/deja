@@ -168,6 +168,13 @@ pub struct Summary {
     /// inconclusive so the orchestrator can auto-rerun instead of red-failing.
     #[serde(default)]
     pub inconclusive_races: u64,
+    /// Calls whose RECORDED baseline is an unexpected boundary error (a DB
+    /// `kind: Other`, e.g. `column ... does not exist`). The recording captured
+    /// an infrastructure/schema failure, not a business outcome, so it is not a
+    /// valid baseline to score a candidate against. Surfaced separately and
+    /// non-blocking: a broken recording must not read as a candidate divergence.
+    #[serde(default)]
+    pub inconclusive_recording_errors: u64,
     /// Novel calls on egress boundaries — tolerated, surfaced separately so a
     /// blocked outbound integration is never read as a candidate bug.
     pub environmental_misses: u64,
@@ -466,6 +473,18 @@ pub(crate) fn values_diverge_under_event(
         return false;
     }
     recorded != observed
+}
+
+/// Whether a recorded result is an UNEXPECTED boundary error — a DB
+/// `{"result":"Err","kind":"Other"}` (the diesel/hyperswitch bucket for an
+/// unclassified failure, e.g. `column ... does not exist`). Such a recorded
+/// value is an infrastructure/schema failure captured at record time, not a
+/// business outcome, so it is not a valid baseline to score a candidate
+/// against. `NotFound`, unique-violation, etc. are legitimate recorded
+/// outcomes and are deliberately NOT matched here.
+pub(crate) fn recorded_baseline_is_unexpected_error(recorded: &serde_json::Value) -> bool {
+    recorded.get("result").and_then(|v| v.as_str()) == Some("Err")
+        && recorded.get("kind").and_then(|v| v.as_str()) == Some("Other")
 }
 
 pub(crate) fn observed_value_diverged(
@@ -1588,6 +1607,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     let undeclared_concurrency_warnings = undeclared_concurrency.len() as u64;
     let mut inconclusive_seed_gaps = 0u64;
     let mut inconclusive_races = 0u64;
+    let mut inconclusive_recording_errors = 0u64;
     // Expected events claimed by a ValueDiverged pairing: counted as the
     // divergence, NOT as an OmittedCall in the omitted pass below.
     let mut paired_consumed: HashSet<u64> = HashSet::new();
@@ -1654,6 +1674,22 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                         consumed.insert(seq);
                         continue;
                     }
+                }
+                // Rule C: the RECORDED baseline is an unexpected boundary error
+                // (a recording env whose DB schema lagged its migrations). The
+                // recording is not a valid baseline for this call — inconclusive,
+                // never a false blocking divergence.
+                if obs
+                    .recorded_result
+                    .as_ref()
+                    .is_some_and(recorded_baseline_is_unexpected_error)
+                {
+                    stats.bump_kind("InconclusiveRecordingError");
+                    inconclusive_recording_errors += 1;
+                    if let Some(seq) = obs.source_event_global_sequence {
+                        consumed.insert(seq);
+                    }
+                    continue;
                 }
                 // The args-aligned execute divergence is the ORIGIN of a
                 // total-derivative cascade: the candidate ran the REAL boundary
@@ -1745,7 +1781,12 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             let value_diverged =
                 values_diverge_under_event(&obs.boundary, &recorded_val, &observed_val, twin_event);
             if value_diverged {
-                if inconclusive_race
+                if recorded_baseline_is_unexpected_error(&recorded_val) {
+                    // The paired recorded twin is itself an unexpected boundary
+                    // error (schema drift at record time) — not a valid baseline.
+                    stats.bump_kind("InconclusiveRecordingError");
+                    inconclusive_recording_errors += 1;
+                } else if inconclusive_race
                     .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
                 {
                     stats.bump_kind("InconclusiveRace");
@@ -1907,6 +1948,15 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             "{inconclusive_races} inconclusive_race row(s) recognized; auto-rerun recommended"
         ));
     }
+    // A recorded baseline that is itself an unexpected boundary error (recording
+    // env schema drift) is reported but non-blocking: the recording, not the
+    // candidate, is at fault, so it must not fail the verdict.
+    if inconclusive_recording_errors > 0 {
+        reasons.push(format!(
+            "{inconclusive_recording_errors} inconclusive recording-baseline error(s) \
+             (non-blocking; the recording captured a boundary error, e.g. a schema mismatch)"
+        ));
+    }
     // Order-nondeterminism demotions (Rule A) are reported but non-blocking: a
     // concurrent same-row UPDATE-RETURNING interleaving whose final state matches
     // the recording is not a divergence.
@@ -1932,10 +1982,12 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     let blocking_reasons = reasons.len()
         - usize::from(inconclusive_seed_gaps > 0)
         - usize::from(inconclusive_races > 0)
+        - usize::from(inconclusive_recording_errors > 0)
         - usize::from(order_nondeterminism_warnings > 0)
         - usize::from(idempotent_delete_warnings > 0)
         - usize::from(undeclared_concurrency_warnings > 0);
-    let inconclusive = nothing || (inconclusive_races > 0 && blocking_reasons == 0);
+    let inconclusive = nothing
+        || ((inconclusive_races > 0 || inconclusive_recording_errors > 0) && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
         "no artifacts ingested for this run yet".to_owned()
@@ -1999,6 +2051,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
             inconclusive_races,
+            inconclusive_recording_errors,
             environmental_misses,
             recovered_rank5_calls,
             resolved_by_rank,
@@ -4762,6 +4815,67 @@ mod tests {
         assert_eq!(card.summary.matched_side_effect_calls, 0);
         assert_eq!(card.summary.omitted_calls, 0, "twin consumed, not omitted");
         assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn recorded_db_other_error_baseline_is_inconclusive_not_blocking() {
+        // The recording captured an UNEXPECTED db error (kind: Other, e.g.
+        // "column ... does not exist" from a recording env whose schema lagged
+        // its own migrations). A candidate cannot be judged against a baseline
+        // whose own query failed on infrastructure — classify inconclusive,
+        // non-blocking, never a false ValueDiverged.
+        let recorded_err = serde_json::json!({
+            "result": "Err", "kind": "Other", "version": 1,
+            "message": "An unknown error occurred\ncolumn events.processor_merchant_id does not exist"
+        });
+        let card = detect(&art(
+            vec![seq_entry_res(Some("c1"), "db", 7, recorded_err.clone())],
+            vec![exec_obs(
+                "db",
+                Some("c1"),
+                true,
+                Some(7),
+                Some(recorded_err),
+                serde_json::json!({"result": "Err", "kind": "NotFound"}),
+            )],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "not a blocking divergence"
+        );
+        assert_eq!(card.summary.inconclusive_recording_errors, 1);
+        assert_eq!(card.summary.side_effect_divergences, 0);
+        assert!(
+            !card.verdict.pass,
+            "inconclusive still isn't a clean pass, but for the recording-error reason"
+        );
+        assert!(card.verdict.inconclusive || card.verdict.reason.contains("recording"));
+    }
+
+    #[test]
+    fn recorded_db_notfound_baseline_still_diverges_normally() {
+        // A recorded NotFound is a LEGITIMATE baseline (record absent) — a real
+        // value difference against it stays a blocking divergence.
+        let card = detect(&art(
+            vec![seq_entry_res(
+                Some("c1"),
+                "db",
+                7,
+                serde_json::json!({"result": "Err", "kind": "NotFound"}),
+            )],
+            vec![exec_obs(
+                "db",
+                Some("c1"),
+                true,
+                Some(7),
+                Some(serde_json::json!({"result": "Err", "kind": "NotFound"})),
+                serde_json::json!({"result": "Ok", "value": {"id": 1}}),
+            )],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(card.summary.inconclusive_recording_errors, 0);
+        assert_eq!(card.summary.value_divergences, 1);
     }
 
     #[test]
