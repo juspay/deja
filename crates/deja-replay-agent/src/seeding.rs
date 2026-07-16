@@ -1408,7 +1408,36 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Recorded redis results can arrive as the codec's `RedisValue` envelope
+/// (`{"BulkString":[bytes]}`, `{"SimpleString":".."}`, `{"Integer":n}`)
+/// rather than the payload itself, depending on which client path recorded
+/// the call. Seeding must store the PAYLOAD: writing the envelope text puts
+/// double-encoded JSON in redis, and every replayed execute-mode read then
+/// diverges against the recorded raw value.
 fn render_redis_seed_value(value: &serde_json::Value) -> String {
+    if let Some(object) = value.as_object() {
+        if object.len() == 1 {
+            if let Some(items) = object.get("BulkString").and_then(|v| v.as_array()) {
+                let bytes: Option<Vec<u8>> = items
+                    .iter()
+                    .map(|b| b.as_u64().and_then(|n| u8::try_from(n).ok()))
+                    .collect();
+                if let Some(bytes) = bytes {
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        return text;
+                    }
+                }
+            }
+            if let Some(text) = object.get("SimpleString").and_then(|v| v.as_str()) {
+                return text.to_owned();
+            }
+            if let Some(n) = object.get("Integer") {
+                if n.is_i64() || n.is_u64() {
+                    return n.to_string();
+                }
+            }
+        }
+    }
     match value {
         serde_json::Value::String(value) => value.clone(),
         other => other.to_string(),
@@ -1442,6 +1471,38 @@ fn psql_output(pg_url: &str, args: &[&str]) -> Result<Output, String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redis_seed_value_unwraps_recorded_redis_value_envelopes() {
+        // {"key":"ucs_enabled","config":"true"} as its BulkString byte envelope —
+        // seeding must store the PAYLOAD, not the envelope text, or every
+        // replayed execute-mode read diverges against the recorded raw value.
+        let bulk = serde_json::json!({"BulkString": [
+            123,34,107,101,121,34,58,34,117,99,115,95,101,110,97,98,108,101,100,
+            34,44,34,99,111,110,102,105,103,34,58,34,116,114,117,101,34,125
+        ]});
+        assert_eq!(
+            render_redis_seed_value(&bulk),
+            r#"{"key":"ucs_enabled","config":"true"}"#
+        );
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({"SimpleString": "OK"})),
+            "OK"
+        );
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({"Integer": 42})),
+            "42"
+        );
+        // Plain strings and unknown shapes keep today's behavior.
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!("plain")),
+            "plain"
+        );
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({"Array": []})),
+            r#"{"Array":[]}"#
+        );
+    }
 
     #[test]
     fn typed_db_image_without_producer_metadata_uses_catalog_metadata() {
