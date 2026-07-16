@@ -463,13 +463,14 @@ fn run_loaded_recording_with_root<C: SandboxClient>(
 
         prepare_driver_request(&mut driver, correlation_id);
         eprintln!("deja-replay-agent: [5/{AGENT_STEPS_TOTAL}] driving requests — {detail}");
-        if reporter.post && (position == 1 || position == total_correlations || position % 10 == 0)
-        {
-            if let Err(e) = reporter.post_stage(5, "driving requests", &detail) {
-                eprintln!("deja-replay-agent: stage callback failed (continuing): {e}");
-            }
-        }
-        drive_and_collect(client, root, &cfg.run.run_id, &driver, timeout)?;
+        let diff = drive_and_collect(client, root, &cfg.run.run_id, &driver, timeout)?;
+        // Every request gets its outcome line on stderr AND the dashboard
+        // stage log: endpoint, correlation, statuses, PASS/FAIL.
+        reporter.report(
+            5,
+            "driving requests",
+            &request_outcome_line(position, total_correlations, &driver, &diff),
+        );
         driven += 1;
     }
 
@@ -572,12 +573,43 @@ fn drive_and_collect<C: SandboxClient>(
     run_id: &str,
     driver: &DriverRequest,
     timeout: Duration,
-) -> Result<(), AgentError> {
+) -> Result<deja_kernel::HttpDiff, AgentError> {
     log_http_incoming_request(driver);
     let response = client.drive(driver, timeout)?;
     log_http_candidate_response(driver, &response);
     let diff = compare_response(driver, response.status, &response.body, &[]);
-    append_jsonl(&root.http_diff_path(run_id), &diff)
+    append_jsonl(&root.http_diff_path(run_id), &diff)?;
+    Ok(diff)
+}
+
+/// One human-readable line per driven request: endpoint, correlation id,
+/// position, recorded→replayed status, and a PASS/FAIL verdict. Reported to
+/// stderr AND the dashboard stage log for every request.
+fn request_outcome_line(
+    position: usize,
+    total: usize,
+    driver: &DriverRequest,
+    diff: &deja_kernel::HttpDiff,
+) -> String {
+    let verdict = if !diff.status_match {
+        "FAIL (status)".to_owned()
+    } else if !diff.body_diff.is_empty() {
+        format!(
+            "FAIL ({} body field{})",
+            diff.body_diff.len(),
+            if diff.body_diff.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        "PASS".to_owned()
+    };
+    format!(
+        "{position}/{total} {} {} · correlation {} · {} → {} · {verdict}",
+        driver.method,
+        driver.path,
+        driver.correlation_id,
+        diff.status_baseline,
+        diff.status_candidate,
+    )
 }
 
 fn prepare_driver_request(driver: &mut DriverRequest, correlation_id: &str) {
@@ -1139,6 +1171,57 @@ fn parse_body_json(body: &[u8]) -> serde_json::Value {
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_outcome_line_carries_endpoint_correlation_and_verdict() {
+        let driver = DriverRequest {
+            correlation_id: "corr-abc".to_owned(),
+            request_sequence: 0,
+            method: "POST".to_owned(),
+            path: "/payments".to_owned(),
+            query: None,
+            headers: Vec::new(),
+            body: None,
+            baseline_response: deja_kernel::BaselineResponse {
+                status: 200,
+                body_json: None,
+                body_text: None,
+            },
+        };
+        let pass = deja_kernel::HttpDiff {
+            correlation_id: "corr-abc".to_owned(),
+            request_sequence: 0,
+            request_path: "/payments".to_owned(),
+            status_baseline: 200,
+            status_candidate: 200,
+            status_match: true,
+            body_diff: Vec::new(),
+            baseline_body: None,
+            candidate_body: None,
+        };
+        let line = request_outcome_line(3, 10, &driver, &pass);
+        assert!(line.contains("POST /payments"), "{line}");
+        assert!(line.contains("corr-abc"), "{line}");
+        assert!(line.contains("3/10"), "{line}");
+        assert!(line.contains("200 → 200"), "{line}");
+        assert!(line.contains("PASS"), "{line}");
+
+        let mut status_fail = pass.clone();
+        status_fail.status_candidate = 599;
+        status_fail.status_match = false;
+        let line = request_outcome_line(3, 10, &driver, &status_fail);
+        assert!(line.contains("200 → 599"), "{line}");
+        assert!(line.contains("FAIL (status)"), "{line}");
+
+        let mut body_fail = pass.clone();
+        body_fail.body_diff = vec![deja_kernel::JsonFieldDiff {
+            json_path: "$.a".to_owned(),
+            baseline: serde_json::json!(1),
+            candidate: serde_json::json!(2),
+        }];
+        let line = request_outcome_line(3, 10, &driver, &body_fail);
+        assert!(line.contains("FAIL (1 body field"), "{line}");
+    }
 
     #[test]
     fn stage_url_derives_from_the_verdict_url() {
