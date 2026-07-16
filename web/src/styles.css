@@ -406,3 +406,12 @@ h2.clicky:hover { color: var(--text); }
 .zcell { overflow: hidden; }
 .zcell .chip.vchip { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 1; }
 .gspan.dim { color: var(--text-faint); }
+
+/* Click-to-expand full values for graph divergence chips */
+.vchip { cursor: pointer; }
+.valdetail { padding: 8px 16px; background: var(--surface-overlay); border-top: 1px solid var(--border-muted); border-bottom: 1px solid var(--border-muted); }
+.vdhead { font-size: var(--fs-12); color: var(--text-muted); margin: 4px 0; }
+.vdpair { display: flex; gap: 12px; }
+.vdpair > div { flex: 1; min-width: 0; }
+.vdpair h4 { margin: 2px 0 4px; font-size: var(--fs-11); color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em; }
+.vdpair pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-12); font-family: var(--font-mono); background: rgba(0,0,0,0.25); padding: 8px; border-radius: 4px; max-height: 340px; overflow-y: auto; margin: 0 0 6px; }

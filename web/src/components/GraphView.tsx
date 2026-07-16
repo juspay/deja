@@ -86,6 +86,7 @@ export default function GraphView({ runId }: { runId: string }) {
   const [focus, setFocus] = React.useState(true);
   const [showInternal, setShowInternal] = React.useState(false);
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
+  const [expandedVals, setExpandedVals] = React.useState<Set<string>>(new Set());
   const graph = useQuery({ queryKey: ["graph", runId], queryFn: () => api.graph(runId) });
   const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId) });
   const firstFork = React.useRef<HTMLDivElement | null>(null);
@@ -205,8 +206,16 @@ export default function GraphView({ runId }: { runId: string }) {
           <span
             className={`chip vchip ${ch.origin ? "fail" : "removed"}`}
             key={i}
-            title={`${ch.origin ? "divergence ORIGIN — executed read returned a new value" : "CONSEQUENCE — write carried the new value downstream"}\n${ch.method}: ${typeof ch.from === "string" ? ch.from : JSON.stringify(ch.from)} → ${typeof ch.to === "string" ? ch.to : JSON.stringify(ch.to)}`}
+            title={`${ch.origin ? "divergence ORIGIN — executed read returned a new value" : "CONSEQUENCE — write carried the new value downstream"} — click to expand the full values`}
             style={{ marginLeft: 4 }}
+            onClick={(e) => {
+              e.stopPropagation();
+              setExpandedVals((prev) => {
+                const next = new Set(prev);
+                next.has(u.path) ? next.delete(u.path) : next.add(u.path);
+                return next;
+              });
+            }}
           >
             {ch.origin ? "origin " : "→ "}{ch.method}: {fmt(ch.from)} → {fmt(ch.to)}
           </span>
@@ -216,6 +225,12 @@ export default function GraphView({ runId }: { runId: string }) {
       </div>
     );
   }
+
+  const prettyVal = (v: unknown): string => {
+    if (typeof v === "string") return v; // error strings carry \n formatting
+    if (v === undefined) return "∅";
+    return JSON.stringify(v, null, 2) ?? "∅";
+  };
 
   function Row({ u, depth }: { u: Uni; depth: number }) {
     const hasKids = u.children.length > 0;
@@ -247,6 +262,21 @@ export default function GraphView({ runId }: { runId: string }) {
             </div>
           </div>
         </div>
+        {expandedVals.has(u.path) && valChipsFor(u).length > 0 && (
+          <div className="valdetail">
+            {valChipsFor(u).map((ch, i) => (
+              <div key={i}>
+                <div className="vdhead">
+                  {ch.origin ? "⭑ origin" : "→ consequence"} · <code>{ch.method}</code>
+                </div>
+                <div className="vdpair">
+                  <div><h4>recorded</h4><pre>{prettyVal(ch.from)}</pre></div>
+                  <div><h4>replayed</h4><pre>{prettyVal(ch.to)}</pre></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
         {!isCollapsed && u.children.map((c) => <Row key={c.path} u={c} depth={depth + 1} />)}
       </>
     );
