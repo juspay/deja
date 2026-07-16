@@ -415,3 +415,5 @@ h2.clicky:hover { color: var(--text); }
 .vdpair > div { flex: 1; min-width: 0; }
 .vdpair h4 { margin: 2px 0 4px; font-size: var(--fs-11); color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em; }
 .vdpair pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-12); font-family: var(--font-mono); background: rgba(0,0,0,0.25); padding: 8px; border-radius: 4px; max-height: 340px; overflow-y: auto; margin: 0 0 6px; }
+
+.tldifflabel { font-size: var(--fs-11, 11px); color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 4px; }

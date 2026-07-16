@@ -160,8 +160,14 @@ function outcomeCounts(calls: CallRecord[]): string {
 }
 
 function TimelineRow({ c }: { c: CallRecord }) {
-  const expandable = c.kind !== "matched" && (c.recorded?.args != null || c.observed?.args != null);
-  const diffs = expandable ? diffArgs(c.recorded?.args, c.observed?.args) : [];
+  // value_diverged rows have IDENTICAL args by definition (the executed
+  // boundary matched the recorded call by args, but its RESULT differed) — so
+  // diff results, not args. Everything else (novel/omitted) diffs args.
+  const isValueDiv = c.kind === "value_diverged";
+  const recSide = isValueDiv ? c.recorded?.result : c.recorded?.args;
+  const obsSide = isValueDiv ? c.observed?.result : c.observed?.args;
+  const expandable = c.kind !== "matched" && (recSide != null || obsSide != null);
+  const diffs = expandable ? diffArgs(recSide, obsSide) : [];
   const row = (
     <div className={`tlrow ${outcomeClass(c.kind)}`}>
       <span className="tlseq">{c.source_event_global_sequence ?? "—"}</span>
@@ -171,12 +177,17 @@ function TimelineRow({ c }: { c: CallRecord }) {
     </div>
   );
   if (!expandable) return row;
+  const label = isValueDiv ? "result" : "args";
   return (
     <details className="tldetails">
       <summary>{row}</summary>
       <div className="argdiff">
-        {diffs.length === 0 && <p className="hint">recorded vs replayed args structurally differ</p>}
-        {diffs.map((d, i) => <LeafDiffRow key={i} d={d} />)}
+        <div className="tldifflabel">recorded vs replayed {label}</div>
+        {diffs.length === 0 ? (
+          <ValuePair baseline={recSide} candidate={obsSide} />
+        ) : (
+          diffs.map((d, i) => <LeafDiffRow key={i} d={d} />)
+        )}
       </div>
     </details>
   );
