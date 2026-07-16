@@ -82,6 +82,20 @@ function bump(m: Map<number, Map<string, number>>, id: number | undefined, b: st
   m.set(id, inner);
 }
 
+// Earliest capture time of a side's nodes — the unfakeable discriminator:
+// recording always happens before replay, so record's min < replay's min.
+function minStartedNs(nodes: GraphNode[]): number | null {
+  let min: number | null = null;
+  for (const n of nodes) {
+    if (typeof n.started_ns === "number" && (min == null || n.started_ns < min)) min = n.started_ns;
+  }
+  return min;
+}
+function fmtCaptureTime(ns: number | null): string {
+  if (ns == null) return "—";
+  return new Date(ns / 1e6).toLocaleString();
+}
+
 export default function GraphView({ runId }: { runId: string }) {
   const [focus, setFocus] = React.useState(true);
   const [showInternal, setShowInternal] = React.useState(false);
@@ -145,13 +159,18 @@ export default function GraphView({ runId }: { runId: string }) {
       if (chips.some((ch) => ch.origin)) { originRec.add(nid); originRep.add(nid); }
     }
     const maxDur = Math.max(1, ...merged.map((u) => Math.max(ms(u.rec), ms(u.rep))));
-    return { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur, hiddenSpans, replayEmpty: repFull.length === 0 };
+    // Capture times straight off the raw sides (before internal-span filtering)
+    // so the discriminator is robust even when one side is all plumbing.
+    const recStart = minStartedNs(graph.data.record);
+    const repStart = minStartedNs(graph.data.replay);
+    const sidesSwapped = recStart != null && repStart != null && recStart > repStart;
+    return { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur, hiddenSpans, replayEmpty: repFull.length === 0, recStart, repStart, sidesSwapped };
   }, [graph.data, calls.data, showInternal]);
 
   if (graph.isLoading || calls.isLoading) return <p className="hint">loading graph…</p>;
   if (graph.error || !graph.data || !model) return <p className="err">{String(graph.error)}</p>;
 
-  const { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur, hiddenSpans, replayEmpty } = model;
+  const { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur, hiddenSpans, replayEmpty, recStart, repStart, sidesSwapped } = model;
   const recDiv = (u: Uni) => !!u.rec && omittedIds.has(u.rec.node_id);
   const repDiv = (u: Uni) => !!u.rep && novelIds.has(u.rep.node_id);
   const valDiv = (u: Uni) =>
@@ -301,10 +320,16 @@ export default function GraphView({ runId }: { runId: string }) {
         <button onClick={() => setCollapsed(new Set())} style={{ background: "var(--surface-overlay)", color: "var(--text-muted)", padding: "2px 10px" }}>expand all</button>
         <span className="hint">⭑ = fork point · record shows omitted (recording made it) · replay shows novel (candidate made it)</span>
       </div>
+      {sidesSwapped && (
+        <p className="err" style={{ padding: "6px 12px" }}>
+          ⚠ the record side's earliest span is <b>newer</b> than the replay side's —
+          the graph sources may be mislabeled for this run.
+        </p>
+      )}
       <div className="graphwrap">
         <div className="graphhdr">
-          <div><b>record</b> <span className="hint">what it used to do</span> {omittedIds.size > 0 && <span className="chip removed">{omittedIds.size} omitted spans</span>}</div>
-          <div><b>replay</b> <span className="hint">what it does now</span> {replayEmpty && <span className="chip muted" title="the replay router emitted no graph nodes — check ROUTER__DEJA__RECORDING__GRAPH">no replay graph captured</span>} {novelIds.size > 0 && <span className="chip added">{novelIds.size} novel spans</span>} {valueDivIds.size > 0 && <span className="chip fail">{valueDivIds.size} value-diverged span{valueDivIds.size > 1 ? "s" : ""}</span>}</div>
+          <div><b>record</b> <span className="hint">what it used to do · captured {fmtCaptureTime(recStart)}</span> {omittedIds.size > 0 && <span className="chip removed">{omittedIds.size} omitted spans</span>}</div>
+          <div><b>replay</b> <span className="hint">what it does now · captured {fmtCaptureTime(repStart)}</span> {replayEmpty && <span className="chip muted" title="the replay router emitted no graph nodes — check ROUTER__DEJA__RECORDING__GRAPH">no replay graph captured</span>} {novelIds.size > 0 && <span className="chip added">{novelIds.size} novel spans</span>} {valueDivIds.size > 0 && <span className="chip fail">{valueDivIds.size} value-diverged span{valueDivIds.size > 1 ? "s" : ""}</span>}</div>
         </div>
         {roots.length === 0 && <p className="hint" style={{ padding: 12 }}>no diverging request to focus</p>}
         {roots.map((u) => <Row key={u.path} u={u} depth={0} />)}
