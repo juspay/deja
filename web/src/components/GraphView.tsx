@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, GraphNode } from "../lib/api";
-import { unwrapIngress } from "../lib/graphalign";
+import { dropInternalSpans, keepAll, unwrapIngress } from "../lib/graphalign";
 
 type TreeNode = GraphNode & { children: TreeNode[] };
 
@@ -63,6 +63,7 @@ function bump(m: Map<number, Map<string, number>>, id: number | undefined, b: st
 
 export default function GraphView({ runId }: { runId: string }) {
   const [focus, setFocus] = React.useState(true);
+  const [showInternal, setShowInternal] = React.useState(false);
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
   const graph = useQuery({ queryKey: ["graph", runId], queryFn: () => api.graph(runId) });
   const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId) });
@@ -72,12 +73,16 @@ export default function GraphView({ runId }: { runId: string }) {
   const model = React.useMemo(() => {
     if (!graph.data) return null;
     // Record-mode wraps each request in deja's synthetic ingress span; replay
-    // does not. Unwrap so the two trees align at "HTTP request".
-    const merged = mergeLevel(
-      buildForest(unwrapIngress(graph.data.record)),
-      buildForest(graph.data.replay),
-      "",
-    );
+    // does not. Unwrap so the two trees align at "HTTP request". Then drop
+    // trace/debug plumbing spans (tokio polls, codec frames) unless asked —
+    // record envs capture them, replay routers usually don't, so they render
+    // as a wall of record-only noise.
+    const recFull = unwrapIngress(graph.data.record);
+    const repFull = graph.data.replay;
+    const rec = showInternal ? keepAll(recFull) : dropInternalSpans(recFull);
+    const rep = showInternal ? keepAll(repFull) : dropInternalSpans(repFull);
+    const hiddenSpans = recFull.length - rec.nodes.length + (repFull.length - rep.nodes.length);
+    const merged = mergeLevel(buildForest(rec.nodes), buildForest(rep.nodes), "");
     const cs = calls.data ?? [];
     // Mark divergence by graph_node_id (exact, per-side) — node ids are unique
     // WITHIN a side; observed ids index the replay tree, recorded ids the record
@@ -94,7 +99,7 @@ export default function GraphView({ runId }: { runId: string }) {
     const valueDivIds = new Set<number>();
     const valueDivByNode = new Map<number, VChip[]>();
     for (const c of cs) {
-      const oid = c.observed?.graph_node_id, rid = c.recorded?.graph_node_id;
+      const oid = rep.resolve(c.observed?.graph_node_id), rid = rec.resolve(c.recorded?.graph_node_id);
       const key = `${c.observed?.logical_span_path ?? c.recorded?.logical_span_path}|${c.boundary}|${c.method_name}`;
       if (c.kind === "value_diverged") {
         const nid = oid ?? rid;
@@ -118,13 +123,13 @@ export default function GraphView({ runId }: { runId: string }) {
       if (chips.some((ch) => ch.origin)) { originRec.add(nid); originRep.add(nid); }
     }
     const maxDur = Math.max(1, ...merged.map((u) => Math.max(ms(u.rec), ms(u.rep))));
-    return { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur };
-  }, [graph.data, calls.data]);
+    return { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur, hiddenSpans, replayEmpty: repFull.length === 0 };
+  }, [graph.data, calls.data, showInternal]);
 
   if (graph.isLoading || calls.isLoading) return <p className="hint">loading graph…</p>;
   if (graph.error || !graph.data || !model) return <p className="err">{String(graph.error)}</p>;
 
-  const { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur } = model;
+  const { merged, novelIds, omittedIds, valueDivIds, valueDivByNode, originRec, originRep, recBadges, repBadges, maxDur, hiddenSpans, replayEmpty } = model;
   const recDiv = (u: Uni) => !!u.rec && omittedIds.has(u.rec.node_id);
   const repDiv = (u: Uni) => !!u.rep && novelIds.has(u.rep.node_id);
   const valDiv = (u: Uni) =>
@@ -228,13 +233,19 @@ export default function GraphView({ runId }: { runId: string }) {
           focus diverging request{focus ? "" : " (showing all spans)"}
         </label>
         {originRec.size > 0 && <button onClick={jump} style={{ padding: "2px 10px" }}>⭑ jump to fork</button>}
+        {(hiddenSpans > 0 || showInternal) && (
+          <label className="toggle">
+            <input type="checkbox" checked={showInternal} onChange={(e) => setShowInternal(e.target.checked)} />
+            show internal spans{hiddenSpans > 0 ? ` (${hiddenSpans} hidden)` : ""}
+          </label>
+        )}
         <button onClick={() => setCollapsed(new Set())} style={{ background: "var(--surface-overlay)", color: "var(--text-muted)", padding: "2px 10px" }}>expand all</button>
         <span className="hint">⭑ = fork point · record shows omitted (recording made it) · replay shows novel (candidate made it)</span>
       </div>
       <div className="graphwrap">
         <div className="graphhdr">
           <div><b>record</b> <span className="hint">what it used to do</span> {omittedIds.size > 0 && <span className="chip removed">{omittedIds.size} omitted spans</span>}</div>
-          <div><b>replay</b> <span className="hint">what it does now</span> {novelIds.size > 0 && <span className="chip added">{novelIds.size} novel spans</span>} {valueDivIds.size > 0 && <span className="chip fail">{valueDivIds.size} value-diverged span{valueDivIds.size > 1 ? "s" : ""}</span>}</div>
+          <div><b>replay</b> <span className="hint">what it does now</span> {replayEmpty && <span className="chip muted" title="the replay router emitted no graph nodes — check ROUTER__DEJA__RECORDING__GRAPH">no replay graph captured</span>} {novelIds.size > 0 && <span className="chip added">{novelIds.size} novel spans</span>} {valueDivIds.size > 0 && <span className="chip fail">{valueDivIds.size} value-diverged span{valueDivIds.size > 1 ? "s" : ""}</span>}</div>
         </div>
         {roots.length === 0 && <p className="hint" style={{ padding: 12 }}>no diverging request to focus</p>}
         {roots.map((u) => <Row key={u.path} u={u} depth={0} />)}
