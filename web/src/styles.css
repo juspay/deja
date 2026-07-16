@@ -401,3 +401,8 @@ h2.clicky:hover { color: var(--text); }
 .tldetails > summary { list-style: none; cursor: pointer; }
 .tldetails > summary::-webkit-details-marker { display: none; }
 .tldetails .argdiff { margin: 4px 0 8px 3.2rem; }
+
+/* Graph cells must never bleed across the record/replay divider. */
+.zcell { overflow: hidden; }
+.zcell .chip.vchip { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 1; }
+.gspan.dim { color: var(--text-faint); }

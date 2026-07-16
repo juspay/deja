@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, GraphNode } from "../lib/api";
-import { dropInternalSpans, keepAll, unwrapIngress } from "../lib/graphalign";
+import { dropHealthTrees, dropInternalSpans, keepAll, unwrapIngress } from "../lib/graphalign";
 
 type TreeNode = GraphNode & { children: TreeNode[] };
 
@@ -25,21 +25,42 @@ function buildForest(nodes: GraphNode[]): TreeNode[] {
 // node and/or the replay node that share a root→leaf span-name chain.
 type Uni = { name: string; path: string; rec?: TreeNode; rep?: TreeNode; children: Uni[] };
 
+// Merge key: span name + http.route when present. Request roots are all
+// named "HTTP request", so bare-name grouping zips DIFFERENT endpoints
+// together by index (a /health probe on one side shifts every pairing after
+// it). The route pins each root to its endpoint; within one route, index
+// order matches because the agent drives requests in recorded order.
+// (request_id is deliberately NOT used: the replay router mints fresh ids.)
+function mergeKey(n: TreeNode): string {
+  const route = n.fields?.["http.route"];
+  return typeof route === "string" ? `${n.span_name}|${route}` : n.span_name;
+}
+
 function mergeLevel(rec: TreeNode[], rep: TreeNode[], parentPath: string): Uni[] {
   const group = (ns: TreeNode[]) => {
     const m = new Map<string, TreeNode[]>();
-    for (const n of ns) (m.get(n.span_name) ?? m.set(n.span_name, []).get(n.span_name)!).push(n);
+    for (const n of ns) {
+      const k = mergeKey(n);
+      (m.get(k) ?? m.set(k, []).get(k)!).push(n);
+    }
     return m;
   };
   const recBy = group(rec), repBy = group(rep);
-  const names: string[] = [];
-  for (const n of [...rec, ...rep]) if (!names.includes(n.span_name)) names.push(n.span_name);
+  const keys: string[] = [];
+  for (const n of [...rec, ...rep]) {
+    const k = mergeKey(n);
+    if (!keys.includes(k)) keys.push(k);
+  }
   const out: Uni[] = [];
-  for (const name of names) {
-    const rs = recBy.get(name) ?? [], ps = repBy.get(name) ?? [];
+  for (const key of keys) {
+    const rs = recBy.get(key) ?? [], ps = repBy.get(key) ?? [];
+    const name = (rs[0] ?? ps[0])!.span_name;
     for (let i = 0; i < Math.max(rs.length, ps.length); i++) {
       const r = rs[i], p = ps[i];
-      const path = parentPath ? `${parentPath}>${name}` : name;
+      // Suffix repeated same-key siblings so paths (React keys + collapse
+      // ids) stay unique per occurrence.
+      const base = parentPath ? `${parentPath}>${key}` : key;
+      const path = i > 0 ? `${base}#${i}` : base;
       out.push({ name, path, rec: r, rep: p, children: mergeLevel(r?.children ?? [], p?.children ?? [], path) });
     }
   }
@@ -77,8 +98,8 @@ export default function GraphView({ runId }: { runId: string }) {
     // trace/debug plumbing spans (tokio polls, codec frames) unless asked —
     // record envs capture them, replay routers usually don't, so they render
     // as a wall of record-only noise.
-    const recFull = unwrapIngress(graph.data.record);
-    const repFull = graph.data.replay;
+    const recFull = dropHealthTrees(unwrapIngress(graph.data.record));
+    const repFull = dropHealthTrees(graph.data.replay);
     const rec = showInternal ? keepAll(recFull) : dropInternalSpans(recFull);
     const rep = showInternal ? keepAll(repFull) : dropInternalSpans(repFull);
     const hiddenSpans = recFull.length - rec.nodes.length + (repFull.length - rep.nodes.length);
@@ -151,8 +172,11 @@ export default function GraphView({ runId }: { runId: string }) {
     const kind = repDiv(u) ? "added" : recDiv(u) ? "removed" : "";
     const n = side === "rec" ? u.rec : u.rep;
     if (!n) {
+      // Name the span from the PRESENT side so a column of absences still
+      // reads as "what was skipped", not anonymous chips.
       return (
         <div className={`zcell absent ${kind}`}>
+          <span className="gspan dim">{u.name}</span>
           <span className={`chip ${kind || "muted"}`}>{kind === "added" ? "added on replay" : "skipped"}</span>
         </div>
       );
@@ -162,7 +186,12 @@ export default function GraphView({ runId }: { runId: string }) {
     const origin = isOrigin(u);
     const b = (side === "rec" ? recBadges : repBadges).get(n.node_id);
     const dur = ms(n);
-    const fmt = (v: unknown) => (typeof v === "string" ? v : JSON.stringify(v) ?? "∅");
+    // Chip values can be whole error payloads; clamp so they never bleed
+    // across the column divider (the full text rides the title tooltip).
+    const fmt = (v: unknown) => {
+      const s = typeof v === "string" ? v : JSON.stringify(v) ?? "∅";
+      return s.length > 90 ? `${s.slice(0, 90)}…` : s;
+    };
     const captureFork = (el: HTMLDivElement | null) => {
       if (el && origin && !seenFork.current) { seenFork.current = true; firstFork.current = el; }
     };
@@ -174,9 +203,9 @@ export default function GraphView({ runId }: { runId: string }) {
         {b && badges(b)}
         {valueChanged && valChipsFor(u).map((ch, i) => (
           <span
-            className={`chip ${ch.origin ? "fail" : "removed"}`}
+            className={`chip vchip ${ch.origin ? "fail" : "removed"}`}
             key={i}
-            title={ch.origin ? "divergence ORIGIN — executed read returned a new value" : "CONSEQUENCE — write carried the new value downstream"}
+            title={`${ch.origin ? "divergence ORIGIN — executed read returned a new value" : "CONSEQUENCE — write carried the new value downstream"}\n${ch.method}: ${typeof ch.from === "string" ? ch.from : JSON.stringify(ch.from)} → ${typeof ch.to === "string" ? ch.to : JSON.stringify(ch.to)}`}
             style={{ marginLeft: 4 }}
           >
             {ch.origin ? "origin " : "→ "}{ch.method}: {fmt(ch.from)} → {fmt(ch.to)}

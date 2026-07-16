@@ -51,6 +51,32 @@ export function dropInternalSpans(nodes: GraphNode[]): FilteredGraph {
   };
 }
 
+// Drop health-probe request trees (kube-probe /health hits): the replay
+// kernel filters health correlations from the driven set, so their record
+// and replay trees are pure harness noise that also skews root pairing.
+export function dropHealthTrees(nodes: GraphNode[]): GraphNode[] {
+  const doomed = new Set<number>();
+  for (const n of nodes) {
+    const route = n.fields?.["http.route"];
+    if (typeof route === "string" && route.replace(/\/+$/, "") === "/health") {
+      doomed.add(n.node_id);
+    }
+  }
+  if (doomed.size === 0) return nodes;
+  // Remove the flagged roots and every descendant (transitively).
+  const parentOf = new Map<number, number | null>();
+  for (const n of nodes) parentOf.set(n.node_id, n.parent_id);
+  const underDoomed = (id: number): boolean => {
+    let cur: number | null | undefined = id;
+    while (cur != null) {
+      if (doomed.has(cur)) return true;
+      cur = parentOf.get(cur) ?? null;
+    }
+    return false;
+  };
+  return nodes.filter((n) => !underDoomed(n.node_id));
+}
+
 // Remove wrapper nodes, re-parenting their children to the wrapper's parent
 // (usually none -> the child becomes a root, aligning with the replay tree's
 // "HTTP request" roots).
