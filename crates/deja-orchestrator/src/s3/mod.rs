@@ -52,6 +52,28 @@ struct EnvelopeProbe<'a> {
     event: Option<&'a serde_json::value::RawValue>,
 }
 
+/// Light probe for session grouping during an arbitrary-prefix scan — only
+/// the envelope's capture identity, everything else untouched.
+#[derive(serde::Deserialize)]
+struct SessionProbe {
+    #[serde(default)]
+    capture: Option<CaptureProbe>,
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureProbe {
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Per-event correlation probe (for the ingest report's correlation count —
+/// the session layout gets this from the manifest; a raw prefix has none).
+#[derive(serde::Deserialize)]
+struct CorrelationProbe {
+    #[serde(default)]
+    correlation_id: Option<String>,
+}
+
 /// Count landing objects for a recording (the "did Vector land anything yet /
 /// has the flush settled" poll the lifecycle runs before compacting).
 pub fn count_session_objects(cfg: &S3Config, recording_id: &str) -> Result<usize, String> {
@@ -97,6 +119,146 @@ pub fn pull_recording(
         sealed: true,
     };
     Ok((report, manifest))
+}
+
+/// Sessions discovered in a prefix scan: `(session_id, envelope line count)`,
+/// most lines first.
+pub type SessionsSeen = Vec<(String, usize)>;
+
+/// Pull a recording out of an ARBITRARY S3 prefix in the DEPLOYED aggregator
+/// layout — date-partitioned objects (e.g. `%Y/%m/%d/…log.gz`, gzip NDJSON)
+/// whose lines are full `deja.artifact_record/v2` envelopes with sessions
+/// INTERLEAVED (the aggregator pipe has no transforms, so envelope content is
+/// identical to the session layout; only key scheme + compression differ).
+///
+/// The recording is identified by envelope CONTENT (`capture.session_id`),
+/// not key layout: scan every object under `prefix`, group lines by session,
+/// then materialize the chosen session through the same collate (unwrap,
+/// dedup, sort) as the session-layout path.
+///
+/// `session`: `Some(id)` filters to that session; `None` auto-resolves when
+/// the scan finds exactly ONE session and errors with the discovered list
+/// otherwise. `dest_for` maps the RESOLVED session id to the events.jsonl
+/// destination (the id isn't known until the scan when auto-resolving).
+/// Returns the report, the resolved session id, and everything the scan saw
+/// (surfaced for a re-submit with an explicit session).
+pub fn pull_recording_from_prefix(
+    cfg: &S3Config,
+    prefix: &str,
+    session: Option<&str>,
+    dest_for: impl Fn(&str) -> std::path::PathBuf,
+) -> Result<(IngestReport, String, SessionsSeen), String> {
+    let prefix = prefix.trim_matches('/');
+    let keys = deja_compactor::list_objects(cfg, prefix)?;
+    if keys.is_empty() {
+        return Err(format!(
+            "no objects under s3://{}/{prefix} — check the path (and that the recording window landed)",
+            cfg.bucket
+        ));
+    }
+
+    let mut by_session: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut junk_lines = 0usize;
+    for key in &keys {
+        let data = deja_compactor::get_object_decoded(cfg, key)?;
+        for line in data.split(|&b| b == b'\n') {
+            if line.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let line_str = String::from_utf8_lossy(line).into_owned();
+            let sid = serde_json::from_str::<SessionProbe>(&line_str)
+                .ok()
+                .and_then(|p| p.capture)
+                .and_then(|c| c.session_id);
+            match sid {
+                Some(sid) => by_session.entry(sid).or_default().push(line_str),
+                None => junk_lines += 1,
+            }
+        }
+    }
+    if junk_lines > 0 {
+        eprintln!("ingest: {junk_lines} line(s) without a capture.session_id skipped");
+    }
+
+    let mut seen: SessionsSeen = by_session
+        .iter()
+        .map(|(sid, lines)| (sid.clone(), lines.len()))
+        .collect();
+    seen.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let resolved = match session {
+        Some(want) => {
+            if !by_session.contains_key(want) {
+                return Err(format!(
+                    "session '{want}' not found under s3://{}/{prefix}; sessions seen: {}",
+                    cfg.bucket,
+                    describe_sessions(&seen)
+                ));
+            }
+            want.to_owned()
+        }
+        None => match seen.len() {
+            1 => seen[0].0.clone(),
+            0 => {
+                return Err(format!(
+                    "objects under s3://{}/{prefix} contained no envelope lines",
+                    cfg.bucket
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "multiple sessions under s3://{}/{prefix} — pick one as the recording id: {}",
+                    cfg.bucket,
+                    describe_sessions(&seen)
+                ))
+            }
+        },
+    };
+
+    let lines = by_session.remove(&resolved).unwrap_or_default();
+    let chunk = lines.join("\n").into_bytes();
+    let (events, lines_in, duplicates) = collate(&[chunk]);
+
+    let dest = dest_for(&resolved);
+    let dest = dest.as_path();
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
+    );
+    let mut correlations = std::collections::HashSet::new();
+    for (_, _, line) in &events {
+        if let Ok(probe) = serde_json::from_str::<CorrelationProbe>(line) {
+            if let Some(corr) = probe.correlation_id {
+                correlations.insert(corr);
+            }
+        }
+        out.write_all(line.as_bytes())
+            .and_then(|_| out.write_all(b"\n"))
+            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+    }
+    out.flush().map_err(|e| format!("flush: {e}"))?;
+
+    let report = IngestReport {
+        prefix: format!("s3://{}/{prefix}", cfg.bucket),
+        landing_objects: keys.len(),
+        lines_in,
+        duplicates_dropped: duplicates,
+        events_out: events.len(),
+        correlations: correlations.len(),
+        // A raw prefix has no manifest seal; completeness is whatever the
+        // aggregator had flushed when we scanned.
+        sealed: false,
+    };
+    Ok((report, resolved, seen))
+}
+
+fn describe_sessions(seen: &SessionsSeen) -> String {
+    seen.iter()
+        .map(|(sid, n)| format!("{sid} ({n} lines)"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Inject the internally-tagged `record_kind` as the first field of a raw JSON

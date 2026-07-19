@@ -38,10 +38,14 @@ type DynStore = Arc<dyn ObjectStore>;
 const PART_MAX_EVENTS: usize = 50_000;
 const ZSTD_LEVEL: i32 = 3;
 
-/// Connection settings; defaults match the demo overlay's MinIO
-/// (host-published on 9100, minioadmin credentials, bucket created by
-/// minio-setup).
+/// Connection settings. An EMPTY `endpoint` targets real AWS S3: object_store
+/// derives the virtual-hosted endpoint from `region` and uses the AWS
+/// credential chain (IRSA/web-identity) when no static credentials are set — so
+/// an in-cluster pod needs only region + bucket. A non-empty `endpoint` (the
+/// demo overlay's MinIO, host-published on 9100 with minioadmin credentials)
+/// overrides that for a self-hosted/S3-compatible store.
 pub struct S3Config {
+    /// Explicit S3 endpoint, or empty to derive the AWS endpoint from `region`.
     pub endpoint: String,
     pub bucket: String,
     pub access_key: String,
@@ -54,7 +58,9 @@ impl S3Config {
     pub fn from_env() -> Self {
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
         Self {
-            endpoint: env("DEJA_S3_ENDPOINT", "http://127.0.0.1:9100"),
+            // Empty by default → real AWS (endpoint derived from region). The
+            // demo overlay sets DEJA_S3_ENDPOINT explicitly for its MinIO.
+            endpoint: env("DEJA_S3_ENDPOINT", ""),
             bucket: env("DEJA_S3_BUCKET", "deja-recordings"),
             access_key: env("DEJA_S3_ACCESS_KEY", "minioadmin"),
             secret_key: env("DEJA_S3_SECRET_KEY", "minioadmin"),
@@ -71,10 +77,17 @@ impl S3Config {
 
     pub fn build(&self) -> Result<DynStore, String> {
         let mut builder = AmazonS3Builder::new()
-            .with_endpoint(&self.endpoint)
             .with_bucket_name(&self.bucket)
             .with_region(&self.region)
             .with_allow_http(self.allow_http);
+
+        // Empty endpoint → let object_store derive the AWS virtual-hosted
+        // endpoint from the region (real S3). A non-empty endpoint overrides it
+        // (MinIO / S3-compatible). Passing an empty endpoint would break the
+        // derived URL, so only set it when present.
+        if !self.endpoint.trim().is_empty() {
+            builder = builder.with_endpoint(&self.endpoint);
+        }
 
         if self.has_static_credentials() {
             builder = builder
@@ -236,12 +249,25 @@ async fn get_decoded(store: &DynStore, key: &object_store::path::Path) -> Result
         .bytes()
         .await
         .map_err(|e| format!("s3 read {key}: {e}"))?;
-    if key.as_ref().ends_with(".zst") {
-        zstd::stream::decode_all(std::io::Cursor::new(&bytes[..]))
-            .map_err(|e| format!("zstd {key}: {e}"))
-    } else {
-        Ok(bytes.to_vec())
+    decode_object(key.as_ref(), &bytes)
+}
+
+/// Decode an object's compression by extension, with a magic-byte fallback:
+/// `.zst` = the deja session layout; `.gz`/gzip-magic = deployed Vector
+/// aggregators configured with `compression: gzip` (whose extension is a
+/// Vector default we don't control).
+fn decode_object(key: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if key.ends_with(".zst") {
+        return zstd::stream::decode_all(std::io::Cursor::new(bytes))
+            .map_err(|e| format!("zstd {key}: {e}"));
     }
+    if key.ends_with(".gz") || bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::new();
+        let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
+        std::io::Read::read_to_end(&mut decoder, &mut out).map_err(|e| format!("gzip {key}: {e}"))?;
+        return Ok(out);
+    }
+    Ok(bytes.to_vec())
 }
 
 async fn put(store: &DynStore, key: &str, bytes: Vec<u8>) -> Result<(), String> {
@@ -265,6 +291,52 @@ struct Accepted {
     correlation_id: Option<String>,
     boundary: String,
     raw_line: String,
+}
+
+/// List object keys under an ARBITRARY prefix (sorted). This is the scan
+/// primitive for ingesting non-session layouts — e.g. the deployed Vector
+/// aggregator's date-partitioned `%Y/%m/%d/` objects — where the recording is
+/// identified by envelope content (`capture.session_id`), not by key layout.
+pub fn list_objects(cfg: &S3Config, prefix: &str) -> Result<Vec<String>, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(async {
+        Ok(list_keys(&store, prefix)
+            .await?
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect())
+    })
+}
+
+/// Fetch one object and decode its compression (`.zst`, `.gz`, or plain).
+/// Companion to [`list_objects`] for arbitrary-prefix ingest.
+pub fn get_object_decoded(cfg: &S3Config, key: &str) -> Result<Vec<u8>, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(get_decoded(&store, &object_store::path::Path::from(key)))
+}
+
+/// Upload raw bytes to `key` (no compression). Used to stage a candidate
+/// CodeBundle (a migrations tar) that a Job initContainer later pulls.
+pub fn put_object(cfg: &S3Config, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(put(&store, key, bytes))
+}
+
+/// Whether an object exists at `key` (HEAD-equivalent). Lets a producer skip
+/// re-staging a bundle already present for a sha.
+pub fn object_exists(cfg: &S3Config, key: &str) -> Result<bool, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(async {
+        match store.head(&object_store::path::Path::from(key)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(format!("s3 head {key}: {e}")),
+        }
+    })
 }
 
 /// Count landing objects for a session (the lifecycle's quiesce poll).
@@ -565,6 +637,39 @@ fn collate(chunks: &[Vec<u8>]) -> Collated {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_object_handles_gzip_zstd_and_plain() {
+        let payload = b"{\"a\":1}\n{\"b\":2}\n";
+
+        // gzip by extension AND by magic bytes (deployed Vector aggregators
+        // use compression: gzip with a default extension we don't control).
+        let mut gz = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(payload).unwrap();
+            enc.finish().unwrap();
+        }
+        assert_eq!(
+            decode_object("2026/07/10/x.log.gz", &gz).unwrap(),
+            payload.to_vec()
+        );
+        assert_eq!(
+            decode_object("2026/07/10/x.log", &gz).unwrap(),
+            payload.to_vec(),
+            "gzip magic sniff must decode extension-less keys"
+        );
+
+        let zst = zstd_encode(payload).unwrap();
+        assert_eq!(
+            decode_object("sessions/v1/s/data/part-00000.ndjsonl.zst", &zst).unwrap(),
+            payload.to_vec()
+        );
+
+        assert_eq!(decode_object("plain.ndjson", payload).unwrap(), payload.to_vec());
+    }
 
     fn envelope(inst: &str, gseq: u64, corr: Option<&str>, boundary: &str) -> String {
         let corr_json = match corr {

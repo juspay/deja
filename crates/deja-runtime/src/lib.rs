@@ -350,6 +350,9 @@ pub enum EffectKind {
     Db,
     Redis,
     Http,
+    /// gRPC egress (kind tag "grpc"; transport-layer boundary — see
+    /// docs/design/grpc-egress-boundary.md).
+    Grpc,
     Entropy,
     Time,
     Function,
@@ -1061,13 +1064,21 @@ impl crate::graph::GraphNodeSink for RecordingHook {
 impl DejaHook for RecordingHook {
     fn mode(&self) -> RuntimeMode {
         // Process-level recording state AND the per-request sampling gate. The
-        // gate defaults to `true` (record) when no sampler is engaged, so a host
-        // that never pushes a decision is byte-for-byte unaffected; an explicit
-        // `false` for this request's correlation makes every boundary a no-op
+        // per-correlation decision is now an enum-ready `RecordDecision` (see
+        // deja-context). NOTE: the OPT-IN FLIP — defaulting undecided boundaries
+        // to `Skip` (`unwrap_or(false)`) so the Superposition sampler's own config
+        // read self-excludes — is deliberately DEFERRED to the sampler-boundary
+        // work, where it lands with the feature that needs it and is validated
+        // end-to-end (record+replay). Until then the gate keeps the pre-existing
+        // default: record when no decision is present, so every current test/rig
+        // is unaffected. An explicit `Skip` still makes every boundary a no-op
         // before any record-only helper allocates sequence numbers. Every
         // boundary — db, instrument id/time/crypto/http, redis, and the
         // `RuntimeHook::Recording` delegation — funnels through here.
-        if self.writer.is_active() && deja_context::recording_decision_for_current().unwrap_or(true)
+        if self.writer.is_active()
+            && deja_context::recording_decision_for_current()
+                .map(deja_context::RecordDecision::should_record)
+                .unwrap_or(true)
         {
             RuntimeMode::Record
         } else {
@@ -1434,20 +1445,10 @@ pub fn installed_runtime_hook() -> Option<Arc<RuntimeHook>> {
     GLOBAL_RUNTIME_HOOK.get().and_then(Clone::clone)
 }
 
-static GRAPH_RECORDING_ENABLED: OnceLock<bool> = OnceLock::new();
-
-/// Declare (set-once, at boot, before logger setup) whether execution-graph
-/// nodes should be captured onto the mode's record stream. Defaults to off:
-/// graph capture is an opt-in volume dial, not ambient behavior.
-pub fn set_graph_recording_enabled(enabled: bool) {
-    let _ = GRAPH_RECORDING_ENABLED.set(enabled);
-}
-
-/// Whether boot declared execution-graph capture on (see
-/// [`set_graph_recording_enabled`]).
-pub fn graph_recording_enabled() -> bool {
-    GRAPH_RECORDING_ENABLED.get().copied().unwrap_or(false)
-}
+// Graph capture is NOT a separate dial: the execution-graph layer is coupled to
+// the runtime mode (installed Record/Replay hook), exactly like the correlation
+// layer. It rides whichever record/replay stream is active or it does not exist
+// — there is no independent on/off knob to leave silently off.
 
 // ---------------------------------------------------------------------------
 // Builder for BoundaryEvent (used by generated delegation code)
@@ -3115,7 +3116,6 @@ where
 /// observation happens AFTER the real future resolves. The boundary macro emits
 /// this for `async fn` bodies and for `future = "boxed"` bodies (wrapping the
 /// returned `T` in `Box::pin`). See [`dispatch`] for the full rationale.
-#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
 pub async fn dispatch_async<T, A, Fut, F, C, R, O>(
     obs: CrossingObservation,
     args: A,
@@ -3130,6 +3130,43 @@ where
     C: FnOnce(serde_json::Value) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+{
+    // Egress default: a Substitute-miss has no honest value and re-running is
+    // unsafe, so STOP (see `fail_stop_substitute_miss`). A boundary whose caller
+    // has a deterministic degraded path uses `dispatch_async_or_miss` instead.
+    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
+    dispatch_async_or_miss(obs, args, run, reconstruct, extract, move || {
+        fail_stop_substitute_miss(boundary, method)
+    })
+    .await
+}
+
+/// [`dispatch_async`] with a caller-supplied `on_miss` closure for the
+/// Substitute-miss branch. The blocking NovelCall divergence is STILL emitted by
+/// `replay_boundary` before this point — the miss is always surfaced on the
+/// scorecard; `on_miss` only decides the continuation. Use this for a read whose
+/// caller has a deterministic degraded path: a Superposition config read returns
+/// `Err(SuperpositionError)` so the app's DB→default fallback runs and replay
+/// progresses, instead of the egress fail-stop. `on_miss` fires ONLY on a genuine
+/// lookup miss — a HIT whose recorded value cannot be reconstructed still
+/// fail-stops (a codec incompatibility is a bug, not graceful degradation).
+#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
+pub async fn dispatch_async_or_miss<T, A, Fut, F, C, R, O, M>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    on_miss: M,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    M: FnOnce() -> T,
 {
     match runtime_mode() {
         RuntimeMode::Disabled => record_only_path_async(obs, args, run, extract).await,
@@ -3174,9 +3211,7 @@ where
                                 obs.spec.method_name,
                             ),
                         },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
+                        None => on_miss(),
                     }
                 }
             }

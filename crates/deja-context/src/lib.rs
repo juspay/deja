@@ -15,11 +15,44 @@ use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
 
+/// The per-correlation recording decision.
+///
+/// Today this is a binary record/skip, but it is an enum — not a bare `bool` —
+/// so context-aware sampling resolved server-side in Superposition (sampling
+/// rates, per-boundary selection, experiment arms) can extend it later without
+/// re-plumbing the carrier through the context registry and task snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordDecision {
+    /// Record no boundary on this correlation.
+    Skip,
+    /// Record every boundary on this correlation.
+    Record,
+}
+
+impl RecordDecision {
+    /// Whether the recording hook should record boundaries under this decision.
+    #[inline]
+    pub fn should_record(self) -> bool {
+        matches!(self, Self::Record)
+    }
+}
+
+impl From<bool> for RecordDecision {
+    #[inline]
+    fn from(record: bool) -> Self {
+        if record {
+            Self::Record
+        } else {
+            Self::Skip
+        }
+    }
+}
+
 /// A captured causal context.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContextSnapshot {
     correlation_id: Option<String>,
-    recording_decision: Option<bool>,
+    recording_decision: Option<RecordDecision>,
 }
 
 impl ContextSnapshot {
@@ -47,13 +80,13 @@ impl ContextSnapshot {
     }
 
     /// Return the propagated recording decision, if one was captured.
-    pub fn recording_decision(&self) -> Option<bool> {
+    pub fn recording_decision(&self) -> Option<RecordDecision> {
         self.recording_decision
     }
 
     /// Attach a recording decision to this snapshot.
-    pub fn with_recording_decision(mut self, record: bool) -> Self {
-        self.recording_decision = Some(record);
+    pub fn with_recording_decision(mut self, record: impl Into<RecordDecision>) -> Self {
+        self.recording_decision = Some(record.into());
         self
     }
 
@@ -68,9 +101,9 @@ thread_local! {
     static CURRENT_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
 
     /// Per-correlation recording decision captured with the current context.
-    /// `Some(false)` must survive registry cleanup while spawned work is still
-    /// running, so it lives independently of the global decision map.
-    static CURRENT_RECORDING_DECISION: RefCell<Option<bool>> = const { RefCell::new(None) };
+    /// `Some(RecordDecision::Skip)` must survive registry cleanup while spawned
+    /// work is still running, so it lives independently of the global decision map.
+    static CURRENT_RECORDING_DECISION: RefCell<Option<RecordDecision>> = const { RefCell::new(None) };
 
     /// Tokio task currently being polled on this OS thread, if Tokio has called
     /// the runtime task-hook entry point.
@@ -116,11 +149,11 @@ pub fn current_correlation_id() -> Option<String> {
     CURRENT_CONTEXT.with(|cell| cell.borrow().clone())
 }
 
-fn current_recording_decision() -> Option<bool> {
+fn current_recording_decision() -> Option<RecordDecision> {
     CURRENT_RECORDING_DECISION.with(|cell| *cell.borrow())
 }
 
-fn snapshot_recording_decision_for(correlation_id: &str) -> Option<bool> {
+fn snapshot_recording_decision_for(correlation_id: &str) -> Option<RecordDecision> {
     let current_id_matches = current_correlation_id().as_deref() == Some(correlation_id);
     if current_id_matches {
         if let Some(record) = current_recording_decision() {
@@ -159,29 +192,36 @@ static SAMPLER_ENGAGED: AtomicBool = AtomicBool::new(false);
 // (`recording_decision_for_current`), which takes a shared read lock that never
 // contends with other readers; writes happen only at ingress/teardown. Combined
 // with the `SAMPLER_ENGAGED` fast-path, an un-sampled process touches neither.
-static RECORD_DECISIONS: OnceLock<RwLock<HashMap<String, bool>>> = OnceLock::new();
+static RECORD_DECISIONS: OnceLock<RwLock<HashMap<String, RecordDecision>>> = OnceLock::new();
 
-fn record_decisions() -> &'static RwLock<HashMap<String, bool>> {
+fn record_decisions() -> &'static RwLock<HashMap<String, RecordDecision>> {
     RECORD_DECISIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Push the per-request recording decision for `correlation_id`.
 ///
 /// The host decides *whether* to record (rate, targeting, experiments — all
-/// server-side in Superposition) and pushes the resolved boolean here at
-/// ingress. Déjà only consumes it: `false` makes the recording hook a no-op for
-/// every boundary on this correlation (gate-before-allocation); `true` records
-/// as usual. With no decision the gate defaults to recording, so a host that
-/// never installs a sampler is unaffected.
-pub fn set_recording_decision(correlation_id: impl Into<String>, record: bool) {
+/// server-side in Superposition) and pushes the resolved decision here at
+/// ingress. Déjà only consumes it: `Skip` makes the recording hook a no-op for
+/// every boundary on this correlation (gate-before-allocation); `Record` records
+/// as usual. With no decision the gate currently records by default (see
+/// [`recording_decision_for_current`]); the opt-in flip (default-skip, so the
+/// Superposition sampler's own fetch self-excludes) is staged for the
+/// sampler-boundary work, not yet switched on. Accepts a `bool` (via `From`) so
+/// binary call-sites stay terse.
+pub fn set_recording_decision(
+    correlation_id: impl Into<String>,
+    decision: impl Into<RecordDecision>,
+) {
     let correlation_id = correlation_id.into();
+    let decision = decision.into();
     SAMPLER_ENGAGED.store(true, Ordering::Relaxed);
     if let Ok(mut map) = record_decisions().write() {
-        map.insert(correlation_id.clone(), record);
+        map.insert(correlation_id.clone(), decision);
     }
     if current_correlation_id().as_deref() == Some(correlation_id.as_str()) {
         CURRENT_RECORDING_DECISION.with(|cell| {
-            *cell.borrow_mut() = Some(record);
+            *cell.borrow_mut() = Some(decision);
         });
     }
 }
@@ -198,7 +238,7 @@ pub fn clear_recording_decision(correlation_id: &str) {
 
 /// The decision for an explicit `correlation_id`, or `None` if no sampler is
 /// engaged or none was set.
-pub fn recording_decision(correlation_id: &str) -> Option<bool> {
+pub fn recording_decision(correlation_id: &str) -> Option<RecordDecision> {
     if !SAMPLER_ENGAGED.load(Ordering::Relaxed) {
         return None;
     }
@@ -211,9 +251,13 @@ pub fn recording_decision(correlation_id: &str) -> Option<bool> {
 /// The decision for the current correlation, or `None` when no sampler is
 /// engaged or the current correlation has none.
 ///
-/// Hot-path gate: `recording_decision_for_current().unwrap_or(true)` — record by
-/// default, suppress only on an explicit `false`.
-pub fn recording_decision_for_current() -> Option<bool> {
+/// Hot-path gate:
+/// `recording_decision_for_current().map(RecordDecision::should_record).unwrap_or(true)`
+/// — records by default, suppressing only on an explicit `Skip`, so a host that
+/// never pushes a decision is byte-for-byte unaffected. The opt-in flip
+/// (defaulting `None` to skip, so the sampler's own Superposition read
+/// self-excludes) is staged for the sampler-boundary work, not yet switched on.
+pub fn recording_decision_for_current() -> Option<RecordDecision> {
     if let Some(record) = current_recording_decision() {
         return Some(record);
     }
@@ -377,19 +421,19 @@ mod tests {
         // Pushing a decision engages the registry and records it per correlation.
         set_recording_decision("req-off", false);
         set_recording_decision("req-on", true);
-        assert_eq!(recording_decision("req-off"), Some(false));
-        assert_eq!(recording_decision("req-on"), Some(true));
-        // An unknown correlation has no decision → caller records by default.
+        assert_eq!(recording_decision("req-off"), Some(RecordDecision::Skip));
+        assert_eq!(recording_decision("req-on"), Some(RecordDecision::Record));
+        // An unknown correlation has no decision → caller skips by default (opt-in).
         assert_eq!(recording_decision("req-unknown-zzz"), None);
 
         // The current-correlation resolver reads the ambient correlation id.
         {
             let _g = enter_correlation_id("req-off");
-            assert_eq!(recording_decision_for_current(), Some(false));
+            assert_eq!(recording_decision_for_current(), Some(RecordDecision::Skip));
         }
         {
             let _g = enter_correlation_id("req-on");
-            assert_eq!(recording_decision_for_current(), Some(true));
+            assert_eq!(recording_decision_for_current(), Some(RecordDecision::Record));
         }
 
         // Clearing bounds the registry; the gate then falls back to default.
@@ -408,7 +452,7 @@ mod tests {
             let _guard = enter_correlation_id(correlation_id);
             let snapshot = capture_current();
             assert_eq!(snapshot.correlation_id(), Some(correlation_id));
-            assert_eq!(snapshot.recording_decision(), Some(false));
+            assert_eq!(snapshot.recording_decision(), Some(RecordDecision::Skip));
             tokio_task_spawn(task_id);
         }
 
@@ -417,7 +461,7 @@ mod tests {
 
         tokio_task_poll_start(task_id);
         assert_eq!(current_correlation_id().as_deref(), Some(correlation_id));
-        assert_eq!(recording_decision_for_current(), Some(false));
+        assert_eq!(recording_decision_for_current(), Some(RecordDecision::Skip));
         tokio_task_poll_stop(task_id);
         tokio_task_terminate(task_id);
     }
@@ -429,13 +473,13 @@ mod tests {
         {
             let _guard = enter(ContextSnapshot::empty().with_recording_decision(false));
             assert_eq!(current_correlation_id(), None);
-            assert_eq!(recording_decision_for_current(), Some(false));
+            assert_eq!(recording_decision_for_current(), Some(RecordDecision::Skip));
             tokio_task_spawn(task_id);
         }
 
         tokio_task_poll_start(task_id);
         assert_eq!(current_correlation_id(), None);
-        assert_eq!(recording_decision_for_current(), Some(false));
+        assert_eq!(recording_decision_for_current(), Some(RecordDecision::Skip));
         tokio_task_poll_stop(task_id);
         tokio_task_terminate(task_id);
     }

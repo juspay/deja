@@ -38,3 +38,4 @@ demo/.env
 
 # Dashboard build inputs (dist is committed; node_modules is not)
 web/node_modules/
+demo/.ucs-build/

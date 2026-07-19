@@ -98,22 +98,60 @@ fn run() -> Result<(), String> {
             .unwrap_or(u64::MAX)
     });
 
-    let mut driven = 0usize;
-    let mut skipped = 0usize;
-    for (cid, events) in ordered {
+    // Optional test-case subset (KERNEL_CORRELATION_FILTER, comma-separated
+    // correlation ids): each request is an independent test case, so driving a
+    // subset is sound — scoring scopes to the same filter. Logged loudly: a
+    // silently narrowed drive-list would read as full coverage.
+    if let Some(filter) = parse_correlation_filter(std::env::var("KERNEL_CORRELATION_FILTER").ok())
+    {
+        let before = ordered.len();
+        ordered.retain(|(cid, _)| filter.contains(*cid));
+        eprintln!(
+            "deja-kernel: correlation filter ({} id(s)): driving {} of {before} correlations ({} filtered out)",
+            filter.len(),
+            ordered.len(),
+            before - ordered.len(),
+        );
+        for want in &filter {
+            if !by_corr.contains_key(want) {
+                eprintln!("deja-kernel: WARNING filter correlation {want} is not in the recording");
+            }
+        }
+    }
+
+    // Concurrency knob (default 1 = today's serial drive). >1 drives that many
+    // correlations at once, so the replay router's per-correlation isolation
+    // (schema-per-correlation `search_path` routing, redis `{corr}:` namespace,
+    // correlation propagation) is actually exercised under contention on the
+    // shared bb8 pool — a single-correlation-at-a-time drive can't surface a
+    // cross-correlation bleed. Each request already carries its own
+    // `x-request-id`, so the correlations stay independent test cases; only the
+    // uncorrelated (null-correlation) background events share a bucket and may
+    // interleave, which is itself honest signal about concurrency safety.
+    let concurrency = std::env::var("KERNEL_DRIVE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let driven = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    let sink = std::sync::Mutex::new(&mut sink_file);
+    let write_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    // Drive ONE correlation: reconstruct its request, stamp the recorded
+    // correlation as `x-request-id` (the replay router runs IdReuse::UseIncoming,
+    // so its time/id/db replay lookups key off the SAME correlation that was
+    // recorded), hit the candidate, and record the diff. Shared verbatim by the
+    // serial and concurrent paths; sink writes serialize under a mutex.
+    let drive_one = |cid: &String, events: &Vec<BoundaryEvent>| {
         match reconstruct_driver_request(events) {
-            // Skip liveness probes — they're harness noise, not workload, and
-            // replaying them tells us nothing about candidate behavior.
+            // Skip liveness probes — harness noise, not workload.
             Some(driver) if driver.path == "/health" => {
-                skipped += 1;
+                skipped.fetch_add(1, Ordering::Relaxed);
             }
             Some(mut driver) => {
-                // Anchor the controlled environment: the replay router runs with
-                // IdReuse::UseIncoming, so feed the recorded correlation_id back
-                // as the x-request-id header. The candidate adopts it as its
-                // request/correlation id, so its time/id/db replay lookups key
-                // off the SAME correlation that was recorded — the prerequisite
-                // for deterministic, byte-exact self-replay.
                 driver
                     .headers
                     .retain(|(k, _)| !k.eq_ignore_ascii_case("x-request-id"));
@@ -121,8 +159,16 @@ fn run() -> Result<(), String> {
                     .headers
                     .push(("x-request-id".to_string(), cid.clone()));
                 let diff = drive(&target_host, target_port, &driver, &allowlist);
-                write_diff(&mut sink_file, &diff).map_err(|e| format!("write diff: {e}"))?;
-                driven += 1;
+                {
+                    let mut file = sink.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Err(e) = write_diff(&mut *file, &diff) {
+                        let mut slot = write_err.lock().unwrap_or_else(|p| p.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(format!("write diff: {e}"));
+                        }
+                    }
+                }
+                driven.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "deja-kernel: drove {cid} → {}{} (status {} vs {}, body diffs {})",
                     driver.method,
@@ -133,10 +179,44 @@ fn run() -> Result<(), String> {
                 );
             }
             None => {
-                skipped += 1;
+                skipped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    };
+
+    if concurrency <= 1 {
+        for &(cid, events) in &ordered {
+            drive_one(cid, events);
+        }
+    } else {
+        eprintln!(
+            "deja-kernel: CONCURRENT DRIVE — {} correlations across {} threads (KERNEL_DRIVE_CONCURRENCY={concurrency})",
+            ordered.len(),
+            concurrency,
+        );
+        let cursor = AtomicUsize::new(0);
+        let cursor_ref = &cursor;
+        let ordered_ref = &ordered;
+        let drive_one_ref = &drive_one;
+        std::thread::scope(|scope| {
+            for _ in 0..concurrency {
+                scope.spawn(move || loop {
+                    let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                    if i >= ordered_ref.len() {
+                        break;
+                    }
+                    let (cid, events) = ordered_ref[i];
+                    drive_one_ref(cid, events);
+                });
+            }
+        });
     }
+
+    if let Some(e) = write_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        return Err(e);
+    }
+    let driven = driven.load(Ordering::Relaxed);
+    let skipped = skipped.load(Ordering::Relaxed);
     eprintln!("deja-kernel: complete (driven {driven}, skipped {skipped})");
     Ok(())
 }
@@ -296,9 +376,30 @@ fn write_diff(file: &mut fs::File, diff: &HttpDiff) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Parse the comma-separated correlation filter; `None` when unset/blank so an
+/// empty env var never becomes "drive nothing".
+fn parse_correlation_filter(raw: Option<String>) -> Option<std::collections::BTreeSet<String>> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+    })
+    .filter(|set| !set.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correlation_filter_blank_means_no_filter() {
+        assert_eq!(parse_correlation_filter(None), None);
+        assert_eq!(parse_correlation_filter(Some("".into())), None);
+        assert_eq!(parse_correlation_filter(Some(" , ,".into())), None);
+        let set = parse_correlation_filter(Some("c-2, c-1 ,c-2".into())).expect("set");
+        assert_eq!(set.into_iter().collect::<Vec<_>>(), ["c-1", "c-2"]);
+    }
 
     #[test]
     fn parse_http_response_extracts_status_and_body() {

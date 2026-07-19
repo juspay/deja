@@ -14,11 +14,18 @@ deja-derive = { path = "../deja-derive" }
 deja-runtime = { path = "../deja-runtime" }
 serde = "1"
 serde_json = "1"
+# Optional: enables `codec::ResultCodec` + `db::recorded_output`, whose Value is
+# `Result<T, error_stack::Report<E>>`. Optional so the core facade stays
+# dependency-lean for consumers that don't use error-stack.
+error-stack = { version = "0.4", default-features = false, optional = true }
 
+[features]
+error-stack = ["dep:error-stack"]
 
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
+error-stack = { version = "0.4", default-features = false }
 
 [lints.clippy]
 dbg_macro = "deny"

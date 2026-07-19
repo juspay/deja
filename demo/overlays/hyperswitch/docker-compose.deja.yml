@@ -94,7 +94,6 @@ services:
       # than silently producing an empty tape.
       ROUTER__DEJA__SAMPLER__ENABLED: "true"
       ROUTER__DEJA__SAMPLER__FAIL_CLOSED: "false"
-      DEJA_GRAPH_DIR: /harness-state/graph/${RECORDING_ID:-demo}
       ROUTER__DEJA__RECORDING__KAFKA__TOPIC: ${DEJA_RECORDING_TOPIC:-hyperswitch-deja-recording-events}
       # Code identity stamped into the recording envelope (code.sha); the
       # orchestrator should provide the candidate git head through the standard
@@ -102,6 +101,17 @@ services:
       VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:-}
       RUST_MIN_STACK: "16777216"
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
+      # deja gRPC egress (DEMO_UCS=1): full-UCS path — stripe connector calls
+      # ride PaymentService/* gRPC through the wrapped channel. The client
+      # config is ALWAYS present (replay-side parity; a run without the `ucs`
+      # profile fails the eager connect instantly — unresolvable host — and
+      # the router stays direct because ucs_enabled is never seeded).
+      ROUTER__GRPC_CLIENT__UNIFIED_CONNECTOR_SERVICE__BASE_URL: http://ucs:8000
+      ROUTER__GRPC_CLIENT__UNIFIED_CONNECTOR_SERVICE__CONNECTION_TIMEOUT: "5"
+      ROUTER__GRPC_CLIENT__UNIFIED_CONNECTOR_SERVICE__REQUEST_TIMEOUT: "30"
+      # forwarded into the container so /workload.sh (docker compose exec) can
+      # seed ucs_enabled + the rollout row before the first payment
+      DEMO_UCS: ${DEMO_UCS:-0}
     volumes:
       # shared HarnessRoot (merged with the base service's ./config + ./files mounts)
       - ${HARNESS_STATE:-../../demo/harness-state}:/harness-state
@@ -133,8 +143,14 @@ services:
       ROUTER__DEJA__REPLAY__OBSERVED_SINK: /harness-state/observed/${RUN_ID:-demo}.jsonl
       # Replay-side execution graph (the future record-vs-replay tree diff).
       ROUTER__DEJA__RUN_ID: ${RUN_ID:-demo}
-      DEJA_GRAPH_DIR: /harness-state/graph-replay/${RUN_ID:-demo}
       RUST_MIN_STACK: "16777216"
+      # UCS client config parity with the record side: under replay the deja
+      # boundary hardwires Substitute and the channel is connect_lazy — the
+      # client must be Some(..) so code-path selection matches the recording,
+      # but nothing ever dials this address.
+      ROUTER__GRPC_CLIENT__UNIFIED_CONNECTOR_SERVICE__BASE_URL: http://ucs:8000
+      ROUTER__GRPC_CLIENT__UNIFIED_CONNECTOR_SERVICE__CONNECTION_TIMEOUT: "5"
+      ROUTER__GRPC_CLIENT__UNIFIED_CONNECTOR_SERVICE__REQUEST_TIMEOUT: "30"
     ports:
       - "${REPLAY_HOST_PORT:-8090}:8080"
     volumes:
@@ -158,6 +174,21 @@ services:
     # replay-only "novel id_generation" noise. Host-side `wait_health` already
     # gates replay readiness via a direct /health poll on the published port, so
     # the container healthcheck is redundant here.
+    healthcheck:
+      disable: true
+
+  # ── Unified Connector Service (real connector-service grpc-server) ────────
+  # Only in the `ucs` compose profile (DEMO_UCS=1 → lib.sh exports it). Built
+  # by demo/lib.sh from the SAME pinned checkout the router's client types
+  # come from. No stripe creds at boot — auth rides per-request gRPC metadata.
+  # NOTE: no depends_on from the router (a non-profiled service cannot depend
+  # on a profiled one — same constraint as kafka0 above); the router's 5s
+  # connection_timeout covers the sub-second ucs boot.
+  ucs:
+    image: deja-ucs-local:latest
+    profiles: [ucs]
+    networks:
+      - router_net
     healthcheck:
       disable: true
 

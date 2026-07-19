@@ -63,8 +63,33 @@ command -v mold >/dev/null || DEMO_CARGO_PROFILE=(env
   CARGO_PROFILE_RELEASE_INCREMENTAL=true
 )
 
+# DEMO_UCS=1: build + stage the real Unified Connector Service (connector-service
+# grpc-server) at the SAME pinned tag the router's UCS client types come from,
+# so the gate records real PaymentService/* gRPC through the deja boundary.
+# The service rides the `ucs` compose profile; router-side client config is
+# always present in the overlay (replay parity — connect_lazy never dials).
+UCS_CHECKOUT="${DEJA_UCS_CHECKOUT:-$HOME/.cargo/git/checkouts/connector-service-eea45f477e53ea08/a070ef7}"
+UCS_BUILD_DIR="$(pwd)/demo/.ucs-build"
+
+build_ucs_image() {
+  [ -d "$UCS_CHECKOUT" ] || { echo "DEMO_UCS=1 but UCS checkout missing: $UCS_CHECKOUT" >&2; exit 1; }
+  mkdir -p "$UCS_BUILD_DIR"
+  if [ ! -x "$UCS_BUILD_DIR/grpc-server" ]; then
+    ( cd "$UCS_CHECKOUT" && "${DEMO_CARGO_PROFILE[@]}"         cargo build --release -p grpc-server --target-dir "$UCS_BUILD_DIR/target" )
+    cp "$UCS_BUILD_DIR/target/release/grpc-server" "$UCS_BUILD_DIR/grpc-server"
+  fi
+  cp -r "$UCS_CHECKOUT/config" "$UCS_BUILD_DIR/"
+  printf '[workspace]\n' > "$UCS_BUILD_DIR/Cargo.toml"
+  cp demo/Dockerfile.ucs-server "$UCS_BUILD_DIR/Dockerfile"
+  docker build -t deja-ucs-local:latest "$UCS_BUILD_DIR"
+}
+
 build_binaries() {
   ( cd "$VENDOR" && "${DEMO_CARGO_PROFILE[@]}" cargo build --release -p router --features deja,v1 --bin router )
+  if [ "${DEMO_UCS:-0}" = "1" ]; then
+    build_ucs_image
+    export COMPOSE_PROFILES="${COMPOSE_PROFILES:+$COMPOSE_PROFILES,}ucs"
+  fi
   cargo build --release -p deja-kernel -p deja-orchestrator
   # deja-tui: the interactive record→replay substitution explorer (final stage).
   cargo build --release -p deja-tui
@@ -105,6 +130,7 @@ start_api() {
   DEJA_VENDOR_PATH="$VENDOR" \
   VERGEN_GIT_SHA="$(git -C "$VENDOR" rev-parse HEAD 2>/dev/null || echo unknown)" \
   STRIPE_API_KEY="$STRIPE_API_KEY" \
+  DEJA_S3_ENDPOINT="http://127.0.0.1:9100" \
     ./target/release/deja-orchestrator &
   API_PID=$!
   local _i

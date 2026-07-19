@@ -59,12 +59,13 @@ if ! command -v just >/dev/null 2>&1; then
 fi
 
 echo "deja: diesel=$(command -v diesel)"
-if command -v just >/dev/null 2>&1; then
-  exec just migrate
-else
-  echo "deja: 'just' unavailable; running 'diesel migration run' directly"
-  exec diesel migration run \
-    --database-url "$DATABASE_URL" \
-    --migration-dir /app/migrations \
-    --config-file /app/diesel.toml
-fi
+# ALWAYS run diesel directly with a NEUTRAL config. The repo's diesel.toml has
+# [print_schema] file = crates/diesel_models/src/schema.rs, so running with it
+# (which `just migrate` does) makes the CONTAINER regenerate schema.rs on the
+# MOUNTED vendor tree after every migration run — the recurring phantom
+# "M crates/diesel_models/src/schema.rs" (52 allow_tables entries dropped).
+# Migrations themselves are identical; only the schema regen is suppressed.
+exec diesel migration run \
+  --database-url "$DATABASE_URL" \
+  --migration-dir /app/migrations \
+  --config-file /dev/null

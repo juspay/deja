@@ -224,27 +224,35 @@ pub fn db_table_from_event_args(args: &serde_json::Value) -> Option<&str> {
     args.get("table").and_then(serde_json::Value::as_str)
 }
 
+/// The pragmatic primary-key column for a table, when known. Unknown tables
+/// return `None` and must use the query-fingerprint fallback — deliberately, so
+/// Rule A cannot group unrelated rows by a merely common column such as
+/// `merchant_id`. Public as a PRODUCER api: the facade's binds-parser derives
+/// row-exact read keys for reads whose result carries no row (e.g. NotFound).
+pub fn db_pk_column(table: &str) -> Option<&'static str> {
+    match table {
+        "payment_attempt" => Some("attempt_id"),
+        "payment_intent" => Some("payment_id"),
+        "merchant_account" | "merchant_key_store" => Some("merchant_id"),
+        "business_profile" => Some("profile_id"),
+        "merchant_connector_account" => Some("merchant_connector_id"),
+        "customers" => Some("customer_id"),
+        "organization" | "organizations" => Some("organization_id"),
+        "users" => Some("user_id"),
+        "api_keys" => Some("key_id"),
+        "user_authentication_methods" => Some("id"),
+        _ => None,
+    }
+}
+
 /// Return the known primary-key column for tables where Phase C can prove row
-/// uniqueness from a serialized result. Unknown tables deliberately fall back to
-/// [`StateKey::DbQuery`] so Rule A cannot group unrelated rows by a merely common
-/// column such as `merchant_id`.
+/// uniqueness from a serialized result (the column must be present and non-null
+/// in the row object).
 fn db_pk_column_for_table(
     table: &str,
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'static str> {
-    let candidate = match table {
-        "payment_attempt" => "attempt_id",
-        "payment_intent" => "payment_id",
-        "merchant_account" | "merchant_key_store" => "merchant_id",
-        "business_profile" => "profile_id",
-        "merchant_connector_account" => "merchant_connector_id",
-        "customers" => "customer_id",
-        "organization" | "organizations" => "organization_id",
-        "users" => "user_id",
-        "api_keys" => "key_id",
-        "user_authentication_methods" => "id",
-        _ => return None,
-    };
+    let candidate = db_pk_column(table)?;
     object
         .get(candidate)
         .filter(|value| !value.is_null())
@@ -2264,7 +2272,10 @@ impl ReadClassification {
 /// boundaries that explicitly declare [`ReturnSemantics::Optional`], a successful
 /// `{"Ok": null}` result is also absence.
 fn is_miss_result(event: &BoundaryEvent) -> bool {
-    if event.result.is_null() {
+    // Through the redis typed-codec envelope when present (identity for
+    // everything else): an enveloped `"value": null` is as much a miss as a
+    // raw null result.
+    if redis_seedable_result(event).is_null() {
         return true;
     }
 
@@ -2293,7 +2304,33 @@ fn is_declared_redis_null_read(event: &BoundaryEvent) -> bool {
     };
     declaration.effect == Some(EffectKind::Redis)
         && !event.read_set.is_empty()
-        && event.result.as_str() == Some("Null")
+        && redis_seedable_result(event).as_str() == Some("Null")
+}
+
+/// The value seed planning materializes for a REDIS event: the `value` inside
+/// a typed `ResultCodec` envelope (`{"version": _, "result": "Ok", "value": …}`)
+/// when the boundary recorded one, otherwise the raw result. Redis boundaries
+/// migrated to the typed codec wrap their wire value in the envelope; the seed
+/// must be the VALUE, not the envelope. DB events are NOT routed through this —
+/// the DB seeder parses its (identically shaped) `DejaDatabaseResult` envelope
+/// itself.
+fn redis_seedable_result(event: &BoundaryEvent) -> &serde_json::Value {
+    let is_redis = event
+        .declaration
+        .as_ref()
+        .is_some_and(|declaration| declaration.effect == Some(EffectKind::Redis));
+    if !is_redis {
+        return &event.result;
+    }
+    let Some(object) = event.result.as_object() else {
+        return &event.result;
+    };
+    let is_ok_envelope = object.contains_key("version")
+        && object.get("result").and_then(serde_json::Value::as_str) == Some("Ok");
+    match (is_ok_envelope, object.get("value")) {
+        (true, Some(value)) => value,
+        _ => &event.result,
+    }
 }
 
 fn is_db_create_event(event: &BoundaryEvent) -> bool {
@@ -2397,7 +2434,9 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 plan.upsert(SeedEntry {
                     boundary: event.boundary.clone(),
                     key: canonical_key.clone(),
-                    value: event.result.clone(),
+                    // Redis typed-codec envelopes seed their inner value; every
+                    // other boundary seeds the raw recorded result unchanged.
+                    value: redis_seedable_result(event).clone(),
                     image: preferred_seed_image(event, &canonical_key),
                     origin: SeedOrigin::Recording,
                 });
