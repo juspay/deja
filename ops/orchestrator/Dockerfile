@@ -58,8 +58,12 @@ RUN cargo build --release -p deja-orchestrator -p deja-kernel
 # (libpq.so.5 + its own transitive deps, resolved by apt) for the postgres
 # migrate stage. Without it, `diesel migration run` fails to load.
 FROM debian:bookworm-slim AS runtime-base
+# postgresql-client (psql) + redis-tools (redis-cli): the in-pod runner's
+# StoreExec::Direct shells out to both for seed/probe/readback against the Job's
+# pg/redis sidecars (store_exec.rs). Without them the schema probe fails with
+# "No such file or directory (os error 2)". libpq5 alone only covers diesel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl bash jq libpq5 \
+        ca-certificates curl bash jq libpq5 postgresql-client redis-tools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace/repo
 COPY --from=build /src/target/release/deja-orchestrator /usr/local/bin/deja-orchestrator
