@@ -60,6 +60,20 @@ pub struct RunRow {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// A run that has NOT reached a terminal state — the k8s reconciler's work
+/// list. Minimal by design: the reconciler only needs the id (to correlate
+/// with its Job), the current state (for log context), and how old the run is
+/// (to age out orphans).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveRun {
+    pub run_id: String,
+    pub state: String,
+    /// Seconds since the run row was created, measured by the DATABASE clock
+    /// (`now() - created_at`), so the reconciler's grace period is immune to
+    /// app/DB clock skew. Clamped non-negative by the consumer.
+    pub age_secs: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageRow {
     pub id: i64,
@@ -240,12 +254,19 @@ impl Store {
         state: &str,
         failure: Option<&serde_json::Value>,
     ) -> Result<(), sqlx::Error> {
+        // V4 terminal-guard: a terminal state (completed/failed) is the settled
+        // verdict — the first one wins. Under at-least-once, possibly-reordered
+        // push-back, a stale `running` or a second/conflicting `finish` must not
+        // regress or flip a run that has already finished. The WHERE clause makes
+        // any post-terminal transition a zero-row no-op, so the store is
+        // idempotent without the caller having to read-modify-write.
         sqlx::query(
             "UPDATE replay_runs SET
                state = $2,
                failure = COALESCE($3, failure),
                finished_at = CASE WHEN $2 IN ('completed','failed') THEN now() ELSE finished_at END
-             WHERE run_id = $1",
+             WHERE run_id = $1
+               AND state NOT IN ('completed','failed')",
         )
         .bind(run_id)
         .bind(state)
@@ -319,6 +340,29 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(run_row).collect())
+    }
+
+    /// Every run that is NOT terminal (state not in 'completed'/'failed'), with
+    /// its DB-clock age. The k8s reconciler polls this after an orchestrator
+    /// restart to re-derive the verdict of runs whose in-flight watcher was lost.
+    pub async fn list_active_runs(&self) -> Result<Vec<ActiveRun>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT run_id, state,
+                    EXTRACT(EPOCH FROM (now() - created_at))::float8 AS age_secs
+             FROM replay_runs
+             WHERE state NOT IN ('completed','failed')
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ActiveRun {
+                run_id: r.get(0),
+                state: r.get(1),
+                age_secs: r.get(2),
+            })
+            .collect())
     }
 
     // -- stage history + logs -------------------------------------------------

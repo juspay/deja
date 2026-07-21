@@ -9,6 +9,15 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+/// Recording is opt-in: a boundary records only when an explicit `Record`
+/// decision is present for the current context. The macro carries each site's
+/// explicit correlation on its event but does not enter it into the ambient
+/// context, so the record gate reads no current correlation — a decision-only
+/// context (checked first, correlation-independent) is what enables recording.
+fn recording_enabled() -> deja_context::ContextGuard {
+    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+}
+
 #[deja::boundary(
     boundary = "unit",
     component = "BoundaryMacroTest",
@@ -198,6 +207,7 @@ fn custom_codec(value: u64) -> u64 {
 
 #[test]
 fn boundary_macro_records_sync_function() {
+    let _rec = recording_enabled();
     let artifacts = tempfile::tempdir().expect("tempdir");
     std::env::set_var("DEJA_MODE", "record");
     std::env::set_var("DEJA_ARTIFACT_DIR", artifacts.path());

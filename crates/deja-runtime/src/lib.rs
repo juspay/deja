@@ -350,6 +350,13 @@ pub enum EffectKind {
     Db,
     Redis,
     Http,
+    /// In-memory (moka) L1 cache lookup (kind tag "imc"; a process-global
+    /// read-through cache fronting redis/db — its `Option` outcome is Substituted
+    /// per-correlation, see docs/design/cache-isolation.md).
+    Imc,
+    /// gRPC egress (kind tag "grpc"; transport-layer boundary — see
+    /// docs/design/grpc-egress-boundary.md).
+    Grpc,
     Entropy,
     Time,
     Function,
@@ -747,6 +754,24 @@ pub trait DejaHook: Send + Sync {
         RuntimeMode::Disabled
     }
 
+    /// The PROCESS-level configured mode, independent of per-request state.
+    ///
+    /// [`mode`](Self::mode) answers "should THIS boundary capture right now?" —
+    /// for a recorder it ANDs the process configuration with sink liveness and
+    /// the per-correlation sampling decision. That makes it unusable as an
+    /// INGRESS predicate: the middleware that pushes the sampling decision
+    /// cannot gate itself on a value that only becomes true once that decision
+    /// has already been pushed.
+    ///
+    /// `process_mode` answers the separate question "what is this process
+    /// configured to do?". It reads no thread-local, task-local, or per-request
+    /// state, so it is stable from boot onwards. Ingress predicates and
+    /// tracing-layer installation use this; the per-boundary capture gate keeps
+    /// using [`mode`](Self::mode).
+    fn process_mode(&self) -> RuntimeMode {
+        self.mode()
+    }
+
     /// Return true when the hook is active (recording or replay is enabled).
     ///
     /// When false, the generated delegation skips all recording overhead
@@ -1060,19 +1085,34 @@ impl crate::graph::GraphNodeSink for RecordingHook {
 
 impl DejaHook for RecordingHook {
     fn mode(&self) -> RuntimeMode {
-        // Process-level recording state AND the per-request sampling gate. The
-        // gate defaults to `true` (record) when no sampler is engaged, so a host
-        // that never pushes a decision is byte-for-byte unaffected; an explicit
-        // `false` for this request's correlation makes every boundary a no-op
-        // before any record-only helper allocates sequence numbers. Every
-        // boundary — db, instrument id/time/crypto/http, redis, and the
-        // `RuntimeHook::Recording` delegation — funnels through here.
-        if self.writer.is_active() && deja_context::recording_decision_for_current().unwrap_or(true)
+        // Process-level recording state AND the per-request sampling gate.
+        // Recording is OPT-IN: the gate records only when an explicit `Record`
+        // decision was pushed for this correlation at ingress (resolved from the
+        // Superposition sampler). `None` — no decision yet, or an orphan boundary
+        // with no live correlation — SKIPS. This is what makes the sampler's own
+        // Superposition read self-exclude: it runs before the decision is set,
+        // sees `None`, and allocates nothing. An explicit `Skip` likewise makes
+        // every boundary a no-op before any record-only helper allocates sequence
+        // numbers. Every boundary — db, instrument id/time/crypto/http, redis, and
+        // the `RuntimeHook::Recording` delegation — funnels through here.
+        if self.writer.is_active()
+            && deja_context::recording_decision_for_current()
+                .map(deja_context::RecordDecision::should_record)
+                .unwrap_or(false)
         {
             RuntimeMode::Record
         } else {
             RuntimeMode::Disabled
         }
+    }
+
+    /// A `RecordingHook` is only ever constructed by a process configured to
+    /// record, so the process-level answer is unconditionally `Record`. The
+    /// sink-liveness and per-correlation sampling gates live in
+    /// [`mode`](DejaHook::mode) and deliberately do NOT apply here — an ingress
+    /// predicate built on those would be self-blocking.
+    fn process_mode(&self) -> RuntimeMode {
+        RuntimeMode::Record
     }
 
     fn record(&self, event: BoundaryEvent) {
@@ -1204,6 +1244,18 @@ impl RuntimeHook {
         }
     }
 
+    /// The process-level configured mode — see [`DejaHook::process_mode`].
+    /// Unlike [`mode`](Self::mode) this never consults per-request state, so it
+    /// is safe as an ingress predicate.
+    pub fn process_mode(&self) -> RuntimeMode {
+        match self {
+            RuntimeHook::Recording(h) => DejaHook::process_mode(h.as_ref()),
+            RuntimeHook::Replay(h) => DejaHook::process_mode(h),
+            RuntimeHook::LookupReplay(h) => DejaHook::process_mode(h),
+            RuntimeHook::Disabled(h) => DejaHook::process_mode(h),
+        }
+    }
+
     /// Whether this hook is replaying recorded results (either the standalone
     /// `Replay` hook or the harness-driven `LookupReplay` hook).
     pub fn is_replay(&self) -> bool {
@@ -1214,6 +1266,10 @@ impl RuntimeHook {
 impl DejaHook for RuntimeHook {
     fn mode(&self) -> RuntimeMode {
         RuntimeHook::mode(self)
+    }
+
+    fn process_mode(&self) -> RuntimeMode {
+        RuntimeHook::process_mode(self)
     }
 
     fn try_replay(
@@ -1434,20 +1490,10 @@ pub fn installed_runtime_hook() -> Option<Arc<RuntimeHook>> {
     GLOBAL_RUNTIME_HOOK.get().and_then(Clone::clone)
 }
 
-static GRAPH_RECORDING_ENABLED: OnceLock<bool> = OnceLock::new();
-
-/// Declare (set-once, at boot, before logger setup) whether execution-graph
-/// nodes should be captured onto the mode's record stream. Defaults to off:
-/// graph capture is an opt-in volume dial, not ambient behavior.
-pub fn set_graph_recording_enabled(enabled: bool) {
-    let _ = GRAPH_RECORDING_ENABLED.set(enabled);
-}
-
-/// Whether boot declared execution-graph capture on (see
-/// [`set_graph_recording_enabled`]).
-pub fn graph_recording_enabled() -> bool {
-    GRAPH_RECORDING_ENABLED.get().copied().unwrap_or(false)
-}
+// Graph capture is NOT a separate dial: the execution-graph layer is coupled to
+// the runtime mode (installed Record/Replay hook), exactly like the correlation
+// layer. It rides whichever record/replay stream is active or it does not exist
+// — there is no independent on/off knob to leave silently off.
 
 // ---------------------------------------------------------------------------
 // Builder for BoundaryEvent (used by generated delegation code)
@@ -2152,6 +2198,25 @@ pub fn capture_is_active() -> bool {
 pub fn runtime_mode() -> RuntimeMode {
     global_runtime_hook_from_env()
         .map(|hook| hook.mode())
+        .unwrap_or(RuntimeMode::Disabled)
+}
+
+/// The process-level configured mode of the installed hook — the pure
+/// counterpart to [`runtime_mode`].
+///
+/// Two differences, both deliberate:
+/// - it reads [`RuntimeHook::process_mode`], so a recorder reports `Record`
+///   from boot rather than only while a sampled-in request is in flight;
+/// - it PEEKS the installed hook ([`installed_runtime_hook`]) instead of
+///   initializing one from the environment, so calling it can never latch the
+///   global ahead of the configured install. This mirrors how the
+///   execution-graph layer is wired.
+///
+/// Boot-time wiring that must reflect "what is this process for?" — tracing
+/// layer installation above all — belongs here. `Disabled` before install.
+pub fn process_runtime_mode() -> RuntimeMode {
+    installed_runtime_hook()
+        .map(|hook| hook.process_mode())
         .unwrap_or(RuntimeMode::Disabled)
 }
 
@@ -3115,7 +3180,6 @@ where
 /// observation happens AFTER the real future resolves. The boundary macro emits
 /// this for `async fn` bodies and for `future = "boxed"` bodies (wrapping the
 /// returned `T` in `Box::pin`). See [`dispatch`] for the full rationale.
-#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
 pub async fn dispatch_async<T, A, Fut, F, C, R, O>(
     obs: CrossingObservation,
     args: A,
@@ -3130,6 +3194,43 @@ where
     C: FnOnce(serde_json::Value) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+{
+    // Egress default: a Substitute-miss has no honest value and re-running is
+    // unsafe, so STOP (see `fail_stop_substitute_miss`). A boundary whose caller
+    // has a deterministic degraded path uses `dispatch_async_or_miss` instead.
+    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
+    dispatch_async_or_miss(obs, args, run, reconstruct, extract, move || {
+        fail_stop_substitute_miss(boundary, method)
+    })
+    .await
+}
+
+/// [`dispatch_async`] with a caller-supplied `on_miss` closure for the
+/// Substitute-miss branch. The blocking NovelCall divergence is STILL emitted by
+/// `replay_boundary` before this point — the miss is always surfaced on the
+/// scorecard; `on_miss` only decides the continuation. Use this for a read whose
+/// caller has a deterministic degraded path: a Superposition config read returns
+/// `Err(SuperpositionError)` so the app's DB→default fallback runs and replay
+/// progresses, instead of the egress fail-stop. `on_miss` fires ONLY on a genuine
+/// lookup miss — a HIT whose recorded value cannot be reconstructed still
+/// fail-stops (a codec incompatibility is a bug, not graceful degradation).
+#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
+pub async fn dispatch_async_or_miss<T, A, Fut, F, C, R, O, M>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    on_miss: M,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    M: FnOnce() -> T,
 {
     match runtime_mode() {
         RuntimeMode::Disabled => record_only_path_async(obs, args, run, extract).await,
@@ -3174,9 +3275,7 @@ where
                                 obs.spec.method_name,
                             ),
                         },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
+                        None => on_miss(),
                     }
                 }
             }

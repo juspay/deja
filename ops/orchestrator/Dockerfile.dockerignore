@@ -1,0 +1,17 @@
+# BuildKit picks this up for ops/orchestrator/Dockerfile specifically.
+# Keep the build context tiny: the repo holds ~43G of demo run state and
+# multi-GB target dirs that must never reach the daemon.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+!web/dist
+!vendor/hyperswitch-deja-clean
+!demo/migration-runner.sh
+!demo/workload.sh
+!demo/superposition_seed.toml
+!demo/.diesel-cli
+!demo/overlays
+vendor/hyperswitch-deja-clean/target
+vendor/hyperswitch-deja-clean/.git
+crates/**/target

@@ -15,10 +15,36 @@ ARTIFACT_DIR="${WORKLOAD_ARTIFACT_DIR:-/tmp/deja-pipeline}"
 LOG_FILE="${WORKLOAD_LOG:-$ARTIFACT_DIR/workload.log}"
 WORKLOAD_RUN_LABEL="${WORKLOAD_RUN_LABEL:-workload}"
 
-if [[ -z "${STRIPE_API_KEY:-}" ]]; then
-  echo "ERROR: STRIPE_API_KEY is required for the Stripe payment-confirm workload." >&2
+# Reuse an existing merchant instead of provisioning one. Required against a
+# shared environment (the sandbox custom pod), where an org + merchant + API key
+# per flow is antisocial and needs that environment's admin key.
+WORKLOAD_API_KEY="${WORKLOAD_API_KEY:-}"
+WORKLOAD_MERCHANT_ID="${WORKLOAD_MERCHANT_ID:-}"
+# Skip the Stripe connector create when the merchant already has one.
+WORKLOAD_SKIP_MCA="${WORKLOAD_SKIP_MCA:-false}"
+# Stop once this many flows have succeeded.
+WORKLOAD_MAX_SUCCESS="${WORKLOAD_MAX_SUCCESS:-5}"
+
+# Headers appended to EVERY request, newline-separated "Name: Value".
+# The sandbox custom pod is selected by an Istio header match, so the route
+# header has to ride every call: a request that omits it silently lands on the
+# stock router, which carries no Deja instrumentation and records nothing.
+# Each curl expands ${CURL_HDR[@]+"${CURL_HDR[@]}"} — the `+` form so an empty
+# array expands to nothing rather than to a single empty argument under `set -u`.
+CURL_HDR=()
+if [[ -n "${WORKLOAD_EXTRA_HEADERS:-}" ]]; then
+  while IFS= read -r _hdr; do
+    [[ -z "${_hdr//[[:space:]]/}" ]] && continue
+    CURL_HDR+=(-H "$_hdr")
+  done <<< "$WORKLOAD_EXTRA_HEADERS"
+fi
+
+# The Stripe key is only needed to create the connector account.
+if [[ "$WORKLOAD_SKIP_MCA" != "true" && -z "${STRIPE_API_KEY:-}" ]]; then
+  echo "ERROR: STRIPE_API_KEY is required to create the Stripe connector account." >&2
   echo "Set it without exposing it in shell history:" >&2
   echo "  read -rsp 'Stripe test key: ' STRIPE_API_KEY; echo; export STRIPE_API_KEY" >&2
+  echo "Or set WORKLOAD_SKIP_MCA=true if the merchant already has a Stripe connector." >&2
   exit 2
 fi
 
@@ -87,6 +113,7 @@ user_signup() {
   curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT_SECS" --max-time "$CURL_MAX_TIME_SECS" -X POST "$BASE_URL/user/signup" \
     -H "Content-Type: application/json" \
     -H "x-request-id: $(semantic_request_id user-signup)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     -d "{\"email\":\"$email\",\"password\":\"DejaDemo123!\"}" 2>/dev/null | jq -r '.token' 2>/dev/null || echo ""
 }
 
@@ -96,6 +123,7 @@ user_signin() {
   curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT_SECS" --max-time "$CURL_MAX_TIME_SECS" -X POST "$BASE_URL/user/signin" \
     -H "Content-Type: application/json" \
     -H "x-request-id: $(semantic_request_id user-signin)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     -d "{\"email\":\"$email\",\"password\":\"DejaDemo123!\"}" 2>/dev/null | jq -r '.token' 2>/dev/null || echo ""
 }
 
@@ -106,6 +134,7 @@ org_create() {
     -H "Content-Type: application/json" \
     -H "api-key: $ADMIN_API_KEY" \
     -H "x-request-id: $(semantic_request_id org-create)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     -d "{\"organization_name\":\"$org_name\"}" 2>/dev/null | jq -r '.organization_id' 2>/dev/null || echo ""
 }
 
@@ -117,7 +146,31 @@ merchant_create() {
     -H "Content-Type: application/json" \
     -H "api-key: $ADMIN_API_KEY" \
     -H "x-request-id: $(semantic_request_id merchant-create)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     -d "{\"merchant_id\":\"$merch_id\",\"merchant_name\":\"$merch_id\",\"organization_id\":\"$org_id\",\"return_url\":\"http://localhost:8080\"}" 2>/dev/null | jq -r '.merchant_id' 2>/dev/null || echo ""
+}
+
+# DEMO_UCS=1: flip the router onto the full-UCS path BEFORE the first payment.
+# Two rows via the admin configs API: ucs_enabled (the availability gate — its
+# false default is CACHED on first miss, hence before any payment) and one
+# org+merchant rollout row (rollout_percent 1.0 kills the sampler randomness;
+# execution_mode primary = synchronous in-request UCS call, 1:1 replay pairing
+# — shadow is a detached tokio::spawn and is deliberately NOT used here).
+enable_ucs() {
+  local org_id="$1" merch_id="$2"
+  local rollout_value='{"rollout_percent":1.0,"execution_mode":"primary"}'
+  curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT_SECS" --max-time "$CURL_MAX_TIME_SECS" -X POST "$BASE_URL/configs/" \
+    -H "Content-Type: application/json" \
+    -H "api-key: $ADMIN_API_KEY" \
+    -H "x-request-id: $(semantic_request_id ucs-enable)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
+    -d "$(jq -nc --arg v true '{key:"ucs_enabled", value:($v|tostring)}')" >/dev/null || return 1
+  curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT_SECS" --max-time "$CURL_MAX_TIME_SECS" -X POST "$BASE_URL/configs/" \
+    -H "Content-Type: application/json" \
+    -H "api-key: $ADMIN_API_KEY" \
+    -H "x-request-id: $(semantic_request_id ucs-rollout)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
+    -d "$(jq -nc --arg k "ucs_rollout_config_${org_id}_${merch_id}" --arg v "$rollout_value" '{key:$k, value:$v}')" >/dev/null || return 1
 }
 
 # API Key Create
@@ -127,6 +180,7 @@ apikey_create() {
     -H "Content-Type: application/json" \
     -H "api-key: $ADMIN_API_KEY" \
     -H "x-request-id: $(semantic_request_id api-key-create)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     -d '{"name":"benchmark-key","expiration":"never","description":"load test"}' 2>/dev/null | jq -r '.api_key' 2>/dev/null || echo ""
 }
 
@@ -136,6 +190,7 @@ merchant_retrieve() {
   local merch_id="$1"
   curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT_SECS" --max-time "$CURL_MAX_TIME_SECS" "$BASE_URL/accounts/$merch_id" \
     -H "x-request-id: $(semantic_request_id merchant-retrieve)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     -H "api-key: $ADMIN_API_KEY" 2>/dev/null | jq -r '.merchant_id' 2>/dev/null || echo ""
 }
 
@@ -151,6 +206,7 @@ mca_create() {
     -H "Content-Type: application/json" \
     -H "api-key: $api_key" \
     -H "x-request-id: $(semantic_request_id mca-create)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     --data-binary @- 2>/dev/null <<EOF
 {"connector_type":"payment_processor","connector_name":"stripe","connector_account_details":{"auth_type":"HeaderKey","api_key":"$STRIPE_API_KEY"}}
 EOF
@@ -174,6 +230,7 @@ payment_create() {
     -H "Content-Type: application/json" \
     -H "api-key: $api_key" \
     -H "x-request-id: $(semantic_request_id payment-create)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     --data-binary @- 2>/dev/null <<JSON
 {"amount":$amount,"currency":"USD","confirm":false,"capture_method":"automatic","authentication_type":"no_three_ds","connector":["stripe"],"return_url":"https://example.com"}
 JSON
@@ -201,6 +258,7 @@ payment_confirm() {
     -H "Content-Type: application/json" \
     -H "api-key: $api_key" \
     -H "x-request-id: $(semantic_request_id payment-confirm)" \
+    ${CURL_HDR[@]+"${CURL_HDR[@]}"} \
     --data-binary @- 2>/dev/null <<'JSON'
 {
   "payment_method": "card",
@@ -298,37 +356,46 @@ record_payment_metrics() {
 # Full flow
 run_flow() {
   local iteration="${1:-1}"
-  local email="user_$(random_id)@deja.dev"
+  local email org_id merch_id api_key
   CURRENT_FLOW_ID="$(printf "flow-%03d" "$iteration")"
 
-  # Signup (writes user to PG)
-  local token
-  token=$(user_signup "$email")
-  [[ -z "$token" ]] && { log "FAIL user_signup"; return 1; }
+  if [[ -n "$WORKLOAD_API_KEY" ]]; then
+    # Reuse mode: the merchant already exists, so the provisioning calls are
+    # skipped entirely. Nothing here writes to the shared environment beyond
+    # the payment itself.
+    email="(reused)"
+    org_id=""
+    merch_id="$WORKLOAD_MERCHANT_ID"
+    api_key="$WORKLOAD_API_KEY"
+  else
+    email="user_$(random_id)@deja.dev"
 
-  # Signin (reads user from PG + Redis)
-  token=$(user_signin "$email")
-  [[ -z "$token" ]] && { log "FAIL user_signin"; return 1; }
+    # Signup (writes user to PG)
+    local token
+    token=$(user_signup "$email")
+    [[ -z "$token" ]] && { log "FAIL user_signup"; return 1; }
 
-  # Create org (admin API, writes to PG)
-  local org_id
-  org_id=$(org_create)
-  [[ -z "$org_id" ]] && { log "FAIL org_create"; return 1; }
+    # Signin (reads user from PG + Redis)
+    token=$(user_signin "$email")
+    [[ -z "$token" ]] && { log "FAIL user_signin"; return 1; }
 
-  # Create merchant (admin API, writes to PG + Redis)
-  local merch_id
-  merch_id=$(merchant_create "$org_id")
-  [[ -z "$merch_id" ]] && { log "FAIL merchant_create"; return 1; }
+    # Create org (admin API, writes to PG)
+    org_id=$(org_create)
+    [[ -z "$org_id" ]] && { log "FAIL org_create"; return 1; }
 
-  # Create API key (admin API, writes to PG)
-  local api_key
-  api_key=$(apikey_create "$merch_id")
-  [[ -z "$api_key" ]] && { log "FAIL apikey_create"; return 1; }
+    # Create merchant (admin API, writes to PG + Redis)
+    merch_id=$(merchant_create "$org_id")
+    [[ -z "$merch_id" ]] && { log "FAIL merchant_create"; return 1; }
 
-  # Retrieve merchant (admin API, exercises a read before payment setup)
-  local retrieved
-  retrieved=$(merchant_retrieve "$merch_id")
-  [[ -z "$retrieved" ]] && { log "FAIL merchant_retrieve"; return 1; }
+    # Create API key (admin API, writes to PG)
+    api_key=$(apikey_create "$merch_id")
+    [[ -z "$api_key" ]] && { log "FAIL apikey_create"; return 1; }
+
+    # Retrieve merchant (admin API, exercises a read before payment setup)
+    local retrieved
+    retrieved=$(merchant_retrieve "$merch_id")
+    [[ -z "$retrieved" ]] && { log "FAIL merchant_retrieve"; return 1; }
+  fi
 
   # Do not enable merchant KV here: the current Hyperswitch payment-confirm
   # path fails on cached PaymentAttempt deserialization. Redis still remains
@@ -339,10 +406,20 @@ run_flow() {
 
   # Create MCA with Stripe (required for payments, uses merchant API key)
   local mca_status mca_ms
-  read -r mca_status mca_ms <<< "$(mca_create "$merch_id" "$api_key")"
-  if ! is_2xx "$mca_status"; then
-    log "FAIL mca_create status=$mca_status"
-    return 1
+  if [[ "$WORKLOAD_SKIP_MCA" == "true" ]]; then
+    mca_ms=0
+  else
+    read -r mca_status mca_ms <<< "$(mca_create "$merch_id" "$api_key")"
+    if ! is_2xx "$mca_status"; then
+      log "FAIL mca_create status=$mca_status"
+      return 1
+    fi
+  fi
+
+  # deja gRPC gate: route this merchant's connector calls through UCS.
+  if [[ "${DEMO_UCS:-0}" == "1" ]]; then
+    enable_ucs "$org_id" "$merch_id" || { log "FAIL enable_ucs"; return 1; }
+    log "UCS enabled: connector calls ride PaymentService/* gRPC (org=$org_id merch=$merch_id)"
   fi
 
   # Create payment intent using the Stripe connector.
@@ -408,7 +485,7 @@ for i in $(seq 1 "$ITERATIONS"); do
   fi
   
   # Stop early if we've collected enough successful samples
-  if [ "$SUCCESS" -ge 5 ]; then
+  if [ "$SUCCESS" -ge "$WORKLOAD_MAX_SUCCESS" ]; then
     log "Collected $SUCCESS successful samples, stopping early"
     break
   fi

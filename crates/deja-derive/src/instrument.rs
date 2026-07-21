@@ -642,12 +642,12 @@ fn replay_strategy_variant(id: &Ident) -> std::result::Result<TokenStream, Token
 
 fn effect_kind_variant(id: &Ident) -> std::result::Result<TokenStream, TokenStream> {
     match id.to_string().as_str() {
-        "Db" | "Redis" | "Http" | "Entropy" | "Time" | "Function" => {
+        "Db" | "Redis" | "Imc" | "Http" | "Grpc" | "Entropy" | "Time" | "Function" => {
             Ok(quote!(::deja::__private::EffectKind::#id))
         }
         _ => Err(syn::Error::new_spanned(
             id,
-            "unknown effect; expected Db | Redis | Http | Entropy | Time | Function",
+            "unknown effect; expected Db | Redis | Imc | Http | Grpc | Entropy | Time | Function",
         )
         .to_compile_error()),
     }

@@ -16,7 +16,7 @@
 //!
 //! Runtime config (env, with demo defaults):
 //!   DEMO_COMPOSE_BASE    HS compose (default vendor/hyperswitch-deja-clean/docker-compose.yml)
-//!   DEMO_COMPOSE_OVERLAY deja overlay (default vendor/hyperswitch-deja-clean/docker-compose.deja.yml)
+//!   DEMO_COMPOSE_OVERLAY deja overlay (default demo/overlays/hyperswitch/docker-compose.deja.yml)
 //!   DEMO_PROJECT         docker compose project name (default deja-demo)
 //!   DEMO_REPLAY_PORT     host port for the replay candidate (default 8090; the
 //!                        only host-published port — the host kernel hits it)
@@ -31,10 +31,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{read_json, write_json, CandidateSpec, HarnessRoot, Run, RunMode, RunStatus};
+use crate::{
+    read_json, write_json, CandidateSpec, HarnessRoot, Run, RunMode, RunStatus, SchemaFingerprint,
+};
 
 pub mod store_ctx;
 pub use store_ctx::StoreCtx;
+pub(crate) mod store_exec;
+use store_exec::StoreExec;
 
 /// Resolved runtime configuration for the demo orchestration.
 #[derive(Clone)]
@@ -49,6 +53,13 @@ struct Demo {
     /// Image tag for the candidate services; defaults to the overlay's local
     /// build, overridden when a `local_binary` candidate is baked per-run.
     candidate_image: Option<String>,
+    /// Whether the `ucs` compose profile is active (DEMO_UCS=1 → lib.sh exports
+    /// `COMPOSE_PROFILES=ucs`, which this process inherits). Named-service
+    /// `compose up` does NOT pull in a profiled service unless it is named
+    /// explicitly, so the RECORD path must add `ucs` to its service list; the
+    /// env alone is not enough. The REPLAY path never lists it — replay
+    /// substitutes the gRPC egress from the tape, no live UCS server.
+    ucs_profile: bool,
 }
 
 impl Demo {
@@ -59,9 +70,13 @@ impl Demo {
                 "DEMO_COMPOSE_BASE",
                 "vendor/hyperswitch-deja-clean/docker-compose.yml",
             ),
+            // The out-of-tree overlay (W4) is canonical: it carries the TYPED
+            // ROUTER__DEJA__* env the current router reads. The vendor tree
+            // still holds a stale pre-typed copy — with that one, a candidate
+            // silently boots with deja disabled.
             compose_overlay: env(
                 "DEMO_COMPOSE_OVERLAY",
-                "vendor/hyperswitch-deja-clean/docker-compose.deja.yml",
+                "demo/overlays/hyperswitch/docker-compose.deja.yml",
             ),
             project: env("DEMO_PROJECT", "deja-demo"),
             replay_port: env("DEMO_REPLAY_PORT", "8090").parse().unwrap_or(8090),
@@ -69,6 +84,9 @@ impl Demo {
             topic: env("DEMO_KAFKA_TOPIC", "hyperswitch-deja-recording-events"),
             harness_state: root.root.display().to_string(),
             candidate_image: None,
+            ucs_profile: std::env::var("COMPOSE_PROFILES")
+                .map(|p| p.split(',').any(|s| s.trim() == "ucs"))
+                .unwrap_or(false),
         }
     }
 
@@ -227,8 +245,10 @@ pub fn drive(root: &HarnessRoot, run_id: &str, ctx: &StoreCtx) {
 
 /// Resolve the run's `CandidateSpec` into the image tag compose will use.
 ///
-/// - `PrebuiltImage` keeps the legacy behavior: the overlay's default image,
-///   built by compose itself (`--build`).
+/// - `PrebuiltImage`: a deployed image ref (e.g. the Jenkins ECR build) —
+///   pre-pull it (fail fast on auth/typo, streamed into the run log), then
+///   point compose at it via `${CANDIDATE_IMAGE}`; no local build. The host's
+///   docker must be logged into the registry (bring-up runbook).
 /// - `LocalPath` ("paste a router binary path" — the Phase 1 web-matrix form):
 ///   validate the binary, sha256 it (the UI's compile-neutral signal), stage a
 ///   minimal docker context, bake `deja-candidate:<run8>`, and point compose at
@@ -240,10 +260,36 @@ fn resolve_candidate(
     run: &mut Run,
     ctx: &StoreCtx,
 ) -> Result<(), String> {
-    let CandidateSpec::LocalPath { binary_or_source } = &run.spec.candidate_spec else {
-        return Ok(()); // legacy paths (prebuilt image / compose build)
+    let binary = match &run.spec.candidate_spec {
+        CandidateSpec::PrebuiltImage { image } => {
+            let image = image.trim().to_owned();
+            // "deja-demo" is the SPA's historical no-candidate default: the
+            // legacy compose self-build (overlay default image, `--build`).
+            // An empty ref means the same.
+            if image.is_empty() || image == "deja-demo" {
+                return Ok(());
+            }
+            ctx.stage("pulling candidate image", 0, 0);
+            let mut cmd = Command::new("docker");
+            cmd.args(["pull", &image]);
+            let status = run_streamed(cmd, ctx, "pulling candidate image", "docker pull")?;
+            if !status.success() {
+                return Err(format!(
+                    "docker pull {image} failed (status {status}) — is the host logged into the registry?"
+                ));
+            }
+            run.candidate_image = Some(crate::CandidateImage {
+                docker_image: image.clone(),
+                source_ref: image.clone(),
+            });
+            write_json(&root.run_path(&run.run_id), run)
+                .map_err(|e| format!("persist run: {e}"))?;
+            demo.candidate_image = Some(image);
+            return Ok(());
+        }
+        CandidateSpec::LocalPath { binary_or_source } => binary_or_source.clone(),
+        _ => return Ok(()), // build-from-ref variants land with M3
     };
-    let binary = binary_or_source.clone();
     ctx.stage("resolving candidate binary", 0, 0);
 
     let bytes = std::fs::read(&binary)
@@ -440,13 +486,22 @@ fn drive_record(
         total,
         "building images + starting kafka/minio",
     );
+    // With DEMO_UCS the Unified Connector Service comes up in THIS infra `up`
+    // (before the router), so the record router's eager UCS connect at boot
+    // finds a listening host and the outbound gRPC egress is exercised + taped.
+    // Named-service `up` won't start `ucs` from COMPOSE_PROFILES alone — it has
+    // to be listed. Replay never lists it (egress is substituted from the tape).
+    let mut infra: Vec<&str> = vec!["kafka0", "minio", "minio-setup"];
+    if demo.ucs_profile {
+        infra.push("ucs");
+    }
     compose_up(
         demo,
         ctx,
         "building images + starting kafka/minio",
         &recording_id,
         &run.run_id,
-        &["kafka0", "minio", "minio-setup"],
+        &infra,
         run.candidate_image.is_none(),
         &[],
     )?;
@@ -502,9 +557,10 @@ fn drive_record(
     // BEFORE the workload — V1 then records reading 0.10 and writing it (the
     // recorded twin). Best-effort.
     seed_redis(
-        demo,
-        &recording_id,
-        &run.run_id,
+        &StoreExec::compose(
+            demo.compose_base_args(),
+            demo.compose_env(&recording_id, &run.run_id),
+        ),
         "settlement_rate_default",
         "0.10",
     );
@@ -569,37 +625,11 @@ fn drive_replay(
     run: &mut Run,
     ctx: &StoreCtx,
 ) -> Result<(), String> {
-    let recording_id = run
-        .spec
-        .recording_id
-        .clone()
-        .or_else(|| run.recording_id.clone())
-        .ok_or_else(|| "replay run requires recording_id".to_string())?;
-    run.recording_id = Some(recording_id.clone());
-    ctx.run_recording(&recording_id);
-
     let total = 6;
     set_status(root, run, RunStatus::Resolving, None);
     ctx.run_state("resolving");
-    // Full loop: the recording comes back out of MinIO. (If a prior record run
-    // on this host already pulled it to disk, reuse that.)
-    set_stage(
-        root,
-        run,
-        ctx,
-        1,
-        total,
-        "pulling recording from MinIO (S3)",
-    );
+    let recording_id = stage_resolve_recording(root, run, ctx, total)?;
     let recording_path = root.recording_events_path(&recording_id);
-    if !recording_path.exists() {
-        pull_recording(root, ctx, &recording_id)?;
-    }
-    if !recording_path.exists() {
-        return Err(format!(
-            "recording {recording_id} not found in S3 or on disk"
-        ));
-    }
 
     // Render the lookup table (whole-document JSON; round-trips through both the
     // candidate's LocalFileLookupSource and the divergence detector).
@@ -663,14 +693,20 @@ fn drive_replay(
     // run wrote → short-circuits → "merchant already exists" / UR_15). The
     // in-memory moka cache is already fresh per replay process; only redis carries
     // record's writes over.
-    flush_redis(demo, &recording_id, &run.run_id)?;
+    // Store transport for this run (S1 seam): compose here; the in-pod k8s
+    // runner builds a StoreExec::direct against its sidecars instead.
+    let store = StoreExec::compose(
+        demo.compose_base_args(),
+        demo.compose_env(&recording_id, &run.run_id),
+    );
+    flush_redis(&store)?;
     // GENERAL SEEDING (replay precondition materialization).
     // Replay routing is driven by the candidate's explicit per-boundary
     // declarations plus DEJA_MODE=replay. Seed materialization restores the
     // recorded preconditions into concrete stores before the replay workload
     // runs; materialization remains best-effort because scoring can still report
     // the replay outcome when store seeding is unavailable.
-    let seed_certificate = materialize_seed_plan(demo, root, &recording_id, &run.run_id);
+    let seed_certificate = materialize_seed_plan(&store, root, &recording_id, &run.run_id);
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
     match write_json(&seed_certificate_path, &seed_certificate) {
         Ok(()) => ctx.artifact(
@@ -680,9 +716,217 @@ fn drive_replay(
         ),
         Err(e) => eprintln!("lifecycle: seed certificate write failed: {e}; continuing"),
     }
-    run_kernel(demo, root, ctx, &recording_id, &run.run_id)?;
+    run_kernel(
+        &demo.kernel_bin,
+        demo.replay_port,
+        root,
+        ctx,
+        &recording_id,
+        &run.run_id,
+        run.spec.correlation_filter.as_deref(),
+    )?;
 
-    set_stage(root, run, ctx, 6, total, "scoring divergence (byte-exact)");
+    // Compose: the orchestrator serves artifacts from its own state dir.
+    score_and_register(root, run, ctx, &recording_id, total, &ArtifactSink::Local)
+}
+
+/// Stage 1 (shared by the compose worker and the in-pod runner): resolve the
+/// recording identity and materialize `events.jsonl`.
+///
+/// With an `s3_source` the spec's recording id is a SESSION FILTER and may be
+/// unset (the scan auto-resolves it when the prefix holds exactly one
+/// session); the session-layout path requires it up front.
+fn stage_resolve_recording(
+    root: &HarnessRoot,
+    run: &mut Run,
+    ctx: &StoreCtx,
+    total: u32,
+) -> Result<String, String> {
+    let wanted = run
+        .spec
+        .recording_id
+        .clone()
+        .or_else(|| run.recording_id.clone());
+    let s3_source = run.spec.s3_source.clone();
+    let recording_id = match &s3_source {
+        // Deployed aggregator layout: scan the given bucket/prefix, resolve
+        // the session, materialize events.jsonl.
+        Some(source) => {
+            set_stage(
+                root,
+                run,
+                ctx,
+                1,
+                total,
+                "scanning S3 source (aggregator layout)",
+            );
+            resolve_recording_from_source(root, ctx, source, wanted.as_deref())?
+        }
+        // Session layout: the recording comes back out of the deja bucket.
+        // (If a prior run on this host already pulled it to disk, reuse that.)
+        None => {
+            let recording_id =
+                wanted.ok_or_else(|| "replay run requires recording_id".to_string())?;
+            set_stage(
+                root,
+                run,
+                ctx,
+                1,
+                total,
+                "pulling recording from MinIO (S3)",
+            );
+            if !root.recording_events_path(&recording_id).exists() {
+                pull_recording(root, ctx, &recording_id)?;
+            }
+            recording_id
+        }
+    };
+    run.recording_id = Some(recording_id.clone());
+    ctx.run_recording(&recording_id);
+    if !root.recording_events_path(&recording_id).exists() {
+        return Err(format!(
+            "recording {recording_id} not found in S3 or on disk"
+        ));
+    }
+    Ok(recording_id)
+}
+
+/// Final stage (shared): score the run, report the verdict, register the
+/// The replay-run stream artifacts [`score_and_register`] publishes, as
+/// `(kind, s3-filename)`. One list so the sink loop and the DB-constraint
+/// coverage test stay in agreement. `observed` also carries the replay-side
+/// execution-graph nodes (`DejaRecord::GraphNode`).
+const REPLAY_STREAM_ARTIFACTS: [(&str, &str); 5] = [
+    ("lookup_table", "lookup_table.jsonl"),
+    ("observed", "observed.jsonl"),
+    ("http_diffs", "http_diffs.jsonl"),
+    ("scorecard", "scorecard.json"),
+    ("call_ledger", "call_ledger.jsonl"),
+];
+
+/// Where a run's replay artifacts are published so the dashboard can read them
+/// back AFTER the run. Compose/local: the orchestrator serves them from its own
+/// state dir, so the local path is enough. In-pod: the runner pod is ephemeral,
+/// so each artifact is uploaded to S3 under `<prefix>/<run_id>/` and the durable
+/// `s3://` URI is registered — the orchestrator hydrates from there on demand.
+/// The RAW streams (`observed`, `http_diffs`, `lookup_table`) are kept, so any
+/// current or future visualization derives from them, not just today's cards.
+pub enum ArtifactSink {
+    Local,
+    S3 {
+        cfg: crate::s3::S3Config,
+        prefix: String,
+    },
+}
+
+impl ArtifactSink {
+    /// The in-pod runner selects the S3 sink via `DEJA_RUN_ARTIFACT_S3=1` (set on
+    /// the Job's runner container ONLY, never the orchestrator), using the
+    /// runner's S3 config and `DEJA_RUN_ARTIFACT_PREFIX` (default `replay-runs`).
+    /// Anything else → Local (the compose worker's orchestrator serves artifacts
+    /// itself). A misconfigured Job (flag unset) degrades to pod-local artifacts,
+    /// which the dashboard simply won't show — never a failed run.
+    pub fn from_env() -> Self {
+        if std::env::var("DEJA_RUN_ARTIFACT_S3").ok().as_deref() == Some("1") {
+            let prefix = std::env::var("DEJA_RUN_ARTIFACT_PREFIX")
+                .ok()
+                .map(|s| s.trim().trim_matches('/').to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "replay-runs".to_owned());
+            ArtifactSink::S3 {
+                cfg: crate::s3::S3Config::from_env(),
+                prefix,
+            }
+        } else {
+            ArtifactSink::Local
+        }
+    }
+
+    /// The durable object key for a run artifact: `<prefix>/<run_id>/<filename>`.
+    pub fn key(prefix: &str, run_id: &str, filename: &str) -> String {
+        format!("{prefix}/{run_id}/{filename}")
+    }
+
+    /// Publish one artifact file and return `(uri, bytes)` to register, or None
+    /// if the file is absent (best-effort — some artifacts are optional) or the
+    /// upload failed (logged; the run still finishes, the dashboard just lacks
+    /// that one artifact). S3: upload under the run prefix, return the `s3://`
+    /// URI. Local: return the local path unchanged.
+    pub fn publish(
+        &self,
+        run_id: &str,
+        filename: &str,
+        local: &std::path::Path,
+    ) -> Option<(String, i64)> {
+        let bytes = std::fs::metadata(local).ok()?.len() as i64;
+        match self {
+            ArtifactSink::Local => Some((local.display().to_string(), bytes)),
+            ArtifactSink::S3 { cfg, prefix } => {
+                let data = std::fs::read(local)
+                    .map_err(|e| eprintln!("artifact: read {}: {e}", local.display()))
+                    .ok()?;
+                let key = Self::key(prefix, run_id, filename);
+                match deja_compactor::put_object(cfg, &key, data) {
+                    Ok(()) => Some((format!("s3://{}/{}", cfg.bucket, key), bytes)),
+                    Err(e) => {
+                        eprintln!("artifact: upload {key} failed: {e}");
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract the record-side execution-graph nodes (`DejaRecord::GraphNode`) from
+/// a recording's events tape into a compact `record_graph.jsonl`: the STRUCTURE
+/// of the recorded run's cascade (span ids, parents, names, level, timing, span
+/// fields), NOT its boundary payloads (args/results). The in-pod runner already
+/// holds the recording locally (it drove replay off it); emitting just the graph
+/// nodes as a run artifact lets the record side reach the dashboard through the
+/// SAME S3 sink as the replay side, WITHOUT copying the sensitive recording tape
+/// off the pod. Returns the node count (0 ⇒ no local recording / no nodes ⇒
+/// nothing to publish).
+fn write_record_graph_nodes(
+    recording_path: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<usize, String> {
+    let Ok(file) = std::fs::File::open(recording_path) else {
+        return Ok(0); // no recording on disk (nothing to derive the record graph from)
+    };
+    let mut out = String::new();
+    let mut nodes = 0usize;
+    for line in BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Keep ONLY graph nodes — boundary events (the payloads) never leave.
+        if let Ok(deja::DejaRecord::GraphNode(_)) = serde_json::from_str::<deja::DejaRecord>(&line) {
+            out.push_str(&line);
+            out.push('\n');
+            nodes += 1;
+        }
+    }
+    if nodes == 0 {
+        return Ok(0);
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(dest, out).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    Ok(nodes)
+}
+
+/// replay artifacts (best-effort; absent files are skipped).
+fn score_and_register(
+    root: &HarnessRoot,
+    run: &mut Run,
+    ctx: &StoreCtx,
+    recording_id: &str,
+    total: u32,
+    sink: &ArtifactSink,
+) -> Result<(), String> {
+    set_stage(root, run, ctx, total, total, "scoring divergence (byte-exact)");
     let card = crate::divergence::detect_and_score(root, &run.run_id)
         .map_err(|e| format!("score: {e}"))?;
     let verdict_line = format!(
@@ -700,34 +944,55 @@ fn drive_replay(
     };
     ctx.result(Some(verdict), serde_json::to_value(&card).ok().as_ref());
 
-    // Register replay artifacts (best-effort; absent files are skipped).
-    ctx.artifact(
-        Some(&recording_id),
-        "lookup_table",
-        &root.lookup_table_path(&run.run_id),
-    );
-    ctx.artifact(
-        Some(&recording_id),
-        "observed",
-        &root.observed_path(&run.run_id),
-    );
-    ctx.artifact(
-        Some(&recording_id),
-        "http_diffs",
-        &root.http_diff_path(&run.run_id),
-    );
-    ctx.artifact(
-        Some(&recording_id),
-        "scorecard",
-        &root.scorecard_path(&run.run_id),
-    );
-    ctx.artifact(
-        Some(&recording_id),
-        "call_ledger",
-        &root.call_ledger_path(&run.run_id),
-    );
-    // Replay-side execution-graph nodes ride the observed stream as
-    // `DejaRecord::GraphNode` lines, already registered above.
+    // Publish the raw replay streams + computed cards through the sink. In-pod
+    // these upload to S3 (durable past the ephemeral pod); compose registers
+    // local paths. The RAW streams (observed, http_diffs, lookup_table) are kept
+    // so any current or future view derives from them. Each entry also lands in
+    // the run manifest index below. `observed` carries the replay-side
+    // execution-graph nodes (`DejaRecord::GraphNode`) — no separate artifact.
+    let mut index = serde_json::Map::new();
+    for (kind, filename) in REPLAY_STREAM_ARTIFACTS {
+        let path = match kind {
+            "lookup_table" => root.lookup_table_path(&run.run_id),
+            "observed" => root.observed_path(&run.run_id),
+            "http_diffs" => root.http_diff_path(&run.run_id),
+            "scorecard" => root.scorecard_path(&run.run_id),
+            "call_ledger" => root.call_ledger_path(&run.run_id),
+            _ => continue,
+        };
+        if let Some((uri, bytes)) = sink.publish(&run.run_id, filename, &path) {
+            ctx.artifact_uri(Some(recording_id), kind, &uri, Some(bytes));
+            index.insert(
+                kind.to_owned(),
+                serde_json::json!({ "uri": uri, "bytes": bytes }),
+            );
+        }
+    }
+
+    // Record-side execution graph: the recorded run's cascade STRUCTURE (graph
+    // nodes only — never the boundary payloads), derived from the recording the
+    // runner already holds locally. Published through the SAME sink so the
+    // dashboard's `/graph` record side renders for in-pod runs too, WITHOUT the
+    // sensitive recording tape ever leaving the pod. (Compose registers the local
+    // path; the orchestrator also reads the recording directly there, so this is
+    // belt-and-suspenders — but it keeps both modes on one artifact contract.)
+    let record_graph_path = root.record_graph_path(&run.run_id);
+    match write_record_graph_nodes(&root.recording_events_path(recording_id), &record_graph_path) {
+        Ok(0) => {} // no recording on disk / no graph nodes — nothing to publish
+        Ok(node_count) => {
+            if let Some((uri, bytes)) =
+                sink.publish(&run.run_id, "record_graph.jsonl", &record_graph_path)
+            {
+                ctx.artifact_uri(Some(recording_id), "record_graph", &uri, Some(bytes));
+                index.insert(
+                    "record_graph".to_owned(),
+                    serde_json::json!({ "uri": uri, "bytes": bytes, "nodes": node_count }),
+                );
+            }
+        }
+        Err(e) => eprintln!("lifecycle: record-graph extract failed: {e}"),
+    }
+
     // Static HTML visualization (the demo's existing visualize-replay.py);
     // best-effort — python3 may be absent.
     let viz = root
@@ -745,9 +1010,224 @@ fn drive_replay(
         .map(|s| s.success())
         .unwrap_or(false);
     if viz_ok {
-        ctx.artifact(Some(&recording_id), "visualization_html", &viz);
+        if let Some((uri, bytes)) = sink.publish(&run.run_id, "visualization.html", &viz) {
+            ctx.artifact_uri(Some(recording_id), "visualization_html", &uri, Some(bytes));
+            index.insert(
+                "visualization_html".to_owned(),
+                serde_json::json!({ "uri": uri, "bytes": bytes }),
+            );
+        }
+    }
+
+    // Run manifest: one object that indexes every artifact + the recording
+    // pointer + candidate + correlation subset + verdict, so the dashboard (and
+    // any future view) can find the whole run from a single key.
+    let manifest = serde_json::json!({
+        "schema": "deja.replay-run/v1",
+        "run_id": run.run_id,
+        "recording_id": recording_id,
+        "candidate_image": run.candidate_image,
+        "correlation_filter": run.spec.correlation_filter,
+        "verdict": verdict,
+        "artifacts": index,
+    });
+    let manifest_path = root
+        .root
+        .join("runs")
+        .join(format!("{}.manifest.json", run.run_id));
+    if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
+        if std::fs::write(&manifest_path, bytes).is_ok() {
+            if let Some((uri, bytes)) = sink.publish(&run.run_id, "manifest.json", &manifest_path) {
+                ctx.artifact_uri(Some(recording_id), "manifest", &uri, Some(bytes));
+            }
+        }
     }
     Ok(())
+}
+
+/// The in-pod (k8s Job) replay driver: `drive_replay` minus the compose
+/// stages. The candidate service is a POD CONTAINER k8s started (not ours to
+/// start or tear down), the stores are sidecars reached directly
+/// ([`StoreExec::Direct`]), and progress flows back through the caller's
+/// `StoreCtx` (the Http transport in a Job). Sequencing:
+///
+///   1. resolve + pull the recording (shared stage)
+///   2. render the lookup table into the SHARED workspace volume at the
+///      contract path ([`HarnessRoot::replay_contract`]); the candidate loads
+///      it eagerly at boot (its own env binds the path — for the Hyperswitch
+///      router, `ROUTER__DEJA__REPLAY__SOURCE`)
+///   3. migrate the sidecar pg (operator-supplied command; the per-corr
+///      schema clone in seeding needs a migrated `public`)
+///   4. flush + seed the sidecar stores (idempotent across Job retries), then
+///      publish the readiness sentinel — the candidate's boot guard blocks on
+///      it, so it can never serve against an unseeded store (A2)
+///   5. wait for candidate health, drive the kernel
+///   6. score + register artifacts (shared stage)
+pub struct InPodOptions {
+    /// Sidecar redis, e.g. ("127.0.0.1", 6379).
+    pub redis_host: String,
+    pub redis_port: u16,
+    /// Sidecar pg conninfo URL (also what seeding's psql uses via `-d`).
+    pub database_url: String,
+    /// The router container's health/traffic port (pod-shared netns).
+    pub router_port: u16,
+    /// deja-kernel binary path inside the runner container.
+    pub kernel_bin: String,
+    /// Migration command (argv) run at stage 3 with DATABASE_URL set; None
+    /// logs the stage as skipped (a pre-migrated store, e.g. an initContainer).
+    ///
+    /// The migration CONTENT this command applies must be the CANDIDATE's
+    /// (its `migrations/` tree at its code sha), staged onto the shared volume
+    /// by the candidate — never the harness runner's own baked migrations. The
+    /// runner owns the migration TOOL (diesel), not the schema. `expected_schema`
+    /// below is what enforces that the right content actually ran.
+    pub migrate_cmd: Option<Vec<String>>,
+    /// The CANDIDATE's expected schema fingerprint — its own migration versions,
+    /// derived by the executor from the candidate ref, NOT a harness constant.
+    /// After migrating, the runner reads the live schema back and refuses
+    /// (fail-closed, P1) unless it is exactly this set, so a stale or foreign
+    /// migration set becomes a loud refusal instead of a false verdict (A1).
+    /// None = no candidate schema supplied: record the live fingerprint, no gate.
+    pub expected_schema: Option<SchemaFingerprint>,
+}
+
+pub fn drive_replay_in_pod(
+    root: &HarnessRoot,
+    run: &mut Run,
+    ctx: &StoreCtx,
+    opts: &InPodOptions,
+) -> Result<(), String> {
+    let total = 6;
+    set_status(root, run, RunStatus::Resolving, None);
+    ctx.run_state("resolving");
+    let recording_id = stage_resolve_recording(root, run, ctx, total)?;
+    let recording_path = root.recording_events_path(&recording_id);
+
+    set_stage(root, run, ctx, 2, total, "rendering lookup table");
+    let table = crate::lookup::render_lookup_table(&recording_path, &recording_id, 1)
+        .map_err(|e| format!("render lookup table: {e}"))?;
+    write_json(&root.lookup_table_path(&run.run_id), &table)
+        .map_err(|e| format!("write lookup table: {e}"))?;
+    if table.entries.is_empty() {
+        return Err("rendered lookup table is empty".to_string());
+    }
+
+    set_status(root, run, RunStatus::Building, None);
+    ctx.run_state("building");
+    set_stage(root, run, ctx, 3, total, "migrating sidecar pg");
+    match &opts.migrate_cmd {
+        Some(argv) if !argv.is_empty() => {
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..])
+                .env("DATABASE_URL", &opts.database_url);
+            let status = run_streamed(cmd, ctx, "migrating sidecar pg", "migrate")?;
+            if !status.success() {
+                return Err(format!("migration command failed (status {status})"));
+            }
+        }
+        _ => ctx.log(
+            "migrating sidecar pg",
+            "no migrate command configured — assuming a pre-migrated store",
+        ),
+    }
+
+    set_status(root, run, RunStatus::Running, None);
+    ctx.run_state("running");
+    set_stage(root, run, ctx, 4, total, "seeding sidecar stores");
+    let store = StoreExec::direct(
+        opts.redis_host.clone(),
+        opts.redis_port,
+        opts.database_url.clone(),
+    );
+
+    // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
+    // into it. The live fingerprint is read back from the store; the expected set
+    // is the candidate's own migration versions (supplied by the executor, a
+    // function of the candidate ref — never a harness constant). A mismatch is a
+    // fail-closed refusal that names the drift, not a silent seed-into-wrong-
+    // schema that resurfaces later as a phantom candidate regression.
+    let live_schema = read_schema_fingerprint(&store)?;
+    ctx.log(
+        "seeding sidecar stores",
+        &format!(
+            "live schema: {} migrations applied (head {})",
+            live_schema.count(),
+            live_schema.head().unwrap_or("none"),
+        ),
+    );
+    if let Some(expected) = &opts.expected_schema {
+        if !live_schema.matches(expected) {
+            let (missing, extra) = live_schema.diff(expected);
+            return Err(format!(
+                "schema fingerprint mismatch (P1): candidate expects {} migrations (head {}), \
+                 store has {} (head {}); missing {} [{}], extra {} [{}]. The applied migration set \
+                 is not the candidate's — refusing rather than emit a false verdict.",
+                expected.count(),
+                expected.head().unwrap_or("none"),
+                live_schema.count(),
+                live_schema.head().unwrap_or("none"),
+                missing.len(),
+                sample_versions(&missing),
+                extra.len(),
+                sample_versions(&extra),
+            ));
+        }
+        ctx.log(
+            "seeding sidecar stores",
+            "schema fingerprint matches the candidate (P1 pass)",
+        );
+    }
+
+    flush_redis(&store)?;
+    let seed_certificate = materialize_seed_plan(&store, root, &recording_id, &run.run_id);
+    let seed_certificate_path = root.seed_certificate_path(&run.run_id);
+    match write_json(&seed_certificate_path, &seed_certificate) {
+        Ok(()) => ctx.artifact(
+            Some(&recording_id),
+            "seed_certificate",
+            &seed_certificate_path,
+        ),
+        Err(e) => eprintln!("lifecycle: seed certificate write failed: {e}; continuing"),
+    }
+
+    // A2: the candidate boots as a pod sibling with no ordering guarantee vs
+    // this runner. It aborts loudly if the lookup table (stage 2) is missing,
+    // but nothing otherwise stops it serving traffic against a store this runner
+    // has not yet seeded — a between-stages boot yields a FALSE divergence.
+    // Publish the readiness sentinel now, only after seeding; the candidate's
+    // boot command blocks on it (`ReplayContract::wait_for_seed_snippet`). Fatal
+    // on failure: a missing sentinel would hang the candidate until the Job times
+    // out. Idempotent across Job retries (overwrite).
+    let ready = root.ready_sentinel_path(&run.run_id);
+    std::fs::write(&ready, run.run_id.as_bytes())
+        .map_err(|e| format!("publish readiness sentinel {}: {e}", ready.display()))?;
+    ctx.log(
+        "seeding sidecar stores",
+        &format!("stores seeded; readiness sentinel published at {}", ready.display()),
+    );
+
+    set_stage(root, run, ctx, 5, total, "driving recorded requests (kernel)");
+    wait_health(opts.router_port, Duration::from_secs(240))?;
+    run_kernel(
+        &opts.kernel_bin,
+        opts.router_port,
+        root,
+        ctx,
+        &recording_id,
+        &run.run_id,
+        run.spec.correlation_filter.as_deref(),
+    )?;
+
+    // In-pod: DEJA_RUN_ARTIFACT_S3=1 (Job template) uploads artifacts to S3 so
+    // they survive the ephemeral pod and the dashboard can hydrate them.
+    score_and_register(
+        root,
+        run,
+        ctx,
+        &recording_id,
+        total,
+        &ArtifactSink::from_env(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -831,19 +1311,68 @@ fn teardown_if_isolated(demo: &Demo, run_id: &str) {
 /// required for byte-exact self-replay. Best-effort: if redis isn't reachable
 /// (e.g. a deployment without the standalone service) the flush is skipped
 /// rather than failing the whole replay.
-fn flush_redis(demo: &Demo, recording_id: &str, run_id: &str) -> Result<(), String> {
-    let mut args = demo.compose_base_args();
-    args.extend(
-        ["exec", "-T", "redis-standalone", "redis-cli", "FLUSHALL"]
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    eprintln!("lifecycle: docker {}", args.join(" "));
-    match Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
-        .status()
-    {
+/// Read the applied migration versions back from the store's diesel bookkeeping
+/// table — the ground truth of which schema is live (A1/P1). Guarded for an
+/// unmigrated store: a missing `__diesel_schema_migrations` yields an EMPTY
+/// fingerprint (not a hard error), which the P1 gate then reports as a mismatch
+/// if a candidate schema was expected. A genuine connection/read failure is
+/// fatal (fail-loud), so an unreadable store never masquerades as unmigrated.
+fn read_schema_fingerprint(store: &StoreExec) -> Result<SchemaFingerprint, String> {
+    let exists = store
+        .psql(
+            &["-A", "-t"],
+            true,
+            "SELECT to_regclass('__diesel_schema_migrations') IS NOT NULL",
+        )
+        .output()
+        .map_err(|e| format!("probe schema migrations table: {e}"))?;
+    if !exists.status.success() {
+        return Err(format!(
+            "probe schema migrations table failed: {}",
+            String::from_utf8_lossy(&exists.stderr).trim()
+        ));
+    }
+    if String::from_utf8_lossy(&exists.stdout).trim() != "t" {
+        return Ok(SchemaFingerprint::new(Vec::new()));
+    }
+    let out = store
+        .psql(
+            &["-A", "-t"],
+            true,
+            "SELECT version FROM __diesel_schema_migrations ORDER BY version",
+        )
+        .output()
+        .map_err(|e| format!("read schema migrations: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "read schema migrations failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let applied = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Ok(SchemaFingerprint::new(applied))
+}
+
+/// Render the first few versions of a drift set for a refusal message (the full
+/// set can be hundreds of entries).
+fn sample_versions(v: &[String]) -> String {
+    let shown: Vec<&str> = v.iter().take(5).map(String::as_str).collect();
+    if v.len() > 5 {
+        format!("{}, …", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn flush_redis(store: &StoreExec) -> Result<(), String> {
+    let mut cmd = store.redis_cli(&["FLUSHALL"]);
+    eprintln!("lifecycle: {}", store_exec::describe(&cmd));
+    match cmd.status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => {
             eprintln!("lifecycle: redis FLUSHALL exited {status}; continuing (best-effort)");
@@ -861,17 +1390,15 @@ fn flush_redis(demo: &Demo, recording_id: &str, run_id: &str) -> Result<(), Stri
 /// not pg. Mirrors `flush_redis`'s `docker compose exec -T redis-standalone
 /// redis-cli ...` pattern. Best-effort: a failure logs and continues.
 fn seed_redis(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
+    store: &StoreExec,
     key: &str,
     value: &str,
 ) -> (SeedMaterializationStatus, SeedReadback) {
     let image = RedisSeedImage::string(key, value);
-    match seed_redis_image(demo, recording_id, run_id, &image) {
+    match seed_redis_image(store, &image) {
         Ok(()) => (
             SeedMaterializationStatus::Materialized,
-            readback_redis(demo, recording_id, run_id, key, value),
+            readback_redis(store, key, value),
         ),
         Err(message) => (
             SeedMaterializationStatus::Failed,
@@ -908,38 +1435,20 @@ impl RedisSeedImage {
     }
 }
 
-fn seed_redis_image(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
-    image: &RedisSeedImage,
-) -> Result<(), String> {
-    let mut args = demo.compose_base_args();
-    args.extend(
-        [
-            "exec",
-            "-T",
-            "redis-standalone",
-            "redis-cli",
-            "SET",
-            image.physical_key.as_str(),
-            image.raw_value.as_str(),
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
+fn seed_redis_image(store: &StoreExec, image: &RedisSeedImage) -> Result<(), String> {
+    let mut cmd = store.redis_cli(&[
+        "SET",
+        image.physical_key.as_str(),
+        image.raw_value.as_str(),
+    ]);
     eprintln!(
-        "lifecycle: docker {} (redis key {} byte(s), value {:?}, ttl {:?})",
-        args.join(" "),
+        "lifecycle: {} (redis key {} byte(s), value {:?}, ttl {:?})",
+        store_exec::describe(&cmd),
         image.physical_key_bytes.len(),
         image.value_type,
         image.ttl_seconds
     );
-    match Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
-        .status()
-    {
+    match cmd.status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => {
             let message = format!("seed_redis exited {status}");
@@ -954,14 +1463,8 @@ fn seed_redis_image(
     }
 }
 
-fn readback_redis(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
-    key: &str,
-    expected: &str,
-) -> SeedReadback {
-    let exists = match redis_cli_output(demo, recording_id, run_id, &["redis-cli", "EXISTS", key]) {
+fn readback_redis(store: &StoreExec, key: &str, expected: &str) -> SeedReadback {
+    let exists = match redis_cli_output(store, &["EXISTS", key]) {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_owned()
         }
@@ -981,12 +1484,7 @@ fn readback_redis(
         );
     }
 
-    let output = match redis_cli_output(
-        demo,
-        recording_id,
-        run_id,
-        &["redis-cli", "--raw", "GET", key],
-    ) {
+    let output = match redis_cli_output(store, &["--raw", "GET", key]) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             return SeedReadback::error(format!(
@@ -1020,21 +1518,11 @@ fn readback_redis(
 }
 
 fn redis_cli_output(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
+    store: &StoreExec,
     redis_args: &[&str],
 ) -> Result<std::process::Output, String> {
-    let mut args = demo.compose_base_args();
-    args.extend(
-        ["exec", "-T", "redis-standalone"]
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    args.extend(redis_args.iter().map(|s| (*s).to_string()));
-    Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
+    store
+        .redis_cli(redis_args)
         .output()
         .map_err(|e| format!("could not run redis readback: {e}"))
 }
@@ -1245,16 +1733,16 @@ impl SeedReadback {
 /// logic lives in `deja-record` and is unit-tested without docker; this function
 /// is the thin I/O wiring that walks the plan.
 ///
-/// Two boundary arms: `redis` entries materialize via [`seed_redis`] (the demo
-/// path); `db` entries (seed-from-result-by-PK rows) materialize via [`seed_db`]
-/// ONLY when `DEJA_SEED_DB` is set — by default the db arm is SKIPPED ENTIRELY,
-/// so the redis-only demo is byte-identical.
+/// Two boundary arms: `redis` entries materialize via [`seed_redis`]; `db`
+/// entries (seed-from-result-by-PK rows) materialize via [`seed_db`] into the
+/// correlation's schema. Both are ON by default; `DEJA_SEED_DB=0` kill-switches
+/// the db arm (falls back to the shared-pg self-rebuild).
 ///
 /// Best-effort throughout: a missing/unparseable recording, an unmapped row, or
 /// an unreachable store logs and continues rather than failing the replay
 /// (matching the prior hand-coded seeds' best-effort behavior).
 fn materialize_seed_plan(
-    demo: &Demo,
+    store: &StoreExec,
     root: &HarnessRoot,
     recording_id: &str,
     run_id: &str,
@@ -1290,12 +1778,12 @@ fn materialize_seed_plan(
     // correlation has seed entries.
     if seed_db_enabled {
         for corr in correlations.iter().filter_map(|c| c.as_deref()) {
-            create_db_schema(demo, recording_id, run_id, &deja::db_schema_for(corr));
+            create_db_schema(store, &deja::db_schema_for(corr));
         }
     }
 
     let db_catalog = if seed_db_enabled {
-        load_db_catalog(demo, recording_id, run_id)
+        load_db_catalog(store)
     } else {
         DbCatalog::default()
     };
@@ -1323,13 +1811,22 @@ fn materialize_seed_plan(
                 // string becomes its inner text, so "0.20" not "\"0.20\""), then
                 // write it under the per-correlation namespace.
                 "redis" => {
-                    let value = render_redis_seed_value(&entry.value);
                     let key = match corr {
                         Some(c) => format!("{c}:{}", entry.key),
                         None => entry.key.clone(),
                     };
-                    let (materialization, readback) =
-                        seed_redis(demo, recording_id, run_id, &key, &value);
+                    // A non-scalar RESP3 value the string `SET` seeder can't
+                    // represent is skipped LOUDLY (an explicit certificate
+                    // entry), never seeded as wrapper text.
+                    let (materialization, readback) = match render_redis_seed_value(&entry.value) {
+                        Some(value) => seed_redis(store, &key, &value),
+                        None => (
+                            SeedMaterializationStatus::Skipped,
+                            SeedReadback::not_run(
+                                "redis value is not a scalar string SET can materialize",
+                            ),
+                        ),
+                    };
                     certificate.push(SeedCertificateEntry::new(
                         corr,
                         entry,
@@ -1339,13 +1836,11 @@ fn materialize_seed_plan(
                         readback,
                     ));
                 }
-                // DB seed-from-result-by-PK, into the correlation's schema. GATED
-                // behind DEJA_SEED_DB; off by default.
+                // DB seed-from-result-by-PK, into the correlation's schema. ON by
+                // default; DEJA_SEED_DB=0 is the kill-switch.
                 "db" if seed_db_enabled => {
                     let (materialization, readback) = seed_db(
-                        demo,
-                        recording_id,
-                        run_id,
+                        store,
                         db_schema.as_deref(),
                         &db_catalog,
                         &entry.key,
@@ -1423,9 +1918,7 @@ fn seed_materialization_priority(entry: &deja::SeedEntry) -> u8 {
 // where the shared (demo, ids, schema, catalog) context becomes a struct.
 #[allow(clippy::too_many_arguments)]
 fn seed_db(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
+    store: &StoreExec,
     schema: Option<&str>,
     catalog: &DbCatalog,
     key: &str,
@@ -1484,25 +1977,6 @@ fn seed_db(
     }
     let row_count = sql.lines().count();
 
-    let mut args = demo.compose_base_args();
-    args.extend(
-        [
-            "exec",
-            "-T",
-            "pg",
-            "psql",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-U",
-            "db_user",
-            "-d",
-            "hyperswitch_db",
-            "-c",
-            &sql,
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
     eprintln!(
         "lifecycle: seed_db {} {} ({row_count} row(s))",
         target.kind, target.table
@@ -1513,15 +1987,10 @@ fn seed_db(
             target.kind, target.table
         );
     }
-    match Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
-        .env("PGPASSWORD", "db_pass")
-        .output()
-    {
+    match store.psql(&[], true, &sql).output() {
         Ok(output) if output.status.success() => (
             SeedMaterializationStatus::Materialized,
-            readback_db(demo, recording_id, run_id, schema, &target, &rows),
+            readback_db(store, schema, &target, &rows),
         ),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1550,9 +2019,7 @@ fn seed_db(
     }
 }
 fn readback_db(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
+    store: &StoreExec,
     schema: Option<&str>,
     target: &DbSeedTarget,
     rows: &[DbRowImage],
@@ -1565,11 +2032,10 @@ fn readback_db(
         full_sql.push_str(&stmt);
         full_sql.push('\n');
     }
-    let full_counts =
-        match run_db_readback_counts(demo, recording_id, run_id, &full_sql, rows.len()) {
-            Ok(counts) => counts,
-            Err(message) => return SeedReadback::error(message),
-        };
+    let full_counts = match run_db_readback_counts(store, &full_sql, rows.len()) {
+        Ok(counts) => counts,
+        Err(message) => return SeedReadback::error(message),
+    };
     let expected = serde_json::json!({
         "rows": rows.len(),
         "table": target.table,
@@ -1591,11 +2057,10 @@ fn readback_db(
             key_sql.push_str(&stmt);
             key_sql.push('\n');
         }
-        let key_counts =
-            match run_db_readback_counts(demo, recording_id, run_id, &key_sql, rows.len()) {
-                Ok(counts) => counts,
-                Err(message) => return SeedReadback::error(message),
-            };
+        let key_counts = match run_db_readback_counts(store, &key_sql, rows.len()) {
+            Ok(counts) => counts,
+            Err(message) => return SeedReadback::error(message),
+        };
         if let Some(map) = observed.as_object_mut() {
             map.insert(
                 "key_matches".to_owned(),
@@ -1618,37 +2083,12 @@ fn readback_db(
 }
 
 fn run_db_readback_counts(
-    demo: &Demo,
-    recording_id: &str,
-    run_id: &str,
+    store: &StoreExec,
     sql: &str,
     expected_lines: usize,
 ) -> Result<Vec<u64>, String> {
-    let mut args = demo.compose_base_args();
-    args.extend(
-        [
-            "exec",
-            "-T",
-            "pg",
-            "psql",
-            "-A",
-            "-t",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-U",
-            "db_user",
-            "-d",
-            "hyperswitch_db",
-            "-c",
-            sql,
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-    let output = Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
-        .env("PGPASSWORD", "db_pass")
+    let output = store
+        .psql(&["-A", "-t"], true, sql)
         .output()
         .map_err(|e| format!("could not run db seed readback: {e}"))?;
     if !output.status.success() {
@@ -1848,7 +2288,7 @@ impl DbCatalog {
     }
 }
 
-fn load_db_catalog(demo: &Demo, recording_id: &str, run_id: &str) -> DbCatalog {
+fn load_db_catalog(store: &StoreExec) -> DbCatalog {
     let sql =
         "SELECT cls.relname, attr.attname, typ.oid::int4, typ.typname, (NOT attr.attnotnull) \
                FROM pg_catalog.pg_attribute attr \
@@ -1860,35 +2300,7 @@ fn load_db_catalog(demo: &Demo, recording_id: &str, run_id: &str) -> DbCatalog {
                  AND NOT attr.attisdropped \
                  AND cls.relkind IN ('r', 'p') \
                ORDER BY cls.relname, attr.attnum";
-    let mut args = demo.compose_base_args();
-    args.extend(
-        [
-            "exec",
-            "-T",
-            "pg",
-            "psql",
-            "-A",
-            "-t",
-            "-F",
-            "\t",
-            "-v",
-            "ON_ERROR_STOP=0",
-            "-U",
-            "db_user",
-            "-d",
-            "hyperswitch_db",
-            "-c",
-            sql,
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-    match Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
-        .env("PGPASSWORD", "db_pass")
-        .output()
-    {
+    match store.psql(&["-A", "-t", "-F", "\t"], false, sql).output() {
         Ok(output) if output.status.success() => {
             let mut catalog = DbCatalog::default();
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1959,7 +2371,7 @@ fn parse_pg_bool(value: &str) -> Option<bool> {
 /// brings the PK/unique indexes that the seed UPSERT's `ON CONFLICT` needs;
 /// `INCLUDING DEFAULTS` keeps SERIAL/sequence defaults so the router's own inserts
 /// (which omit the serial id) still work. Best-effort: a failure logs + continues.
-fn create_db_schema(demo: &Demo, recording_id: &str, run_id: &str, schema: &str) {
+fn create_db_schema(store: &StoreExec, schema: &str) {
     let sql = format!(
         "CREATE SCHEMA IF NOT EXISTS \"{schema}\"; \
          DO $deja$ DECLARE r record; BEGIN \
@@ -1970,32 +2382,8 @@ fn create_db_schema(demo: &Demo, recording_id: &str, run_id: &str, schema: &str)
            END LOOP; \
          END $deja$;"
     );
-    let mut args = demo.compose_base_args();
-    args.extend(
-        [
-            "exec",
-            "-T",
-            "pg",
-            "psql",
-            "-v",
-            "ON_ERROR_STOP=0",
-            "-U",
-            "db_user",
-            "-d",
-            "hyperswitch_db",
-            "-c",
-            &sql,
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
     eprintln!("lifecycle: create_db_schema {schema} (clone of public)");
-    match Command::new("docker")
-        .args(&args)
-        .envs(demo.compose_env(recording_id, run_id))
-        .env("PGPASSWORD", "db_pass")
-        .status()
-    {
+    match store.psql(&[], false, &sql).status() {
         Ok(status) if status.success() => {}
         Ok(status) => {
             eprintln!(
@@ -2295,14 +2683,41 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Render a seed value to the raw string redis holds: a JSON string becomes its
-/// inner text (so `"0.20"` materializes as `0.20`, byte-identical to the old
-/// literal `redis-cli SET ... 0.20`); any other JSON becomes its compact form.
-fn render_redis_seed_value(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+/// Reconstruct the raw value redis holds from a recorded redis result, or
+/// `None` when the value cannot be materialized as a string `SET`.
+///
+/// Two genuinely different sources feed this, and the branch reflects that:
+///
+/// - **Ambient/config template** — a bare JSON string (e.g. `"0.20"`) that is
+///   *already* the raw text redis holds. Passed through byte-for-byte.
+/// - **Recording-derived** — a serialized [`deja::value::RedisWireValue`], the
+///   canonical shared type. We deserialize into it and let
+///   [`RedisWireValue::to_redis_string`] produce the value redis returns. The
+///   match there is exhaustive with no wildcard, so a new scalar variant is a
+///   compile error rather than a silent fall-through to corruption.
+///
+/// `None` (a non-scalar RESP3 shape, or a `Null` miss) means "do not SET this":
+/// the caller records an explicit skip in the seed certificate instead of
+/// writing garbage. This is what replaced the old `to_string()` fallback, which
+/// wrote the enum wrapper text (`{"BulkString":[…]}`) into redis and made the
+/// replayed router branch on garbage — a false divergence.
+fn render_redis_seed_value(value: &serde_json::Value) -> Option<String> {
+    // Recording-derived: decode into the canonical shared type FIRST. This also
+    // correctly treats a bare-string unit variant (`"Null"`, a miss that leaked
+    // past the upstream filter) as "nothing to seed" rather than the literal
+    // text "Null".
+    if let Ok(v) = serde_json::from_value::<deja::value::RedisWireValue>(value.clone()) {
+        return v.to_redis_string();
     }
+    // Ambient/config template: a bare string that is NOT a `RedisWireValue`
+    // (e.g. `"0.20"`) is already the raw text redis holds. Preserved
+    // byte-for-byte, exactly as before.
+    if let serde_json::Value::String(s) = value {
+        return Some(s.clone());
+    }
+    // A non-scalar RESP3 shape (Array/Map/Set/…) the string `SET` seeder cannot
+    // represent: an explicit skip, never a silent stringify of the wrapper.
+    None
 }
 
 /// Read a recording's boundary events JSONL, tolerating non-event records from
@@ -2429,19 +2844,26 @@ fn stop_service(demo: &Demo, recording_id: &str, service: &str) {
 }
 
 fn run_kernel(
-    demo: &Demo,
+    kernel_bin: &str,
+    target_port: u16,
     root: &HarnessRoot,
     ctx: &StoreCtx,
     recording_id: &str,
     run_id: &str,
+    correlation_filter: Option<&[String]>,
 ) -> Result<(), String> {
     let recording_path = root.recording_events_path(recording_id);
     let diff_sink = root.http_diff_path(run_id);
-    let mut cmd = Command::new(&demo.kernel_bin);
+    let mut cmd = Command::new(kernel_bin);
     cmd.env("KERNEL_RECORDING_PATH", &recording_path)
         .env("KERNEL_TARGET_HOST", "127.0.0.1")
-        .env("KERNEL_TARGET_PORT", demo.replay_port.to_string())
+        .env("KERNEL_TARGET_PORT", target_port.to_string())
         .env("KERNEL_HTTP_DIFF_SINK", &diff_sink);
+    // Test-case subset: the kernel drives only these correlations; scoring
+    // scopes to the same list (load_artifacts reads it off the run spec).
+    if let Some(filter) = correlation_filter.filter(|f| !f.is_empty()) {
+        cmd.env("KERNEL_CORRELATION_FILTER", filter.join(","));
+    }
     // empty allowlist by default = byte-exact gate; override via
     // KERNEL_BODY_ALLOWLIST on the harness-api process during bring-up.
     let status = run_streamed(cmd, ctx, "driving recorded requests (kernel)", "kernel")?;
@@ -2685,6 +3107,83 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
     Ok(())
 }
 
+/// Pull a replay's recording out of an arbitrary bucket/prefix in the DEPLOYED
+/// aggregator layout (see `s3::pull_recording_from_prefix`) and register it
+/// exactly like the session-layout pull — minus the manifest, which a raw
+/// prefix doesn't have. Returns the resolved recording (session) id.
+///
+/// An explicit, already-ingested session reuses the on-disk events file; a
+/// filterless spec always scans (the session isn't known until then).
+fn resolve_recording_from_source(
+    root: &HarnessRoot,
+    ctx: &StoreCtx,
+    source: &crate::S3Source,
+    wanted: Option<&str>,
+) -> Result<String, String> {
+    if let Some(id) = wanted {
+        if root.recording_events_path(id).exists() {
+            eprintln!("lifecycle: recording {id} already ingested; reusing");
+            return Ok(id.to_owned());
+        }
+    }
+    let (cfg, prefix) = source.to_config()?;
+    let (report, resolved, seen) =
+        crate::s3::pull_recording_from_prefix(&cfg, &prefix, wanted, |sid| {
+            root.recording_events_path(sid)
+        })?;
+    if seen.len() > 1 {
+        let others = seen
+            .iter()
+            .filter(|(sid, _)| sid != &resolved)
+            .map(|(sid, n)| format!("{sid} ({n})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.log("ingest", &format!("other sessions under this prefix: {others}"));
+    }
+    let line = format!(
+        "ingested {resolved} from {}: {} object(s), {} line(s), {} duplicate(s) dropped → \
+         {} event(s), {} correlation(s) (unsealed prefix scan)",
+        report.prefix,
+        report.landing_objects,
+        report.lines_in,
+        report.duplicates_dropped,
+        report.events_out,
+        report.correlations,
+    );
+    eprintln!("lifecycle: {line}");
+    ctx.log("ingest", &line);
+    if report.events_out == 0 {
+        return Err(format!(
+            "session {resolved} pulled empty from {}",
+            report.prefix
+        ));
+    }
+    let dest = root.recording_events_path(&resolved);
+    // Same consumer shim as the session-layout pull (deja-tui / metrics).
+    let legacy_copy = root.root.join("recording").join("semantic-events.jsonl");
+    if let Some(parent) = legacy_copy.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::copy(&dest, &legacy_copy) {
+        eprintln!("lifecycle: semantic-events.jsonl shim copy failed: {e}");
+    }
+    let report_path = dest.with_file_name("ingest-report.json");
+    if let Err(e) = write_json(&report_path, &report) {
+        eprintln!("lifecycle: ingest report write failed: {e}");
+    }
+    ctx.artifact(Some(&resolved), "ingest_report", &report_path);
+    let bytes = std::fs::metadata(&dest).ok().map(|m| m.len() as i64);
+    ctx.recording(
+        &resolved,
+        dest.to_str(),
+        Some(report.events_out as i64),
+        Some(report.correlations as i64),
+        bytes,
+        None,
+    );
+    Ok(resolved)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
@@ -2692,23 +3191,30 @@ mod tests {
     use crate::{CandidateSpec, RunSpec};
 
     fn extract_ctx_artifact_kinds(source: &str) -> std::collections::BTreeSet<String> {
-        let marker = concat!("ctx", ".artifact(");
         let mut kinds = std::collections::BTreeSet::new();
-        for call in source.split(marker).skip(1) {
-            let first_comma = call
-                .find(',')
-                .expect("ctx.artifact call should pass recording_id before kind");
-            let after_recording_id = &call[first_comma + 1..];
-            let quote_start = after_recording_id
-                .find('"')
-                .expect("ctx.artifact kind should be a string literal")
-                + 1;
-            let after_quote = &after_recording_id[quote_start..];
-            let quote_end = after_quote
-                .find('"')
-                .expect("ctx.artifact kind literal should close");
-            kinds.insert(after_quote[..quote_end].to_owned());
+        // Both StoreCtx registration forms — the local path form and the
+        // sink-published uri form — pass the kind as the 2nd arg. A call whose
+        // kind is a VARIABLE (the REPLAY_STREAM_ARTIFACTS loop) is skipped here;
+        // those kinds are added from the const below. (Markers are built with
+        // concat! so this scanner never matches its own source text.)
+        for marker in [concat!("ctx", ".artifact("), concat!("ctx", ".artifact_uri(")] {
+            for call in source.split(marker).skip(1) {
+                let Some(first_comma) = call.find(',') else {
+                    continue;
+                };
+                let after = call[first_comma + 1..].trim_start();
+                if !after.starts_with('"') {
+                    continue; // variable kind (loop) — not a literal
+                }
+                let after_quote = &after[1..];
+                let Some(end) = after_quote.find('"') else {
+                    continue;
+                };
+                kinds.insert(after_quote[..end].to_owned());
+            }
         }
+        // The stream artifacts are published from the const via a variable kind.
+        kinds.extend(REPLAY_STREAM_ARTIFACTS.iter().map(|(k, _)| (*k).to_owned()));
         kinds
     }
 
@@ -2754,6 +3260,7 @@ mod tests {
                 "lookup_table",
                 "manifest",
                 "observed",
+                "record_graph",
                 "scorecard",
                 "seed_certificate",
                 "visualization_html",
@@ -2770,6 +3277,7 @@ mod tests {
             include_str!("../../../deja-store/migrations/0003_session_manifests.sql"),
             include_str!("../../../deja-store/migrations/0004_call_ledger_artifact.sql"),
             include_str!("../../../deja-store/migrations/0005_seed_certificate_artifact.sql"),
+            include_str!("../../../deja-store/migrations/0006_record_graph_artifact.sql"),
         ];
         let allowed_by_step = migrations
             .into_iter()
@@ -3200,7 +3708,10 @@ mod tests {
             spec: RunSpec {
                 mode: RunMode::Record,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
+                candidate_repo: None,
                 recording_id: None,
+                s3_source: None,
+                correlation_filter: None,
                 workload,
             },
             status: RunStatus::Pending,
@@ -3232,6 +3743,7 @@ mod tests {
             topic: "recording-events".into(),
             harness_state: "/tmp/deja-state".into(),
             candidate_image: None,
+            ucs_profile: false,
         };
 
         let replay_a = demo.isolated_for_replay("run-20260702feedface00000001");
@@ -3322,6 +3834,50 @@ mod tests {
         assert_eq!(events[0].read_set, vec!["settlement_rate_default"]);
     }
 
+    #[test]
+    fn record_graph_extract_keeps_only_graph_nodes_and_drops_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let recording = dir.path().join("events.jsonl");
+        // A tape interleaving graph-node STRUCTURE with a boundary event that
+        // carries a payment payload — the exact thing that must NOT leave the pod.
+        let secret_value = "SECRET_SETTLEMENT_PAYLOAD";
+        let body = format!(
+            "{}\n{}\n{}\n",
+            r#"{"record_kind":"graph_node","node_id":1,"global_sequence":1,"sequence":1,"span_name":"root","target":"router","level":"INFO","fields":{"request_id":"req-1"},"started_ns":1}"#,
+            settlement_read_event_jsonl("c1", "settlement_rate_default", secret_value),
+            r#"{"record_kind":"graph_node","node_id":2,"global_sequence":3,"sequence":2,"parent_id":1,"span_name":"charge","target":"router","level":"INFO","fields":{},"started_ns":2}"#,
+        );
+        std::fs::write(&recording, body).unwrap();
+
+        let dest = dir.path().join("record-graph.jsonl");
+        let n = write_record_graph_nodes(&recording, &dest).unwrap();
+        assert_eq!(n, 2, "both graph nodes extracted, the boundary event dropped");
+
+        let out = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(out.lines().count(), 2);
+        assert!(
+            !out.contains(secret_value),
+            "boundary payloads must never appear in the record-graph artifact"
+        );
+        // Every emitted line is a GraphNode DejaRecord the /graph reader accepts.
+        for line in out.lines() {
+            assert!(matches!(
+                serde_json::from_str::<deja::DejaRecord>(line),
+                Ok(deja::DejaRecord::GraphNode(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn record_graph_extract_absent_recording_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("record-graph.jsonl");
+        // No recording on disk (compose without ingest) → 0 nodes, no file written.
+        let n = write_record_graph_nodes(&dir.path().join("missing.jsonl"), &dest).unwrap();
+        assert_eq!(n, 0);
+        assert!(!dest.exists(), "nothing to publish → no empty artifact left behind");
+    }
+
     /// The full replay-side wiring: derive the default rate from the recording's
     /// read-set, supply the premium rate from the ambient template, and render
     /// both to the byte-identical redis values the old hand-coded seeds wrote.
@@ -3349,15 +3905,15 @@ mod tests {
             .resolve("redis", "settlement_rate_default")
             .expect("default seeded from recording");
         assert_eq!(default.origin, deja::SeedOrigin::Recording);
-        assert_eq!(render_redis_seed_value(&default.value), "0.10");
+        assert_eq!(render_redis_seed_value(&default.value).as_deref(), Some("0.10"));
 
         let premium = plan
             .resolve("redis", "settlement_rate_premium")
             .expect("premium seeded from ambient template");
         assert_eq!(premium.origin, deja::SeedOrigin::Ambient);
         assert_eq!(
-            render_redis_seed_value(&premium.value),
-            "0.20",
+            render_redis_seed_value(&premium.value).as_deref(),
+            Some("0.20"),
             "premium rate renders byte-identically to the old `redis-cli SET ... 0.20`"
         );
     }
@@ -3374,8 +3930,69 @@ mod tests {
                     .resolve("redis", "settlement_rate_premium")
                     .unwrap()
                     .value
-            ),
-            "0.20"
+            )
+            .as_deref(),
+            Some("0.20")
+        );
+    }
+
+    #[test]
+    fn redis_seed_decodes_dejarredisvalue_wrapper_to_raw_value() {
+        // V1 regression: a recorded redis GET hit is an externally-tagged
+        // DejaRedisValue, not a bare string. The seeder must write the DECODED
+        // value redis returns, never the enum wrapper text.
+
+        // Golden case — the exact bytes of a real recorded API_LOCK GET hit from
+        // demo/harness-state/1783513055 (redis_rs backend, `BulkString`). These
+        // bytes are the UTF-8 of a UUID; the old `to_string()` seeded the literal
+        // `{"BulkString":[48,49,...]}` text and the router read back garbage.
+        let bulk = serde_json::json!({
+            "BulkString": [
+                48, 49, 57, 102, 52, 49, 98, 49, 45, 50, 50, 48, 101, 45, 55, 50,
+                56, 50, 45, 56, 48, 101, 51, 45, 53, 56, 55, 54, 100, 97, 56, 99,
+                100, 101, 57, 99
+            ]
+        });
+        assert_eq!(
+            render_redis_seed_value(&bulk).as_deref(),
+            Some("019f41b1-220e-7282-80e3-5876da8cde9c"),
+            "BulkString must decode to the raw UUID redis holds, not the wrapper"
+        );
+
+        // fred backend uses different variant names for the same shapes; the
+        // shared type's serde aliases fold both dialects into one decode.
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({ "Bytes": [104, 105] })).as_deref(),
+            Some("hi"),
+        );
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({ "String": "merchant_xyz" })).as_deref(),
+            Some("merchant_xyz"),
+        );
+        // redis_rs scalar variants.
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({ "SimpleString": "OK" })).as_deref(),
+            Some("OK"),
+        );
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({ "Int": 42 })).as_deref(),
+            Some("42"),
+        );
+
+        // Backwards-compat: an ambient/template bare string is preserved
+        // byte-for-byte (this is the path the demo relied on).
+        assert_eq!(
+            render_redis_seed_value(&serde_json::Value::String("0.20".to_owned())).as_deref(),
+            Some("0.20"),
+        );
+
+        // A miss and a non-scalar RESP3 shape both decline to seed (loud skip at
+        // the call site) rather than writing garbage.
+        assert_eq!(render_redis_seed_value(&serde_json::json!("Null")), None);
+        assert_eq!(
+            render_redis_seed_value(&serde_json::json!({ "Array": [{ "Int": 1 }] })),
+            None,
+            "a non-scalar value must be skipped, never stringified into redis"
         );
     }
 

@@ -12,6 +12,13 @@ use deja_runtime::replay::{
 };
 use deja_runtime::{read_events, Provenance, RecordingHook, ReplayHook};
 
+/// Recording is opt-in: enter a decision-only context so the record phase's
+/// `RecordingHook` actually records. Only the record phase consults this; the
+/// replay phase uses `ReplayHook`, which ignores the recording decision.
+fn recording_enabled() -> deja_context::ContextGuard {
+    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+}
+
 // --- Define a trait ---
 
 #[deja_derive::recordable]
@@ -95,6 +102,7 @@ impl LookupTableSource for StaticLookupSource {
 
 #[tokio::test]
 async fn replay_returns_recorded_value_without_calling_real_impl() {
+    let _rec = recording_enabled();
     // Phase 1: Record.
     let record_dir = tempfile::tempdir().expect("tempdir");
     let record_hook = Arc::new(RecordingHook::new(record_dir.path()).expect("hook"));
@@ -131,6 +139,7 @@ async fn replay_returns_recorded_value_without_calling_real_impl() {
 
 #[tokio::test]
 async fn replay_sliding_window_recovers_skipped_calls() {
+    let _rec = recording_enabled();
     let record_dir = tempfile::tempdir().expect("tempdir");
     let record_hook = Arc::new(RecordingHook::new(record_dir.path()).expect("hook"));
     let real = RealCounter::new();
@@ -262,6 +271,7 @@ async fn replay_lookup_hit_with_unreconstructable_result_fail_stops_before_real_
 
 #[tokio::test]
 async fn replay_arg_mismatch_returns_recorded_result_anyway() {
+    let _rec = recording_enabled();
     let record_dir = tempfile::tempdir().expect("tempdir");
     let record_hook = Arc::new(RecordingHook::new(record_dir.path()).expect("hook"));
     let real = RealCounter::new();
@@ -297,6 +307,7 @@ async fn replay_arg_mismatch_returns_recorded_result_anyway() {
 
 #[tokio::test]
 async fn replay_with_owned_arg_does_not_move_before_fallthrough() {
+    let _rec = recording_enabled();
     let record_dir = tempfile::tempdir().expect("tempdir");
     let record_hook = Arc::new(RecordingHook::new(record_dir.path()).expect("hook"));
     let real = RealCounter::new();

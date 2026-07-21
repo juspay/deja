@@ -8,6 +8,14 @@ use std::sync::Arc;
 use deja_runtime::{read_events, RecordingHook};
 use serde::Serialize;
 
+/// Recording is opt-in: a boundary records only when an explicit `Record`
+/// decision is present for the current context. Enter a decision-only context
+/// (no correlation) so `RecordingHook::mode()` records on this thread; hold the
+/// returned guard until after the recording + `read_events` section.
+fn recording_enabled() -> deja_context::ContextGuard {
+    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+}
+
 // --- Define a trait using #[deja::recordable] ---
 
 #[deja_derive::recordable]
@@ -143,6 +151,7 @@ delegate_sync_lookup_interface!(DejaSyncLookupStore, inner, hook, "storage");
 
 #[tokio::test]
 async fn delegation_records_successful_call() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -181,6 +190,7 @@ async fn delegation_records_successful_call() {
 
 #[tokio::test]
 async fn delegation_records_error() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -206,6 +216,7 @@ async fn delegation_records_error() {
 
 #[tokio::test]
 async fn delegation_sequences_multiple_calls() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -247,6 +258,7 @@ async fn delegation_with_owned_args_works() {
 
 #[tokio::test]
 async fn delegation_with_associated_type_works() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -269,6 +281,7 @@ async fn delegation_with_associated_type_works() {
 
 #[tokio::test]
 async fn recording_only_does_not_require_deserialize_owned_return() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -296,6 +309,7 @@ async fn recording_only_does_not_require_deserialize_owned_return() {
 
 #[test]
 fn sync_method_with_where_clause_records() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -318,6 +332,7 @@ fn sync_method_with_where_clause_records() {
 
 #[tokio::test]
 async fn delegation_serializes_args_and_results() {
+    let _rec = recording_enabled();
     let dir = tempfile::tempdir().expect("tempdir");
     let hook = Arc::new(RecordingHook::new(dir.path()).expect("hook"));
 
@@ -388,4 +403,58 @@ async fn fast_path_skips_recording_when_inactive() {
                 .map(|e| e.is_empty())
                 .unwrap_or(true)
     );
+}
+
+/// Bootstrap-paradox guard: recording is opt-in *per context*, even with a live
+/// `RecordingHook` installed. A boundary call made BEFORE the recording decision
+/// flips to `Record` — e.g. the sampler's own Superposition read that DECIDES
+/// whether to record this request — must self-exclude and leave no event. Only
+/// calls made after the middleware flips the decision to `Record` are captured.
+///
+/// This is the record-side half of the sampler bootstrap: the decision defaults
+/// to `Skip` (`recording_decision_for_current().map(should_record).unwrap_or(false)`),
+/// so the config read that produces the decision cannot recursively record itself.
+#[tokio::test]
+async fn bootstrap_read_self_excludes_until_decision_flips() {
+    // Phase 1 — the bootstrap read. NO recording decision is present, so the gate
+    // resolves to `Skip`. This models the sampler reading its own config from
+    // Superposition *before* it has decided to record. The real block runs, but a
+    // live `RecordingHook` must capture nothing.
+    let skip_dir = tempfile::tempdir().expect("tempdir");
+    {
+        let hook = Arc::new(RecordingHook::new(skip_dir.path()).expect("hook"));
+        let store = DejaStore {
+            inner: Box::new(RealStore),
+            hook: hook.clone(),
+        };
+        let boot = store.find_address_by_id("sampler_self_read").await;
+        assert_eq!(boot, Ok("Address(sampler_self_read)".to_string()));
+    }
+    let skipped = read_events(skip_dir.path()).expect("read");
+    assert!(
+        skipped.is_empty(),
+        "the bootstrap read must self-exclude — no decision means Skip, so the \
+         sampler's own Superposition read is never recorded even with a hook installed"
+    );
+
+    // Phase 2 — the middleware has now flipped the decision to `Record`. The same
+    // boundary, on the same thread, IS captured.
+    let rec_dir = tempfile::tempdir().expect("tempdir");
+    {
+        let _rec = recording_enabled();
+        let hook = Arc::new(RecordingHook::new(rec_dir.path()).expect("hook"));
+        let store = DejaStore {
+            inner: Box::new(RealStore),
+            hook: hook.clone(),
+        };
+        let after = store.find_address_by_id("addr_after_flip").await;
+        assert_eq!(after, Ok("Address(addr_after_flip)".to_string()));
+    }
+    let recorded = read_events(rec_dir.path()).expect("read");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one event — only the post-flip call is recorded"
+    );
+    assert_eq!(recorded[0].args["address_id"], "addr_after_flip");
 }

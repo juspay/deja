@@ -47,6 +47,14 @@ use std::collections::{HashMap, HashSet};
 use deja::{addresses_for, canonical_args_hash, BoundaryEvent, KeyStamper, LookupKey};
 use serde_json::json;
 
+/// Recording is opt-in: enter a decision-only context so the `#[deja::boundary]`
+/// record calls below are actually recorded. Each site's explicit correlation is
+/// carried on its event but not entered into the ambient context, so the record
+/// gate relies on this decision-only context (checked first).
+fn recording_enabled() -> deja_context::ContextGuard {
+    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+}
+
 // ---------------------------------------------------------------------------
 // Scenario B1 — benign signature edit (+ inevitable source-line shift).
 //
@@ -308,6 +316,7 @@ fn resolve_stream(
 
 #[test]
 fn v2_benign_edits_resolve_while_a_real_change_diverges() {
+    let _rec = recording_enabled();
     let artifacts = tempfile::tempdir().expect("tempdir");
     std::env::set_var("DEJA_MODE", "record");
     std::env::set_var("DEJA_ARTIFACT_DIR", artifacts.path());

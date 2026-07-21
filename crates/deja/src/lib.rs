@@ -21,12 +21,13 @@ pub use deja_derive::{boundary, http, id, instrument, redis, time};
 
 /// Re-export the per-request recording sampling gate. The host (e.g. Hyperswitch)
 /// resolves *whether* to record from Superposition at ingress and pushes the
-/// boolean here; Déjà only consumes it — `false` makes the recording hook a
-/// no-op for the request, `true` records as usual. Absent any decision the gate
-/// defaults to recording, so a host without a sampler is unaffected.
+/// decision here; Déjà only consumes it — `Skip` makes the recording hook a
+/// no-op for the request, `Record` records as usual. Recording is opt-in: absent
+/// an explicit `Record` decision the gate skips, so the sampler's own
+/// Superposition read (which runs before the decision is pushed) self-excludes.
 pub use deja_context::{
     clear_recording_decision, recording_decision, recording_decision_for_current,
-    set_recording_decision,
+    set_recording_decision, RecordDecision,
 };
 /// Re-export lookup-table replay primitives (hybrid architecture: in-process
 /// lookup with per-site ReplayStrategy selecting Execute vs Substitute).
@@ -53,8 +54,8 @@ pub use deja_runtime::ExecutionGraphLayer;
 /// Re-export semantic recording primitives so downstream crates only need
 /// one `deja` dependency.
 pub use deja_runtime::{
-    flush_global_hook, fork_span, global_hook_from_env, graph_recording_enabled, hook_from_env,
-    installed_runtime_hook, set_graph_recording_enabled, spawn_fork, AsyncRecordWriter,
+    flush_global_hook, fork_span, global_hook_from_env, hook_from_env,
+    installed_runtime_hook, spawn_fork, AsyncRecordWriter,
     BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder, Fidelity, GraphNodeSink,
     JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink, RecordedOutput,
     RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot, CURRENT_EVENT_SCHEMA_VERSION,
@@ -62,7 +63,7 @@ pub use deja_runtime::{
 /// Re-export callsite identity and runtime hook primitives for the
 /// `DEJA_MODE=record|replay` foundation.
 pub use deja_runtime::{
-    flush_global_runtime_hook, global_runtime_hook_from_env, replay_is_active,
+    flush_global_runtime_hook, global_runtime_hook_from_env, process_runtime_mode, replay_is_active,
     runtime_hook_from_env, runtime_mode, set_global_runtime_hook, stable_callsite_hash,
     CallsiteIdentity, CallsiteSource, ExecuteMode, ExecuteShadowToken, ReplayLookup, RuntimeHook,
     RuntimeMode,
@@ -361,6 +362,78 @@ pub mod value {
         },
     }
 
+    /// The canonical redis boundary value, shared by the record side (via the
+    /// codec), replay, and the seeder — the redis analogue of
+    /// [`DejaDatabaseResultPayload`], which the DB path already shares.
+    ///
+    /// # Why this exists
+    ///
+    /// The router records a redis result as an externally-tagged enum, so the
+    /// wire JSON is a single-key object naming the variant (`{"BulkString":[…]}`).
+    /// That enum is defined PRIVATELY in the vendor's `redis_interface`, and in
+    /// TWO backend dialects — `redis_rs` (`BulkString`/`SimpleString`/`Int`) and
+    /// `fred` (`Bytes`/`String`/`Integer`) — for the same concepts. Consumers
+    /// outside that crate (the seeder, replay tooling) otherwise have to re-parse
+    /// the JSON by string-matching those tags, which silently rots the moment a
+    /// variant is added. This is the one canonical, exhaustively-matchable type;
+    /// `#[serde(alias)]` folds the two dialects into one, so a single
+    /// `serde_json::from_value::<RedisWireValue>` decodes either backend.
+    ///
+    /// # Scope
+    ///
+    /// Only the SCALAR variants a plain redis string read (GET-family) can return
+    /// are modelled — those are the values the seeder materializes. Non-scalar
+    /// RESP3 shapes (arrays, maps, sets, push, verbatim, …) are deliberately
+    /// absent: deserializing one fails, and the seeder treats that failure as an
+    /// explicit, logged "cannot represent as a string SET" rather than guessing.
+    /// The compiler enforces the seeder handles every variant here (no wildcard),
+    /// so adding a scalar variant is a build error, not a 2am corruption.
+    // No `Eq`: the `Double(f64)` variant is only `PartialEq`.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub enum RedisWireValue {
+        /// A cache miss / nil. Filtered upstream by the miss check, never seeded.
+        Null,
+        /// A signed integer, returned as its decimal ASCII form.
+        /// (`fred` names this variant `Integer`.)
+        #[serde(alias = "Integer")]
+        Int(i64),
+        /// A byte string — the dominant redis GET hit. The bytes ARE the value
+        /// redis holds (UUIDs, tokens, serialized configs). (`fred`: `Bytes`.)
+        #[serde(alias = "Bytes")]
+        BulkString(Vec<u8>),
+        /// An inline UTF-8 string. (`fred` names this variant `String`.)
+        #[serde(alias = "String")]
+        SimpleString(String),
+        /// A floating-point number, returned in its recorded textual form.
+        Double(f64),
+        /// A boolean.
+        Boolean(bool),
+    }
+
+    impl RedisWireValue {
+        /// The raw string redis returns for this value, i.e. what a seed
+        /// `SET key <value>` must write so the replayed router reads it back
+        /// unchanged.
+        ///
+        /// `BulkString` bytes are decoded lossily to UTF-8: real payment values
+        /// (UUIDs, tokens, JSON configs) are UTF-8, and the seed transport is a
+        /// string-argument `redis-cli SET`; a genuinely binary value is a
+        /// pre-existing limitation of that transport, not this decode. `Null`
+        /// yields `None` (nothing to seed).
+        pub fn to_redis_string(&self) -> Option<String> {
+            match self {
+                Self::Null => None,
+                Self::Int(n) => Some(n.to_string()),
+                Self::BulkString(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                Self::SimpleString(s) => Some(s.clone()),
+                Self::Double(d) => Some(d.to_string()),
+                Self::Boolean(b) => Some(if *b { "1" } else { "0" }.to_owned()),
+            }
+        }
+    }
+
     /// A versioned envelope around [`DejaDatabaseResultPayload`].
     ///
     /// Keeping `version` separate lets the recorded shape evolve without
@@ -506,6 +579,81 @@ pub mod codec {
             serde_json::from_value::<R>(recorded).ok()
         }
     }
+
+    /// Typed `Result` codec — the uniform "recording threw ⇒ replay throws"
+    /// contract. Captures the `Ok` arm losslessly OR the error **context** (the
+    /// `error_stack::Report`'s current context — the value recovery code
+    /// branches on), and reconstructs either arm: a recorded error replays as
+    /// `Err(report!(E))` carrying the SAME typed context the recording threw.
+    /// Report attachments/backtraces are diagnostics and do not round-trip.
+    ///
+    /// The wire envelope is byte-compatible with [`crate::value::DejaDatabaseResult`]
+    /// (`{version, result: "Ok"|"Err", value/type_name | kind/message}`), so
+    /// existing envelope consumers (seed planner, `db::row_state_keys`' visitor)
+    /// keep parsing without change; for a fieldless error enum the serialized
+    /// `kind` is the variant name string, exactly as the hand-rolled DB mapping
+    /// produced.
+    ///
+    /// Requires the `error-stack` cargo feature.
+    #[cfg(feature = "error-stack")]
+    pub struct ResultCodec<T, E>(PhantomData<fn() -> (T, E)>);
+
+    #[cfg(feature = "error-stack")]
+    impl<T, E> ReplayCodec for ResultCodec<T, E>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        E: serde::Serialize + serde::de::DeserializeOwned + error_stack::Context,
+    {
+        type Value = Result<T, error_stack::Report<E>>;
+
+        fn capture(value: &Self::Value) -> (serde_json::Value, bool) {
+            match value {
+                Ok(inner) => (
+                    serde_json::json!({
+                        "version": crate::value::DejaDatabaseResult::VERSION,
+                        "result": "Ok",
+                        "value": serde_json::to_value(inner)
+                            .unwrap_or(serde_json::Value::Null),
+                        "type_name": std::any::type_name::<T>(),
+                    }),
+                    false,
+                ),
+                Err(report) => (
+                    serde_json::json!({
+                        "version": crate::value::DejaDatabaseResult::VERSION,
+                        "result": "Err",
+                        // For a fieldless enum this serializes to the bare
+                        // variant-name string ("NotFound"), keeping the wire
+                        // `kind` identical to the legacy hand-rolled mapping.
+                        "kind": serde_json::to_value(report.current_context())
+                            .unwrap_or(serde_json::Value::Null),
+                        "message": format!("{report:?}"),
+                    }),
+                    true,
+                ),
+            }
+        }
+
+        fn reconstruct(recorded: serde_json::Value) -> Option<Self::Value> {
+            let object = recorded.as_object()?;
+            match object.get("result").and_then(serde_json::Value::as_str) {
+                Some("Ok") => {
+                    let value = object.get("value")?;
+                    let inner: T = serde_json::from_value(value.clone()).ok()?;
+                    Some(Ok(inner))
+                }
+                Some("Err") => {
+                    let kind = object.get("kind")?;
+                    // A `kind` that no longer names a variant of the candidate's
+                    // error type is a reconstruction FAILURE (never a silent
+                    // fabrication) — the seam fail-stops on it.
+                    let context: E = serde_json::from_value(kind.clone()).ok()?;
+                    Some(Err(error_stack::report!(context)))
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Helpers for HTTP request/response boundary payloads.
@@ -551,12 +699,14 @@ pub mod http {
 pub mod db {
     use std::{collections::HashMap, fmt::Debug};
 
-    /// Build the database request payload common to Diesel helpers.
+    /// Build the database request payload common to Diesel helpers. Borrows
+    /// its inputs so boundary-attribute exprs can evaluate it eagerly while the
+    /// same values remain available to the later capture closures.
     pub fn args(
         operation: &'static str,
         table: &str,
-        sql: String,
-        inputs: serde_json::Value,
+        sql: &str,
+        inputs: &serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "operation": operation,
@@ -755,6 +905,135 @@ pub mod db {
         deja_runtime::replay::db_row_state_keys(table, value)
     }
 
+    /// Which side(s) of state one DB operation touches. Mirrors the event
+    /// builder's `state_read_to`/`state_write_to`/`state_touch_to` axes; each
+    /// generic query helper declares its axis as a compile-time constant.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StateAxis {
+        /// Row-returning or scalar read (`find*`, `filter`, `count`).
+        Read,
+        /// Pure write (`insert`, `update`, `delete`).
+        Write,
+        /// Read-then-write (`update_with_results`, `update_by_id`,
+        /// `delete_one_with_result`).
+        Touch,
+    }
+
+    /// Derive row-exact READ keys from the rendered SQL's trailing bind list
+    /// (diesel `debug_query` emits `… -- binds: [...]`). This is the explicit
+    /// producer for reads whose RESULT carries no row — most importantly a
+    /// NotFound read, which otherwise records an empty read set and starves
+    /// seed planning of the read's identity.
+    ///
+    /// Conservative by construction: only equality binds on the table's known
+    /// pragmatic primary-key column produce keys, and any bind list that does
+    /// not parse yields no keys (never a guess).
+    pub fn binds_read_keys(table: &str, sql: &str) -> Vec<String> {
+        let Some(pk) = deja_runtime::replay::db_pk_column(table) else {
+            return Vec::new();
+        };
+        let Some(binds_at) = sql.rfind(" -- binds: ") else {
+            return Vec::new();
+        };
+        let (query, binds_raw) = sql.split_at(binds_at);
+        let binds_raw = binds_raw.trim_start_matches(" -- binds: ").trim();
+        // Diesel debug-prints binds as a bracketed list; strings/numbers/bools
+        // are JSON-compatible. Anything richer fails the parse and yields no
+        // keys rather than a fabricated one.
+        let Ok(binds) = serde_json::from_str::<Vec<serde_json::Value>>(binds_raw) else {
+            return Vec::new();
+        };
+
+        let needle = format!("\"{pk}\" = $");
+        let mut keys = Vec::new();
+        let mut cursor = 0;
+        while let Some(found) = query[cursor..].find(&needle) {
+            let digits_start = cursor + found + needle.len();
+            let digits: String = query[digits_start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            cursor = digits_start;
+            let Ok(position) = digits.parse::<usize>() else {
+                continue;
+            };
+            let Some(value) = position.checked_sub(1).and_then(|i| binds.get(i)) else {
+                continue;
+            };
+            let row = serde_json::json!({ pk: value });
+            if let Some(key) = deja_runtime::replay::db_row_state_key(table, &row) {
+                let wire = key.to_wire();
+                if !keys.contains(&wire) {
+                    keys.push(wire);
+                }
+            }
+        }
+        keys
+    }
+
+    /// Explicit producer API for one DB query result: the full
+    /// [`crate::RecordedOutput`] — codec envelope + typed row state keys +
+    /// row image — routed by the operation's [`StateAxis`].
+    ///
+    /// This is the fold replacement for the hand-rolled per-op capture
+    /// closures: the boundary macro's `result = …` escape hatch calls it with
+    /// the fn's own `table`/`sql` args. The recorder itself never infers state
+    /// (`finish` stamps only explicit captures); this helper IS the explicit
+    /// producer, and improving its derivation (e.g. the binds parser) is a
+    /// deja-side change needing no vendor edit.
+    ///
+    /// Requires the `error-stack` cargo feature.
+    #[cfg(feature = "error-stack")]
+    pub fn recorded_output<T, E>(
+        axis: StateAxis,
+        table: &str,
+        sql: &str,
+        result: &Result<T, error_stack::Report<E>>,
+    ) -> crate::RecordedOutput
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        E: serde::Serialize + serde::de::DeserializeOwned + error_stack::Context,
+    {
+        use crate::codec::{ReplayCodec, ResultCodec};
+
+        let (envelope, is_error) = ResultCodec::<T, E>::capture(result);
+        let ok_value = (!is_error)
+            .then(|| envelope.get("value").cloned())
+            .flatten();
+        let mut output = crate::RecordedOutput::new(envelope, is_error);
+
+        // Row-exact keys from rows the result actually carried.
+        let row_keys: Vec<String> = ok_value
+            .as_ref()
+            .map(|value| {
+                row_state_keys(table, value)
+                    .into_iter()
+                    .map(|key| key.to_wire())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Row-exact keys from the query's own binds — covers reads whose
+        // result carries no row (NotFound) and writes addressed by PK.
+        let bind_keys = binds_read_keys(table, sql);
+
+        for key in row_keys.iter().chain(bind_keys.iter()) {
+            output = match axis {
+                StateAxis::Read => output.with_read_key(key.clone()),
+                StateAxis::Write => output.with_write_key(key.clone()),
+                StateAxis::Touch => output
+                    .with_read_key(key.clone())
+                    .with_write_key(key.clone()),
+            };
+        }
+
+        if let Some(value) = ok_value {
+            if let Some(image) = row_image_payload(table, &value) {
+                output = output.with_result_image(image);
+            }
+        }
+        output
+    }
+
     /// Metadata for a database query boundary.
     #[derive(Debug, Clone)]
     pub struct QuerySpec {
@@ -881,7 +1160,7 @@ pub mod __private {
     #[allow(deprecated)]
     pub use deja_runtime::{
         boundary_execute_mode, capture_is_active, current_span_path, dispatch, dispatch_async,
-        execute_shadow_observe_boundary, execute_shadow_peek_boundary,
+        dispatch_async_or_miss, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
         fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
         next_boundary_occurrence, record_boundary_async, record_boundary_async_lazy,
         record_boundary_sync, record_boundary_sync_lazy, replay_boundary, replay_is_active,

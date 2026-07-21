@@ -46,21 +46,50 @@ schema = { type = "string" }
 description = "Type of payout retry (single_connector or multi_connector)"
 change_reason = "Initial setup"
 
+# ── Deja recording sampler context dimensions ────────────────────────────────
+# The sampler passes the RAW request `path` + `method` when resolving
+# `deja_record`. `path` is also the basis of the `deja_dimension` LOCAL_COHORT
+# (seeded LIVE by scripts/seed_superposition.sh — cohorts don't round-trip
+# through this TOML). Registered here so the FileDataSource fallback accepts the
+# sampler's evaluation context.
+[dimensions.path]
+position = 7
+schema = { type = "string" }
+description = "HTTP request path (Deja recording sampler context; basis of the deja_dimension cohort)"
+change_reason = "Deja recording sampler"
+
+[dimensions.method]
+position = 8
+schema = { type = "string" }
+description = "HTTP request method (Deja recording sampler context)"
+change_reason = "Deja recording sampler"
+
 [default-configs.requires_cvv]
 value = true
 schema = { type = "boolean" }
 description = "Whether CVV is required for payments"
 change_reason = "Initial setup"
 
-# Deja recording sampler gate (deja.sampler.record_key = "deja_record"). Seed it
-# TRUE so the record baseline deterministically captures EVERY request. Without
-# it, the sampler's Superposition lookup returns Ok(false) once warm and drops
-# the payment flow, leaving only the fail-open /health probe — a flaky tape.
+# Deja recording sampler gate (deja.sampler.record_key = "deja_record").
+#
+# LAYER-2 (selective sampling): default SKIP. The record decision is driven by
+# the `deja_dimension` LOCAL_COHORT on `path` + its recordable route override —
+# both seeded LIVE by scripts/seed_superposition.sh (run by the superposition-init
+# service the record candidate depends on), because a cohort's json-logic
+# definitions cannot round-trip through this TOML. So the recordable endpoints
+# (/payments, /accounts, /refunds, …) resolve deja_record=true against live
+# Superposition, while /health and other probe traffic fall through to this
+# default and skip — no /health noise in the baseline.
+#
+# This value is only the FileDataSource FALLBACK (used if live Superposition is
+# unreachable); with the sampler FAIL_CLOSED=false the router still fails open to
+# recording in that case, so a cold Superposition never yields a silently-empty
+# tape. (Layer-1 baked `true` here to blanket-record; layer-2 records selectively.)
 [default-configs.deja_record]
-value = true
+value = false
 schema = { type = "boolean" }
-description = "Record every request into the Deja golden baseline (demo rig)"
-change_reason = "Deterministic demo recording"
+description = "Deja per-request recording decision — default SKIP; the deja_dimension cohort override (live-seeded) records the recordable endpoint bucket"
+change_reason = "Deja recording sampler (layer-2 selective)"
 
 [default-configs.implicit_customer_update]
 value = false

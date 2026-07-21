@@ -48,6 +48,10 @@ export default function NewRunPage() {
   const [params] = useSearchParams();
   const [mode, setMode] = React.useState<"record" | "replay">("replay");
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
+  const [imageRef, setImageRef] = React.useState("");
+  const [candidateRepo, setCandidateRepo] = React.useState("");
+  const [s3Path, setS3Path] = React.useState("");
+  const [corrFilter, setCorrFilter] = React.useState("");
   const [binaryPath, setBinaryPath] = React.useState("");
   const [iterations, setIterations] = React.useState(1);
   const [expectation, setExpectation] = React.useState("");
@@ -55,16 +59,36 @@ export default function NewRunPage() {
 
 
   const triggerSpec = React.useMemo(() => {
-    const candidate = binaryPath
-      ? { kind: "local_path", binary_or_source: binaryPath }
-      : { kind: "prebuilt_image", image: "deja-demo" };
+    // Candidate precedence: a deployed image ref (e.g. the Jenkins ECR build)
+    // beats a local binary; neither = the legacy compose self-build sentinel.
+    const candidate = imageRef
+      ? { kind: "prebuilt_image", image: imageRef }
+      : binaryPath
+        ? { kind: "local_path", binary_or_source: binaryPath }
+        : { kind: "prebuilt_image", image: "deja-demo" };
     const spec: Record<string, unknown> =
       mode === "record"
         ? { mode, candidate_spec: candidate, recording_id: null, workload: { iterations } }
-        : { mode, candidate_spec: candidate, recording_id: recordingId || "<recording_id>" };
+        : {
+            mode,
+            candidate_spec: candidate,
+            // With an S3 source the id is the session filter and may be empty
+            // (auto-resolved when the prefix holds exactly one session).
+            recording_id: recordingId || (s3Path ? null : "<recording_id>"),
+          };
+    if (mode === "replay" && s3Path) spec.s3_source = { path: s3Path };
+    // Candidate source repo (owner/name) — a per-run parameter, since a
+    // candidate image can be built from any repo/fork. The orchestrator fetches
+    // this ref's migrations/ to arm the schema gate. Empty = its configured
+    // DEJA_CANDIDATE_REPO default.
+    if (candidateRepo.trim()) spec.candidate_repo = candidateRepo.trim();
+    // Test-case subset: drive only these correlations; scoring scopes to the
+    // same list (an undriven case is excluded, not counted omitted).
+    const corrs = corrFilter.split(",").map((s) => s.trim()).filter(Boolean);
+    if (mode === "replay" && corrs.length) spec.correlation_filter = corrs;
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [binaryPath, expectation, iterations, mode, recordingId]);
+  }, [binaryPath, candidateRepo, corrFilter, expectation, imageRef, iterations, mode, recordingId, s3Path]);
 
   const curlCommand = React.useMemo(() => {
     const body = JSON.stringify(triggerSpec);
@@ -141,15 +165,70 @@ export default function NewRunPage() {
         {mode === "replay" && (
           <>
             <label>
-              recording
-              <select value={recordingId} onChange={(e) => setRecordingId(e.target.value)}>
-                <option value="">— pick a recording —</option>
-                {recordings.data?.map((r) => (
-                  <option key={r.recording_id} value={r.recording_id}>
-                    {r.recording_id} ({r.event_count ?? "?"} events)
-                  </option>
-                ))}
-              </select>
+              recording S3 path{" "}
+              <span className="hint">
+                (a deployed bucket/prefix, e.g. the sandbox aggregator landing;
+                empty = pick from the local catalog below)
+              </span>
+              <input
+                type="text"
+                placeholder="s3://hyperswitch-art/2026/07/11"
+                value={s3Path}
+                onChange={(e) => setS3Path(e.target.value)}
+              />
+            </label>
+            {s3Path ? (
+              <label>
+                recording session id{" "}
+                <span className="hint">
+                  (optional — auto-resolved when the path holds exactly one
+                  session; the failure message lists what it found)
+                </span>
+                <input
+                  type="text"
+                  placeholder="sandbox-art-2026-07-11"
+                  value={recordingId}
+                  onChange={(e) => setRecordingId(e.target.value)}
+                />
+              </label>
+            ) : (
+              <label>
+                recording
+                <select value={recordingId} onChange={(e) => setRecordingId(e.target.value)}>
+                  <option value="">— pick a recording —</option>
+                  {recordings.data?.map((r) => (
+                    <option key={r.recording_id} value={r.recording_id}>
+                      {r.recording_id} ({r.event_count ?? "?"} events)
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <label>
+              candidate image{" "}
+              <span className="hint">
+                (a deployed image ref, e.g. the Jenkins ECR build; takes
+                precedence over the binary path below)
+              </span>
+              <input
+                type="text"
+                placeholder="223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router:<tag>"
+                value={imageRef}
+                onChange={(e) => setImageRef(e.target.value)}
+              />
+            </label>
+            <label>
+              candidate repo{" "}
+              <span className="hint">
+                (optional, owner/name — the image's source repo, used to fetch
+                its migrations for the schema gate; empty = the server default)
+              </span>
+              <input
+                type="text"
+                placeholder="juspay/hyperswitch"
+                value={candidateRepo}
+                onChange={(e) => setCandidateRepo(e.target.value)}
+              />
             </label>
             <label>
               candidate router binary path{" "}
@@ -165,6 +244,19 @@ export default function NewRunPage() {
               />
             </label>
             <label>
+              correlation filter{" "}
+              <span className="hint">
+                (optional, comma-separated correlation ids — drive only these
+                test cases; the verdict judges only the driven subset)
+              </span>
+              <input
+                type="text"
+                placeholder="all correlations"
+                value={corrFilter}
+                onChange={(e) => setCorrFilter(e.target.value)}
+              />
+            </label>
+            <label>
               expectation <span className="hint">(note for the audit trail: pass / diverge)</span>
               <input
                 type="text"
@@ -176,7 +268,7 @@ export default function NewRunPage() {
           </>
         )}
 
-        <button disabled={create.isPending || (mode === "replay" && !recordingId)}>
+        <button disabled={create.isPending || (mode === "replay" && !recordingId && !s3Path)}>
           {create.isPending ? "scheduling…" : "schedule run"}
         </button>
         {create.error && <p className="err">{String(create.error)}</p>}

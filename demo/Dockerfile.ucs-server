@@ -1,0 +1,23 @@
+# Déjà demo UCS (Unified Connector Service) image.
+#
+# Thin wrapper around a HOST-BUILT `grpc-server` binary from the SAME pinned
+# connector-service checkout the router's UCS client types come from
+# (tag 2026.07.02.1 @ a070ef74) — proto parity with the router by construction.
+# Staged into demo/.ucs-build/ by demo/lib.sh (build_ucs_image, DEMO_UCS=1).
+#
+# No connector credentials at boot: auth rides per-request gRPC metadata
+# (x-api-key etc.) from the router's merchant connector account.
+FROM --platform=linux/amd64 debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libpq5 libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+# Stub workspace marker: grpc-server resolves its config dir by walking up
+# from CARGO_MANIFEST_DIR to the first Cargo.toml containing [workspace].
+COPY Cargo.toml /app/Cargo.toml
+COPY config /app/config
+COPY grpc-server /app/grpc-server
+RUN chmod +x /app/grpc-server
+ENV CARGO_MANIFEST_DIR=/app
+EXPOSE 8000
+ENTRYPOINT ["/app/grpc-server"]

@@ -112,6 +112,10 @@ pub struct Scorecard {
     pub per_boundary: BTreeMap<String, BoundaryStats>,
     pub per_correlation: Vec<CorrelationOutcome>,
     pub verdict: Verdict,
+    /// The driven test-case subset when the run used a correlation filter —
+    /// the verdict judges ONLY these cases; absent = the full recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_scope: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -241,6 +245,7 @@ impl Scorecard {
                 inconclusive: true,
                 reason: "run not yet completed".to_owned(),
             },
+            correlation_scope: None,
             warnings: Vec::new(),
         }
     }
@@ -261,6 +266,11 @@ pub struct RunArtifacts {
     /// can reason about wall-clock windows + row identity for the concurrent
     /// same-row write (order-nondeterminism) demotion. Empty when unavailable.
     pub events: Vec<deja::BoundaryEvent>,
+    /// Replay scope: when the run drove a correlation SUBSET (the spec's
+    /// `correlation_filter`), recorded expectations outside the subset are
+    /// dropped at load — an undriven test case is excluded, never counted
+    /// omitted. `None` = the full recording was driven.
+    pub correlation_scope: Option<std::collections::BTreeSet<String>>,
     pub warnings: Vec<String>,
 }
 
@@ -1977,6 +1987,10 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             inconclusive,
             reason,
         },
+        correlation_scope: art
+            .correlation_scope
+            .as_ref()
+            .map(|scope| scope.iter().cloned().collect()),
         warnings,
     }
 }
@@ -1989,18 +2003,48 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
 /// empty (a run mid-flight); parse failures are surfaced as `warnings` rather
 /// than silently dropped, so a corrupt stream can't masquerade as a clean run.
 pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifacts> {
-    let recording_id = crate::read_json::<crate::Run>(&root.run_path(run_id))
-        .ok()
-        .and_then(|run| run.recording_id.or(run.spec.recording_id));
+    let run = crate::read_json::<crate::Run>(&root.run_path(run_id)).ok();
+    let recording_id = run
+        .as_ref()
+        .and_then(|run| run.recording_id.clone().or_else(|| run.spec.recording_id.clone()));
+    // The kernel drove only this subset (KERNEL_CORRELATION_FILTER); scope
+    // recorded expectations to it so undriven cases don't score as omitted.
+    let correlation_scope: Option<std::collections::BTreeSet<String>> = run
+        .as_ref()
+        .and_then(|run| run.spec.correlation_filter.as_ref())
+        .map(|ids| {
+            ids.iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .filter(|set| !set.is_empty());
 
     let mut warnings = Vec::new();
-    let table = load_table(&root.lookup_table_path(run_id), &mut warnings);
+    let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
     let observed = load_observed_calls(&root.observed_path(run_id), &mut warnings);
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
-    let events = match &recording_id {
+    let mut events = match &recording_id {
         Some(rec) => load_boundary_events(&root.recording_events_path(rec), &mut warnings),
         None => Vec::new(),
     };
+
+    if let Some(scope) = &correlation_scope {
+        // Uncorrelated (background) records stay: they are tolerated by the
+        // scorer and shared across cases. No-silent-caps: say what was cut.
+        let in_scope =
+            |cid: &Option<String>| cid.as_ref().is_none_or(|c| scope.contains(c));
+        let entries_before = table.entries.len();
+        let events_before = events.len();
+        table.entries.retain(|e| in_scope(&e.key.correlation_id));
+        events.retain(|e| in_scope(&e.correlation_id));
+        warnings.push(format!(
+            "correlation scope: {} id(s) driven; excluded {} lookup entries and {} recorded events outside the subset",
+            scope.len(),
+            entries_before - table.entries.len(),
+            events_before - events.len(),
+        ));
+    }
 
     Ok(RunArtifacts {
         run_id: run_id.to_owned(),
@@ -2009,6 +2053,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         observed,
         http_diffs,
         events,
+        correlation_scope,
         warnings,
     })
 }
@@ -2362,6 +2407,82 @@ mod tests {
         seq_entry_res(corr, boundary, src, serde_json::json!("v"))
     }
 
+    /// A correlation filter must scope scoring to the DRIVEN subset: an
+    /// undriven case's recorded calls are excluded at load (never omitted),
+    /// while a driven-but-unobserved call still counts as a real omission.
+    #[test]
+    fn correlation_filter_scopes_expectations_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-scope";
+        crate::write_json(
+            &root.run_path(run_id),
+            &crate::Run {
+                run_id: run_id.to_owned(),
+                spec: crate::RunSpec {
+                    mode: crate::RunMode::Replay,
+                    candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                        image: "deja-demo".to_owned(),
+                    },
+                    candidate_repo: None,
+                    recording_id: Some("rec-scope".to_owned()),
+                    s3_source: None,
+                    correlation_filter: Some(vec!["c-keep".to_owned(), " ".to_owned()]),
+                    workload: serde_json::Value::Null,
+                },
+                status: crate::RunStatus::Completed,
+                recording_id: Some("rec-scope".to_owned()),
+                candidate_image: None,
+                failure_reason: None,
+                stage: None,
+                step: 0,
+                steps_total: 0,
+                stage_updated_ms: 0,
+            },
+        )
+        .unwrap();
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: "rec-scope".to_owned(),
+                policy_version: 1,
+                entries: vec![
+                    seq_entry(Some("c-keep"), "db", 1),
+                    seq_entry(Some("c-drop"), "db", 2),
+                    seq_entry(None, "db", 3),
+                ],
+            },
+        )
+        .unwrap();
+
+        let art = load_artifacts(&root, run_id).unwrap();
+        let scope = art.correlation_scope.as_ref().expect("scope set");
+        assert_eq!(
+            scope.iter().collect::<Vec<_>>(),
+            ["c-keep"],
+            "blank filter ids are dropped"
+        );
+        let corrs: Vec<Option<&str>> = art
+            .table
+            .entries
+            .iter()
+            .map(|e| e.key.correlation_id.as_deref())
+            .collect();
+        assert_eq!(
+            corrs,
+            [Some("c-keep"), None],
+            "out-of-scope entries are dropped; uncorrelated background stays"
+        );
+
+        let card = detect(&art);
+        assert_eq!(card.correlation_scope.as_deref(), Some(&["c-keep".to_owned()][..]));
+        assert_eq!(
+            card.summary.omitted_calls, 1,
+            "the driven-but-unobserved c-keep call is a real omission; \
+             the undriven c-drop call must not count"
+        );
+    }
+
     /// A rank-6 `Sequence` entry with an explicit recorded `result` — lets a test
     /// set the recorded operand the args-free value pairing compares against.
     fn seq_entry_res(
@@ -2533,6 +2654,7 @@ mod tests {
             observed,
             http_diffs: http,
             events: Vec::new(),
+            correlation_scope: None,
             warnings: Vec::new(),
         }
     }
@@ -2738,6 +2860,7 @@ mod tests {
                 observed,
                 http_diffs: vec![http(corr, true, vec![])],
                 events: Vec::new(),
+                correlation_scope: None,
                 warnings: Vec::new(),
             },
         )
@@ -4423,6 +4546,7 @@ mod tests {
             observed,
             http_diffs,
             events: Vec::new(),
+            correlation_scope: None,
             warnings: Vec::new(),
         };
 
