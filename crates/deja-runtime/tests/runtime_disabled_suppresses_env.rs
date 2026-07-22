@@ -1,25 +1,22 @@
-//! Typed runtime-hook install must be authoritative over legacy env recording.
+//! A typed `Disabled` runtime hook keeps recording OFF.
 //!
 //! Kept in its own integration-test binary because `set_global_runtime_hook`,
-//! `global_hook_from_env`, and the env-derived hooks are process-wide `OnceLock`s.
+//! `global_hook_from_env`, and `observation_is_active` all read a process-wide
+//! `OnceLock` that is installed exactly once at boot.
 
 #[test]
-fn typed_disabled_hook_suppresses_legacy_env_recording_fallback() {
-    let artifacts = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("DEJA_MODE", "record");
-    std::env::set_var("DEJA_ARTIFACT_DIR", artifacts.path());
-
+fn typed_disabled_hook_exposes_no_recorder_and_keeps_observation_inactive() {
     deja_runtime::set_global_runtime_hook(Some(deja_runtime::RuntimeHook::Disabled(
         deja_runtime::DisabledHook,
     )))
-    .expect("install disabled runtime hook before env fallback is resolved");
+    .expect("install disabled runtime hook");
 
     assert!(
         deja_runtime::global_hook_from_env().is_none(),
-        "an explicit typed Disabled runtime hook must suppress the legacy DEJA_MODE=record standalone recorder"
+        "a typed Disabled runtime hook exposes no recording hook"
     );
     assert!(
-        !deja_runtime::capture_is_active(),
-        "legacy recording env must not make capture active after a typed Disabled runtime hook is installed"
+        !deja_runtime::observation_is_active(),
+        "a typed Disabled runtime hook keeps capture inactive"
     );
 }

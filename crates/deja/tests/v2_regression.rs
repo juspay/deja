@@ -318,8 +318,12 @@ fn resolve_stream(
 fn v2_benign_edits_resolve_while_a_real_change_diverges() {
     let _rec = recording_enabled();
     let artifacts = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("DEJA_MODE", "record");
-    std::env::set_var("DEJA_ARTIFACT_DIR", artifacts.path());
+    deja_runtime::set_global_runtime_hook(Some(deja_runtime::RuntimeHook::Recording(
+        std::sync::Arc::new(
+            deja_runtime::RecordingHook::new(artifacts.path()).expect("recording hook"),
+        ),
+    )))
+    .expect("install recording hook");
 
     // ---- record a baseline (V1) and a candidate (V2) for each scenario ----
     // B1: signature edit + source-line shift.

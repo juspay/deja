@@ -426,7 +426,7 @@ fn generate_async_method(
             // exactly as before: the async method returns a `Box::pin` future into
             // which both the args image and the run block are moved, which forbids
             // a borrowing lazy args thunk (a returned future cannot borrow locals).
-            if !::deja_runtime::DejaHook::is_active(&*self.$hook) {
+            if !::deja_runtime::DejaHook::observation_active(&*self.$hook) {
                 return Box::pin(async move {
                     self.$inner.#method_ident(#(#delegation_args),*).await
                 });
@@ -582,7 +582,7 @@ fn generate_sync_method(
             // (recording gate, not a replay-only operation). On the active path
             // args are serialized eagerly so the seam call needs no borrowing
             // thunk — matching the boxed-future constraint of the async sibling.
-            if !::deja_runtime::DejaHook::is_active(&*self.$hook) {
+            if !::deja_runtime::DejaHook::observation_active(&*self.$hook) {
                 return self.$inner.#method_ident(#(#delegation_args),*);
             }
 

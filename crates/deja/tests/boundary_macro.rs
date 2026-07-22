@@ -209,8 +209,12 @@ fn custom_codec(value: u64) -> u64 {
 fn boundary_macro_records_sync_function() {
     let _rec = recording_enabled();
     let artifacts = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("DEJA_MODE", "record");
-    std::env::set_var("DEJA_ARTIFACT_DIR", artifacts.path());
+    deja_runtime::set_global_runtime_hook(Some(deja_runtime::RuntimeHook::Recording(
+        std::sync::Arc::new(
+            deja_runtime::RecordingHook::new(artifacts.path()).expect("recording hook"),
+        ),
+    )))
+    .expect("install recording hook");
 
     assert_eq!(add_one(41), 42);
     assert_eq!(block_on_ready(async_add_one(99)), Ok(100));

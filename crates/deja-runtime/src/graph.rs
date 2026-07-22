@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -81,10 +82,29 @@ where
     S: for<'lookup> LookupSpan<'lookup>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        // Allocate nothing — no node id, no `graph_node_map` lock, no span
+        // extension — unless this call will be recorded or replayed. A recorder
+        // with the request sampled out is as inert as a disabled process.
+        if !crate::observation_is_active() {
+            return;
+        }
+
         let parent_id = graph_parent_id(attrs, &ctx);
         let metadata = attrs.metadata();
         let mut fields = BTreeMap::new();
-        attrs.record(&mut JsonFieldVisitor::new(&mut fields));
+        // Contain a panic in a span field's Debug/Display impl: keep the fields
+        // captured before it and mark the node, so a misbehaving field truncates
+        // capture instead of killing the request.
+        if catch_unwind(AssertUnwindSafe(|| {
+            attrs.record(&mut JsonFieldVisitor::new(&mut fields));
+        }))
+        .is_err()
+        {
+            fields.insert(
+                "deja.field_capture_panicked".to_owned(),
+                serde_json::Value::Bool(true),
+            );
+        }
 
         if let Some(span) = ctx.span(id) {
             let node_id = self.next_node_id();
@@ -107,9 +127,25 @@ where
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        // Skip the span lookup when not recording or replaying (a span opened
+        // while inert carries no `GraphSpanState`, so the `get_mut` below would
+        // no-op anyway).
+        if !crate::observation_is_active() {
+            return;
+        }
         if let Some(span) = ctx.span(id) {
             if let Some(state) = span.extensions_mut().get_mut::<GraphSpanState>() {
-                values.record(&mut JsonFieldVisitor::new(&mut state.fields));
+                // Same field-visitor firewall as `on_new_span`.
+                if catch_unwind(AssertUnwindSafe(|| {
+                    values.record(&mut JsonFieldVisitor::new(&mut state.fields));
+                }))
+                .is_err()
+                {
+                    state.fields.insert(
+                        "deja.field_capture_panicked".to_owned(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
             }
         }
     }
@@ -133,6 +169,13 @@ where
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        // Not gated on `observation_is_active()`: close must match open. A span
+        // opened while observing owns a `GraphSpanState` and a `graph_node_map`
+        // entry; if it closes after its correlation scope has exited (an async span
+        // held across an await) the flag can read false by now, and gating here
+        // would leak the map entry and drop the node. The `remove`-None early
+        // return is the real gate — a span that allocated nothing returns before
+        // the `graph_node_map` lock.
         let Some(span) = ctx.span(&id) else {
             return;
         };

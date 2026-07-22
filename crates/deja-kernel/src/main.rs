@@ -161,7 +161,7 @@ fn run() -> Result<(), String> {
                 let diff = drive(&target_host, target_port, &driver, &allowlist);
                 {
                     let mut file = sink.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Err(e) = write_diff(&mut *file, &diff) {
+                    if let Err(e) = write_diff(&mut file, &diff) {
                         let mut slot = write_err.lock().unwrap_or_else(|p| p.into_inner());
                         if slot.is_none() {
                             *slot = Some(format!("write diff: {e}"));

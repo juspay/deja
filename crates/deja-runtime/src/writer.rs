@@ -475,6 +475,23 @@ where
         })?
     }
 
+    /// Request a flush WITHOUT blocking on its completion (fire-and-forget).
+    ///
+    /// Enqueues a `Flush` the writer thread honors on its own schedule and
+    /// discards the reply. Used on the per-request finalize hot path so completing
+    /// a response never waits on a writer round-trip; durability still comes from
+    /// the periodic timer, the `flush_after_records` threshold, and the shutdown
+    /// flush. The record enqueue itself already happened (non-blocking) before this.
+    pub fn request_flush(&self) {
+        if !self.is_active() {
+            return;
+        }
+        // A dropped receiver is intentional: the writer flushes, then its reply
+        // `send` to the closed channel fails silently — exactly fire-and-forget.
+        let (tx, _rx) = mpsc::channel();
+        let _ = self.sender.send(WriterMessage::Flush(tx));
+    }
+
     pub fn stats(&self) -> WriterStatsSnapshot {
         let mut snapshot = self.stats.snapshot();
         if let Ok(slot) = self.secondary_failure_counter.lock() {

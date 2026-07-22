@@ -279,6 +279,18 @@ pub fn enter_correlation_id(correlation_id: impl Into<String>) -> ContextGuard {
     enter(ContextSnapshot::new(correlation_id))
 }
 
+/// Set the thread-visible correlation directly, resolving its recording decision
+/// from the registry; `None` clears it. Unlike [`enter_correlation_id`] this
+/// returns no restore guard — the caller owns restoration. The correlation layer
+/// uses it for an on-change model where the previous value is restored from the
+/// span tree rather than an RAII guard per span.
+pub fn set_current_correlation(correlation_id: Option<&str>) {
+    match correlation_id {
+        Some(id) => set_current_context(&ContextSnapshot::new(id)),
+        None => clear_current_context(),
+    }
+}
+
 /// Guard that restores the previous thread-visible context on drop.
 #[derive(Debug)]
 pub struct ContextGuard {

@@ -147,43 +147,9 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     let args_expr = args
         .args
         .unwrap_or_else(|| inferred_args_expr(sig, &args.skip, args.skip_all, &args.fields));
-    let has_state_capture = state_read.is_some()
-        || state_write.is_some()
-        || state_touch.is_some()
-        || read_set.is_some()
-        || write_set.is_some();
-    let eager_args_binding = if has_state_capture {
-        quote! {
-            // Evaluate args EAGERLY into an owned value before state-capture
-            // expressions may move key collections, and before the run thunk moves
-            // borrowed inputs. Keep the existing inactive-path args gate intact.
-            let __deja_boundary_args = if ::deja::__private::capture_is_active() {
-                #args_expr
-            } else {
-                ::serde_json::Value::Null
-            };
-        }
-    } else {
-        quote! {}
-    };
-    let args_thunk_expr = if has_state_capture {
-        quote! { move || __deja_boundary_args }
-    } else {
-        quote! {
-            {
-                // Evaluate args EAGERLY into an owned value (ending any
-                // borrow it holds, e.g. `&request`) BEFORE the run thunk
-                // moves that value; then hand `dispatch` an owning thunk.
-                // Gated so the inactive path never runs the args expr.
-                let __deja_boundary_args = if ::deja::__private::capture_is_active() {
-                    #args_expr
-                } else {
-                    ::serde_json::Value::Null
-                };
-                move || __deja_boundary_args
-            }
-        }
-    };
+    // `args_expr` (above) is materialized eagerly inside the A3 firewall emitted
+    // per shape below — it is the only place the user args `Serialize`/`Debug`
+    // runs, and it runs under `catch_unwind` on the already-active branch.
 
     // --- CallsiteIdentity (rank-2 SpanPath + rank-3 SyntacticHash + rank-4
     //     LexicalPath) ------------------------------------------------------------
@@ -370,6 +336,28 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         },
     };
 
+    // A3 FIREWALL: piece-1's reorder made the capture-prep EAGER on the active
+    // branch — it evaluates user-provided exprs (the correlation expr, the args
+    // `Serialize`/`Debug`, and the state-key extraction exprs) BEFORE the real
+    // call runs. A panic in any of those must NEVER unwind into the real call.
+    // Evaluate the whole prep inside `catch_unwind`; on panic fall back to the
+    // pure passthrough (identical to the inactive branch), restoring the shadow
+    // guarantee for the eager path. (An occurrence index allocated inside
+    // `#identity_build` before a mid-prep panic is simply skipped — recording is
+    // dropped for that call, exactly like any other shadow-guarantee skip.)
+    let firewalled_prep = quote! {
+        ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+            let __deja_boundary_correlation_id: ::std::option::Option<String> = { #correlation_expr };
+            #identity_build
+            // Materialize args EAGERLY into an owned value (ending any borrow it
+            // holds, e.g. `&request`) BEFORE the state-key exprs may move key
+            // collections and before the run thunk moves inputs.
+            let __deja_boundary_args: ::serde_json::Value = #args_expr;
+            let __deja_observation = #crossing_observation_expr;
+            (__deja_observation, __deja_boundary_args)
+        }))
+    };
+
     if sig.asyncness.is_some() {
         if args.future.is_some() {
             return syn::Error::new_spanned(
@@ -387,16 +375,33 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         quote! {
             #(#attrs)*
             #vis #sig {
-                let __deja_boundary_correlation_id: Option<String> = { #correlation_expr };
-                #identity_build
-                #eager_args_binding
-                ::deja::__private::dispatch_async(
-                    #crossing_observation_expr,
-                    #args_thunk_expr,
-                    move || async move #block,
-                    #reconstruct_closure,
-                    move |__deja_result| { #result_expr },
-                ).await
+                // INERTNESS: hoist the observation gate to the TOP. When not
+                // observing (Disabled, or Record with the request sampled out), the
+                // boundary is a pure passthrough — zero identity allocs, no args
+                // serialization, no state-key hashing, no dispatch. The active
+                // branch (capture OR replay) does the full prep. Record∧Skip is as
+                // inert as Disabled.
+                if ::deja::__private::observation_is_active() {
+                    // Bind the caller location in the `#[track_caller]` fn body,
+                    // OUTSIDE the firewall closure below — closures break
+                    // `#[track_caller]` propagation, so `Location::caller()` must be
+                    // read here (real call site) and captured by the closure.
+                    let __deja_caller = ::std::panic::Location::caller();
+                    match #firewalled_prep {
+                        ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
+                            ::deja::__private::dispatch_async(
+                                __deja_observation,
+                                move || __deja_boundary_args,
+                                move || async move #block,
+                                #reconstruct_closure,
+                                move |__deja_result| { #result_expr },
+                            ).await
+                        }
+                        ::std::result::Result::Err(_) => { #block }
+                    }
+                } else {
+                    #block
+                }
             }
         }
     } else if matches!(args.future, Some(FutureMode::Boxed)) {
@@ -407,16 +412,28 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         quote! {
             #(#attrs)*
             #vis #sig {
-                let __deja_boundary_correlation_id: Option<String> = { #correlation_expr };
-                #identity_build
-                #eager_args_binding
-                ::std::boxed::Box::pin(::deja::__private::dispatch_async(
-                    #crossing_observation_expr,
-                    #args_thunk_expr,
-                    move || async move { #block.await },
-                    #reconstruct_closure,
-                    move |__deja_result| { #result_expr },
-                ))
+                // INERTNESS: top-level observation gate (see the async shape).
+                if ::deja::__private::observation_is_active() {
+                    // Bind the caller location in the `#[track_caller]` fn body,
+                    // OUTSIDE the firewall closure below — closures break
+                    // `#[track_caller]` propagation, so `Location::caller()` must be
+                    // read here (real call site) and captured by the closure.
+                    let __deja_caller = ::std::panic::Location::caller();
+                    match #firewalled_prep {
+                        ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
+                            ::std::boxed::Box::pin(::deja::__private::dispatch_async(
+                                __deja_observation,
+                                move || __deja_boundary_args,
+                                move || async move { #block.await },
+                                #reconstruct_closure,
+                                move |__deja_result| { #result_expr },
+                            ))
+                        }
+                        ::std::result::Result::Err(_) => { #block }
+                    }
+                } else {
+                    #block
+                }
             }
         }
     } else {
@@ -424,16 +441,28 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         quote! {
             #(#attrs)*
             #vis #sig {
-                let __deja_boundary_correlation_id: Option<String> = { #correlation_expr };
-                #identity_build
-                #eager_args_binding
-                ::deja::__private::dispatch(
-                    #crossing_observation_expr,
-                    #args_thunk_expr,
-                    || #block,
-                    #reconstruct_closure,
-                    move |__deja_result| { #result_expr },
-                )
+                // INERTNESS: top-level observation gate (see the async shape).
+                if ::deja::__private::observation_is_active() {
+                    // Bind the caller location in the `#[track_caller]` fn body,
+                    // OUTSIDE the firewall closure below — closures break
+                    // `#[track_caller]` propagation, so `Location::caller()` must be
+                    // read here (real call site) and captured by the closure.
+                    let __deja_caller = ::std::panic::Location::caller();
+                    match #firewalled_prep {
+                        ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
+                            ::deja::__private::dispatch(
+                                __deja_observation,
+                                move || __deja_boundary_args,
+                                || #block,
+                                #reconstruct_closure,
+                                move |__deja_result| { #result_expr },
+                            )
+                        }
+                        ::std::result::Result::Err(_) => { #block }
+                    }
+                } else {
+                    #block
+                }
             }
         }
     }
@@ -447,11 +476,21 @@ fn build_crossing_observation_expr(
     read_set: Option<&Expr>,
     write_set: Option<&Expr>,
 ) -> TokenStream {
+    // The whole observation (identity + state-capture key exprs) is built ONLY on
+    // the active branch of the top-level `observation_is_active()` gate emitted by
+    // the boundary shapes below, so no per-item gate is needed here.
+    //
+    // Uses the pre-bound `__deja_caller` rather than `Location::caller()` directly:
+    // the A3 firewall evaluates this observation inside a `catch_unwind` CLOSURE,
+    // and `#[track_caller]` does NOT propagate across a closure boundary — calling
+    // `Location::caller()` here would resolve to the generated code, not the real
+    // call site. The shape binds `__deja_caller` in the `#[track_caller]` fn body
+    // (outside the closure) and the closure captures it.
     let mut observation = quote! {
         ::deja::__private::CrossingObservation::with_correlation(
             #boundary_spec_expr,
             __deja_identity,
-            ::std::panic::Location::caller(),
+            __deja_caller,
             __deja_boundary_correlation_id,
         )
     };

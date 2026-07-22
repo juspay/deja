@@ -541,6 +541,40 @@ impl RuntimeMode {
     }
 }
 
+/// What a boundary should do at the moment it fires — the record-side
+/// counterpart to [`RuntimeMode`].
+///
+/// [`RuntimeMode`] (returned by `process_mode`) answers "what is this process
+/// configured for?". `CaptureVerdict` (returned by `capture_verdict`) answers
+/// the SEPARATE question "should THIS boundary capture right now?", folding in
+/// sink liveness and the per-correlation sampling decision. Splitting the two
+/// questions into two types is what prevents the conflation that let an ingress
+/// predicate gate itself on a per-request decision it had not pushed yet.
+///
+/// A verdict never collapses to a bool: a skip carries its reason, so it is
+/// observable, countable, and impossible to mistake for a process-level "off".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureVerdict {
+    /// Emit a recorded event for this boundary.
+    Capture,
+    /// The sampler pushed an explicit `Skip` for this correlation.
+    SkipSampledOut,
+    /// No recording decision exists for this correlation yet (or the boundary is
+    /// orphaned with no live correlation). Distinct from an explicit skip.
+    SkipNoDecision,
+    /// The record sink has died (fail-open degrade); recording is a no-op.
+    SkipSinkDown,
+    /// The process is not in record mode; boundaries never capture.
+    NotRecording,
+}
+
+impl CaptureVerdict {
+    /// Whether the boundary should emit a recorded event.
+    pub const fn should_capture(self) -> bool {
+        matches!(self, CaptureVerdict::Capture)
+    }
+}
+
 /// The declared intrinsic semantics of a boundary, carried alongside the
 /// [`BoundarySpec`]. The per-site [`ReplayStrategy`] knob is the routing source
 /// of truth; `kind` is a non-routing descriptive label for the dashboard /
@@ -749,40 +783,58 @@ pub struct ReplayLookup<'a> {
 ///
 /// Implementations handle recording (write to file) or replay (match + return).
 pub trait DejaHook: Send + Sync {
-    /// Return the hook's current runtime mode.
-    fn mode(&self) -> RuntimeMode {
+    /// The PROCESS-level configured mode, independent of per-request state.
+    ///
+    /// Answers "what is this process configured to do?" — Record, Replay, or
+    /// Disabled. It reads no thread-local, task-local, or per-request state, so
+    /// it is stable from boot onwards. Ingress predicates and tracing-layer
+    /// installation use this.
+    ///
+    /// The separate per-boundary question "should THIS boundary capture right
+    /// now?" — which folds in the sampling decision and sink liveness — is
+    /// [`capture_verdict`](Self::capture_verdict), a distinct call with a
+    /// distinct return type. Keeping the two as different methods returning
+    /// different types is what prevents the conflation that let an ingress
+    /// predicate gate itself on a decision it had not pushed yet.
+    fn process_mode(&self) -> RuntimeMode {
         RuntimeMode::Disabled
     }
 
-    /// The PROCESS-level configured mode, independent of per-request state.
-    ///
-    /// [`mode`](Self::mode) answers "should THIS boundary capture right now?" —
-    /// for a recorder it ANDs the process configuration with sink liveness and
-    /// the per-correlation sampling decision. That makes it unusable as an
-    /// INGRESS predicate: the middleware that pushes the sampling decision
-    /// cannot gate itself on a value that only becomes true once that decision
-    /// has already been pushed.
-    ///
-    /// `process_mode` answers the separate question "what is this process
-    /// configured to do?". It reads no thread-local, task-local, or per-request
-    /// state, so it is stable from boot onwards. Ingress predicates and
-    /// tracing-layer installation use this; the per-boundary capture gate keeps
-    /// using [`mode`](Self::mode).
-    fn process_mode(&self) -> RuntimeMode {
-        self.mode()
+    /// The per-boundary capture verdict: should THIS boundary emit a recorded
+    /// event right now? See [`CaptureVerdict`]. This is where the per-correlation
+    /// sampling decision and sink liveness are consulted — never in
+    /// [`process_mode`](Self::process_mode). Non-recording hooks never capture.
+    fn capture_verdict(&self) -> CaptureVerdict {
+        CaptureVerdict::NotRecording
     }
 
-    /// Return true when the hook is active (recording or replay is enabled).
+    /// Return true when the hook is active (recording or replaying).
     ///
-    /// When false, the generated delegation skips all recording overhead
-    /// (no JSON serialization, no file writes, no sequencing).
+    /// Process-level: true when [`process_mode`](Self::process_mode) is Record
+    /// or Replay. This is NOT the per-request capture gate — a recorder is
+    /// "active" from boot; whether a given boundary actually captures is
+    /// [`capture_verdict`](Self::capture_verdict).
     fn is_active(&self) -> bool {
-        !self.mode().is_disabled()
+        !self.process_mode().is_disabled()
     }
 
     /// Whether this hook REPLAYS recorded results (vs records / no-op).
     fn is_replay(&self) -> bool {
-        self.mode().is_replay()
+        self.process_mode().is_replay()
+    }
+
+    /// Whether this hook should do per-call OBSERVATION prep for a boundary right
+    /// now — capture-active (Record AND this correlation sampled in) OR
+    /// replay-active. The single per-boundary inertness gate: when false, the
+    /// boundary is a pure passthrough (no identity allocs, no args serialization,
+    /// no state-key hashing). NOT `is_active`, which is process-level and stays
+    /// true for a Record process even on a sampled-out request.
+    fn observation_active(&self) -> bool {
+        match self.process_mode() {
+            RuntimeMode::Replay => true,
+            RuntimeMode::Record => self.capture_verdict().should_capture(),
+            RuntimeMode::Disabled => false,
+        }
     }
 
     /// Attempt to replay a previously recorded result without calling the
@@ -883,6 +935,11 @@ pub trait DejaHook: Send + Sync {
     fn flush(&self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Request a flush without blocking (fire-and-forget). Default no-op; the
+    /// recording hook overrides it so the per-request finalizer can ask for a
+    /// flush without stalling the response on a writer round-trip.
+    fn request_flush(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -899,9 +956,8 @@ pub trait DejaHook: Send + Sync {
 pub struct DisabledHook;
 
 impl DejaHook for DisabledHook {
-    fn mode(&self) -> RuntimeMode {
-        RuntimeMode::Disabled
-    }
+    // process_mode() defaults to Disabled and capture_verdict() to NotRecording,
+    // so no override is needed — a disabled hook is a no-op by every measure.
     fn record(&self, _event: BoundaryEvent) {}
 
     fn next_global_sequence(&self) -> u64 {
@@ -1065,6 +1121,12 @@ impl RecordingHook {
         self.writer.flush()
     }
 
+    /// Request a flush without blocking (fire-and-forget), for the per-request
+    /// finalize hot path. See [`crate::writer::AsyncRecordWriter::request_flush`].
+    pub fn request_flush(&self) {
+        self.writer.request_flush()
+    }
+
     /// Snapshot health counters for the async writer.
     pub fn writer_stats(&self) -> WriterStatsSnapshot {
         self.writer.stats()
@@ -1084,35 +1146,34 @@ impl crate::graph::GraphNodeSink for RecordingHook {
 }
 
 impl DejaHook for RecordingHook {
-    fn mode(&self) -> RuntimeMode {
-        // Process-level recording state AND the per-request sampling gate.
-        // Recording is OPT-IN: the gate records only when an explicit `Record`
-        // decision was pushed for this correlation at ingress (resolved from the
-        // Superposition sampler). `None` — no decision yet, or an orphan boundary
-        // with no live correlation — SKIPS. This is what makes the sampler's own
-        // Superposition read self-exclude: it runs before the decision is set,
-        // sees `None`, and allocates nothing. An explicit `Skip` likewise makes
-        // every boundary a no-op before any record-only helper allocates sequence
-        // numbers. Every boundary — db, instrument id/time/crypto/http, redis, and
-        // the `RuntimeHook::Recording` delegation — funnels through here.
-        if self.writer.is_active()
-            && deja_context::recording_decision_for_current()
-                .map(deja_context::RecordDecision::should_record)
-                .unwrap_or(false)
-        {
-            RuntimeMode::Record
-        } else {
-            RuntimeMode::Disabled
-        }
-    }
-
     /// A `RecordingHook` is only ever constructed by a process configured to
     /// record, so the process-level answer is unconditionally `Record`. The
     /// sink-liveness and per-correlation sampling gates live in
-    /// [`mode`](DejaHook::mode) and deliberately do NOT apply here — an ingress
+    /// [`capture_verdict`](DejaHook::capture_verdict), NOT here — an ingress
     /// predicate built on those would be self-blocking.
     fn process_mode(&self) -> RuntimeMode {
         RuntimeMode::Record
+    }
+
+    fn capture_verdict(&self) -> CaptureVerdict {
+        // The record-side gate, split out of the old conflated `mode()`.
+        // Recording is OPT-IN: only an explicit `Record` decision pushed for this
+        // correlation at ingress captures. `None` — no decision yet (e.g. the
+        // sampler's own Superposition read, which runs before the decision is
+        // set, so it self-excludes) or an orphan boundary with no live
+        // correlation — and an explicit `Skip` both no-op before any sequence
+        // number is allocated. A dead sink degrades to a no-op rather than
+        // failing the application. Every boundary — db, instrument
+        // id/time/crypto/http, redis, and the `RuntimeHook::Recording` delegation
+        // — funnels through here.
+        if !self.writer.is_active() {
+            return CaptureVerdict::SkipSinkDown;
+        }
+        match deja_context::recording_decision_for_current() {
+            Some(deja_context::RecordDecision::Record) => CaptureVerdict::Capture,
+            Some(deja_context::RecordDecision::Skip) => CaptureVerdict::SkipSampledOut,
+            None => CaptureVerdict::SkipNoDecision,
+        }
     }
 
     fn record(&self, event: BoundaryEvent) {
@@ -1147,6 +1208,14 @@ impl DejaHook for RecordingHook {
         source: CallsiteSource,
         scope: Option<&str>,
     ) -> u32 {
+        // INERTNESS (A2): a sampled-out recorder (Skip / no decision / dead sink)
+        // writes no event, so its occurrence numbering is never consulted — skip
+        // the per-call Mutex entirely. Occurrence stays consistent for sampled-IN
+        // runs (only they increment); replay hooks are a separate impl that always
+        // allocates, so record/replay identity matching is unaffected.
+        if !self.capture_verdict().should_capture() {
+            return 0;
+        }
         let key = (
             correlation_id.map(String::from),
             Some(current_task_lineage().bucket_id),
@@ -1169,6 +1238,10 @@ impl DejaHook for RecordingHook {
         RecordingHook::flush(self)
     }
 
+    fn request_flush(&self) {
+        RecordingHook::request_flush(self)
+    }
+
     fn recording_run_id(&self) -> Option<&str> {
         Some(&self.recording_run_id)
     }
@@ -1186,15 +1259,12 @@ impl DejaHook for RecordingHook {
 pub enum RuntimeHook {
     /// Writes every event to a JSONL artifact.
     ///
-    /// Held behind an `Arc` so the SAME recorder can be shared with
-    /// `GLOBAL_RECORDING_HOOK` via [`global_hook_from_env`]. Without sharing,
-    /// boundaries that resolve through the runtime hook (e.g. id generation)
-    /// and boundaries that resolve through `global_hook_from_env` (e.g. db,
-    /// http, redis) would use two independent `RecordingHook`s — two
-    /// `global_sequence` counters and two sink sets — corrupting the recording
-    /// (duplicate sequences, torn JSONL lines) and splitting any
-    /// application-supplied secondary sink (e.g. Kafka) across only half the
-    /// boundaries.
+    /// Held behind an `Arc` so the SAME recorder is shared between boundaries that
+    /// resolve through the runtime hook (e.g. id generation) and those that resolve
+    /// through [`global_hook_from_env`] (e.g. db, http, redis) — both read this one
+    /// installed cell. A single `RecordingHook` means one `global_sequence` counter
+    /// and one sink set across every boundary, so an application-supplied secondary
+    /// sink (e.g. Kafka) sees every boundary and the JSONL never tears.
     Recording(Arc<RecordingHook>),
     /// Replays a previously recorded artifact using the in-process cascade.
     Replay(ReplayHook),
@@ -1216,6 +1286,14 @@ impl RuntimeHook {
         }
     }
 
+    /// Request a flush without blocking (fire-and-forget). Only the recording
+    /// variant has a lazy async writer to flush.
+    pub fn request_flush(&self) {
+        if let RuntimeHook::Recording(h) = self {
+            h.request_flush();
+        }
+    }
+
     /// Snapshot writer stats when the underlying hook is a recorder.
     pub fn writer_stats(&self) -> Option<WriterStatsSnapshot> {
         match self {
@@ -1234,16 +1312,6 @@ impl RuntimeHook {
         }
     }
 
-    /// Return the active runtime mode for this hook.
-    pub fn mode(&self) -> RuntimeMode {
-        match self {
-            RuntimeHook::Recording(h) => h.mode(),
-            RuntimeHook::Replay(h) => h.mode(),
-            RuntimeHook::LookupReplay(h) => h.mode(),
-            RuntimeHook::Disabled(h) => h.mode(),
-        }
-    }
-
     /// The process-level configured mode — see [`DejaHook::process_mode`].
     /// Unlike [`mode`](Self::mode) this never consults per-request state, so it
     /// is safe as an ingress predicate.
@@ -1256,20 +1324,31 @@ impl RuntimeHook {
         }
     }
 
+    /// The per-boundary capture verdict for this hook — see
+    /// [`DejaHook::capture_verdict`].
+    pub fn capture_verdict(&self) -> CaptureVerdict {
+        match self {
+            RuntimeHook::Recording(h) => DejaHook::capture_verdict(h.as_ref()),
+            RuntimeHook::Replay(h) => DejaHook::capture_verdict(h),
+            RuntimeHook::LookupReplay(h) => DejaHook::capture_verdict(h),
+            RuntimeHook::Disabled(h) => DejaHook::capture_verdict(h),
+        }
+    }
+
     /// Whether this hook is replaying recorded results (either the standalone
     /// `Replay` hook or the harness-driven `LookupReplay` hook).
     pub fn is_replay(&self) -> bool {
-        self.mode().is_replay()
+        self.process_mode().is_replay()
     }
 }
 
 impl DejaHook for RuntimeHook {
-    fn mode(&self) -> RuntimeMode {
-        RuntimeHook::mode(self)
-    }
-
     fn process_mode(&self) -> RuntimeMode {
         RuntimeHook::process_mode(self)
+    }
+
+    fn capture_verdict(&self) -> CaptureVerdict {
+        RuntimeHook::capture_verdict(self)
     }
 
     fn try_replay(
@@ -1365,6 +1444,10 @@ impl DejaHook for RuntimeHook {
         RuntimeHook::flush(self)
     }
 
+    fn request_flush(&self) {
+        RuntimeHook::request_flush(self)
+    }
+
     fn recording_run_id(&self) -> Option<&str> {
         match self {
             RuntimeHook::Recording(h) => Some(h.recording_run_id()),
@@ -1375,88 +1458,17 @@ impl DejaHook for RuntimeHook {
     }
 }
 
-/// Construct an `Option<RuntimeHook::LookupReplay>` from
-/// `DEJA_LOOKUP_TABLE` (path to a JSONL or JSON `LookupTable`) and
-/// optionally `DEJA_OBSERVED_SINK` (path to a JSONL file the candidate
-/// writes per-call `ObservedCall` records to). When the sink env var is
-/// unset, observations accumulate in memory and are lost unless the
-/// application drains them explicitly via the hook's underlying sink.
-fn lookup_replay_hook_from_env() -> Option<RuntimeHook> {
-    let table_path = std::env::var("DEJA_LOOKUP_TABLE").ok()?;
-    let hook = match std::env::var("DEJA_OBSERVED_SINK").ok() {
-        Some(observed_path) => match crate::replay::FileObservedSink::create(&observed_path) {
-            Ok(sink) => crate::replay::LookupTableHook::from_source(
-                crate::replay::LocalFileLookupSource::new(&table_path),
-                sink,
-            ),
-            Err(err) => {
-                eprintln!("deja: failed to open DEJA_OBSERVED_SINK={observed_path}: {err}");
-                return None;
-            }
-        },
-        None => crate::replay::LookupTableHook::from_source(
-            crate::replay::LocalFileLookupSource::new(&table_path),
-            crate::replay::InMemoryObservedSink::new(),
-        ),
-    };
-    match hook {
-        Ok(h) => Some(RuntimeHook::LookupReplay(h)),
-        Err(err) => {
-            eprintln!("deja: failed to load DEJA_LOOKUP_TABLE={table_path}: {err}");
-            None
-        }
-    }
-}
-
-/// Construct a [`RuntimeHook`] from environment variables.
-///
-/// Reads `DEJA_MODE` (`record` | `replay` | `disabled`) and
-/// `DEJA_ARTIFACT_DIR`. Returns `None` when disabled or misconfigured.
-pub fn runtime_hook_from_env() -> Option<RuntimeHook> {
-    let mode = std::env::var("DEJA_MODE").ok();
-    let artifact_dir = std::env::var("DEJA_ARTIFACT_DIR").ok();
-
-    match mode.as_deref() {
-        Some("record") => artifact_dir.and_then(|dir| {
-            RecordingHook::new(Path::new(&dir))
-                .ok()
-                .map(|h| RuntimeHook::Recording(Arc::new(h)))
-        }),
-        Some("replay") => {
-            // Prefer the lookup-table path when DEJA_LOOKUP_TABLE is set
-            // (harness-driven runs); fall back to the classic in-process
-            // ReplayHook for standalone use (local development loops).
-            if let Some(hook) = lookup_replay_hook_from_env() {
-                Some(hook)
-            } else {
-                artifact_dir.and_then(|dir| {
-                    ReplayHook::from_artifact_dir(Path::new(&dir))
-                        .ok()
-                        .map(RuntimeHook::Replay)
-                })
-            }
-        }
-        Some("disabled") | Some("off") | Some("none") => None,
-        // Mode must be explicit: an artifact dir alone never turns recording
-        // on (recording live traffic is an opt-in switch, not an inference).
-        None => None,
-        Some(other) => {
-            eprintln!(
-                "deja: unknown DEJA_MODE='{}', expected record|replay|disabled",
-                other
-            );
-            None
-        }
-    }
-}
-
 static GLOBAL_RUNTIME_HOOK: OnceLock<Option<Arc<RuntimeHook>>> = OnceLock::new();
 
-/// Process-wide [`RuntimeHook`] initialized once from environment configuration.
+/// Process-wide [`RuntimeHook`], PEEKED (never env-initialized).
+///
+/// The hook is installed exactly once at boot via [`set_global_runtime_hook`]
+/// (the application constructs it — record/replay/disabled — with its own sink).
+/// This getter only reads the installed cell; there is no env-derived fallback.
+/// Identical to [`installed_runtime_hook`], kept as the name dispatch resolvers
+/// and the ingress boundary call through.
 pub fn global_runtime_hook_from_env() -> Option<Arc<RuntimeHook>> {
-    GLOBAL_RUNTIME_HOOK
-        .get_or_init(|| runtime_hook_from_env().map(Arc::new))
-        .clone()
+    installed_runtime_hook()
 }
 
 /// Install an explicitly-constructed [`RuntimeHook`] as the process-wide hook.
@@ -2057,7 +2069,10 @@ impl LazyEventFinalizer {
         inject_body_json(&mut result, std::mem::take(&mut self.body));
 
         builder.finish(&*hook, result, self.is_error);
-        let _ = hook.flush();
+        // Fire-and-forget: the events are already enqueued (non-blocking) above.
+        // Request a flush but do NOT block the response path waiting for the writer
+        // round-trip — durability comes from the periodic/threshold/shutdown flush.
+        hook.request_flush();
         clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
         correlation_id
     }
@@ -2114,62 +2129,35 @@ pub fn serialized_result_is_error(result: &serde_json::Value) -> bool {
 // Environment-based factory
 // ---------------------------------------------------------------------------
 
-/// Initialize a recording hook from environment variables.
+/// The installed recording hook, if any.
 ///
-/// Reads:
-/// - `DEJA_MODE`: "record" to enable recording (default: disabled)
-/// - `DEJA_ARTIFACT_DIR`: directory for output files (required when recording)
-///
-/// Returns `None` if disabled or misconfigured.
-pub fn hook_from_env() -> Option<RecordingHook> {
-    let mode = std::env::var("DEJA_MODE").unwrap_or_default();
-    if mode != "record" {
-        return None;
-    }
-    let dir = std::env::var("DEJA_ARTIFACT_DIR").ok()?;
-    RecordingHook::new(Path::new(&dir)).ok()
-}
-
-static GLOBAL_RECORDING_HOOK: OnceLock<Option<Arc<RecordingHook>>> = OnceLock::new();
-
-/// Shared recording hook initialized once from `DEJA_MODE` and `DEJA_ARTIFACT_DIR`.
-///
-/// If an application has installed a recording [`RuntimeHook`] via
+/// Returns the shared [`RecordingHook`] inside the process-wide runtime hook when
+/// it was installed as [`RuntimeHook::Recording`] at boot via
 /// [`set_global_runtime_hook`] (e.g. Hyperswitch's `deja_boot`, which composes a
-/// Kafka secondary onto the JSONL primary), this returns that hook's SHARED
-/// `RecordingHook` so callers of this getter use the exact same recorder as
-/// callers of [`global_runtime_hook_from_env`]. That unification is what keeps a
-/// single `global_sequence` counter and a single sink set across every boundary
-/// — regardless of which resolver a given boundary happens to call.
-///
-/// The runtime hook is only PEEKED (`get`, never `get_or_init`): we must not
-/// pre-empt the install-before-getter ordering contract documented on
-/// [`set_global_runtime_hook`]. When an explicit runtime hook has been installed,
-/// that typed hook is authoritative: non-recording hooks suppress the legacy
-/// standalone env recorder. Only when no runtime hook has been initialized does
-/// this fall back to the env-derived `GLOBAL_RECORDING_HOOK`.
+/// Kafka secondary onto the JSONL primary). Every caller uses the exact same
+/// recorder as callers of [`global_runtime_hook_from_env`] — one `global_sequence`
+/// counter and one sink set across every boundary. Non-recording hooks (replay /
+/// disabled) and an uninstalled cell return `None`. The cell is only PEEKED
+/// (`get`, never `get_or_init`): the hook is installed exactly once at boot.
 pub fn global_hook_from_env() -> Option<Arc<RecordingHook>> {
-    if let Some(runtime) = GLOBAL_RUNTIME_HOOK.get() {
-        return match runtime {
-            Some(hook) => match hook.as_ref() {
-                RuntimeHook::Recording(hook) => Some(Arc::clone(hook)),
-                RuntimeHook::Replay(_)
-                | RuntimeHook::LookupReplay(_)
-                | RuntimeHook::Disabled(_) => None,
-            },
-            None => None,
-        };
+    match GLOBAL_RUNTIME_HOOK.get() {
+        Some(Some(hook)) => match hook.as_ref() {
+            RuntimeHook::Recording(hook) => Some(Arc::clone(hook)),
+            RuntimeHook::Replay(_) | RuntimeHook::LookupReplay(_) | RuntimeHook::Disabled(_) => {
+                None
+            }
+        },
+        _ => None,
     }
-    GLOBAL_RECORDING_HOOK
-        .get_or_init(|| hook_from_env().map(Arc::new))
-        .as_ref()
-        .cloned()
 }
 
-/// Whether ANY hook that consumes a boundary's args is active — the runtime
-/// (replay/execute) hook OR the standalone recording hook. The boundary macro
-/// uses this to decide whether to EAGERLY evaluate the args expression into an
-/// owned `serde_json::Value` *before* forming the run closure.
+/// Whether a boundary should do per-call OBSERVATION prep — evaluate the args
+/// expression, the state-capture key expressions, and allocate the callsite
+/// occurrence. True when observation is active: capture-active (Record AND this
+/// correlation sampled in) OR replay-active. NOT capture alone — state keys and
+/// occurrence are needed in replay too (execute-shadow / seed-gap classification,
+/// identity matching). When idle (Disabled) or sampled-out, this is false and the
+/// macro skips ALL that prep, so those paths are inert.
 ///
 /// Why eager-when-active rather than a lazy thunk: a lazy args *thunk* and the
 /// run *thunk* are handed to `dispatch` simultaneously, so a thunk that borrows
@@ -2179,16 +2167,20 @@ pub fn global_hook_from_env() -> Option<Arc<RecordingHook>> {
 /// the move. Gating on this keeps the inactive path zero-cost: when nothing is
 /// capturing, the macro never runs the args expression at all.
 ///
-/// This mirrors the paths that actually consume args: `dispatch` evaluates args
-/// when the runtime mode consumes args, and the record-only path evaluates args
-/// only when the recording hook is still in [`RuntimeMode::Record`] after the
-/// sampling gate. A sampled-out recorder must not serialize args just to return
-/// before `EventBuilder::start`.
-pub fn capture_is_active() -> bool {
-    runtime_mode().consumes_args()
-        || global_hook_from_env()
-            .map(|hook| hook.mode().is_record())
-            .unwrap_or(false)
+/// This is the SINGLE gate for all per-call recording-prep (args, state keys,
+/// occurrence): `dispatch` records only when observing, and a sampled-out recorder
+/// must not serialize args or hash state keys just to return before
+/// `EventBuilder::start`. It is the process_mode-routes / capture_verdict-gates
+/// split expressed as one predicate.
+pub fn observation_is_active() -> bool {
+    // Replay always observes (identity matching / seed-gap need the keys); Record
+    // observes only when THIS boundary will actually capture — a sampled-out
+    // recorder does no prep at all. See [`DejaHook::observation_active`]. Resolves
+    // the SAME installed hook `dispatch` uses, so this predicate can never skip a
+    // boundary dispatch would have recorded.
+    global_runtime_hook_from_env()
+        .map(|hook| hook.observation_active())
+        .unwrap_or(false)
 }
 
 /// The explicit process-wide runtime mode.
@@ -2197,7 +2189,7 @@ pub fn capture_is_active() -> bool {
 /// no runtime hook is configured.
 pub fn runtime_mode() -> RuntimeMode {
     global_runtime_hook_from_env()
-        .map(|hook| hook.mode())
+        .map(|hook| hook.process_mode())
         .unwrap_or(RuntimeMode::Disabled)
 }
 
@@ -2351,18 +2343,11 @@ pub fn fork_span() -> tracing::Span {
     tracing::info_span!("deja.fork", deja.fork = true)
 }
 
-/// Flush the global recording hook, when one is configured.
+/// Flush the global recording hook, when one is installed.
 ///
-/// The recording hook may live in EITHER `GLOBAL_RECORDING_HOOK` (when
-/// resolved standalone) OR inside `GLOBAL_RUNTIME_HOOK` as
-/// `RuntimeHook::Recording` (when the runtime hook was initialized first — e.g.
-/// because a boundary allocated a callsite occurrence via the runtime hook
-/// before any event was recorded). Flush whichever holds it so events are not
-/// silently left unflushed.
+/// The recorder lives inside `GLOBAL_RUNTIME_HOOK` as `RuntimeHook::Recording`
+/// (installed once at boot); flush it so events are not silently left unflushed.
 pub fn flush_global_hook() -> std::io::Result<()> {
-    if let Some(hook) = GLOBAL_RECORDING_HOOK.get().and_then(|hook| hook.as_ref()) {
-        return hook.flush();
-    }
     if let Some(Some(runtime)) = GLOBAL_RUNTIME_HOOK.get() {
         if let RuntimeHook::Recording(hook) = runtime.as_ref() {
             return hook.flush();
@@ -2408,7 +2393,7 @@ fn record_semantic_event_with_hook(
     is_error: bool,
     caller: &'static Location<'static>,
 ) {
-    if !hook.mode().is_record() {
+    if !hook.capture_verdict().should_capture() {
         return;
     }
 
@@ -3340,9 +3325,18 @@ where
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
-    match obs.hook.mode() {
+    match obs.hook.process_mode() {
         RuntimeMode::Disabled => run(),
-        RuntimeMode::Record => delegate_record_path(obs, args, run, extract),
+        // process_mode ROUTES; capture_verdict GATES the emit. A sampled-out
+        // recorder (no/Skip decision, or a dead sink) runs live without recording
+        // — the per-request gate lives here, never in process_mode.
+        RuntimeMode::Record => {
+            if obs.hook.capture_verdict().should_capture() {
+                delegate_record_path(obs, args, run, extract)
+            } else {
+                run()
+            }
+        }
         RuntimeMode::Replay => {
             let boundary_args = args;
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
@@ -3413,9 +3407,16 @@ where
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
-    match obs.hook.mode() {
+    match obs.hook.process_mode() {
         RuntimeMode::Disabled => run().await,
-        RuntimeMode::Record => delegate_record_path_async(obs, args, run, extract).await,
+        // process_mode ROUTES; capture_verdict GATES the emit (see the sync path).
+        RuntimeMode::Record => {
+            if obs.hook.capture_verdict().should_capture() {
+                delegate_record_path_async(obs, args, run, extract).await
+            } else {
+                run().await
+            }
+        }
         RuntimeMode::Replay => {
             let boundary_args = args;
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
@@ -3596,13 +3597,17 @@ fn start_boundary_event_lazy_with_hook<A>(
 where
     A: FnOnce() -> serde_json::Value,
 {
-    if !hook.mode().is_record() {
+    if !hook.capture_verdict().should_capture() {
         return None;
     }
-    // SHADOW GUARANTEE: `args()` runs user `Serialize`/`Debug` impls and the
-    // builder setup may touch poisoned locks — either could panic. Catch it so a
-    // recording panic can NEVER unwind into the real request; on panic we simply
-    // skip recording this boundary and the caller proceeds with the real call.
+    // SHADOW GUARANTEE: `args()` invokes the caller's args thunk. On the
+    // attribute-macro path that thunk just returns a value already materialized
+    // eagerly at the call site (under the macro's own A3 `catch_unwind` firewall),
+    // so the user `Serialize`/`Debug` impls have already run there; other callers
+    // may pass a lazy serializer that runs those impls here. Either way the builder
+    // setup may touch poisoned locks, so still catch any panic so a recording panic
+    // can NEVER unwind into the real request; on panic we simply skip recording
+    // this boundary and the caller proceeds with the real call.
     let semantics = spec.semantics();
     let event = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut event = EventBuilder::start_with_correlation_id(
@@ -4081,7 +4086,7 @@ mod tests {
         deja_context::set_recording_decision(correlation_id, false);
         {
             let _guard = deja_context::enter_correlation_id(correlation_id);
-            assert_eq!(hook.mode(), RuntimeMode::Disabled);
+            assert_eq!(hook.capture_verdict(), CaptureVerdict::SkipSampledOut);
         }
         deja_context::clear_recording_decision(correlation_id);
     }
@@ -4111,7 +4116,7 @@ mod tests {
 
             assert!(event.is_none());
             assert!(!args_evaluated.get());
-            assert_eq!(hook.mode(), RuntimeMode::Disabled);
+            assert_eq!(hook.capture_verdict(), CaptureVerdict::SkipSampledOut);
             record_semantic_event_with_hook(
                 std::sync::Arc::clone(&hook),
                 "manual",
@@ -4820,13 +4825,22 @@ mod tests {
     }
 
     impl DejaHook for FakeHook {
-        fn mode(&self) -> RuntimeMode {
+        fn process_mode(&self) -> RuntimeMode {
             if !self.active {
                 RuntimeMode::Disabled
             } else if self.replay_value.is_some() || self.execute {
                 RuntimeMode::Replay
             } else {
                 RuntimeMode::Record
+            }
+        }
+
+        fn capture_verdict(&self) -> CaptureVerdict {
+            // Test double: capture whenever it is configured as a live recorder.
+            if matches!(self.process_mode(), RuntimeMode::Record) {
+                CaptureVerdict::Capture
+            } else {
+                CaptureVerdict::NotRecording
             }
         }
         fn record(&self, event: BoundaryEvent) {

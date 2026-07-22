@@ -15,21 +15,24 @@
 //!
 //! # Mechanism (lock-light hot path)
 //!
-//! `on_new_span` resolves the span's correlation ONCE — from its own `request_id`
-//! field, else inherited from the parent's already-resolved value — and stores it
-//! in the span's extensions. That is the only extension *write*, and it happens
-//! once per span (the same shape the execution-graph layer uses safely).
+//! `on_new_span` resolves the span's correlation, full logical path (root→leaf),
+//! task lineage, and Skip-gate verdict ONCE into a single `SpanContext`
+//! extension. That is the only extension *write*, once per span.
 //!
-//! The per-poll hot path stays lock-light: `on_enter` does a brief extension
-//! *read* of the pre-resolved value, enters it into deja-context, and parks the
-//! restore guard on a **thread-local stack**; `on_exit` pops that stack. No
-//! per-poll extension writes and no parent-walk. Because an `Instrumented` future
-//! enters/exits its span on every poll, the context is re-established per-poll on
-//! whichever worker thread polls the task — correct under tokio work-stealing.
+//! The per-poll hot path is a brief extension *read* plus thread-local cursor
+//! writes: `on_enter` sets the path and lineage cursors to this span's values;
+//! `on_exit` restores them from the span PARENT via `ctx`. The payloads are
+//! `Arc`, so a poll bracket moves no heap. Correlation is entered into
+//! deja-context only when it CHANGES from the thread's current value (≈once per
+//! request), saving the previous value so a spawned task polled on a fresh worker
+//! reverts to nothing rather than to its parent. Because an `Instrumented` future
+//! enters/exits its span on every poll, the cursors are re-established per-poll on
+//! whichever worker thread polls the task — correct under work-stealing.
 
 use std::cell::RefCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
-use deja_context::{enter_correlation_id, ContextGuard};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
 use tracing::Subscriber;
@@ -40,10 +43,25 @@ use tracing_subscriber::registry::LookupSpan;
 /// span — see `router_env::root_span`).
 const CORRELATION_FIELD: &str = "request_id";
 
-/// Correlation id resolved for a span (own field or inherited from parent),
-/// stored in the span's extensions by `on_new_span`.
+/// Everything `on_new_span` resolves for a span, written once into its extensions
+/// and read on every enter/exit. `Arc` payloads keep the per-poll cursor moves
+/// allocation-free.
 #[derive(Clone)]
-struct SpanCorrelation(String);
+struct SpanContext {
+    /// Logical span-path root→leaf (`"payments_core>update_trackers"`), built once
+    /// from the parent's path plus this span's name.
+    path: Arc<str>,
+    /// Correlation id from this span's own `request_id` field, else inherited from
+    /// the parent. `None` when no ancestor carried one.
+    correlation: Option<Arc<str>>,
+    /// Task lineage: a fresh bucket when this span is a fork boundary, else the
+    /// parent's bucket.
+    lineage: Arc<crate::TaskLineage>,
+    /// Whether entering this span should engage the correlation scope — false when
+    /// the ingress pushed a `Skip` decision for `correlation`. Cached so the hot
+    /// path reads a bool, not a decision-registry lookup.
+    observe: bool,
+}
 
 /// The span field that marks a spawned-task boundary: a span carrying
 /// `deja.fork = true` (minted by [`crate::fork_span`] at the `tokio::spawn` site)
@@ -53,44 +71,62 @@ struct SpanCorrelation(String);
 /// purely from the span tree instead of `spawn_detached`.
 const FORK_FIELD: &str = "deja.fork";
 
-/// Task lineage resolved for a span (own bucket if it is a fork boundary, else
-/// inherited from parent), stored in the span's extensions by `on_new_span` and
-/// mirrored onto the current thread by `on_enter` — the span-derived replacement
-/// for the `CURRENT_TASK_LINEAGE` task-local.
-#[derive(Clone)]
-struct SpanLineage(crate::TaskLineage);
-
 thread_local! {
-    /// LIFO stack of restore guards, one frame per `on_enter`/`on_exit` pair on
-    /// this thread. `None` when the entered span resolved no correlation. Tracing
-    /// brackets enter/exit per poll on a single thread, so this stays balanced and
-    /// empty between polls (work-stealing safe — see module docs).
-    static GUARD_STACK: RefCell<Vec<Option<ContextGuard>>> = const { RefCell::new(Vec::new()) };
+    /// The full logical span-path active on this thread. `on_enter` sets it to the
+    /// entered span's path; `on_exit` restores it from the span parent. This is the
+    /// SOURCE for the `SpanPath` address: same-callsite calls in DISTINCT spans get
+    /// distinct paths → distinct occurrence buckets, fixing the positional
+    /// `occurrence` swap async interleaving otherwise causes.
+    static CURRENT_PATH: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
 
-    /// LIFO stack of entered span NAMES on this thread — the **logical span-path**
-    /// (root→leaf) a boundary fires within. Pushed in `on_enter`, popped in
-    /// `on_exit`, in lock-step with `GUARD_STACK` (one frame per poll-bracket), so
-    /// it is balanced per poll and work-stealing safe for the same reason.
-    ///
-    /// Span names are `&'static str` (from `tracing` metadata), so pushing is
-    /// allocation-free. The stack holds `Option<&'static str>` rather than `&str`
-    /// only so a (spurious) enter with no resolvable span still pushes a frame and
-    /// stays balanced with the unconditional `on_exit` pop.
-    ///
-    /// This is the SOURCE for the `SpanPath` address: concurrent same-callsite
-    /// calls in DISTINCT spans get distinct paths → distinct occurrence buckets,
-    /// which is what fixes the positional `occurrence` swap that async task
-    /// interleaving otherwise causes (see `addresses_for` / the
-    /// `Address::SpanPath` rank).
-    static NAME_STACK: RefCell<Vec<Option<&'static str>>> = const { RefCell::new(Vec::new()) };
+    /// The task lineage active on this thread, same set/restore-from-parent shape
+    /// as `CURRENT_PATH`. `None` means the root region.
+    static CURRENT_LINEAGE: RefCell<Option<Arc<crate::TaskLineage>>> =
+        const { RefCell::new(None) };
 
-    /// LIFO stack of the task lineage active on this thread — one frame per
-    /// `on_enter`/`on_exit` pair, in lock-step with `GUARD_STACK`/`NAME_STACK`.
-    /// `on_enter` pushes the span's resolved `SpanLineage`; `on_exit` pops. The
-    /// top frame is what `current_task_lineage` reads; an empty stack means the
-    /// root region. Balanced per poll, so work-stealing safe for the same reason
-    /// the correlation stack is.
-    static LINEAGE_STACK: RefCell<Vec<crate::TaskLineage>> = const { RefCell::new(Vec::new()) };
+    /// The correlation this layer has entered into deja-context on this thread,
+    /// compared against each span's engaged correlation so the scope is entered
+    /// only on a CHANGE.
+    static CURRENT_CORRELATION: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
+
+    /// Saved previous correlations, one frame per CHANGE (not per span), tagged
+    /// with the span id that caused it. `on_exit` pops the frame its own enter
+    /// pushed and restores the exact previous value — so a spawned task polled on a
+    /// fresh worker reverts to nothing, which restore-from-parent could not do.
+    /// Depth ≈ correlation nesting (≈1 per request).
+    static CORRELATION_RESTORE: RefCell<Vec<(u64, Option<Arc<str>>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Enter `target` into deja-context only when it differs from what this layer last
+/// entered on this thread, saving the previous value tagged with `span_id` so the
+/// matching `on_exit` reverts exactly it.
+fn engage_correlation(span_id: u64, target: Option<Arc<str>>) {
+    CURRENT_CORRELATION.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.as_deref() == target.as_deref() {
+            return;
+        }
+        CORRELATION_RESTORE.with(|stack| stack.borrow_mut().push((span_id, current.clone())));
+        deja_context::set_current_correlation(target.as_deref());
+        *current = target;
+    });
+}
+
+/// Revert the correlation change `span_id`'s enter made, if it made one.
+fn restore_correlation(span_id: u64) {
+    let restored = CORRELATION_RESTORE.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.last().is_some_and(|(id, _)| *id == span_id) {
+            stack.pop()
+        } else {
+            None
+        }
+    });
+    if let Some((_, previous)) = restored {
+        deja_context::set_current_correlation(previous.as_deref());
+        CURRENT_CORRELATION.with(|current| *current.borrow_mut() = previous);
+    }
 }
 
 /// The logical span-path currently active on this thread — the entered span NAMES
@@ -123,28 +159,17 @@ thread_local! {
 ///    `#[instrument]` span to resolve (a follow-up, not handled here). The headline
 ///    case (`update_payment_attempt` vs `update_payment_intent`) has distinct names
 ///    and IS disambiguated.
-///
-/// (`None` frames from spurious enters are elided here; two stacks differing only by
-/// elided `None`s collapse to the same path — harmless given the limitations above.)
 #[must_use]
 pub fn current_span_path() -> Option<String> {
-    NAME_STACK.with(|stack| {
-        let stack = stack.borrow();
-        let parts: Vec<&str> = stack.iter().filter_map(|name| *name).collect();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(">"))
-        }
-    })
+    CURRENT_PATH.with(|cell| cell.borrow().as_ref().map(|path| path.to_string()))
 }
 
 /// The task lineage active on this thread, derived from the entered span tree —
 /// the span-based replacement for the `CURRENT_TASK_LINEAGE` task-local. Returns
 /// the root region's lineage when no lineage-bearing span is entered.
 pub(crate) fn current_span_lineage() -> crate::TaskLineage {
-    LINEAGE_STACK
-        .with(|stack| stack.borrow().last().cloned())
+    CURRENT_LINEAGE
+        .with(|cell| cell.borrow().as_ref().map(|lineage| (**lineage).clone()))
         .unwrap_or_else(crate::TaskLineage::root)
 }
 
@@ -202,81 +227,97 @@ where
             return;
         };
 
-        // Prefer this span's own `request_id` field.
+        // Everything this span inherits comes from the parent's resolved context;
+        // the parent was processed before this child, so its context is set.
+        let parent = span
+            .parent()
+            .and_then(|parent| parent.extensions().get::<SpanContext>().cloned());
+
+        // Prefer this span's own `request_id`; contain a panic in its Debug/Display
+        // so a bad field cannot kill the request (correlation stays inherited).
         let mut visitor = CorrelationVisitor(None);
-        attrs.record(&mut visitor);
-        let resolved = visitor.0.or_else(|| {
-            // Else inherit the parent's already-resolved correlation. The parent
-            // exists and was processed before this child, so its value is set.
-            span.parent().and_then(|parent| {
-                parent
-                    .extensions()
-                    .get::<SpanCorrelation>()
-                    .map(|c| c.0.clone())
-            })
-        });
+        let _ = catch_unwind(AssertUnwindSafe(|| attrs.record(&mut visitor)));
+        let own_correlation = visitor.0.map(|id| Arc::<str>::from(id.as_str()));
+        let correlation = own_correlation
+            .clone()
+            .or_else(|| parent.as_ref().and_then(|c| c.correlation.clone()));
 
-        if let Some(correlation) = resolved.clone() {
-            span.extensions_mut().insert(SpanCorrelation(correlation));
-        }
+        // Path: the parent's path plus this span's static name.
+        let name = span.name();
+        let path: Arc<str> = match parent.as_ref() {
+            Some(parent) => Arc::from(format!("{}>{name}", parent.path).as_str()),
+            None => Arc::from(name),
+        };
 
-        // Resolve task lineage from the span tree. A `deja.fork`-marked span opens
-        // a fresh bucket (an independent, unordered task region); every other span
-        // inherits its parent's lineage, so synchronous nesting stays in one
-        // bucket. This replaces the `spawn_detached`/task-local model outright.
+        // A `deja.fork` span opens a fresh, unordered lineage bucket; every other
+        // span inherits its parent's, so synchronous nesting stays in one bucket.
         let mut fork_visitor = ForkVisitor(false);
         attrs.record(&mut fork_visitor);
-        let parent_lineage = span.parent().and_then(|parent| {
-            parent
-                .extensions()
-                .get::<SpanLineage>()
-                .map(|l| l.0.clone())
-        });
         let lineage = if fork_visitor.0 {
-            let base = parent_lineage.unwrap_or_else(crate::TaskLineage::root);
-            crate::TaskLineage::forked_child_of(base, resolved.as_deref())
+            let base = parent
+                .as_ref()
+                .map_or_else(crate::TaskLineage::root, |c| (*c.lineage).clone());
+            Arc::new(crate::TaskLineage::forked_child_of(
+                base,
+                correlation.as_deref(),
+            ))
         } else {
-            parent_lineage.unwrap_or_else(crate::TaskLineage::root)
+            parent
+                .as_ref()
+                .map_or_else(|| Arc::new(crate::TaskLineage::root()), |c| Arc::clone(&c.lineage))
         };
-        span.extensions_mut().insert(SpanLineage(lineage));
+
+        // Only a span carrying its OWN correlation pays a decision lookup; a span
+        // that inherited its correlation inherits the verdict too.
+        let observe = if own_correlation.is_some() {
+            correlation.as_deref().is_some_and(|id| {
+                !matches!(
+                    deja_context::recording_decision(id),
+                    Some(deja_context::RecordDecision::Skip)
+                )
+            })
+        } else {
+            parent.as_ref().is_some_and(|c| c.observe)
+        };
+
+        span.extensions_mut().insert(SpanContext {
+            path,
+            correlation,
+            lineage,
+            observe,
+        });
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        // Brief read of the pre-resolved correlation, the span's static name, and
-        // the pre-resolved lineage; never a write, never a walk.
-        let span = ctx.span(id);
-        let name: Option<&'static str> = span.as_ref().map(|span| span.name());
-        let correlation = span.as_ref().and_then(|span| {
-            span.extensions()
-                .get::<SpanCorrelation>()
-                .map(|c| c.0.clone())
-        });
-        let lineage = span
-            .as_ref()
-            .and_then(|span| span.extensions().get::<SpanLineage>().map(|l| l.0.clone()))
-            .unwrap_or_else(crate::TaskLineage::root);
+        let Some(cx) = ctx
+            .span(id)
+            .and_then(|span| span.extensions().get::<SpanContext>().cloned())
+        else {
+            return;
+        };
 
-        // Always push a frame to EVERY stack so `on_exit` can pop each
-        // unconditionally, keeping them balanced across nested spans.
-        let frame = correlation.map(enter_correlation_id);
-        GUARD_STACK.with(|stack| stack.borrow_mut().push(frame));
-        NAME_STACK.with(|stack| stack.borrow_mut().push(name));
-        LINEAGE_STACK.with(|stack| stack.borrow_mut().push(lineage));
+        CURRENT_PATH.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&cx.path)));
+        CURRENT_LINEAGE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&cx.lineage)));
+
+        // Engage the correlation scope unless the ingress sampled this request out.
+        let engaged = cx.observe.then(|| cx.correlation.clone()).flatten();
+        engage_correlation(id.into_u64(), engaged);
     }
 
-    fn on_exit(&self, _id: &Id, _ctx: Context<'_, S>) {
-        // Pop the name + lineage frames first (pure thread-local, no guard
-        // restore), then pop this poll's correlation frame OUT and drop it — so the
-        // guard's restore (which touches a different thread-local) never runs while
-        // a stack borrow is held. A spurious exit with empty stacks is a no-op.
-        NAME_STACK.with(|stack| {
-            stack.borrow_mut().pop();
+    fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
+        // Restore the path and lineage cursors from the span PARENT (clear at root).
+        let parent = ctx
+            .span(id)
+            .and_then(|span| span.parent())
+            .and_then(|parent| parent.extensions().get::<SpanContext>().cloned());
+        CURRENT_PATH.with(|cell| {
+            *cell.borrow_mut() = parent.as_ref().map(|c| Arc::clone(&c.path));
         });
-        LINEAGE_STACK.with(|stack| {
-            stack.borrow_mut().pop();
+        CURRENT_LINEAGE.with(|cell| {
+            *cell.borrow_mut() = parent.as_ref().map(|c| Arc::clone(&c.lineage));
         });
-        let frame = GUARD_STACK.with(|stack| stack.borrow_mut().pop());
-        drop(frame);
+
+        restore_correlation(id.into_u64());
     }
 }
 
@@ -384,6 +425,64 @@ mod tests {
                 Some("payments_core>update_payment_intent")
             );
             assert_ne!(path_a, path_b);
+        });
+    }
+
+    #[test]
+    fn skip_decision_leaves_correlation_disengaged() {
+        // A sampled-out request (an ingress `Skip` decision on its correlation)
+        // must not engage the correlation scope, so boundaries under it inherit no
+        // correlation. Record/replay/no-decision engage (the tests above, whose ids
+        // carry no decision, cover that).
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let correlation_id = "req-skip-disengage";
+            deja_context::set_recording_decision(correlation_id, false);
+            let span = tracing::info_span!("deja::http_incoming", request_id = "req-skip-disengage");
+            {
+                let _entered = span.enter();
+                assert_eq!(
+                    current_correlation_id(),
+                    None,
+                    "a Skip request must leave the correlation scope disengaged"
+                );
+            }
+            deja_context::clear_recording_decision(correlation_id);
+        });
+    }
+
+    #[test]
+    fn spawned_child_entered_without_parent_engages_then_reverts_correlation() {
+        // A task span polled on a fresh worker: its parent (the request root) is in
+        // the span tree but NOT entered on this thread. Entering the child engages
+        // its inherited correlation and exposes the full-ancestry path. On exit the
+        // two cursors deliberately differ: CORRELATION reverts faithfully to nothing
+        // (a stale correlation would attribute a later boundary to the wrong
+        // request), while PATH/LINEAGE restore from the tree parent (a cheap cursor
+        // whose between-poll value is never read — boundaries read only within a
+        // span, and the next poll's enter overwrites it).
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-spawn");
+            let child = {
+                let _root = root.enter();
+                tracing::info_span!("spawned_work")
+            };
+            // Root has been exited; nothing is entered on this thread.
+            assert_eq!(current_correlation_id(), None);
+            assert_eq!(current_span_path(), None);
+            {
+                let _child = child.enter();
+                assert_eq!(current_correlation_id().as_deref(), Some("req-spawn"));
+                assert_eq!(
+                    current_span_path().as_deref(),
+                    Some("deja::http_incoming>spawned_work")
+                );
+            }
+            // Correlation reverts faithfully to None (not the parent's "req-spawn").
+            assert_eq!(current_correlation_id(), None);
+            // Path is a parent-restored cursor, so it holds the tree parent here.
+            assert_eq!(current_span_path().as_deref(), Some("deja::http_incoming"));
         });
     }
 

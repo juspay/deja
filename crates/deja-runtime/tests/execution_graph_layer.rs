@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use deja_core::ExecutionGraphNode;
 use deja_runtime::{
@@ -6,6 +7,43 @@ use deja_runtime::{
 };
 use tracing::{span, Level, Subscriber};
 use tracing_subscriber::prelude::*;
+
+/// The graph layer gates every method on `observation_is_active()`, which reads
+/// the process runtime hook and this correlation's recording decision, so a bare
+/// layer install observes nothing. These helpers establish the context a running
+/// process has: a process Record hook (installed once, since the hook is a process
+/// `OnceLock`) plus a per-test correlation carrying a Record or Skip decision.
+fn install_process_record_hook() {
+    static HOOK_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOOK_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("hook tempdir");
+        let hook = deja_runtime::RecordingHook::new(dir.path()).expect("recording hook");
+        deja_runtime::set_global_runtime_hook(Some(deja_runtime::RuntimeHook::Recording(
+            Arc::new(hook),
+        )))
+        .expect("install the process Record hook before any observation call");
+        dir
+    });
+}
+
+static NEXT_CORRELATION: AtomicU64 = AtomicU64::new(0);
+
+/// Run `f` under a fresh correlation carrying `decision`, after ensuring the
+/// process Record hook is installed. The decision lives on a thread-local
+/// snapshot (no global registry write), so parallel tests never collide. With
+/// `Record`, `observation_is_active()` is true and the layer observes; with
+/// `Skip` it is false and the layer is inert.
+fn with_decision<T>(decision: bool, f: impl FnOnce() -> T) -> T {
+    install_process_record_hook();
+    let correlation_id = format!(
+        "graph-layer-test-{}",
+        NEXT_CORRELATION.fetch_add(1, Ordering::Relaxed)
+    );
+    let snapshot =
+        deja_context::ContextSnapshot::new(correlation_id).with_recording_decision(decision);
+    let _guard = deja_context::enter(snapshot);
+    f()
+}
 
 /// Deterministic in-memory sink: layer behavior is asserted without any
 /// async writer or file round-trip in the loop.
@@ -37,7 +75,9 @@ fn subscriber(sink: Arc<CollectingSink>) -> impl Subscriber + Send + Sync {
 
 fn collect_graph<T>(f: impl FnOnce() -> T) -> Vec<ExecutionGraphNode> {
     let sink = Arc::new(CollectingSink::default());
-    tracing::subscriber::with_default(subscriber(Arc::clone(&sink)), f);
+    with_decision(true, || {
+        tracing::subscriber::with_default(subscriber(Arc::clone(&sink)), f);
+    });
     sink.drain()
 }
 
@@ -159,20 +199,25 @@ fn graph_nodes_ride_the_recording_tape() {
     let hook = Arc::new(deja_runtime::RecordingHook::new(dir.path()).expect("recording hook"));
     let layer_sink: Arc<dyn GraphNodeSink> = Arc::clone(&hook) as _;
     let subscriber = tracing_subscriber::registry().with(ExecutionGraphLayer::new(layer_sink));
-    tracing::subscriber::with_default(subscriber, || {
-        let span = span!(Level::INFO, "semantic.parent", request_id = "req_join");
-        let _guard = span.enter();
-        let event = EventBuilder::start(
-            hook.as_ref(),
-            "db",
-            "PaymentIntentInterface",
-            "insert_payment_intent",
-            std::panic::Location::caller(),
-            serde_json::json!({"payment_id": "pay_join"}),
-        );
-        event.finish(hook.as_ref(), serde_json::json!({"ok": true}), false);
-        drop(_guard);
-        drop(span);
+    // Record decision in scope so the gated layer observes; the layer still emits
+    // to `hook` (its sink), independent of which process hook `with_decision`
+    // installs.
+    with_decision(true, || {
+        tracing::subscriber::with_default(subscriber, || {
+            let span = span!(Level::INFO, "semantic.parent", request_id = "req_join");
+            let _guard = span.enter();
+            let event = EventBuilder::start(
+                hook.as_ref(),
+                "db",
+                "PaymentIntentInterface",
+                "insert_payment_intent",
+                std::panic::Location::caller(),
+                serde_json::json!({"payment_id": "pay_join"}),
+            );
+            event.finish(hook.as_ref(), serde_json::json!({"ok": true}), false);
+            drop(_guard);
+            drop(span);
+        });
     });
     hook.flush().expect("flush tape");
 
@@ -190,4 +235,27 @@ fn graph_nodes_ride_the_recording_tape() {
     // graph-invariant.
     assert_eq!(nodes[0].global_sequence, 0);
     assert_eq!(events[0].global_sequence, 0);
+}
+
+/// A sampled-out (Skip) request allocates no graph nodes: `on_new_span`
+/// early-returns on `!observation_is_active()` before any node id, `graph_node_map`
+/// lock, or span extension, so the sink stays empty even though spans open and
+/// close.
+#[test]
+fn skip_decision_records_no_graph_nodes() {
+    let sink = Arc::new(CollectingSink::default());
+    with_decision(false, || {
+        tracing::subscriber::with_default(subscriber(Arc::clone(&sink)), || {
+            let parent = span!(Level::INFO, "payment.request", request_id = "req_skip");
+            let _guard = parent.enter();
+            let child = span!(Level::DEBUG, "child");
+            drop(child);
+            drop(_guard);
+            drop(parent);
+        });
+    });
+    assert!(
+        sink.drain().is_empty(),
+        "a Skip request must produce zero graph nodes (layer inert)"
+    );
 }

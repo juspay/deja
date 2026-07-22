@@ -54,7 +54,7 @@ pub use deja_runtime::ExecutionGraphLayer;
 /// Re-export semantic recording primitives so downstream crates only need
 /// one `deja` dependency.
 pub use deja_runtime::{
-    flush_global_hook, fork_span, global_hook_from_env, hook_from_env,
+    flush_global_hook, fork_span, global_hook_from_env,
     installed_runtime_hook, spawn_fork, AsyncRecordWriter,
     BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder, Fidelity, GraphNodeSink,
     JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink, RecordedOutput,
@@ -64,9 +64,9 @@ pub use deja_runtime::{
 /// `DEJA_MODE=record|replay` foundation.
 pub use deja_runtime::{
     flush_global_runtime_hook, global_runtime_hook_from_env, process_runtime_mode, replay_is_active,
-    runtime_hook_from_env, runtime_mode, set_global_runtime_hook, stable_callsite_hash,
-    CallsiteIdentity, CallsiteSource, ExecuteMode, ExecuteShadowToken, ReplayLookup, RuntimeHook,
-    RuntimeMode,
+    runtime_mode, set_global_runtime_hook, stable_callsite_hash,
+    CallsiteIdentity, CallsiteSource, CaptureVerdict, ExecuteMode, ExecuteShadowToken, ReplayLookup,
+    RuntimeHook, RuntimeMode,
 };
 /// Re-export replay primitives so `deja::*` consumers get the full replay API.
 pub use deja_runtime::{
@@ -1159,7 +1159,7 @@ pub mod __private {
     // subsumed by `dispatch`).
     #[allow(deprecated)]
     pub use deja_runtime::{
-        boundary_execute_mode, capture_is_active, current_span_path, dispatch, dispatch_async,
+        boundary_execute_mode, current_span_path, dispatch, dispatch_async, observation_is_active,
         dispatch_async_or_miss, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
         fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
         next_boundary_occurrence, record_boundary_async, record_boundary_async_lazy,

@@ -804,7 +804,7 @@ enum IdentityOutcome {
 }
 
 impl DejaHook for ReplayHook {
-    fn mode(&self) -> RuntimeMode {
+    fn process_mode(&self) -> RuntimeMode {
         RuntimeMode::Replay
     }
 
@@ -1313,7 +1313,7 @@ pub fn replay_strategy_to_execute_mode(strategy: ReplayStrategy) -> ExecuteMode 
 /// Runtime entry point for the boundary-macro execute-mode decision under a
 /// concrete hook.
 pub fn boundary_execute_mode_for(hook: &dyn DejaHook, spec: &BoundarySpec) -> ExecuteMode {
-    if !hook.mode().is_replay() {
+    if !hook.process_mode().is_replay() {
         return ExecuteMode::Lookup;
     }
 
@@ -1885,7 +1885,7 @@ impl crate::graph::GraphNodeSink for LookupTableHook {
 }
 
 impl DejaHook for LookupTableHook {
-    fn mode(&self) -> RuntimeMode {
+    fn process_mode(&self) -> RuntimeMode {
         RuntimeMode::Replay
     }
 
@@ -4034,7 +4034,7 @@ mod tests {
 
     /// Under the partial-function model, a DECLARED `Execute` site on any replay
     /// hook resolves to `Execute` directly. In record / no-op mode it is `Lookup`
-    /// (Execute is a replay-only concept), gated by `hook.mode().is_replay()`.
+    /// (Execute is a replay-only concept), gated by `hook.process_mode().is_replay()`.
     #[test]
     fn declared_execute_is_honored_on_any_replay_hook() {
         let empty = LookupTable {

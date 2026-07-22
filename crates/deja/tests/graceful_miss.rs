@@ -30,7 +30,7 @@ async fn read_config(operation: &'static str, key: &str) -> Result<u64, String> 
     let caller = std::panic::Location::caller();
 
     // Passthrough when deja is inactive — no observation, no allocation.
-    if !deja::__private::capture_is_active() {
+    if !deja::__private::observation_is_active() {
         return Ok(REAL_BODY);
     }
 
