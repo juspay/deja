@@ -478,10 +478,14 @@ where
     /// Request a flush WITHOUT blocking on its completion (fire-and-forget).
     ///
     /// Enqueues a `Flush` the writer thread honors on its own schedule and
-    /// discards the reply. Used on the per-request finalize hot path so completing
-    /// a response never waits on a writer round-trip; durability still comes from
-    /// the periodic timer, the `flush_after_records` threshold, and the shutdown
-    /// flush. The record enqueue itself already happened (non-blocking) before this.
+    /// discards the reply. Callers must never wait on a writer round-trip;
+    /// durability still comes from the periodic timer, the
+    /// `flush_after_records` threshold, and the shutdown flush.
+    ///
+    /// The enqueue itself is `try_send`: when the bounded channel is full
+    /// (a saturated sink) the advisory flush is simply DROPPED — a full
+    /// channel means the writer is already busy, and a blocking send here
+    /// would hold the calling thread hostage until the sink freed a slot.
     pub fn request_flush(&self) {
         if !self.is_active() {
             return;
@@ -489,7 +493,7 @@ where
         // A dropped receiver is intentional: the writer flushes, then its reply
         // `send` to the closed channel fails silently — exactly fire-and-forget.
         let (tx, _rx) = mpsc::channel();
-        let _ = self.sender.send(WriterMessage::Flush(tx));
+        let _ = self.sender.try_send(WriterMessage::Flush(tx));
     }
 
     pub fn stats(&self) -> WriterStatsSnapshot {
@@ -1143,5 +1147,77 @@ mod tests {
                 "explicit flush should trigger exactly one sink.flush()"
             );
         }
+    }
+
+    /// `request_flush` must NEVER block the calling (request) thread, even
+    /// when the writer channel is completely full behind a wedged sink: a
+    /// blocking enqueue would stall request threads behind the sink for as
+    /// long as the sink stays wedged.
+    #[test]
+    fn request_flush_never_blocks_on_a_full_queue() {
+        /// Blocks inside write_batch until released — the "saturated broker".
+        struct WedgedSink {
+            gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl RecordSink<TestRecord> for WedgedSink {
+            fn write_batch(&mut self, _records: &[TestRecord]) -> io::Result<()> {
+                let (lock, cvar) = &*self.gate;
+                let mut open = lock.lock().expect("gate");
+                while !*open {
+                    open = cvar.wait(open).expect("gate wait");
+                }
+                Ok(())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let writer = AsyncRecordWriter::with_seq_of(
+            WedgedSink {
+                gate: Arc::clone(&gate),
+            },
+            WriterConfig {
+                queue_capacity: 1,
+                batch_size: 1,
+                flush_interval: Duration::from_secs(60),
+                flush_timeout: Duration::from_secs(30),
+                flush_after_records: None,
+                policy: SinkPolicy::FailOpen,
+            },
+            Some(Arc::new(|r: &TestRecord| r.id)),
+        );
+
+        // Worker picks up record 1 and wedges inside the sink; record 2 fills
+        // the capacity-1 queue; record 3 fail-open drops. Channel is now FULL.
+        assert!(writer.record(TestRecord { id: 1 }));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(writer.record(TestRecord { id: 2 }));
+        assert!(!writer.record(TestRecord { id: 3 }));
+
+        // Safety valve: release the wedge after 300ms so a blocking
+        // request_flush unblocks and the test FAILS with a measurement
+        // instead of hanging forever.
+        let release_gate = Arc::clone(&gate);
+        let releaser = thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let (lock, cvar) = &*release_gate;
+            *lock.lock().expect("gate") = true;
+            cvar.notify_all();
+        });
+
+        let start = std::time::Instant::now();
+        writer.request_flush();
+        let elapsed = start.elapsed();
+
+        releaser.join().expect("releaser");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "request_flush blocked the caller for {elapsed:?} on a full queue \
+             (must be fire-and-forget even under sink saturation)"
+        );
     }
 }

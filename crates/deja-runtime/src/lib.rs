@@ -2069,10 +2069,12 @@ impl LazyEventFinalizer {
         inject_body_json(&mut result, std::mem::take(&mut self.body));
 
         builder.finish(&*hook, result, self.is_error);
-        // Fire-and-forget: the events are already enqueued (non-blocking) above.
-        // Request a flush but do NOT block the response path waiting for the writer
-        // round-trip — durability comes from the periodic/threshold/shutdown flush.
-        hook.request_flush();
+        // No per-request flush of any kind: the events are already enqueued
+        // (non-blocking) above, and durability is bounded by the writer's own
+        // cadence — `flush_after_records` and the periodic timer — plus the
+        // shutdown flush. A per-request flush adds control-channel pressure
+        // for no durability gain and, behind a saturated sink, stalls the
+        // response path.
         clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
         correlation_id
     }
@@ -2104,7 +2106,11 @@ impl Drop for LazyEventFinalizer {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     builder.finish(&*hook, result, self.is_error);
                 }));
-                let _ = hook.flush();
+                // Abort/disconnect path: nudge the writer (advisory, never
+                // blocks) so the aborted request's events land promptly. A
+                // blocking flush here can wait out the full flush timeout on
+                // a saturated sink, stalling teardown.
+                hook.request_flush();
             }
         }
         if let Some(correlation_id) = cleanup_correlation_id {
