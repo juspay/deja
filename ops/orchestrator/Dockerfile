@@ -43,7 +43,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN cargo install diesel_cli --version 2.3.5 --no-default-features --features postgres --root /diesel
 
 # ── build stage ──────────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS build
+# 1.88 (was 1.85): the workspace Cargo.lock now pulls transitive deps with
+# higher MSRVs (home 0.5.12 → 1.88, icu_* 2.2 → 1.86); the host toolchain is
+# already newer, so this only realigns the image build with the current lock.
+FROM rust:1.88-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev libpq-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -58,8 +61,12 @@ RUN cargo build --release -p deja-orchestrator -p deja-kernel
 # (libpq.so.5 + its own transitive deps, resolved by apt) for the postgres
 # migrate stage. Without it, `diesel migration run` fails to load.
 FROM debian:bookworm-slim AS runtime-base
+# postgresql-client (psql) + redis-tools (redis-cli): the in-pod runner's
+# StoreExec::Direct shells out to both for seed/probe/readback against the Job's
+# pg/redis sidecars (store_exec.rs). Without them the schema probe fails with
+# "No such file or directory (os error 2)". libpq5 alone only covers diesel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl bash jq libpq5 \
+        ca-certificates curl bash jq libpq5 postgresql-client redis-tools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace/repo
 COPY --from=build /src/target/release/deja-orchestrator /usr/local/bin/deja-orchestrator
