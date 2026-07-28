@@ -349,12 +349,45 @@ pub fn bundle_migrations_from_targz<R: Read>(
     Ok((out, fp))
 }
 
+/// A `ureq` agent that honors an outbound HTTP proxy for the codeload fetch.
+///
+/// The orchestrator's hosting environment may have no direct internet egress —
+/// all outbound traffic goes through a forward proxy (e.g. squid) — and `ureq`
+/// does NOT read proxy environment variables on its own, so a bare `ureq::get`
+/// ignores the proxy and the connection times out. The proxy is read from
+/// `DEJA_HTTP_PROXY` first — a DEDICATED var so it scopes to this one outbound
+/// call and never redirects the in-cluster k8s API / S3 clients — then falls
+/// back to the conventional `HTTPS_PROXY`/`HTTP_PROXY`. Unset → a direct agent,
+/// so local/demo/CI keep working unchanged.
+fn tarball_agent() -> ureq::Agent {
+    let mut builder =
+        ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(15));
+    let proxy = [
+        "DEJA_HTTP_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .into_iter()
+    .find_map(|k| std::env::var(k).ok())
+    .map(|v| v.trim().to_owned())
+    .filter(|v| !v.is_empty())
+    .and_then(|v| ureq::Proxy::new(&v).ok());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    builder.build()
+}
+
 /// Fetch a repo tarball from `url` (a codeload-style `…/tar.gz/<ref>`; the caller
 /// substitutes the ref, so no host/repo/project name lives here) and build the
 /// candidate's migration bundle from it. The orchestrator — never the sealed
-/// replay pod — makes this outbound call.
+/// replay pod — makes this outbound call, through the forward proxy when one is
+/// configured (see [`tarball_agent`]).
 pub fn bundle_from_tarball_url(url: &str) -> Result<(Vec<u8>, SchemaFingerprint), String> {
-    let resp = ureq::get(url)
+    let resp = tarball_agent()
+        .get(url)
         .call()
         .map_err(|e| format!("fetch repo tarball {url}: {e}"))?;
     bundle_migrations_from_targz(resp.into_reader())
