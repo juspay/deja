@@ -212,15 +212,15 @@ async fn main() {
 }
 
 fn app_router(state: AppState) -> Router {
-    let create_run = post(v1_create_run).route_layer(middleware::from_fn_with_state(
-        state.mutation_auth.clone(),
-        require_mutation_auth,
-    ));
-    // Push-back ingest: an out-of-process lifecycle runner (the k8s Job)
-    // reports RunEvents here; same mutation boundary as run creation.
+    // Human create: audited via X-Deja-Actor, no service token (this endpoint is
+    // internal-only, so reachability is the access boundary). The service secret
+    // stays scoped to inter-service callbacks below.
+    let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
+    // Push-back ingest: an out-of-process lifecycle runner (the k8s Job) reports
+    // RunEvents here and authenticates with the service token (require_service_auth).
     let ingest_run_event = post(v1_ingest_run_event).route_layer(middleware::from_fn_with_state(
         state.mutation_auth.clone(),
-        require_mutation_auth,
+        require_service_auth,
     ));
 
     let api_v1 = Router::new()
@@ -301,7 +301,25 @@ fn require_store(st: &AppState) -> Result<Arc<Store>, Response> {
     })
 }
 
-async fn require_mutation_auth(
+/// Human-facing mutations (`POST /runs`): identify the caller via `X-Deja-Actor`
+/// for the audit trail, but do NOT require the service token. The orchestrator is
+/// internal-only, so network reachability is the access boundary; keeping the
+/// service token off this path means operators never handle it (it stays scoped
+/// to inter-service callbacks — see `require_service_auth`). Stronger human authn
+/// (SSO at the ingress) is a deliberate follow-up, not this layer's job.
+async fn require_human_auth(mut req: Request<axum::body::Body>, next: Next) -> Response {
+    let Some(actor) = actor_from_headers(req.headers()) else {
+        return error_resp(401, "X-Deja-Actor header required for mutating requests");
+    };
+    req.extensions_mut().insert(AuthenticatedActor(actor));
+    next.run(req).await
+}
+
+/// Inter-service callbacks (`POST /runs/{id}/events`): the out-of-process runner
+/// authenticates with the shared `DEJA_API_SERVICE_TOKEN` (plus `X-Deja-Actor`
+/// for audit). The token is provisioned to services only; human clients never
+/// need it. When no token is configured (local/dev) the actor alone suffices.
+async fn require_service_auth(
     State(auth): State<MutationAuth>,
     mut req: Request<axum::body::Body>,
     next: Next,
@@ -354,10 +372,11 @@ fn service_token_matches(expected: &str, supplied: &str) -> bool {
 
 /// `POST /api/v1/runs` — create a run and spawn its lifecycle worker.
 ///
-/// Mutating requests reach this handler only after `require_mutation_auth`
-/// resolved an `AuthenticatedActor`: local/dev supplies `X-Deja-Actor`, and
-/// hosted sandboxes additionally set `DEJA_API_SERVICE_TOKEN` so the middleware
-/// requires a matching bearer token before audit/store mutation.
+/// Requests reach this handler only after `require_human_auth` resolved an
+/// `AuthenticatedActor` from `X-Deja-Actor` (the audit identity). This is a
+/// human-facing endpoint, so it does NOT require the service token — that token
+/// is scoped to inter-service callbacks (`require_service_auth`) so operators
+/// never handle it. The endpoint is internal-only; SSO in front is a follow-up.
 async fn v1_create_run(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
@@ -989,80 +1008,95 @@ mod tests {
         "read-ok"
     }
 
-    fn protected_router(auth: MutationAuth) -> Router {
-        let create_run =
-            post(ok).route_layer(middleware::from_fn_with_state(auth, require_mutation_auth));
+    // Human mutation boundary (POST /runs): X-Deja-Actor only, no service token.
+    fn human_router() -> Router {
+        let create_run = post(ok).route_layer(middleware::from_fn(require_human_auth));
         Router::new().route("/runs", create_run.get(read_ok))
     }
 
-    async fn request_status(
-        auth: MutationAuth,
+    // Service callback boundary (POST /runs/{id}/events): X-Deja-Actor plus the
+    // bearer token when DEJA_API_SERVICE_TOKEN is configured.
+    fn service_router(auth: MutationAuth) -> Router {
+        let ingest =
+            post(ok).route_layer(middleware::from_fn_with_state(auth, require_service_auth));
+        Router::new().route("/events", ingest)
+    }
+
+    async fn oneshot_status(
+        router: Router,
+        uri: &str,
         method: Method,
         token: Option<&str>,
         actor: Option<&str>,
     ) -> StatusCode {
-        let mut builder = Request::builder().method(method).uri("/runs");
+        let mut builder = Request::builder().method(method).uri(uri);
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         if let Some(actor) = actor {
             builder = builder.header("X-Deja-Actor", actor);
         }
-        protected_router(auth)
+        router
             .oneshot(builder.body(Body::empty()).unwrap())
             .await
             .unwrap()
             .status()
     }
 
-    #[tokio::test]
-    async fn auth_boundary_allows_dev_mutation_with_actor_when_no_token_configured() {
-        let status = request_status(
-            MutationAuth {
-                service_token: None,
-            },
-            Method::POST,
-            None,
-            Some("local-dev"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+    async fn human_status(method: Method, token: Option<&str>, actor: Option<&str>) -> StatusCode {
+        oneshot_status(human_router(), "/runs", method, token, actor).await
+    }
+
+    async fn service_status(
+        auth: MutationAuth,
+        token: Option<&str>,
+        actor: Option<&str>,
+    ) -> StatusCode {
+        oneshot_status(service_router(auth), "/events", Method::POST, token, actor).await
     }
 
     #[tokio::test]
-    async fn auth_boundary_denies_anonymous_mutation_even_without_token() {
-        let status = request_status(
-            MutationAuth {
-                service_token: None,
-            },
-            Method::POST,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    async fn human_create_allows_actor_only() {
+        assert_eq!(
+            human_status(Method::POST, None, Some("local-dev")).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
-    async fn auth_boundary_requires_configured_service_token_for_mutation() {
+    async fn human_create_does_not_require_service_token() {
+        // The point of the split: a human scheduling a run never presents the
+        // service token, even where one is configured (it's a service secret).
+        assert_eq!(
+            human_status(Method::POST, None, Some("hosted-user")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn human_create_denies_anonymous() {
+        assert_eq!(
+            human_status(Method::POST, None, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn human_read_routes_are_open() {
+        assert_eq!(
+            human_status(Method::GET, None, None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn service_callback_requires_configured_token() {
         let auth = MutationAuth {
             service_token: Some(Arc::<str>::from("sandbox-secret")),
         };
-        let missing = request_status(auth.clone(), Method::POST, None, Some("hosted-user")).await;
-        let wrong = request_status(
-            auth.clone(),
-            Method::POST,
-            Some("wrong"),
-            Some("hosted-user"),
-        )
-        .await;
-        let allowed = request_status(
-            auth,
-            Method::POST,
-            Some("sandbox-secret"),
-            Some("hosted-user"),
-        )
-        .await;
+        let missing = service_status(auth.clone(), None, Some("runner")).await;
+        let wrong = service_status(auth.clone(), Some("wrong"), Some("runner")).await;
+        let allowed = service_status(auth, Some("sandbox-secret"), Some("runner")).await;
 
         assert_eq!(missing, StatusCode::UNAUTHORIZED);
         assert_eq!(wrong, StatusCode::UNAUTHORIZED);
@@ -1070,17 +1104,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_boundary_does_not_gate_read_only_routes() {
-        let status = request_status(
-            MutationAuth {
-                service_token: Some(Arc::<str>::from("sandbox-secret")),
-            },
-            Method::GET,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+    async fn service_callback_denies_anonymous() {
+        let auth = MutationAuth {
+            service_token: Some(Arc::<str>::from("sandbox-secret")),
+        };
+        assert_eq!(
+            service_status(auth, Some("sandbox-secret"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn service_callback_allows_actor_when_no_token_configured() {
+        assert_eq!(
+            service_status(
+                MutationAuth {
+                    service_token: None,
+                },
+                None,
+                Some("runner"),
+            )
+            .await,
+            StatusCode::OK
+        );
     }
 
     fn test_state(dir: &std::path::Path) -> AppState {
