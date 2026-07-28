@@ -472,7 +472,7 @@ mod tests {
             fp.applied,
             vec![
                 "00000000000000".to_string(),
-                "2022-09-29-084920".to_string()
+                "20220929084920".to_string()
             ]
         );
     }
@@ -501,7 +501,7 @@ mod tests {
         std::fs::write(mig.join("notes.txt"), b"x").expect("write notes");
         let fp = fingerprint_from_migrations_dir(&mig).expect("walk");
         assert_eq!(fp.count(), 2);
-        assert_eq!(fp.head(), Some("2026-04-16-000001"));
+        assert_eq!(fp.head(), Some("20260416000001"));
     }
 
     // The git-backed producer against a real temporary repo: manifest + tar.
@@ -533,7 +533,7 @@ mod tests {
         }
 
         let fp = manifest_from_repo(repo, "HEAD").expect("manifest");
-        assert_eq!(fp.applied, vec!["2022-09-29-084920".to_string()]);
+        assert_eq!(fp.applied, vec!["20220929084920".to_string()]);
 
         let tar = produce_tar(repo, "HEAD").expect("tar");
         assert!(!tar.is_empty());
@@ -610,7 +610,7 @@ mod tests {
             fp.applied,
             vec![
                 "00000000000000".to_string(),
-                "2022-09-29-084920".to_string()
+                "20220929084920".to_string()
             ]
         );
         // The bundle is canonical: extracting it yields dest/migrations/… and
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(n, 2, "both files unpack");
         let fp = fingerprint_from_migrations_dir(&dest.path().join("migrations"))
             .expect("fingerprint");
-        assert_eq!(fp.applied, vec!["2022-09-29-084920".to_string()]);
+        assert_eq!(fp.applied, vec!["20220929084920".to_string()]);
         assert!(dest
             .path()
             .join("migrations/2022-09-29-084920_create_initial_tables/up.sql")

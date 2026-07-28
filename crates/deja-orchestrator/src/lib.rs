@@ -56,14 +56,29 @@ pub struct CandidateImage {
 /// environment rather than a false statement about the candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaFingerprint {
-    /// Applied migration versions, ascending. For diesel this is the timestamp
-    /// prefix of each `migrations/<version>_<name>/` directory, as recorded in
-    /// `__diesel_schema_migrations.version`.
+    /// Applied migration versions, ascending, in CANONICAL form (separators
+    /// stripped — see `canonical_version`). The candidate side is built from
+    /// `migrations/<version>_<name>/` directory names, which carry dashes (e.g.
+    /// `2026-07-16-000001`); the store side is read from
+    /// `__diesel_schema_migrations.version`, where diesel records the same
+    /// versions digits-only (`20260716000001`). Canonicalizing both to the
+    /// digits-only form makes the P1 comparison a true set-equality rather than
+    /// a spurious dashed-vs-undashed mismatch (499 "missing" + 499 "extra" for
+    /// what is really the same 500 migrations).
     pub applied: Vec<String>,
 }
 
+/// Canonicalize a migration version to diesel's recorded form by dropping the
+/// `-`/`_` separators a directory-name prefix may carry, so `2026-07-16-000001`
+/// and `20260716000001` (what diesel stores in `__diesel_schema_migrations`)
+/// compare equal.
+fn canonical_version(v: &str) -> String {
+    v.chars().filter(|c| *c != '-' && *c != '_').collect()
+}
+
 impl SchemaFingerprint {
-    pub fn new(mut applied: Vec<String>) -> Self {
+    pub fn new(applied: Vec<String>) -> Self {
+        let mut applied: Vec<String> = applied.iter().map(|v| canonical_version(v)).collect();
         applied.sort();
         applied.dedup();
         Self { applied }
@@ -441,6 +456,28 @@ mod schema_fingerprint_tests {
         assert!(applied.matches(&expected));
         assert_eq!(applied.count(), 3);
         assert_eq!(applied.head(), Some("003"));
+    }
+
+    // The real-sandbox P1 bug: the candidate fingerprint is built from dashed
+    // migration dir names (`2026-07-16-000001`) while the store is read from
+    // diesel digits-only (`20260716000001`). Same migrations — must match, not
+    // report 499 missing + 499 extra. Canonicalization in `new` makes both sides
+    // digits-only.
+    #[test]
+    fn dashed_candidate_matches_undashed_diesel_store() {
+        let candidate = SchemaFingerprint::new(vec![
+            "2026-07-16-000001".into(),
+            "2022-09-29-084920".into(),
+            "00000000000000".into(),
+        ]);
+        let store = SchemaFingerprint::new(vec![
+            "20260716000001".into(),
+            "20220929084920".into(),
+            "00000000000000".into(),
+        ]);
+        assert!(store.matches(&candidate));
+        assert_eq!(store.diff(&candidate), (Vec::new(), Vec::new()));
+        assert_eq!(store.head(), Some("20260716000001"));
     }
 
     // The A1 case: the harness runner's stale baked set (fewer migrations) is
