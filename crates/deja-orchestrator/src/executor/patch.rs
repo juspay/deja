@@ -25,6 +25,25 @@ pub struct JobPatch {
     /// read from the env profile) — so this type carries no candidate-specific
     /// names and stays generic.
     pub env: Vec<EnvUpsert>,
+    /// Optional `metadata.ownerReferences` entry. Makes the Job a child of a
+    /// stable, same-namespace owner (the chart-managed template ConfigMap) so it
+    /// shows in ArgoCD's resource tree and is cascade-GC'd. `None` leaves the Job
+    /// un-owned (the pre-ownerRef behavior).
+    pub owner: Option<OwnerRef>,
+}
+
+/// A single Kubernetes ownerReference. The owner MUST be same-namespace as the
+/// Job (k8s forbids cross-namespace ownerRefs — a cross-ns ref makes the Job
+/// create fail). `controller` and `blockOwnerDeletion` are always false here: the
+/// owner exists only to give the Job a resource-tree parent (visibility) and
+/// cascade GC, never to control the Job's lifecycle or wedge the owner's own
+/// deletion on a still-running Job.
+#[derive(Debug, Clone)]
+pub struct OwnerRef {
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
 }
 
 /// Upsert one env var on one container: replace the entry with this `name` if
@@ -91,6 +110,24 @@ pub fn apply_job_patch(template: &Value, patch: &JobPatch) -> Result<Value, Patc
             .or_insert_with(|| Value::Object(Default::default())),
         &patch.labels,
     )?;
+
+    // metadata.ownerReferences (optional). Stamp a single owner so the Job shows
+    // in the owner's resource tree (ArgoCD renders it as a child of the chart-
+    // managed template ConfigMap) and is cascade-GC'd. controller=false +
+    // blockOwnerDeletion=false: tree/GC only, never lifecycle control.
+    if let Some(owner) = &patch.owner {
+        metadata.insert(
+            "ownerReferences".into(),
+            serde_json::json!([{
+                "apiVersion": owner.api_version,
+                "kind": owner.kind,
+                "name": owner.name,
+                "uid": owner.uid,
+                "controller": false,
+                "blockOwnerDeletion": false,
+            }]),
+        );
+    }
 
     // spec.template.metadata.labels — the pod labels the Job's selector matches.
     {
@@ -239,6 +276,7 @@ mod tests {
                 // env on a container that had none
                 EnvUpsert::new("candidate", "ROUTER__DEJA__MODE", "replay"),
             ],
+            ..Default::default()
         };
         let out = apply_job_patch(&template(), &patch).expect("patch applies");
 
@@ -274,6 +312,34 @@ mod tests {
                 && e["value"] == json!("0001\n0002")));
         // candidate got a fresh env list
         assert_eq!(candidate["env"][0]["name"], json!("ROUTER__DEJA__MODE"));
+        // no owner supplied -> no ownerReferences (default behavior)
+        assert!(out["metadata"].get("ownerReferences").is_none());
+    }
+
+    #[test]
+    fn stamps_owner_reference_when_owner_present() {
+        let patch = JobPatch {
+            job_name: "j".into(),
+            owner: Some(OwnerRef {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                name: "job-template".into(),
+                uid: "cm-uid-123".into(),
+            }),
+            ..Default::default()
+        };
+        let out = apply_job_patch(&template(), &patch).expect("patch applies");
+        let owners = out["metadata"]["ownerReferences"]
+            .as_array()
+            .expect("ownerReferences array");
+        assert_eq!(owners.len(), 1, "exactly one owner");
+        assert_eq!(owners[0]["apiVersion"], json!("v1"));
+        assert_eq!(owners[0]["kind"], json!("ConfigMap"));
+        assert_eq!(owners[0]["name"], json!("job-template"));
+        assert_eq!(owners[0]["uid"], json!("cm-uid-123"));
+        // tree/GC only — never controls the Job's lifecycle or wedges owner deletion
+        assert_eq!(owners[0]["controller"], json!(false));
+        assert_eq!(owners[0]["blockOwnerDeletion"], json!(false));
     }
 
     #[test]
