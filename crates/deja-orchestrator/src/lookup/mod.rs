@@ -116,13 +116,22 @@ pub fn render_lookup_table(
     // clean run — surface it loudly, with the parsed/dropped ratio so the
     // magnitude is visible, so it can't masquerade as success.
     if dbg_skip > 0 {
-        eprintln!(
-            "[deja] WARNING: render dropped {dbg_skip} of {} recording event(s) from {} \
-             — replay coverage is INCOMPLETE (first error: {:?})",
-            dbg_ok + dbg_skip,
-            recording_path.display(),
-            dbg_first_err
-        );
+        // Fail-closed: a dropped event is a hole in replay coverage, so the
+        // resulting verdict would be silently incomplete — this exact path once
+        // hid a Vector-stringified-u64 that discarded ~half a real recording. An
+        // incomplete lookup table must never masquerade as a clean run, so this is
+        // a hard error (not a warning); the message carries the parsed/dropped
+        // ratio + the first parse error so the cause is immediately visible.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "render dropped {dbg_skip} of {} recording event(s) from {} \
+                 — replay coverage would be INCOMPLETE (first error: {:?})",
+                dbg_ok + dbg_skip,
+                recording_path.display(),
+                dbg_first_err
+            ),
+        ));
     }
     Ok(LookupTable {
         recording_id: recording_id.to_owned(),
@@ -203,6 +212,43 @@ mod tests {
                 deja::Address::Sequence { boundary, .. } if boundary == "redis"
             )),
             "rank-6 sequence address names the boundary"
+        );
+    }
+
+    #[test]
+    fn renderer_accepts_vector_stringified_u64_ids() {
+        // The Kafka->Vector->S3 pipeline stringifies u64s > i64::MAX. A recording
+        // whose boundary_event carries tracing_span_id / graph_node_id / value_digest
+        // as JSON STRINGS must still parse — otherwise the event is dropped and
+        // replay coverage silently collapses (this dropped ~48% of a real tape).
+        let mut ev = event("redis", 1, serde_json::Value::Null);
+        ev["tracing_span_id"] = serde_json::json!("9225624661302181899"); // > i64::MAX
+        ev["graph_node_id"] = serde_json::json!("18000000000000000000"); // > i64::MAX
+        ev["value_digest"] = serde_json::json!("12345678901234567890");
+        let (_dir, path) = write_events(&[ev]);
+        // Must NOT drop the event -> render succeeds and yields entries.
+        let table = render_lookup_table(&path, "rec-1", 1).unwrap();
+        assert!(
+            !table.entries.is_empty(),
+            "a stringified-u64 event must render, not drop"
+        );
+    }
+
+    #[test]
+    fn renderer_hard_fails_on_dropped_event() {
+        // Fail-closed: a truly unparseable boundary record must FAIL the render,
+        // never silently reduce coverage and pass as a clean run.
+        let good = event("redis", 1, serde_json::Value::Null);
+        let bad = serde_json::json!({
+            "record_kind": "boundary_event",
+            "global_sequence": "not-a-number"
+        });
+        let (_dir, path) = write_events(&[good, bad]);
+        let err = render_lookup_table(&path, "rec-1", 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("INCOMPLETE"),
+            "error names the coverage hole: {err}"
         );
     }
 
