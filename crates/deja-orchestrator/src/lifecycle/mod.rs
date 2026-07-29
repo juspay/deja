@@ -706,7 +706,13 @@ fn drive_replay(
     // recorded preconditions into concrete stores before the replay workload
     // runs; materialization remains best-effort because scoring can still report
     // the replay outcome when store seeding is unavailable.
-    let seed_certificate = materialize_seed_plan(&store, root, &recording_id, &run.run_id);
+    let seed_certificate = materialize_seed_plan(
+        &store,
+        root,
+        &recording_id,
+        &run.run_id,
+        run.spec.correlation_filter.as_deref(),
+    );
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
     match write_json(&seed_certificate_path, &seed_certificate) {
         Ok(()) => ctx.artifact(
@@ -1179,7 +1185,13 @@ pub fn drive_replay_in_pod(
     }
 
     flush_redis(&store)?;
-    let seed_certificate = materialize_seed_plan(&store, root, &recording_id, &run.run_id);
+    let seed_certificate = materialize_seed_plan(
+        &store,
+        root,
+        &recording_id,
+        &run.run_id,
+        run.spec.correlation_filter.as_deref(),
+    );
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
     match write_json(&seed_certificate_path, &seed_certificate) {
         Ok(()) => ctx.artifact(
@@ -1741,11 +1753,30 @@ impl SeedReadback {
 /// Best-effort throughout: a missing/unparseable recording, an unmapped row, or
 /// an unreachable store logs and continues rather than failing the replay
 /// (matching the prior hand-coded seeds' best-effort behavior).
+/// Restrict the seed correlation set to the run's test-case subset. `None`
+/// (uncorrelated/ambient) correlations are always kept; a non-empty filter keeps
+/// only the listed correlation ids. An empty/unset filter keeps everything, so
+/// the default (seed all) is unchanged. Pure + separate so the selection
+/// semantics are unit-tested without a live store.
+fn select_seed_correlations(
+    mut correlations: Vec<Option<String>>,
+    correlation_filter: Option<&[String]>,
+) -> Vec<Option<String>> {
+    if let Some(filter) = correlation_filter.filter(|f| !f.is_empty()) {
+        correlations.retain(|c| match c {
+            None => true,
+            Some(id) => filter.iter().any(|f| f == id),
+        });
+    }
+    correlations
+}
+
 fn materialize_seed_plan(
     store: &StoreExec,
     root: &HarnessRoot,
     recording_id: &str,
     run_id: &str,
+    correlation_filter: Option<&[String]>,
 ) -> SeedCertificate {
     let recording_path = root.recording_events_path(recording_id);
     let events = read_recording_events(&recording_path);
@@ -1762,6 +1793,15 @@ fn materialize_seed_plan(
         events.iter().map(|e| e.correlation_id.clone()).collect();
     correlations.sort();
     correlations.dedup();
+    // Test-case subset (R1): when the run pins a correlation_filter, seed ONLY
+    // those correlations — the SAME subset the kernel drives (run_kernel) and
+    // scoring scopes to (divergence). Without this, seeding clones a full
+    // public-schema per correlation for EVERY recorded correlation — including
+    // the many single-event health checks that are never driven — which is
+    // O(correlations × schema) and dominates runtime on a real recording. The
+    // three (seed/drive/score) stay consistent because they all read the SAME
+    // explicit list off the run spec.
+    correlations = select_seed_correlations(correlations, correlation_filter);
 
     // DB isolation + seeding is ON by default (R1: real seeding). `DEJA_SEED_DB=0`
     // is a kill-switch that falls back to the old shared-pg self-rebuild. When on,
@@ -3189,6 +3229,29 @@ fn resolve_recording_from_source(
 mod tests {
     use super::*;
     use crate::{CandidateSpec, RunSpec};
+
+    #[test]
+    fn select_seed_correlations_scopes_to_filter_and_keeps_ambient() {
+        let all = || {
+            vec![
+                None,                          // ambient / uncorrelated
+                Some("pay-1".to_string()),
+                Some("health-1".to_string()),
+                Some("health-2".to_string()),
+                Some("pay-2".to_string()),
+            ]
+        };
+        // Unset / empty filter -> unchanged (seed everything).
+        assert_eq!(select_seed_correlations(all(), None), all());
+        assert_eq!(select_seed_correlations(all(), Some(&[])), all());
+        // Non-empty filter -> only the listed correlations, plus ambient (None).
+        let filter = vec!["pay-1".to_string(), "pay-2".to_string()];
+        assert_eq!(
+            select_seed_correlations(all(), Some(&filter)),
+            vec![None, Some("pay-1".to_string()), Some("pay-2".to_string())],
+            "keeps ambient + the two payment correlations, drops the health checks"
+        );
+    }
 
     fn extract_ctx_artifact_kinds(source: &str) -> std::collections::BTreeSet<String> {
         let mut kinds = std::collections::BTreeSet::new();
