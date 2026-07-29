@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::config::{resolve_candidate_image, K8sExecutorConfig};
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
-use super::patch::{apply_job_patch, EnvUpsert, JobPatch};
+use super::patch::{apply_job_patch, EnvUpsert, JobPatch, OwnerRef};
 use crate::{ReplayContract, Run, SchemaFingerprint};
 
 /// The label the launcher stamps on every replay Job (and its pod template),
@@ -158,11 +158,31 @@ pub fn build_job<T: KubeTransport>(
         ExecutorError::Template(format!("data['{}'] is not valid JSON: {e}", spec.template_key))
     })?;
 
+    // Owner = the template ConfigMap itself: same-namespace (required — k8s
+    // forbids cross-namespace ownerRefs), chart-managed (ArgoCD tracks it, so the
+    // Job renders as its child in the resource tree) and already fetched here.
+    // Omitted when the Job lands in a different namespace than the template (falls
+    // back to an un-owned Job rather than a create k8s would reject) or when the
+    // fetched ConfigMap carries no uid (e.g. a fake in tests).
+    let owner = if spec.template_namespace == spec.jobs_namespace {
+        cm.pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .map(|uid| OwnerRef {
+                api_version: "v1".to_owned(),
+                kind: "ConfigMap".to_owned(),
+                name: spec.template_configmap.clone(),
+                uid: uid.to_owned(),
+            })
+    } else {
+        None
+    };
+
     let patch = JobPatch {
         job_name: job_name_for(&spec.run_id),
         labels: spec.labels.clone(),
         images: vec![(spec.candidate_container.clone(), spec.candidate_image.clone())],
         env: spec.env.clone(),
+        owner,
     };
     apply_job_patch(&template, &patch).map_err(|e| ExecutorError::Template(e.to_string()))
 }
@@ -292,6 +312,51 @@ mod tests {
         assert_eq!(containers[1]["image"], json!("hyperswitch:sha_c"));
         assert_eq!(containers[0]["env"][0]["name"], json!("DEJA_RUN_ID"));
         assert_eq!(containers[1]["env"][0]["name"], json!("ROUTER__DEJA__MODE"));
+    }
+
+    // template_cm() plus the ConfigMap's OWN metadata.uid, so the owner (the
+    // ConfigMap itself) is derivable in build_job.
+    fn template_cm_with_uid(uid: &str) -> Value {
+        json!({
+            "metadata": { "uid": uid, "name": "job-template" },
+            "data": template_cm()["data"].clone()
+        })
+    }
+
+    #[test]
+    fn build_job_stamps_configmap_owner_when_same_namespace() {
+        let mut s = spec();
+        s.template_namespace = "replay-sbx".into(); // == jobs_namespace
+        let api = KubeApi::new(FakeTransport::new(vec![resp(
+            200,
+            template_cm_with_uid("cm-uid-1"),
+        )]));
+        let job = build_job(&api, &s).expect("built");
+        let owners = job["metadata"]["ownerReferences"]
+            .as_array()
+            .expect("ownerReferences present");
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0]["kind"], json!("ConfigMap"));
+        assert_eq!(owners[0]["name"], json!("job-template"));
+        assert_eq!(owners[0]["uid"], json!("cm-uid-1"));
+        assert_eq!(owners[0]["controller"], json!(false));
+        assert_eq!(owners[0]["blockOwnerDeletion"], json!(false));
+    }
+
+    #[test]
+    fn build_job_omits_owner_across_namespaces() {
+        // default spec(): template_namespace (replay-env) != jobs_namespace
+        // (replay-sbx) — a cross-namespace ownerRef is forbidden, so it is omitted
+        // even though the ConfigMap has a uid.
+        let api = KubeApi::new(FakeTransport::new(vec![resp(
+            200,
+            template_cm_with_uid("cm-uid-1"),
+        )]));
+        let job = build_job(&api, &spec()).expect("built");
+        assert!(
+            job["metadata"].get("ownerReferences").is_none(),
+            "cross-namespace owner must be omitted (k8s forbids it)"
+        );
     }
 
     #[test]

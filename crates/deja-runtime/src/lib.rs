@@ -84,10 +84,25 @@ pub struct BoundaryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_run_id: Option<String>,
     /// Active execution graph node id, when the execution graph layer is installed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lenient u64 (number-or-string): the Kafka->Vector->S3 pipeline stringifies
+    /// integers > i64::MAX, so a large node id would otherwise fail to parse and
+    /// drop the whole event from replay (same class as `value_digest` below).
+    #[serde(
+        default,
+        deserialize_with = "de_u64_opt_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub graph_node_id: Option<u64>,
     /// Active `tracing` span id. Useful for diagnosing missing graph-node joins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lenient u64 (number-or-string): span ids are effectively random 64-bit and
+    /// routinely exceed i64::MAX, which the Kafka->Vector->S3 pipeline stringifies
+    /// — the exact failure that silently dropped ~half of a real recording's events
+    /// from replay (same class as `value_digest` below).
+    #[serde(
+        default,
+        deserialize_with = "de_u64_opt_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tracing_span_id: Option<u64>,
     /// Stable replay task id for lineage/canonicalization consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -746,7 +761,7 @@ where
             s.parse::<u64>().map(Some).map_err(serde::de::Error::custom)
         }
         Some(other) => Err(serde::de::Error::custom(format!(
-            "syntax_hash: expected u64 number or string, got {other}"
+            "expected u64 number or string, got {other}"
         ))),
     }
 }
