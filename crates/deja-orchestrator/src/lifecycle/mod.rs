@@ -1828,16 +1828,6 @@ fn materialize_seed_plan(
         .map(|v| v.trim() != "0")
         .unwrap_or(true);
 
-    // Create one isolated schema per correlation BEFORE seeding — every correlation
-    // that replays needs its schema to exist (the router routes ALL its queries
-    // there, not just seeded tables), so this is independent of whether a
-    // correlation has seed entries.
-    if seed_db_enabled {
-        for corr in correlations.iter().filter_map(|c| c.as_deref()) {
-            create_db_schema(store, &deja::db_schema_for(corr));
-        }
-    }
-
     let db_catalog = if seed_db_enabled {
         load_db_catalog(store)
     } else {
@@ -1853,12 +1843,30 @@ fn materialize_seed_plan(
         // recording-derived precondition). Each case gets its own copy in its
         // namespace, since reads are isolated per correlation.
         let plan = deja::build_seed_plan(&events, corr.as_deref()).with_ambient(&ambient);
-        if plan.is_empty() {
-            continue;
-        }
         // The per-correlation pg schema (DB isolation): same derivation the router
         // uses for `search_path`, so seeded rows land where replay reads them.
         let db_schema = corr.as_deref().map(deja::db_schema_for);
+
+        // GRANULAR SCHEMA CLONING: clone ONLY the tables this correlation touches.
+        // Read-precondition tables (where seed rows land) ∪ write-target tables
+        // (writes must isolate here, not leak to the shared `public` base).
+        // Untouched tables are NOT cloned — they resolve to the empty,
+        // freshly-migrated `public` via `search_path` fallback as a correct miss.
+        // This is O(touched) DDL per correlation, not O(all-tables). A correlation
+        // with no db entries but with writes still gets its write-target tables
+        // cloned (write isolation), so the plan.is_empty() skip below applies only
+        // to SEED materialization, not to schema provisioning.
+        if seed_db_enabled {
+            if let Some(schema) = db_schema.as_deref() {
+                let mut needed = plan.touched_db_tables();
+                needed.extend(deja::build_write_target_tables(&events, corr.as_deref()));
+                create_db_schema(store, schema, &needed);
+            }
+        }
+
+        if plan.is_empty() {
+            continue;
+        }
         let mut entries = plan.iter().collect::<Vec<_>>();
         entries.sort_by_key(|entry| seed_materialization_priority(entry));
         for entry in entries {
@@ -2417,28 +2425,90 @@ fn parse_pg_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Create the per-correlation isolation schema (R1) as a FULL structural clone of
-/// `public`: `CREATE SCHEMA` + one `CREATE TABLE … (LIKE public.t INCLUDING
-/// DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)` per public table. The
-/// router routes this correlation's queries here via `search_path`, so EVERY table
-/// must exist (writes resolve to the schema first → isolation). `LIKE` never
-/// copies FOREIGN KEYS — deliberate: we seed only a subset of rows (read-before-
-/// write preconditions), so FK refs would otherwise dangle. `INCLUDING INDEXES`
-/// brings the PK/unique indexes that the seed UPSERT's `ON CONFLICT` needs;
-/// `INCLUDING DEFAULTS` keeps SERIAL/sequence defaults so the router's own inserts
-/// (which omit the serial id) still work. Best-effort: a failure logs + continues.
-fn create_db_schema(store: &StoreExec, schema: &str) {
-    let sql = format!(
-        "CREATE SCHEMA IF NOT EXISTS \"{schema}\"; \
-         DO $deja$ DECLARE r record; BEGIN \
-           FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP \
-             EXECUTE format('CREATE TABLE IF NOT EXISTS \"{schema}\".%I \
-               (LIKE public.%I INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)', \
-               r.tablename, r.tablename); \
-           END LOOP; \
-         END $deja$;"
+/// Create the per-correlation isolation schema (R1) and clone ONLY the tables
+/// the correlation actually touches — its read-precondition tables (rows the
+/// seed materializes) and its write-target tables (writes must isolate here, not
+/// leak to the shared `public` base). Untouched tables are NOT cloned: they
+/// resolve to the (empty, freshly-migrated) `public` via `search_path` fallback
+/// as a correct miss, so cloning them is pure waste. `tables` is the union of
+/// [`deja::SeedPlan::touched_db_tables`] and [`deja::build_write_target_tables`].
+///
+/// Each cloned table is `CREATE TABLE … (LIKE public.t INCLUDING DEFAULTS
+/// INCLUDING CONSTRAINTS INCLUDING INDEXES)`. `LIKE` never copies FOREIGN KEYS —
+/// deliberate: we seed only a subset of rows (read-before-write preconditions),
+/// so FK refs would otherwise dangle. `INCLUDING INDEXES` brings the PK/unique
+/// indexes the seed UPSERT's `ON CONFLICT` needs; `INCLUDING DEFAULTS` keeps
+/// SERIAL/sequence defaults so the router's own inserts (which omit the serial
+/// id) still work. Best-effort: a failure logs + continues.
+///
+/// If `tables` is empty, only the bare schema is created (the router still emits
+/// `SET search_path TO "<schema>", public` — a schema with no tables is safe and
+/// falls through to `public`).
+/// Build the SQL for [`create_db_schema`]: `CREATE SCHEMA` + a `DO` block that
+/// `LIKE`-clones ONLY the named tables from `public` (not every public table).
+/// Empty `tables` → bare schema only. Pure (no store) so it is unit-testable.
+fn build_create_schema_sql(schema: &str, tables: &[String]) -> String {
+    // De-duplicate + quote. Empty → bare schema (search_path falls through to public).
+    let table_list: Vec<String> = {
+        let mut t = tables.to_vec();
+        t.sort();
+        t.dedup();
+        t.into_iter()
+            .map(|name| format!("'{}'", name.replace('\'', "''")))
+            .collect()
+    };
+    let clone_sql = if table_list.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "DO $deja$ DECLARE r record; BEGIN \
+               FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' \
+                 AND tablename = ANY(ARRAY[{}]) LOOP \
+                 EXECUTE format('CREATE TABLE IF NOT EXISTS \"{schema}\".%I \
+                   (LIKE public.%I INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)', \
+                   r.tablename, r.tablename); \
+               END LOOP; \
+             END $deja$;",
+            table_list.join(", ")
+        )
+    };
+    format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"; {clone_sql}")
+}
+
+/// Create the per-correlation isolation schema (R1) and clone ONLY the tables
+/// the correlation actually touches — its read-precondition tables (rows the
+/// seed materializes) and its write-target tables (writes must isolate here, not
+/// leak to the shared `public` base). Untouched tables are NOT cloned: they
+/// resolve to the (empty, freshly-migrated) `public` via `search_path` fallback
+/// as a correct miss, so cloning them is pure waste. `tables` is the union of
+/// [`deja::SeedPlan::touched_db_tables`] and [`deja::build_write_target_tables`].
+///
+/// Each cloned table is `CREATE TABLE … (LIKE public.t INCLUDING DEFAULTS
+/// INCLUDING CONSTRAINTS INCLUDING INDEXES)`. `LIKE` never copies FOREIGN KEYS —
+/// deliberate: we seed only a subset of rows (read-before-write preconditions),
+/// so FK refs would otherwise dangle. `INCLUDING INDEXES` brings the PK/unique
+/// indexes the seed UPSERT's `ON CONFLICT` needs; `INCLUDING DEFAULTS` keeps
+/// SERIAL/sequence defaults so the router's own inserts (which omit the serial
+/// id) still work. Best-effort: a failure logs + continues.
+///
+/// If `tables` is empty, only the bare schema is created (the router still emits
+/// `SET search_path TO "<schema>", public` — a schema with no tables is safe and
+/// falls through to `public`).
+fn create_db_schema(store: &StoreExec, schema: &str, tables: &[String]) {
+    let sql = build_create_schema_sql(schema, tables);
+    let table_count = tables
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    eprintln!(
+        "lifecycle: create_db_schema {schema} (clone of {} table(s): {})",
+        table_count,
+        if tables.is_empty() {
+            "none — bare schema, untouched tables fall through to public".to_string()
+        } else {
+            tables.join(",")
+        }
     );
-    eprintln!("lifecycle: create_db_schema {schema} (clone of public)");
     match store.psql(&[], false, &sql).status() {
         Ok(status) if status.success() => {}
         Ok(status) => {
@@ -4900,5 +4970,45 @@ mod tests {
         assert_eq!(image.raw_value, "0.10");
         assert_eq!(image.raw_value_bytes, b"0.10");
         assert_eq!(image.ttl_seconds, None);
+    }
+
+    #[test]
+    fn create_schema_sql_clones_only_named_tables_not_all_public() {
+        // The granular contract: only the touched tables are LIKE-cloned, via an
+        // ARRAY filter — NOT the old blanket `pg_tables WHERE schemaname='public'` scan.
+        let sql =
+            build_create_schema_sql("deja_corr_1", &["users".into(), "payment_intent".into()]);
+        assert!(sql.contains("CREATE SCHEMA IF NOT EXISTS \"deja_corr_1\";"));
+        assert!(
+            sql.contains("tablename = ANY(ARRAY['payment_intent', 'users'])"),
+            "clone list must be scoped to the touched tables via ARRAY filter; got: {sql}"
+        );
+        assert!(
+            !sql.contains("WHERE schemaname = 'public' LOOP"),
+            "must NOT use the old blanket scan that clones every public table; got: {sql}"
+        );
+        assert!(sql.contains("INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES"));
+    }
+
+    #[test]
+    fn create_schema_sql_empty_tables_is_bare_schema_only() {
+        // A correlation that touches no db tables (read or write) gets a bare
+        // schema — no DO block, no clone. Untouched tables fall through to public.
+        let sql = build_create_schema_sql("deja_empty", &[]);
+        assert_eq!(sql, "CREATE SCHEMA IF NOT EXISTS \"deja_empty\"; ");
+        assert!(!sql.contains("DO $deja$"));
+    }
+
+    #[test]
+    fn create_schema_sql_deduplicates_and_quotes_tables() {
+        // Duplicate table names collapse; quotes are SQL-escaped.
+        let sql = build_create_schema_sql(
+            "deja_d",
+            &["users".into(), "users".into(), "weird'name".into()],
+        );
+        assert!(
+            sql.contains("ARRAY['users', 'weird''name']"),
+            "dedup + single-quote escape; got: {sql}"
+        );
     }
 }
