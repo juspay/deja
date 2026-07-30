@@ -122,6 +122,31 @@ fn image_tag(image: &str) -> &str {
     }
 }
 
+/// Derive the record code-sha from a recording router image ref, for selecting
+/// that version's config artifacts from the version-keyed pool. The sha is the
+/// image TAG (CI tags each build by its git sha), same as the candidate side. A
+/// digest-pinned ref (`@sha256:…`) or an untagged/`latest` ref carries no git sha
+/// we can map to the pool's `cus-<sha>` / `replay-<sha>` naming, so it yields None
+/// and the Job keeps its template-default (currently-pooled) config artifacts.
+pub fn record_sha_from_image(image: &str) -> Option<String> {
+    let tag = image_tag(image);
+    if tag == "latest" || tag.starts_with("sha256:") {
+        return None;
+    }
+    Some(tag.to_owned())
+}
+
+/// The config-artifact ConfigMap names the version-keyed replay-env-app pool
+/// renders for a record sha, mirroring its `releaseName: replay-<sha>` convention:
+/// returns `(router_config_map, configs_config_map)` =
+/// (`router-cm-replay-<sha>`, `replay-<sha>-hyperswitch-configs`).
+pub fn config_artifact_names(record_sha: &str) -> (String, String) {
+    (
+        format!("router-cm-replay-{record_sha}"),
+        format!("replay-{record_sha}-hyperswitch-configs"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +183,38 @@ mod tests {
         })
         .expect("bare image resolves");
         assert_eq!(sha, "latest");
+    }
+
+    #[test]
+    fn record_sha_from_tagged_recording_image() {
+        assert_eq!(
+            record_sha_from_image("ecr.io/hyperswitch-router:dcb9f9e955").as_deref(),
+            Some("dcb9f9e955")
+        );
+        // a registry :port is not mistaken for the tag
+        assert_eq!(
+            record_sha_from_image("registry:5000/hyperswitch-router:ff191d7f").as_deref(),
+            Some("ff191d7f")
+        );
+    }
+
+    #[test]
+    fn record_sha_is_none_without_a_usable_git_sha_tag() {
+        // digest-pinned, untagged, and `latest` all carry no git sha → None → the
+        // Job keeps its template-default config artifacts.
+        assert_eq!(
+            record_sha_from_image("ecr.io/hyperswitch@sha256:abcd"),
+            None
+        );
+        assert_eq!(record_sha_from_image("ecr.io/hyperswitch:latest"), None);
+        assert_eq!(record_sha_from_image("registry:5000/hyperswitch"), None);
+    }
+
+    #[test]
+    fn config_artifact_names_follow_the_pool_release_convention() {
+        let (router_cm, configs_cm) = config_artifact_names("dcb9f9e955");
+        assert_eq!(router_cm, "router-cm-replay-dcb9f9e955");
+        assert_eq!(configs_cm, "replay-dcb9f9e955-hyperswitch-configs");
     }
 
     #[test]

@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{resolve_candidate_image, K8sExecutorConfig};
+use super::config::{
+    config_artifact_names, record_sha_from_image, resolve_candidate_image, K8sExecutorConfig,
+};
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
-use super::patch::{apply_job_patch, EnvUpsert, JobPatch, OwnerRef};
+use super::patch::{apply_job_patch, ConfigArtifacts, EnvUpsert, JobPatch, OwnerRef};
 use crate::{ReplayContract, Run, SchemaFingerprint};
 
 /// The label the launcher stamps on every replay Job (and its pod template),
@@ -41,6 +43,10 @@ pub struct LaunchSpec {
     pub env: Vec<EnvUpsert>,
     /// Labels merged onto the Job + pod template (selectors, run correlation).
     pub labels: Vec<(String, String)>,
+    /// Per-run config-artifact repoint, derived from the run's `recording_image`
+    /// (record sha → the pool's `router-cm-replay-<sha>` + `replay-<sha>-hyperswitch-configs`).
+    /// `None` when no recording_image is given — the Job keeps its template default.
+    pub config_artifacts: Option<ConfigArtifacts>,
 }
 
 #[derive(Debug)]
@@ -125,6 +131,24 @@ pub fn launch_spec_for_run(
         ));
     }
 
+    // Per-run config artifacts: when the run names a recording_image, derive its
+    // record sha and point the Job at that version's pooled ConfigMaps. Absent (or
+    // a digest/`latest` ref with no git sha) → None, and the Job keeps the
+    // template's default (currently-pooled) artifacts.
+    let config_artifacts = run
+        .spec
+        .recording_image
+        .as_deref()
+        .and_then(record_sha_from_image)
+        .map(|sha| {
+            let (router_config_map, configs_config_map) = config_artifact_names(&sha);
+            ConfigArtifacts {
+                container: cfg.candidate_binding.container.clone(),
+                router_config_map,
+                configs_config_map,
+            }
+        });
+
     Ok(LaunchSpec {
         run_id: run.run_id.clone(),
         jobs_namespace: cfg.jobs_namespace.clone(),
@@ -135,6 +159,7 @@ pub fn launch_spec_for_run(
         candidate_image,
         env,
         labels: vec![(RUN_ID_LABEL.to_owned(), run.run_id.clone())],
+        config_artifacts,
     })
 }
 
@@ -189,6 +214,7 @@ pub fn build_job<T: KubeTransport>(
         )],
         env: spec.env.clone(),
         owner,
+        config_artifacts: spec.config_artifacts.clone(),
     };
     apply_job_patch(&template, &patch).map_err(|e| ExecutorError::Template(e.to_string()))
 }
@@ -302,6 +328,7 @@ mod tests {
                 EnvUpsert::new("candidate", "ROUTER__DEJA__MODE", "replay"),
             ],
             labels: vec![("deja.run-id".into(), "run-9f".into())],
+            config_artifacts: None,
         }
     }
 

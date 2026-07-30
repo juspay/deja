@@ -30,7 +30,33 @@ pub struct JobPatch {
     /// shows in ArgoCD's resource tree and is cascade-GC'd. `None` leaves the Job
     /// un-owned (the pre-ownerRef behavior).
     pub owner: Option<OwnerRef>,
+    /// Optional per-run repoint of the candidate's config artifacts at a specific
+    /// record version's ConfigMaps (the version-keyed replay-env-app pool). `None`
+    /// leaves the template's default (currently-pooled) artifacts in place.
+    pub config_artifacts: Option<ConfigArtifacts>,
 }
+
+/// Repoint the candidate at one record version's rendered config artifacts. The
+/// version-keyed replay-env-app pool renders a `router-cm-replay-<sha>` (the
+/// router.toml baseline) and a `replay-<sha>-hyperswitch-configs` (the ROUTER__*
+/// env) per record version; this rewrites the Job's `router-config` volume and the
+/// candidate container's `envFrom` configMapRef to that version's pair. Both
+/// targets must exist in the template — a missing one is a loud error, never a
+/// silent boot against the default version's config (a wrong-verdict trap).
+#[derive(Debug, Clone)]
+pub struct ConfigArtifacts {
+    /// Candidate container whose `envFrom` configMapRef (the ROUTER__* env) is
+    /// repointed.
+    pub container: String,
+    /// New name for the `router-config` volume's configMap (the router.toml baseline).
+    pub router_config_map: String,
+    /// New name for the candidate `envFrom` configMapRef (the ROUTER__* env).
+    pub configs_config_map: String,
+}
+
+/// The pod volume (in the Job template) that mounts the router.toml baseline.
+/// Fixed protocol name shared with the replay-env chart's `job-configmap.yaml`.
+const ROUTER_CONFIG_VOLUME: &str = "router-config";
 
 /// A single Kubernetes ownerReference. The owner MUST be same-namespace as the
 /// Job (k8s forbids cross-namespace ownerRefs — a cross-ns ref makes the Job
@@ -145,6 +171,13 @@ pub fn apply_job_patch(template: &Value, patch: &JobPatch) -> Result<Value, Patc
         )?;
     }
 
+    // Config artifacts: repoint the router-config volume + the candidate's
+    // configs envFrom at this run's record version. Applied before the images/env
+    // early-return so a config-only patch still lands.
+    if let Some(ca) = &patch.config_artifacts {
+        apply_config_artifacts(&mut job, ca)?;
+    }
+
     // Image + env target a named container, which may be a main container OR an
     // initContainer (e.g. the `migrations` init that pulls the CodeBundle by
     // sha). Both arrays are searched; a name in neither is a loud error.
@@ -179,6 +212,52 @@ fn merge_labels(target: &mut Value, labels: &[(String, String)]) -> Result<(), P
     for (k, v) in labels {
         map.insert(k.clone(), Value::String(v.clone()));
     }
+    Ok(())
+}
+
+/// Repoint the pod's `router-config` volume and the candidate container's configs
+/// `envFrom` at a specific record version's ConfigMaps. Every target must exist —
+/// a missing volume, configMap, envFrom, or configMapRef is a loud error, because
+/// silently keeping the template default would boot the candidate against another
+/// version's config and produce a confidently wrong verdict.
+fn apply_config_artifacts(job: &mut Value, ca: &ConfigArtifacts) -> Result<(), PatchError> {
+    // Pod volume `router-config` -> configMap.name (the router.toml baseline).
+    {
+        let vols = job
+            .pointer_mut("/spec/template/spec/volumes")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| PatchError::Shape("spec.template.spec.volumes".into()))?;
+        let vol = vols
+            .iter_mut()
+            .find(|v| v.get("name").and_then(Value::as_str) == Some(ROUTER_CONFIG_VOLUME))
+            .ok_or_else(|| {
+                PatchError::Shape(format!("volume '{ROUTER_CONFIG_VOLUME}' not found"))
+            })?;
+        let cm = vol
+            .get_mut("configMap")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                PatchError::Shape(format!("volume '{ROUTER_CONFIG_VOLUME}' has no configMap"))
+            })?;
+        cm.insert("name".into(), Value::String(ca.router_config_map.clone()));
+    }
+
+    // Candidate container `envFrom` configMapRef -> name (the ROUTER__* env).
+    let c = find_container_in_job(job, &ca.container)?;
+    let env_from = c
+        .get_mut("envFrom")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| PatchError::Shape(format!("container '{}' has no envFrom", ca.container)))?;
+    let cm_ref = env_from
+        .iter_mut()
+        .find_map(|e| e.get_mut("configMapRef").and_then(Value::as_object_mut))
+        .ok_or_else(|| {
+            PatchError::Shape(format!(
+                "container '{}' envFrom has no configMapRef",
+                ca.container
+            ))
+        })?;
+    cm_ref.insert("name".into(), Value::String(ca.configs_config_map.clone()));
     Ok(())
 }
 
@@ -262,6 +341,111 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A template shaped like the replay-env Job: a `router-config` volume backed
+    /// by a configMap, and a `candidate` container whose `envFrom` carries both a
+    /// configMapRef (the ROUTER__* env) and a secretRef (replay-crypto).
+    fn template_with_config_artifacts() -> Value {
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "labels": {} },
+            "spec": { "template": { "metadata": { "labels": {} }, "spec": {
+                "volumes": [
+                    { "name": "workspace", "emptyDir": {} },
+                    { "name": "router-config",
+                      "configMap": { "name": "router-cm-replay-default", "defaultMode": 420 } }
+                ],
+                "containers": [
+                    { "name": "candidate", "image": "candidate:template",
+                      "envFrom": [
+                          { "configMapRef": { "name": "replay-default-hyperswitch-configs" } },
+                          { "secretRef": { "name": "replay-crypto" } }
+                      ] }
+                ]
+            }}}
+        })
+    }
+
+    #[test]
+    fn config_artifacts_repoints_volume_and_envfrom() {
+        let patch = JobPatch {
+            config_artifacts: Some(ConfigArtifacts {
+                container: "candidate".into(),
+                router_config_map: "router-cm-replay-abc123".into(),
+                configs_config_map: "replay-abc123-hyperswitch-configs".into(),
+            }),
+            ..Default::default()
+        };
+        let out = apply_job_patch(&template_with_config_artifacts(), &patch).expect("applies");
+        let vols = out["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        let rc = vols
+            .iter()
+            .find(|v| v["name"] == json!("router-config"))
+            .expect("router-config volume");
+        assert_eq!(rc["configMap"]["name"], json!("router-cm-replay-abc123"));
+        // defaultMode (structural) is preserved — only the name is repointed.
+        assert_eq!(rc["configMap"]["defaultMode"], json!(420));
+
+        let cand = &out["spec"]["template"]["spec"]["containers"][0];
+        let ef = cand["envFrom"].as_array().expect("envFrom");
+        let cm_ref = ef
+            .iter()
+            .find(|e| e.get("configMapRef").is_some())
+            .expect("configMapRef entry");
+        assert_eq!(
+            cm_ref["configMapRef"]["name"],
+            json!("replay-abc123-hyperswitch-configs")
+        );
+        // the secretRef (replay-crypto) is untouched.
+        let sec_ref = ef
+            .iter()
+            .find(|e| e.get("secretRef").is_some())
+            .expect("secretRef entry");
+        assert_eq!(sec_ref["secretRef"]["name"], json!("replay-crypto"));
+    }
+
+    #[test]
+    fn config_artifacts_missing_volume_is_loud() {
+        // template() has no volumes at all — a repoint must error, not no-op.
+        let patch = JobPatch {
+            config_artifacts: Some(ConfigArtifacts {
+                container: "candidate".into(),
+                router_config_map: "x".into(),
+                configs_config_map: "y".into(),
+            }),
+            ..Default::default()
+        };
+        let err = apply_job_patch(&template(), &patch).expect_err("no volumes -> error");
+        assert!(matches!(err, PatchError::Shape(_)));
+    }
+
+    #[test]
+    fn config_artifacts_missing_configmapref_is_loud() {
+        // candidate envFrom has only a secretRef — repointing the configs CM must
+        // error rather than silently leave the default configs ConfigMap.
+        let tmpl = json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": { "labels": {} },
+            "spec": { "template": { "metadata": { "labels": {} }, "spec": {
+                "volumes": [ { "name": "router-config", "configMap": { "name": "x" } } ],
+                "containers": [ { "name": "candidate", "image": "c",
+                    "envFrom": [ { "secretRef": { "name": "replay-crypto" } } ] } ]
+            }}}
+        });
+        let patch = JobPatch {
+            config_artifacts: Some(ConfigArtifacts {
+                container: "candidate".into(),
+                router_config_map: "x".into(),
+                configs_config_map: "y".into(),
+            }),
+            ..Default::default()
+        };
+        let err = apply_job_patch(&tmpl, &patch).expect_err("no configMapRef -> error");
+        assert!(matches!(err, PatchError::Shape(_)));
     }
 
     #[test]
