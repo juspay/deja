@@ -49,6 +49,52 @@ pub struct K8sExecutorConfig {
     pub migrations_init_container: String,
     pub code_bundle_uri_env: String,
     pub candidate_binding: CandidateBinding,
+    /// Where the candidate's L1 config env is COPIED from: the recorded system's
+    /// own rendered Deployment (artifact-only, its chart at the record version).
+    /// Names are config, never compiled in — a different recorded system (a
+    /// different router, a different service entirely) is a profile change, not a
+    /// code change. `{record_sha}` in the deployment name expands per run.
+    pub config_source: ConfigSource,
+}
+
+/// Which rendered workload the candidate's config env is copied from. Both names
+/// belong to the RECORDED SYSTEM (e.g. its Deployment and container names), so
+/// they are deployment profile data. An unset deployment name disables the copy —
+/// the Job then boots with whatever env its template carries.
+#[derive(Debug, Clone)]
+pub struct ConfigSource {
+    /// Deployment name; may contain `{record_sha}` (expanded per run). Empty =
+    /// copying disabled.
+    pub deployment: String,
+    /// Container within that Deployment whose `env` + `envFrom` are copied.
+    pub container: String,
+}
+
+impl ConfigSource {
+    /// Expand `{record_sha}` in the deployment name for this run. `None` when
+    /// copying is disabled, or when the name needs a sha the run cannot supply
+    /// (no `recording_image`) — the caller then leaves the template env alone
+    /// rather than reading some other version's Deployment.
+    pub fn deployment_for(&self, record_sha: Option<&str>) -> Option<String> {
+        if self.deployment.is_empty() {
+            return None;
+        }
+        if !self.needs_record_sha() {
+            return Some(self.deployment.clone());
+        }
+        record_sha.map(|sha| self.deployment.replace(Self::PLACEHOLDER, sha))
+    }
+
+    /// Is this source version-keyed (i.e. useless without a record sha)? Enabled
+    /// plus a placeholder means a run that cannot supply a sha must be refused,
+    /// not silently launched without its recorded config.
+    pub fn needs_record_sha(&self) -> bool {
+        !self.deployment.is_empty() && self.deployment.contains(Self::PLACEHOLDER)
+    }
+}
+
+impl ConfigSource {
+    const PLACEHOLDER: &'static str = "{record_sha}";
 }
 
 impl K8sExecutorConfig {
@@ -79,6 +125,15 @@ impl K8sExecutorConfig {
                     "DEJA_CANDIDATE_CODE_SHA_ENV",
                     "ROUTER__DEJA__IDENTITY__CODE_SHA",
                 ),
+            },
+            // Defaults name the Hyperswitch sandbox render; another recorded
+            // system sets its own. Empty deployment name disables copying.
+            config_source: ConfigSource {
+                deployment: var(
+                    "DEJA_CONFIG_SOURCE_DEPLOYMENT",
+                    "replay-{record_sha}-hyperswitch-server",
+                ),
+                container: var("DEJA_CONFIG_SOURCE_CONTAINER", "hyperswitch-router"),
             },
         }
     }
@@ -208,6 +263,42 @@ mod tests {
         );
         assert_eq!(record_sha_from_image("ecr.io/hyperswitch:latest"), None);
         assert_eq!(record_sha_from_image("registry:5000/hyperswitch"), None);
+    }
+
+    #[test]
+    fn config_source_expands_the_record_sha_placeholder() {
+        let cs = ConfigSource {
+            deployment: "replay-{record_sha}-some-system-server".into(),
+            container: "some-system-server".into(),
+        };
+        assert_eq!(
+            cs.deployment_for(Some("abc123")).as_deref(),
+            Some("replay-abc123-some-system-server")
+        );
+        // a run with no record sha must NOT read some other version's workload
+        assert_eq!(cs.deployment_for(None), None);
+    }
+
+    #[test]
+    fn config_source_without_placeholder_is_version_independent() {
+        let cs = ConfigSource {
+            deployment: "one-fixed-render".into(),
+            container: "c".into(),
+        };
+        assert_eq!(cs.deployment_for(None).as_deref(), Some("one-fixed-render"));
+        assert_eq!(
+            cs.deployment_for(Some("abc")).as_deref(),
+            Some("one-fixed-render")
+        );
+    }
+
+    #[test]
+    fn empty_config_source_disables_copying() {
+        let cs = ConfigSource {
+            deployment: String::new(),
+            container: "c".into(),
+        };
+        assert_eq!(cs.deployment_for(Some("abc")), None);
     }
 
     #[test]

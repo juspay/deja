@@ -13,7 +13,10 @@ use super::config::{
 };
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
-use super::patch::{apply_job_patch, ConfigArtifacts, EnvUpsert, JobPatch, OwnerRef};
+use super::patch::{
+    apply_job_patch, referenced_secret_names, ConfigArtifacts, ConfigEnvCopy, EnvUpsert, JobPatch,
+    OwnerRef,
+};
 use crate::{ReplayContract, Run, SchemaFingerprint};
 
 /// The label the launcher stamps on every replay Job (and its pod template),
@@ -43,10 +46,23 @@ pub struct LaunchSpec {
     pub env: Vec<EnvUpsert>,
     /// Labels merged onto the Job + pod template (selectors, run correlation).
     pub labels: Vec<(String, String)>,
-    /// Per-run config-artifact repoint, derived from the run's `recording_image`
-    /// (record sha → the pool's `router-cm-replay-<sha>` + `replay-<sha>-hyperswitch-configs`).
+    /// Per-run repoint of the config-FILE volume, derived from the run's
+    /// `recording_image` (record sha → that version's config-baseline ConfigMap).
     /// `None` when no recording_image is given — the Job keeps its template default.
     pub config_artifacts: Option<ConfigArtifacts>,
+    /// Where to copy the L1 config ENV from: the recorded system's rendered
+    /// workload for this run's record version. Resolved at Job build (it needs a
+    /// cluster read). `None` disables copying.
+    pub config_source: Option<ConfigSourceRef>,
+}
+
+/// A resolved pointer to the rendered workload whose container env is copied.
+#[derive(Debug, Clone)]
+pub struct ConfigSourceRef {
+    /// Deployment name, already expanded for this run's record sha.
+    pub deployment: String,
+    /// Container within it whose `env` + `envFrom` are copied.
+    pub container: String,
 }
 
 #[derive(Debug)]
@@ -54,6 +70,13 @@ pub enum ExecutorError {
     Kube(KubeError),
     /// The ConfigMap exists but does not hold a usable Job template at the key.
     Template(String),
+    /// The copied config env references secrets that do not exist in the Jobs
+    /// namespace. Refusing here states the environment gap by name, instead of
+    /// letting the pod fail opaquely at container-create time.
+    MissingSecrets {
+        namespace: String,
+        names: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for ExecutorError {
@@ -61,6 +84,13 @@ impl std::fmt::Display for ExecutorError {
         match self {
             ExecutorError::Kube(e) => write!(f, "{e}"),
             ExecutorError::Template(m) => write!(f, "job template: {m}"),
+            ExecutorError::MissingSecrets { namespace, names } => write!(
+                f,
+                "the recorded config env references secret(s) [{}] which do not exist in \
+                 namespace '{namespace}' — provision them there (same names, same keys) \
+                 before replaying this recording",
+                names.join(", ")
+            ),
         }
     }
 }
@@ -131,23 +161,38 @@ pub fn launch_spec_for_run(
         ));
     }
 
-    // Per-run config artifacts: when the run names a recording_image, derive its
-    // record sha and point the Job at that version's pooled ConfigMaps. Absent (or
-    // a digest/`latest` ref with no git sha) → None, and the Job keeps the
-    // template's default (currently-pooled) artifacts.
-    let config_artifacts = run
+    // The record version this run replays, from the recording image's tag. Drives
+    // BOTH the config-file volume and the config-env source, so the candidate reads
+    // one version's config throughout. Absent (or a digest/`latest` ref with no git
+    // sha) → the Job keeps its template defaults.
+    let record_sha = run
         .spec
         .recording_image
         .as_deref()
-        .and_then(record_sha_from_image)
-        .map(|sha| {
-            let (router_config_map, configs_config_map) = config_artifact_names(&sha);
-            ConfigArtifacts {
-                container: cfg.candidate_binding.container.clone(),
-                router_config_map,
-                configs_config_map,
-            }
-        });
+        .and_then(record_sha_from_image);
+
+    let config_artifacts = record_sha.as_deref().map(|sha| ConfigArtifacts {
+        router_config_map: config_artifact_names(sha).0,
+    });
+
+    let config_source = match cfg.config_source.deployment_for(record_sha.as_deref()) {
+        Some(deployment) => Some(ConfigSourceRef {
+            deployment,
+            container: cfg.config_source.container.clone(),
+        }),
+        // A version-keyed config source with no record sha to key it: refuse
+        // rather than launch a candidate with no recorded config (which would
+        // crash opaquely at boot, or worse, boot against something arbitrary).
+        None if cfg.config_source.needs_record_sha() => {
+            return Err(ExecutorError::Template(format!(
+                "config source '{}' is version-keyed but this run has no usable \
+                 recording_image to key it — set recording_image to the image that \
+                 produced the recording",
+                cfg.config_source.deployment
+            )))
+        }
+        None => None,
+    };
 
     Ok(LaunchSpec {
         run_id: run.run_id.clone(),
@@ -160,6 +205,7 @@ pub fn launch_spec_for_run(
         env,
         labels: vec![(RUN_ID_LABEL.to_owned(), run.run_id.clone())],
         config_artifacts,
+        config_source,
     })
 }
 
@@ -205,6 +251,12 @@ pub fn build_job<T: KubeTransport>(
         None
     };
 
+    // L1 config env: copy the recorded system's own generated container env.
+    let config_env = match &spec.config_source {
+        Some(src) => Some(copy_config_env(api, spec, src)?),
+        None => None,
+    };
+
     let patch = JobPatch {
         job_name: job_name_for(&spec.run_id),
         labels: spec.labels.clone(),
@@ -215,8 +267,75 @@ pub fn build_job<T: KubeTransport>(
         env: spec.env.clone(),
         owner,
         config_artifacts: spec.config_artifacts.clone(),
+        config_env,
     };
     apply_job_patch(&template, &patch).map_err(|e| ExecutorError::Template(e.to_string()))
+}
+
+/// Copy the recorded system's generated container env for this run's record
+/// version, and refuse if anything it references is absent.
+///
+/// The env is read from a rendered workload the recorded system's OWN chart
+/// produced (artifact-only, zero replicas) — so every value, and every
+/// `secretKeyRef` name/key indirection, is exactly what that system's config
+/// declares at that version. Nothing is enumerated or rewritten here: a config key
+/// or secret added to that system tomorrow flows through untouched, and no secret
+/// VALUE is ever read by the orchestrator (only names, to check existence).
+fn copy_config_env<T: KubeTransport>(
+    api: &KubeApi<T>,
+    spec: &LaunchSpec,
+    src: &ConfigSourceRef,
+) -> Result<ConfigEnvCopy, ExecutorError> {
+    let dep = api.get_deployment(&spec.jobs_namespace, &src.deployment)?;
+    let container = dep
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .and_then(|cs| {
+            cs.iter()
+                .find(|c| c.get("name").and_then(Value::as_str) == Some(src.container.as_str()))
+        })
+        .ok_or_else(|| {
+            ExecutorError::Template(format!(
+                "config source deployment '{}' has no container '{}'",
+                src.deployment, src.container
+            ))
+        })?;
+
+    let list = |key: &str| {
+        container
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let env = list("env");
+    let env_from = list("envFrom");
+    if env.is_empty() && env_from.is_empty() {
+        return Err(ExecutorError::Template(format!(
+            "config source '{}'/'{}' carries no env — refusing to boot the candidate \
+             with no recorded config",
+            src.deployment, src.container
+        )));
+    }
+
+    // Pre-launch check: every secret the copied env points at must exist here, or
+    // the pod would fail opaquely at container-create. Names come from the data.
+    let missing: Vec<String> = referenced_secret_names(&env)
+        .into_iter()
+        .filter(|name| api.get_secret(&spec.jobs_namespace, name).is_err())
+        .collect();
+    if !missing.is_empty() {
+        return Err(ExecutorError::MissingSecrets {
+            namespace: spec.jobs_namespace.clone(),
+            names: missing,
+        });
+    }
+
+    Ok(ConfigEnvCopy {
+        container: spec.candidate_container.clone(),
+        env,
+        env_from,
+    })
 }
 
 /// Build + create the Job. A 409 (the Job already exists) is treated as SUCCESS
@@ -329,7 +448,108 @@ mod tests {
             ],
             labels: vec![("deja.run-id".into(), "run-9f".into())],
             config_artifacts: None,
+            config_source: None,
         }
+    }
+
+    /// A rendered workload of the recorded system: its own chart's generated
+    /// container env, including a `secretKeyRef` under that system's own names.
+    fn source_deployment() -> Value {
+        json!({ "spec": { "template": { "spec": { "containers": [
+            { "name": "some-system-server", "env": [
+                { "name": "RUN_ENV", "value": "sandbox" },
+                { "name": "SOME__DB__HOST", "value": "sbx-pg.internal" },
+                { "name": "SOME__SECRET_FIELD", "valueFrom": { "secretKeyRef": {
+                    "name": "some-system-secrets", "key": "SOME__SECRET_FIELD_V2" } } }
+              ],
+              "envFrom": [ { "configMapRef": { "name": "recorded-configs" } } ] }
+        ] } } } })
+    }
+
+    fn spec_with_source() -> LaunchSpec {
+        let mut s = spec();
+        s.config_source = Some(ConfigSourceRef {
+            deployment: "replay-abc123-some-system-server".into(),
+            container: "some-system-server".into(),
+        });
+        s
+    }
+
+    #[test]
+    fn build_job_copies_recorded_env_and_checks_its_secrets() {
+        // template CM, then the source Deployment, then the secret existence probe.
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(200, template_cm()),
+            resp(200, source_deployment()),
+            resp(
+                200,
+                json!({ "metadata": { "name": "some-system-secrets" } }),
+            ),
+        ]));
+        let job = build_job(&api, &spec_with_source()).expect("built");
+
+        let cand = job
+            .pointer("/spec/template/spec/containers/1")
+            .expect("candidate container");
+        let env = cand["env"].as_array().expect("candidate env");
+        // recorded plain value copied
+        assert!(env
+            .iter()
+            .any(|e| e["name"] == json!("RUN_ENV") && e["value"] == json!("sandbox")));
+        // secretKeyRef indirection copied verbatim — this codebase never names it
+        let sref = env
+            .iter()
+            .find(|e| e["name"] == json!("SOME__SECRET_FIELD"))
+            .expect("copied secret ref");
+        assert_eq!(
+            sref["valueFrom"]["secretKeyRef"]["name"],
+            json!("some-system-secrets")
+        );
+        assert_eq!(
+            sref["valueFrom"]["secretKeyRef"]["key"],
+            json!("SOME__SECRET_FIELD_V2")
+        );
+        // the per-run replay override is still applied on top
+        assert!(env
+            .iter()
+            .any(|e| e["name"] == json!("ROUTER__DEJA__MODE") && e["value"] == json!("replay")));
+        // envFrom came from the recorded render too
+        assert_eq!(
+            cand["envFrom"][0]["configMapRef"]["name"],
+            json!("recorded-configs")
+        );
+    }
+
+    #[test]
+    fn build_job_refuses_when_a_referenced_secret_is_absent() {
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(200, template_cm()),
+            resp(200, source_deployment()),
+            resp(404, json!({ "message": "not found" })),
+        ]));
+        let err = build_job(&api, &spec_with_source()).expect_err("missing secret refuses");
+        match err {
+            ExecutorError::MissingSecrets { namespace, names } => {
+                assert_eq!(namespace, "replay-sbx");
+                assert_eq!(names, vec!["some-system-secrets"]);
+            }
+            other => panic!("expected MissingSecrets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_job_refuses_when_the_source_container_is_absent() {
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(200, template_cm()),
+            resp(
+                200,
+                json!({ "spec": { "template": { "spec": { "containers": [
+                { "name": "a-different-container", "env": [] }
+            ] } } } }),
+            ),
+        ]));
+        let err = build_job(&api, &spec_with_source()).expect_err("wrong container refuses");
+        assert!(matches!(err, ExecutorError::Template(_)));
     }
 
     #[test]
