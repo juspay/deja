@@ -106,8 +106,8 @@ mod tests {
 
     #[test]
     fn candidate_env_maps_artifacts_to_the_bound_vars() {
-        let root = HarnessRoot::new(std::env::temp_dir().join("deja-test-env-binding"))
-            .expect("root");
+        let root =
+            HarnessRoot::new(std::env::temp_dir().join("deja-test-env-binding")).expect("root");
         let contract = root.replay_contract("run-5");
         let env = binding().env_for(&contract, "abc123");
 
@@ -121,7 +121,10 @@ mod tests {
             find(&env, "ROUTER__DEJA__REPLAY__OBSERVED_SINK").value,
             contract.observed_sink.display().to_string()
         );
-        assert_eq!(find(&env, "ROUTER__DEJA__IDENTITY__CODE_SHA").value, "abc123");
+        assert_eq!(
+            find(&env, "ROUTER__DEJA__IDENTITY__CODE_SHA").value,
+            "abc123"
+        );
         // every pair targets the candidate container
         assert!(env.iter().all(|e| e.container == "candidate"));
     }

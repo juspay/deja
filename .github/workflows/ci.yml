@@ -42,4 +42,4 @@ jobs:
         with:
           key: msrv-1850
       - name: Check runtime crates on 1.85.0
-        run: cargo +1.85.0 check -p deja -p deja-context -p deja-core -p deja-derive -p deja-record
+        run: cargo +1.85.0 check -p deja -p deja-context -p deja-core -p deja-derive

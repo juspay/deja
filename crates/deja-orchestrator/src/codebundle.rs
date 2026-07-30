@@ -185,10 +185,14 @@ pub fn manifest_from_repo(repo_dir: &Path, sha: &str) -> Result<SchemaFingerprin
 ///   - `config/superposition_seed.toml` — the offline Superposition fallback the
 ///     router reads when the live service is unreachable (always, in the sealed
 ///     replay pod).
-/// The frozen image bakes neither at a usable path (only `payment_required_fields
-/// _v2.toml`), so both ride the bundle rather than being copied into infra.
-const CANDIDATE_CONFIG_FILES: [&str; 2] =
-    ["config/docker_compose.toml", "config/superposition_seed.toml"];
+///
+/// The frozen image bakes neither at a usable path (only
+/// `payment_required_fields_v2.toml`), so both ride the bundle rather than
+/// being copied into infra.
+const CANDIDATE_CONFIG_FILES: [&str; 2] = [
+    "config/docker_compose.toml",
+    "config/superposition_seed.toml",
+];
 
 /// The candidate's `migrations/` tree at `sha` as a tar (git archive reads the
 /// tree object directly — no working-tree checkout). This is the bundle the
@@ -307,7 +311,10 @@ pub fn bundle_migrations_from_targz<R: Read>(
     let mut versions = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut out);
-        for entry in archive.entries().map_err(|e| format!("read source tar: {e}"))? {
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("read source tar: {e}"))?
+        {
             let mut entry = entry.map_err(|e| format!("source tar entry: {e}"))?;
             // Only regular files — extraction recreates parent dirs.
             if entry.header().entry_type() != tar::EntryType::Regular {
@@ -331,7 +338,9 @@ pub fn bundle_migrations_from_targz<R: Read>(
                 continue;
             };
             let mut data = Vec::new();
-            entry.read_to_end(&mut data).map_err(|e| format!("read {rel}: {e}"))?;
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("read {rel}: {e}"))?;
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
@@ -340,7 +349,9 @@ pub fn bundle_migrations_from_targz<R: Read>(
                 .append_data(&mut header, &rel, &data[..])
                 .map_err(|e| format!("write bundle entry {rel}: {e}"))?;
         }
-        builder.finish().map_err(|e| format!("finish bundle tar: {e}"))?;
+        builder
+            .finish()
+            .map_err(|e| format!("finish bundle tar: {e}"))?;
     }
     let fp = SchemaFingerprint::new(versions);
     if fp.count() == 0 {
@@ -360,8 +371,7 @@ pub fn bundle_migrations_from_targz<R: Read>(
 /// back to the conventional `HTTPS_PROXY`/`HTTP_PROXY`. Unset → a direct agent,
 /// so local/demo/CI keep working unchanged.
 fn tarball_agent() -> ureq::Agent {
-    let mut builder =
-        ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(15));
+    let mut builder = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(15));
     let proxy = [
         "DEJA_HTTP_PROXY",
         "HTTPS_PROXY",
@@ -399,7 +409,10 @@ pub fn bundle_from_tarball_url(url: &str) -> Result<(Vec<u8>, SchemaFingerprint)
 pub fn fingerprint_from_bundle_tar_bytes(bytes: &[u8]) -> Result<SchemaFingerprint, String> {
     let mut archive = tar::Archive::new(io::Cursor::new(bytes));
     let mut versions = Vec::new();
-    for entry in archive.entries().map_err(|e| format!("read bundle tar: {e}"))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("read bundle tar: {e}"))?
+    {
         let entry = entry.map_err(|e| format!("bundle tar entry: {e}"))?;
         let path = entry
             .path()
@@ -470,10 +483,7 @@ mod tests {
         assert_eq!(fp.count(), 2);
         assert_eq!(
             fp.applied,
-            vec![
-                "00000000000000".to_string(),
-                "20220929084920".to_string()
-            ]
+            vec!["00000000000000".to_string(), "20220929084920".to_string()]
         );
     }
 
@@ -509,10 +519,10 @@ mod tests {
     fn git_manifest_and_tar_from_a_real_repo() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
-        let git = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(repo).args(args).output()
-        };
-        let inited = git(&["init", "-q"]).map(|o| o.status.success()).unwrap_or(false);
+        let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).output();
+        let inited = git(&["init", "-q"])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
         if !inited {
             eprintln!("skipping: git unavailable");
             return;
@@ -554,9 +564,11 @@ mod tests {
     #[test]
     fn parses_s3_uris_and_rejects_malformed() {
         assert_eq!(
-            parse_s3_uri("s3://bundles/codebundles/ff191d7f/migrations.tar")
-                .expect("valid uri"),
-            ("bundles".to_owned(), "codebundles/ff191d7f/migrations.tar".to_owned())
+            parse_s3_uri("s3://bundles/codebundles/ff191d7f/migrations.tar").expect("valid uri"),
+            (
+                "bundles".to_owned(),
+                "codebundles/ff191d7f/migrations.tar".to_owned()
+            )
         );
         assert!(parse_s3_uri("https://x/y").is_err(), "wrong scheme");
         assert!(parse_s3_uri("s3://bucket-only").is_err(), "no key");
@@ -589,12 +601,27 @@ mod tests {
         let targz = fake_codeload_targz(
             "hyperswitch-ff191d7f",
             &[
-                ("migrations/2022-09-29-084920_create_initial_tables/up.sql", b"-- up"),
-                ("migrations/2022-09-29-084920_create_initial_tables/down.sql", b"-- down"),
-                ("migrations/00000000000000_diesel_initial_setup/up.sql", b"-- up"),
+                (
+                    "migrations/2022-09-29-084920_create_initial_tables/up.sql",
+                    b"-- up",
+                ),
+                (
+                    "migrations/2022-09-29-084920_create_initial_tables/down.sql",
+                    b"-- down",
+                ),
+                (
+                    "migrations/00000000000000_diesel_initial_setup/up.sql",
+                    b"-- up",
+                ),
                 // The candidate's self-sufficient config — both files kept alongside migrations.
-                ("config/docker_compose.toml", b"[server]\nhost = \"0.0.0.0\"\n"),
-                ("config/superposition_seed.toml", b"[superposition]\nenabled = false\n"),
+                (
+                    "config/docker_compose.toml",
+                    b"[server]\nhost = \"0.0.0.0\"\n",
+                ),
+                (
+                    "config/superposition_seed.toml",
+                    b"[superposition]\nenabled = false\n",
+                ),
                 // NOT under root migrations/ — must be ignored.
                 ("crates/diesel_models/migrations/x/up.sql", b"-- nope"),
                 // NOT root-level config — must be ignored.
@@ -608,17 +635,14 @@ mod tests {
         // config file does NOT contribute to the migration fingerprint.
         assert_eq!(
             fp.applied,
-            vec![
-                "00000000000000".to_string(),
-                "20220929084920".to_string()
-            ]
+            vec!["00000000000000".to_string(), "20220929084920".to_string()]
         );
         // The bundle is canonical: extracting it yields dest/migrations/… and
         // fingerprints back to the same set (produce → extract → fingerprint).
         let dest = tempfile::tempdir().expect("dest");
         extract_tar_bytes(&bundle, dest.path()).expect("extract bundle");
-        let extracted = fingerprint_from_migrations_dir(&dest.path().join("migrations"))
-            .expect("fingerprint");
+        let extracted =
+            fingerprint_from_migrations_dir(&dest.path().join("migrations")).expect("fingerprint");
         assert_eq!(extracted.applied, fp.applied);
         // The candidate's config rode along at the canonical root paths (so the Job
         // boots the router `-f config/docker_compose.toml` and points its offline
@@ -663,7 +687,11 @@ mod tests {
         }
         let url = "https://codeload.github.com/juspay/hyperswitch/tar.gz/ff191d7f79";
         let (bundle, fp) = bundle_from_tarball_url(url).expect("fetch + produce");
-        assert!(fp.count() >= 461, "expected the candidate's full set, got {}", fp.count());
+        assert!(
+            fp.count() >= 461,
+            "expected the candidate's full set, got {}",
+            fp.count()
+        );
         assert!(!bundle.is_empty());
         // canonical shape: extracts to migrations/…
         let dest = tempfile::tempdir().expect("dest");
@@ -695,8 +723,8 @@ mod tests {
         let dest = tempfile::tempdir().expect("dest");
         let n = extract_tar_bytes(&buf, dest.path()).expect("extract");
         assert_eq!(n, 2, "both files unpack");
-        let fp = fingerprint_from_migrations_dir(&dest.path().join("migrations"))
-            .expect("fingerprint");
+        let fp =
+            fingerprint_from_migrations_dir(&dest.path().join("migrations")).expect("fingerprint");
         assert_eq!(fp.applied, vec!["20220929084920".to_string()]);
         assert!(dest
             .path()
@@ -712,7 +740,10 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../vendor/hyperswitch-deja-clean/migrations");
         if !dir.exists() {
-            eprintln!("skipping: vendored migrations not present at {}", dir.display());
+            eprintln!(
+                "skipping: vendored migrations not present at {}",
+                dir.display()
+            );
             return;
         }
         let subdirs = std::fs::read_dir(&dir)

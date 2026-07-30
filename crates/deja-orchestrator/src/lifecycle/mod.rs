@@ -907,7 +907,8 @@ fn write_record_graph_nodes(
             continue;
         }
         // Keep ONLY graph nodes — boundary events (the payloads) never leave.
-        if let Ok(deja::DejaRecord::GraphNode(_)) = serde_json::from_str::<deja::DejaRecord>(&line) {
+        if let Ok(deja::DejaRecord::GraphNode(_)) = serde_json::from_str::<deja::DejaRecord>(&line)
+        {
             out.push_str(&line);
             out.push('\n');
             nodes += 1;
@@ -932,7 +933,14 @@ fn score_and_register(
     total: u32,
     sink: &ArtifactSink,
 ) -> Result<(), String> {
-    set_stage(root, run, ctx, total, total, "scoring divergence (byte-exact)");
+    set_stage(
+        root,
+        run,
+        ctx,
+        total,
+        total,
+        "scoring divergence (byte-exact)",
+    );
     let card = crate::divergence::detect_and_score(root, &run.run_id)
         .map_err(|e| format!("score: {e}"))?;
     let verdict_line = format!(
@@ -983,7 +991,10 @@ fn score_and_register(
     // path; the orchestrator also reads the recording directly there, so this is
     // belt-and-suspenders — but it keeps both modes on one artifact contract.)
     let record_graph_path = root.record_graph_path(&run.run_id);
-    match write_record_graph_nodes(&root.recording_events_path(recording_id), &record_graph_path) {
+    match write_record_graph_nodes(
+        &root.recording_events_path(recording_id),
+        &record_graph_path,
+    ) {
         Ok(0) => {} // no recording on disk / no graph nodes — nothing to publish
         Ok(node_count) => {
             if let Some((uri, bytes)) =
@@ -1124,8 +1135,7 @@ pub fn drive_replay_in_pod(
     match &opts.migrate_cmd {
         Some(argv) if !argv.is_empty() => {
             let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..])
-                .env("DATABASE_URL", &opts.database_url);
+            cmd.args(&argv[1..]).env("DATABASE_URL", &opts.database_url);
             let status = run_streamed(cmd, ctx, "migrating sidecar pg", "migrate")?;
             if !status.success() {
                 return Err(format!("migration command failed (status {status})"));
@@ -1215,10 +1225,20 @@ pub fn drive_replay_in_pod(
         .map_err(|e| format!("publish readiness sentinel {}: {e}", ready.display()))?;
     ctx.log(
         "seeding sidecar stores",
-        &format!("stores seeded; readiness sentinel published at {}", ready.display()),
+        &format!(
+            "stores seeded; readiness sentinel published at {}",
+            ready.display()
+        ),
     );
 
-    set_stage(root, run, ctx, 5, total, "driving recorded requests (kernel)");
+    set_stage(
+        root,
+        run,
+        ctx,
+        5,
+        total,
+        "driving recorded requests (kernel)",
+    );
     wait_health(opts.router_port, Duration::from_secs(240))?;
     run_kernel(
         &opts.kernel_bin,
@@ -1448,11 +1468,7 @@ impl RedisSeedImage {
 }
 
 fn seed_redis_image(store: &StoreExec, image: &RedisSeedImage) -> Result<(), String> {
-    let mut cmd = store.redis_cli(&[
-        "SET",
-        image.physical_key.as_str(),
-        image.raw_value.as_str(),
-    ]);
+    let mut cmd = store.redis_cli(&["SET", image.physical_key.as_str(), image.raw_value.as_str()]);
     eprintln!(
         "lifecycle: {} (redis key {} byte(s), value {:?}, ttl {:?})",
         store_exec::describe(&cmd),
@@ -2456,8 +2472,12 @@ impl DbColumnMetadata {
         }
     }
 
-    fn is_bytea(&self) -> bool {
-        self.type_oid == Some(17) || self.type_name.as_deref() == Some("bytea")
+    /// Classify this column into the cast the seed renderer emits, using the
+    /// always-available pg catalog metadata (`type_oid` and/or `type_name`).
+    /// Implemented as a `TryFrom` so precedence (array spellings bind before
+    /// scalar json/jsonb) and the untyped fallthrough live in one place.
+    fn cast_kind(&self) -> SqlCastKind {
+        SqlCastKind::try_from(self).unwrap_or(SqlCastKind::Untyped)
     }
     fn merge_typed(&self, typed: &deja::db::DbColumnImage) -> Self {
         Self {
@@ -2465,6 +2485,49 @@ impl DbColumnMetadata {
             type_oid: typed.type_oid.or(self.type_oid),
             type_name: typed.type_name.clone().or_else(|| self.type_name.clone()),
             nullable: typed.nullable.or(self.nullable),
+        }
+    }
+}
+
+/// The pg cast the seed renderer applies to a column's quoted value, or
+/// `Untyped` when the plain-quote path is correct. Derived purely from pg
+/// catalog metadata — a fallible mapping of the `(type_oid, type_name)` key,
+/// so precedence (arrays before scalars) and the untyped fallthrough are
+/// explicit in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlCastKind {
+    Bytea,
+    /// scalar `json` (oid 114)
+    Json,
+    /// scalar `jsonb` (oid 3802)
+    Jsonb,
+    /// array-of-json (oid 199, pg name `_json` / `json[]`)
+    JsonArray,
+    /// array-of-jsonb (oid 3807, pg name `_jsonb` / `jsonb[]`)
+    JsonbArray,
+    /// No metadata, or a collected type we don't cast (text, numeric, uuid,
+    /// timestamptz, text[], …) — renderer falls through to plain quoting.
+    Untyped,
+}
+
+impl TryFrom<&DbColumnMetadata> for SqlCastKind {
+    type Error = ();
+
+    /// Array spellings (`_json`, `json[]`, `_jsonb`, `jsonb[]`) bind BEFORE the
+    /// scalar json/jsonb names so the array casts are never shadowed by a
+    /// scalar-name match. Both oid and name are honored since either may be the
+    /// only metadata present.
+    fn try_from(md: &DbColumnMetadata) -> Result<Self, Self::Error> {
+        let key = (md.type_oid, md.type_name.as_deref());
+        match key {
+            (Some(17), _) | (_, Some("bytea")) => Ok(SqlCastKind::Bytea),
+            (Some(199), _) | (_, Some("_json")) | (_, Some("json[]")) => Ok(SqlCastKind::JsonArray),
+            (Some(3807), _) | (_, Some("_jsonb")) | (_, Some("jsonb[]")) => {
+                Ok(SqlCastKind::JsonbArray)
+            }
+            (Some(114), _) | (_, Some("json")) => Ok(SqlCastKind::Json),
+            (Some(3802), _) | (_, Some("jsonb")) => Ok(SqlCastKind::Jsonb),
+            _ => Err(()),
         }
     }
 }
@@ -2643,17 +2706,50 @@ fn sql_literal_for_column(column: &DbColumnImage) -> Option<String> {
     if column.value.is_null() {
         return Some("NULL".to_string());
     }
-    if column.metadata.is_bytea() {
-        let Some(bytes) = bytea_bytes_from_typed_value(&column.value) else {
-            eprintln!(
-                "lifecycle: cannot render bytea seed value for column {}; skipping row",
-                column.metadata.name
-            );
-            return None;
-        };
-        return Some(bytea_hex_literal(&bytes));
+    let md = &column.metadata;
+    // Classify once via the pg catalog metadata; the match is exhaustive over
+    // the cast families the renderer understands, so an unhandled typed
+    // non-scalar (the json[] "malformed array literal" class of bug) can't slip
+    // through a quote-and-hope fallthrough.
+    match md.cast_kind() {
+        SqlCastKind::Bytea => bytea_bytes_from_typed_value(&column.value).map_or_else(
+            || {
+                eprintln!(
+                    "lifecycle: cannot render bytea seed value for column {}; skipping row",
+                    md.name
+                );
+                None
+            },
+            |bytes| Some(bytea_hex_literal(&bytes)),
+        ),
+        // json/jsonb/array family: the recorded value is a serde_json::Value
+        // (object or array). Emit it as a quoted JSON literal WITH an explicit
+        // pg cast so Postgres parses it into the real column type instead of
+        // reading `{...}` inside the string as array-element delimiters (the
+        // "malformed array literal" failure on json[]/jsonb[] columns).
+        SqlCastKind::Json => Some(format!("{}::json", sql_literal(&column.value))),
+        SqlCastKind::Jsonb => Some(format!("{}::jsonb", sql_literal(&column.value))),
+        SqlCastKind::JsonArray => Some(format!("{}::json[]", sql_literal(&column.value))),
+        SqlCastKind::JsonbArray => Some(format!("{}::jsonb[]", sql_literal(&column.value))),
+        // Fail-closed for a typed column we haven't been taught: if it carries
+        // authoritative pg catalog metadata but is neither bytea nor the json
+        // family AND holds a non-scalar object/array, the plain-quote path
+        // could silently mis-materialize (the array case). Surface it rather
+        // than guess. Scalar values in unknown columns are safe to quote.
+        SqlCastKind::Untyped => {
+            let has_type_metadata = md.type_oid.is_some() || md.type_name.is_some();
+            let is_non_scalar = column.value.is_object() || column.value.is_array();
+            if has_type_metadata && is_non_scalar {
+                eprintln!(
+                    "lifecycle: cannot render non-scalar seed value for column {} of type {:?}/{:?}; skipping row",
+                    md.name, md.type_oid, md.type_name
+                );
+                None
+            } else {
+                Some(sql_literal(&column.value))
+            }
+        }
     }
-    Some(sql_literal(&column.value))
 }
 
 /// Render a JSON value as a SQL literal with no column-type assumptions:
@@ -3178,7 +3274,10 @@ fn resolve_recording_from_source(
             .map(|(sid, n)| format!("{sid} ({n})"))
             .collect::<Vec<_>>()
             .join(", ");
-        ctx.log("ingest", &format!("other sessions under this prefix: {others}"));
+        ctx.log(
+            "ingest",
+            &format!("other sessions under this prefix: {others}"),
+        );
     }
     let line = format!(
         "ingested {resolved} from {}: {} object(s), {} line(s), {} duplicate(s) dropped → \
@@ -3234,7 +3333,7 @@ mod tests {
     fn select_seed_correlations_scopes_to_filter_and_keeps_ambient() {
         let all = || {
             vec![
-                None,                          // ambient / uncorrelated
+                None, // ambient / uncorrelated
                 Some("pay-1".to_string()),
                 Some("health-1".to_string()),
                 Some("health-2".to_string()),
@@ -3260,7 +3359,10 @@ mod tests {
         // kind is a VARIABLE (the REPLAY_STREAM_ARTIFACTS loop) is skipped here;
         // those kinds are added from the const below. (Markers are built with
         // concat! so this scanner never matches its own source text.)
-        for marker in [concat!("ctx", ".artifact("), concat!("ctx", ".artifact_uri(")] {
+        for marker in [
+            concat!("ctx", ".artifact("),
+            concat!("ctx", ".artifact_uri("),
+        ] {
             for call in source.split(marker).skip(1) {
                 let Some(first_comma) = call.find(',') else {
                     continue;
@@ -3914,7 +4016,10 @@ mod tests {
 
         let dest = dir.path().join("record-graph.jsonl");
         let n = write_record_graph_nodes(&recording, &dest).unwrap();
-        assert_eq!(n, 2, "both graph nodes extracted, the boundary event dropped");
+        assert_eq!(
+            n, 2,
+            "both graph nodes extracted, the boundary event dropped"
+        );
 
         let out = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(out.lines().count(), 2);
@@ -3938,7 +4043,10 @@ mod tests {
         // No recording on disk (compose without ingest) → 0 nodes, no file written.
         let n = write_record_graph_nodes(&dir.path().join("missing.jsonl"), &dest).unwrap();
         assert_eq!(n, 0);
-        assert!(!dest.exists(), "nothing to publish → no empty artifact left behind");
+        assert!(
+            !dest.exists(),
+            "nothing to publish → no empty artifact left behind"
+        );
     }
 
     /// The full replay-side wiring: derive the default rate from the recording's
@@ -3968,7 +4076,10 @@ mod tests {
             .resolve("redis", "settlement_rate_default")
             .expect("default seeded from recording");
         assert_eq!(default.origin, deja::SeedOrigin::Recording);
-        assert_eq!(render_redis_seed_value(&default.value).as_deref(), Some("0.10"));
+        assert_eq!(
+            render_redis_seed_value(&default.value).as_deref(),
+            Some("0.10")
+        );
 
         let premium = plan
             .resolve("redis", "settlement_rate_premium")
@@ -4670,6 +4781,113 @@ mod tests {
             sql_literal_for_column(&column(serde_json::json!({"inner": [300]}))),
             None
         );
+    }
+
+    #[test]
+    fn json_family_columns_render_with_explicit_pg_cast() {
+        let mk = |name: &str, type_oid: Option<u32>, type_name: &str| DbColumnImage {
+            metadata: DbColumnMetadata {
+                name: name.into(),
+                type_oid,
+                type_name: Some(type_name.into()),
+                nullable: Some(true),
+            },
+            value: serde_json::json!([{"pm": "card", "types": ["credit"]}]),
+        };
+        // json (oid 114)
+        assert_eq!(
+            sql_literal_for_column(&mk("j", Some(114), "json")),
+            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::json".to_string())
+        );
+        // jsonb (oid 3802)
+        assert_eq!(
+            sql_literal_for_column(&mk("jb", Some(3802), "jsonb")),
+            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::jsonb".to_string())
+        );
+        // json[] array (oid 199, pg name `_json`)
+        assert_eq!(
+            sql_literal_for_column(&mk("ja", Some(199), "_json")),
+            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::json[]".to_string())
+        );
+        // jsonb[] array (oid 3807, pg name `_jsonb`)
+        assert_eq!(
+            sql_literal_for_column(&mk("jba", Some(3807), "_jsonb")),
+            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::jsonb[]".to_string())
+        );
+        // type_name alone (no oid) also detects: `json[]`
+        assert_eq!(
+            sql_literal_for_column(&mk("jad", None, "json[]")),
+            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::json[]".to_string())
+        );
+    }
+
+    #[test]
+    fn sql_cast_kind_classifier_precedence() {
+        // Precedence lock: the TryFrom classifier must bind array spellings
+        // BEFORE scalar json/jsonb, else `_json`/`json[]` would shadow to Json.
+        assert_eq!(
+            SqlCastKind::try_from(&DbColumnMetadata {
+                name: "pme".into(),
+                type_oid: Some(199),
+                type_name: Some("_json".into()),
+                nullable: Some(true),
+            }),
+            Ok(SqlCastKind::JsonArray)
+        );
+        // type_name alone (no oid) still classifies — recorder may supply only one.
+        assert_eq!(
+            SqlCastKind::try_from(&DbColumnMetadata {
+                name: "x".into(),
+                type_oid: None,
+                type_name: Some("jsonb[]".into()),
+                nullable: None,
+            }),
+            Ok(SqlCastKind::JsonbArray)
+        );
+        // Unknown type is Err (renderer maps to Untyped -> plain quote or fail-closed).
+        assert_eq!(
+            SqlCastKind::try_from(&DbColumnMetadata {
+                name: "x".into(),
+                type_oid: Some(1009), // _text
+                type_name: Some("_text".into()),
+                nullable: Some(true),
+            }),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn unhandled_typed_nonscalar_column_fails_closed() {
+        // A column with authoritative type metadata that is neither bytea nor
+        // the json family must NOT silently wrap a non-scalar value in quotes.
+        let metadata = DbColumnMetadata {
+            name: "tags".into(),
+            type_oid: Some(1009), // text[]
+            type_name: Some("_text".into()),
+            nullable: Some(true),
+        };
+        let column = DbColumnImage {
+            metadata: metadata.clone(),
+            value: serde_json::json!(["a", "b"]),
+        };
+        assert_eq!(sql_literal_for_column(&column), None);
+    }
+
+    #[test]
+    fn scalar_value_in_typed_still_quotes_without_cast() {
+        // Scalars (strings/numbers/bools) in typed columns keep the legacy
+        // quote path — no cast appended, no regression on existing seeds.
+        let metadata = DbColumnMetadata {
+            name: "amount".into(),
+            type_oid: Some(1700), // numeric
+            type_name: Some("numeric".into()),
+            nullable: Some(true),
+        };
+        let column = DbColumnImage {
+            metadata,
+            value: serde_json::json!("0.20"),
+        };
+        assert_eq!(sql_literal_for_column(&column), Some("'0.20'".to_string()));
     }
 
     #[test]

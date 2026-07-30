@@ -61,12 +61,8 @@ async fn read_config(operation: &'static str, key: &str) -> Result<u64, String> 
     };
     let spec =
         deja::__private::BoundarySpec::with_semantics(BOUNDARY, COMPONENT, operation, semantics);
-    let observation = deja::__private::CrossingObservation::with_correlation(
-        spec,
-        identity,
-        caller,
-        correlation,
-    );
+    let observation =
+        deja::__private::CrossingObservation::with_correlation(spec, identity, caller, correlation);
 
     let args = json!({ "key": key });
     deja::__private::dispatch_async_or_miss(
@@ -101,10 +97,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
             raw()
         }
         fn nop(_: *const ()) {}
-        RawWaker::new(
-            std::ptr::null(),
-            &RawWakerVTable::new(clone, nop, nop, nop),
-        )
+        RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone, nop, nop, nop))
     }
     // SAFETY: the vtable's fns are all no-ops on a null data pointer.
     let waker = unsafe { Waker::from_raw(raw()) };

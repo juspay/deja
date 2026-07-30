@@ -155,7 +155,10 @@ pub fn build_job<T: KubeTransport>(
             ))
         })?;
     let template: Value = serde_json::from_str(raw).map_err(|e| {
-        ExecutorError::Template(format!("data['{}'] is not valid JSON: {e}", spec.template_key))
+        ExecutorError::Template(format!(
+            "data['{}'] is not valid JSON: {e}",
+            spec.template_key
+        ))
     })?;
 
     // Owner = the template ConfigMap itself: same-namespace (required — k8s
@@ -180,7 +183,10 @@ pub fn build_job<T: KubeTransport>(
     let patch = JobPatch {
         job_name: job_name_for(&spec.run_id),
         labels: spec.labels.clone(),
-        images: vec![(spec.candidate_container.clone(), spec.candidate_image.clone())],
+        images: vec![(
+            spec.candidate_container.clone(),
+            spec.candidate_image.clone(),
+        )],
         env: spec.env.clone(),
         owner,
     };
@@ -395,7 +401,10 @@ mod tests {
         // First poll: running; second poll: complete.
         let api = KubeApi::new(FakeTransport::new(vec![
             resp(200, json!({"status": {"active": 1}})),
-            resp(200, json!({"status": {"conditions": [{"type": "Complete", "status": "True"}]}})),
+            resp(
+                200,
+                json!({"status": {"conditions": [{"type": "Complete", "status": "True"}]}}),
+            ),
         ]));
         let mut slept = 0;
         let v = watch_to_terminal(

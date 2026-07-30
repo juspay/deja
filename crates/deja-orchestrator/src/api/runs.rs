@@ -129,7 +129,10 @@ fn resolve_expected_schema(run: &Run) -> Option<(crate::SchemaFingerprint, Strin
     }
 
     // 2) local candidate checkout (fallback).
-    if let Some(repo) = std::env::var("DEJA_CANDIDATE_REPO_DIR").ok().and_then(nonempty) {
+    if let Some(repo) = std::env::var("DEJA_CANDIDATE_REPO_DIR")
+        .ok()
+        .and_then(nonempty)
+    {
         let repo = std::path::Path::new(&repo);
         match crate::codebundle::ensure_bundle_staged(&s3, repo, &sha) {
             Ok(fp) => {
@@ -224,9 +227,7 @@ pub fn spawn_k8s_run(
             std::thread::sleep,
         ) {
             Ok(Some(true)) => ctx.finish(true, None),
-            Ok(Some(false)) => {
-                ctx.finish(false, Some("job failed (see runner logs / pod events)"))
-            }
+            Ok(Some(false)) => ctx.finish(false, Some("job failed (see runner logs / pod events)")),
             Ok(None) => ctx.finish(
                 false,
                 Some("job did not reach a terminal state within the watch deadline"),
