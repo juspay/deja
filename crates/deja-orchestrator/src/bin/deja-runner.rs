@@ -76,8 +76,8 @@ fn run() -> Result<(), String> {
     }
     let base = required("DEJA_ORCHESTRATOR_URL")?;
     let token = std::env::var("DEJA_API_SERVICE_TOKEN").ok();
-    let actor = std::env::var("DEJA_RUNNER_ACTOR")
-        .unwrap_or_else(|_| format!("system:runner:{run_id}"));
+    let actor =
+        std::env::var("DEJA_RUNNER_ACTOR").unwrap_or_else(|_| format!("system:runner:{run_id}"));
 
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
     let opts = InPodOptions {
@@ -92,7 +92,11 @@ fn run() -> Result<(), String> {
         kernel_bin: env("RUNNER_KERNEL_BIN", "target/release/deja-kernel"),
         migrate_cmd: std::env::var("RUNNER_MIGRATE_CMD")
             .ok()
-            .map(|raw| raw.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+            .map(|raw| {
+                raw.split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
             .filter(|argv| !argv.is_empty()),
         // The CANDIDATE's own migration versions, supplied by the executor
         // (derived from the candidate ref — its migrations/ tree at its code

@@ -28,16 +28,11 @@ pub enum KubeError {
     Transport(String),
     /// The apiserver returned a non-2xx status. `reason` is the parsed
     /// `.reason`/`.message` from the Status body when present.
-    Api {
-        status: u16,
-        reason: String,
-    },
+    Api { status: u16, reason: String },
     /// A `create` collided with an existing object (HTTP 409). Called out
     /// separately because for an idempotent launch it is SUCCESS, not failure
     /// (the Job already exists — do not launch a second one). (V6)
-    AlreadyExists {
-        name: String,
-    },
+    AlreadyExists { name: String },
 }
 
 impl std::fmt::Display for KubeError {
@@ -278,8 +273,7 @@ impl UreqTransport {
     pub fn new(cfg: &InClusterConfig) -> Result<Self, KubeError> {
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut cfg.ca_pem.as_slice()) {
-            let cert =
-                cert.map_err(|e| KubeError::Config(format!("parse cluster CA PEM: {e}")))?;
+            let cert = cert.map_err(|e| KubeError::Config(format!("parse cluster CA PEM: {e}")))?;
             roots
                 .add(cert)
                 .map_err(|e| KubeError::Config(format!("add cluster CA to trust store: {e}")))?;
@@ -303,7 +297,9 @@ impl UreqTransport {
     fn bearer(&self) -> Result<String, KubeError> {
         std::fs::read_to_string(&self.token_path)
             .map(|t| t.trim().to_owned())
-            .map_err(|e| KubeError::Config(format!("read SA token {}: {e}", self.token_path.display())))
+            .map_err(|e| {
+                KubeError::Config(format!("read SA token {}: {e}", self.token_path.display()))
+            })
     }
 }
 
@@ -331,9 +327,7 @@ impl KubeTransport for UreqTransport {
 }
 
 fn read_response(status: u16, resp: ureq::Response) -> Result<KubeResponse, KubeError> {
-    let body = resp
-        .into_json::<Value>()
-        .unwrap_or(Value::Null); // a 204/empty body is fine; verb layer keys off status
+    let body = resp.into_json::<Value>().unwrap_or(Value::Null); // a 204/empty body is fine; verb layer keys off status
     Ok(KubeResponse { status, body })
 }
 
@@ -450,7 +444,9 @@ mod tests {
             ]
         });
         let api = KubeApi::new(FakeTransport::new(vec![resp(200, body)]));
-        let items = api.list_jobs("replay-sbx", "deja.run-id").expect("list jobs");
+        let items = api
+            .list_jobs("replay-sbx", "deja.run-id")
+            .expect("list jobs");
         assert_eq!(items.len(), 2);
         let seen = api.transport.seen.borrow();
         assert_eq!(seen[0].0, "GET");
@@ -463,15 +459,19 @@ mod tests {
     #[test]
     fn list_jobs_missing_items_is_empty_not_error() {
         // A JobList with no `.items` (nothing matched) yields an empty Vec.
-        let api = KubeApi::new(FakeTransport::new(vec![resp(200, json!({"kind": "JobList"}))]));
-        let items = api.list_jobs("replay-sbx", "deja.run-id").expect("list jobs");
+        let api = KubeApi::new(FakeTransport::new(vec![resp(
+            200,
+            json!({"kind": "JobList"}),
+        )]));
+        let items = api
+            .list_jobs("replay-sbx", "deja.run-id")
+            .expect("list jobs");
         assert!(items.is_empty());
     }
 
     #[test]
     fn verdict_reads_conditions_then_counts() {
-        let complete =
-            json!({"status": {"conditions": [{"type": "Complete", "status": "True"}]}});
+        let complete = json!({"status": {"conditions": [{"type": "Complete", "status": "True"}]}});
         let failed = json!({"status": {"conditions": [{"type": "Failed", "status": "True"}]}});
         let running = json!({"status": {"active": 1}});
         let by_count = json!({"status": {"succeeded": 1}});
@@ -486,8 +486,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("ca.crt"), b"-----BEGIN CERTIFICATE-----\n")
             .expect("write ca");
-        std::fs::write(dir.path().join("namespace"), "replay-orchestrator-sandbox\n")
-            .expect("write namespace");
+        std::fs::write(
+            dir.path().join("namespace"),
+            "replay-orchestrator-sandbox\n",
+        )
+        .expect("write namespace");
         std::fs::write(dir.path().join("token"), "tok").expect("write token");
         // Guard the shared process env with a mutex-free approach: set/read/clear.
         std::env::set_var("KUBERNETES_SERVICE_HOST", "10.0.0.1");

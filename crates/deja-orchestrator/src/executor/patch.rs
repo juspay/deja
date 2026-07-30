@@ -163,7 +163,9 @@ pub fn apply_job_patch(template: &Value, patch: &JobPatch) -> Result<Value, Patc
             .entry("env")
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .ok_or_else(|| PatchError::Shape(format!("container '{}' env is not a list", up.container)))?;
+            .ok_or_else(|| {
+                PatchError::Shape(format!("container '{}' env is not a list", up.container))
+            })?;
         upsert_env(env, &up.name, &up.value);
     }
 
@@ -426,6 +428,9 @@ mod tests {
         };
         let out = apply_job_patch(&bare, &patch).expect("label-only patch applies");
         assert_eq!(out["metadata"]["name"], json!("bare"));
-        assert_eq!(out["spec"]["template"]["metadata"]["labels"]["k"], json!("v"));
+        assert_eq!(
+            out["spec"]["template"]["metadata"]["labels"]["k"],
+            json!("v")
+        );
     }
 }

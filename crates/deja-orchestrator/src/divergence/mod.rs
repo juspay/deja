@@ -2004,9 +2004,11 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
 /// than silently dropped, so a corrupt stream can't masquerade as a clean run.
 pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifacts> {
     let run = crate::read_json::<crate::Run>(&root.run_path(run_id)).ok();
-    let recording_id = run
-        .as_ref()
-        .and_then(|run| run.recording_id.clone().or_else(|| run.spec.recording_id.clone()));
+    let recording_id = run.as_ref().and_then(|run| {
+        run.recording_id
+            .clone()
+            .or_else(|| run.spec.recording_id.clone())
+    });
     // The kernel drove only this subset (KERNEL_CORRELATION_FILTER); scope
     // recorded expectations to it so undriven cases don't score as omitted.
     let correlation_scope: Option<std::collections::BTreeSet<String>> = run
@@ -2032,8 +2034,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     if let Some(scope) = &correlation_scope {
         // Uncorrelated (background) records stay: they are tolerated by the
         // scorer and shared across cases. No-silent-caps: say what was cut.
-        let in_scope =
-            |cid: &Option<String>| cid.as_ref().is_none_or(|c| scope.contains(c));
+        let in_scope = |cid: &Option<String>| cid.as_ref().is_none_or(|c| scope.contains(c));
         let entries_before = table.entries.len();
         let events_before = events.len();
         table.entries.retain(|e| in_scope(&e.key.correlation_id));
@@ -2475,7 +2476,10 @@ mod tests {
         );
 
         let card = detect(&art);
-        assert_eq!(card.correlation_scope.as_deref(), Some(&["c-keep".to_owned()][..]));
+        assert_eq!(
+            card.correlation_scope.as_deref(),
+            Some(&["c-keep".to_owned()][..])
+        );
         assert_eq!(
             card.summary.omitted_calls, 1,
             "the driven-but-unobserved c-keep call is a real omission; \

@@ -41,8 +41,8 @@ fn ok_arm_round_trips() {
     let ok: DbResult<UserRow> = Ok(sample_row());
     let (envelope, is_error) = ResultCodec::<UserRow, DbError>::capture(&ok);
     assert!(!is_error);
-    let back = ResultCodec::<UserRow, DbError>::reconstruct(envelope)
-        .expect("ok envelope reconstructs");
+    let back =
+        ResultCodec::<UserRow, DbError>::reconstruct(envelope).expect("ok envelope reconstructs");
     assert_eq!(back.expect("ok arm"), sample_row());
 }
 
@@ -57,8 +57,8 @@ fn err_arm_round_trips_the_same_typed_context() {
         "fieldless enum kind must serialize as the bare variant string \
          (byte-compatible with the legacy hand-rolled mapping)"
     );
-    let back = ResultCodec::<UserRow, DbError>::reconstruct(envelope)
-        .expect("err envelope reconstructs");
+    let back =
+        ResultCodec::<UserRow, DbError>::reconstruct(envelope).expect("err envelope reconstructs");
     match back {
         Err(report) => assert_eq!(*report.current_context(), DbError::UniqueViolation),
         Ok(_) => panic!("expected the Err arm"),
@@ -124,7 +124,11 @@ fn binds_parser_derives_a_row_exact_read_key() {
 #[test]
 fn binds_parser_never_guesses() {
     // Unknown table → no pragmatic PK → no keys.
-    assert!(binds_read_keys("unknown_table", r#"SELECT 1 WHERE "id" = $1 -- binds: ["x"]"#).is_empty());
+    assert!(binds_read_keys(
+        "unknown_table",
+        r#"SELECT 1 WHERE "id" = $1 -- binds: ["x"]"#
+    )
+    .is_empty());
     // Unparseable binds (rich debug shapes) → no keys, no panic.
     assert!(binds_read_keys(
         "users",
@@ -143,7 +147,12 @@ fn notfound_read_records_the_binds_read_key() {
     let sql = r#"SELECT * FROM "users" WHERE "users"."user_id" = $1 -- binds: ["ghost_user"]"#;
     let output = recorded_output(StateAxis::Read, "users", sql, &err);
     assert!(output.is_error);
-    assert_eq!(output.read_set.len(), 1, "binds key expected: {:?}", output.read_set);
+    assert_eq!(
+        output.read_set.len(),
+        1,
+        "binds key expected: {:?}",
+        output.read_set
+    );
     assert!(output.write_set.is_empty());
 }
 

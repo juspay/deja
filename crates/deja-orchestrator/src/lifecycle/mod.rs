@@ -907,7 +907,8 @@ fn write_record_graph_nodes(
             continue;
         }
         // Keep ONLY graph nodes — boundary events (the payloads) never leave.
-        if let Ok(deja::DejaRecord::GraphNode(_)) = serde_json::from_str::<deja::DejaRecord>(&line) {
+        if let Ok(deja::DejaRecord::GraphNode(_)) = serde_json::from_str::<deja::DejaRecord>(&line)
+        {
             out.push_str(&line);
             out.push('\n');
             nodes += 1;
@@ -932,7 +933,14 @@ fn score_and_register(
     total: u32,
     sink: &ArtifactSink,
 ) -> Result<(), String> {
-    set_stage(root, run, ctx, total, total, "scoring divergence (byte-exact)");
+    set_stage(
+        root,
+        run,
+        ctx,
+        total,
+        total,
+        "scoring divergence (byte-exact)",
+    );
     let card = crate::divergence::detect_and_score(root, &run.run_id)
         .map_err(|e| format!("score: {e}"))?;
     let verdict_line = format!(
@@ -983,7 +991,10 @@ fn score_and_register(
     // path; the orchestrator also reads the recording directly there, so this is
     // belt-and-suspenders — but it keeps both modes on one artifact contract.)
     let record_graph_path = root.record_graph_path(&run.run_id);
-    match write_record_graph_nodes(&root.recording_events_path(recording_id), &record_graph_path) {
+    match write_record_graph_nodes(
+        &root.recording_events_path(recording_id),
+        &record_graph_path,
+    ) {
         Ok(0) => {} // no recording on disk / no graph nodes — nothing to publish
         Ok(node_count) => {
             if let Some((uri, bytes)) =
@@ -1124,8 +1135,7 @@ pub fn drive_replay_in_pod(
     match &opts.migrate_cmd {
         Some(argv) if !argv.is_empty() => {
             let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..])
-                .env("DATABASE_URL", &opts.database_url);
+            cmd.args(&argv[1..]).env("DATABASE_URL", &opts.database_url);
             let status = run_streamed(cmd, ctx, "migrating sidecar pg", "migrate")?;
             if !status.success() {
                 return Err(format!("migration command failed (status {status})"));
@@ -1215,10 +1225,20 @@ pub fn drive_replay_in_pod(
         .map_err(|e| format!("publish readiness sentinel {}: {e}", ready.display()))?;
     ctx.log(
         "seeding sidecar stores",
-        &format!("stores seeded; readiness sentinel published at {}", ready.display()),
+        &format!(
+            "stores seeded; readiness sentinel published at {}",
+            ready.display()
+        ),
     );
 
-    set_stage(root, run, ctx, 5, total, "driving recorded requests (kernel)");
+    set_stage(
+        root,
+        run,
+        ctx,
+        5,
+        total,
+        "driving recorded requests (kernel)",
+    );
     wait_health(opts.router_port, Duration::from_secs(240))?;
     run_kernel(
         &opts.kernel_bin,
@@ -1448,11 +1468,7 @@ impl RedisSeedImage {
 }
 
 fn seed_redis_image(store: &StoreExec, image: &RedisSeedImage) -> Result<(), String> {
-    let mut cmd = store.redis_cli(&[
-        "SET",
-        image.physical_key.as_str(),
-        image.raw_value.as_str(),
-    ]);
+    let mut cmd = store.redis_cli(&["SET", image.physical_key.as_str(), image.raw_value.as_str()]);
     eprintln!(
         "lifecycle: {} (redis key {} byte(s), value {:?}, ttl {:?})",
         store_exec::describe(&cmd),
@@ -2505,9 +2521,7 @@ impl TryFrom<&DbColumnMetadata> for SqlCastKind {
         let key = (md.type_oid, md.type_name.as_deref());
         match key {
             (Some(17), _) | (_, Some("bytea")) => Ok(SqlCastKind::Bytea),
-            (Some(199), _) | (_, Some("_json")) | (_, Some("json[]")) => {
-                Ok(SqlCastKind::JsonArray)
-            }
+            (Some(199), _) | (_, Some("_json")) | (_, Some("json[]")) => Ok(SqlCastKind::JsonArray),
             (Some(3807), _) | (_, Some("_jsonb")) | (_, Some("jsonb[]")) => {
                 Ok(SqlCastKind::JsonbArray)
             }
@@ -3260,7 +3274,10 @@ fn resolve_recording_from_source(
             .map(|(sid, n)| format!("{sid} ({n})"))
             .collect::<Vec<_>>()
             .join(", ");
-        ctx.log("ingest", &format!("other sessions under this prefix: {others}"));
+        ctx.log(
+            "ingest",
+            &format!("other sessions under this prefix: {others}"),
+        );
     }
     let line = format!(
         "ingested {resolved} from {}: {} object(s), {} line(s), {} duplicate(s) dropped → \
@@ -3316,7 +3333,7 @@ mod tests {
     fn select_seed_correlations_scopes_to_filter_and_keeps_ambient() {
         let all = || {
             vec![
-                None,                          // ambient / uncorrelated
+                None, // ambient / uncorrelated
                 Some("pay-1".to_string()),
                 Some("health-1".to_string()),
                 Some("health-2".to_string()),
@@ -3342,7 +3359,10 @@ mod tests {
         // kind is a VARIABLE (the REPLAY_STREAM_ARTIFACTS loop) is skipped here;
         // those kinds are added from the const below. (Markers are built with
         // concat! so this scanner never matches its own source text.)
-        for marker in [concat!("ctx", ".artifact("), concat!("ctx", ".artifact_uri(")] {
+        for marker in [
+            concat!("ctx", ".artifact("),
+            concat!("ctx", ".artifact_uri("),
+        ] {
             for call in source.split(marker).skip(1) {
                 let Some(first_comma) = call.find(',') else {
                     continue;
@@ -3996,7 +4016,10 @@ mod tests {
 
         let dest = dir.path().join("record-graph.jsonl");
         let n = write_record_graph_nodes(&recording, &dest).unwrap();
-        assert_eq!(n, 2, "both graph nodes extracted, the boundary event dropped");
+        assert_eq!(
+            n, 2,
+            "both graph nodes extracted, the boundary event dropped"
+        );
 
         let out = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(out.lines().count(), 2);
@@ -4020,7 +4043,10 @@ mod tests {
         // No recording on disk (compose without ingest) → 0 nodes, no file written.
         let n = write_record_graph_nodes(&dir.path().join("missing.jsonl"), &dest).unwrap();
         assert_eq!(n, 0);
-        assert!(!dest.exists(), "nothing to publish → no empty artifact left behind");
+        assert!(
+            !dest.exists(),
+            "nothing to publish → no empty artifact left behind"
+        );
     }
 
     /// The full replay-side wiring: derive the default rate from the recording's
@@ -4050,7 +4076,10 @@ mod tests {
             .resolve("redis", "settlement_rate_default")
             .expect("default seeded from recording");
         assert_eq!(default.origin, deja::SeedOrigin::Recording);
-        assert_eq!(render_redis_seed_value(&default.value).as_deref(), Some("0.10"));
+        assert_eq!(
+            render_redis_seed_value(&default.value).as_deref(),
+            Some("0.10")
+        );
 
         let premium = plan
             .resolve("redis", "settlement_rate_premium")
@@ -4858,10 +4887,7 @@ mod tests {
             metadata,
             value: serde_json::json!("0.20"),
         };
-        assert_eq!(
-            sql_literal_for_column(&column),
-            Some("'0.20'".to_string())
-        );
+        assert_eq!(sql_literal_for_column(&column), Some("'0.20'".to_string()));
     }
 
     #[test]

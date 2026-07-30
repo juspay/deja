@@ -31,9 +31,17 @@ use deja_store::Store;
 pub enum RunEvent {
     /// Append a worker log line. `seq` is assigned by the SENDER so ordering
     /// survives the network (the orchestrator must not re-number).
-    Log { stage: String, seq: i64, line: String },
+    Log {
+        stage: String,
+        seq: i64,
+        line: String,
+    },
     /// Stage transition (closes the previous running stage as ok).
-    Stage { stage: String, step: u32, total: u32 },
+    Stage {
+        stage: String,
+        step: u32,
+        total: u32,
+    },
     /// Coarse run state ("resolving" | "building" | "running" | …).
     State { state: String },
     /// Terminal state: close the running stage and settle the run row.
@@ -93,9 +101,7 @@ pub async fn apply_run_event(
                 .update_run_state(run_id, state, failure_json.as_ref())
                 .await
         }
-        RunEvent::Recording { recording_id } => {
-            store.set_run_recording(run_id, recording_id).await
-        }
+        RunEvent::Recording { recording_id } => store.set_run_recording(run_id, recording_id).await,
         RunEvent::CandidateSha { sha256 } => store.set_run_candidate_sha(run_id, sha256).await,
         RunEvent::Result { verdict, scorecard } => {
             store
@@ -397,7 +403,14 @@ mod tests {
             serde_json::json!({"event": "stage", "stage": "seeding", "step": 5, "total": 6})
         );
         let back: RunEvent = serde_json::from_value(json).unwrap();
-        assert!(matches!(back, RunEvent::Stage { step: 5, total: 6, .. }));
+        assert!(matches!(
+            back,
+            RunEvent::Stage {
+                step: 5,
+                total: 6,
+                ..
+            }
+        ));
     }
 
     #[test]

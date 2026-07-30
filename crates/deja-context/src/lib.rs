@@ -444,7 +444,10 @@ mod tests {
         }
         {
             let _g = enter_correlation_id("req-on");
-            assert_eq!(recording_decision_for_current(), Some(RecordDecision::Record));
+            assert_eq!(
+                recording_decision_for_current(),
+                Some(RecordDecision::Record)
+            );
         }
 
         // Clearing bounds the registry; the gate then falls back to default.

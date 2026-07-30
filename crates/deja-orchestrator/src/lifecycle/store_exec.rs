@@ -86,7 +86,16 @@ impl StoreExec {
                 cmd.args(base_args)
                     .args(["exec", "-T", "pg", "psql"])
                     .args(shape_flags)
-                    .args(["-v", stop, "-U", "db_user", "-d", "hyperswitch_db", "-c", sql])
+                    .args([
+                        "-v",
+                        stop,
+                        "-U",
+                        "db_user",
+                        "-d",
+                        "hyperswitch_db",
+                        "-c",
+                        sql,
+                    ])
                     .envs(env.iter().cloned())
                     .env("PGPASSWORD", "db_pass");
                 cmd
@@ -133,8 +142,17 @@ mod tests {
         assert_eq!(
             argv(&cmd),
             [
-                "docker", "compose", "-p", "proj", "exec", "-T", "redis-standalone",
-                "redis-cli", "--raw", "GET", "k"
+                "docker",
+                "compose",
+                "-p",
+                "proj",
+                "exec",
+                "-T",
+                "redis-standalone",
+                "redis-cli",
+                "--raw",
+                "GET",
+                "k"
             ]
         );
     }
@@ -146,8 +164,23 @@ mod tests {
         assert_eq!(
             argv(&cmd),
             [
-                "docker", "compose", "exec", "-T", "pg", "psql", "-A", "-t", "-F", "\t",
-                "-v", "ON_ERROR_STOP=0", "-U", "db_user", "-d", "hyperswitch_db", "-c",
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "pg",
+                "psql",
+                "-A",
+                "-t",
+                "-F",
+                "\t",
+                "-v",
+                "ON_ERROR_STOP=0",
+                "-U",
+                "db_user",
+                "-d",
+                "hyperswitch_db",
+                "-c",
                 "SELECT 1"
             ]
         );
@@ -159,7 +192,11 @@ mod tests {
 
     #[test]
     fn direct_variants_target_sidecars() {
-        let exec = StoreExec::direct("127.0.0.1".into(), 6379, "postgres://u:p@localhost/db".into());
+        let exec = StoreExec::direct(
+            "127.0.0.1".into(),
+            6379,
+            "postgres://u:p@localhost/db".into(),
+        );
         assert_eq!(
             argv(&exec.redis_cli(&["EXISTS", "k"])),
             ["redis-cli", "-h", "127.0.0.1", "-p", "6379", "EXISTS", "k"]
@@ -167,8 +204,13 @@ mod tests {
         assert_eq!(
             argv(&exec.psql(&[], true, "SELECT 1")),
             [
-                "psql", "-v", "ON_ERROR_STOP=1", "-d", "postgres://u:p@localhost/db",
-                "-c", "SELECT 1"
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                "postgres://u:p@localhost/db",
+                "-c",
+                "SELECT 1"
             ]
         );
     }

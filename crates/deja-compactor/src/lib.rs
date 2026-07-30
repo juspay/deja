@@ -264,7 +264,8 @@ fn decode_object(key: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     if key.ends_with(".gz") || bytes.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
         let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
-        std::io::Read::read_to_end(&mut decoder, &mut out).map_err(|e| format!("gzip {key}: {e}"))?;
+        std::io::Read::read_to_end(&mut decoder, &mut out)
+            .map_err(|e| format!("gzip {key}: {e}"))?;
         return Ok(out);
     }
     Ok(bytes.to_vec())
@@ -647,8 +648,7 @@ mod tests {
         let mut gz = Vec::new();
         {
             use std::io::Write as _;
-            let mut enc =
-                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
             enc.write_all(payload).unwrap();
             enc.finish().unwrap();
         }
@@ -668,7 +668,10 @@ mod tests {
             payload.to_vec()
         );
 
-        assert_eq!(decode_object("plain.ndjson", payload).unwrap(), payload.to_vec());
+        assert_eq!(
+            decode_object("plain.ndjson", payload).unwrap(),
+            payload.to_vec()
+        );
     }
 
     fn envelope(inst: &str, gseq: u64, corr: Option<&str>, boundary: &str) -> String {

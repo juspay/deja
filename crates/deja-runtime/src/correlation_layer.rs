@@ -262,9 +262,10 @@ where
                 correlation.as_deref(),
             ))
         } else {
-            parent
-                .as_ref()
-                .map_or_else(|| Arc::new(crate::TaskLineage::root()), |c| Arc::clone(&c.lineage))
+            parent.as_ref().map_or_else(
+                || Arc::new(crate::TaskLineage::root()),
+                |c| Arc::clone(&c.lineage),
+            )
         };
 
         // Only a span carrying its OWN correlation pays a decision lookup; a span
@@ -438,7 +439,8 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let correlation_id = "req-skip-disengage";
             deja_context::set_recording_decision(correlation_id, false);
-            let span = tracing::info_span!("deja::http_incoming", request_id = "req-skip-disengage");
+            let span =
+                tracing::info_span!("deja::http_incoming", request_id = "req-skip-disengage");
             {
                 let _entered = span.enter();
                 assert_eq!(

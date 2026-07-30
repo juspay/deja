@@ -35,9 +35,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::config::K8sExecutorConfig;
-use super::k8s::{
-    job_terminal_verdict, InClusterConfig, KubeApi, KubeTransport, UreqTransport,
-};
+use super::k8s::{job_terminal_verdict, InClusterConfig, KubeApi, KubeTransport, UreqTransport};
 use super::launch::RUN_ID_LABEL;
 use deja_store::Store;
 
@@ -123,8 +121,7 @@ pub fn reconcile_decisions(
     jobs: &[RunJob],
     grace: Duration,
 ) -> Vec<ReconcileAction> {
-    let by_run: HashMap<&str, &RunJob> =
-        jobs.iter().map(|j| (j.run_id.as_str(), j)).collect();
+    let by_run: HashMap<&str, &RunJob> = jobs.iter().map(|j| (j.run_id.as_str(), j)).collect();
 
     runs.iter()
         .map(|run| match by_run.get(run.run_id.as_str()) {
@@ -251,10 +248,8 @@ async fn reconcile_pass<T>(
     // The kube client is blocking (ureq); keep it off the async runtime worker.
     let api_for_list = api.clone();
     let ns = jobs_namespace.to_owned();
-    let items = match tokio::task::spawn_blocking(move || {
-        api_for_list.list_jobs(&ns, RUN_ID_LABEL)
-    })
-    .await
+    let items = match tokio::task::spawn_blocking(move || api_for_list.list_jobs(&ns, RUN_ID_LABEL))
+        .await
     {
         Ok(Ok(items)) => items,
         Ok(Err(e)) => {
@@ -310,7 +305,10 @@ async fn settle(store: &Store, run_id: &str, ok: bool, reason: &str) {
     } else {
         Some(serde_json::json!({ "message": reason }))
     };
-    match store.update_run_state(run_id, state, failure.as_ref()).await {
+    match store
+        .update_run_state(run_id, state, failure.as_ref())
+        .await
+    {
         Ok(()) => eprintln!("reconcile: settled {run_id} -> {state} ({reason})"),
         Err(e) => eprintln!("reconcile: settle {run_id} -> {state} failed: {e}"),
     }
@@ -350,8 +348,11 @@ mod tests {
 
     #[test]
     fn completed_job_reports_ok() {
-        let actions =
-            reconcile_decisions(&[run("run-1", Duration::ZERO)], &[job("run-1", Some(true))], GRACE);
+        let actions = reconcile_decisions(
+            &[run("run-1", Duration::ZERO)],
+            &[job("run-1", Some(true))],
+            GRACE,
+        );
         match &actions[0] {
             ReconcileAction::Report { run_id, ok, .. } => {
                 assert_eq!(run_id, "run-1");
@@ -379,8 +380,11 @@ mod tests {
 
     #[test]
     fn running_job_waits() {
-        let actions =
-            reconcile_decisions(&[run("run-3", Duration::ZERO)], &[job("run-3", None)], GRACE);
+        let actions = reconcile_decisions(
+            &[run("run-3", Duration::ZERO)],
+            &[job("run-3", None)],
+            GRACE,
+        );
         assert!(
             matches!(&actions[0], ReconcileAction::Wait { run_id, .. } if run_id == "run-3"),
             "a still-running Job means wait, not settle: {:?}",

@@ -437,9 +437,13 @@ async fn v1_create_run(
     };
     match &*st.executor {
         ExecutorSelection::Compose => runs::spawn_worker(&st.root, &run.run_id, ctx),
-        ExecutorSelection::K8s(k) => {
-            runs::spawn_k8s_run(&st.root, run.clone(), ctx, k.incluster.clone(), k.cfg.clone())
-        }
+        ExecutorSelection::K8s(k) => runs::spawn_k8s_run(
+            &st.root,
+            run.clone(),
+            ctx,
+            k.incluster.clone(),
+            k.cfg.clone(),
+        ),
     }
     json_ok(
         serde_json::to_value(&runs::CreateRunResponse {
@@ -1083,10 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn human_read_routes_are_open() {
-        assert_eq!(
-            human_status(Method::GET, None, None).await,
-            StatusCode::OK
-        );
+        assert_eq!(human_status(Method::GET, None, None).await, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1165,11 +1166,7 @@ mod tests {
         }
     }
 
-    async fn post_event(
-        state: AppState,
-        run_id: &str,
-        body: serde_json::Value,
-    ) -> StatusCode {
+    async fn post_event(state: AppState, run_id: &str, body: serde_json::Value) -> StatusCode {
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/api/v1/runs/{run_id}/events"))
@@ -1218,7 +1215,8 @@ mod tests {
     async fn ingest_terminal_guard_ignores_post_finish_events() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path());
-        deja_orchestrator::write_json(&state.root.run_path("run-t"), &pending_run("run-t")).unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-t"), &pending_run("run-t"))
+            .unwrap();
 
         // Settle the run as Failed.
         let status = post_event(
@@ -1257,7 +1255,10 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
 
         let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-t")).unwrap();
-        assert!(matches!(run.status, RunStatus::Failed), "terminal verdict is final");
+        assert!(
+            matches!(run.status, RunStatus::Failed),
+            "terminal verdict is final"
+        );
         assert_eq!(run.failure_reason.as_deref(), Some("kernel failed"));
         // The dropped stage never touched progress.
         assert_ne!(run.stage.as_deref(), Some("seeding"));
@@ -1273,7 +1274,11 @@ mod tests {
             serde_json::json!({"event": "state", "state": "running"}),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "unknown run must 404, not upsert");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "unknown run must 404, not upsert"
+        );
 
         deja_orchestrator::write_json(&state.root.run_path("run-ev2"), &pending_run("run-ev2"))
             .unwrap();
