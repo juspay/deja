@@ -49,52 +49,86 @@ pub struct K8sExecutorConfig {
     pub migrations_init_container: String,
     pub code_bundle_uri_env: String,
     pub candidate_binding: CandidateBinding,
-    /// Where the candidate's L1 config env is COPIED from: the recorded system's
-    /// own rendered Deployment (artifact-only, its chart at the record version).
-    /// Names are config, never compiled in — a different recorded system (a
-    /// different router, a different service entirely) is a profile change, not a
-    /// code change. `{record_sha}` in the deployment name expands per run.
+    /// Where the candidate's config env is COPIED from: the recorded system's own
+    /// rendered workload (artifact-only, its chart at the record version).
     pub config_source: ConfigSource,
+    /// The candidate's on-disk config baseline for the record version.
+    ///
+    /// Together with `config_source` and `candidate_binding`, every name that
+    /// belongs to the recorded system lives here as data. Replaying a different
+    /// system — a different router, or a different service entirely — is a profile
+    /// change, not a code change: nothing in this crate names one.
+    pub config_file: ConfigFile,
+}
+
+/// The token a per-version name pattern uses for the run's record code-sha.
+const RECORD_SHA_PLACEHOLDER: &str = "{record_sha}";
+
+/// Expand a per-version name pattern for one run.
+///
+/// `None` means "no name": either the pattern is empty (the feature is switched
+/// off) or it is version-keyed and this run has no record sha to key it — in which
+/// case the caller must refuse rather than guess at another version's object.
+fn expand_record_sha(pattern: &str, record_sha: Option<&str>) -> Option<String> {
+    if pattern.is_empty() {
+        return None;
+    }
+    if !pattern.contains(RECORD_SHA_PLACEHOLDER) {
+        return Some(pattern.to_owned());
+    }
+    record_sha.map(|sha| pattern.replace(RECORD_SHA_PLACEHOLDER, sha))
+}
+
+/// Is a per-version name pattern version-keyed (enabled, and useless without a
+/// record sha)? A run that cannot supply one must then be refused, not silently
+/// launched without its recorded config.
+fn is_version_keyed(pattern: &str) -> bool {
+    !pattern.is_empty() && pattern.contains(RECORD_SHA_PLACEHOLDER)
 }
 
 /// Which rendered workload the candidate's config env is copied from. Both names
-/// belong to the RECORDED SYSTEM (e.g. its Deployment and container names), so
-/// they are deployment profile data. An unset deployment name disables the copy —
-/// the Job then boots with whatever env its template carries.
+/// belong to the RECORDED SYSTEM (its own workload and container names), so they
+/// are deployment profile data, never compiled in. An empty deployment name
+/// disables the copy — the Job then boots with whatever env its template carries.
 #[derive(Debug, Clone)]
 pub struct ConfigSource {
-    /// Deployment name; may contain `{record_sha}` (expanded per run). Empty =
-    /// copying disabled.
+    /// Workload name; may contain `{record_sha}` (expanded per run).
     pub deployment: String,
-    /// Container within that Deployment whose `env` + `envFrom` are copied.
+    /// Container within it whose `env` + `envFrom` are copied.
     pub container: String,
 }
 
 impl ConfigSource {
-    /// Expand `{record_sha}` in the deployment name for this run. `None` when
-    /// copying is disabled, or when the name needs a sha the run cannot supply
-    /// (no `recording_image`) — the caller then leaves the template env alone
-    /// rather than reading some other version's Deployment.
+    /// The workload to read for this run — see [`expand_record_sha`].
     pub fn deployment_for(&self, record_sha: Option<&str>) -> Option<String> {
-        if self.deployment.is_empty() {
-            return None;
-        }
-        if !self.needs_record_sha() {
-            return Some(self.deployment.clone());
-        }
-        record_sha.map(|sha| self.deployment.replace(Self::PLACEHOLDER, sha))
+        expand_record_sha(&self.deployment, record_sha)
     }
 
-    /// Is this source version-keyed (i.e. useless without a record sha)? Enabled
-    /// plus a placeholder means a run that cannot supply a sha must be refused,
-    /// not silently launched without its recorded config.
+    /// Version-keyed, so a run with no record sha must be refused.
     pub fn needs_record_sha(&self) -> bool {
-        !self.deployment.is_empty() && self.deployment.contains(Self::PLACEHOLDER)
+        is_version_keyed(&self.deployment)
     }
 }
 
-impl ConfigSource {
-    const PLACEHOLDER: &'static str = "{record_sha}";
+/// The candidate's on-disk config baseline: the ConfigMap holding it, and the pod
+/// volume that mounts it. Both belong to the RECORDED SYSTEM and its deployment
+/// (the ConfigMap is named by whatever renders that system's config artifacts; the
+/// volume is named by the Job template), so both are profile data. This service
+/// names neither — it only substitutes the run's version into the pattern.
+#[derive(Debug, Clone)]
+pub struct ConfigFile {
+    /// ConfigMap name; may contain `{record_sha}` (expanded per run). Empty =
+    /// leave whatever ConfigMap the Job template references.
+    pub config_map: String,
+    /// The Job template's volume that mounts it, repointed at the above.
+    pub volume: String,
+}
+
+impl ConfigFile {
+    /// The ConfigMap to mount for this run — see [`expand_record_sha`].
+    pub fn config_map_for(&self, record_sha: Option<&str>) -> Option<String> {
+        expand_record_sha(&self.config_map, record_sha)
+    }
 }
 
 impl K8sExecutorConfig {
@@ -126,14 +160,23 @@ impl K8sExecutorConfig {
                     "ROUTER__DEJA__IDENTITY__CODE_SHA",
                 ),
             },
-            // Defaults name the Hyperswitch sandbox render; another recorded
-            // system sets its own. Empty deployment name disables copying.
+            // Defaults describe the Hyperswitch sandbox render; another recorded
+            // system sets its own. They are deployment defaults (a deployment
+            // concern), not names baked into the copy/patch logic. An empty
+            // deployment name disables copying.
             config_source: ConfigSource {
                 deployment: var(
                     "DEJA_CONFIG_SOURCE_DEPLOYMENT",
                     "replay-{record_sha}-hyperswitch-server",
                 ),
                 container: var("DEJA_CONFIG_SOURCE_CONTAINER", "hyperswitch-router"),
+            },
+            config_file: ConfigFile {
+                config_map: var(
+                    "DEJA_CONFIG_FILE_CONFIGMAP",
+                    "router-cm-replay-{record_sha}",
+                ),
+                volume: var("DEJA_CONFIG_FILE_VOLUME", "router-config"),
             },
         }
     }
@@ -189,17 +232,6 @@ pub fn record_sha_from_image(image: &str) -> Option<String> {
         return None;
     }
     Some(tag.to_owned())
-}
-
-/// The config-artifact ConfigMap names the version-keyed replay-env-app pool
-/// renders for a record sha, mirroring its `releaseName: replay-<sha>` convention:
-/// returns `(router_config_map, configs_config_map)` =
-/// (`router-cm-replay-<sha>`, `replay-<sha>-hyperswitch-configs`).
-pub fn config_artifact_names(record_sha: &str) -> (String, String) {
-    (
-        format!("router-cm-replay-{record_sha}"),
-        format!("replay-{record_sha}-hyperswitch-configs"),
-    )
 }
 
 #[cfg(test)]
@@ -301,11 +333,37 @@ mod tests {
         assert_eq!(cs.deployment_for(Some("abc")), None);
     }
 
+    /// The config-file ConfigMap is named by a profile-supplied pattern, so this
+    /// crate imposes no naming convention of its own — any recorded system's
+    /// scheme works, including one with no version in the name at all.
     #[test]
-    fn config_artifact_names_follow_the_pool_release_convention() {
-        let (router_cm, configs_cm) = config_artifact_names("dcb9f9e955");
-        assert_eq!(router_cm, "router-cm-replay-dcb9f9e955");
-        assert_eq!(configs_cm, "replay-dcb9f9e955-hyperswitch-configs");
+    fn config_file_config_map_comes_from_the_configured_pattern() {
+        let cf = ConfigFile {
+            config_map: "any-scheme-{record_sha}-suffix".into(),
+            volume: "some-volume".into(),
+        };
+        assert_eq!(
+            cf.config_map_for(Some("abc123")).as_deref(),
+            Some("any-scheme-abc123-suffix")
+        );
+        // version-keyed pattern + no record sha: no name, so the caller leaves the
+        // template's own reference alone rather than guessing a version.
+        assert_eq!(cf.config_map_for(None), None);
+
+        let fixed = ConfigFile {
+            config_map: "one-fixed-configmap".into(),
+            volume: "some-volume".into(),
+        };
+        assert_eq!(
+            fixed.config_map_for(None).as_deref(),
+            Some("one-fixed-configmap")
+        );
+
+        let off = ConfigFile {
+            config_map: String::new(),
+            volume: "some-volume".into(),
+        };
+        assert_eq!(off.config_map_for(Some("abc123")), None);
     }
 
     #[test]

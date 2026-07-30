@@ -8,9 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{
-    config_artifact_names, record_sha_from_image, resolve_candidate_image, K8sExecutorConfig,
-};
+use super::config::{record_sha_from_image, resolve_candidate_image, K8sExecutorConfig};
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
 use super::patch::{
@@ -171,9 +169,13 @@ pub fn launch_spec_for_run(
         .as_deref()
         .and_then(record_sha_from_image);
 
-    let config_artifacts = record_sha.as_deref().map(|sha| ConfigArtifacts {
-        router_config_map: config_artifact_names(sha).0,
-    });
+    let config_artifacts =
+        cfg.config_file
+            .config_map_for(record_sha.as_deref())
+            .map(|config_map| ConfigArtifacts {
+                volume: cfg.config_file.volume.clone(),
+                config_map,
+            });
 
     let config_source = match cfg.config_source.deployment_for(record_sha.as_deref()) {
         Some(deployment) => Some(ConfigSourceRef {

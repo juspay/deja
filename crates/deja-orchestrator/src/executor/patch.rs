@@ -41,12 +41,16 @@ pub struct JobPatch {
 
 /// Repoint the config-file volume at one record version's ConfigMap (the config
 /// baseline the candidate reads from disk — the part that is a FILE, not env).
-/// The volume must exist in the template: a missing one is a loud error, never a
-/// silent boot against the default version's config (a wrong-verdict trap).
+/// Both names are supplied by the caller from deployment profile data, so no
+/// recorded system's vocabulary appears here. The volume must exist in the
+/// template: a missing one is a loud error, never a silent boot against another
+/// version's config (a wrong-verdict trap).
 #[derive(Debug, Clone)]
 pub struct ConfigArtifacts {
-    /// New name for the config-file volume's configMap.
-    pub router_config_map: String,
+    /// The Job template's volume to repoint.
+    pub volume: String,
+    /// ConfigMap it should mount for this run.
+    pub config_map: String,
 }
 
 /// The recorded system's own generated container env, copied verbatim.
@@ -66,10 +70,6 @@ pub struct ConfigEnvCopy {
     /// The source container's `envFrom` list, verbatim.
     pub env_from: Vec<Value>,
 }
-
-/// The pod volume (in the Job template) that mounts the router.toml baseline.
-/// Fixed protocol name shared with the replay-env chart's `job-configmap.yaml`.
-const ROUTER_CONFIG_VOLUME: &str = "router-config";
 
 /// A single Kubernetes ownerReference. The owner MUST be same-namespace as the
 /// Job (k8s forbids cross-namespace ownerRefs — a cross-ns ref makes the Job
@@ -248,15 +248,13 @@ fn apply_config_artifacts(job: &mut Value, ca: &ConfigArtifacts) -> Result<(), P
         .ok_or_else(|| PatchError::Shape("spec.template.spec.volumes".into()))?;
     let vol = vols
         .iter_mut()
-        .find(|v| v.get("name").and_then(Value::as_str) == Some(ROUTER_CONFIG_VOLUME))
-        .ok_or_else(|| PatchError::Shape(format!("volume '{ROUTER_CONFIG_VOLUME}' not found")))?;
+        .find(|v| v.get("name").and_then(Value::as_str) == Some(ca.volume.as_str()))
+        .ok_or_else(|| PatchError::Shape(format!("volume '{}' not found", ca.volume)))?;
     let cm = vol
         .get_mut("configMap")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            PatchError::Shape(format!("volume '{ROUTER_CONFIG_VOLUME}' has no configMap"))
-        })?;
-    cm.insert("name".into(), Value::String(ca.router_config_map.clone()));
+        .ok_or_else(|| PatchError::Shape(format!("volume '{}' has no configMap", ca.volume)))?;
+    cm.insert("name".into(), Value::String(ca.config_map.clone()));
     Ok(())
 }
 
@@ -389,7 +387,8 @@ mod tests {
     fn config_artifacts_repoints_volume_and_envfrom() {
         let patch = JobPatch {
             config_artifacts: Some(ConfigArtifacts {
-                router_config_map: "router-cm-replay-abc123".into(),
+                volume: "router-config".into(),
+                config_map: "router-cm-replay-abc123".into(),
             }),
             ..Default::default()
         };
@@ -411,7 +410,8 @@ mod tests {
         // template() has no volumes at all — a repoint must error, not no-op.
         let patch = JobPatch {
             config_artifacts: Some(ConfigArtifacts {
-                router_config_map: "x".into(),
+                volume: "router-config".into(),
+                config_map: "x".into(),
             }),
             ..Default::default()
         };
