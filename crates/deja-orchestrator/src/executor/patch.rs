@@ -167,13 +167,29 @@ pub fn apply_job_patch(template: &Value, patch: &JobPatch) -> Result<Value, Patc
         )?;
     }
 
-    // L1: the recorded system's generated env, copied wholesale. Applied BEFORE
-    // the per-run upserts below (and before the images/env early-return, so a
-    // config-only patch still lands) so the replay overrides (localhost stores,
-    // replay mode, run id) win over the recorded values they must displace.
+    // The recorded system's generated env, copied in UNDER the template's own.
+    //
+    // The template's env is the replay delta: every entry is there because replay
+    // differs from recording — the stores are the Job's own sidecars, deja runs in
+    // replay mode, the artifacts are this run's. Those MUST outrank the recorded
+    // values they displace, so the copy goes in first and the template's entries
+    // are layered back on top by name. Replacing outright would point the
+    // candidate at the recorded environment's live database and redis.
+    //
+    // Runs before the images/env early-return so a config-only patch still lands;
+    // the per-run upserts further below then apply last of all.
     if let Some(ce) = &patch.config_env {
         let c = find_container_in_job(&mut job, &ce.container)?;
-        c.insert("env".into(), Value::Array(ce.env.clone()));
+        let overrides: Vec<Value> = c
+            .get("env")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut env = ce.env.clone();
+        for entry in overrides {
+            upsert_entry(&mut env, entry);
+        }
+        c.insert("env".into(), Value::Array(env));
         c.insert("envFrom".into(), Value::Array(ce.env_from.clone()));
     }
 
@@ -278,10 +294,20 @@ fn find_container_in_job<'a>(
 /// Replace the `{name,value}` entry with this name, or append it. k8s env is an
 /// ordered list of `{name, value}`; a duplicate name is undefined, so upsert.
 fn upsert_env(env: &mut Vec<Value>, name: &str, value: &str) {
-    let entry = serde_json::json!({ "name": name, "value": value });
+    upsert_entry(env, serde_json::json!({ "name": name, "value": value }));
+}
+
+/// Upsert a WHOLE env entry by its `name`, so an entry carrying `valueFrom`
+/// (a secret or downward-API reference) survives intact rather than being
+/// flattened to a literal. An entry without a name is dropped: k8s would reject
+/// it, and silently shipping one would fail the pod for a non-obvious reason.
+fn upsert_entry(env: &mut Vec<Value>, entry: Value) {
+    let Some(name) = entry.get("name").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
     if let Some(existing) = env
         .iter_mut()
-        .find(|e| e.get("name").and_then(Value::as_str) == Some(name))
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(name.as_str()))
     {
         *existing = entry;
     } else {
@@ -331,6 +357,13 @@ mod tests {
                 ],
                 "containers": [
                     { "name": "candidate", "image": "candidate:template",
+                      // The template carries the REPLAY DELTA, exactly as the real
+                      // one does: sealed-pod store coordinates and runtime knobs
+                      // that must outrank whatever the recorded env says.
+                      "env": [
+                          { "name": "RUST_MIN_STACK", "value": "16777216" },
+                          { "name": "ROUTER__MASTER_DATABASE__HOST", "value": "127.0.0.1" }
+                      ],
                       "envFrom": [
                           { "configMapRef": { "name": "replay-default-hyperswitch-configs" } },
                           { "secretRef": { "name": "replay-crypto" } }
@@ -358,12 +391,13 @@ mod tests {
                 env: copied_env,
                 env_from: vec![json!({ "configMapRef": { "name": "recorded-configs" } })],
             }),
-            // L2 replay override for a key the recorded env also sets.
-            env: vec![EnvUpsert::new(
-                "candidate",
-                "ROUTER__MASTER_DATABASE__HOST",
-                "127.0.0.1",
-            )],
+            // Only the per-run bindings, as the executor really builds them — the
+            // store overrides come from the TEMPLATE, not from here. Passing them
+            // here instead is what let a bug hide: the copy replaced the
+            // template's env wholesale, so every override that is not restated as
+            // a per-run upsert was silently dropped, pointing the candidate at the
+            // recorded environment's own database.
+            env: vec![EnvUpsert::new("candidate", "ROUTER__DEJA__MODE", "replay")],
             ..Default::default()
         };
         let out = apply_job_patch(&template_with_env_sources(), &patch).expect("applies");
@@ -390,13 +424,34 @@ mod tests {
                 .expect("copied RUN_ENV")["value"],
             json!("sandbox")
         );
-        // the replay override REPLACED the recorded value (exactly once)
+        // The template's replay override outranks the recorded value (exactly
+        // once). This is the sealed-pod contract: the candidate must reach the
+        // Job's own store, never the one the recording ran against.
         let hosts: Vec<_> = env
             .iter()
             .filter(|e| e["name"] == json!("ROUTER__MASTER_DATABASE__HOST"))
             .collect();
         assert_eq!(hosts.len(), 1, "override replaces, not duplicates");
-        assert_eq!(hosts[0]["value"], json!("127.0.0.1"));
+        assert_eq!(
+            hosts[0]["value"],
+            json!("127.0.0.1"),
+            "recorded database host must not survive the copy"
+        );
+        // A template override with NO per-run counterpart survives too — these are
+        // the ones a wholesale replace loses without any test noticing.
+        assert_eq!(
+            env.iter()
+                .find(|e| e["name"] == json!("RUST_MIN_STACK"))
+                .expect("template override kept")["value"],
+            json!("16777216")
+        );
+        // and the per-run binding still lands last
+        assert_eq!(
+            env.iter()
+                .find(|e| e["name"] == json!("ROUTER__DEJA__MODE"))
+                .expect("per-run binding")["value"],
+            json!("replay")
+        );
         // envFrom came from the copy, replacing the template's own
         assert_eq!(
             cand["envFrom"][0]["configMapRef"]["name"],
