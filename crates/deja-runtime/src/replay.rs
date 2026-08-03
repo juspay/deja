@@ -2196,6 +2196,25 @@ impl SeedPlan {
         self.entries.values()
     }
 
+    /// The distinct DB tables whose rows this plan seeds as read-preconditions
+    /// (parsed from the `db` entries' state keys). These are the tables that
+    /// MUST exist in the correlation's isolation schema so the seeded rows land
+    /// and replay reads resolve to them. Tables the correlation only WRITES to
+    /// (creates) are NOT here — they carry no seeded rows — see
+    /// [`build_write_target_tables`] for the write-isolation set. Sorted for
+    /// deterministic DDL.
+    pub fn touched_db_tables(&self) -> Vec<String> {
+        let mut tables: Vec<String> = self
+            .entries
+            .values()
+            .filter(|e| e.boundary == "db")
+            .filter_map(|e| db_table_for_state_key(&e.key))
+            .collect();
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+
     /// Merge an [`AmbientTemplate`] into this plan (deliverable 4). Ambient
     /// entries fill keys the recording never observed (e.g. a config rate a
     /// re-keyed read reaches for); they never overwrite a recording-derived
@@ -2442,7 +2461,6 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 });
             }
         }
-
         // THEN mark this event's writes: subsequent reads of these keys observe the
         // post-write value (no longer a precondition), and a create additionally
         // masks later read-backs of the whole table (they'd collide with the
@@ -2458,6 +2476,46 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     }
 
     plan
+}
+
+/// The distinct DB tables this correlation WRITES to — the write-isolation set.
+/// A table here must exist in the correlation's schema (cloned from `public`) so
+/// replayed writes resolve to the isolation schema, not to the shared `public`
+/// base. Derived from the same events [`build_seed_plan`] scans: any event whose
+/// `write_set` or create-envelope names a DB table counts. Sorted for
+/// deterministic DDL.
+///
+/// Together with [`SeedPlan::touched_db_tables`], this is the full set of tables
+/// the harness must clone per correlation — everything else resolves to the
+/// (empty, freshly-migrated) `public` via `search_path` fallback as a correct
+/// miss, so it need not be cloned.
+pub fn build_write_target_tables(
+    events: &[BoundaryEvent],
+    correlation_id: Option<&str>,
+) -> Vec<String> {
+    let mut tables: Vec<String> = Vec::new();
+    for event in events {
+        if !correlation_matches(event, correlation_id) {
+            continue;
+        }
+        if event.boundary != "db" {
+            continue;
+        }
+        // A create event names its table in the args/request envelope; other
+        // writes carry table identity in their write_set state keys.
+        if let Some(table) = db_created_table(event) {
+            tables.push(table);
+            continue;
+        }
+        for key in &event.write_set {
+            if let Some(table) = db_table_for_state_key(key) {
+                tables.push(table);
+            }
+        }
+    }
+    tables.sort();
+    tables.dedup();
+    tables
 }
 
 // ---------------------------------------------------------------------------
@@ -5176,6 +5234,181 @@ redis\tcurrency\tusd
             !call.seed_gap,
             "a novel call (no recorded event) must NOT be flagged seed_gap — it is a \
              NovelCall, not a swallowed InconclusiveSeedGap (the extra-call regression)"
+        );
+    }
+
+    /// `touched_db_tables` returns exactly the read-precondition tables (db
+    /// entries' keys), deduplicated — the set the harness must clone so seeded
+    /// rows land. Write-target tables are NOT here (no seeded rows for them).
+    #[test]
+    fn touched_db_tables_lists_only_read_precondition_tables() {
+        let users_key = StateKey::DbRow {
+            table: "users".to_owned(),
+            pk_column: "user_id".to_owned(),
+            pk_value: "u1".to_owned(),
+        }
+        .to_wire();
+        let mca_key = StateKey::DbRow {
+            table: "merchant_connector_account".to_owned(),
+            pk_column: "merchant_connector_account_id".to_owned(),
+            pk_value: "mca1".to_owned(),
+        }
+        .to_wire();
+        // Two reads of `users` (one is a dup) + one read of `mca`; a redis read
+        // must not appear in the db table set.
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "db",
+                "fetch",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &[&users_key],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c1"),
+                "db",
+                "fetch",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &[&users_key],
+                &[],
+                false,
+            ),
+            state_event(
+                2,
+                Some("c1"),
+                "db",
+                "fetch",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &[&mca_key],
+                &[],
+                false,
+            ),
+            state_event(
+                3,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!([]),
+                serde_json::json!("0.20"),
+                &["rate"],
+                &[],
+                false,
+            ),
+        ];
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.touched_db_tables(),
+            vec!["merchant_connector_account".to_owned(), "users".to_owned()],
+            "touched_db_tables = distinct read-precondition tables, sorted; no redis"
+        );
+    }
+
+    /// `build_write_target_tables` returns the tables a correlation WRITES to —
+    /// derived from write_set state keys — so the harness clones them for write
+    /// isolation. A write-only correlation (no reads → empty plan) still gets its
+    /// write-target tables here, so its schema is provisioned.
+    #[test]
+    fn build_write_target_tables_lists_write_isolation_tables() {
+        let pi_key = StateKey::DbRow {
+            table: "payment_intent".to_owned(),
+            pk_column: "payment_id".to_owned(),
+            pk_value: "pay_1".to_owned(),
+        }
+        .to_wire();
+        // A write to payment_intent; a read of users (must NOT appear in the
+        // write-target set); a redis write (not a db table).
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "db",
+                "fetch",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &["users:k"],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c1"),
+                "db",
+                "update",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &[],
+                &[&pi_key],
+                false,
+            ),
+            state_event(
+                2,
+                Some("c1"),
+                "redis",
+                "set",
+                serde_json::json!([]),
+                serde_json::json!("ok"),
+                &[],
+                &["rate"],
+                false,
+            ),
+        ];
+        let writes = build_write_target_tables(&events, Some("c1"));
+        assert_eq!(
+            writes,
+            vec!["payment_intent".to_owned()],
+            "write-target set = distinct db write tables only; reads and redis excluded"
+        );
+    }
+
+    /// A correlation scoped to a different id contributes no tables to either set.
+    #[test]
+    fn table_sets_are_correlation_scoped() {
+        let key = StateKey::DbRow {
+            table: "users".to_owned(),
+            pk_column: "user_id".to_owned(),
+            pk_value: "u1".to_owned(),
+        }
+        .to_wire();
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "db",
+                "fetch",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &[&key],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c2"),
+                "db",
+                "update",
+                serde_json::json!([]),
+                serde_json::json!({}),
+                &[],
+                &[&key],
+                false,
+            ),
+        ];
+        assert_eq!(
+            build_seed_plan(&events, Some("c1")).touched_db_tables(),
+            vec!["users".to_owned()],
+            "c1 read-precondition tables scoped to c1"
+        );
+        assert_eq!(
+            build_write_target_tables(&events, Some("c1")),
+            Vec::<String>::new(),
+            "c1 has no writes → empty write-target set"
         );
     }
 }
