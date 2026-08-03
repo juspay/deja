@@ -2381,6 +2381,16 @@ fn load_db_catalog(store: &StoreExec) -> DbCatalog {
                 catalog.columns_by_table.len(),
                 catalog.column_count()
             );
+            if catalog.columns_by_table.is_empty() {
+                // psql succeeded and returned nothing: the query ran against a
+                // database whose `public` schema has no tables. Seeding will then
+                // render every column untyped and quietly mis-materialize the
+                // typed ones, so say so here rather than let it look like a row
+                // problem later.
+                eprintln!(
+                    "lifecycle: db catalog is EMPTY — every seeded column will be rendered without type information"
+                );
+            }
             catalog
         }
         Ok(output) => {
@@ -2744,10 +2754,29 @@ fn sql_literal_for_column(column: &DbColumnImage) -> Option<String> {
                     "lifecycle: cannot render non-scalar seed value for column {} of type {:?}/{:?}; skipping row",
                     md.name, md.type_oid, md.type_name
                 );
-                None
-            } else {
-                Some(sql_literal(&column.value))
+                return None;
             }
+            // No catalog metadata AND a non-scalar value: the plain-quote path is
+            // a coin flip decided by the column's real type. Postgres coerces an
+            // unquoted-type literal into json/jsonb happily, so an object or array
+            // in a json column still lands; the same literal in an ARRAY column is
+            // read as an array constructor and fails ("malformed array literal").
+            // Rendering it anyway is the pre-existing behaviour and is right more
+            // often than not, but a column reaching here at all means the catalog
+            // did not cover it — name it, because that gap is the actual bug and
+            // it is otherwise invisible.
+            if is_non_scalar {
+                eprintln!(
+                    "lifecycle: no pg catalog metadata for column {}; rendering its {} seed value as a plain literal, which pg will reject if the column is array-typed",
+                    md.name,
+                    if column.value.is_array() {
+                        "array"
+                    } else {
+                        "object"
+                    },
+                );
+            }
+            Some(sql_literal(&column.value))
         }
     }
 }
@@ -4853,6 +4882,34 @@ mod tests {
                 nullable: Some(true),
             }),
             Err(())
+        );
+    }
+
+    #[test]
+    fn uncatalogued_nonscalar_column_still_renders() {
+        // The complement of the fail-closed case: NO type metadata at all. The
+        // plain-quote path stays (pg coerces an unknown-type literal into a
+        // json/jsonb column, so skipping would lose rows that seed correctly
+        // today) — but this is the shape that produces "malformed array literal"
+        // when the column turns out to be array-typed, so the renderer logs it.
+        // A column reaching here means the pg catalog did not cover it.
+        let column = DbColumnImage {
+            metadata: DbColumnMetadata::unknown("payment_methods_enabled"),
+            value: serde_json::json!([{"payment_method": "card"}]),
+        };
+        assert_eq!(
+            sql_literal_for_column(&column),
+            Some("'[{\"payment_method\":\"card\"}]'".to_string())
+        );
+
+        // Scalars in an uncatalogued column are unambiguous and stay quiet.
+        let scalar = DbColumnImage {
+            metadata: DbColumnMetadata::unknown("profile_name"),
+            value: serde_json::json!("US_default"),
+        };
+        assert_eq!(
+            sql_literal_for_column(&scalar),
+            Some("'US_default'".to_string())
         );
     }
 
