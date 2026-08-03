@@ -475,13 +475,39 @@ async fn v1_kill_run(
     let ExecutorSelection::K8s(k) = &*st.executor else {
         return error_resp(400, "kill is only supported for the k8s executor");
     };
-    let api = match deja_orchestrator::executor::UreqTransport::new(&k.incluster) {
-        Ok(t) => deja_orchestrator::executor::KubeApi::new(t),
-        Err(e) => return error_resp(500, &format!("k8s client: {e}")),
-    };
-    let report = match deja_orchestrator::executor::kill_run(&api, &k.cfg.jobs_namespace, &run_id) {
-        Ok(r) => r,
-        Err(e) => return error_resp(500, &format!("kill run: {e}")),
+    let incluster = k.incluster.clone();
+    let namespace = k.cfg.jobs_namespace.clone();
+    let store = st.store.clone();
+    let handle = tokio::runtime::Handle::current();
+    let (id, who) = (run_id.clone(), actor.0.clone());
+
+    // Off the async runtime: the apiserver client is blocking, and settling the
+    // run goes through the same StoreCtx the worker thread uses, which drives its
+    // async writes with `Handle::block_on` — that panics if called on a runtime
+    // thread, taking the connection down with it.
+    let report = match tokio::task::spawn_blocking(move || {
+        let transport = deja_orchestrator::executor::UreqTransport::new(&incluster)
+            .map_err(|e| format!("k8s client: {e}"))?;
+        let api = deja_orchestrator::executor::KubeApi::new(transport);
+        let report = deja_orchestrator::executor::kill_run(&api, &namespace, &id)
+            .map_err(|e| format!("kill run: {e}"))?;
+        // Settle the run so it stops showing as in-flight. The store's terminal
+        // guard makes this a no-op if the runner already reported a verdict.
+        let ctx = match &store {
+            Some(s) => deja_orchestrator::lifecycle::StoreCtx::new(
+                &id,
+                Some((handle, std::sync::Arc::clone(s))),
+            ),
+            None => deja_orchestrator::lifecycle::StoreCtx::disabled(&id),
+        };
+        ctx.finish(false, Some(&format!("killed by {who}")));
+        Ok::<_, String>(report)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return error_resp(500, &e),
+        Err(e) => return error_resp(500, &format!("kill task: {e}")),
     };
 
     if let Some(store) = &st.store {
@@ -497,16 +523,6 @@ async fn v1_kill_run(
             )
             .await;
     }
-    // Settle the run so it stops showing as in-flight. The store's terminal
-    // guard makes this a no-op if the runner already reported a verdict.
-    let ctx = match &st.store {
-        Some(store) => deja_orchestrator::lifecycle::StoreCtx::new(
-            &run_id,
-            Some((tokio::runtime::Handle::current(), store.clone())),
-        ),
-        None => deja_orchestrator::lifecycle::StoreCtx::disabled(&run_id),
-    };
-    ctx.finish(false, Some(&format!("killed by {}", actor.0)));
 
     json_ok(serde_json::json!({
         "run_id": run_id,
