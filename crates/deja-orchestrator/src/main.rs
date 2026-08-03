@@ -9,6 +9,7 @@
 //!   POST /api/v1/runs                     → create a run (spawns the worker)
 //!   GET  /api/v1/runs                     → run list
 //!   POST /api/v1/runs/{id}/events         → push-back ingest (out-of-process runner)
+//!   POST /api/v1/runs/{id}/kill           → stop a run, delete its Job + pods
 //!   GET  /api/v1/runs/{id}                → store row + live worker snapshot
 //!   GET  /api/v1/runs/{id}/stages         → stage history
 //!   GET  /api/v1/runs/{id}/logs           → persisted worker logs
@@ -216,6 +217,8 @@ fn app_router(state: AppState) -> Router {
     // internal-only, so reachability is the access boundary). The service secret
     // stays scoped to inter-service callbacks below.
     let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
+    // Killing a run is a human action like creating one: same auth, and audited.
+    let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
     // Push-back ingest: an out-of-process lifecycle runner (the k8s Job) reports
     // RunEvents here and authenticates with the service token (require_service_auth).
     let ingest_run_event = post(v1_ingest_run_event).route_layer(middleware::from_fn_with_state(
@@ -228,6 +231,7 @@ fn app_router(state: AppState) -> Router {
         .route("/recordings", get(v1_list_recordings))
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
+        .route("/runs/{run_id}/kill", kill_run_route)
         .route("/runs/{run_id}", get(v1_get_run))
         .route("/runs/{run_id}/stages", get(v1_run_stages))
         .route("/runs/{run_id}/logs", get(v1_run_logs))
@@ -452,6 +456,64 @@ async fn v1_create_run(
         })
         .unwrap_or_default(),
     )
+}
+
+/// `POST /api/v1/runs/{run_id}/kill` — stop a run and reclaim its pod.
+///
+/// A replay pod holds a candidate, a runner and two stores, and it is kept after
+/// the Job finishes so its logs can be read — so a run left running, or one whose
+/// Job outlives a failure, sits on that for hours. This deletes the Job and
+/// sweeps any pod the cascade misses, then records the run as failed.
+///
+/// Idempotent: killing an already-dead run reports nothing removed and still
+/// succeeds, so it is always safe to press again.
+async fn v1_kill_run(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let ExecutorSelection::K8s(k) = &*st.executor else {
+        return error_resp(400, "kill is only supported for the k8s executor");
+    };
+    let api = match deja_orchestrator::executor::UreqTransport::new(&k.incluster) {
+        Ok(t) => deja_orchestrator::executor::KubeApi::new(t),
+        Err(e) => return error_resp(500, &format!("k8s client: {e}")),
+    };
+    let report = match deja_orchestrator::executor::kill_run(&api, &k.cfg.jobs_namespace, &run_id) {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("kill run: {e}")),
+    };
+
+    if let Some(store) = &st.store {
+        let _ = store
+            .audit(
+                &actor.0,
+                "run.kill",
+                "run",
+                &run_id,
+                &serde_json::json!({ "job_deleted": report.job_deleted,
+                                     "pods_deleted": report.pods_deleted,
+                                     "problems": report.problems }),
+            )
+            .await;
+    }
+    // Settle the run so it stops showing as in-flight. The store's terminal
+    // guard makes this a no-op if the runner already reported a verdict.
+    let ctx = match &st.store {
+        Some(store) => deja_orchestrator::lifecycle::StoreCtx::new(
+            &run_id,
+            Some((tokio::runtime::Handle::current(), store.clone())),
+        ),
+        None => deja_orchestrator::lifecycle::StoreCtx::disabled(&run_id),
+    };
+    ctx.finish(false, Some(&format!("killed by {}", actor.0)));
+
+    json_ok(serde_json::json!({
+        "run_id": run_id,
+        "job_deleted": report.job_deleted,
+        "pods_deleted": report.pods_deleted,
+        "problems": report.problems,
+    }))
 }
 
 /// `POST /api/v1/runs/{run_id}/events` — push-back ingest for an

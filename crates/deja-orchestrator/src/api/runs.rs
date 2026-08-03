@@ -5,8 +5,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::executor::{
-    launch, launch_spec_for_run, watch_to_terminal, InClusterConfig, K8sExecutorConfig, KubeApi,
-    UreqTransport,
+    collect_pod_diagnostics, launch, launch_spec_for_run, watch_to_terminal, InClusterConfig,
+    K8sExecutorConfig, KubeApi, UreqTransport,
 };
 use crate::lifecycle::StoreCtx;
 use crate::{new_id, read_json, write_json, HarnessRoot, Run, RunMode, RunSpec, RunStatus};
@@ -230,14 +230,37 @@ pub fn spawn_k8s_run(
             std::thread::sleep,
         ) {
             Ok(Some(true)) => ctx.finish(true, None),
-            Ok(Some(false)) => ctx.finish(false, Some("job failed (see runner logs / pod events)")),
-            Ok(None) => ctx.finish(
-                false,
-                Some("job did not reach a terminal state within the watch deadline"),
-            ),
+            Ok(Some(false)) => {
+                capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
+                ctx.finish(
+                    false,
+                    Some("job failed (see pod diagnostics in the run log)"),
+                )
+            }
+            Ok(None) => {
+                capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
+                ctx.finish(
+                    false,
+                    Some("job did not reach a terminal state within the watch deadline"),
+                )
+            }
             Err(e) => ctx.finish(false, Some(&format!("watch job: {e}"))),
         }
     });
+}
+
+/// Pull the pod's per-container state and output into the run's log, so a failure
+/// can be read from the run itself. Runs after the failure is known and before it
+/// is recorded, so the diagnostics are already there when someone opens the run.
+fn capture_diagnostics<T: crate::executor::KubeTransport>(
+    api: &KubeApi<T>,
+    cfg: &K8sExecutorConfig,
+    run_id: &str,
+    ctx: &StoreCtx,
+) {
+    for (label, body) in collect_pod_diagnostics(api, &cfg.jobs_namespace, run_id, 200) {
+        ctx.log("diagnostics", &format!("{label}: {body}"));
+    }
 }
 
 /// Serialized run mode (the store's `mode` column).
