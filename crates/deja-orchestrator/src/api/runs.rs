@@ -181,11 +181,14 @@ pub fn spawn_k8s_run(
 ) {
     let root_path = root.root.clone();
     std::thread::spawn(move || {
-        let root = match HarnessRoot::new(&root_path) {
-            Ok(r) => r,
-            Err(e) => return ctx.finish(false, Some(&format!("state root: {e}"))),
-        };
-        let contract = root.replay_contract(&run.run_id);
+        // Fail the run cleanly if the control plane's own state root is unusable.
+        // Nothing is derived FROM it here: a run's artifacts live on the pod's
+        // shared mount, and the executor derives their paths there, so the
+        // candidate is never handed a path from this filesystem.
+        if let Err(e) = HarnessRoot::new(&root_path) {
+            return ctx.finish(false, Some(&format!("state root: {e}")));
+        }
+        //
         // A1/P1: resolve the candidate's migration bundle from its ref — the
         // expected set (runner refuses on drift) AND the S3 URI the migrations
         // initContainer pulls the candidate's own migrations from. Absent →
@@ -195,7 +198,7 @@ pub fn spawn_k8s_run(
             Some((fp, u)) => (Some(fp), Some(u.as_str())),
             None => (None, None),
         };
-        let spec = match launch_spec_for_run(&run, &contract, &cfg, expected, uri) {
+        let spec = match launch_spec_for_run(&run, &cfg, expected, uri) {
             Ok(s) => s,
             Err(e) => {
                 ctx.log("launch", &format!("build launch spec failed: {e}"));

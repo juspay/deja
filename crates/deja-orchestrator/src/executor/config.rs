@@ -48,6 +48,15 @@ pub struct K8sExecutorConfig {
     /// candidate/template specifics are compiled in.
     pub migrations_init_container: String,
     pub code_bundle_uri_env: String,
+    /// The Job's shared state mount — where the runner writes a run's artifacts
+    /// and the candidate reads and writes them.
+    ///
+    /// This is NOT the control plane's own state directory. The orchestrator
+    /// derives run paths under its own root to track a run; the pod has a
+    /// different filesystem entirely, and pointing the candidate at a control
+    /// plane path gives it something it cannot open. Must match the Job
+    /// template's workspace `mountPath` and the runner's `HARNESS_STATE_DIR`.
+    pub job_state_dir: String,
     pub candidate_binding: CandidateBinding,
     /// Where the candidate's config env is COPIED from: the recorded system's own
     /// rendered workload (artifact-only, one current render).
@@ -83,6 +92,7 @@ impl K8sExecutorConfig {
             runner_container: var("DEJA_RUNNER_CONTAINER", "runner"),
             migrations_init_container: var("DEJA_MIGRATIONS_INIT_CONTAINER", "migrations"),
             code_bundle_uri_env: var("DEJA_CODE_BUNDLE_URI_ENV", "DEJA_CODE_BUNDLE_URI"),
+            job_state_dir: var("DEJA_JOB_STATE_DIR", "/workspace/state"),
             // Defaults are the Hyperswitch-router binding; a different candidate
             // overrides these. They are config defaults (a deployment concern),
             // not names baked into the patch/artifact logic.
