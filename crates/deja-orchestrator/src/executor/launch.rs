@@ -4,6 +4,7 @@
 //! boot guard, resource limits) is the env profile's; this module only overlays
 //! the per-run fields and drives the lifecycle.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -14,7 +15,7 @@ use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
 use super::patch::{
     apply_job_patch, referenced_secret_names, ConfigEnvCopy, EnvUpsert, JobPatch, OwnerRef,
 };
-use crate::{ReplayContract, Run, SchemaFingerprint};
+use crate::{HarnessRoot, Run, SchemaFingerprint};
 
 /// The label the launcher stamps on every replay Job (and its pod template),
 /// carrying the run id that Job backs. One source of truth for both sides: the
@@ -119,15 +120,18 @@ pub fn job_name_for(run_id: &str) -> String {
     s
 }
 
-/// Build a [`LaunchSpec`] from a run + its harness contract + the k8s config.
-/// Composes the runner's per-run env and the candidate's bound env (both derived
-/// from the contract + resolved sha — no constants), and resolves the candidate
-/// image. `expected_schema` is the candidate's migration set once resolved
-/// (Option B: the staged CodeBundle); `None` runs the P1 gate in record-only
-/// mode until that lands.
+/// Build a [`LaunchSpec`] from a run + the k8s config.
+///
+/// Composes the runner's per-run env and the candidate's bound env, and resolves
+/// the candidate image. The artifact contract is derived HERE, at the Job's state
+/// mount, rather than taken from the caller: the control plane's own contract
+/// names paths on a filesystem the pod does not have, and passing one in is how
+/// the candidate ends up pointed at a sink it cannot open.
+///
+/// `expected_schema` is the candidate's migration set once resolved (Option B:
+/// the staged CodeBundle); `None` runs the P1 gate in record-only mode.
 pub fn launch_spec_for_run(
     run: &Run,
-    contract: &ReplayContract,
     cfg: &K8sExecutorConfig,
     expected_schema: Option<&SchemaFingerprint>,
     code_bundle_uri: Option<&str>,
@@ -142,7 +146,17 @@ pub fn launch_spec_for_run(
         &run_spec_json,
         expected_schema,
     );
-    env.extend(cfg.candidate_binding.env_for(contract, &code_sha));
+    // Point the candidate at the JOB's copy of the run artifacts, not the control
+    // plane's. `contract` is derived from the orchestrator's own state root, which
+    // exists on a different filesystem than the pod: handing those paths to the
+    // candidate gives it a lookup table it cannot read and a sink it cannot write.
+    // Re-derive at the Job's shared mount through the SAME function the runner
+    // calls, so the two processes cannot drift apart on a path convention.
+    let job_contract = HarnessRoot {
+        root: PathBuf::from(&cfg.job_state_dir),
+    }
+    .replay_contract(&run.run_id);
+    env.extend(cfg.candidate_binding.env_for(&job_contract, &code_sha));
     // The migrations initContainer pulls the candidate's bundle from this URI
     // (Option B). Only injected when the bundle resolved — else the template's
     // placeholder stays and the init no-ops / fails loudly on a bad URI.
@@ -429,6 +443,61 @@ mod tests {
               ],
               "envFrom": [ { "configMapRef": { "name": "recorded-configs" } } ] }
         ] } } } })
+    }
+
+    /// The candidate's artifact paths must name the JOB's shared mount, never the
+    /// control plane's state root — those are different filesystems, and a path
+    /// from the wrong one is something the candidate cannot open. It failed
+    /// exactly that way once the candidate first booted: `failed to open replay
+    /// observed sink '/var/lib/deja/state/observed/<run>.jsonl': Permission denied`.
+    #[test]
+    fn candidate_artifact_paths_are_on_the_job_mount() {
+        let mut cfg = K8sExecutorConfig::from_env();
+        cfg.job_state_dir = "/workspace/state".into();
+        let run = Run {
+            run_id: "run-42".into(),
+            spec: crate::RunSpec {
+                mode: crate::RunMode::Replay,
+                candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                    image: "img:abc123".into(),
+                },
+                candidate_repo: None,
+                recording_id: None,
+                s3_source: None,
+                correlation_filter: None,
+                workload: serde_json::Value::Null,
+            },
+            status: crate::RunStatus::Pending,
+            recording_id: None,
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
+        let candidate: Vec<_> = spec
+            .env
+            .iter()
+            .filter(|e| e.container == cfg.candidate_binding.container)
+            .collect();
+        let val = |name: &str| {
+            candidate
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} bound"))
+                .value
+                .clone()
+        };
+        assert_eq!(
+            val(&cfg.candidate_binding.source_env),
+            "/workspace/state/lookup-tables/run-42.jsonl"
+        );
+        assert_eq!(
+            val(&cfg.candidate_binding.observed_env),
+            "/workspace/state/observed/run-42.jsonl"
+        );
     }
 
     fn spec_with_source() -> LaunchSpec {
