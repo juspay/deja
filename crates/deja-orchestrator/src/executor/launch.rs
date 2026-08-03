@@ -318,6 +318,203 @@ fn copy_config_env<T: KubeTransport>(
     })
 }
 
+/// What killing a run actually removed, so the caller can report it rather than
+/// claim success blindly.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct KillReport {
+    /// The Job, if it was still there. Absent = already gone, which is success.
+    pub job_deleted: Option<String>,
+    /// Pods deleted directly — normally none, since deleting the Job takes them.
+    pub pods_deleted: Vec<String>,
+    /// Non-fatal problems. A kill reports what it could not remove instead of
+    /// failing outright, so one stuck pod never blocks reclaiming the rest.
+    pub problems: Vec<String>,
+}
+
+/// Tear a run's Job down and make sure its pods go with it.
+///
+/// Deleting the Job cascades in the background, which is usually enough. But a
+/// replay pod is expensive — a candidate, a runner and two stores — and it can
+/// outlive its Job (a stuck terminating container, or a Job already reaped while
+/// its pod lingers). A failed run holding that for hours is why this sweeps the
+/// pods afterwards rather than trusting the cascade.
+///
+/// Idempotent: killing an already-dead run reports nothing removed and succeeds,
+/// so a retry is always safe.
+pub fn kill_run<T: KubeTransport>(
+    api: &KubeApi<T>,
+    namespace: &str,
+    run_id: &str,
+) -> Result<KillReport, ExecutorError> {
+    let mut report = KillReport::default();
+    let job = job_name_for(run_id);
+
+    match api.delete_job(namespace, &job) {
+        Ok(_) => report.job_deleted = Some(job.clone()),
+        // Already gone is the desired end state, not a failure.
+        Err(KubeError::Api { status: 404, .. }) => {}
+        Err(e) => report.problems.push(format!("delete job {job}: {e}")),
+    }
+
+    // Sweep whatever the cascade has not taken. Selecting by the run-id label
+    // catches a pod whose Job was already reaped.
+    match api.list_pods(namespace, &format!("{RUN_ID_LABEL}={run_id}")) {
+        Ok(pods) => {
+            for pod in pods {
+                let Some(name) = pod.pointer("/metadata/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                // A pod already terminating is on its way out; deleting again
+                // would be noise, not progress.
+                if pod.pointer("/metadata/deletionTimestamp").is_some() {
+                    continue;
+                }
+                match api.delete_pod(namespace, name) {
+                    Ok(_) => report.pods_deleted.push(name.to_owned()),
+                    Err(KubeError::Api { status: 404, .. }) => {}
+                    Err(e) => report.problems.push(format!("delete pod {name}: {e}")),
+                }
+            }
+        }
+        Err(e) => report.problems.push(format!("list pods: {e}")),
+    }
+    Ok(report)
+}
+
+/// Everything a dead run can still tell us about its pod: per-container state,
+/// and what each container printed.
+///
+/// The runner can only observe that the candidate never became healthy — the
+/// reason is in the candidate's own output, in a pod that is deleted soon after.
+/// Collected on failure so the account survives the pod, and reported through the
+/// run's own log rather than requiring cluster access to read.
+///
+/// Best-effort by construction: every step degrades to a note. A run has already
+/// failed by the time this is called, and a diagnostics error must never replace
+/// the real failure with one about diagnostics.
+pub fn collect_pod_diagnostics<T: KubeTransport>(
+    api: &KubeApi<T>,
+    namespace: &str,
+    run_id: &str,
+    tail_lines: u32,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let pods = match api.list_pods(namespace, &format!("{RUN_ID_LABEL}={run_id}")) {
+        Ok(p) if p.is_empty() => {
+            out.push((
+                "pod".into(),
+                format!("no pod carries {RUN_ID_LABEL}={run_id} — already garbage-collected?"),
+            ));
+            return out;
+        }
+        Ok(p) => p,
+        Err(e) => {
+            out.push(("pod".into(), format!("listing pods failed: {e}")));
+            return out;
+        }
+    };
+
+    for pod in &pods {
+        let name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let phase = pod
+            .pointer("/status/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        out.push((format!("pod/{name}"), format!("phase={phase}")));
+
+        // Container states first: they say WHICH container failed and how, which
+        // is what makes the logs below worth reading.
+        for (kind, path) in [
+            ("init", "/status/initContainerStatuses"),
+            ("container", "/status/containerStatuses"),
+        ] {
+            for cs in pod
+                .pointer(path)
+                .and_then(Value::as_array)
+                .unwrap_or(&vec![])
+            {
+                let cname = cs.get("name").and_then(Value::as_str).unwrap_or("?");
+                out.push((
+                    format!("pod/{name} {kind}/{cname}"),
+                    describe_container_state(cs),
+                ));
+            }
+        }
+
+        // Then each container's own output.
+        for (kind, path) in [
+            ("init", "/status/initContainerStatuses"),
+            ("container", "/status/containerStatuses"),
+        ] {
+            for cs in pod
+                .pointer(path)
+                .and_then(Value::as_array)
+                .unwrap_or(&vec![])
+            {
+                let Some(cname) = cs.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let body = match api.pod_logs(namespace, &name, cname, tail_lines) {
+                    Ok(l) if l.trim().is_empty() => "<no output>".to_owned(),
+                    Ok(l) => l,
+                    Err(e) => format!("<log unavailable: {e}>"),
+                };
+                out.push((format!("pod/{name} {kind}/{cname} log"), body));
+            }
+        }
+    }
+    out
+}
+
+/// One line describing a container's state: running, waiting with a reason, or
+/// terminated with its exit code — the shape `kubectl describe` shows, reduced to
+/// what identifies a failure.
+fn describe_container_state(status: &Value) -> String {
+    let ready = status
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let restarts = status
+        .get("restartCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let state = status.get("state").and_then(Value::as_object);
+    let detail = match state.and_then(|s| s.keys().next().cloned()) {
+        Some(k) => {
+            let inner = status.pointer(&format!("/state/{k}"));
+            let field = |f: &str| {
+                inner
+                    .and_then(|v| v.get(f))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let code = inner
+                .and_then(|v| v.get("exitCode"))
+                .and_then(Value::as_i64);
+            let mut d = k.clone();
+            let reason = field("reason");
+            if !reason.is_empty() {
+                d.push_str(&format!(" reason={reason}"));
+            }
+            if let Some(c) = code {
+                d.push_str(&format!(" exitCode={c}"));
+            }
+            let msg = field("message");
+            if !msg.is_empty() {
+                d.push_str(&format!(" message={msg}"));
+            }
+            d
+        }
+        None => "<no state>".to_owned(),
+    };
+    format!("{detail} ready={ready} restarts={restarts}")
+}
+
 /// Build + create the Job. A 409 (the Job already exists) is treated as SUCCESS
 /// — an idempotent relaunch must not create a second Job or error (V6). Returns
 /// the Job's name so the caller can watch it.
@@ -498,6 +695,97 @@ mod tests {
             val(&cfg.candidate_binding.observed_env),
             "/workspace/state/observed/run-42.jsonl"
         );
+    }
+
+    /// Killing must take the pod with the Job, and sweep one the cascade missed —
+    /// a replay pod holds a candidate, a runner and two stores, so one left behind
+    /// is what keeps a failed run occupying a node for hours.
+    #[test]
+    fn kill_deletes_the_job_and_sweeps_remaining_pods() {
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(200, json!({ "kind": "Status", "status": "Success" })), // delete job
+            resp(
+                200,
+                json!({ "items": [
+                    { "metadata": { "name": "pod-still-here" } },
+                    // already terminating: leave it alone, deleting again is noise
+                    { "metadata": { "name": "pod-going", "deletionTimestamp": "2026-08-03T10:00:00Z" } }
+                ] }),
+            ),
+            resp(200, json!({ "kind": "Status", "status": "Success" })), // delete pod
+        ]));
+        let r = kill_run(&api, "replay-sbx", "run-7").expect("kill");
+        assert_eq!(r.job_deleted.as_deref(), Some("deja-replay-run-7"));
+        assert_eq!(r.pods_deleted, vec!["pod-still-here".to_owned()]);
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+    }
+
+    /// Killing an already-dead run is success, not an error — otherwise the
+    /// button is unsafe to press twice, which is exactly when it gets pressed.
+    #[test]
+    fn kill_is_idempotent_when_everything_is_already_gone() {
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(404, json!({ "kind": "Status", "reason": "NotFound" })),
+            resp(200, json!({ "items": [] })),
+        ]));
+        let r = kill_run(&api, "replay-sbx", "run-8").expect("kill");
+        assert_eq!(r, KillReport::default());
+    }
+
+    /// A dead run must still be able to say WHY. Reproduces the shape that cost a
+    /// day: the runner reports only "candidate never became healthy", while the
+    /// candidate's own last words — a config error at boot — are in its container
+    /// log, in a pod that is about to be deleted.
+    #[test]
+    fn diagnostics_report_container_state_and_output() {
+        let pod = json!({ "items": [ { "metadata": { "name": "deja-replay-run-7-abc" },
+            "status": {
+                "phase": "Failed",
+                "initContainerStatuses": [
+                    { "name": "migrations", "ready": true, "restartCount": 0,
+                      "state": { "terminated": { "reason": "Completed", "exitCode": 0 } } }
+                ],
+                "containerStatuses": [
+                    { "name": "candidate", "ready": false, "restartCount": 0,
+                      "state": { "terminated": { "reason": "Error", "exitCode": 1 } } }
+                ]
+            } } ] });
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(200, pod),
+            // one log fetch per container, in the order the collector walks them
+            resp(200, json!("staging CodeBundle …")),
+            resp(
+                200,
+                json!("Error: failed to open replay observed sink: Permission denied"),
+            ),
+        ]));
+        let out = collect_pod_diagnostics(&api, "replay-sbx", "run-7", 200);
+        let joined = out
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // which container failed, and how
+        assert!(joined.contains("phase=Failed"), "{joined}");
+        assert!(
+            joined.contains("container/candidate") && joined.contains("exitCode=1"),
+            "{joined}"
+        );
+        // and what it actually said
+        assert!(joined.contains("Permission denied"), "{joined}");
+        // the healthy init container is reported too, so a clean step is visibly clean
+        assert!(joined.contains("init/migrations") && joined.contains("exitCode=0"));
+    }
+
+    /// Diagnostics run only after a failure, so they must never introduce one:
+    /// a vanished pod is reported as a note, not an error.
+    #[test]
+    fn diagnostics_degrade_when_the_pod_is_gone() {
+        let api = KubeApi::new(FakeTransport::new(vec![resp(200, json!({ "items": [] }))]));
+        let out = collect_pod_diagnostics(&api, "replay-sbx", "run-9", 200);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.contains("garbage-collected"), "{:?}", out[0]);
     }
 
     fn spec_with_source() -> LaunchSpec {

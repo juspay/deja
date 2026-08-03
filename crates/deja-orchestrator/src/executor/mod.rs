@@ -28,7 +28,7 @@ pub use k8s::{
     KubeTransport, UreqTransport,
 };
 pub use launch::{
-    build_job, job_name_for, launch, launch_spec_for_run, watch_to_terminal, ExecutorError,
-    LaunchSpec, RUN_ID_LABEL,
+    build_job, collect_pod_diagnostics, job_name_for, kill_run, launch, launch_spec_for_run,
+    watch_to_terminal, ExecutorError, LaunchSpec, RUN_ID_LABEL,
 };
 pub use patch::{apply_job_patch, EnvUpsert, JobPatch, PatchError};

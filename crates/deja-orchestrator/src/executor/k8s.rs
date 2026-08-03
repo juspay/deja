@@ -171,6 +171,64 @@ impl<T: KubeTransport> KubeApi<T> {
         self.expect_2xx(self.transport.send(&req)?, name)
     }
 
+    /// LIST pods by label selector — the run's own pods, found by the run-id
+    /// label the launcher stamps on the pod template. `label_selector` is placed
+    /// verbatim in the query param, as in [`Self::list_jobs`]; the selectors used
+    /// here are label names and run ids, which are DNS-1123 safe.
+    pub fn list_pods(&self, ns: &str, label_selector: &str) -> Result<Vec<Value>, KubeError> {
+        let req = KubeRequest {
+            method: "GET",
+            path: format!("/api/v1/namespaces/{ns}/pods?labelSelector={label_selector}"),
+            body: None,
+        };
+        let list = self.expect_2xx(self.transport.send(&req)?, label_selector)?;
+        Ok(list
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// GET one container's log. Returns plain text, not JSON.
+    ///
+    /// This is how a candidate's own failure becomes visible: the runner can only
+    /// observe that it never became healthy, and the pod is gone soon after, so
+    /// whatever the container printed is the only account of why it died.
+    /// `tail_lines` bounds the read — the interesting part is the end.
+    pub fn pod_logs(
+        &self,
+        ns: &str,
+        pod: &str,
+        container: &str,
+        tail_lines: u32,
+    ) -> Result<String, KubeError> {
+        let req = KubeRequest {
+            method: "GET",
+            path: format!(
+                "/api/v1/namespaces/{ns}/pods/{pod}/log?container={container}&tailLines={tail_lines}"
+            ),
+            body: None,
+        };
+        let body = self.expect_2xx(self.transport.send(&req)?, pod)?;
+        Ok(match body {
+            Value::String(s) => s,
+            Value::Null => String::new(),
+            other => other.to_string(),
+        })
+    }
+
+    /// DELETE a pod. Deleting the Job normally takes its pods with it, so this is
+    /// for the pod that outlives its Job — a stuck terminating container, or one
+    /// whose Job is already gone.
+    pub fn delete_pod(&self, ns: &str, name: &str) -> Result<Value, KubeError> {
+        let req = KubeRequest {
+            method: "DELETE",
+            path: format!("/api/v1/namespaces/{ns}/pods/{name}?propagationPolicy=Background"),
+            body: None,
+        };
+        self.expect_2xx(self.transport.send(&req)?, name)
+    }
+
     /// POST a Job. A 409 is surfaced as [`KubeError::AlreadyExists`] so an
     /// idempotent launch can treat it as success rather than an error (V6).
     pub fn create_job(&self, ns: &str, job: &Value) -> Result<Value, KubeError> {
@@ -353,7 +411,18 @@ impl KubeTransport for UreqTransport {
 }
 
 fn read_response(status: u16, resp: ureq::Response) -> Result<KubeResponse, KubeError> {
-    let body = resp.into_json::<Value>().unwrap_or(Value::Null); // a 204/empty body is fine; verb layer keys off status
+    // Most of the apiserver speaks JSON, but the pod-log endpoint returns plain
+    // text. Read the body once and parse if we can; otherwise carry it through as
+    // a string rather than discarding it, so a container's output is usable.
+    // An empty body (204) stays null — the verb layer keys off status there.
+    let raw = resp.into_string().unwrap_or_default();
+    let body = serde_json::from_str::<Value>(&raw).unwrap_or({
+        if raw.is_empty() {
+            Value::Null
+        } else {
+            Value::String(raw)
+        }
+    });
     Ok(KubeResponse { status, body })
 }
 
