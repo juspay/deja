@@ -30,27 +30,10 @@ pub struct JobPatch {
     /// shows in ArgoCD's resource tree and is cascade-GC'd. `None` leaves the Job
     /// un-owned (the pre-ownerRef behavior).
     pub owner: Option<OwnerRef>,
-    /// Optional per-run repoint of the config-file volume at a specific record
-    /// version's ConfigMap. `None` leaves the template's default in place.
-    pub config_artifacts: Option<ConfigArtifacts>,
     /// Optional L1 config env COPIED from the recorded system's rendered workload.
     /// Replaces the candidate's `env`/`envFrom` wholesale before the per-run env
     /// upserts (which therefore win, as the replay overrides must).
     pub config_env: Option<ConfigEnvCopy>,
-}
-
-/// Repoint the config-file volume at one record version's ConfigMap (the config
-/// baseline the candidate reads from disk — the part that is a FILE, not env).
-/// Both names are supplied by the caller from deployment profile data, so no
-/// recorded system's vocabulary appears here. The volume must exist in the
-/// template: a missing one is a loud error, never a silent boot against another
-/// version's config (a wrong-verdict trap).
-#[derive(Debug, Clone)]
-pub struct ConfigArtifacts {
-    /// The Job template's volume to repoint.
-    pub volume: String,
-    /// ConfigMap it should mount for this run.
-    pub config_map: String,
 }
 
 /// The recorded system's own generated container env, copied verbatim.
@@ -184,16 +167,10 @@ pub fn apply_job_patch(template: &Value, patch: &JobPatch) -> Result<Value, Patc
         )?;
     }
 
-    // Config artifacts: repoint the config-file volume at this run's record
-    // version. Applied before the images/env early-return so a config-only patch
-    // still lands.
-    if let Some(ca) = &patch.config_artifacts {
-        apply_config_artifacts(&mut job, ca)?;
-    }
-
     // L1: the recorded system's generated env, copied wholesale. Applied BEFORE
-    // the per-run upserts below so the replay overrides (localhost stores, replay
-    // mode, run id) win over the recorded values they must displace.
+    // the per-run upserts below (and before the images/env early-return, so a
+    // config-only patch still lands) so the replay overrides (localhost stores,
+    // replay mode, run id) win over the recorded values they must displace.
     if let Some(ce) = &patch.config_env {
         let c = find_container_in_job(&mut job, &ce.container)?;
         c.insert("env".into(), Value::Array(ce.env.clone()));
@@ -234,27 +211,6 @@ fn merge_labels(target: &mut Value, labels: &[(String, String)]) -> Result<(), P
     for (k, v) in labels {
         map.insert(k.clone(), Value::String(v.clone()));
     }
-    Ok(())
-}
-
-/// Repoint the pod's config-file volume at a specific record version's ConfigMap.
-/// The volume and its configMap must exist — silently keeping the template default
-/// would boot the candidate against another version's config baseline and produce a
-/// confidently wrong verdict, so both are loud errors.
-fn apply_config_artifacts(job: &mut Value, ca: &ConfigArtifacts) -> Result<(), PatchError> {
-    let vols = job
-        .pointer_mut("/spec/template/spec/volumes")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| PatchError::Shape("spec.template.spec.volumes".into()))?;
-    let vol = vols
-        .iter_mut()
-        .find(|v| v.get("name").and_then(Value::as_str) == Some(ca.volume.as_str()))
-        .ok_or_else(|| PatchError::Shape(format!("volume '{}' not found", ca.volume)))?;
-    let cm = vol
-        .get_mut("configMap")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| PatchError::Shape(format!("volume '{}' has no configMap", ca.volume)))?;
-    cm.insert("name".into(), Value::String(ca.config_map.clone()));
     Ok(())
 }
 
@@ -360,8 +316,9 @@ mod tests {
 
     /// A template shaped like the replay-env Job: a `router-config` volume backed
     /// by a configMap, and a `candidate` container whose `envFrom` carries both a
-    /// configMapRef (the ROUTER__* env) and a secretRef (replay-crypto).
-    fn template_with_config_artifacts() -> Value {
+    /// configMapRef (the ROUTER__* env) and a secretRef (replay-crypto) — the
+    /// template-supplied env sources the copied config env must displace.
+    fn template_with_env_sources() -> Value {
         json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -381,42 +338,6 @@ mod tests {
                 ]
             }}}
         })
-    }
-
-    #[test]
-    fn config_artifacts_repoints_volume_and_envfrom() {
-        let patch = JobPatch {
-            config_artifacts: Some(ConfigArtifacts {
-                volume: "router-config".into(),
-                config_map: "router-cm-replay-abc123".into(),
-            }),
-            ..Default::default()
-        };
-        let out = apply_job_patch(&template_with_config_artifacts(), &patch).expect("applies");
-        let vols = out["spec"]["template"]["spec"]["volumes"]
-            .as_array()
-            .expect("volumes");
-        let rc = vols
-            .iter()
-            .find(|v| v["name"] == json!("router-config"))
-            .expect("router-config volume");
-        assert_eq!(rc["configMap"]["name"], json!("router-cm-replay-abc123"));
-        // defaultMode (structural) is preserved — only the name is repointed.
-        assert_eq!(rc["configMap"]["defaultMode"], json!(420));
-    }
-
-    #[test]
-    fn config_artifacts_missing_volume_is_loud() {
-        // template() has no volumes at all — a repoint must error, not no-op.
-        let patch = JobPatch {
-            config_artifacts: Some(ConfigArtifacts {
-                volume: "router-config".into(),
-                config_map: "x".into(),
-            }),
-            ..Default::default()
-        };
-        let err = apply_job_patch(&template(), &patch).expect_err("no volumes -> error");
-        assert!(matches!(err, PatchError::Shape(_)));
     }
 
     /// The copied env lands verbatim — including `secretKeyRef` indirection under
@@ -445,7 +366,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let out = apply_job_patch(&template_with_config_artifacts(), &patch).expect("applies");
+        let out = apply_job_patch(&template_with_env_sources(), &patch).expect("applies");
         let cand = &out["spec"]["template"]["spec"]["containers"][0];
         let env = cand["env"].as_array().expect("env");
 

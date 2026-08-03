@@ -1153,7 +1153,6 @@ mod tests {
                 recording_id: Some("rec-1".to_owned()),
                 s3_source: None,
                 correlation_filter: None,
-                recording_image: None,
                 workload: serde_json::Value::Null,
             },
             status: RunStatus::Pending,

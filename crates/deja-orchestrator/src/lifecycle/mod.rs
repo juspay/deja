@@ -3877,7 +3877,6 @@ mod tests {
                 recording_id: None,
                 s3_source: None,
                 correlation_filter: None,
-                recording_image: None,
                 workload,
             },
             status: RunStatus::Pending,

@@ -155,16 +155,6 @@ pub struct RunSpec {
     /// counted omitted. Unset/empty = drive everything.
     #[serde(default)]
     pub correlation_filter: Option<Vec<String>>,
-    /// For mode=replay: the recording router IMAGE — the version that produced the
-    /// recording. Its tag is the record code-sha; the orchestrator derives the
-    /// per-version config artifacts the candidate boots against
-    /// (`router-cm-replay-<sha>` + `replay-<sha>-hyperswitch-configs`, rendered by
-    /// the version-keyed replay-env-app pool) and repoints the Job at them. Unset →
-    /// the Job template's default (the currently-pooled version). Together with
-    /// `candidate_spec` this makes {recording_image, candidate_image} the only
-    /// version inputs; nothing version-specific is hardcoded in the pipeline.
-    #[serde(default)]
-    pub recording_image: Option<String>,
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,

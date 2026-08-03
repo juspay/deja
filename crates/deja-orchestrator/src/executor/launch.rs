@@ -8,12 +8,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{record_sha_from_image, resolve_candidate_image, K8sExecutorConfig};
+use super::config::{resolve_candidate_image, K8sExecutorConfig};
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
 use super::patch::{
-    apply_job_patch, referenced_secret_names, ConfigArtifacts, ConfigEnvCopy, EnvUpsert, JobPatch,
-    OwnerRef,
+    apply_job_patch, referenced_secret_names, ConfigEnvCopy, EnvUpsert, JobPatch, OwnerRef,
 };
 use crate::{ReplayContract, Run, SchemaFingerprint};
 
@@ -44,20 +43,16 @@ pub struct LaunchSpec {
     pub env: Vec<EnvUpsert>,
     /// Labels merged onto the Job + pod template (selectors, run correlation).
     pub labels: Vec<(String, String)>,
-    /// Per-run repoint of the config-FILE volume, derived from the run's
-    /// `recording_image` (record sha → that version's config-baseline ConfigMap).
-    /// `None` when no recording_image is given — the Job keeps its template default.
-    pub config_artifacts: Option<ConfigArtifacts>,
     /// Where to copy the L1 config ENV from: the recorded system's rendered
-    /// workload for this run's record version. Resolved at Job build (it needs a
-    /// cluster read). `None` disables copying.
+    /// workload. Read at Job build (it needs a cluster read). `None` disables
+    /// copying.
     pub config_source: Option<ConfigSourceRef>,
 }
 
 /// A resolved pointer to the rendered workload whose container env is copied.
 #[derive(Debug, Clone)]
 pub struct ConfigSourceRef {
-    /// Deployment name, already expanded for this run's record sha.
+    /// Deployment name.
     pub deployment: String,
     /// Container within it whose `env` + `envFrom` are copied.
     pub container: String,
@@ -159,42 +154,13 @@ pub fn launch_spec_for_run(
         ));
     }
 
-    // The record version this run replays, from the recording image's tag. Drives
-    // BOTH the config-file volume and the config-env source, so the candidate reads
-    // one version's config throughout. Absent (or a digest/`latest` ref with no git
-    // sha) → the Job keeps its template defaults.
-    let record_sha = run
-        .spec
-        .recording_image
-        .as_deref()
-        .and_then(record_sha_from_image);
-
-    let config_artifacts =
-        cfg.config_file
-            .config_map_for(record_sha.as_deref())
-            .map(|config_map| ConfigArtifacts {
-                volume: cfg.config_file.volume.clone(),
-                config_map,
-            });
-
-    let config_source = match cfg.config_source.deployment_for(record_sha.as_deref()) {
-        Some(deployment) => Some(ConfigSourceRef {
-            deployment,
-            container: cfg.config_source.container.clone(),
-        }),
-        // A version-keyed config source with no record sha to key it: refuse
-        // rather than launch a candidate with no recorded config (which would
-        // crash opaquely at boot, or worse, boot against something arbitrary).
-        None if cfg.config_source.needs_record_sha() => {
-            return Err(ExecutorError::Template(format!(
-                "config source '{}' is version-keyed but this run has no usable \
-                 recording_image to key it — set recording_image to the image that \
-                 produced the recording",
-                cfg.config_source.deployment
-            )))
-        }
-        None => None,
-    };
+    // One fixed render supplies the config env for every run. An empty name in
+    // the profile switches the copy off — the Job then boots with whatever env
+    // its template carries.
+    let config_source = (!cfg.config_source.deployment.is_empty()).then(|| ConfigSourceRef {
+        deployment: cfg.config_source.deployment.clone(),
+        container: cfg.config_source.container.clone(),
+    });
 
     Ok(LaunchSpec {
         run_id: run.run_id.clone(),
@@ -206,7 +172,6 @@ pub fn launch_spec_for_run(
         candidate_image,
         env,
         labels: vec![(RUN_ID_LABEL.to_owned(), run.run_id.clone())],
-        config_artifacts,
         config_source,
     })
 }
@@ -268,19 +233,18 @@ pub fn build_job<T: KubeTransport>(
         )],
         env: spec.env.clone(),
         owner,
-        config_artifacts: spec.config_artifacts.clone(),
         config_env,
     };
     apply_job_patch(&template, &patch).map_err(|e| ExecutorError::Template(e.to_string()))
 }
 
-/// Copy the recorded system's generated container env for this run's record
-/// version, and refuse if anything it references is absent.
+/// Copy the recorded system's generated container env, and refuse if anything it
+/// references is absent.
 ///
 /// The env is read from a rendered workload the recorded system's OWN chart
 /// produced (artifact-only, zero replicas) — so every value, and every
 /// `secretKeyRef` name/key indirection, is exactly what that system's config
-/// declares at that version. Nothing is enumerated or rewritten here: a config key
+/// declares. Nothing is enumerated or rewritten here: a config key
 /// or secret added to that system tomorrow flows through untouched, and no secret
 /// VALUE is ever read by the orchestrator (only names, to check existence).
 fn copy_config_env<T: KubeTransport>(
@@ -449,7 +413,6 @@ mod tests {
                 EnvUpsert::new("candidate", "ROUTER__DEJA__MODE", "replay"),
             ],
             labels: vec![("deja.run-id".into(), "run-9f".into())],
-            config_artifacts: None,
             config_source: None,
         }
     }
@@ -471,7 +434,7 @@ mod tests {
     fn spec_with_source() -> LaunchSpec {
         let mut s = spec();
         s.config_source = Some(ConfigSourceRef {
-            deployment: "replay-abc123-some-system-server".into(),
+            deployment: "replay-sbx-some-system-server".into(),
             container: "some-system-server".into(),
         });
         s

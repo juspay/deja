@@ -2429,7 +2429,6 @@ mod tests {
                     recording_id: Some("rec-scope".to_owned()),
                     s3_source: None,
                     correlation_filter: Some(vec!["c-keep".to_owned(), " ".to_owned()]),
-                    recording_image: None,
                     workload: serde_json::Value::Null,
                 },
                 status: crate::RunStatus::Completed,
