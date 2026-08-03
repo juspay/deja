@@ -2183,11 +2183,7 @@ fn build_count_sql(
         None => {
             let mut predicates = Vec::with_capacity(row.columns.len());
             for column in &row.columns {
-                predicates.push(format!(
-                    "{} IS NOT DISTINCT FROM {}",
-                    quote_ident(&column.metadata.name),
-                    sql_literal_for_column(column)?
-                ));
+                predicates.push(db_comparison_predicate(&column.metadata.name, column)?);
             }
             predicates
         }
@@ -2204,21 +2200,13 @@ fn db_filter_predicate(row: &DbRowImage, filter: &DbRowFilter) -> Option<String>
         .iter()
         .find(|column| column.metadata.name == filter.pk_column)
     {
-        return Some(format!(
-            "{} IS NOT DISTINCT FROM {}",
-            quote_ident(&column.metadata.name),
-            sql_literal_for_column(column)?
-        ));
+        return db_comparison_predicate(&column.metadata.name, column);
     }
     let column = DbColumnImage {
         metadata: DbColumnMetadata::unknown(&filter.pk_column),
         value: serde_json::Value::String(filter.pk_value.clone()),
     };
-    Some(format!(
-        "{} IS NOT DISTINCT FROM {}",
-        quote_ident(&filter.pk_column),
-        sql_literal_for_column(&column)?
-    ))
+    db_comparison_predicate(&filter.pk_column, &column)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2381,6 +2369,16 @@ fn load_db_catalog(store: &StoreExec) -> DbCatalog {
                 catalog.columns_by_table.len(),
                 catalog.column_count()
             );
+            if catalog.columns_by_table.is_empty() {
+                // psql succeeded and returned nothing: the query ran against a
+                // database whose `public` schema has no tables. Seeding will then
+                // render every column untyped and quietly mis-materialize the
+                // typed ones, so say so here rather than let it look like a row
+                // problem later.
+                eprintln!(
+                    "lifecycle: db catalog is EMPTY — every seeded column will be rendered without type information"
+                );
+            }
             catalog
         }
         Ok(output) => {
@@ -2702,6 +2700,46 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Render a recorded JSON array into a Postgres array of `json`/`jsonb`.
+///
+/// `ARRAY['<elem>', …]::json[]` — each element rendered as its own json literal.
+/// A recorded value that is not an array cannot describe an array column, so it
+/// is refused rather than guessed at.
+fn pg_json_array_literal(
+    value: &serde_json::Value,
+    element_type: &str,
+    column_name: &str,
+) -> Option<String> {
+    let Some(items) = value.as_array() else {
+        eprintln!(
+            "lifecycle: seed value for {element_type}[] column {column_name} is not an array; skipping row"
+        );
+        return None;
+    };
+    let elements = items.iter().map(sql_literal).collect::<Vec<_>>().join(", ");
+    Some(format!("ARRAY[{elements}]::{element_type}[]"))
+}
+
+/// One `column IS NOT DISTINCT FROM value` predicate for the seed readback.
+///
+/// Postgres `json` carries no equality operator — only `jsonb` does — so a
+/// readback that compares a `json` or `json[]` column directly fails with
+/// "operator does not exist: json = json" and the verification is lost rather
+/// than answered. Both sides are compared as `jsonb`, which is equality on the
+/// parsed document: what the readback is asking in the first place, and it does
+/// not depend on key order or whitespace surviving a round trip.
+fn db_comparison_predicate(column_name: &str, column: &DbColumnImage) -> Option<String> {
+    let literal = sql_literal_for_column(column)?;
+    let ident = quote_ident(column_name);
+    Some(match column.metadata.cast_kind() {
+        SqlCastKind::Json => format!("{ident}::jsonb IS NOT DISTINCT FROM ({literal})::jsonb"),
+        SqlCastKind::JsonArray => {
+            format!("{ident}::jsonb[] IS NOT DISTINCT FROM ({literal})::jsonb[]")
+        }
+        _ => format!("{ident} IS NOT DISTINCT FROM {literal}"),
+    })
+}
+
 fn sql_literal_for_column(column: &DbColumnImage) -> Option<String> {
     if column.value.is_null() {
         return Some("NULL".to_string());
@@ -2722,15 +2760,18 @@ fn sql_literal_for_column(column: &DbColumnImage) -> Option<String> {
             },
             |bytes| Some(bytea_hex_literal(&bytes)),
         ),
-        // json/jsonb/array family: the recorded value is a serde_json::Value
-        // (object or array). Emit it as a quoted JSON literal WITH an explicit
-        // pg cast so Postgres parses it into the real column type instead of
-        // reading `{...}` inside the string as array-element delimiters (the
-        // "malformed array literal" failure on json[]/jsonb[] columns).
+        // Scalar json/jsonb: the recorded value is one document, and a quoted
+        // JSON literal with an explicit cast is exactly that.
         SqlCastKind::Json => Some(format!("{}::json", sql_literal(&column.value))),
         SqlCastKind::Jsonb => Some(format!("{}::jsonb", sql_literal(&column.value))),
-        SqlCastKind::JsonArray => Some(format!("{}::json[]", sql_literal(&column.value))),
-        SqlCastKind::JsonbArray => Some(format!("{}::jsonb[]", sql_literal(&column.value))),
+        // Array-of-json: the recorded value is a JSON array, and its ELEMENTS are
+        // the Postgres array's elements. Casting the array's text is not a way to
+        // say that — Postgres writes array literals as `{…}`, so it reads the
+        // leading `[` as a malformed one and rejects the value whatever the cast
+        // says. An array constructor states the structure instead of hoping the
+        // text is read as one.
+        SqlCastKind::JsonArray => pg_json_array_literal(&column.value, "json", &md.name),
+        SqlCastKind::JsonbArray => pg_json_array_literal(&column.value, "jsonb", &md.name),
         // Fail-closed for a typed column we haven't been taught: if it carries
         // authoritative pg catalog metadata but is neither bytea nor the json
         // family AND holds a non-scalar object/array, the plain-quote path
@@ -2744,10 +2785,29 @@ fn sql_literal_for_column(column: &DbColumnImage) -> Option<String> {
                     "lifecycle: cannot render non-scalar seed value for column {} of type {:?}/{:?}; skipping row",
                     md.name, md.type_oid, md.type_name
                 );
-                None
-            } else {
-                Some(sql_literal(&column.value))
+                return None;
             }
+            // No catalog metadata AND a non-scalar value: the plain-quote path is
+            // a coin flip decided by the column's real type. Postgres coerces an
+            // unquoted-type literal into json/jsonb happily, so an object or array
+            // in a json column still lands; the same literal in an ARRAY column is
+            // read as an array constructor and fails ("malformed array literal").
+            // Rendering it anyway is the pre-existing behaviour and is right more
+            // often than not, but a column reaching here at all means the catalog
+            // did not cover it — name it, because that gap is the actual bug and
+            // it is otherwise invisible.
+            if is_non_scalar {
+                eprintln!(
+                    "lifecycle: no pg catalog metadata for column {}; rendering its {} seed value as a plain literal, which pg will reject if the column is array-typed",
+                    md.name,
+                    if column.value.is_array() {
+                        "array"
+                    } else {
+                        "object"
+                    },
+                );
+            }
+            Some(sql_literal(&column.value))
         }
     }
 }
@@ -4804,20 +4864,91 @@ mod tests {
             sql_literal_for_column(&mk("jb", Some(3802), "jsonb")),
             Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::jsonb".to_string())
         );
-        // json[] array (oid 199, pg name `_json`)
+        // json[] array (oid 199, pg name `_json`). An ARRAY constructor, NOT a
+        // cast of the array's text: `'[…]'::json[]` is rejected by Postgres as a
+        // malformed array literal, because array literals are written `{…}`.
         assert_eq!(
             sql_literal_for_column(&mk("ja", Some(199), "_json")),
-            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::json[]".to_string())
+            Some("ARRAY['{\"pm\":\"card\",\"types\":[\"credit\"]}']::json[]".to_string())
         );
         // jsonb[] array (oid 3807, pg name `_jsonb`)
         assert_eq!(
             sql_literal_for_column(&mk("jba", Some(3807), "_jsonb")),
-            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::jsonb[]".to_string())
+            Some("ARRAY['{\"pm\":\"card\",\"types\":[\"credit\"]}']::jsonb[]".to_string())
         );
         // type_name alone (no oid) also detects: `json[]`
         assert_eq!(
             sql_literal_for_column(&mk("jad", None, "json[]")),
-            Some("'[{\"pm\":\"card\",\"types\":[\"credit\"]}]'::json[]".to_string())
+            Some("ARRAY['{\"pm\":\"card\",\"types\":[\"credit\"]}']::json[]".to_string())
+        );
+        // Multi-element and empty arrays both stay well-formed.
+        let multi = DbColumnImage {
+            metadata: DbColumnMetadata {
+                name: "pme".into(),
+                type_oid: Some(199),
+                type_name: Some("_json".into()),
+                nullable: Some(true),
+            },
+            value: serde_json::json!([{"a": 1}, {"b": 2}]),
+        };
+        assert_eq!(
+            sql_literal_for_column(&multi),
+            Some("ARRAY['{\"a\":1}', '{\"b\":2}']::json[]".to_string())
+        );
+        let empty = DbColumnImage {
+            metadata: multi.metadata.clone(),
+            value: serde_json::json!([]),
+        };
+        assert_eq!(
+            sql_literal_for_column(&empty),
+            Some("ARRAY[]::json[]".to_string())
+        );
+    }
+
+    #[test]
+    fn json_columns_are_compared_as_jsonb_in_readback() {
+        // Postgres `json` has no equality operator, so comparing it directly in
+        // the readback fails with "operator does not exist: json = json" and the
+        // verification is lost. Both sides go through jsonb.
+        let scalar = DbColumnImage {
+            metadata: DbColumnMetadata {
+                name: "cfg".into(),
+                type_oid: Some(114),
+                type_name: Some("json".into()),
+                nullable: Some(true),
+            },
+            value: serde_json::json!({"a": 1}),
+        };
+        assert_eq!(
+            db_comparison_predicate("cfg", &scalar),
+            Some("\"cfg\"::jsonb IS NOT DISTINCT FROM ('{\"a\":1}'::json)::jsonb".to_string())
+        );
+
+        let array = DbColumnImage {
+            metadata: DbColumnMetadata {
+                name: "pme".into(),
+                type_oid: Some(199),
+                type_name: Some("_json".into()),
+                nullable: Some(true),
+            },
+            value: serde_json::json!([{"a": 1}]),
+        };
+        assert_eq!(
+            db_comparison_predicate("pme", &array),
+            Some(
+                "\"pme\"::jsonb[] IS NOT DISTINCT FROM (ARRAY['{\"a\":1}']::json[])::jsonb[]"
+                    .to_string()
+            )
+        );
+
+        // jsonb already compares, and non-json columns are untouched.
+        let plain = DbColumnImage {
+            metadata: DbColumnMetadata::unknown("profile_name"),
+            value: serde_json::json!("US_default"),
+        };
+        assert_eq!(
+            db_comparison_predicate("profile_name", &plain),
+            Some("\"profile_name\" IS NOT DISTINCT FROM 'US_default'".to_string())
         );
     }
 
@@ -4853,6 +4984,34 @@ mod tests {
                 nullable: Some(true),
             }),
             Err(())
+        );
+    }
+
+    #[test]
+    fn uncatalogued_nonscalar_column_still_renders() {
+        // The complement of the fail-closed case: NO type metadata at all. The
+        // plain-quote path stays (pg coerces an unknown-type literal into a
+        // json/jsonb column, so skipping would lose rows that seed correctly
+        // today) — but this is the shape that produces "malformed array literal"
+        // when the column turns out to be array-typed, so the renderer logs it.
+        // A column reaching here means the pg catalog did not cover it.
+        let column = DbColumnImage {
+            metadata: DbColumnMetadata::unknown("payment_methods_enabled"),
+            value: serde_json::json!([{"payment_method": "card"}]),
+        };
+        assert_eq!(
+            sql_literal_for_column(&column),
+            Some("'[{\"payment_method\":\"card\"}]'".to_string())
+        );
+
+        // Scalars in an uncatalogued column are unambiguous and stay quiet.
+        let scalar = DbColumnImage {
+            metadata: DbColumnMetadata::unknown("profile_name"),
+            value: serde_json::json!("US_default"),
+        };
+        assert_eq!(
+            sql_literal_for_column(&scalar),
+            Some("'US_default'".to_string())
         );
     }
 

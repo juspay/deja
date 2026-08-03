@@ -57,6 +57,12 @@ pub struct K8sExecutorConfig {
     /// plane path gives it something it cannot open. Must match the Job
     /// template's workspace `mountPath` and the runner's `HARNESS_STATE_DIR`.
     pub job_state_dir: String,
+    /// How many trailing lines of each container's output the failure diagnostics
+    /// keep. A failure is usually explained by the last few lines, but a seeding
+    /// or migration failure is explained by a line emitted near the START of a
+    /// long, chatty stage — a tail small enough to cut those off makes the run
+    /// undiagnosable from its own record.
+    pub diagnostics_tail_lines: u32,
     pub candidate_binding: CandidateBinding,
     /// Where the candidate's config env is COPIED from: the recorded system's own
     /// rendered workload (artifact-only, one current render).
@@ -93,6 +99,9 @@ impl K8sExecutorConfig {
             migrations_init_container: var("DEJA_MIGRATIONS_INIT_CONTAINER", "migrations"),
             code_bundle_uri_env: var("DEJA_CODE_BUNDLE_URI_ENV", "DEJA_CODE_BUNDLE_URI"),
             job_state_dir: var("DEJA_JOB_STATE_DIR", "/workspace/state"),
+            diagnostics_tail_lines: var("DEJA_DIAGNOSTICS_TAIL_LINES", "2000")
+                .parse()
+                .unwrap_or(2000),
             // Defaults are the Hyperswitch-router binding; a different candidate
             // overrides these. They are config defaults (a deployment concern),
             // not names baked into the patch/artifact logic.

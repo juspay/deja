@@ -258,7 +258,9 @@ fn capture_diagnostics<T: crate::executor::KubeTransport>(
     run_id: &str,
     ctx: &StoreCtx,
 ) {
-    for (label, body) in collect_pod_diagnostics(api, &cfg.jobs_namespace, run_id, 200) {
+    for (label, body) in
+        collect_pod_diagnostics(api, &cfg.jobs_namespace, run_id, cfg.diagnostics_tail_lines)
+    {
         ctx.log("diagnostics", &format!("{label}: {body}"));
     }
 }
