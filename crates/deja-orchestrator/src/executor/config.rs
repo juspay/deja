@@ -49,6 +49,26 @@ pub struct K8sExecutorConfig {
     pub migrations_init_container: String,
     pub code_bundle_uri_env: String,
     pub candidate_binding: CandidateBinding,
+    /// Where the candidate's config env is COPIED from: the recorded system's own
+    /// rendered workload (artifact-only, one current render).
+    ///
+    /// Together with `candidate_binding`, every name that belongs to the recorded
+    /// system lives here as data. Replaying a different system — a different
+    /// router, or a different service entirely — is a profile change, not a code
+    /// change: nothing in this crate names one.
+    pub config_source: ConfigSource,
+}
+
+/// Which rendered workload the candidate's config env is copied from. Both names
+/// belong to the RECORDED SYSTEM (its own workload and container names), so they
+/// are deployment profile data, never compiled in. An empty deployment name
+/// disables the copy — the Job then boots with whatever env its template carries.
+#[derive(Debug, Clone)]
+pub struct ConfigSource {
+    /// Workload name — one fixed render, the same for every run.
+    pub deployment: String,
+    /// Container within it whose `env` + `envFrom` are copied.
+    pub container: String,
 }
 
 impl K8sExecutorConfig {
@@ -79,6 +99,17 @@ impl K8sExecutorConfig {
                     "DEJA_CANDIDATE_CODE_SHA_ENV",
                     "ROUTER__DEJA__IDENTITY__CODE_SHA",
                 ),
+            },
+            // Defaults describe the Hyperswitch sandbox render; another recorded
+            // system sets its own. They are deployment defaults (a deployment
+            // concern), not names baked into the copy/patch logic. An empty
+            // deployment name disables copying.
+            config_source: ConfigSource {
+                deployment: var(
+                    "DEJA_CONFIG_SOURCE_DEPLOYMENT",
+                    "replay-sbx-hyperswitch-server",
+                ),
+                container: var("DEJA_CONFIG_SOURCE_CONTAINER", "hyperswitch-router"),
             },
         }
     }
