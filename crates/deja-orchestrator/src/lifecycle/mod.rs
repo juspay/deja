@@ -995,7 +995,25 @@ fn score_and_register(
         &root.recording_events_path(recording_id),
         &record_graph_path,
     ) {
-        Ok(0) => {} // no recording on disk / no graph nodes — nothing to publish
+        // Nothing to publish. Say which of the two reasons it was: an absent
+        // recording is a different problem from a recording that carries no
+        // graph. Staying quiet here is what let an entire missing record-side
+        // graph look like an ordinary run for weeks — the dashboard renders the
+        // absence as "skipped" on every row, which reads as a finding.
+        Ok(0) => {
+            let events = root.recording_events_path(recording_id);
+            if events.exists() {
+                eprintln!(
+                    "lifecycle: recording {recording_id} carries NO graph nodes — the record side \
+                     of the execution graph will be empty and no comparison is possible"
+                );
+            } else {
+                eprintln!(
+                    "lifecycle: no recording at {} — record graph not extracted",
+                    events.display()
+                );
+            }
+        }
         Ok(node_count) => {
             if let Some((uri, bytes)) =
                 sink.publish(&run.run_id, "record_graph.jsonl", &record_graph_path)
