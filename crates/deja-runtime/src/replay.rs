@@ -1331,6 +1331,80 @@ pub fn canonical_args_hash(args: &serde_json::Value) -> u64 {
     hash_value(crate::FNV_OFFSET_BASIS, args)
 }
 
+/// Captured request bodies, by the `kind` the instrumented system records.
+///
+/// Matched as data, not reconstructed from a type: the strings are wire values
+/// produced by the recorded system, and this crate never sees its types.
+const JSON_REQUEST_BODY_KIND: &str = "JsonRequestBody";
+const FORM_URLENCODED_REQUEST_BODY_KIND: &str = "FormUrlEncodedRequestBody";
+
+/// Hash a captured request body by its CONTENT rather than by the bytes it was
+/// serialized into, returning `None` when the object is not a body this
+/// understands (the caller then hashes it generically).
+///
+/// A request body arrives as an ordered rendering — a byte array, and for JSON
+/// also its text — of a document that is unordered. Whether the recorded system
+/// emits `{"a":1,"b":2}` or `{"b":2,"a":1}` for the same values depends on how
+/// its map iterates, which is not stable across processes. Hashing those bytes
+/// therefore puts map iteration order into the call's identity, and a replay
+/// that builds exactly the same request with its fields in a different order
+/// does not match its own recording:
+///
+/// ```text
+/// recorded: …&metadata[login_date]=…&metadata[new_customer]=…&metadata[order_id]=…
+/// observed: …&metadata[order_id]=…&metadata[new_customer]=…&metadata[login_date]=…
+/// ```
+///
+/// Same fields, same values, same length, different hash — and since the hash is
+/// part of every address rank, every rank misses at once and the call cannot be
+/// substituted from the tape at all.
+///
+/// So the content is hashed instead: a JSON body by its parsed document, whose
+/// object keys already sort canonically here, and a form body by its fields
+/// sorted. The other members (`raw_bytes`, `text`, `utf8`, `bytes_len`) are
+/// renderings of that same content and are deliberately not hashed. The `kind`
+/// is, so two bodies that differ only in encoding stay distinct.
+fn hash_request_body(hash: u64, map: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    let kind = map.get("kind")?.as_str()?;
+    let hash = crate::fnv1a_str(crate::fnv1a_bytes(hash, b"B"), kind);
+    match kind {
+        JSON_REQUEST_BODY_KIND => {
+            // Only when the document was actually captured; an uncaptured body
+            // has nothing to hash and falls back to the generic path.
+            let json = map.get("json").filter(|value| !value.is_null())?;
+            Some(hash_value(hash, json))
+        }
+        FORM_URLENCODED_REQUEST_BODY_KIND => {
+            let text = request_body_text(map)?;
+            // Sorting the still-encoded fields is enough: both sides encode the
+            // same values with the same encoder, so only their order differs.
+            let mut fields: Vec<&str> = text.split('&').collect();
+            fields.sort_unstable();
+            let mut hash = crate::fnv1a_bytes(hash, b"[");
+            for field in fields {
+                hash = crate::fnv1a_str(crate::fnv1a_bytes(hash, b"s"), field);
+            }
+            Some(crate::fnv1a_bytes(hash, b"]"))
+        }
+        _ => None,
+    }
+}
+
+/// A captured body's bytes as text — the `text` member when the capture kept
+/// one, otherwise decoded from `raw_bytes`. `None` when neither is present or
+/// the bytes are not UTF-8.
+fn request_body_text(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+        return Some(text.to_owned());
+    }
+    let raw = map.get("raw_bytes")?.as_array()?;
+    let mut bytes = Vec::with_capacity(raw.len());
+    for byte in raw {
+        bytes.push(u8::try_from(byte.as_u64()?).ok()?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn hash_value(hash: u64, value: &serde_json::Value) -> u64 {
     use serde_json::Value;
     match value {
@@ -1347,6 +1421,11 @@ fn hash_value(hash: u64, value: &serde_json::Value) -> u64 {
             crate::fnv1a_bytes(h, b"]")
         }
         Value::Object(map) => {
+            // A captured request body hashes by its content, not by the bytes it
+            // was serialized into — see `hash_request_body`.
+            if let Some(hash) = hash_request_body(hash, map) {
+                return hash;
+            }
             // Sort keys for canonical order regardless of serde_json's map impl
             // (BTreeMap by default, IndexMap under `preserve_order`).
             let mut keys: Vec<&String> = map.keys().collect();
@@ -2614,6 +2693,147 @@ impl AmbientTemplate {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod body_identity_tests {
+    use super::*;
+
+    /// One captured form body, its fields in the given order.
+    fn form_body(fields: &[&str]) -> serde_json::Value {
+        let text = fields.join("&");
+        serde_json::json!({
+            "kind": "FormUrlEncodedRequestBody",
+            "captured": true,
+            "json": serde_json::Value::Null,
+            "bytes_len": text.len(),
+            "raw_bytes": text.as_bytes(),
+        })
+    }
+
+    fn args_with(body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "url": "https://api.stripe.com/v1/payment_intents",
+            "method": "Post",
+            "request_body": body,
+        })
+    }
+
+    #[test]
+    fn form_body_field_order_does_not_change_call_identity() {
+        // The real failure: a connector request whose `metadata` map serialized
+        // in a different order on replay than it did while recording. Same
+        // fields, same values, same length — and the call could not be matched
+        // to its own recording at any address rank, because the args hash is
+        // part of every rank's key.
+        let recorded = args_with(form_body(&[
+            "amount=66650",
+            "metadata%5Blogin_date%5D=2019-09-10T10%3A11%3A12Z",
+            "metadata%5Bnew_customer%5D=false",
+            "metadata%5Border_id%5D=pay_ENhoTvTSqEwEAQ7NWOpO_1",
+        ]));
+        let observed = args_with(form_body(&[
+            "amount=66650",
+            "metadata%5Border_id%5D=pay_ENhoTvTSqEwEAQ7NWOpO_1",
+            "metadata%5Bnew_customer%5D=false",
+            "metadata%5Blogin_date%5D=2019-09-10T10%3A11%3A12Z",
+        ]));
+        assert_eq!(
+            canonical_args_hash(&recorded),
+            canonical_args_hash(&observed)
+        );
+    }
+
+    #[test]
+    fn form_body_field_values_still_change_call_identity() {
+        // Order-independence must not become value-blindness.
+        let a = args_with(form_body(&["amount=66650", "currency=USD"]));
+        let b = args_with(form_body(&["amount=66651", "currency=USD"]));
+        assert_ne!(canonical_args_hash(&a), canonical_args_hash(&b));
+
+        // Nor may a field be dropped without notice.
+        let c = args_with(form_body(&["amount=66650"]));
+        assert_ne!(canonical_args_hash(&a), canonical_args_hash(&c));
+    }
+
+    #[test]
+    fn json_body_key_order_does_not_change_call_identity() {
+        // Same defect, other encoding: a JSON body carries `raw_bytes` and
+        // `text` renderings whose key order is not stable. The parsed document
+        // is what identifies the call.
+        let body = |text: &str| {
+            serde_json::json!({
+                "kind": "JsonRequestBody",
+                "captured": true,
+                "json": serde_json::from_str::<serde_json::Value>(text).unwrap(),
+                "text": text,
+                "utf8": true,
+                "bytes_len": text.len(),
+                "raw_bytes": text.as_bytes(),
+            })
+        };
+        let recorded = args_with(body(r#"{"card":"4242","name":"joseph"}"#));
+        let observed = args_with(body(r#"{"name":"joseph","card":"4242"}"#));
+        assert_eq!(
+            canonical_args_hash(&recorded),
+            canonical_args_hash(&observed)
+        );
+
+        let different = args_with(body(r#"{"name":"joseph","card":"4243"}"#));
+        assert_ne!(
+            canonical_args_hash(&recorded),
+            canonical_args_hash(&different)
+        );
+    }
+
+    #[test]
+    fn encoding_kind_distinguishes_otherwise_identical_bodies() {
+        let form = args_with(form_body(&["a=1"]));
+        let json = args_with(serde_json::json!({
+            "kind": "JsonRequestBody",
+            "captured": true,
+            "json": {"a": "1"},
+            "bytes_len": 3,
+            "raw_bytes": b"a=1",
+        }));
+        assert_ne!(canonical_args_hash(&form), canonical_args_hash(&json));
+    }
+
+    #[test]
+    fn an_uncaptured_body_falls_back_to_generic_hashing() {
+        // No document and no bytes to canonicalize: the object must still hash,
+        // and still distinguish itself from a captured one.
+        let uncaptured = args_with(serde_json::json!({
+            "kind": "JsonRequestBody",
+            "captured": false,
+            "json": serde_json::Value::Null,
+            "bytes_len": 0,
+        }));
+        let captured = args_with(serde_json::json!({
+            "kind": "JsonRequestBody",
+            "captured": true,
+            "json": {"a": 1},
+            "bytes_len": 7,
+        }));
+        assert_ne!(
+            canonical_args_hash(&uncaptured),
+            canonical_args_hash(&captured)
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_body_kind_hashes_generically() {
+        // A kind this does not understand must not silently canonicalize to
+        // something order-insensitive — it keeps the conservative behaviour.
+        let a = args_with(serde_json::json!({
+            "kind": "XmlRequestBody", "captured": true, "raw_bytes": b"<a/><b/>",
+        }));
+        let b = args_with(serde_json::json!({
+            "kind": "XmlRequestBody", "captured": true, "raw_bytes": b"<b/><a/>",
+        }));
+        assert_ne!(canonical_args_hash(&a), canonical_args_hash(&b));
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
