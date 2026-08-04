@@ -33,6 +33,68 @@ pub struct IngestReport {
     pub events_out: usize,
     pub correlations: usize,
     pub sealed: bool,
+    /// Every other way a line can leave the ingest, counted.
+    ///
+    /// These exist because a line used to be able to disappear without
+    /// appearing anywhere: `lines_in` and `events_out` differed by 97,309 on a
+    /// real recording and nothing said where those lines went. A count that
+    /// does not balance is the only signal that the ingest is discarding a
+    /// record shape it does not understand, so all of them are reported and
+    /// [`IngestReport::balances`] asserts they add up.
+    pub markers_dropped: usize,
+    pub non_envelope_dropped: usize,
+    pub unparseable_dropped: usize,
+}
+
+impl IngestReport {
+    /// Whether every line read is accounted for by exactly one outcome. A
+    /// false here means the ingest grew a silent exit.
+    pub fn balances(&self) -> bool {
+        self.events_out
+            + self.duplicates_dropped
+            + self.markers_dropped
+            + self.non_envelope_dropped
+            + self.unparseable_dropped
+            == self.lines_in
+    }
+
+    /// One line naming where the input went — logged on every ingest, so a
+    /// loss is visible in the run's own record rather than inferred later.
+    pub fn accounting(&self) -> String {
+        format!(
+            "ingest: {} line(s) -> {} event(s); dropped {} duplicate(s), {} marker(s), \
+             {} non-envelope, {} unparseable{}",
+            self.lines_in,
+            self.events_out,
+            self.duplicates_dropped,
+            self.markers_dropped,
+            self.non_envelope_dropped,
+            self.unparseable_dropped,
+            if self.balances() {
+                String::new()
+            } else {
+                format!(
+                    " — UNACCOUNTED: {} line(s) left the ingest without being counted",
+                    self.lines_in as i64
+                        - (self.events_out
+                            + self.duplicates_dropped
+                            + self.markers_dropped
+                            + self.non_envelope_dropped
+                            + self.unparseable_dropped) as i64
+                )
+            }
+        )
+    }
+}
+
+/// Why a line did not become an event. Returned alongside the events so the
+/// caller can report every outcome rather than only the successful one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropCounts {
+    pub duplicates: usize,
+    pub markers: usize,
+    pub non_envelope: usize,
+    pub unparseable: usize,
 }
 
 /// Minimal probe of an event for identity (dedup/sort key) — everything else
@@ -45,13 +107,46 @@ struct EventProbe {
     global_sequence: u64,
 }
 
-/// Envelope shape (v2): the payload is kept as raw bytes.
+/// Envelope shape: the payload is kept as raw bytes.
+///
+/// The payload's KEY depends on what the envelope carries, and the producer
+/// chose those names deliberately: a boundary event is nested under `event`,
+/// while an execution-graph node is nested under `node` because it carries its
+/// own `recording_run_id` and `global_sequence` that flattening would collide
+/// with the envelope's. A probe that knows only `event` therefore reads every
+/// graph envelope as having no payload at all.
 #[derive(serde::Deserialize)]
 struct EnvelopeProbe<'a> {
     #[serde(default)]
     artifact_type: Option<String>,
     #[serde(borrow)]
     event: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    node: Option<&'a serde_json::value::RawValue>,
+}
+
+/// The wire `artifact_type` values, and the `DejaRecord` tag each becomes.
+///
+/// A marker is loss accounting rather than an event and is counted, not kept.
+/// An unset type is the legacy boundary-event envelope.
+const ARTIFACT_TYPE_MARKER: &str = "deja_sink_marker";
+const ARTIFACT_TYPE_GRAPH_NODE: &str = "deja_graph_node";
+
+impl<'a> EnvelopeProbe<'a> {
+    /// The record kind this envelope declares, and the raw payload under
+    /// whichever key that kind uses. `None` when the envelope declares a kind
+    /// whose payload is absent — a malformed line, not a shape we don't know.
+    fn payload(&self) -> Option<(&'static str, &'a serde_json::value::RawValue)> {
+        match self.artifact_type.as_deref() {
+            Some(ARTIFACT_TYPE_GRAPH_NODE) => self.node.map(|n| ("graph_node", n)),
+            // `deja_artifact_record`, and an unset type for legacy envelopes.
+            _ => self.event.map(|e| ("boundary_event", e)),
+        }
+    }
+
+    fn is_marker(&self) -> bool {
+        self.artifact_type.as_deref() == Some(ARTIFACT_TYPE_MARKER)
+    }
 }
 
 /// Light probe for session grouping during an arbitrary-prefix scan — only
@@ -96,7 +191,7 @@ pub fn pull_recording(
     };
     let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
     let chunk = lines.join("\n").into_bytes();
-    let (events, lines_in, duplicates) = collate(&[chunk]);
+    let (events, lines_in, drops) = collate(&[chunk]);
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -115,11 +210,18 @@ pub fn pull_recording(
         prefix: deja_compactor::layout::session_root(recording_id),
         landing_objects: manifest.counts.landing_objects,
         lines_in,
-        duplicates_dropped: manifest.counts.duplicates_dropped + duplicates,
+        // The manifest's own duplicates were dropped when the session was
+        // sealed, so they are outside this pass's line accounting and are
+        // reported separately from what collate saw.
+        duplicates_dropped: manifest.counts.duplicates_dropped + drops.duplicates,
         events_out: events.len(),
         correlations: manifest.counts.correlations,
         sealed: true,
+        markers_dropped: drops.markers,
+        non_envelope_dropped: drops.non_envelope,
+        unparseable_dropped: drops.unparseable,
     };
+    eprintln!("{}", report.accounting());
     Ok((report, manifest))
 }
 
@@ -219,7 +321,7 @@ pub fn pull_recording_from_prefix(
 
     let lines = by_session.remove(&resolved).unwrap_or_default();
     let chunk = lines.join("\n").into_bytes();
-    let (events, lines_in, duplicates) = collate(&[chunk]);
+    let (events, lines_in, drops) = collate(&[chunk]);
 
     let dest = dest_for(&resolved);
     let dest = dest.as_path();
@@ -246,13 +348,17 @@ pub fn pull_recording_from_prefix(
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
         landing_objects: keys.len(),
         lines_in,
-        duplicates_dropped: duplicates,
+        duplicates_dropped: drops.duplicates,
         events_out: events.len(),
         correlations: correlations.len(),
         // A raw prefix has no manifest seal; completeness is whatever the
         // aggregator had flushed when we scanned.
         sealed: false,
+        markers_dropped: drops.markers,
+        non_envelope_dropped: drops.non_envelope,
+        unparseable_dropped: drops.unparseable,
     };
+    eprintln!("{}", report.accounting());
     Ok((report, resolved, seen))
 }
 
@@ -278,32 +384,35 @@ fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
     }
 }
 
-/// Unwrap envelopes (raw event bytes preserved), probe the dedup/sort key,
+/// Unwrap envelopes (raw payload bytes preserved), probe the dedup/sort key,
 /// drop duplicates and sink markers, sort canonically. Returns the sorted
-/// `(recording_run_id, record_kind, global_sequence, raw_event_json)` tuples
-/// plus `(lines_in, duplicates_dropped)`.
+/// `(recording_run_id, record_kind, global_sequence, raw_event_json)` tuples,
+/// the line count, and every reason a line did not become an event.
 ///
-/// The record kind is part of the key because `global_sequence` is only unique
-/// WITHIN a kind. The recorder numbers graph nodes in a sequence space of their
-/// own, deliberately, so that boundary-event numbering is identical whether or
-/// not graph capture is on — replay's lookup addressing mirrors it. Both spaces
-/// start at zero in the same recording, so a key of `(recording, sequence)`
-/// alone makes graph node N collide with boundary event N, and the second one
-/// collated is discarded as a duplicate. With boundary events covering the whole
-/// range that silently drops the entire graph, which is what left the record
-/// side of the execution graph empty while replay produced thousands of nodes.
+/// The kind is dispatched from `artifact_type` BEFORE the payload is looked
+/// for, because which key holds the payload depends on the kind — see
+/// [`EnvelopeProbe`]. Requiring `event` first made every graph envelope look
+/// like a line that was not an envelope at all, so the graph arm below could
+/// never be reached and an entire record type was discarded on the way in.
+///
+/// The kind is also part of the dedup key, because `global_sequence` is only
+/// unique WITHIN a kind: graph nodes are numbered in a sequence space of their
+/// own so that boundary-event numbering is identical whether or not graph
+/// capture is on, and replay's lookup addressing mirrors that numbering. Both
+/// spaces start at zero in one recording, so a key without the kind makes graph
+/// node N collide with boundary event N.
 #[allow(clippy::type_complexity)]
 fn collate(
     raw_chunks: &[Vec<u8>],
 ) -> (
     Vec<(Option<String>, &'static str, u64, String)>,
     usize,
-    usize,
+    DropCounts,
 ) {
     let mut seen = std::collections::HashSet::new();
     let mut events: Vec<(Option<String>, &'static str, u64, String)> = Vec::new();
     let mut lines_in = 0usize;
-    let mut duplicates = 0usize;
+    let mut drops = DropCounts::default();
     for chunk in raw_chunks {
         for line in chunk.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -314,31 +423,32 @@ fn collate(
             // Landing lines are envelopes; the payload's raw bytes are kept.
             let (record_kind, event_raw): (&'static str, String) =
                 match serde_json::from_str::<EnvelopeProbe>(&line_str) {
-                    Ok(EnvelopeProbe {
-                        artifact_type,
-                        event: Some(event),
-                    }) => {
-                        // The canonical events.jsonl is a `DejaRecord` stream, internally
-                        // tagged by `record_kind`. The wire envelope's `artifact_type` is
-                        // the record kind, but the sink omits the tag from the raw event
-                        // payload — stamp the matching one as we unwrap so the renderer
-                        // and kernel can deserialize the line as a `DejaRecord`.
-                        let record_kind = match artifact_type.as_deref() {
-                            Some("deja_sink_marker") => continue, // loss-accounting, not events
-                            Some("deja_graph_node") => "graph_node",
-                            _ => "boundary_event", // deja_artifact_record (+ unset legacy)
-                        };
-                        (record_kind, stamp_record_kind(event.get(), record_kind))
+                    // Loss accounting, not events — counted so the totals balance.
+                    Ok(probe) if probe.is_marker() => {
+                        drops.markers += 1;
+                        continue;
                     }
-                    _ => {
-                        eprintln!("ingest: dropping non-envelope line");
+                    // The canonical events.jsonl is a `DejaRecord` stream, internally
+                    // tagged by `record_kind`. The wire envelope's `artifact_type` is
+                    // the record kind, but the sink omits the tag from the raw payload
+                    // — stamp the matching one as we unwrap so the renderer and kernel
+                    // can deserialize the line as a `DejaRecord`.
+                    Ok(probe) => match probe.payload() {
+                        Some((kind, payload)) => (kind, stamp_record_kind(payload.get(), kind)),
+                        None => {
+                            drops.non_envelope += 1;
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        drops.non_envelope += 1;
                         continue;
                     }
                 };
             let probe: EventProbe = match serde_json::from_str(&event_raw) {
                 Ok(p) => p,
-                Err(e) => {
-                    eprintln!("ingest: dropping unparseable line ({e})");
+                Err(_) => {
+                    drops.unparseable += 1;
                     continue;
                 }
             };
@@ -347,7 +457,7 @@ fn collate(
                 record_kind,
                 probe.global_sequence,
             )) {
-                duplicates += 1;
+                drops.duplicates += 1;
                 continue;
             }
             events.push((
@@ -361,7 +471,7 @@ fn collate(
     // Sequence first so a kind's own order is preserved and boundary-event
     // ordering is unchanged; kind only breaks the tie between the two spaces.
     events.sort_by(|a, b| (&a.0, a.2, a.1).cmp(&(&b.0, b.2, b.1)));
-    (events, lines_in, duplicates)
+    (events, lines_in, drops)
 }
 
 #[cfg(test)]
@@ -388,19 +498,110 @@ mod tests {
             envelope("r1", 1, r#","k":"a""#), // duplicate of obj1's gseq 1
             envelope("r1", 2, r#","k":"b""#),
         );
-        let (events, lines_in, dupes) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
+        let (events, lines_in, drops) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
         assert_eq!(lines_in, 6);
-        assert_eq!(dupes, 1);
+        assert_eq!(drops.duplicates, 1);
+        assert_eq!(drops.markers, 1);
+        assert_eq!(drops.non_envelope, 1); // the `not-json` line
         let gseqs: Vec<u64> = events.iter().map(|(_, _, g, _)| *g).collect();
         assert_eq!(gseqs, vec![1, 2, 3]);
         // Raw event bytes preserved verbatim (no key reordering).
         assert!(events[0].3.contains(r#""global_sequence":1,"k":"a""#));
     }
 
+    /// A graph-node envelope EXACTLY as the recorded system emits it.
+    ///
+    /// The payload is under `node`, not `event`, and the schema version is 1 —
+    /// both copied from the producer (`GraphEnvelope` in the router's deja
+    /// record sink), not invented here. An earlier version of this helper used
+    /// `event`, which is why a test suite could pass while every graph node in
+    /// production was discarded: the fixture described a wire shape nothing
+    /// ever wrote.
     fn graph_envelope(rid: &str, gseq: u64) -> String {
         format!(
-            r#"{{"schema_version":2,"artifact_type":"deja_graph_node","instance_id":"router-h-1","event":{{"recording_run_id":"{rid}","global_sequence":{gseq},"span_name":"payments_create"}}}}"#
+            r#"{{"schema_version":1,"artifact_type":"deja_graph_node","instance_id":"router-h-1","recording_run_id":"{rid}","capture":{{"mode":"session","session_id":"{rid}"}},"node":{{"recording_run_id":"{rid}","global_sequence":{gseq},"node_id":{gseq},"span_name":"payments_create"}}}}"#
         )
+    }
+
+    #[test]
+    fn a_graph_envelope_is_kept_even_though_its_payload_is_not_under_event() {
+        // The defect this pins: the probe looked only for `event`, so a graph
+        // envelope — whose payload the producer nests under `node`, precisely
+        // because the node carries its own recording_run_id and global_sequence
+        // that flattening would collide with — parsed as an envelope with no
+        // payload and was discarded as "not an envelope" before its
+        // artifact_type was ever consulted.
+        let chunk = format!("{}\n", graph_envelope("r1", 5)).into_bytes();
+        let (events, lines_in, drops) = collate(&[chunk]);
+        assert_eq!(lines_in, 1);
+        assert_eq!(
+            drops.non_envelope, 0,
+            "a graph envelope is an envelope; it must not be dropped as junk"
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, "graph_node");
+        assert_eq!(events[0].2, 5);
+        assert!(events[0].3.contains(r#""record_kind":"graph_node""#));
+        // The node's own payload survives verbatim, not the envelope's copy.
+        assert!(events[0].3.contains(r#""span_name":"payments_create""#));
+    }
+
+    #[test]
+    fn every_line_read_is_accounted_for() {
+        // The balance property. A line may become an event or be dropped for a
+        // named reason, and nothing else. This is the check that would have
+        // surfaced 97,309 vanishing lines on a real recording instead of
+        // leaving them to be inferred from a graph that never rendered.
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n{}\nnot-json-at-all\n{}\n",
+            envelope("r1", 1, ""),
+            envelope("r1", 1, ""), // duplicate
+            graph_envelope("r1", 1),
+            graph_envelope("r1", 1), // duplicate
+            r#"{"artifact_type":"deja_sink_marker","recording_run_id":"r1"}"#,
+            r#"{"artifact_type":"deja_artifact_record","instance_id":"h"}"#, // no payload
+        )
+        .into_bytes();
+        let (events, lines_in, drops) = collate(&[chunk]);
+        assert_eq!(lines_in, 7);
+        assert_eq!(events.len(), 2);
+        assert_eq!(drops.duplicates, 2);
+        assert_eq!(drops.markers, 1);
+        assert_eq!(drops.non_envelope, 2); // the junk line and the payload-less envelope
+
+        let report = IngestReport {
+            prefix: "s3://b/p".into(),
+            landing_objects: 1,
+            lines_in,
+            duplicates_dropped: drops.duplicates,
+            events_out: events.len(),
+            correlations: 0,
+            sealed: false,
+            markers_dropped: drops.markers,
+            non_envelope_dropped: drops.non_envelope,
+            unparseable_dropped: drops.unparseable,
+        };
+        assert!(report.balances(), "{}", report.accounting());
+        assert!(!report.accounting().contains("UNACCOUNTED"));
+    }
+
+    #[test]
+    fn an_unbalanced_report_says_so() {
+        // The assertion has to be able to fail, or it is decoration.
+        let report = IngestReport {
+            prefix: "s3://b/p".into(),
+            landing_objects: 1,
+            lines_in: 139_916,
+            duplicates_dropped: 0,
+            events_out: 42_607,
+            correlations: 3,
+            sealed: false,
+            markers_dropped: 0,
+            non_envelope_dropped: 0,
+            unparseable_dropped: 0,
+        };
+        assert!(!report.balances());
+        assert!(report.accounting().contains("UNACCOUNTED: 97309"));
     }
 
     #[test]
@@ -420,8 +621,11 @@ mod tests {
             graph_envelope("r1", 1),
         )
         .into_bytes();
-        let (events, _, dupes) = collate(&[chunk]);
-        assert_eq!(dupes, 0, "no record may be dropped as a duplicate here");
+        let (events, _, drops) = collate(&[chunk]);
+        assert_eq!(
+            drops.duplicates, 0,
+            "no record may be dropped as a duplicate here"
+        );
         assert_eq!(events.len(), 4);
 
         let kinds: Vec<&str> = events.iter().map(|(_, kind, _, _)| *kind).collect();
@@ -450,8 +654,8 @@ mod tests {
             graph_envelope("r1", 7),
         )
         .into_bytes();
-        let (events, _, dupes) = collate(&[chunk]);
-        assert_eq!(dupes, 2);
+        let (events, _, drops) = collate(&[chunk]);
+        assert_eq!(drops.duplicates, 2);
         assert_eq!(events.len(), 2);
     }
 
@@ -459,8 +663,8 @@ mod tests {
     fn collate_keeps_distinct_runs_apart() {
         let chunks =
             vec![format!("{}\n{}\n", envelope("r2", 1, ""), envelope("r1", 1, "")).into_bytes()];
-        let (events, _, dupes) = collate(&chunks);
-        assert_eq!(dupes, 0);
+        let (events, _, drops) = collate(&chunks);
+        assert_eq!(drops.duplicates, 0);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0.as_deref(), Some("r1")); // sorted by (rid, gseq, kind)
     }
