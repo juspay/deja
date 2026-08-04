@@ -9,8 +9,10 @@
 //! 2. stream the data parts (full envelope lines, already deduped + sorted)
 //! 3. unwrap envelopes — raw event bytes preserved via `RawValue`, no
 //!    reserialization — and re-verify dedup/order by
-//!    `(recording_run_id, global_sequence)` while materializing the
-//!    canonical `events.jsonl` the kernel + renderer read
+//!    `(recording_run_id, record_kind, global_sequence)` while materializing
+//!    the canonical `events.jsonl` the kernel + renderer read. The kind
+//!    belongs in the key: each record kind is numbered in a sequence space of
+//!    its own, so a sequence identifies an event only within its kind.
 //!
 //! (`KeyStamper` occurrences are correlation/address/args-scoped, so
 //! dedup+sort cannot perturb lookup stamping.)
@@ -102,7 +104,7 @@ pub fn pull_recording(
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
-    for (_, _, line) in &events {
+    for (_, _, _, line) in &events {
         out.write_all(line.as_bytes())
             .and_then(|_| out.write_all(b"\n"))
             .map_err(|e| format!("write {}: {e}", dest.display()))?;
@@ -228,7 +230,7 @@ pub fn pull_recording_from_prefix(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
     let mut correlations = std::collections::HashSet::new();
-    for (_, _, line) in &events {
+    for (_, _, _, line) in &events {
         if let Ok(probe) = serde_json::from_str::<CorrelationProbe>(line) {
             if let Some(corr) = probe.correlation_id {
                 correlations.insert(corr);
@@ -278,12 +280,28 @@ fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
 
 /// Unwrap envelopes (raw event bytes preserved), probe the dedup/sort key,
 /// drop duplicates and sink markers, sort canonically. Returns the sorted
-/// `(recording_run_id, global_sequence, raw_event_json)` triples plus
-/// `(lines_in, duplicates_dropped)`.
+/// `(recording_run_id, record_kind, global_sequence, raw_event_json)` tuples
+/// plus `(lines_in, duplicates_dropped)`.
+///
+/// The record kind is part of the key because `global_sequence` is only unique
+/// WITHIN a kind. The recorder numbers graph nodes in a sequence space of their
+/// own, deliberately, so that boundary-event numbering is identical whether or
+/// not graph capture is on — replay's lookup addressing mirrors it. Both spaces
+/// start at zero in the same recording, so a key of `(recording, sequence)`
+/// alone makes graph node N collide with boundary event N, and the second one
+/// collated is discarded as a duplicate. With boundary events covering the whole
+/// range that silently drops the entire graph, which is what left the record
+/// side of the execution graph empty while replay produced thousands of nodes.
 #[allow(clippy::type_complexity)]
-fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize, usize) {
+fn collate(
+    raw_chunks: &[Vec<u8>],
+) -> (
+    Vec<(Option<String>, &'static str, u64, String)>,
+    usize,
+    usize,
+) {
     let mut seen = std::collections::HashSet::new();
-    let mut events: Vec<(Option<String>, u64, String)> = Vec::new();
+    let mut events: Vec<(Option<String>, &'static str, u64, String)> = Vec::new();
     let mut lines_in = 0usize;
     let mut duplicates = 0usize;
     for chunk in raw_chunks {
@@ -294,28 +312,29 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize
             lines_in += 1;
             let line_str = String::from_utf8_lossy(line);
             // Landing lines are envelopes; the payload's raw bytes are kept.
-            let event_raw: String = match serde_json::from_str::<EnvelopeProbe>(&line_str) {
-                Ok(EnvelopeProbe {
-                    artifact_type,
-                    event: Some(event),
-                }) => {
-                    // The canonical events.jsonl is a `DejaRecord` stream, internally
-                    // tagged by `record_kind`. The wire envelope's `artifact_type` is
-                    // the record kind, but the sink omits the tag from the raw event
-                    // payload — stamp the matching one as we unwrap so the renderer
-                    // and kernel can deserialize the line as a `DejaRecord`.
-                    let record_kind = match artifact_type.as_deref() {
-                        Some("deja_sink_marker") => continue, // loss-accounting, not events
-                        Some("deja_graph_node") => "graph_node",
-                        _ => "boundary_event", // deja_artifact_record (+ unset legacy)
-                    };
-                    stamp_record_kind(event.get(), record_kind)
-                }
-                _ => {
-                    eprintln!("ingest: dropping non-envelope line");
-                    continue;
-                }
-            };
+            let (record_kind, event_raw): (&'static str, String) =
+                match serde_json::from_str::<EnvelopeProbe>(&line_str) {
+                    Ok(EnvelopeProbe {
+                        artifact_type,
+                        event: Some(event),
+                    }) => {
+                        // The canonical events.jsonl is a `DejaRecord` stream, internally
+                        // tagged by `record_kind`. The wire envelope's `artifact_type` is
+                        // the record kind, but the sink omits the tag from the raw event
+                        // payload — stamp the matching one as we unwrap so the renderer
+                        // and kernel can deserialize the line as a `DejaRecord`.
+                        let record_kind = match artifact_type.as_deref() {
+                            Some("deja_sink_marker") => continue, // loss-accounting, not events
+                            Some("deja_graph_node") => "graph_node",
+                            _ => "boundary_event", // deja_artifact_record (+ unset legacy)
+                        };
+                        (record_kind, stamp_record_kind(event.get(), record_kind))
+                    }
+                    _ => {
+                        eprintln!("ingest: dropping non-envelope line");
+                        continue;
+                    }
+                };
             let probe: EventProbe = match serde_json::from_str(&event_raw) {
                 Ok(p) => p,
                 Err(e) => {
@@ -323,14 +342,25 @@ fn collate(raw_chunks: &[Vec<u8>]) -> (Vec<(Option<String>, u64, String)>, usize
                     continue;
                 }
             };
-            if !seen.insert((probe.recording_run_id.clone(), probe.global_sequence)) {
+            if !seen.insert((
+                probe.recording_run_id.clone(),
+                record_kind,
+                probe.global_sequence,
+            )) {
                 duplicates += 1;
                 continue;
             }
-            events.push((probe.recording_run_id, probe.global_sequence, event_raw));
+            events.push((
+                probe.recording_run_id,
+                record_kind,
+                probe.global_sequence,
+                event_raw,
+            ));
         }
     }
-    events.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    // Sequence first so a kind's own order is preserved and boundary-event
+    // ordering is unchanged; kind only breaks the tie between the two spaces.
+    events.sort_by(|a, b| (&a.0, a.2, a.1).cmp(&(&b.0, b.2, b.1)));
     (events, lines_in, duplicates)
 }
 
@@ -361,10 +391,68 @@ mod tests {
         let (events, lines_in, dupes) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
         assert_eq!(lines_in, 6);
         assert_eq!(dupes, 1);
-        let gseqs: Vec<u64> = events.iter().map(|(_, g, _)| *g).collect();
+        let gseqs: Vec<u64> = events.iter().map(|(_, _, g, _)| *g).collect();
         assert_eq!(gseqs, vec![1, 2, 3]);
         // Raw event bytes preserved verbatim (no key reordering).
-        assert!(events[0].2.contains(r#""global_sequence":1,"k":"a""#));
+        assert!(events[0].3.contains(r#""global_sequence":1,"k":"a""#));
+    }
+
+    fn graph_envelope(rid: &str, gseq: u64) -> String {
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_graph_node","instance_id":"router-h-1","event":{{"recording_run_id":"{rid}","global_sequence":{gseq},"span_name":"payments_create"}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_graph_node_does_not_displace_the_boundary_event_of_the_same_sequence() {
+        // Graph nodes are numbered in a sequence space of their own so that
+        // boundary-event numbering is identical whether or not graph capture is
+        // on. Both spaces therefore start at zero in one recording, and a key
+        // that is only `(recording, sequence)` treats node N and event N as the
+        // same record — silently discarding one of them. With boundary events
+        // covering the whole range that drops the entire graph, which is what
+        // left the record side of the execution graph empty.
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n",
+            envelope("r1", 0, r#","k":"a""#),
+            envelope("r1", 1, r#","k":"b""#),
+            graph_envelope("r1", 0),
+            graph_envelope("r1", 1),
+        )
+        .into_bytes();
+        let (events, _, dupes) = collate(&[chunk]);
+        assert_eq!(dupes, 0, "no record may be dropped as a duplicate here");
+        assert_eq!(events.len(), 4);
+
+        let kinds: Vec<&str> = events.iter().map(|(_, kind, _, _)| *kind).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == "graph_node").count(), 2);
+        assert_eq!(kinds.iter().filter(|k| **k == "boundary_event").count(), 2);
+
+        // Each kind keeps its own order, and the stamped tag makes the line
+        // deserializable as the right `DejaRecord` variant.
+        let graph: Vec<&String> = events
+            .iter()
+            .filter(|(_, kind, _, _)| *kind == "graph_node")
+            .map(|(_, _, _, line)| line)
+            .collect();
+        assert!(graph
+            .iter()
+            .all(|l| l.contains(r#""record_kind":"graph_node""#)));
+    }
+
+    #[test]
+    fn a_true_duplicate_within_one_kind_is_still_dropped() {
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n",
+            envelope("r1", 7, ""),
+            envelope("r1", 7, ""),
+            graph_envelope("r1", 7),
+            graph_envelope("r1", 7),
+        )
+        .into_bytes();
+        let (events, _, dupes) = collate(&[chunk]);
+        assert_eq!(dupes, 2);
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
@@ -374,6 +462,6 @@ mod tests {
         let (events, _, dupes) = collate(&chunks);
         assert_eq!(dupes, 0);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0.as_deref(), Some("r1")); // sorted by (rid, gseq)
+        assert_eq!(events[0].0.as_deref(), Some("r1")); // sorted by (rid, gseq, kind)
     }
 }
