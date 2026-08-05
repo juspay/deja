@@ -557,7 +557,7 @@ fn drive_record(
         ctx,
         4,
         total,
-        "driving payment workload (HS → Kafka → Vector → MinIO)",
+        "driving payment workload (recording to the configured sink)",
     );
     // EU-settlement demo: the settlement READ is now a RAW fred GET against
     // redis, so seed the default rate in the record container's redis (not pg)
@@ -592,7 +592,7 @@ fn drive_record(
         ctx,
         5,
         total,
-        "waiting for recording to land in MinIO (S3)",
+        "waiting for the recording to land",
     );
     // The full 9-step Stripe workload keeps producing events while this stage is
     // already counting down, then the router→Kafka→Vector→S3 drain adds a tail
@@ -779,13 +779,17 @@ fn stage_resolve_recording(
         None => {
             let recording_id =
                 wanted.ok_or_else(|| "replay run requires recording_id".to_string())?;
+            // Name the SOURCE, not the store that happens to back it. MinIO is
+            // the local demo's object store; a deployed run reads real S3, and a
+            // stage label that says otherwise tells an operator to go looking in
+            // the wrong place.
             set_stage(
                 root,
                 run,
                 ctx,
                 1,
                 total,
-                "pulling recording from MinIO (S3)",
+                &format!("fetching recording {recording_id}"),
             );
             if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
                 pull_recording(root, ctx, &recording_id)?;
@@ -3120,7 +3124,7 @@ fn run_workload(
     let status = run_streamed(
         cmd,
         ctx,
-        "driving payment workload (HS → Kafka → Vector → MinIO)",
+        "driving payment workload (recording to the configured sink)",
         "workload",
     )?;
     if !status.success() {
