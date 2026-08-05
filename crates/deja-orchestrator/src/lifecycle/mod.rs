@@ -774,8 +774,9 @@ fn stage_resolve_recording(
             );
             resolve_recording_from_source(root, ctx, source, wanted.as_deref())?
         }
-        // Session layout: the recording comes back out of the deja bucket.
-        // (If a prior run on this host already pulled it to disk, reuse that.)
+        // No source given: the recording is resolved by NAME against the
+        // deployment's own bucket, whichever layout holds it. (If a prior run
+        // on this host already pulled it to disk, reuse that.)
         None => {
             let recording_id =
                 wanted.ok_or_else(|| "replay run requires recording_id".to_string())?;
@@ -788,7 +789,7 @@ fn stage_resolve_recording(
                 "pulling recording from MinIO (S3)",
             );
             if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
-                pull_recording(root, ctx, &recording_id)?;
+                pull_recording_by_name(root, ctx, &recording_id)?;
             }
             recording_id
         }
@@ -3419,6 +3420,69 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
     Ok(())
 }
 
+/// Materialize a recording NAMED BY ID from the deployment's own landing
+/// area, whichever key layout holds it.
+///
+/// The bucket and root come from the environment (`DEJA_S3_BUCKET`,
+/// `DEJA_RECORDING_ROOT`) — the same place the recordings index reads — so
+/// choosing a recording from the index and driving it are ONE resolution. A
+/// caller names a recording, never a path; the spec's `s3_source` remains the
+/// explicit override for a recording that lives in a different bucket.
+///
+/// Routing: a session the aggregator wrote date-partitioned
+/// (`landing/v1/dt=…/session={id}`) is ingested from its discovered prefix,
+/// scoped to the named session. Anything else — session-layout landing, a
+/// sealed session whose landing objects are gone, or an index that cannot be
+/// listed — goes to the compactor's own manifest-or-compact path, which
+/// errors loudly if the recording truly is not there.
+fn pull_recording_by_name(
+    root: &HarnessRoot,
+    ctx: &StoreCtx,
+    recording_id: &str,
+) -> Result<(), String> {
+    let cfg = crate::s3::S3Config::from_env();
+    let landing_root =
+        std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    let landed = deja_compactor::list_landed_recordings(&cfg, &landing_root).unwrap_or_else(|e| {
+        eprintln!(
+            "lifecycle: landing index under {landing_root} unavailable ({e}); \
+             trying the sealed-session path"
+        );
+        Vec::new()
+    });
+    match route_for_named_recording(&landed, recording_id) {
+        NamedRecordingRoute::Prefix(prefix) => {
+            let (report, resolved, _seen) =
+                crate::s3::pull_recording_from_prefix(&cfg, prefix, Some(recording_id), |sid| {
+                    crate::scope::TapeSlot::for_write(root, sid)
+                })?;
+            register_prefix_ingest(root, ctx, &resolved, &report)
+        }
+        NamedRecordingRoute::SessionLayout => pull_recording(root, ctx, recording_id),
+    }
+}
+
+/// Where a NAMED recording is ingested from. Separated from the IO so the
+/// routing can be stated as examples.
+enum NamedRecordingRoute<'a> {
+    /// Date-partitioned landing: scan this prefix, scoped to the session.
+    Prefix(&'a str),
+    /// The compactor's own session paths (landing `session=` keys or a sealed
+    /// manifest) — also the fallback when the landing index says nothing,
+    /// because a sealed session outlives its landing objects.
+    SessionLayout,
+}
+
+fn route_for_named_recording<'a>(
+    landed: &'a [deja_compactor::LandedRecording],
+    recording_id: &str,
+) -> NamedRecordingRoute<'a> {
+    match landed.iter().find(|r| r.session_id == recording_id) {
+        Some(rec) if !rec.dates.is_empty() => NamedRecordingRoute::Prefix(&rec.prefix),
+        _ => NamedRecordingRoute::SessionLayout,
+    }
+}
+
 /// Pull a replay's recording out of an arbitrary bucket/prefix in the DEPLOYED
 /// aggregator layout (see `s3::pull_recording_from_prefix`) and register it
 /// exactly like the session-layout pull — minus the manifest, which a raw
@@ -3455,6 +3519,20 @@ fn resolve_recording_from_source(
             &format!("other sessions under this prefix: {others}"),
         );
     }
+    register_prefix_ingest(root, ctx, &resolved, &report)?;
+    Ok(resolved)
+}
+
+/// Register a prefix-scan ingest exactly like the session-layout pull — the
+/// consumer shim, the ingest-report artifact, the catalog row — minus the
+/// manifest, which a raw prefix does not have. Shared by the named-recording
+/// resolver and the explicit `s3_source` path so the two cannot drift.
+fn register_prefix_ingest(
+    root: &HarnessRoot,
+    ctx: &StoreCtx,
+    resolved: &str,
+    report: &crate::s3::IngestReport,
+) -> Result<(), String> {
     let line = format!(
         "ingested {resolved} from {}: {} object(s), {} line(s), {} duplicate(s) dropped → \
          {} event(s), {} correlation(s) (unsealed prefix scan)",
@@ -3473,7 +3551,7 @@ fn resolve_recording_from_source(
             report.prefix
         ));
     }
-    let dest = crate::scope::TapeSlot::for_write(root, &resolved);
+    let dest = crate::scope::TapeSlot::for_write(root, resolved);
     // Same consumer shim as the session-layout pull (deja-tui / metrics).
     let legacy_copy = root.root.join("recording").join("semantic-events.jsonl");
     if let Some(parent) = legacy_copy.parent() {
@@ -3483,20 +3561,20 @@ fn resolve_recording_from_source(
         eprintln!("lifecycle: semantic-events.jsonl shim copy failed: {e}");
     }
     let report_path = dest.with_file_name("ingest-report.json");
-    if let Err(e) = write_json(&report_path, &report) {
+    if let Err(e) = write_json(&report_path, report) {
         eprintln!("lifecycle: ingest report write failed: {e}");
     }
-    ctx.artifact(Some(&resolved), "ingest_report", &report_path);
+    ctx.artifact(Some(resolved), "ingest_report", &report_path);
     let bytes = std::fs::metadata(&dest).ok().map(|m| m.len() as i64);
     ctx.recording(
-        &resolved,
+        resolved,
         dest.to_str(),
         Some(report.events_out as i64),
         Some(report.correlations as i64),
         bytes,
         None,
     );
-    Ok(resolved)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3505,6 +3583,57 @@ mod tests {
     use super::*;
     use crate::scope::{RunScope, ScopedRecording, TapeSlot};
     use crate::{CandidateSpec, RunSpec};
+
+    #[test]
+    fn a_named_recording_routes_by_where_the_landing_area_holds_it() {
+        use deja_compactor::LandedRecording;
+        let landed = vec![
+            LandedRecording {
+                session_id: "run-dt".into(),
+                dates: vec!["2026-08-04".into()],
+                prefix: "landing/v1/dt=2026-08-04/session=run-dt".into(),
+                objects: 3,
+            },
+            LandedRecording {
+                session_id: "run-straddle".into(),
+                dates: vec!["2026-08-04".into(), "2026-08-05".into()],
+                prefix: "landing/v1".into(),
+                objects: 5,
+            },
+            LandedRecording {
+                session_id: "run-plain".into(),
+                dates: vec![],
+                prefix: "landing/v1/session=run-plain".into(),
+                objects: 2,
+            },
+        ];
+
+        // A date-partitioned session is ingested from its discovered prefix —
+        // the caller named a recording and the index said where it lives.
+        assert!(matches!(
+            route_for_named_recording(&landed, "run-dt"),
+            NamedRecordingRoute::Prefix("landing/v1/dt=2026-08-04/session=run-dt")
+        ));
+        // A midnight-straddler is scanned from the shared parent, so the scan
+        // sees all of it rather than half of one date.
+        assert!(matches!(
+            route_for_named_recording(&landed, "run-straddle"),
+            NamedRecordingRoute::Prefix("landing/v1")
+        ));
+        // Session-layout landing keeps the compactor's own manifest-or-compact
+        // path (which also seals + registers the manifest).
+        assert!(matches!(
+            route_for_named_recording(&landed, "run-plain"),
+            NamedRecordingRoute::SessionLayout
+        ));
+        // Absent from the landing index is NOT absent from the bucket: a
+        // sealed session outlives its landing objects, so the compactor path
+        // gets the last word (and errors loudly if it truly is not there).
+        assert!(matches!(
+            route_for_named_recording(&landed, "run-retired"),
+            NamedRecordingRoute::SessionLayout
+        ));
+    }
 
     /// Write a tape into the canonical slot and open it at `scope`.
     fn recording(body: &str, scope: RunScope) -> (tempfile::TempDir, ScopedRecording) {
