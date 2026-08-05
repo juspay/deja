@@ -1,26 +1,9 @@
 import React from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
-
-// The fast-iteration build profile demo/lib.sh uses (DEMO_CARGO_PROFILE).
-const BUILD_CMD = (patch: string) => `# 1. apply the candidate patch to the vendored Hyperswitch tree
-git -C vendor/hyperswitch-deja-clean apply ${patch}
-
-# 2. build the candidate router with the fast profile
-( cd vendor/hyperswitch-deja-clean && \\
-  env CARGO_PROFILE_RELEASE_LTO=false \\
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \\
-      CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \\
-      CARGO_PROFILE_RELEASE_INCREMENTAL=true \\
-  cargo build --release -p router --features deja,v1 --bin router )
-
-# 3. copy the binary somewhere stable and paste its path below
-cp vendor/hyperswitch-deja-clean/target/release/router /tmp/router-candidate
-# → candidate binary path: /tmp/router-candidate
-
-# 4. revert the patch (the vendor tree goes back to V1)
-git -C vendor/hyperswitch-deja-clean apply -R ${patch}`;
+import { useDebug } from "../lib/debug";
+import { RunLaunchModal } from "../components/RunLaunchModal";
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -31,6 +14,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   return (
     <button
       type="button"
+      className="btn"
       onClick={() => {
         void navigator.clipboard.writeText(text).then(() => {
           setCopied(true);
@@ -43,29 +27,40 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   );
 }
 
+/**
+ * HOME. The form, and nothing else.
+ *
+ * Gone with this rewrite: the build-command block (a shell recipe for building a
+ * router binary in a vendored tree, on the page whose job is to launch a run),
+ * the cross-version scenario selector that drove only that recipe's file name,
+ * and the candidate binary path — `local_path` is 0 of 29 live runs, and the
+ * field's presence made the real input (an image ref) look optional.
+ */
 export default function NewRunPage() {
-  const nav = useNavigate();
   const [params] = useSearchParams();
+  const debug = useDebug();
   const [mode, setMode] = React.useState<"record" | "replay">("replay");
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
   const [imageRef, setImageRef] = React.useState("");
   const [candidateRepo, setCandidateRepo] = React.useState("");
   const [s3Path, setS3Path] = React.useState("");
   const [corrFilter, setCorrFilter] = React.useState("");
-  const [binaryPath, setBinaryPath] = React.useState("");
   const [iterations, setIterations] = React.useState(1);
   const [expectation, setExpectation] = React.useState("");
-  const [scenario, setScenario] = React.useState("benign-line-shift");
+  const [launched, setLaunched] = React.useState<string | null>(null);
 
+  const recordings = useQuery({ queryKey: ["recordings"], queryFn: api.recordings });
+  const picked = recordings.data?.find((r) => r.recording_id === recordingId.trim());
+
+  const corrs = React.useMemo(
+    () => corrFilter.split(",").map((s) => s.trim()).filter(Boolean),
+    [corrFilter],
+  );
 
   const triggerSpec = React.useMemo(() => {
-    // Candidate precedence: a deployed image ref (e.g. the Jenkins ECR build)
-    // beats a local binary; neither = the legacy compose self-build sentinel.
     const candidate = imageRef
       ? { kind: "prebuilt_image", image: imageRef }
-      : binaryPath
-        ? { kind: "local_path", binary_or_source: binaryPath }
-        : { kind: "prebuilt_image", image: "deja-demo" };
+      : { kind: "prebuilt_image", image: "deja-demo" };
     const spec: Record<string, unknown> =
       mode === "record"
         ? { mode, candidate_spec: candidate, recording_id: null, workload: { iterations } }
@@ -74,67 +69,37 @@ export default function NewRunPage() {
             candidate_spec: candidate,
             // With an S3 source the id is the session filter and may be empty
             // (auto-resolved when the prefix holds exactly one session).
-            recording_id: recordingId || (s3Path ? null : "<recording_id>"),
+            recording_id: recordingId.trim() || (s3Path ? null : "<recording_id>"),
           };
     if (mode === "replay" && s3Path) spec.s3_source = { path: s3Path };
-    // Candidate source repo (owner/name) — a per-run parameter, since a
-    // candidate image can be built from any repo/fork. The orchestrator fetches
-    // this ref's migrations/ to arm the schema gate. Empty = its configured
-    // DEJA_CANDIDATE_REPO default.
     if (candidateRepo.trim()) spec.candidate_repo = candidateRepo.trim();
-    // Test-case subset: drive only these correlations; scoring scopes to the
-    // same list (an undriven case is excluded, not counted omitted).
-    const corrs = corrFilter.split(",").map((s) => s.trim()).filter(Boolean);
     if (mode === "replay" && corrs.length) spec.correlation_filter = corrs;
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [binaryPath, candidateRepo, corrFilter, expectation, imageRef, iterations, mode, recordingId, s3Path]);
+  }, [candidateRepo, corrs, expectation, imageRef, iterations, mode, recordingId, s3Path]);
 
-  const curlCommand = React.useMemo(() => {
-    const body = JSON.stringify(triggerSpec);
-    return [
-      `curl -sS -X POST ${window.location.origin}/api/v1/runs`,
-      "  -H 'content-type: application/json'",
-      `  -H ${shellQuote("X-Deja-Actor: user:<name>")}`,
-      `  --data ${shellQuote(body)}`,
-    ].join(" \\\n");
-  }, [triggerSpec]);
-
-  const prSnippet = React.useMemo(
+  const curlCommand = React.useMemo(
     () =>
       [
-        "### Deja replay request",
-        "",
-        `- Recording: \`${recordingId || "<recording_id>"}\``,
-        `- Candidate binary: \`${binaryPath || "/tmp/router-candidate"}\``,
-        `- Expected result: \`${expectation || "pass/diverge"}\``,
-        "",
-        "Trigger locally from the orchestrator worktree:",
-        "",
-        "```sh",
-        curlCommand,
-        "```",
-        "",
-        "After it finishes, update this comment with:",
-        `- Run: ${window.location.origin}/runs/<run_id>`,
-        `- Scorecard: ${window.location.origin}/runs/<run_id>/scorecard`,
-        "- Artifact URL(s): copy from the run Artifacts tab",
-      ].join("\n"),
-    [binaryPath, curlCommand, expectation, recordingId],
+        `curl -sS -X POST ${window.location.origin}/api/v1/runs`,
+        "  -H 'content-type: application/json'",
+        `  -H ${shellQuote("X-Deja-Actor: user:<name>")}`,
+        `  --data ${shellQuote(JSON.stringify(triggerSpec))}`,
+      ].join(" \\\n"),
+    [triggerSpec],
   );
-  const recordings = useQuery({ queryKey: ["recordings"], queryFn: api.recordings });
 
   const create = useMutation({
-    mutationFn: () => {
-      const spec = triggerSpec;
-      return api.createRun(spec);
-    },
-    onSuccess: (resp) => nav(`/runs/${resp.run_id}`),
+    mutationFn: () => api.createRun(triggerSpec),
+    onSuccess: (resp) => setLaunched(resp.run_id),
   });
+
+  const wholeSession = mode === "replay" && corrs.length === 0;
 
   return (
     <>
       <h1>New run</h1>
+
       <form
         className="runform"
         onSubmit={(e) => {
@@ -167,8 +132,7 @@ export default function NewRunPage() {
             <label>
               recording S3 path{" "}
               <span className="hint">
-                (a deployed bucket/prefix, e.g. the sandbox aggregator landing;
-                empty = pick from the local catalog below)
+                (a deployed bucket/prefix; empty = pick from the catalog below)
               </span>
               <input
                 type="text"
@@ -177,12 +141,12 @@ export default function NewRunPage() {
                 onChange={(e) => setS3Path(e.target.value)}
               />
             </label>
+
             {s3Path ? (
               <label>
                 recording session id{" "}
                 <span className="hint">
-                  (optional — auto-resolved when the path holds exactly one
-                  session; the failure message lists what it found)
+                  (optional — auto-resolved when the path holds exactly one session)
                 </span>
                 <input
                   type="text"
@@ -198,18 +162,16 @@ export default function NewRunPage() {
                   <option value="">— pick a recording —</option>
                   {recordings.data?.map((r) => (
                     <option key={r.recording_id} value={r.recording_id}>
-                      {r.recording_id} ({r.event_count ?? "?"} events)
+                      {r.recording_id} ({(r.correlation_count ?? 0).toLocaleString()} requests)
                     </option>
                   ))}
                 </select>
               </label>
             )}
+
             <label>
               candidate image{" "}
-              <span className="hint">
-                (a deployed image ref, e.g. the Jenkins ECR build; takes
-                precedence over the binary path below)
-              </span>
+              <span className="hint">(a deployed image ref, e.g. the ECR build)</span>
               <input
                 type="text"
                 placeholder="223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router:<tag>"
@@ -217,11 +179,12 @@ export default function NewRunPage() {
                 onChange={(e) => setImageRef(e.target.value)}
               />
             </label>
+
             <label>
               candidate repo{" "}
               <span className="hint">
-                (optional, owner/name — the image's source repo, used to fetch
-                its migrations for the schema gate; empty = the server default)
+                (optional, owner/name — the image's source repo, used to fetch its migrations for
+                the schema gate; empty = the server default)
               </span>
               <input
                 type="text"
@@ -230,34 +193,44 @@ export default function NewRunPage() {
                 onChange={(e) => setCandidateRepo(e.target.value)}
               />
             </label>
-            <label>
-              candidate router binary path{" "}
-              <span className="hint">
-                (empty = the default local build, i.e. self-replay; later this
-                field becomes PR/branch/commit/tag)
-              </span>
-              <input
-                type="text"
-                placeholder="/tmp/router-candidate"
-                value={binaryPath}
-                onChange={(e) => setBinaryPath(e.target.value)}
-              />
-            </label>
+
             <label>
               correlation filter{" "}
               <span className="hint">
-                (optional, comma-separated correlation ids — drive only these
-                test cases; the verdict judges only the driven subset)
+                (comma-separated correlation ids — the test cases to drive; the verdict judges only
+                the driven subset)
               </span>
               <input
                 type="text"
-                placeholder="all correlations"
+                placeholder="019fae07-b8d4-7080-aa62-9ecc4f816dd8, …"
                 value={corrFilter}
                 onChange={(e) => setCorrFilter(e.target.value)}
               />
             </label>
+
+            {/* SCOPE. Leaving the filter empty is not "a small default" — the live
+                recordings hold 42,310 and 170,568 correlations. Say the number. */}
+            {wholeSession && (
+              <p className="scopewarn">
+                <b>No scope set — this drives the entire session.</b>{" "}
+                {picked?.correlation_count
+                  ? `${picked.recording_id} holds ${picked.correlation_count.toLocaleString()} correlations; every one of them will be driven and scored.`
+                  : "A session recording can hold tens of thousands of correlations; every one will be driven and scored."}{" "}
+                List the correlation ids you actually want to test.
+              </p>
+            )}
+            {!wholeSession && (
+              <p className="hint">
+                {corrs.length} test case{corrs.length === 1 ? "" : "s"} will be driven
+                {picked?.correlation_count
+                  ? ` — of ${picked.correlation_count.toLocaleString()} in the recording`
+                  : ""}
+                . Everything outside this list is excluded from the verdict, not counted omitted.
+              </p>
+            )}
+
             <label>
-              expectation <span className="hint">(note for the audit trail: pass / diverge)</span>
+              expectation <span className="hint">(a note for the audit trail: pass / diverge)</span>
               <input
                 type="text"
                 placeholder="pass"
@@ -268,53 +241,27 @@ export default function NewRunPage() {
           </>
         )}
 
-        <button disabled={create.isPending || (mode === "replay" && !recordingId && !s3Path)}>
+        <button
+          className="btn primary"
+          disabled={create.isPending || (mode === "replay" && !recordingId.trim() && !s3Path)}
+        >
           {create.isPending ? "scheduling…" : "schedule run"}
         </button>
         {create.error && <p className="err">{String(create.error)}</p>}
       </form>
 
-      {mode === "replay" && (
+      {debug && (
         <>
-          <h2>Build a candidate binary (copy into a terminal)</h2>
-          <label>
-            cross-version scenario
-            <select value={scenario} onChange={(e) => setScenario(e.target.value)}>
-              <option value="benign-line-shift">benign-line-shift (expect pass)</option>
-              <option value="real-change">real-change (expect diverge)</option>
-            </select>
-          </label>
-          <pre className="cmd">{BUILD_CMD(`demo/cross-version/${scenario}.patch`)}</pre>
-          <p className="hint">
-            If the new binary's sha256 equals the previous candidate's, the patch
-            was compile-neutral — the run page shows the sha for comparison.
-          </p>
-
-          <h2>Manual trigger curl</h2>
-          <p className="hint">
-            This is the real v1 path: build or copy a local router binary, then
-            POST the run spec with <code>candidate_spec.kind=local_path</code>.
-            PR/branch/SHA resolution is a later candidate-resolver step, not a
-            dashboard gate yet.
-          </p>
+          <h2>Trigger curl <span className="hint">(?debug=1)</span></h2>
           <div className="copyhead">
             <span className="hint">Uses the current form values.</span>
             <CopyButton text={curlCommand} label="copy curl" />
           </div>
           <pre className="cmd">{curlCommand}</pre>
-
-          <h2>PR comment snippet</h2>
-          <p className="hint">
-            Paste this into a PR while v1 remains manual. No webhook is implied;
-            update the run and scorecard links after the replay completes.
-          </p>
-          <div className="copyhead">
-            <span className="hint">Manual posting only.</span>
-            <CopyButton text={prSnippet} label="copy snippet" />
-          </div>
-          <pre className="cmd">{prSnippet}</pre>
         </>
       )}
+
+      <RunLaunchModal runId={launched} onClose={() => setLaunched(null)} />
     </>
   );
 }

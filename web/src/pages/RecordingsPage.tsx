@@ -58,7 +58,7 @@ export default function RecordingsPage() {
               <td>{r.created_by}</td>
               <td>{new Date(r.created_at).toLocaleString()}</td>
               <td>
-                <Link to={`/replays/new?recording=${r.recording_id}`}>replay →</Link>
+                <Link to={`/?recording=${r.recording_id}`}>replay →</Link>
               </td>
             </tr>
           ))}

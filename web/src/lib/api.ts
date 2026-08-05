@@ -1,11 +1,22 @@
 // Thin API client. Every mutating request carries X-Deja-Actor (decision 8:
 // auth-light but audit-ready); the actor name persists in localStorage.
 
+// The serialized `CandidateSpec` enum (crates/deja-orchestrator/src/lib.rs:28).
+// Live runs carry 28 `prebuilt_image` and 1 `repo_sha`; the other three arms are
+// declared server-side and unreached so far.
+export type CandidateSpecRow =
+  | { kind: "prebuilt_image"; image: string }
+  | { kind: "local_path"; binary_or_source: string }
+  | { kind: "repo_sha"; repo: string; sha: string }
+  | { kind: "repo_branch"; repo: string; branch: string }
+  | { kind: "repo_pr"; repo: string; pr: number }
+  | { kind: string; [k: string]: unknown };
+
 export type RunRow = {
   run_id: string;
   mode: "record" | "replay";
   recording_id: string | null;
-  candidate: Record<string, unknown>;
+  candidate: CandidateSpecRow;
   candidate_sha256: string | null;
   // Serialized RunSpec params persisted by the API.
   params: { workload?: unknown; [k: string]: unknown };
@@ -102,8 +113,16 @@ export type Scorecard = {
     inconclusive_seed_gaps?: number;
     environmental_misses?: number;
     recovered_rank5_calls?: number;
+    matched_side_effect_calls?: number;
     resolved_by_rank: Record<string, number>;
   };
+  // The correlations this run was scoped to. On the live recording that is 3 of
+  // 42,310 — a fact the trust strip states rather than leaving the reader to
+  // read "0/3 matched" as "0 of everything".
+  correlation_scope?: string[];
+  // The scorer's own caveats, e.g. "correlation scope: 3 id(s) driven; excluded
+  // 42307 recorded events outside the subset". Rendered nowhere before this.
+  warnings?: string[];
   per_boundary?: Record<
     string,
     {
@@ -131,7 +150,10 @@ export type CallSide = {
   call_file?: string;
   call_line?: number;
   call_column?: number;
-  logical_span_path?: string;
+  // The wire name. `logical_span_path` was never emitted by any producer:
+  // measured 535 occurrences of `span_path` and 0 of `logical_span_path` in the
+  // live /calls payload for run-18c89f82e67728b9.
+  span_path?: string;
   graph_node_id?: number;
 };
 
@@ -220,6 +242,12 @@ export const api = {
       `/api/v1/runs/${id}/logs?after_seq=${afterSeq}`,
     ),
   artifacts: (id: string) => request<ArtifactRow[]>(`/api/v1/runs/${id}/artifacts`),
+  // DO NOT use this to decide a run's result — use `resultOf(run)` over the
+  // scorecard the run row embeds. This endpoint SYNTHESISES a scorecard when no
+  // artifact exists: on a run that died in stage 1 it returns 200 with
+  // `correlation_scope: [3 ids]`, `total_correlations: 0` and
+  // `inconclusive: true`, which reads as "3 correlations matched 0 of 42,310".
+  // No consumer in this app today; kept as raw API surface.
   scorecard: (id: string) => request<Scorecard>(`/api/v1/runs/${id}/scorecard`),
   calls: (id: string) => request<CallRecord[]>(`/api/v1/runs/${id}/calls`),
   httpDiffs: (id: string) => request<HttpDiff[]>(`/api/v1/runs/${id}/http-diffs`),
