@@ -6,6 +6,7 @@ import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { VerdictBanner } from "../components/Result";
 import { ConfidenceBadge, ConfidenceLadder, overallConfidence } from "../components/Confidence";
+import { KillRun } from "../components/KillRun";
 import UnifiedView from "../components/UnifiedView";
 import { Side, transportFailure } from "../lib/spine";
 
@@ -52,6 +53,9 @@ function RunHeader({ run }: { run: RunRow }) {
       <div className="rhead-top">
         <code className="rhead-id">{run.run_id}</code>
         <CopyButton text={`${window.location.origin}/r/${run.run_id}`} label="copy link" />
+        {/* Renders itself only while the run is still running, and stays to
+            report what the kill removed once it is not. */}
+        <KillRun run={run} />
       </div>
       <dl className="rhead-facts">
         <div>

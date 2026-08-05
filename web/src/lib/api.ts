@@ -109,6 +109,25 @@ export type ArtifactRow = {
   created_at: string;
 };
 
+/**
+ * What killing a run actually removed (`POST /runs/{id}/kill`).
+ *
+ * The server reports rather than claims: `job_deleted` is null when the Job was
+ * already gone, which is SUCCESS and not a failure — the endpoint is idempotent.
+ * `problems` holds what it could not remove, non-fatally, so one stuck pod never
+ * blocks reclaiming the rest. A caller must render `problems` — a 200 with
+ * problems is a partial kill, not a clean one.
+ */
+export type KillReport = {
+  run_id: string;
+  /** The Job name, when one was still there. Null = already gone. */
+  job_deleted: string | null;
+  /** Pods deleted directly — normally empty, since deleting the Job takes them. */
+  pods_deleted: string[];
+  /** Non-fatal problems. Never swallowed. */
+  problems: string[];
+};
+
 export type AuditRow = {
   id: number;
   ts: string;
@@ -248,6 +267,16 @@ export function setActor(name: string) {
   localStorage.setItem("deja-actor", name);
 }
 
+/**
+ * A failed request, carrying the HTTP status alongside the server's message.
+ *
+ * It is a plain `Error` with a field, not a subclass: every existing consumer
+ * renders `String(error)`, and a subclass would change that string everywhere by
+ * changing `name`. `status` lets a caller tell "no such thing" (404) from "could
+ * not look" (5xx / network) — a distinction this app treats as load-bearing.
+ */
+export type ApiError = Error & { status?: number };
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
@@ -258,7 +287,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* non-JSON error */
     }
-    throw new Error(detail);
+    const err: ApiError = new Error(detail);
+    err.status = resp.status;
+    throw err;
+  }
+  // AN UNROUTED /api/v1 PATH IS NOT A 404 HERE. The SPA fallback owns every URL
+  // the API router does not claim, and it answers index.html with 200 — so an
+  // endpoint this build knows about and the deployed orchestrator does not comes
+  // back as HTML, and `resp.json()` would fail with "Unexpected token '<'".
+  // Naming it is the difference between "this orchestrator has no such endpoint"
+  // and an unreadable parse error. No `status` is set: the route being absent
+  // says nothing about the thing that was asked for.
+  const ctype = resp.headers.get("content-type") ?? "";
+  if (!ctype.includes("json")) {
+    throw new Error(
+      `${path} is not served by this orchestrator (answered ${ctype || "no content-type"}, not JSON)`,
+    );
   }
   return (await resp.json()) as T;
 }
@@ -295,6 +339,23 @@ export const api = {
         "X-Deja-Actor": who,
       },
       body: JSON.stringify(spec),
+    });
+  },
+
+  /**
+   * Stop a run and reclaim its pod. Mutating, so it carries the actor header
+   * like `createRun`.
+   *
+   * Fails with 400 "kill is only supported for the k8s executor" on a compose
+   * deployment. That is a real answer and is shown as one — the caller must not
+   * present a refusal as a kill.
+   */
+  killRun: (id: string) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<KillReport>(`/api/v1/runs/${id}/kill`, {
+      method: "POST",
+      headers: { "X-Deja-Actor": who },
     });
   },
 };
@@ -365,4 +426,57 @@ export type AvailableRecordingsPage = {
 export const availableRecordings = (limit = 200, offset = 0) =>
   request<AvailableRecordingsPage>(
     `/api/v1/recordings/available?limit=${limit}&offset=${offset}`,
+  );
+
+// ===========================================================================
+// THE CORRELATIONS INDEX — appended, so nothing above moves.
+//
+// `GET /api/v1/recordings/{id}/correlations` answers "which test cases does
+// this recording hold", from the sealed index (manifest + sidecar) rather than
+// from the tape. It is the ONLY endpoint that can name a recording's
+// correlations; the catalog carries a count and no ids, and the bucket listing
+// carries neither.
+// ===========================================================================
+
+/**
+ * The recording's correlation ids, in the recording's own order.
+ *
+ * THREE ANSWERS, and they must stay three. A recording can be sealed (the index
+ * is final and `correlations` is authoritative), present but not yet sealed (the
+ * manifest is written last, so its absence IS "not sealed" — the ids are not
+ * knowable cheaply and `correlations` is empty), or unknown (404). The middle
+ * one is not "no correlations" and must never be rendered as one.
+ *
+ * `status` mirrors `SessionManifest.status`, whose sealed value is the literal
+ * `"sealed"`. `sealed` is accepted as well because the ingest path spells the
+ * same fact as a bool (`s3::IngestReport.sealed`); either is enough.
+ *
+ * ORDER IS THE SERVER'S. Correlation ids are time-ordered, so the index's own
+ * ascending order is arrival order — the first entry is the earliest request.
+ * A client must not re-sort: it could only disagree with the index.
+ */
+export type RecordingCorrelations = {
+  recording_id: string;
+  /** `"sealed"` when the index is final. */
+  status?: string;
+  /** The same fact as a bool, if the server spells it that way. */
+  sealed?: boolean;
+  /** How many the recording holds. Null when that is not known yet. */
+  total: number | null;
+  /** A PAGE of the index, earliest first. Empty when the recording is unsealed. */
+  correlations: string[];
+};
+
+/**
+ * Page the correlations index, from the start.
+ *
+ * The page exists because the index is not always small — the live catalog has
+ * recordings holding 42,310 and 170,568 correlations, and shipping 170k ids to a
+ * browser to populate a picker would be absurd. Offset 0 with the server's order
+ * means the head of the page is the head of the index, which is what makes "the
+ * first N" answerable without reading the whole thing.
+ */
+export const recordingCorrelations = (id: string, limit = 1000, offset = 0) =>
+  request<RecordingCorrelations>(
+    `/api/v1/recordings/${encodeURIComponent(id)}/correlations?limit=${limit}&offset=${offset}`,
   );
