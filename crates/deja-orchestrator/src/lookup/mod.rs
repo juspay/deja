@@ -14,23 +14,28 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
 
-use deja::{
-    addresses_for, canonical_args_hash, BoundaryEvent, DejaRecord, KeyStamper, LookupEntry,
-    LookupTable,
-};
+use deja::{addresses_for, canonical_args_hash, KeyStamper, LookupEntry, LookupTable};
 
-/// Walk a recording (JSONL on disk) and produce a `LookupTable`.
+use crate::scope::{ScopedRecording, TapeItem};
+
+/// Walk a recording and produce a `LookupTable` for the run's scope.
+///
+/// Takes a [`ScopedRecording`], not a path: this function produces the
+/// substitution table the replay candidate resolves against, so an unscoped
+/// render puts every correlation in the recorded session — 42,310 of them on a
+/// production tape — into a 5.95 MB artifact for a run that drives three. It
+/// was benign only because the untouched correlations happened to contribute no
+/// lookup material; that was luck, not design.
+///
+/// Scoping is safe for key identity: `KeyStamper`'s occurrence counter and the
+/// per-request sequence are both keyed BY correlation, so omitting other
+/// correlations' events does not shift the keys of the ones kept.
 pub fn render_lookup_table(
-    recording_path: &Path,
+    recording: &ScopedRecording,
     recording_id: &str,
     policy_version: u32,
 ) -> io::Result<LookupTable> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(recording_path)?;
-    let reader = BufReader::new(file);
-
     // Shared occurrence assigner — advanced for every rank on every event, in
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();
@@ -42,29 +47,22 @@ pub fn render_lookup_table(
     let (mut dbg_ok, mut dbg_skip): (u64, u64) = (0, 0);
     let mut dbg_first_err: Option<String> = None;
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Tagged one-stream tape: let the shared wire enum route each line.
-        // Graph nodes and replay observations can cohabit the stream but are
-        // never lookup material, so they skip WITHOUT counting as dropped
-        // boundary events. Malformed/unknown records still count against
+    // Streams: `EntireSession` on a live recording is 171,234 events off a
+    // 361 MB tape, so the renderer never holds the tape in memory.
+    for item in recording.events()? {
+        // Graph nodes and replay observations cohabit the stream but are never
+        // lookup material, so the reader drops them WITHOUT counting them as
+        // dropped boundary events. Malformed records still count against
         // coverage (the guard below).
-        let event: BoundaryEvent = match serde_json::from_str::<DejaRecord>(&line) {
-            Ok(DejaRecord::BoundaryEvent(event)) => {
+        let event = match item {
+            TapeItem::Event(event) => {
                 dbg_ok += 1;
                 *event
             }
-            Ok(DejaRecord::GraphNode(_) | DejaRecord::Observed(_)) => continue,
-            Err(e) => {
+            TapeItem::Malformed { error, excerpt, .. } => {
                 dbg_skip += 1;
                 if dbg_first_err.is_none() {
-                    dbg_first_err = Some(format!(
-                        "{e} :: {}",
-                        &line.chars().take(200).collect::<String>()
-                    ));
+                    dbg_first_err = Some(format!("{error} :: {excerpt}"));
                 }
                 continue;
             }
@@ -128,7 +126,7 @@ pub fn render_lookup_table(
                 "render dropped {dbg_skip} of {} recording event(s) from {} \
                  — replay coverage would be INCOMPLETE (first error: {:?})",
                 dbg_ok + dbg_skip,
-                recording_path.display(),
+                recording.recording_id(),
                 dbg_first_err
             ),
         ));
@@ -146,15 +144,27 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_events(lines: &[serde_json::Value]) -> (tempfile::TempDir, std::path::PathBuf) {
+    /// A recording on disk, opened at whole-session scope (what a render with
+    /// no correlation filter has always meant).
+    fn write_events(lines: &[serde_json::Value]) -> (tempfile::TempDir, ScopedRecording) {
+        write_events_scoped(lines, crate::scope::RunScope::entire_session())
+    }
+
+    fn write_events_scoped(
+        lines: &[serde_json::Value],
+        scope: crate::scope::RunScope,
+    ) -> (tempfile::TempDir, ScopedRecording) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let path = crate::scope::TapeSlot::for_write(&root, "rec-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut f = std::fs::File::create(&path).unwrap();
         for line in lines {
             writeln!(f, "{}", line).unwrap();
         }
         drop(f);
-        (dir, path)
+        let recording = ScopedRecording::open(&root, "rec-1", scope).unwrap();
+        (dir, recording)
     }
 
     fn event(boundary: &str, seq: u64, identity: serde_json::Value) -> serde_json::Value {
@@ -185,16 +195,55 @@ mod tests {
         })
     }
 
+    /// The lookup table IS the substitution material the candidate replays
+    /// against, so it must carry the run's correlations and nothing else.
+    /// Rendering it off the whole session put every recorded request's args and
+    /// results into a run that drives three of them.
+    #[test]
+    fn renderer_emits_no_entry_for_a_correlation_outside_the_run_scope() {
+        let mut driven = event("redis", 0, serde_json::Value::Null);
+        driven["correlation_id"] = serde_json::json!("c-driven");
+        driven["result"] = serde_json::json!("driven-value");
+        let mut foreign = event("redis", 1, serde_json::Value::Null);
+        foreign["correlation_id"] = serde_json::json!("c-foreign");
+        foreign["result"] = serde_json::json!("FOREIGN_SECRET");
+
+        let (_dir, recording) = write_events_scoped(
+            &[driven, foreign],
+            crate::scope::RunScope::from_filter(Some(&["c-driven".to_owned()])),
+        );
+        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        assert!(
+            table
+                .entries
+                .iter()
+                .all(|e| e.key.correlation_id.as_deref() == Some("c-driven")),
+            "out-of-scope correlations must not reach the substitution table: {:?}",
+            table
+                .entries
+                .iter()
+                .map(|e| e.key.correlation_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !serde_json::to_string(&table)
+                .unwrap()
+                .contains("FOREIGN_SECRET"),
+            "an out-of-scope recorded value reached the lookup table"
+        );
+        assert!(!table.entries.is_empty(), "the driven case still renders");
+    }
+
     #[test]
     fn renderer_skips_http_incoming_and_emits_one_entry_per_rank() {
         // http_incoming (skipped) + one redis event with no callsite identity,
         // so the redis event addresses at rank 5 (location) and rank 6 (sequence).
-        let (_dir, path) = write_events(&[
+        let (_dir, recording) = write_events(&[
             event("http_incoming", 0, serde_json::Value::Null),
             event("redis", 1, serde_json::Value::Null),
         ]);
 
-        let table = render_lookup_table(&path, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
         assert_eq!(
             table.entries.len(),
             2,
@@ -225,9 +274,9 @@ mod tests {
         ev["tracing_span_id"] = serde_json::json!("9225624661302181899"); // > i64::MAX
         ev["graph_node_id"] = serde_json::json!("18000000000000000000"); // > i64::MAX
         ev["value_digest"] = serde_json::json!("12345678901234567890");
-        let (_dir, path) = write_events(&[ev]);
+        let (_dir, recording) = write_events(&[ev]);
         // Must NOT drop the event -> render succeeds and yields entries.
-        let table = render_lookup_table(&path, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
         assert!(
             !table.entries.is_empty(),
             "a stringified-u64 event must render, not drop"
@@ -243,8 +292,8 @@ mod tests {
             "record_kind": "boundary_event",
             "global_sequence": "not-a-number"
         });
-        let (_dir, path) = write_events(&[good, bad]);
-        let err = render_lookup_table(&path, "rec-1", 1).unwrap_err();
+        let (_dir, recording) = write_events(&[good, bad]);
+        let err = render_lookup_table(&recording, "rec-1", 1).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("INCOMPLETE"),
@@ -265,9 +314,9 @@ mod tests {
             "lexical_path": "crate::pay::confirm",
             "syntax_hash": null
         });
-        let (_dir, path) = write_events(&[event("redis", 0, identity)]);
+        let (_dir, recording) = write_events(&[event("redis", 0, identity)]);
 
-        let table = render_lookup_table(&path, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
         let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.address.rank()).collect();
         assert!(
             ranks.contains(&4),
@@ -296,8 +345,8 @@ mod tests {
         detached["bucket_id"] = serde_json::json!("detached-bucket-1");
         detached["fork_seq"] = serde_json::json!(1);
 
-        let (_dir, path) = write_events(&[root, detached]);
-        let table = render_lookup_table(&path, "rec-1", 1).unwrap();
+        let (_dir, recording) = write_events(&[root, detached]);
+        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
         let location_keys = table
             .entries
             .iter()

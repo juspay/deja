@@ -2011,39 +2011,56 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     });
     // The kernel drove only this subset (KERNEL_CORRELATION_FILTER); scope
     // recorded expectations to it so undriven cases don't score as omitted.
-    let correlation_scope: Option<std::collections::BTreeSet<String>> = run
+    let scope = run
         .as_ref()
-        .and_then(|run| run.spec.correlation_filter.as_ref())
-        .map(|ids| {
-            ids.iter()
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .filter(|set| !set.is_empty());
+        .map(crate::scope::RunScope::of)
+        .unwrap_or_else(crate::scope::RunScope::entire_session);
+    let correlation_scope: Option<std::collections::BTreeSet<String>> = scope.ids().cloned();
 
     let mut warnings = Vec::new();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
     let observed = load_observed_calls(&root.observed_path(run_id), &mut warnings);
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
-    let mut events = match &recording_id {
-        Some(rec) => load_boundary_events(&root.recording_events_path(rec), &mut warnings),
-        None => Vec::new(),
-    };
 
-    if let Some(scope) = &correlation_scope {
-        // Uncorrelated (background) records stay: they are tolerated by the
-        // scorer and shared across cases. No-silent-caps: say what was cut.
-        let in_scope = |cid: &Option<String>| cid.as_ref().is_none_or(|c| scope.contains(c));
+    // The tape is read THROUGH the scope, not read and then trimmed: the
+    // events this function returns are the only ones any consumer sees, so
+    // there is no second, wider view of the same run to disagree with.
+    let mut events = Vec::new();
+    if let Some(rec) = &recording_id {
+        match crate::scope::ScopedRecording::open(root, rec, scope.clone()) {
+            Ok(recording) => match recording.events() {
+                // A run mid-flight has no tape yet; that is not a corrupt run.
+                Ok(stream) => {
+                    for item in stream {
+                        match item {
+                            crate::scope::TapeItem::Event(event) => events.push(*event),
+                            crate::scope::TapeItem::Malformed { line_no, error, .. } => warnings
+                                .push(format!("recording {rec}:{line_no}: parse error: {error}")),
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!("read recording {rec} failed: {e}")),
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warnings.push(format!("open recording {rec} failed: {e}")),
+        }
+    }
+
+    if let Some(ids) = scope.ids() {
+        // The lookup table on disk is still the whole session's (it is written
+        // before the scope is known), so it is trimmed here. Uncorrelated
+        // (background) entries stay: they are tolerated by the scorer and
+        // shared across cases. No-silent-caps: say what was cut.
         let entries_before = table.entries.len();
-        let events_before = events.len();
-        table.entries.retain(|e| in_scope(&e.key.correlation_id));
-        events.retain(|e| in_scope(&e.correlation_id));
+        table
+            .entries
+            .retain(|e| scope.contains(e.key.correlation_id.as_deref()));
         warnings.push(format!(
-            "correlation scope: {} id(s) driven; excluded {} lookup entries and {} recorded events outside the subset",
-            scope.len(),
+            "correlation scope: {} id(s) driven; excluded {} lookup entries outside the subset; \
+             {} recorded event(s) in scope",
+            ids.len(),
             entries_before - table.entries.len(),
-            events_before - events.len(),
+            events.len(),
         ));
     }
 
@@ -2078,7 +2095,7 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     crate::write_json(&path, &card)?;
 
     // Ledger: the per-call detail the scorecard summary drops. Best-effort.
-    match build_ledger(root, &art) {
+    match build_ledger(&art) {
         Ok(rows) => {
             if let Err(e) = write_ledger(&root.call_ledger_path(run_id), &rows) {
                 eprintln!("divergence: ledger write failed for {run_id}: {e}");
@@ -2091,21 +2108,24 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 
 /// Build the per-call ledger for a run: join the recording's events (recorded
 /// side) to the candidate's observed calls, classified like `detect()`.
-pub fn build_ledger(root: &HarnessRoot, art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
-    let mut warnings = Vec::new();
-    let events = match &art.recording_id {
-        Some(rec) => load_boundary_events(&root.recording_events_path(rec), &mut warnings),
-        None => Vec::new(),
-    };
+///
+/// Reads `art.events`, which `load_artifacts` has ALREADY scoped to the run's
+/// `correlation_filter`. It used to reload the tape from `root` unscoped, so on
+/// any run carrying a filter the scorecard classified one event set and
+/// `GET /runs/{id}/calls` classified a different, larger one — same run, same
+/// data, two answers, and recorded payloads from correlations the run never
+/// drove attached to its ledger rows.
+pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
+    let events = &art.events;
     let expected = ledger::expected_sequences(&art.table);
     let span_paths = ledger::recorded_span_paths(&art.table);
     // Mirror scorecard classification: discover race evidence under status-clean
     // HTTP first, then treat only unattributable body diffs as blocking.
     let http_status_clean =
         !art.http_diffs.is_empty() && art.http_diffs.iter().all(|d| d.status_match);
-    let http_incoming_by_correlation = http_incoming_events_by_correlation(&events);
+    let http_incoming_by_correlation = http_incoming_events_by_correlation(events);
     let inconclusive_race =
-        inconclusive_race_evidence(&events, &art.observed, http_status_clean, &span_paths);
+        inconclusive_race_evidence(events, &art.observed, http_status_clean, &span_paths);
     let blocking_http_body_mismatches = art
         .http_diffs
         .iter()
@@ -2120,10 +2140,10 @@ pub fn build_ledger(root: &HarnessRoot, art: &RunArtifacts) -> io::Result<Vec<Ca
         })
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
-    let demote = order_nondeterministic_demotions(&events, &art.observed, http_clean);
-    let idempotent_delete = idempotent_delete_demotions(&events, &art.observed, http_clean);
+    let demote = order_nondeterministic_demotions(events, &art.observed, http_clean);
+    let idempotent_delete = idempotent_delete_demotions(events, &art.observed, http_clean);
     Ok(ledger::build_with_inconclusive(
-        &events,
+        events,
         &art.observed,
         &expected,
         &span_paths,
@@ -2137,7 +2157,7 @@ pub fn build_ledger(root: &HarnessRoot, art: &RunArtifacts) -> io::Result<Vec<Ca
 /// works for runs scored before the sidecar existed).
 pub fn call_ledger(root: &HarnessRoot, run_id: &str) -> io::Result<Vec<CallRecord>> {
     let art = load_artifacts(root, run_id)?;
-    build_ledger(root, &art)
+    build_ledger(&art)
 }
 
 fn write_ledger(path: &std::path::Path, rows: &[CallRecord]) -> io::Result<()> {
@@ -2226,18 +2246,11 @@ fn load_deja_records(path: &std::path::Path, warnings: &mut Vec<String>) -> Vec<
     out
 }
 
-fn load_boundary_events(
-    path: &std::path::Path,
-    warnings: &mut Vec<String>,
-) -> Vec<deja::BoundaryEvent> {
-    load_deja_records(path, warnings)
-        .into_iter()
-        .filter_map(|record| match record {
-            deja::DejaRecord::BoundaryEvent(event) => Some(*event),
-            deja::DejaRecord::GraphNode(_) | deja::DejaRecord::Observed(_) => None,
-        })
-        .collect()
-}
+// NOTE: there is deliberately no `load_boundary_events(path)` here any more.
+// It read a recording tape from a raw `&Path` with no notion of the run's
+// scope, which is how `build_ledger` came to classify a different, wider event
+// set than the scorecard it was supposed to mirror. Recordings are read through
+// `scope::ScopedRecording`.
 
 fn load_observed_calls(path: &std::path::Path, warnings: &mut Vec<String>) -> Vec<ObservedCall> {
     load_deja_records(path, warnings)
@@ -2484,6 +2497,124 @@ mod tests {
             card.summary.omitted_calls, 1,
             "the driven-but-unobserved c-keep call is a real omission; \
              the undriven c-drop call must not count"
+        );
+    }
+
+    /// The ledger and the scorecard must classify the SAME events. The ledger
+    /// used to RELOAD the tape from `root` — unscoped — while `detect()` read
+    /// the already-scoped `art.events`, so one run got two recorded sides.
+    ///
+    /// The observable damage: the replay kernel resolves against the WHOLE
+    /// lookup table (`render_lookup_table` is unscoped), so an in-scope call
+    /// can carry a `source_event_global_sequence` belonging to a correlation
+    /// this run never drove. With the reload, `recorded_for` found that event
+    /// and the `/calls` row published another production request's recorded
+    /// args and result. With `art.events` it cannot: the event is not in scope,
+    /// so there is nothing to attach.
+    #[test]
+    fn build_ledger_never_attaches_a_recorded_side_from_outside_the_run_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-ledger-scope";
+        let recording_id = "rec-ledger-scope";
+        let driven_row = serde_json::json!({ "attempt_id": "pay_driven" });
+        let foreign_row = serde_json::json!({ "attempt_id": "pay_NOT_IN_SCOPE" });
+        // The tape on disk holds BOTH cases: one session's tape, a run driving
+        // a subset of it. That is the production shape.
+        write_recording_tape(
+            &crate::scope::TapeSlot::for_write(&root, recording_id),
+            &[
+                db_read_ev(
+                    "c-keep",
+                    "payment_attempt",
+                    1,
+                    driven_row.clone(),
+                    100,
+                    110,
+                    "root",
+                    0,
+                ),
+                db_read_ev(
+                    "c-drop",
+                    "payment_attempt",
+                    2,
+                    foreign_row.clone(),
+                    100,
+                    110,
+                    "root",
+                    0,
+                ),
+            ],
+        );
+        crate::write_json(
+            &root.run_path(run_id),
+            &crate::Run {
+                run_id: run_id.to_owned(),
+                spec: crate::RunSpec {
+                    mode: crate::RunMode::Replay,
+                    candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                        image: "deja-demo".to_owned(),
+                    },
+                    candidate_repo: None,
+                    recording_id: Some(recording_id.to_owned()),
+                    s3_source: None,
+                    correlation_filter: Some(vec!["c-keep".to_owned()]),
+                    workload: serde_json::Value::Null,
+                },
+                status: crate::RunStatus::Completed,
+                recording_id: Some(recording_id.to_owned()),
+                candidate_image: None,
+                failure_reason: None,
+                stage: None,
+                step: 0,
+                steps_total: 0,
+                stage_updated_ms: 0,
+            },
+        )
+        .unwrap();
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: recording_id.to_owned(),
+                policy_version: 1,
+                entries: vec![
+                    seq_entry(Some("c-keep"), "db", 1),
+                    seq_entry(Some("c-drop"), "db", 2),
+                ],
+            },
+        )
+        .unwrap();
+        // The driven case resolved against the FOREIGN case's baseline (seq 2) —
+        // the kernel consults the whole unscoped lookup table, so this happens.
+        write_jsonl_rows(
+            &root.observed_path(run_id),
+            &[deja::DejaRecord::Observed(Box::new(exec_obs(
+                "db",
+                Some("c-keep"),
+                true,
+                Some(2),
+                Some(envelope(foreign_row.clone())),
+                envelope(foreign_row.clone()),
+            )))],
+        );
+
+        let art = load_artifacts(&root, run_id).unwrap();
+        assert_eq!(
+            art.events.len(),
+            1,
+            "load_artifacts scopes the recorded side to the driven subset"
+        );
+        let rows = build_ledger(&art).unwrap();
+        let dump = serde_json::to_string(&rows).unwrap();
+        assert!(
+            !dump.contains("pay_NOT_IN_SCOPE"),
+            "the ledger published a recorded payload from a correlation the run \
+             never drove: {dump}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.correlation_id.as_deref() != Some("c-drop")),
+            "no ledger row may be attributed to an out-of-scope correlation"
         );
     }
 
@@ -2848,26 +2979,20 @@ mod tests {
         assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 1);
         assert!(!card.verdict.pass, "real status drift must still block");
 
-        let dir = tempfile::tempdir().unwrap();
-        let root = HarnessRoot::new(dir.path()).unwrap();
-        write_recording_tape(&root.recording_events_path("rec-1"), &events);
-        let rows = build_ledger(
-            &root,
-            &RunArtifacts {
-                run_id: "run-db-volatile-canon-ledger".to_owned(),
-                recording_id: Some("rec-1".to_owned()),
-                table: LookupTable {
-                    recording_id: "rec-1".to_owned(),
-                    policy_version: 1,
-                    entries,
-                },
-                observed,
-                http_diffs: vec![http(corr, true, vec![])],
-                events: Vec::new(),
-                correlation_scope: None,
-                warnings: Vec::new(),
+        let rows = build_ledger(&RunArtifacts {
+            run_id: "run-db-volatile-canon-ledger".to_owned(),
+            recording_id: Some("rec-1".to_owned()),
+            table: LookupTable {
+                recording_id: "rec-1".to_owned(),
+                policy_version: 1,
+                entries,
             },
-        )
+            observed,
+            http_diffs: vec![http(corr, true, vec![])],
+            events: events.clone(),
+            correlation_scope: None,
+            warnings: Vec::new(),
+        })
         .unwrap();
         let volatile_row = rows
             .iter()
@@ -4434,8 +4559,6 @@ mod tests {
 
     #[test]
     fn build_ledger_mirrors_race_attributed_http_body_classification() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = HarnessRoot::new(dir.path()).unwrap();
         let run_id = "run-ledger-race-body";
         let recording_id = "rec-ledger-race-body";
         let corr = "race-body-ledger-corr";
@@ -4472,10 +4595,7 @@ mod tests {
             "root",
             0,
         );
-        write_recording_tape(
-            &root.recording_events_path(recording_id),
-            &[read_event, conflicting_write],
-        );
+        let recorded_events = vec![read_event, conflicting_write];
 
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
@@ -4549,12 +4669,12 @@ mod tests {
             table,
             observed,
             http_diffs,
-            events: Vec::new(),
+            events: recorded_events,
             correlation_scope: None,
             warnings: Vec::new(),
         };
 
-        let rows = build_ledger(&root, &art).unwrap();
+        let rows = build_ledger(&art).unwrap();
         let race_row = rows
             .iter()
             .find(|row| row.source_event_global_sequence == Some(300))

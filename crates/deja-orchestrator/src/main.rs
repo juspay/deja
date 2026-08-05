@@ -858,13 +858,35 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
     // Prefer the `record_graph` artifact (present for k8s post-hydrate and for
     // compose runs); fall back to the local recording tape (older runs / compose
     // before this artifact existed). recording_id comes from the run record.
+    //
+    // The fallback reads the tape THROUGH the run's scope. It used to take the
+    // raw path and return every node in the session, so a run driving three
+    // correlations answered this unauthenticated endpoint with the span
+    // structure and field values of all 42,310. A scoping refusal is returned as
+    // a 500, not swallowed into an empty record side: an empty graph reads as
+    // "this run had no cascade", which is a false finding rather than a missing
+    // one.
     let mut record = read_nodes(st.root.record_graph_path(&id));
     if record.is_empty() {
-        if let Some(rec) = runs::get(&st.root, &id)
-            .ok()
-            .and_then(|r| r.recording_id.or(r.spec.recording_id))
-        {
-            record = read_nodes(st.root.recording_events_path(&rec));
+        if let Ok(run) = runs::get(&st.root, &id) {
+            let scope = deja_orchestrator::scope::RunScope::of(&run);
+            if let Some(rec) = run.recording_id.clone().or(run.spec.recording_id.clone()) {
+                match deja_orchestrator::scope::ScopedRecording::open(&st.root, &rec, scope) {
+                    Ok(recording) => match recording.graph_nodes() {
+                        Ok(nodes) => {
+                            record = nodes
+                                .into_iter()
+                                .filter_map(|n| serde_json::to_value(n).ok())
+                                .collect();
+                        }
+                        Err(e) => {
+                            return error_resp(500, &format!("scoped record graph: {e}"));
+                        }
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return error_resp(500, &format!("open recording {rec}: {e}")),
+                }
+            }
         }
     }
     let replay = read_nodes(st.root.observed_path(&id));
