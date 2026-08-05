@@ -262,13 +262,18 @@ fn resolve_candidate(
 ) -> Result<(), String> {
     let binary = match &run.spec.candidate_spec {
         CandidateSpec::PrebuiltImage { image } => {
-            let image = image.trim().to_owned();
+            let declared = image.trim().to_owned();
             // "deja-demo" is the SPA's historical no-candidate default: the
             // legacy compose self-build (overlay default image, `--build`).
             // An empty ref means the same.
-            if image.is_empty() || image == "deja-demo" {
+            if declared.is_empty() || declared == "deja-demo" {
                 return Ok(());
             }
+            // The SAME resolution the k8s executor uses (a bare ref qualifies
+            // against DEJA_CANDIDATE_IMAGE_REPO). One spec must not read as two
+            // different images depending on which executor picked it up.
+            let (image, _tag) = crate::executor::resolve_candidate_image(&run.spec.candidate_spec)
+                .map_err(|e| e.to_string())?;
             ctx.stage("pulling candidate image", 0, 0);
             let mut cmd = Command::new("docker");
             cmd.args(["pull", &image]);
@@ -280,7 +285,9 @@ fn resolve_candidate(
             }
             run.candidate_image = Some(crate::CandidateImage {
                 docker_image: image.clone(),
-                source_ref: image.clone(),
+                // What the run DECLARED, kept apart from what it resolved to —
+                // the declared ref is what the run id and the spec carry.
+                source_ref: declared,
             });
             write_json(&root.run_path(&run.run_id), run)
                 .map_err(|e| format!("persist run: {e}"))?;
