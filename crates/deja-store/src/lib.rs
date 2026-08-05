@@ -297,16 +297,33 @@ impl Store {
         Ok(())
     }
 
+    /// Name the recording a run drives, once it is known.
+    ///
+    /// A run given only an S3 prefix asks for a session it cannot name yet; the
+    /// runner resolves it during the scan. The persisted request (`params`) is
+    /// updated with it too, so what the run was asked to do keeps naming the
+    /// concrete recording that ran rather than the prefix that was typed. Rows
+    /// written before the request was persisted carry no request to update and
+    /// are left exactly as they are.
     pub async fn set_run_recording(
         &self,
         run_id: &str,
         recording_id: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE replay_runs SET recording_id = $2 WHERE run_id = $1")
-            .bind(run_id)
-            .bind(recording_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE replay_runs SET
+               recording_id = $2,
+               params = CASE
+                          WHEN jsonb_exists(params, 'candidate_spec')
+                          THEN params || jsonb_build_object('recording_id', $2::text)
+                          ELSE params
+                        END
+             WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .bind(recording_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
