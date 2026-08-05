@@ -1,14 +1,13 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { VerdictBanner } from "../components/Result";
 import { ConfidenceBadge, ConfidenceLadder, overallConfidence } from "../components/Confidence";
-import { JsonView, ValuePair } from "../components/JsonView";
-import DiffView from "../components/DiffView";
-import GraphView from "../components/GraphView";
+import UnifiedView from "../components/UnifiedView";
+import { Side, transportFailure } from "../lib/spine";
 
 /* ---------------------------------------------------------------- header --- */
 
@@ -94,8 +93,15 @@ type Finding = {
   title: string;
   where: string;
   span: string;
-  call?: CallRecord;
-  http?: HttpDiff;
+  /**
+   * Where this finding lives in the unified view. A finding is an ANCHOR, not a
+   * copy of the evidence — clicking it selects the span below and the evidence
+   * renders once, in the detail panel. `nodeId` is null only for response
+   * findings, which carry correlation_id / request_path / request_sequence and
+   * no span path at all, so the case root is the deepest honest target.
+   */
+  nodeId: number | null;
+  side: Side;
 };
 
 // The order a reader should meet them: what changed, what that changed, what the
@@ -135,72 +141,66 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
     else if (c.kind === "novel") rank = "novel";
     else if (c.kind === "environmental") rank = "environmental";
     if (!rank) continue; // matched / recovered / deterministic are not findings
+    // Anchor on the side that owns the evidence: the recording for a call the
+    // candidate did not make, the candidate for one the recording did not. The
+    // two sides carry DIFFERENT node ids — on all 18 value-divergence rows here
+    // they differ — so the side must travel with the id, never be inferred.
+    const rec = c.recorded?.graph_node_id ?? null;
+    const rep = c.observed?.graph_node_id ?? null;
+    const order: [number | null, Side][] =
+      rank === "novel" || rank === "environmental"
+        ? [[rep, "rep"], [rec, "rec"]]
+        : [[rec, "rec"], [rep, "rep"]];
+    const [nodeId, side] = order.find(([id]) => id != null) ?? [null, "rec" as Side];
     out.push({
       rank,
       correlation: c.correlation_id ?? null,
       title: `${c.boundary}·${c.method_name}`,
       where: siteOf(c),
       span: spanOf(c),
-      call: c,
+      nodeId,
+      side,
     });
   }
   for (const d of https) {
     if (d.status_match && d.body_diff.length === 0) continue;
+    const failed = transportFailure(d);
     out.push({
       rank: "http",
       correlation: d.correlation_id,
       title: `${d.request_path} · seq ${d.request_sequence}`,
-      where: d.status_match
-        ? `${d.body_diff.length} field${d.body_diff.length === 1 ? "" : "s"} differ`
-        : `${d.status_baseline} → ${d.status_candidate}`,
+      // ONE failure, not 54 fields. When the candidate produced no parseable
+      // response every recorded field is reported as differing; saying "54
+      // fields differ" would present one failure as 54.
+      where: failed
+        ? `no response — ${failed}`
+        : d.status_match
+          ? `${d.body_diff.length} field${d.body_diff.length === 1 ? "" : "s"} differ`
+          : `${d.status_baseline} → ${d.status_candidate}`,
       span: "",
-      http: d,
+      nodeId: null,
+      side: "rep",
     });
   }
   return out.sort((a, b) => RANKS.indexOf(a.rank) - RANKS.indexOf(b.rank));
 }
 
-function FindingRow({ f }: { f: Finding }) {
-  const [open, setOpen] = React.useState(false);
-  const c = f.call;
+function FindingRow({ f, onOpen }: { f: Finding; onOpen: (f: Finding) => void }) {
   return (
     <li className={`finding rank-${f.rank}`}>
-      <button className="finding-head" type="button" onClick={() => setOpen((x) => !x)}>
-        <span className="fcaret">{open ? "▾" : "▸"}</span>
+      <button className="finding-head" type="button" onClick={() => onOpen(f)}>
+        <span className="fcaret">→</span>
         <span className={`fchip rank-${f.rank}`}>{f.rank}</span>
         <span className="ftitle mono">{f.title}</span>
         {f.span && <span className="fspan">@ {leafOf(f.span)}</span>}
         <span className="fwhere mono">{f.where}</span>
         {f.correlation && <span className="fcorr mono">{f.correlation.slice(0, 8)}</span>}
       </button>
-      {open && (
-        <div className="finding-body">
-          {c && (f.rank === "origin" || f.rank === "consequence") && (
-            <ValuePair baseline={c.recorded?.result} candidate={c.observed?.result} />
-          )}
-          {c && f.rank === "omitted" && (
-            <>
-              <div className="kv"><span>args</span><JsonView value={c.recorded?.args} /></div>
-              <div className="kv"><span>result</span><JsonView value={c.recorded?.result} /></div>
-            </>
-          )}
-          {c && (f.rank === "novel" || f.rank === "environmental") && (
-            <div className="kv"><span>args</span><JsonView value={c.observed?.args} /></div>
-          )}
-          {f.http && (
-            <div className="kv">
-              <span>fields</span>
-              <JsonView value={f.http.body_diff.slice(0, 40)} />
-            </div>
-          )}
-          {f.span && <code className="spanpath">{f.span.replace(/>/g, " › ")}</code>}
-        </div>
-      )}
     </li>
   );
 }
 
-function FindingList({ findings }: { findings: Finding[] }) {
+function FindingList({ findings, onOpen }: { findings: Finding[]; onOpen: (f: Finding) => void }) {
   const [show, setShow] = React.useState<FindingRank | "all">("all");
   const counts = React.useMemo(() => {
     const m = new Map<FindingRank, number>();
@@ -235,8 +235,9 @@ function FindingList({ findings }: { findings: Finding[] }) {
         ))}
       </div>
       {show !== "all" && <p className="hint">{RANK_BLURB[show]}</p>}
+      <p className="hint">Click a finding to open it in the execution view below.</p>
       <ul className="findings">
-        {rows.slice(0, 200).map((f, i) => <FindingRow key={i} f={f} />)}
+        {rows.slice(0, 200).map((f, i) => <FindingRow key={i} f={f} onOpen={onOpen} />)}
       </ul>
       {rows.length > 200 && (
         <p className="hint">showing the first 200 of {rows.length}.</p>
@@ -457,7 +458,9 @@ function DebugSection({ run, result }: { run: RunRow; result: RunResult }) {
       <details open><summary>stages</summary><StageTimeline stages={stages.data ?? []} /></details>
       <details><summary>logs</summary><Logs runId={runId} active={active} /></details>
       <details><summary>artifacts</summary><ArtifactTable list={artifacts.data ?? []} /></details>
-      <details><summary>execution graph</summary>{!active && <GraphView runId={runId} />}</details>
+      {/* The raw execution graph is no longer a separate view: it is the
+          enrichment layer of the unified view above, where it can be read
+          against the ledger that gives it structure. */}
       <details>
         <summary>run row (json)</summary>
         <pre className="log">{JSON.stringify(run, null, 2)}</pre>
@@ -479,6 +482,7 @@ function DebugSection({ run, result }: { run: RunRow; result: RunResult }) {
 export default function ReportPage() {
   const { runId = "" } = useParams();
   const debug = useDebug();
+  const [, setParams] = useSearchParams();
 
   const run = useQuery({
     queryKey: ["run", runId],
@@ -506,6 +510,30 @@ export default function ReportPage() {
     [calls.data, https.data],
   );
 
+  // A finding is an anchor into the one execution view — the same
+  // `?case=&node=&side=` selection a shared URL carries.
+  const openFinding = React.useCallback(
+    (f: Finding) => {
+      setParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (f.correlation) next.set("case", f.correlation);
+          if (f.nodeId != null) {
+            next.set("node", String(f.nodeId));
+            next.set("side", f.side);
+          } else {
+            next.delete("node");
+            next.delete("side");
+          }
+          return next;
+        },
+        { replace: true },
+      );
+      document.getElementById("execution")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    },
+    [setParams],
+  );
+
   if (run.isLoading) return <p className="hint">loading…</p>;
   if (run.error || !run.data || !result) return <p className="err">{String(run.error)}</p>;
   const r = run.data;
@@ -530,7 +558,7 @@ export default function ReportPage() {
 
           <section>
             <h2>What diverged</h2>
-            <FindingList findings={findings} />
+            <FindingList findings={findings} onOpen={openFinding} />
           </section>
 
           <section>
@@ -551,9 +579,13 @@ export default function ReportPage() {
             </div>
           </section>
 
-          <section>
-            <h2>Response &amp; side-effect detail</h2>
-            <DiffView runId={runId} result={result} />
+          {/* ONE VIEW. The execution graph and the response/side-effect diff
+              were two tabs answering halves of the same question — "where did
+              this go wrong" and "what exactly changed there". They are one
+              tree with one detail panel now. */}
+          <section id="execution">
+            <h2>Execution — recorded against replayed</h2>
+            <UnifiedView runId={runId} scorecard={r.scorecard} />
           </section>
         </>
       )}
