@@ -729,6 +729,34 @@ fn collate(chunks: &[Vec<u8>]) -> Collated {
     }
 }
 
+/// Where a session's landing objects actually are, whatever layout wrote them.
+///
+/// The compactor's own layout puts them under `landing/v1/session={id}`. The
+/// deployed aggregator partitions by date first —
+/// `landing/v1/dt=<date>/session={id}/` — so a session it wrote is not under
+/// the prefix the compactor looks in, and a caller naming a recording by id
+/// alone was told there were no landing objects for a recording sitting right
+/// there. Both layouts are read, because which one a bucket uses belongs to the
+/// deployment.
+///
+/// `None` means the session is not in the bucket at all, which is a different
+/// answer from "not where I looked" and deserves a different message.
+pub fn locate_landing_prefix(
+    cfg: &S3Config,
+    session_id: &str,
+    root: &str,
+) -> Result<Option<String>, String> {
+    // The flat layout first: one cheap list, and it is exact when it hits.
+    let flat = layout::landing_prefix(session_id);
+    if !list_objects(cfg, &flat)?.is_empty() {
+        return Ok(Some(flat));
+    }
+    Ok(list_landed_recordings(cfg, root)?
+        .into_iter()
+        .find(|found| found.session_id == session_id)
+        .map(|found| found.prefix))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -811,6 +839,44 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "run-a");
         assert_eq!(found[0].objects, 1);
+    }
+
+    #[test]
+    fn the_flat_layout_is_preferred_and_the_index_is_the_fallback() {
+        // Two layouts exist and a caller naming a recording by id knows neither.
+        // The flat one is exact when it hits, so it is tried first; the index
+        // reads both and is what finds a date-partitioned session.
+        let flat = index_landed_keys(
+            "landing/v1",
+            &keys(&["landing/v1/session=run-a/inst=r1/0.log.gz"]),
+        );
+        assert_eq!(flat[0].prefix, "landing/v1/session=run-a");
+
+        // The case that was failing: the aggregator partitions by date, so the
+        // flat prefix holds nothing and the recording is nonetheless present.
+        let dated = index_landed_keys(
+            "landing/v1",
+            &keys(&["landing/v1/dt=2026-08-04/session=run-b/inst=r1/0.log.gz"]),
+        );
+        assert_eq!(dated[0].prefix, "landing/v1/dt=2026-08-04/session=run-b");
+
+        // And a session spanning two dates resolves to the shared parent, which
+        // holds OTHER sessions — so whoever ingests it must filter by the
+        // session id in each envelope rather than trusting the prefix.
+        let spanning = index_landed_keys(
+            "landing/v1",
+            &keys(&[
+                "landing/v1/dt=2026-08-04/session=run-c/inst=r1/9.log.gz",
+                "landing/v1/dt=2026-08-05/session=run-c/inst=r1/0.log.gz",
+                "landing/v1/dt=2026-08-05/session=run-d/inst=r1/0.log.gz",
+            ]),
+        );
+        let c = spanning.iter().find(|r| r.session_id == "run-c").unwrap();
+        assert_eq!(c.prefix, "landing/v1");
+        assert!(
+            spanning.iter().any(|r| r.session_id == "run-d"),
+            "the shared parent holds another session — content, not the prefix, separates them"
+        );
     }
 
     #[test]

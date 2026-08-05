@@ -3369,6 +3369,34 @@ fn wait_s3_objects(recording_id: &str, timeout: Duration) -> Result<(), String> 
 /// artifacts; the recording catalog row upserts from the manifest.
 fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Result<(), String> {
     let cfg = crate::s3::S3Config::from_env();
+    // A recording named by id alone still has to be FOUND. The compactor looks
+    // under its own flat layout; the deployed aggregator partitions by date
+    // first, so a session it wrote is not there and the pull failed with "no
+    // landing objects" for a recording plainly present in the bucket — which is
+    // every recording the index offers but has not yet ingested.
+    //
+    // An unsealed session therefore goes through the prefix scan, which filters
+    // by the session id carried in each envelope. That matters beyond finding
+    // it: a session spanning two dates is addressed from the shared parent, so
+    // the prefix holds other sessions too, and only content can separate them.
+    if deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
+        let root_prefix =
+            std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+        let prefix = deja_compactor::locate_landing_prefix(&cfg, recording_id, &root_prefix)?
+            .ok_or_else(|| {
+                format!(
+                    "recording {recording_id} is not in s3://{}/{root_prefix} — it was never                      landed, or it landed under a different root",
+                    cfg.bucket
+                )
+            })?;
+        let source = crate::S3Source {
+            path: format!("s3://{}/{prefix}", cfg.bucket),
+            region: Some(cfg.region.clone()),
+            endpoint: (!cfg.endpoint.trim().is_empty()).then(|| cfg.endpoint.clone()),
+        };
+        resolve_recording_from_source(root, ctx, &source, Some(recording_id))?;
+        return Ok(());
+    }
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
     let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &dest)?;
     let gaps: usize = manifest.instances.iter().map(|i| i.gaps.len()).sum();
