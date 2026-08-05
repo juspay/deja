@@ -12,6 +12,7 @@ import {
   whatHappened,
 } from "../lib/result";
 import { ResultChip } from "../components/Result";
+import { KillRun } from "../components/KillRun";
 
 function when(iso: string): { short: string; full: string } {
   const d = new Date(iso);
@@ -112,6 +113,9 @@ export default function RunsPage() {
           <span>recording</span>
           <span>what happened</span>
           <span className="num">attempt</span>
+          {/* The action column. Reserved on every row, occupied only on the
+              ones that are still running, so the columns above never shift. */}
+          <span />
         </div>
 
         {rows.map((r) => {
@@ -122,29 +126,38 @@ export default function RunsPage() {
           const t = when(r.created_at);
           // The whole row is the link: middle-click, copy-link-address and
           // keyboard focus all work, and there is no dead zone between cells.
+          //
+          // The kill control cannot live INSIDE it — a <button> inside an <a>
+          // is invalid and the click would be the link's. It sits over the
+          // reserved last column instead, so the row stays one anchor.
           return (
-            <Link
-              key={r.run_id}
-              className="runrow"
-              to={withDebug(`/r/${r.run_id}`, debug)}
-              title={`${r.run_id} · ${r.created_by} · ${t.full}`}
-            >
-              <span className="rl-when">{t.short}</span>
-              <span className="rl-result"><ResultChip result={res} /></span>
-              <span className="rl-cand mono" title={cand.full}>{cand.label}</span>
-              <span className="rl-rec mono">{r.recording_id ?? "—"}</span>
-              <span className="rl-said" title={said ?? undefined}>{said ?? "—"}</span>
-              <span
-                className="rl-attempt num"
-                title={
-                  at
-                    ? `derived client-side: run ${at.attempt} of ${at.of} with this mode + recording + candidate. The server does not persist a subject key.`
-                    : undefined
-                }
+            <div className="runrowwrap" key={r.run_id}>
+              <Link
+                className="runrow"
+                to={withDebug(`/r/${r.run_id}`, debug)}
+                title={`${r.run_id} · ${r.created_by} · ${t.full}`}
               >
-                {at ? (at.of > 1 ? `${at.attempt}/${at.of}` : "1") : "—"}
-              </span>
-            </Link>
+                <span className="rl-when">{t.short}</span>
+                <span className="rl-result"><ResultChip result={res} /></span>
+                <span className="rl-cand mono" title={cand.full}>{cand.label}</span>
+                <span className="rl-rec mono">{r.recording_id ?? "—"}</span>
+                <span className="rl-said" title={said ?? undefined}>{said ?? "—"}</span>
+                <span
+                  className="rl-attempt num"
+                  title={
+                    at
+                      ? `derived client-side: run ${at.attempt} of ${at.of} with this mode + recording + candidate. The server does not persist a subject key.`
+                      : undefined
+                  }
+                >
+                  {at ? (at.of > 1 ? `${at.attempt}/${at.of}` : "1") : "—"}
+                </span>
+                <span />
+              </Link>
+              <div className="rl-kill">
+                <KillRun run={r} compact />
+              </div>
+            </div>
           );
         })}
 

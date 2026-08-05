@@ -342,13 +342,19 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
 .runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
 .runrow {
   display: grid; align-items: center;
-  grid-template-columns: 90px 118px minmax(130px, 1fr) minmax(150px, 1.1fr) minmax(200px, 2.4fr) 74px;
+  grid-template-columns: 90px 118px minmax(130px, 1fr) minmax(150px, 1.1fr) minmax(200px, 2.4fr) 74px 132px;
   gap: var(--s3); padding: var(--s2) var(--s3); font-size: var(--fs-12);
   color: var(--text-muted); text-decoration: none; border-bottom: 1px solid var(--border-muted);
 }
 a.runrow:hover { background: var(--surface-overlay); color: var(--text); text-decoration: none; }
 a.runrow:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.runrow:last-child { border-bottom: 0; }
+/* The wrapper is the row now (a <button> may not live inside the <a>), so
+   `:last-child` on the link would match every row and erase every divider. */
+.runrowwrap { position: relative; }
+.runrowwrap:last-child .runrow { border-bottom: 0; }
+.rl-kill {
+  position: absolute; z-index: 1; right: var(--s3); top: 50%; transform: translateY(-50%);
+}
 .runrow.runhead {
   background: var(--surface-raised); color: var(--text-subtle);
   font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
@@ -564,6 +570,8 @@ main:has(.runlist), main:has(.verdict) { max-width: 1440px; }
 .recorphan td { color: var(--text-subtle); }
 
 main:has(.recintro) { max-width: 1440px; }
+
+/* ==========================================================================
    THE UNIFIED EXECUTION VIEW
    One merged tree (spine = the call ledger) + one detail panel. Replaces the
    separate two-column graph and the response/side-effect diff, which were two
@@ -700,3 +708,179 @@ main:has(.recintro) { max-width: 1440px; }
 .evlist code { color: var(--text); }
 /* A classified leaf: shown and labelled, never deleted. */
 .suppressed { color: var(--text-faint); font-size: var(--fs-11); font-style: italic; line-height: 1.6; }
+
+/* ==========================================================================
+   KILL A RUN
+   Appended, so nothing above moves.
+
+   Destructive and irreversible, so it arms before it fires and the armed state
+   is the loud one. In the runs list the outcome cannot grow the row without
+   shifting every row beneath it, so it hangs in a small popover under the
+   button (`.killpop`) — the same overlay treatment `.recpick-pop` uses — rather
+   than being reduced to a tooltip, which would be swallowing it.
+   ========================================================================== */
+.killwrap { display: grid; gap: var(--s2); justify-items: start; }
+.killwrap.compact { position: relative; display: block; }
+.killrow { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+
+.killbtn { color: var(--red-fg); border-color: var(--border); padding: 3px 11px; font-size: var(--fs-11); }
+.killbtn:hover { background: rgba(248,81,73,0.12); border-color: var(--diff-del-edge); color: var(--red-fg); }
+.killbtn.armed { background: #c93631; color: #fff; border-color: transparent; font-weight: 600; }
+.killbtn.armed:hover { background: #e04a44; color: #fff; }
+.killcancel { padding: 3px 11px; font-size: var(--fs-11); }
+.killarmed { max-width: 46ch; }
+
+.killnote { margin: 0; font-size: var(--fs-12); line-height: 1.55; color: var(--text-muted); }
+.killnote b { color: var(--text); }
+.killnote.err b { color: var(--red-fg); }
+.killwarn { color: var(--amber-fg); }
+.killdismiss {
+  background: transparent; border: 0; color: var(--text-faint); font: inherit;
+  font-size: var(--fs-11); padding: 0; width: auto; text-decoration: underline;
+}
+.killdismiss:hover { background: transparent; color: var(--text); }
+
+.killpop {
+  position: absolute; z-index: 5; right: 0; top: calc(100% + 4px); width: max-content; max-width: 380px;
+  display: grid; gap: var(--s2); justify-items: start; text-align: left;
+  background: var(--surface-overlay); border: 1px solid var(--border-strong);
+  border-radius: var(--r-md); box-shadow: var(--shadow-overlay); padding: var(--s2) var(--s3);
+  white-space: normal;
+}
+.killpop.hint { margin: 0; }
+
+/* ==========================================================================
+   CORRELATION PICKER — which recorded requests a run drives.
+   Appended, so nothing above moves.
+
+   Search, multi-select, and range-select by dragging. The cap is stated at the
+   top and never hidden; a sweep says its size WHILE it is being dragged
+   (`.corrdrag`), and a refusal is a block of prose (`.corrrefusal`), not a
+   toast that disappears before it is read. Nothing here ever trims a selection
+   to fit — see components/CorrelationPicker.tsx.
+   ========================================================================== */
+.corrpick {
+  display: grid; gap: var(--s2);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); padding: var(--s3);
+}
+.corrhead { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.corrsearch {
+  flex: 1; min-width: 220px;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; font-size: var(--fs-13);
+}
+.corrcount {
+  font-family: var(--font-mono); font-size: var(--fs-12); color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.corrcount.full { color: var(--amber-fg); }
+.corrcap { flex-basis: 100%; }
+.corrsrc { margin: 0; max-width: 88ch; }
+.corrfail { margin: 0; font-size: var(--fs-12); line-height: 1.55; max-width: 88ch; }
+
+.corrnone {
+  border: 1px solid var(--border); border-left: 3px solid var(--border-strong);
+  border-radius: var(--r-sm); background: var(--surface-raised);
+  padding: var(--s2) var(--s3); display: grid; gap: var(--s1);
+}
+.corrnone p { margin: 0; max-width: 88ch; line-height: 1.55; }
+
+.corrtools { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.corrtools .btn { padding: 3px 11px; font-size: var(--fs-11); }
+
+.corrdrag {
+  margin: 0; padding: var(--s1) var(--s3); border-radius: var(--r-sm);
+  background: var(--surface-overlay); color: var(--text-muted);
+  font-size: var(--fs-12); font-variant-numeric: tabular-nums;
+}
+.corrdrag.over { background: rgba(248,81,73,0.14); color: var(--red-fg); font-weight: 600; }
+
+.corrlist {
+  list-style: none; margin: 0; padding: var(--s1);
+  max-height: 300px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg);
+  /* A drag is a selection gesture; without this it paints the row text instead. */
+  user-select: none;
+}
+.corrrow {
+  display: grid; grid-template-columns: 16px 56px minmax(0, 1fr) 84px;
+  align-items: center; gap: var(--s2); width: 100%; text-align: left;
+  background: transparent; border: 0; border-radius: var(--r-sm);
+  padding: 3px var(--s2); font: inherit; font-size: var(--fs-12);
+  color: var(--text-muted); cursor: pointer;
+}
+.corrrow:hover { background: var(--surface-overlay); }
+.corrrow:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* The rows the no-selection default covers. Deliberately quieter than `.on`:
+   it is what WOULD run, not something anyone picked. Ordered after `.on` and
+   before `.sweep` so an explicit state always wins. */
+.corrrow.dflt { background: rgba(88,166,255,0.05); box-shadow: inset 2px 0 0 var(--border-strong); }
+.corrrow.dflt .corrmark { color: var(--text-faint); }
+.corrrow.on { background: var(--accent-muted); color: var(--text); box-shadow: none; }
+.corrrow.sweep { background: var(--surface-raised); box-shadow: inset 2px 0 0 var(--accent); }
+.corrrow.sweep.over { background: rgba(248,81,73,0.12); box-shadow: inset 2px 0 0 var(--diff-del-edge); }
+.corrbox {
+  width: 14px; height: 14px; border: 1px solid var(--border-strong); border-radius: var(--r-xs);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; line-height: 1; color: var(--accent);
+}
+.corrrow.on .corrbox { border-color: var(--accent); }
+.corrid { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.corrord {
+  color: var(--text-faint); font-size: var(--fs-11); font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+/* Empty on every row but the default's, so the column is reserved and the rows
+   below it do not shift when the default stops applying. */
+.corrmark { color: var(--text-faint); font-size: var(--fs-11); text-align: right; white-space: nowrap; }
+.corrnomatch { margin: 0; max-width: 88ch; }
+
+.corrrefusal {
+  margin: 0; border: 1px solid var(--diff-del-edge); border-left: 3px solid var(--diff-del-edge);
+  background: rgba(248,81,73,0.10); border-radius: var(--r-sm);
+  padding: var(--s2) var(--s3); font-size: var(--fs-12); line-height: 1.55; max-width: 88ch;
+}
+
+.corrchosen { display: grid; gap: var(--s2); }
+.corrchosen ul {
+  list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--s1);
+  max-height: 148px; overflow-y: auto;
+}
+.corrchip {
+  display: inline-flex; align-items: center; gap: 6px; width: auto;
+  background: var(--surface-overlay); color: var(--text-muted); border: 1px solid transparent;
+  border-radius: var(--r-pill); padding: 2px 9px; font: inherit; font-size: var(--fs-11);
+  font-weight: 400; cursor: pointer;
+}
+.corrchip:hover { background: var(--surface-raised); color: var(--text); }
+.corrchip.unknown { border-color: var(--diff-mod-edge); }
+.corrchip em { color: var(--amber-fg); font-style: normal; font-size: var(--fs-11); }
+
+.corrpaste { display: grid; gap: var(--s1); justify-items: start; }
+.corrpaste label { color: var(--text-subtle); font-size: var(--fs-12); }
+.corrpaste textarea {
+  width: 100%; resize: vertical; font-family: var(--font-mono); font-size: var(--fs-12);
+}
+
+/* The no-selection default, stated on the form. It is a statement of what will
+   happen, not a warning that something is wrong, so it reuses `.scopewarn`'s
+   shape but drops its alarm colour. */
+.scopedefault {
+  border-color: var(--border-strong); border-left-color: var(--accent);
+  background: var(--surface-raised); display: grid; gap: var(--s2); justify-items: start;
+}
+.scopedefault p { margin: 0; max-width: 92ch; }
+.scopedefault b { color: var(--text); }
+.scopeids { font-size: var(--fs-12); }
+.scopeids summary {
+  cursor: pointer; color: var(--accent); font-family: var(--font-mono); font-size: var(--fs-11);
+}
+.scopeids summary:hover { color: var(--accent-hover); }
+.scopeidlist {
+  margin: var(--s2) 0 0; padding: var(--s2) var(--s3) var(--s2) var(--s5);
+  max-height: 220px; overflow-y: auto;
+  background: var(--surface-inset); border: 1px solid var(--border); border-radius: var(--r-sm);
+  color: var(--text-muted); font-size: var(--fs-11); line-height: 1.7;
+}
+.scopeidlist li::marker { color: var(--text-faint); font-family: var(--font-mono); }

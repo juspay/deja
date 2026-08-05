@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import { api, StageRow } from "../lib/api";
 import { resultOf } from "../lib/result";
 import { ResultChip } from "./Result";
+import { KillRun } from "./KillRun";
 
 function CopyLink({ url }: { url: string }) {
   const [copied, setCopied] = React.useState(false);
@@ -141,6 +142,9 @@ export function RunLaunchModal({ runId, onClose }: { runId: string | null; onClo
               <button type="button" className="btn" onClick={() => ref.current?.close()}>
                 close
               </button>
+              {/* The first place a run that will never start becomes visible.
+                  Self-gating: nothing renders once the run is terminal. */}
+              {run.data && <KillRun run={run.data} />}
             </div>
           </div>
         </>
