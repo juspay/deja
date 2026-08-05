@@ -142,8 +142,9 @@ impl K8sExecutorConfig {
 pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String), ExecutorError> {
     match spec {
         CandidateSpec::PrebuiltImage { image } => {
-            let sha = image_tag(image).to_owned();
-            Ok((image.clone(), sha))
+            let image = qualify_candidate_image(image);
+            let sha = image_tag(&image).to_owned();
+            Ok((image, sha))
         }
         CandidateSpec::RepoSha { .. }
         | CandidateSpec::RepoBranch { .. }
@@ -155,6 +156,34 @@ pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String),
         CandidateSpec::LocalPath { .. } => Err(ExecutorError::Template(
             "local_path candidates run only under the compose executor".into(),
         )),
+    }
+}
+
+/// Expand a bare candidate REF into a full image reference using the
+/// deployment's registry, leaving an already-qualified reference alone.
+///
+/// Which registry holds the candidate's images belongs to the deployment, not
+/// to a run: it is the same for every run against a given system, and a caller
+/// retyping it is a caller who can get it wrong in a way nothing checks. So a
+/// run names a build — a tag, a git sha — and this resolves where that build
+/// lives, from `DEJA_CANDIDATE_IMAGE_REPO`.
+///
+/// A reference containing `/` or `@`, or a `:` that is not the registry's port,
+/// is taken as already qualified and used verbatim. That keeps a fork, another
+/// registry, or a digest reachable without a config change — the convention is
+/// the default, not the only option. With no repo configured a bare ref is also
+/// left alone, so compose (where the "image" is a local tag) is unaffected.
+fn qualify_candidate_image(reference: &str) -> String {
+    let reference = reference.trim();
+    let already_qualified = reference.contains('/') || reference.contains('@');
+    if already_qualified {
+        return reference.to_owned();
+    }
+    match std::env::var("DEJA_CANDIDATE_IMAGE_REPO") {
+        Ok(repo) if !repo.trim().is_empty() => {
+            format!("{}:{}", repo.trim().trim_end_matches('/'), reference)
+        }
+        _ => reference.to_owned(),
     }
 }
 
@@ -221,5 +250,48 @@ mod tests {
             binary_or_source: "/x".into(),
         })
         .is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod candidate_reference_tests {
+    use super::*;
+
+    /// `DEJA_CANDIDATE_IMAGE_REPO` is process-global, so these run under one
+    /// lock rather than as separate tests racing the same variable.
+    #[test]
+    fn a_bare_ref_resolves_against_the_deployment_registry() {
+        const REPO: &str = "2236.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router";
+        std::env::set_var("DEJA_CANDIDATE_IMAGE_REPO", REPO);
+
+        // The only part a run chooses is the build.
+        assert_eq!(
+            qualify_candidate_image("dcb9f9e955"),
+            format!("{REPO}:dcb9f9e955")
+        );
+
+        // An already-qualified reference is left alone, so another registry, a
+        // fork, or a digest stays reachable without changing configuration.
+        let elsewhere = "ghcr.io/someone/hyperswitch-router:abc123";
+        assert_eq!(qualify_candidate_image(elsewhere), elsewhere);
+        let digest = "2236.dkr.ecr.ap-south-1.amazonaws.com/router@sha256:beef";
+        assert_eq!(qualify_candidate_image(digest), digest);
+
+        // And the tag is read from the resolved reference, not the bare one.
+        let (image, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
+            image: "dcb9f9e955".into(),
+        })
+        .unwrap();
+        assert_eq!(image, format!("{REPO}:dcb9f9e955"));
+        assert_eq!(sha, "dcb9f9e955");
+
+        // With no registry configured a bare ref is untouched — compose builds
+        // a local tag and has no registry to resolve against.
+        std::env::remove_var("DEJA_CANDIDATE_IMAGE_REPO");
+        assert_eq!(
+            qualify_candidate_image("deja-router-local"),
+            "deja-router-local"
+        );
     }
 }

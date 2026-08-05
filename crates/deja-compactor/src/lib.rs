@@ -310,6 +310,101 @@ pub fn list_objects(cfg: &S3Config, prefix: &str) -> Result<Vec<String>, String>
     })
 }
 
+/// One recording as it exists in the landing area, discovered by listing.
+///
+/// Held so a caller can name a recording instead of constructing a path to it.
+/// The partitions a session spans are kept because they are a property of when
+/// the aggregator flushed, not of the recording: a session that runs across
+/// midnight lands under two dates, and a prefix naming only one of them
+/// silently ingests part of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandedRecording {
+    pub session_id: String,
+    /// Partition dates this session appears under, earliest first. Empty for a
+    /// layout that carries no date partition.
+    pub dates: Vec<String>,
+    /// The prefix to ingest from — the shared parent when a session spans more
+    /// than one partition, so the scan sees all of it.
+    pub prefix: String,
+    pub objects: usize,
+}
+
+impl LandedRecording {
+    /// The date a listing sorts by: the last partition the session appears
+    /// under, so "latest" means most recently written.
+    pub fn latest_date(&self) -> Option<&str> {
+        self.dates.last().map(String::as_str)
+    }
+}
+
+/// Enumerate the recordings present under `root` (default `landing/v1`),
+/// newest first.
+///
+/// The deployed aggregator writes `landing/v1/dt=<date>/session=<id>/…` while
+/// the session layout writes `landing/v1/session=<id>/…`; both are read here,
+/// because which one a bucket uses is a property of the deployment and not
+/// something a caller should have to know. Keys that match neither are ignored
+/// rather than guessed at.
+pub fn list_landed_recordings(cfg: &S3Config, root: &str) -> Result<Vec<LandedRecording>, String> {
+    Ok(index_landed_keys(root, &list_objects(cfg, root)?))
+}
+
+/// The listing's parsing half, separated from its IO so the key shapes it must
+/// understand can be stated as examples rather than discovered in production.
+pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
+    let root = root.trim_end_matches('/');
+    // (session, dates) — BTreeMap so the dates come out sorted without a pass.
+    let mut found: BTreeMap<String, (BTreeSet<String>, usize)> = BTreeMap::new();
+    for key in keys {
+        let Some(rest) = key.strip_prefix(root).map(|r| r.trim_start_matches('/')) else {
+            continue;
+        };
+        let mut date: Option<&str> = None;
+        let mut session: Option<&str> = None;
+        for segment in rest.split('/') {
+            if let Some(d) = segment.strip_prefix("dt=") {
+                date = Some(d);
+            } else if let Some(s) = segment.strip_prefix("session=") {
+                session = Some(s);
+                break; // everything below the session belongs to it
+            }
+        }
+        let Some(session) = session else { continue };
+        let entry = found.entry(session.to_owned()).or_default();
+        if let Some(d) = date {
+            entry.0.insert(d.to_owned());
+        }
+        entry.1 += 1;
+    }
+
+    let mut out: Vec<LandedRecording> = found
+        .into_iter()
+        .map(|(session_id, (dates, objects))| {
+            let dates: Vec<String> = dates.into_iter().collect();
+            // One partition: address it directly. Several (or none): address the
+            // root, so a straddling session is ingested whole.
+            let prefix = match dates.as_slice() {
+                [only] => format!("{root}/dt={only}/session={session_id}"),
+                [] => format!("{root}/session={session_id}"),
+                _ => root.to_owned(),
+            };
+            LandedRecording {
+                session_id,
+                dates,
+                prefix,
+                objects,
+            }
+        })
+        .collect();
+    // Newest first: by last partition, then by id so the order is total.
+    out.sort_by(|a, b| {
+        b.latest_date()
+            .cmp(&a.latest_date())
+            .then_with(|| b.session_id.cmp(&a.session_id))
+    });
+    out
+}
+
 /// Fetch one object and decode its compression (`.zst`, `.gz`, or plain).
 /// Companion to [`list_objects`] for arbitrary-prefix ingest.
 pub fn get_object_decoded(cfg: &S3Config, key: &str) -> Result<Vec<u8>, String> {
@@ -638,6 +733,85 @@ fn collate(chunks: &[Vec<u8>]) -> Collated {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_index_reads_both_layouts_a_bucket_may_use() {
+        // The deployed aggregator partitions by date; the session layout does
+        // not. Which one a bucket uses belongs to the deployment, so a caller
+        // naming a recording must get the same answer either way.
+        let found = index_landed_keys(
+            "landing/v1",
+            &keys(&[
+                "landing/v1/dt=2026-07-29/session=run-a/inst=r1/0.log.gz",
+                "landing/v1/dt=2026-07-29/session=run-a/inst=r1/1.log.gz",
+                "landing/v1/session=run-b/inst=r1/0.log.gz",
+            ]),
+        );
+        let a = found.iter().find(|r| r.session_id == "run-a").unwrap();
+        assert_eq!(a.dates, vec!["2026-07-29"]);
+        assert_eq!(a.objects, 2);
+        assert_eq!(a.prefix, "landing/v1/dt=2026-07-29/session=run-a");
+
+        let b = found.iter().find(|r| r.session_id == "run-b").unwrap();
+        assert!(b.dates.is_empty());
+        assert_eq!(b.prefix, "landing/v1/session=run-b");
+    }
+
+    #[test]
+    fn a_session_spanning_midnight_is_addressed_whole() {
+        // The partition is when the aggregator flushed, not when the recording
+        // happened. A prefix naming one of the two dates would ingest half a
+        // recording and report it as a whole one.
+        let found = index_landed_keys(
+            "landing/v1",
+            &keys(&[
+                "landing/v1/dt=2026-07-29/session=run-x/inst=r1/9.log.gz",
+                "landing/v1/dt=2026-07-30/session=run-x/inst=r1/0.log.gz",
+            ]),
+        );
+        assert_eq!(found.len(), 1);
+        let x = &found[0];
+        assert_eq!(x.dates, vec!["2026-07-29", "2026-07-30"]);
+        assert_eq!(x.objects, 2);
+        assert_eq!(
+            x.prefix, "landing/v1",
+            "a straddling session must be scanned from the shared parent"
+        );
+        assert_eq!(x.latest_date(), Some("2026-07-30"));
+    }
+
+    #[test]
+    fn the_index_is_newest_first() {
+        let found = index_landed_keys(
+            "landing/v1",
+            &keys(&[
+                "landing/v1/dt=2026-07-28/session=run-old/inst=r1/0.log.gz",
+                "landing/v1/dt=2026-08-04/session=run-new/inst=r1/0.log.gz",
+                "landing/v1/dt=2026-07-29/session=run-mid/inst=r1/0.log.gz",
+            ]),
+        );
+        let order: Vec<&str> = found.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(order, vec!["run-new", "run-mid", "run-old"]);
+    }
+
+    #[test]
+    fn keys_that_name_no_session_are_ignored_not_guessed_at() {
+        let found = index_landed_keys(
+            "landing/v1",
+            &keys(&[
+                "landing/v1/dt=2026-07-29/stray.log.gz",
+                "landing/v1/_SUCCESS",
+                "landing/v1/dt=2026-07-29/session=run-a/inst=r1/0.log.gz",
+            ]),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "run-a");
+        assert_eq!(found[0].objects, 1);
+    }
 
     #[test]
     fn decode_object_handles_gzip_zstd_and_plain() {

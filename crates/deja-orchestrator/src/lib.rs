@@ -248,6 +248,242 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}-{nanos:x}")
 }
 
+/// What a recording's id says about the recording, when it says anything.
+///
+/// Two shapes exist and both are permanent. A recorder that knows the revision
+/// it is running names it:
+///
+/// ```text
+/// rec-dcb9f9e-07291352-a3     revision, when, which instance
+/// ```
+///
+/// A recorder that does NOT know its revision must not pretend to. The code
+/// sha resolves through a chain ending in the literal `"unknown"`, and
+/// `rec-unknown-07291352-a3` would be worse than an opaque id: it claims a
+/// provenance it does not have. So an unnamed recorder keeps the older form,
+/// which at least admits it carries nothing:
+///
+/// ```text
+/// run-1785331134782268537     a timestamp, and no claim beyond it
+/// ```
+///
+/// Every reader therefore has to handle both, forever — recordings made before
+/// this existed are still replayable, and a build without revision information
+/// still records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordingIdentity {
+    /// The id names the revision that produced the recording.
+    Described {
+        /// Short git sha of the recorded system.
+        revision: String,
+        /// `MMDDhhmm` UTC, when recording began.
+        recorded_at: String,
+        /// Discriminator for the instance, so two pods starting in the same
+        /// minute stay distinct.
+        instance: String,
+    },
+    /// The id carries no provenance. Its parts live in the recording's
+    /// envelopes (`code.sha`, `instance_id`) rather than in its name.
+    Opaque,
+}
+
+/// The `rec-` / `run-` prefix carries no information — the position already
+/// says what this is — so composition drops it and both spellings are stripped.
+pub fn recording_id_body(recording_id: &str) -> &str {
+    recording_id
+        .strip_prefix("rec-")
+        .or_else(|| recording_id.strip_prefix("run-"))
+        .unwrap_or(recording_id)
+}
+
+/// Read what a recording's id claims about itself.
+///
+/// Deliberately strict: a shape that does not match is [`Opaque`] rather than
+/// half-parsed. An id is a convenience, and the recording's envelopes carry the
+/// same facts authoritatively — so guessing here would trade a small
+/// convenience for a wrong answer.
+///
+/// [`Opaque`]: RecordingIdentity::Opaque
+pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
+    let Some(body) = recording_id.strip_prefix("rec-") else {
+        return RecordingIdentity::Opaque;
+    };
+    let parts: Vec<&str> = body.split('-').collect();
+    let [revision, recorded_at, instance] = parts[..] else {
+        return RecordingIdentity::Opaque;
+    };
+    let shaped = !revision.is_empty()
+        && revision.chars().all(|c| c.is_ascii_hexdigit())
+        && recorded_at.len() == 8
+        && recorded_at.chars().all(|c| c.is_ascii_digit())
+        && !instance.is_empty();
+    if !shaped {
+        return RecordingIdentity::Opaque;
+    }
+    RecordingIdentity::Described {
+        revision: revision.to_owned(),
+        recorded_at: recorded_at.to_owned(),
+        instance: instance.to_owned(),
+    }
+}
+
+/// The most a run id may be. A k8s Job is named `deja-replay-{run_id}` and
+/// DNS-1123 caps a name at 63, so 51 is the ceiling — and `job_name_for`
+/// truncates the TAIL, which is where uniqueness lives. Composition below
+/// therefore shortens a segment itself rather than letting the name builder
+/// cut the end off.
+pub const RUN_ID_MAX: usize = 51;
+
+/// Segment budgets, summing with separators to exactly [`RUN_ID_MAX`]. The
+/// recording keeps all 19 digits a `run-`-stripped id has, because the whole
+/// point of carrying it is that it can be searched for verbatim.
+const ENV_MAX: usize = 3;
+const CANDIDATE_MAX: usize = 10;
+const RECORDING_MAX: usize = 19;
+/// `MMDDhhmmssSSS` — see [`run_id_stamp`].
+const STAMP_MAX: usize = 13;
+
+/// Compose a replay run id from the things that identify the run.
+///
+/// `rp-sbx-dcb9f9e955-1785331134782268537-0805t1408`
+///
+/// Every segment is an identifier someone already has, so the id can be read
+/// and — more importantly — SEARCHED. `rp-sbx-dcb9f9e955-` finds every run of
+/// a candidate, `-1785331134782268537-` every run of a recording, without
+/// resolving anything first. A digest would be shorter and would answer
+/// neither question.
+///
+/// The trailing stamp is what makes it unique, and it is a time rather than an
+/// attempt counter deliberately: an attempt number has to be allocated
+/// atomically, so two concurrent fires of the same inputs race for the same
+/// ordinal. A time needs no coordination, and the attempt a person actually
+/// wants to see ("the 3rd run of this pair") is derived for display from the
+/// runs that share the same subject.
+///
+/// NORMALIZATION IS LOSSY, SO THE STAMP CARRIES THE DISTINCTNESS. Collapsing
+/// punctuation maps `2026.08.04` and `2026-08-04` onto one segment, and
+/// shortening maps every ref sharing a prefix onto one. That matters because a
+/// run id is a STORAGE KEY — `s3://…/replay-runs/{id}/…` and
+/// `{root}/runs/{id}.json` — so two runs sharing an id do not merely look
+/// alike, the second overwrites the first's artifacts.
+///
+/// Distinctness therefore comes from the RESOLUTION of the stamp, not from
+/// asking a store whether an id is free. Asking would be stateful, would need
+/// the store at mint time, and would still be a read-then-write race between
+/// two concurrent creates. A millisecond stamp needs none of that: composition
+/// is a pure function of its inputs and the clock. Two runs collide only if
+/// they are minted in the same millisecond with inputs that normalize alike —
+/// and a lossy segment costs a little fidelity in the address either way, never
+/// correctness, because the run record keeps the spec verbatim.
+pub fn replay_run_id(env: &str, candidate_ref: &str, recording_id: &str, stamp: &str) -> String {
+    // The prefix says only "this is a recording", which the position already
+    // says. Both spellings are dropped — see [`RecordingIdentity`].
+    let recording = recording_id_body(recording_id).to_owned();
+    let env_seg = clamp_segment(env, ENV_MAX, Trim::Tail);
+    let cand_seg = clamp_segment(candidate_ref, CANDIDATE_MAX, Trim::Tail);
+    // Keep the DISTINCTIVE end of a recording id: these are timestamps, so the
+    // leading digits are shared by everything recorded the same week.
+    let rec_seg = clamp_segment(&recording, RECORDING_MAX, Trim::Lead);
+    let stamp_seg = clamp_segment(stamp, STAMP_MAX, Trim::Tail);
+
+    // An address that does not quite match what was typed should say so, once,
+    // rather than leave someone to wonder why their tag reads differently.
+    for (what, original, kept) in [
+        ("environment", env, &env_seg),
+        ("candidate", candidate_ref, &cand_seg),
+        ("recording", recording.as_str(), &rec_seg),
+    ] {
+        if kept.as_str() != original {
+            eprintln!(
+                "run id: {what} {original:?} is addressed as {kept:?} — the run record keeps the \
+                 original"
+            );
+        }
+    }
+
+    let id = format!("rp-{env_seg}-{cand_seg}-{rec_seg}-{stamp_seg}");
+    debug_assert!(
+        id.len() <= RUN_ID_MAX,
+        "composed run id {id} is {} chars, over the {RUN_ID_MAX} budget",
+        id.len()
+    );
+    id
+}
+
+enum Trim {
+    /// Drop the end — for values whose start identifies them.
+    Tail,
+    /// Drop the start — for values whose end distinguishes them.
+    Lead,
+}
+
+/// Reduce one segment to something a DNS-1123 name and an S3 key both accept,
+/// within `max`. Lowercased, runs of anything else collapsed to a single `-`,
+/// no leading or trailing `-` (which would double a separator or end the id on
+/// one).
+fn clamp_segment(value: &str, max: usize, trim: Trim) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let cleaned = out.trim_matches('-');
+    let clamped = if cleaned.len() <= max {
+        cleaned.to_owned()
+    } else {
+        match trim {
+            Trim::Tail => cleaned[..max].to_owned(),
+            Trim::Lead => cleaned[cleaned.len() - max..].to_owned(),
+        }
+    };
+    let clamped = clamped.trim_matches('-').to_owned();
+    if clamped.is_empty() {
+        "none".to_owned()
+    } else {
+        clamped
+    }
+}
+
+/// `MMDDhhmmssSSS` in UTC — the stamp that makes a run id distinct.
+///
+/// Millisecond resolution, and the precision is the whole mechanism: it is what
+/// lets composition stay a pure function instead of consulting a store to find
+/// a free name. Written without a separator inside the time so all thirteen
+/// characters fit the budget; it still reads as `08-05 14:08:32.123`.
+pub fn run_id_stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let (month, day) = civil_month_day(secs / 86_400);
+    let today = secs % 86_400;
+    format!(
+        "{month:02}{day:02}{:02}{:02}{:02}{:03}",
+        today / 3600,
+        (today % 3600) / 60,
+        today % 60,
+        now.subsec_millis()
+    )
+}
+
+/// Days since the epoch → (month, day), via the civil-from-days algorithm.
+/// Avoids a date dependency for the one place a calendar is needed.
+fn civil_month_day(days_since_epoch: u64) -> (u64, u64) {
+    let z = days_since_epoch as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (m as u64, d as u64)
+}
+
 /// On-disk root for harness state. Defaults to `./harness-state` relative
 /// to the working directory. Layout:
 ///   {root}/runs/{run_id}.json
@@ -510,5 +746,229 @@ mod schema_fingerprint_tests {
     fn new_sorts_and_dedups() {
         let fp = SchemaFingerprint::new(vec!["002".into(), "001".into(), "002".into()]);
         assert_eq!(fp.applied, vec!["001".to_string(), "002".to_string()]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod run_identity_tests {
+    use super::*;
+
+    #[test]
+    fn ids_minted_in_sequence_are_distinct() {
+        // Composition is a pure function of its inputs and the clock, so
+        // distinctness comes from the stamp's resolution rather than from
+        // asking a store whether a name is free. That matters because the id is
+        // the key a run's artifacts are stored under: two runs sharing one do
+        // not merely look alike, the second overwrites the first.
+        let ids: std::collections::BTreeSet<String> = (0..50)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                replay_run_id(
+                    "sbx",
+                    "dcb9f9e955",
+                    "run-1785331134782268537",
+                    &run_id_stamp(),
+                )
+            })
+            .collect();
+        assert_eq!(ids.len(), 50, "a stamp of this resolution must not repeat");
+        assert!(ids.iter().all(|id| id.len() <= RUN_ID_MAX));
+    }
+
+    #[test]
+    fn a_recording_id_is_read_in_both_shapes_and_neither_is_guessed_at() {
+        // A recorder that knows its revision names it.
+        assert_eq!(
+            parse_recording_id("rec-dcb9f9e-07291352-a3"),
+            RecordingIdentity::Described {
+                revision: "dcb9f9e".into(),
+                recorded_at: "07291352".into(),
+                instance: "a3".into(),
+            }
+        );
+
+        // A recorder that does NOT know its revision keeps the older form
+        // rather than minting `rec-unknown-…`, which would claim a provenance
+        // it does not have. Every recording made before ids carried one reads
+        // this way, and stays replayable.
+        assert_eq!(
+            parse_recording_id("run-1785331134782268537"),
+            RecordingIdentity::Opaque
+        );
+
+        // Anything that does not match the shape is opaque, never half-read:
+        // the envelopes carry these facts authoritatively, so a guess here
+        // would trade a small convenience for a wrong answer.
+        for malformed in [
+            "rec-dcb9f9e-07291352",     // missing the instance
+            "rec-dcb9f9e-072913520-a3", // wrong width for a timestamp
+            "rec-nothex-07291352-a3",   // not a revision
+            "rec--07291352-a3",         // empty revision
+            "rec-dcb9f9e-july2913-a3",  // not digits
+            "1785331134782268537",      // no prefix at all
+        ] {
+            assert_eq!(
+                parse_recording_id(malformed),
+                RecordingIdentity::Opaque,
+                "{malformed} should not have parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn both_recording_id_shapes_embed_in_a_replay_id() {
+        // Whichever shape a recording has, the replay id carries it — the
+        // prefix is dropped because the position already says what it is.
+        let described = replay_run_id(
+            "sbx",
+            "dcb9f9e955",
+            "rec-dcb9f9e-07291352-a3",
+            "0805140832123",
+        );
+        assert_eq!(
+            described,
+            "rp-sbx-dcb9f9e955-dcb9f9e-07291352-a3-0805140832123"
+        );
+        assert!(described.len() <= RUN_ID_MAX, "{} chars", described.len());
+
+        let opaque = replay_run_id(
+            "sbx",
+            "dcb9f9e955",
+            "run-1785331134782268537",
+            "0805140832123",
+        );
+        assert_eq!(
+            opaque,
+            "rp-sbx-dcb9f9e955-1785331134782268537-0805140832123"
+        );
+        assert!(opaque.len() <= RUN_ID_MAX, "{} chars", opaque.len());
+
+        // The described form reads BOTH revisions: recorded by dcb9f9e,
+        // replayed with dcb9f9e955 — which is the question a regression tool
+        // exists to answer, and today needs two lookups.
+        assert!(described.contains("dcb9f9e955"), "the candidate");
+        assert!(described.contains("dcb9f9e-0729"), "the recorded revision");
+    }
+
+    #[test]
+    fn a_run_id_names_what_it_replayed() {
+        let id = replay_run_id("sbx", "dcb9f9e955", "run-1785331134782268537", "0805t1408");
+        assert_eq!(id, "rp-sbx-dcb9f9e955-1785331134782268537-0805t1408");
+
+        // The point of not hashing: both identifiers are found by substring,
+        // with no lookup and no resolution.
+        assert!(id.contains("dcb9f9e955"), "every run of a candidate");
+        assert!(
+            id.contains("1785331134782268537"),
+            "every run of a recording"
+        );
+    }
+
+    #[test]
+    fn a_run_id_always_survives_the_k8s_name_builder() {
+        // `job_name_for` prefixes 12 chars and truncates at 63 — from the TAIL,
+        // which is exactly where uniqueness lives. Composition must therefore
+        // never produce something that needs cutting. Worst case on every axis:
+        let id = replay_run_id(
+            "production",                           // over budget
+            "2026.08.04.1-release-candidate-build", // over budget, punctuated
+            "run-99999999999999999999999999999999", // over budget
+            "1231t2359",
+        );
+        assert!(
+            id.len() <= RUN_ID_MAX,
+            "id {id} is {} chars, over the {RUN_ID_MAX} budget",
+            id.len()
+        );
+        let job = crate::executor::job_name_for(&id);
+        assert!(job.len() <= 63);
+        assert!(
+            job.ends_with(&id),
+            "the k8s name must carry the id whole: {job} vs {id}"
+        );
+    }
+
+    #[test]
+    fn a_recording_keeps_its_distinctive_end_and_a_candidate_its_start() {
+        // Recording ids are timestamps: everything recorded the same week shares
+        // a prefix, so shortening one must drop the front.
+        let a = replay_run_id("sbx", "abc", "run-17853311347822220000", "0805t1408");
+        let b = replay_run_id("sbx", "abc", "run-17853311347811110000", "0805t1408");
+        assert_ne!(a, b, "two recordings must not collapse to one id");
+
+        // A candidate ref is distinguished by its start (a git sha prefix), so
+        // shortening one drops the end — asserted as the property, not against
+        // whatever the cap happens to be.
+        let long = replay_run_id("sbx", "dcb9f9e955aaaaaaaaaa", "run-1", "0805t1408");
+        let segment = long.split('-').nth(2).unwrap();
+        assert!(
+            "dcb9f9e955aaaaaaaaaa".starts_with(segment),
+            "the candidate segment {segment:?} must be a PREFIX of the ref"
+        );
+        assert!(
+            segment.len() >= 7,
+            "a short git sha must survive whole: {segment:?}"
+        );
+    }
+
+    #[test]
+    fn segments_are_normalised_to_what_a_name_and_a_key_both_accept() {
+        let id = replay_run_id("SBX", "2026.08.04", "run-abc_DEF", "0805t1408");
+        assert_eq!(id, "rp-sbx-2026-08-04-abc-def-0805t1408");
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(!id.contains("--"), "no empty segment: {id}");
+        assert!(!id.ends_with('-') && !id.starts_with('-'));
+    }
+
+    #[test]
+    fn an_empty_segment_is_named_rather_than_left_blank() {
+        // An unresolved recording (an s3_source spec resolves it later) must not
+        // produce `rp-sbx-abc--0805t1408`.
+        let id = replay_run_id("sbx", "abc", "", "0805t1408");
+        assert!(!id.contains("--"), "{id}");
+        assert!(id.contains("none"), "{id}");
+    }
+
+    #[test]
+    fn the_stamp_is_a_readable_utc_millisecond() {
+        let stamp = run_id_stamp();
+        assert_eq!(stamp.len(), STAMP_MAX, "MMDDhhmmssSSS: {stamp}");
+        assert!(stamp.chars().all(|c| c.is_ascii_digit()), "{stamp}");
+        let field = |from: usize, to: usize| stamp[from..to].parse::<u32>().unwrap();
+        assert!((1..=12).contains(&field(0, 2)), "month: {stamp}");
+        assert!((1..=31).contains(&field(2, 4)), "day: {stamp}");
+        assert!(field(4, 6) < 24, "hour: {stamp}");
+        assert!(field(6, 8) < 60, "minute: {stamp}");
+        assert!(field(8, 10) < 60, "second: {stamp}");
+        assert!(field(10, 13) < 1000, "millisecond: {stamp}");
+    }
+
+    #[test]
+    fn the_civil_calendar_matches_known_dates() {
+        // 2026-08-05 is 20670 days after the epoch; the algorithm is the one
+        // place a date library would otherwise be needed, so pin it.
+        assert_eq!(civil_month_day(0), (1, 1)); // 1970-01-01
+        assert_eq!(civil_month_day(59), (3, 1)); // 1970-03-01
+        assert_eq!(civil_month_day(20_669), (8, 4)); // 2026-08-04
+        assert_eq!(civil_month_day(20_670), (8, 5));
+    }
+
+    #[test]
+    fn two_refs_that_normalize_alike_are_separated_by_the_stamp() {
+        // `2026.08.04` and `2026-08-04` collapse to one segment — normalization
+        // is lossy on purpose, for readability. What keeps them from sharing a
+        // storage key is that they are not minted in the same millisecond.
+        assert_eq!(
+            replay_run_id("sbx", "2026.08.04", "run-1", "0805140832123"),
+            replay_run_id("sbx", "2026-08-04", "run-1", "0805140832123"),
+            "at one instant they SHOULD be equal — that is what the stamp is for"
+        );
+        let a = replay_run_id("sbx", "2026.08.04", "run-1", &run_id_stamp());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = replay_run_id("sbx", "2026-08-04", "run-1", &run_id_stamp());
+        assert_ne!(a, b);
     }
 }

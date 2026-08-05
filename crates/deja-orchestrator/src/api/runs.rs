@@ -9,7 +9,10 @@ use crate::executor::{
     K8sExecutorConfig, KubeApi, UreqTransport,
 };
 use crate::lifecycle::StoreCtx;
-use crate::{new_id, read_json, write_json, HarnessRoot, Run, RunMode, RunSpec, RunStatus};
+use crate::{
+    new_id, read_json, replay_run_id, run_id_stamp, write_json, CandidateSpec, HarnessRoot, Run,
+    RunMode, RunSpec, RunStatus,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRunResponse {
@@ -17,11 +20,54 @@ pub struct CreateRunResponse {
     pub status: RunStatus,
 }
 
+/// The id a run is addressed by, composed from what identifies it.
+///
+/// A replay names what it drove: environment, candidate ref, recording, and
+/// when. So the id can be searched — every run of a candidate, or of a
+/// recording, is a substring away — and a link says what it points at without
+/// being opened.
+///
+/// The candidate ref is taken AS DECLARED rather than resolved. The id is
+/// minted here, at request time, before the executor has resolved a tag to a
+/// registry path or a digest; and resolution reads process env, so the same
+/// request would mint different ids in two deployments. The resolved image is
+/// recorded on the run when the executor learns it, which is where a tag that
+/// moved becomes visible.
+///
+/// A record run has no recording to name yet — it is producing one — so it
+/// keeps the plain time-based id.
+fn run_id_for(spec: &RunSpec) -> String {
+    if spec.mode != RunMode::Replay {
+        return new_id("run");
+    }
+    let candidate = match &spec.candidate_spec {
+        CandidateSpec::PrebuiltImage { image } => image
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit(':').next())
+            .unwrap_or(image)
+            .to_owned(),
+        CandidateSpec::RepoSha { sha, .. } => sha.clone(),
+        CandidateSpec::RepoBranch { branch, .. } => branch.clone(),
+        CandidateSpec::RepoPr { pr, .. } => format!("pr{pr}"),
+        CandidateSpec::LocalPath { .. } => "local".to_owned(),
+    };
+    // With an s3_source the recording is resolved later, in the worker; name
+    // the session filter when there is one and say so plainly when there isn't.
+    let recording = spec.recording_id.as_deref().unwrap_or("unresolved");
+    replay_run_id(
+        &std::env::var("DEJA_ENV").unwrap_or_else(|_| "dev".to_owned()),
+        &candidate,
+        recording,
+        &run_id_stamp(),
+    )
+}
+
 /// Build and persist a Pending run record (no worker yet). The caller is
 /// responsible for inserting the store row (if a store is connected) BEFORE
 /// spawning the worker — stage rows reference the run row by foreign key.
 pub fn persist_new(root: &HarnessRoot, spec: RunSpec) -> std::io::Result<Run> {
-    let run_id = new_id("run");
+    let run_id = run_id_for(&spec);
     let run = Run {
         run_id: run_id.clone(),
         spec,
