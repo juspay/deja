@@ -743,7 +743,8 @@ fn drive_replay(
 }
 
 /// Stage 1 (shared by the compose worker and the in-pod runner): resolve the
-/// recording identity and materialize `events.jsonl`.
+/// recording identity, materialize `events.jsonl`, and settle which
+/// correlations the run drives.
 ///
 /// With an `s3_source` the spec's recording id is a SESSION FILTER and may be
 /// unset (the scan auto-resolves it when the prefix holds exactly one
@@ -804,7 +805,74 @@ fn stage_resolve_recording(
             "recording {recording_id} not found in S3 or on disk"
         ));
     }
+    resolve_correlation_filter(root, run, ctx, &recording_id)?;
     Ok(recording_id)
+}
+
+/// Settle the run's correlation filter into a CONCRETE list of ids, here, once,
+/// before any stage reads the scope.
+///
+/// An unbounded replay must not be reachable. Driving a whole session is not a
+/// choice anyone makes on purpose — the one run that did it drove 455
+/// correlations, took 439.8s and died in the scorer — so an absent filter
+/// resolves to the first [`crate::scope::MAX_CORRELATIONS_PER_RUN`] in tape
+/// order rather than to everything.
+///
+/// The resolution is written back into `run.spec.correlation_filter`, so what
+/// the run carries of what it was asked to do is the 100 concrete ids that ran,
+/// not an empty filter plus a rule someone has to know about. Everything
+/// downstream already reads the spec: `RunScope::of(run)` in both drivers, the
+/// run manifest, the kernel's env filter, the scorer, and the run json on disk
+/// that the API and the divergence detector re-read afterwards.
+///
+/// Record mode is untouched. A recording has nothing to filter against, and
+/// `RunScope`'s `EntireSession` stays exactly what an absent filter means as a
+/// value — the ceiling is a property of ADMITTING a replay run, not of the type.
+fn resolve_correlation_filter(
+    root: &HarnessRoot,
+    run: &mut Run,
+    ctx: &StoreCtx,
+    recording_id: &str,
+) -> Result<(), String> {
+    if run.spec.mode != crate::RunMode::Replay {
+        return Ok(());
+    }
+    let requested = run.spec.correlation_filter.clone();
+    // Only read the tape when the answer depends on it: an explicit filter is
+    // the caller's, and a recording of 171,234 events should not be re-read to
+    // confirm what the caller already named.
+    let tape_order =
+        if crate::scope::RunScope::from_filter(requested.as_deref()).is_entire_session() {
+            crate::scope::TapeSlot::correlations_in_tape_order(root, recording_id)
+                .map_err(|e| format!("read correlations of {recording_id}: {e}"))?
+        } else {
+            Vec::new()
+        };
+    let resolved = crate::scope::resolve_run_correlations(requested.as_deref(), &tape_order)?;
+    if resolved.is_empty() {
+        return Err(format!(
+            "recording {recording_id} has no correlations to drive"
+        ));
+    }
+
+    if requested.is_none() || requested.as_deref().is_some_and(<[String]>::is_empty) {
+        let line = format!(
+            "no correlations chosen — driving the first {} of {} in recording order",
+            resolved.len(),
+            tape_order.len()
+        );
+        eprintln!("lifecycle: {line}");
+        ctx.log("scope", &line);
+    }
+    // Persist at the moment the decision is made rather than relying on the
+    // next stage's write: the resolved list is this run's record of what it was
+    // asked to do, and a run that fails before the next stage would otherwise
+    // show an empty filter and no sign of which correlations it had picked.
+    run.spec.correlation_filter = Some(resolved);
+    if let Err(e) = write_json(&root.run_path(&run.run_id), run) {
+        eprintln!("lifecycle: failed to persist the resolved correlation filter: {e}");
+    }
+    Ok(())
 }
 
 /// Final stage (shared): score the run, report the verdict, register the
@@ -3453,8 +3521,9 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
 
 /// Pull a replay's recording out of an arbitrary bucket/prefix in the DEPLOYED
 /// aggregator layout (see `s3::pull_recording_from_prefix`) and register it
-/// exactly like the session-layout pull — minus the manifest, which a raw
-/// prefix doesn't have. Returns the resolved recording (session) id.
+/// exactly like the session-layout pull. The scan seals what it read, so the
+/// next pull of the same recording takes the manifest fast path instead of
+/// repeating it. Returns the resolved recording (session) id.
 ///
 /// An explicit, already-ingested session reuses the on-disk events file; a
 /// filterless spec always scans (the session isn't known until then).
@@ -3489,13 +3558,18 @@ fn resolve_recording_from_source(
     }
     let line = format!(
         "ingested {resolved} from {}: {} object(s), {} line(s), {} duplicate(s) dropped → \
-         {} event(s), {} correlation(s) (unsealed prefix scan)",
+         {} event(s), {} correlation(s) (prefix scan, {})",
         report.prefix,
         report.landing_objects,
         report.lines_in,
         report.duplicates_dropped,
         report.events_out,
         report.correlations,
+        if report.sealed {
+            "sealed for the next run"
+        } else {
+            "NOT sealed — the next run rescans"
+        },
     );
     eprintln!("lifecycle: {line}");
     ctx.log("ingest", &line);
@@ -4150,6 +4224,180 @@ mod tests {
 
         assert_eq!(shared_replay.project, demo.project);
         assert_eq!(shared_replay.replay_port, demo.replay_port);
+    }
+
+    // -- the correlation backstop --------------------------------------------
+
+    /// A replay run of `recording_id`, with whatever filter the caller sent.
+    fn replay_run(recording_id: &str, filter: Option<Vec<String>>) -> Run {
+        Run {
+            run_id: "run-backstop".into(),
+            spec: RunSpec {
+                mode: RunMode::Replay,
+                candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
+                candidate_repo: None,
+                recording_id: Some(recording_id.to_owned()),
+                s3_source: None,
+                correlation_filter: filter,
+                workload: serde_json::Value::Null,
+            },
+            status: RunStatus::Pending,
+            recording_id: Some(recording_id.to_owned()),
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        }
+    }
+
+    /// A tape of `n` correlations, one boundary event each, in the order given.
+    /// Written through the same door an ingest writes through.
+    fn tape_of(root: &HarnessRoot, recording_id: &str, correlations: &[String]) {
+        let path = crate::scope::TapeSlot::for_write(root, recording_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: Vec<String> = correlations
+            .iter()
+            .enumerate()
+            .map(|(i, correlation)| {
+                serde_json::json!({
+                    "record_kind": "boundary_event",
+                    "global_sequence": i as u64 + 1,
+                    "request_sequence": 0,
+                    "correlation_id": correlation,
+                    "timestamp_ns": 0,
+                    "recording_run_id": recording_id,
+                    "boundary": "http_incoming",
+                    "trait_name": "T",
+                    "method_name": "m",
+                    "call_file": "x.rs",
+                    "call_line": 1,
+                    "call_column": 0,
+                    "request": null,
+                    "args": {},
+                    "response": null,
+                    "result": "v",
+                    "is_error": false,
+                    "duration_us": 0,
+                    "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                    "provenance": "recorded",
+                    "recon": "lossless",
+                    "replay_strategy": "substitute",
+                    "graph_node_id": null,
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+
+    /// Ids that sort the OPPOSITE way to the traffic, so "the first hundred"
+    /// cannot accidentally pass by sorting.
+    fn descending_ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("c-{:04}", n - i)).collect()
+    }
+
+    #[test]
+    fn a_run_that_chose_nothing_is_bounded_to_the_first_hundred() {
+        // An unbounded replay must not be reachable: the one run that drove a
+        // whole session took 439.8s and died in the scorer. So "no choice" is
+        // resolved here, before any stage reads the scope.
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let recorded = descending_ids(455);
+        tape_of(&root, "rec", &recorded);
+        let mut run = replay_run("rec", None);
+
+        resolve_correlation_filter(&root, &mut run, &StoreCtx::disabled("run-backstop"), "rec")
+            .unwrap();
+
+        let resolved = run.spec.correlation_filter.clone().expect(
+            "the run must carry the concrete ids it will drive, not an empty filter and a rule",
+        );
+        assert_eq!(resolved.len(), crate::scope::MAX_CORRELATIONS_PER_RUN);
+        assert_eq!(
+            resolved,
+            recorded[..crate::scope::MAX_CORRELATIONS_PER_RUN].to_vec(),
+            "the earliest hundred requests, in recording order"
+        );
+        // And the scope every stage builds from the spec now covers exactly them.
+        let scope = crate::scope::RunScope::of(&run);
+        assert!(!scope.is_entire_session());
+        assert_eq!(scope.ids().map(|ids| ids.len()), Some(100));
+
+        // The decision is durable at the moment it is made, not at the next stage.
+        let persisted: Run = crate::read_json(&root.run_path("run-backstop")).unwrap();
+        assert_eq!(persisted.spec.correlation_filter, Some(resolved));
+    }
+
+    #[test]
+    fn a_recording_with_fewer_than_a_hundred_correlations_runs_all_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let recorded = descending_ids(40);
+        tape_of(&root, "rec", &recorded);
+        let mut run = replay_run("rec", None);
+
+        resolve_correlation_filter(&root, &mut run, &StoreCtx::disabled("run-backstop"), "rec")
+            .unwrap();
+
+        assert_eq!(
+            run.spec.correlation_filter,
+            Some(recorded),
+            "the cap is a ceiling, not a target"
+        );
+    }
+
+    #[test]
+    fn an_oversized_explicit_filter_fails_the_run_instead_of_being_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        tape_of(&root, "rec", &descending_ids(500));
+        let asked: Vec<String> = (0..101).map(|i| format!("c-{i:04}")).collect();
+        let mut run = replay_run("rec", Some(asked.clone()));
+
+        let err =
+            resolve_correlation_filter(&root, &mut run, &StoreCtx::disabled("run-backstop"), "rec")
+                .unwrap_err();
+
+        assert!(err.contains("101"), "{err}");
+        assert_eq!(
+            run.spec.correlation_filter,
+            Some(asked),
+            "a refused run keeps what was asked for — it is not quietly rewritten to 100"
+        );
+    }
+
+    #[test]
+    fn an_explicit_filter_is_left_exactly_as_the_caller_named_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        tape_of(&root, "rec", &descending_ids(455));
+        let mut run = replay_run("rec", Some(vec!["c-0400".to_owned(), "c-0002".to_owned()]));
+
+        resolve_correlation_filter(&root, &mut run, &StoreCtx::disabled("run-backstop"), "rec")
+            .unwrap();
+
+        assert_eq!(
+            run.spec.correlation_filter,
+            Some(vec!["c-0002".to_owned(), "c-0400".to_owned()]),
+            "a caller that named two correlations drives two, not the first hundred"
+        );
+    }
+
+    #[test]
+    fn a_record_run_is_not_given_a_correlation_filter() {
+        // A recording has nothing to filter against, and record mode's absent
+        // filter is a real answer rather than an unmade choice.
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let mut run = run_with_workload(serde_json::json!({}));
+        assert_eq!(run.spec.mode, RunMode::Record);
+
+        resolve_correlation_filter(&root, &mut run, &StoreCtx::disabled("r1"), "rec").unwrap();
+
+        assert_eq!(run.spec.correlation_filter, None);
     }
 
     #[test]

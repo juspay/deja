@@ -30,6 +30,75 @@ use deja_core::ExecutionGraphNode;
 
 use crate::{HarnessRoot, Run, RunSpec};
 
+/// The most correlations one replay run drives.
+///
+/// Seeding is LINEAR in correlations — 362.5s for 455 (~0.8 s/correlation) and
+/// 3.8s for 3 (1.27 s/correlation) — so 100 costs roughly 80 seconds of seeding,
+/// which is a run someone will wait for. (The earlier belief that seeding grew
+/// superlinearly came from mislabelling that 455-correlation run as 42; it does
+/// not, and the ceiling is about total run time, not about a cliff.) An
+/// unfiltered run of a real session is 455 correlations, took 439.8s and died in
+/// the scorer, which is why "no choice" resolves to a bounded default rather
+/// than to everything.
+pub const MAX_CORRELATIONS_PER_RUN: usize = 100;
+
+/// Refuse an explicit filter larger than [`MAX_CORRELATIONS_PER_RUN`].
+///
+/// A caller that names 400 correlations is asking for something this harness
+/// will not do, and the wrong answer is to drive 100 of them: the run would
+/// score as though it had driven all 400, and the 300 it never touched would
+/// read as clean. So an oversized filter is a refusal, never a truncation. The
+/// cap applies to the NORMALIZED set — blank and duplicate ids are not names of
+/// test cases and must not count against a caller.
+pub fn check_requested_correlations(requested: Option<&[String]>) -> Result<(), String> {
+    if let Some(ids) = RunScope::from_filter(requested).ids() {
+        if ids.len() > MAX_CORRELATIONS_PER_RUN {
+            return Err(format!(
+                "correlation_filter names {} correlations; one run drives at most {}. \
+                 Split this into {} runs — driving a subset under one run id would score \
+                 the correlations it skipped as though they had passed.",
+                ids.len(),
+                MAX_CORRELATIONS_PER_RUN,
+                ids.len().div_ceil(MAX_CORRELATIONS_PER_RUN),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The concrete correlations a run will drive.
+///
+/// An absent or blank filter is not "drive everything" for a replay run: it is
+/// "the caller did not choose", and the answer is the first
+/// [`MAX_CORRELATIONS_PER_RUN`] in TAPE ORDER — the earliest requests in the
+/// recording. That is deterministic and explainable ("the first 100 requests of
+/// the session"), and it is a real default rather than a refusal.
+///
+/// The result is always the explicit list, never an empty filter plus a rule
+/// applied somewhere downstream: the run's own record has to show which 100 ran.
+/// A recording with fewer correlations than the cap runs all of them — the cap
+/// is a ceiling, not a target.
+///
+/// A default keeps tape order, so the persisted list reads as what it is (the
+/// session's first hundred requests, in order); an explicit filter comes back
+/// normalized and sorted. Neither ordering reaches behaviour — [`RunScope`]
+/// takes the list as a set — so the difference is only in how the run's record
+/// reads.
+pub fn resolve_run_correlations(
+    requested: Option<&[String]>,
+    tape_order: &[String],
+) -> Result<Vec<String>, String> {
+    check_requested_correlations(requested)?;
+    match RunScope::from_filter(requested).ids() {
+        Some(ids) => Ok(ids.iter().cloned().collect()),
+        None => Ok(tape_order
+            .iter()
+            .take(MAX_CORRELATIONS_PER_RUN)
+            .cloned()
+            .collect()),
+    }
+}
+
 /// Which recorded test cases a run covers.
 ///
 /// `EntireSession` is not "no filter yet" — it is a real answer, and the one
@@ -545,6 +614,47 @@ impl TapeSlot {
         recording_events_path(root, recording_id).exists()
     }
 
+    /// CHOOSING a scope: the recording's correlations in tape order — each one
+    /// at its first appearance, earliest first.
+    ///
+    /// This is the one read that cannot be scoped, because its whole job is to
+    /// decide what the scope will be. It stays behind a typed door for the same
+    /// reason the others do, and it yields ids only: no event, no payload, no
+    /// path. One sequential pass with the same cheap projection the index pass
+    /// uses — a full `DejaRecord` parse per line to read one field is the cost
+    /// this shape exists to avoid.
+    ///
+    /// The sealed session's correlation index (`deja-compactor`) is ordered the
+    /// same way, so the list a caller browses and the list a run defaults to
+    /// agree. The two are computed over the same records in the same
+    /// sequence-major order; they can only diverge for a session written by more
+    /// than one producer, which no capture mode emits today.
+    pub fn correlations_in_tape_order(
+        root: &HarnessRoot,
+        recording_id: &str,
+    ) -> io::Result<Vec<String>> {
+        let path = recording_events_path(root, recording_id);
+        let reader = io::BufReader::new(std::fs::File::open(&path)?);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(RecordHead::BoundaryEvent(event)) = serde_json::from_str::<RecordHead>(&line)
+            {
+                // An uncorrelated record is ambient traffic shared across cases,
+                // not a case anyone can choose to drive.
+                if let Some(correlation) = event.correlation_id {
+                    if seen.insert(correlation.clone()) {
+                        order.push(correlation);
+                    }
+                }
+            }
+        }
+        Ok(order)
+    }
+
     /// SUBPROCESS: the replay kernel reads the tape in another process, so the
     /// scope has to cross as an env var. This door emits `KERNEL_RECORDING_PATH`
     /// and `KERNEL_CORRELATION_FILTER` TOGETHER — there is no way to set the
@@ -866,5 +976,134 @@ mod tests {
         assert!(!TapeSlot::is_materialized(&root, "rec"));
         let err = ScopedRecording::open(&root, "rec", RunScope::entire_session()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // -- how many correlations a run drives -----------------------------------
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("c-{i:04}")).collect()
+    }
+
+    #[test]
+    fn no_choice_drives_the_first_hundred_in_tape_order() {
+        // The recording's order, not the ids' order: these ids sort backwards
+        // against the traffic, so a resolution that sorted would return the
+        // LAST hundred requests of the session and call them the first.
+        let tape: Vec<String> = (0..455).map(|i| format!("c-{:04}", 455 - i)).collect();
+
+        let resolved = resolve_run_correlations(None, &tape).unwrap();
+        assert_eq!(resolved.len(), MAX_CORRELATIONS_PER_RUN);
+        let expected: Vec<String> = tape[..MAX_CORRELATIONS_PER_RUN].to_vec();
+        assert_eq!(
+            resolved, expected,
+            "the first 100 the recording saw, in the order it saw them, whatever \
+             their ids sort like"
+        );
+
+        // A blank filter is not a choice either — the dashboard sends one when
+        // nothing is selected.
+        assert_eq!(
+            resolve_run_correlations(Some(&[]), &tape).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_run_correlations(Some(&[" ".to_owned()]), &tape).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_recording_smaller_than_the_cap_runs_all_of_it() {
+        // The cap is a ceiling, not a target.
+        let tape = ids(40);
+        let resolved = resolve_run_correlations(None, &tape).unwrap();
+        assert_eq!(resolved.len(), 40);
+        assert_eq!(resolved, tape);
+    }
+
+    #[test]
+    fn an_explicit_filter_over_the_cap_is_refused_not_trimmed() {
+        // Silently driving 100 of 400 would score the 300 that never ran as
+        // though they had passed — a run that looks clean because it did less.
+        let asked = ids(101);
+        let err = resolve_run_correlations(Some(&asked), &ids(500)).unwrap_err();
+        assert!(err.contains("101"), "{err}");
+        assert!(err.contains("100"), "{err}");
+        assert!(
+            check_requested_correlations(Some(&asked)).is_err(),
+            "the same refusal is available before a run is created"
+        );
+
+        // Exactly at the cap is allowed, and is returned whole.
+        let at_cap = ids(MAX_CORRELATIONS_PER_RUN);
+        assert_eq!(
+            resolve_run_correlations(Some(&at_cap), &[]).unwrap().len(),
+            MAX_CORRELATIONS_PER_RUN
+        );
+    }
+
+    #[test]
+    fn blanks_and_duplicates_do_not_count_against_a_callers_cap() {
+        // The cap is about test cases, and neither a blank nor a repeat is one.
+        let mut asked = ids(MAX_CORRELATIONS_PER_RUN);
+        asked.push(asked[0].clone());
+        asked.push("   ".to_owned());
+        assert!(check_requested_correlations(Some(&asked)).is_ok());
+        assert_eq!(
+            resolve_run_correlations(Some(&asked), &[]).unwrap().len(),
+            MAX_CORRELATIONS_PER_RUN
+        );
+    }
+
+    #[test]
+    fn an_explicit_filter_never_takes_the_default() {
+        // The default applies to an ABSENT filter only. A caller that named
+        // three correlations gets three, not the first hundred.
+        let resolved =
+            resolve_run_correlations(Some(&["c-2".to_owned(), "c-1".to_owned()]), &ids(400))
+                .unwrap();
+        assert_eq!(resolved, vec!["c-1".to_owned(), "c-2".to_owned()]);
+    }
+
+    #[test]
+    fn the_tape_order_reader_yields_first_appearance_and_ids_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        tape(
+            &root,
+            "rec",
+            &[
+                node(1, None, "ROOT_SPAN"),
+                event(1, "c-late", Some(1)),
+                event(2, "c-early", Some(1)),
+                // c-late again: it is not a new correlation, and must not move.
+                event(3, "c-late", Some(1)),
+                event(4, "c-mid", Some(1)),
+            ],
+        );
+        assert_eq!(
+            TapeSlot::correlations_in_tape_order(&root, "rec").unwrap(),
+            vec![
+                "c-late".to_owned(),
+                "c-early".to_owned(),
+                "c-mid".to_owned()
+            ],
+        );
+    }
+
+    #[test]
+    fn ambient_traffic_is_not_offered_as_a_test_case() {
+        // Uncorrelated records are shared background traffic. They ride along
+        // with every case and there is nothing to drive, so they must not
+        // occupy one of a run's hundred slots.
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let mut ambient = event(1, "ignored", None);
+        ambient["correlation_id"] = serde_json::Value::Null;
+        tape(&root, "rec", &[ambient, event(2, "c-1", None)]);
+        assert_eq!(
+            TapeSlot::correlations_in_tape_order(&root, "rec").unwrap(),
+            vec!["c-1".to_owned()]
+        );
     }
 }

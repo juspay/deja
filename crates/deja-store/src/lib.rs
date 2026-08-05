@@ -205,6 +205,27 @@ impl Store {
         Ok(())
     }
 
+    /// How many correlations the catalog recorded for one recording, if it has
+    /// been ingested at all.
+    ///
+    /// Answers the count for a recording whose session is NOT sealed, where the
+    /// manifest cannot. Two `None`s are possible and mean different things — no
+    /// such row, or a row that never carried a count — and neither is zero.
+    pub async fn recording_correlation_count(
+        &self,
+        recording_id: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row = sqlx::query("SELECT correlation_count FROM recordings WHERE recording_id = $1")
+            .bind(recording_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| {
+            r.try_get::<Option<i64>, _>("correlation_count")
+                .ok()
+                .flatten()
+        }))
+    }
+
     pub async fn list_recordings(&self, limit: i64) -> Result<Vec<RecordingRow>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT recording_id, kind, source_path, event_count, correlation_count,

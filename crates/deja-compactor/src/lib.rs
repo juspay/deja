@@ -4,10 +4,11 @@
 //! objects under `landing/v1/session={id}/inst={instance_id}/`. The compactor
 //! turns one session's landing into the canonical store form:
 //!
-//!   sessions/v1/{id}/data/part-NNNNN.ndjsonl.zst   ← full envelope lines,
-//!                                                    deduped + sorted
-//!   sessions/v1/{id}/index/correlations.ndjson.zst ← per-correlation summary
-//!   sessions/v1/{id}/manifest.json                 ← written LAST = the seal
+//!   sessions/v1/{id}/data/{seal}/part-NNNNN.ndjsonl.zst
+//!                                    ← full envelope lines, deduped + sorted
+//!   sessions/v1/{id}/index/{seal}/correlations.ndjson.zst
+//!                                    ← per-correlation summary
+//!   sessions/v1/{id}/manifest.json   ← written LAST = the seal
 //!
 //! The manifest records per-instance `global_sequence` coverage (ranges,
 //! gaps, duplicates dropped), schema versions, code provenance, and counts —
@@ -15,21 +16,39 @@
 //! Its existence is the seal: readers treat a session without a manifest as
 //! still landing.
 //!
-//! Dedup is per `(instance_id, global_sequence)` — gseq is a per-process
-//! counter, so two producers may legitimately share gseq values. (Session
-//! mode runs single-instance today; the key is already multi-producer-safe
-//! for the Phase 3 window mode.)
+//! Two things follow from "the manifest is the seal", and both are load-bearing
+//! because a recording is sealed by whichever run happens to ingest it first —
+//! concurrently, from several runs, with no lock between them:
+//!
+//! - Write order is data parts, then index, then manifest. A seal interrupted
+//!   anywhere before the last PUT leaves no manifest at all, so the session is
+//!   indistinguishable from one still landing and the caller rescans. There is
+//!   no state in which a reader can be handed a manifest naming an object that
+//!   is not yet durable.
+//! - Part and index keys are content-addressed by [`seal_id`]. Sealers that read
+//!   the same landing write byte-identical objects to identical keys; sealers
+//!   that read DIFFERENT landings (one saw more of a still-flushing session)
+//!   write disjoint key sets, so neither can truncate the other's parts. The
+//!   manifest key is shared and its PUT is atomic, so the last writer wins — and
+//!   the manifest that wins names only its own, complete, immutable parts.
+//!
+//! Dedup is per `(instance_id, record kind, global_sequence)` — gseq is a
+//! per-process counter, so two producers may legitimately share gseq values,
+//! and each record kind is numbered in a sequence space of its own, so a gseq
+//! identifies a record only within its kind. (Session mode runs single-instance
+//! today; the key is already multi-producer-safe for the Phase 3 window mode.)
 //!
 //! Sync API over a current-thread runtime: the orchestrator lifecycle calls
 //! this in-process from a plain worker thread, and the bin wraps the same
 //! entry points.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, WriteMultipart};
 use serde::{Deserialize, Serialize};
 
 type DynStore = Arc<dyn ObjectStore>;
@@ -37,6 +56,25 @@ type DynStore = Arc<dyn ObjectStore>;
 /// Events per data part before rotating to the next object.
 const PART_MAX_EVENTS: usize = 50_000;
 const ZSTD_LEVEL: i32 = 3;
+
+/// Bodies up to this size go up as one PUT; anything larger is uploaded as a
+/// multipart in [`UPLOAD_CHUNK_BYTES`] pieces.
+///
+/// A single-shot PUT sends the whole body in ONE request, which has to complete
+/// within the HTTP client's per-request timeout (30s by default in
+/// `object_store`). A data part is as large as the recording it holds — the
+/// first part of a session with 22,936 landing objects is tens of megabytes —
+/// so the object's size, not any transient condition, decided whether the
+/// request could finish, and `s3 put sessions/v1/…/part-00000` failed every
+/// time on the recordings that most needed sealing. Chunking makes each request
+/// a fixed size, independent of how big the recording is.
+///
+/// 8 MiB clears S3's 5 MiB minimum for non-final multipart parts.
+const SINGLE_PUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Parts in flight at once. Bounded so a large upload's memory is a few chunks
+/// rather than the whole body a second time.
+const UPLOAD_CONCURRENCY: usize = 4;
 
 /// Connection settings. An EMPTY `endpoint` targets real AWS S3: object_store
 /// derives the virtual-hosted endpoint from `region` and uses the AWS
@@ -108,11 +146,33 @@ pub mod layout {
     pub fn session_root(session_id: &str) -> String {
         format!("sessions/v1/{session_id}")
     }
-    pub fn part_key(session_id: &str, n: usize) -> String {
-        format!("{}/data/part-{n:05}.ndjsonl.zst", session_root(session_id))
+
+    /// The directory component that scopes one seal's objects, or nothing for
+    /// an empty id. Manifests written before seals were content-addressed carry
+    /// no id and name their parts at the unscoped keys; reading them is
+    /// unaffected, since a reader takes part keys from the manifest, and the
+    /// correlations index is the one key a reader has to derive.
+    fn seal_scope(seal_id: &str) -> String {
+        if seal_id.is_empty() {
+            String::new()
+        } else {
+            format!("{seal_id}/")
+        }
     }
-    pub fn correlations_key(session_id: &str) -> String {
-        format!("{}/index/correlations.ndjson.zst", session_root(session_id))
+
+    pub fn part_key(session_id: &str, seal_id: &str, n: usize) -> String {
+        format!(
+            "{}/data/{}part-{n:05}.ndjsonl.zst",
+            session_root(session_id),
+            seal_scope(seal_id)
+        )
+    }
+    pub fn correlations_key(session_id: &str, seal_id: &str) -> String {
+        format!(
+            "{}/index/{}correlations.ndjson.zst",
+            session_root(session_id),
+            seal_scope(seal_id)
+        )
     }
     pub fn manifest_key(session_id: &str) -> String {
         format!("{}/manifest.json", session_root(session_id))
@@ -127,6 +187,11 @@ pub struct SessionManifest {
     pub session_id: String,
     /// "sealed" — the manifest is written last, so its presence IS the seal.
     pub status: String,
+    /// Content address of this seal's data (see [`seal_id`]), and the directory
+    /// component its parts and index live under. Empty on manifests written
+    /// before seals were addressed.
+    #[serde(default)]
+    pub seal_id: String,
     pub capture_mode: String,
     pub envelope_schema_versions: Vec<u32>,
     pub event_schema_versions: Vec<u32>,
@@ -159,9 +224,28 @@ pub struct InstanceCoverage {
 pub struct Counts {
     pub landing_objects: usize,
     pub lines_in: usize,
+    /// Boundary events. Graph nodes are counted separately — see below.
     pub events: usize,
     pub duplicates_dropped: usize,
+    /// Correlations — test cases — in the recording. This is the count a caller
+    /// gets from the seal instead of pulling the tape.
+    ///
+    /// The index sidecar carries one MORE row than this when the recording has
+    /// uncorrelated events: ambient background traffic is shared across cases
+    /// and gets a row of its own so its events are accounted somewhere, but it
+    /// is not a correlation and counting it would make the same recording
+    /// report a different number here than a scan of its landing does.
     pub correlations: usize,
+    /// Execution-graph nodes carried in the data parts.
+    ///
+    /// They are recording data, but they are not boundary events: they are
+    /// numbered in a sequence space of their own and carry no correlation, so
+    /// they are excluded from `events`, from the per-instance coverage, and
+    /// from the correlation index. They are counted here because a seal that
+    /// dropped them would take the whole record side of the execution graph
+    /// with it, and nothing would say so.
+    #[serde(default)]
+    pub graph_nodes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +255,9 @@ pub struct DataPart {
     pub bytes: usize,
 }
 
-/// Per-correlation row of the `index/correlations` sidecar.
+/// Per-correlation row of the `index/correlations` sidecar. Rows are in TAPE
+/// ORDER — each correlation's first appearance in the recording — so "the first
+/// N" means the earliest N requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrelationSummary {
     pub correlation_id: Option<String>,
@@ -184,6 +270,20 @@ pub struct CorrelationSummary {
 }
 
 // -- envelope probing --------------------------------------------------------
+
+/// The wire `artifact_type` values the landing carries. An unset type is the
+/// legacy boundary-event envelope.
+const ARTIFACT_TYPE_MARKER: &str = "deja_sink_marker";
+const ARTIFACT_TYPE_GRAPH_NODE: &str = "deja_graph_node";
+
+/// Which record an envelope carries. It decides two things at once: where the
+/// payload is nested, and which `global_sequence` space the record is numbered
+/// in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RecordKind {
+    BoundaryEvent,
+    GraphNode,
+}
 
 #[derive(Deserialize)]
 struct EnvelopeProbe<'a> {
@@ -199,6 +299,29 @@ struct EnvelopeProbe<'a> {
     code: Option<CodeRef>,
     #[serde(borrow)]
     event: Option<&'a serde_json::value::RawValue>,
+    /// An execution-graph node is nested under `node`, not `event`, because it
+    /// carries its own `recording_run_id` and `global_sequence` that flattening
+    /// would collide with the envelope's. A probe that knows only `event`
+    /// therefore reads every graph envelope as an envelope with no payload —
+    /// which is how the compactor used to drop the entire record-side graph
+    /// while reporting a clean seal.
+    #[serde(borrow)]
+    node: Option<&'a serde_json::value::RawValue>,
+}
+
+impl<'a> EnvelopeProbe<'a> {
+    /// The record this envelope declares, and the raw payload under whichever
+    /// key that record uses. `None` when the declared payload is absent.
+    fn payload(&self) -> Option<(RecordKind, &'a serde_json::value::RawValue)> {
+        match self.artifact_type.as_deref() {
+            Some(ARTIFACT_TYPE_GRAPH_NODE) => self.node.map(|n| (RecordKind::GraphNode, n)),
+            _ => self.event.map(|e| (RecordKind::BoundaryEvent, e)),
+        }
+    }
+
+    fn is_marker(&self) -> bool {
+        self.artifact_type.as_deref() == Some(ARTIFACT_TYPE_MARKER)
+    }
 }
 
 #[derive(Deserialize)]
@@ -271,12 +394,57 @@ fn decode_object(key: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
+/// Upload one object. Small bodies go up as a single PUT; large ones are
+/// chunked into a multipart upload — see [`SINGLE_PUT_MAX_BYTES`] for why the
+/// size of the body, on its own, used to decide whether the write succeeded.
+///
+/// Either way the object becomes visible in one step: S3 publishes a multipart
+/// upload only on `complete`, so a reader never sees a half-written part.
 async fn put(store: &DynStore, key: &str, bytes: Vec<u8>) -> Result<(), String> {
-    store
-        .put(&object_store::path::Path::from(key), bytes.into())
+    let path = object_store::path::Path::from(key);
+    if bytes.len() <= SINGLE_PUT_MAX_BYTES {
+        return store
+            .put(&path, bytes.into())
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("s3 put {key}: {e}"));
+    }
+    put_chunked(store, &path, &bytes, UPLOAD_CHUNK_BYTES)
+        .await
+        .map_err(|e| format!("s3 put {key} ({} bytes): {e}", bytes.len()))
+}
+
+/// Multipart upload of `bytes` in `chunk_size` pieces, at most
+/// [`UPLOAD_CONCURRENCY`] in flight.
+///
+/// A failed upload is aborted rather than left behind: S3 keeps the parts of an
+/// abandoned multipart upload (and bills for them) until a lifecycle rule
+/// expires them.
+async fn put_chunked(
+    store: &DynStore,
+    path: &object_store::path::Path,
+    bytes: &[u8],
+    chunk_size: usize,
+) -> Result<(), String> {
+    let upload = store
+        .put_multipart(path)
+        .await
+        .map_err(|e| format!("begin multipart: {e}"))?;
+    let mut writer = WriteMultipart::new_with_chunk_size(upload, chunk_size);
+    for chunk in bytes.chunks(chunk_size) {
+        if let Err(e) = writer.wait_for_capacity(UPLOAD_CONCURRENCY).await {
+            let _ = writer.abort().await;
+            return Err(format!("upload part: {e}"));
+        }
+        writer.write(chunk);
+    }
+    // `finish` flushes the tail, waits for every part, and aborts the upload
+    // itself if completion fails.
+    writer
+        .finish()
         .await
         .map(|_| ())
-        .map_err(|e| format!("s3 put {key}: {e}"))
+        .map_err(|e| format!("complete multipart: {e}"))
 }
 
 fn zstd_encode(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -288,10 +456,38 @@ fn zstd_encode(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// dedups, and summarizes by.
 struct Accepted {
     instance_id: String,
+    kind: RecordKind,
     gseq: u64,
     correlation_id: Option<String>,
     boundary: String,
     raw_line: String,
+}
+
+/// Content address of a seal: sha256 over exactly the bytes the data parts
+/// hold, in the order they are written, truncated to 16 hex characters.
+///
+/// This is what makes concurrent sealing safe. Two sealers that read the same
+/// landing produce the same id, so they write the same keys with identical
+/// bytes and overwriting is a no-op in content. Two that read different
+/// landings — one caught a session mid-flush — produce different ids and
+/// therefore disjoint key sets, so a shorter seal cannot truncate a longer
+/// one's parts underneath the manifest that names them.
+///
+/// The uncompressed lines are hashed rather than the zstd frames, so the
+/// address does not move when the compressor's output does.
+fn seal_id(events: &[Accepted]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for acc in events {
+        hasher.update(acc.raw_line.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// List object keys under an ARBITRARY prefix (sorted). This is the scan
@@ -450,26 +646,77 @@ pub fn count_landing_objects(cfg: &S3Config, session_id: &str) -> Result<usize, 
 pub fn read_manifest(cfg: &S3Config, session_id: &str) -> Result<Option<SessionManifest>, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(async {
-        match store
-            .get(&object_store::path::Path::from(layout::manifest_key(
-                session_id,
-            )))
-            .await
-        {
-            Ok(obj) => {
-                let bytes = obj
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("manifest read: {e}"))?;
-                serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|e| format!("manifest parse: {e}"))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(format!("manifest get: {e}")),
+    rt.block_on(manifest_of(&store, session_id))
+}
+
+async fn manifest_of(
+    store: &DynStore,
+    session_id: &str,
+) -> Result<Option<SessionManifest>, String> {
+    match store
+        .get(&object_store::path::Path::from(layout::manifest_key(
+            session_id,
+        )))
+        .await
+    {
+        Ok(obj) => {
+            let bytes = obj
+                .bytes()
+                .await
+                .map_err(|e| format!("manifest read: {e}"))?;
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| format!("manifest parse: {e}"))
         }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(format!("manifest get: {e}")),
+    }
+}
+
+/// How many correlations a sealed recording holds, WITHOUT pulling the tape.
+///
+/// One small GET: the count is a fact the seal already recorded, and reading it
+/// off the manifest costs the same whether the recording is 3 correlations or
+/// 42,310. `None` means the recording is not sealed yet, which is a different
+/// answer from zero and must not be reported as one.
+pub fn correlation_count(cfg: &S3Config, session_id: &str) -> Result<Option<usize>, String> {
+    Ok(read_manifest(cfg, session_id)?.map(|m| m.counts.correlations))
+}
+
+/// The per-correlation index of a sealed recording: one row per correlation
+/// with its event count, `global_sequence` span, and whether replay can
+/// re-drive it. One manifest GET plus one sidecar GET — the data parts are
+/// never touched. `None` if the recording is not sealed.
+pub fn read_correlation_index(
+    cfg: &S3Config,
+    session_id: &str,
+) -> Result<Option<Vec<CorrelationSummary>>, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(async {
+        let Some(manifest) = manifest_of(&store, session_id).await? else {
+            return Ok(None);
+        };
+        correlation_index_of(&store, &manifest).await.map(Some)
     })
+}
+
+async fn correlation_index_of(
+    store: &DynStore,
+    manifest: &SessionManifest,
+) -> Result<Vec<CorrelationSummary>, String> {
+    let key = layout::correlations_key(&manifest.session_id, &manifest.seal_id);
+    let data = get_decoded(store, &object_store::path::Path::from(key.as_str())).await?;
+    let mut rows = Vec::with_capacity(manifest.counts.correlations);
+    for line in data.split(|&b| b == b'\n') {
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        rows.push(
+            serde_json::from_slice(line).map_err(|e| format!("correlation row in {key}: {e}"))?,
+        );
+    }
+    Ok(rows)
 }
 
 /// Stream every envelope line out of a sealed session's data parts, in the
@@ -480,25 +727,29 @@ pub fn read_session_lines(
 ) -> Result<Vec<String>, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(async {
-        let mut lines = Vec::new();
-        for part in &manifest.data_parts {
-            let data =
-                get_decoded(&store, &object_store::path::Path::from(part.key.as_str())).await?;
-            for line in data.split(|&b| b == b'\n') {
-                if line.iter().all(|b| b.is_ascii_whitespace()) {
-                    continue;
-                }
-                lines.push(String::from_utf8_lossy(line).into_owned());
+    rt.block_on(session_lines(&store, manifest))
+}
+
+async fn session_lines(
+    store: &DynStore,
+    manifest: &SessionManifest,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for part in &manifest.data_parts {
+        let data = get_decoded(store, &object_store::path::Path::from(part.key.as_str())).await?;
+        for line in data.split(|&b| b == b'\n') {
+            if line.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
             }
+            lines.push(String::from_utf8_lossy(line).into_owned());
         }
-        Ok(lines)
-    })
+    }
+    Ok(lines)
 }
 
 /// Compact one session: landing objects → data parts + correlations index,
-/// manifest written last (the seal). Idempotent — recompacting overwrites the
-/// same keys from the same landing data.
+/// manifest written last (the seal). Idempotent — recompacting the same landing
+/// data writes identical bytes to identical keys.
 pub fn compact_session(cfg: &S3Config, session_id: &str) -> Result<SessionManifest, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
@@ -519,18 +770,78 @@ async fn compact_session_inner(
         chunks.push(get_decoded(store, key).await?);
     }
 
-    let collated = collate(&chunks);
+    let collated = collate(chunk_lines(&chunks));
+    write_seal(store, session_id, collated, keys.len()).await
+}
 
-    // Data parts: full envelope lines, rotated.
+/// Seal a recording from envelope lines a caller has ALREADY read.
+///
+/// The ingest that scans a raw landing prefix ends up holding exactly what a
+/// seal is made of, and until it wrote that back every replay run re-listed,
+/// re-fetched and re-collated the same landing objects — 8 to 17 seconds per
+/// run, forever, for a recording that cannot change. Sealing here is what makes
+/// the next pull of the same recording take the manifest fast path.
+///
+/// `landing_objects` is the number of source objects these lines came from,
+/// recorded in the manifest for the same accounting the landing-driven compact
+/// reports.
+pub fn seal_session(
+    cfg: &S3Config,
+    session_id: &str,
+    envelope_lines: &[String],
+    landing_objects: usize,
+) -> Result<SessionManifest, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(async {
+        let collated = collate(envelope_lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        write_seal(&store, session_id, collated, landing_objects).await
+    })
+}
+
+/// Write the sealed form: data parts, then the correlations index, then the
+/// manifest LAST.
+///
+/// The ordering is the whole safety property. Every object the manifest names
+/// is durable before the manifest exists, so an interrupted seal leaves a
+/// session that reads as unsealed and is rescanned, never a manifest promising
+/// parts that are not there. See the module header for why the part and index
+/// keys are content-addressed.
+async fn write_seal(
+    store: &DynStore,
+    session_id: &str,
+    collated: Collated,
+    landing_objects: usize,
+) -> Result<SessionManifest, String> {
+    // A seal claims this is the whole recording, and it is permanent in the
+    // sense that matters: every later run takes the manifest fast path and
+    // stops looking at the landing. An empty one cannot be told apart from a
+    // landing that was scanned too early or read through the wrong prefix, so
+    // it would turn a recoverable mistake into a recording that is empty
+    // forever. Leave the session unsealed and say why.
+    if collated.events.is_empty() {
+        return Err(format!(
+            "refusing to seal {session_id} as an empty recording: {} line(s) yielded no records",
+            collated.lines_in
+        ));
+    }
+    let seal = seal_id(&collated.events);
+
+    // Data parts: full envelope lines, rotated. One part is built, compressed
+    // and uploaded at a time — the session's lines are already in memory, and
+    // holding every part's buffers as well is what turns a large recording into
+    // a memory problem.
     let mut data_parts = Vec::new();
     for (n, window) in collated.events.chunks(PART_MAX_EVENTS).enumerate() {
-        let mut buf = Vec::new();
-        for acc in window {
-            buf.extend_from_slice(acc.raw_line.as_bytes());
-            buf.push(b'\n');
-        }
-        let compressed = zstd_encode(&buf)?;
-        let key = layout::part_key(session_id, n);
+        let compressed = {
+            let mut buf = Vec::new();
+            for acc in window {
+                buf.extend_from_slice(acc.raw_line.as_bytes());
+                buf.push(b'\n');
+            }
+            zstd_encode(&buf)?
+        };
+        let key = layout::part_key(session_id, &seal, n);
         let bytes = compressed.len();
         put(store, &key, compressed).await?;
         data_parts.push(DataPart {
@@ -552,7 +863,7 @@ async fn compact_session_inner(
     }
     put(
         store,
-        &layout::correlations_key(session_id),
+        &layout::correlations_key(session_id, &seal),
         zstd_encode(&corr_buf)?,
     )
     .await?;
@@ -562,17 +873,23 @@ async fn compact_session_inner(
         manifest_version: 1,
         session_id: session_id.to_owned(),
         status: "sealed".to_owned(),
+        seal_id: seal,
         capture_mode: collated.capture_mode,
         envelope_schema_versions: collated.envelope_schema_versions,
         event_schema_versions: collated.event_schema_versions,
         code: collated.code,
         instances: collated.instances,
         counts: Counts {
-            landing_objects: keys.len(),
+            landing_objects,
             lines_in: collated.lines_in,
-            events: collated.events.len(),
+            events: collated.events.len() - collated.graph_nodes,
             duplicates_dropped: collated.duplicates_dropped,
-            correlations: collated.correlations.len(),
+            correlations: collated
+                .correlations
+                .iter()
+                .filter(|row| row.correlation_id.is_some())
+                .count(),
+            graph_nodes: collated.graph_nodes,
         },
         data_parts,
         created_unix_ms: std::time::SystemTime::now()
@@ -587,7 +904,11 @@ async fn compact_session_inner(
 }
 
 struct Collated {
+    /// Every accepted record, boundary events and graph nodes together — the
+    /// data parts carry the recording whole.
     events: Vec<Accepted>,
+    /// How many of `events` are graph nodes.
+    graph_nodes: usize,
     lines_in: usize,
     duplicates_dropped: usize,
     capture_mode: String,
@@ -598,81 +919,114 @@ struct Collated {
     correlations: Vec<CorrelationSummary>,
 }
 
-/// Parse landing chunks into deduped, sorted envelope lines plus the
-/// coverage/summary facts the manifest records.
-fn collate(chunks: &[Vec<u8>]) -> Collated {
-    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+/// Split landing objects into envelope lines. Blank lines are not lines.
+fn chunk_lines(chunks: &[Vec<u8>]) -> impl Iterator<Item = Cow<'_, str>> {
+    chunks
+        .iter()
+        .flat_map(|chunk| chunk.split(|&b| b == b'\n'))
+        .map(String::from_utf8_lossy)
+}
+
+/// Parse envelope lines into deduped, sorted records plus the coverage/summary
+/// facts the manifest records.
+///
+/// The record kind is dispatched from `artifact_type` BEFORE the payload is
+/// looked for, because which key holds the payload depends on the kind (see
+/// [`EnvelopeProbe`]), and it is part of the dedup key, because
+/// `global_sequence` is only unique WITHIN a kind: graph nodes are numbered in
+/// a sequence space of their own so that boundary-event numbering is identical
+/// whether or not graph capture is on. Both spaces start at zero in one
+/// recording, so a key without the kind makes graph node N collide with
+/// boundary event N and drops one of them.
+///
+/// Coverage and the correlation index describe the BOUNDARY EVENT stream only.
+/// Graph nodes have their own numbering and no correlation, so folding them in
+/// would invent gaps and an uncorrelated bucket; they still ride in the data
+/// parts, which is what the recording is.
+fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
+    let mut seen: BTreeSet<(String, RecordKind, u64)> = BTreeSet::new();
     let mut dupes_by_instance: BTreeMap<String, u64> = BTreeMap::new();
     let mut events: Vec<Accepted> = Vec::new();
     let mut lines_in = 0usize;
     let mut duplicates = 0usize;
+    let mut graph_nodes = 0usize;
     let mut envelope_versions: BTreeSet<u32> = BTreeSet::new();
     let mut event_versions: BTreeSet<u32> = BTreeSet::new();
     let mut codes: Vec<CodeRef> = Vec::new();
     let mut capture_mode = String::from("session");
 
-    for chunk in chunks {
-        for line in chunk.split(|&b| b == b'\n') {
-            if line.iter().all(|b| b.is_ascii_whitespace()) {
+    for line_str in lines {
+        if line_str.trim().is_empty() {
+            continue;
+        }
+        lines_in += 1;
+        let env: EnvelopeProbe = match serde_json::from_str(&line_str) {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("compactor: dropping non-envelope line");
                 continue;
             }
-            lines_in += 1;
-            let line_str = String::from_utf8_lossy(line);
-            let env: EnvelopeProbe = match serde_json::from_str(&line_str) {
-                Ok(e) => e,
-                Err(_) => {
-                    eprintln!("compactor: dropping non-envelope line");
-                    continue;
-                }
-            };
-            if env.artifact_type.as_deref() == Some("deja_sink_marker") {
-                continue; // loss accounting, not session data (P2.4)
-            }
-            let Some(event) = env.event else {
-                eprintln!("compactor: dropping envelope without event payload");
-                continue;
-            };
-            let probe: EventProbe = match serde_json::from_str(event.get()) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("compactor: dropping unparseable event ({e})");
-                    continue;
-                }
-            };
-            let instance_id = env.instance_id.unwrap_or_else(|| "unknown".to_owned());
-            if !seen.insert((instance_id.clone(), probe.global_sequence)) {
-                duplicates += 1;
-                *dupes_by_instance.entry(instance_id).or_default() += 1;
+        };
+        if env.is_marker() {
+            continue; // loss accounting, not session data (P2.4)
+        }
+        let Some((kind, payload)) = env.payload() else {
+            eprintln!("compactor: dropping envelope without a payload");
+            continue;
+        };
+        let probe: EventProbe = match serde_json::from_str(payload.get()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("compactor: dropping unparseable event ({e})");
                 continue;
             }
+        };
+        let instance_id = env.instance_id.unwrap_or_else(|| "unknown".to_owned());
+        if !seen.insert((instance_id.clone(), kind, probe.global_sequence)) {
+            duplicates += 1;
+            *dupes_by_instance.entry(instance_id).or_default() += 1;
+            continue;
+        }
+        // The two version fields describe the boundary-event stream. A graph
+        // envelope carries its own, unrelated `schema_version`, and folding it
+        // in here would read as the recording spanning two envelope versions.
+        if kind == RecordKind::BoundaryEvent {
             if let Some(v) = env.schema_version {
                 envelope_versions.insert(v);
             }
             if let Some(v) = probe.event_schema_version {
                 event_versions.insert(v);
             }
-            if let Some(code) = env.code {
-                if !codes.contains(&code) {
-                    codes.push(code);
-                }
-            }
-            if let Some(mode) = env.capture.and_then(|c| c.mode) {
-                capture_mode = mode;
-            }
-            events.push(Accepted {
-                instance_id,
-                gseq: probe.global_sequence,
-                correlation_id: probe.correlation_id,
-                boundary: probe.boundary,
-                raw_line: line_str.into_owned(),
-            });
+        } else {
+            graph_nodes += 1;
         }
+        if let Some(code) = env.code {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+        if let Some(mode) = env.capture.and_then(|c| c.mode) {
+            capture_mode = mode;
+        }
+        events.push(Accepted {
+            instance_id,
+            kind,
+            gseq: probe.global_sequence,
+            correlation_id: probe.correlation_id,
+            boundary: probe.boundary,
+            raw_line: line_str.into_owned(),
+        });
     }
-    events.sort_by(|a, b| (&a.instance_id, a.gseq).cmp(&(&b.instance_id, b.gseq)));
+    // Sequence before kind, so each kind keeps its own order and the kind only
+    // breaks the tie between the two spaces.
+    events.sort_by(|a, b| (&a.instance_id, a.gseq, a.kind).cmp(&(&b.instance_id, b.gseq, b.kind)));
 
     // Per-instance coverage (events are sorted, so gaps fall out of one scan).
     let mut instances: Vec<InstanceCoverage> = Vec::new();
-    for acc in &events {
+    for acc in events
+        .iter()
+        .filter(|a| a.kind == RecordKind::BoundaryEvent)
+    {
         match instances.last_mut() {
             Some(cov) if cov.instance_id == acc.instance_id => {
                 if acc.gseq > cov.gseq_max + 1 {
@@ -698,26 +1052,45 @@ fn collate(chunks: &[Vec<u8>]) -> Collated {
             .unwrap_or(0);
     }
 
-    // Per-correlation summary.
+    // Per-correlation summary, in TAPE ORDER: rows come out in the order each
+    // correlation first appears in the data parts, not sorted by id.
+    //
+    // The order is what a caller reads "the first N correlations" from, so it
+    // has to mean something about the recording. First appearance is the
+    // recording's own order — the earliest requests — and it stays that whatever
+    // the ids look like. Today's ids are UUIDv7, which sort chronologically by
+    // construction, so sorting by id would give the same answer; that is a
+    // property of the current id scheme, not of the recording, and it is not
+    // something a reader should have to know or a future id scheme has to keep.
+    let mut order: Vec<Option<String>> = Vec::new();
     let mut corr: BTreeMap<Option<String>, CorrelationSummary> = BTreeMap::new();
-    for acc in &events {
-        let row = corr
-            .entry(acc.correlation_id.clone())
-            .or_insert_with(|| CorrelationSummary {
+    for acc in events
+        .iter()
+        .filter(|a| a.kind == RecordKind::BoundaryEvent)
+    {
+        let row = corr.entry(acc.correlation_id.clone()).or_insert_with(|| {
+            order.push(acc.correlation_id.clone());
+            CorrelationSummary {
                 correlation_id: acc.correlation_id.clone(),
                 events: 0,
                 gseq_min: acc.gseq,
                 gseq_max: acc.gseq,
                 has_ingress: false,
-            });
+            }
+        });
         row.events += 1;
         row.gseq_min = row.gseq_min.min(acc.gseq);
         row.gseq_max = row.gseq_max.max(acc.gseq);
         row.has_ingress |= acc.boundary == "http_incoming";
     }
+    let correlations: Vec<CorrelationSummary> = order
+        .into_iter()
+        .filter_map(|id| corr.remove(&id))
+        .collect();
 
     Collated {
         events,
+        graph_nodes,
         lines_in,
         duplicates_dropped: duplicates,
         capture_mode,
@@ -725,7 +1098,7 @@ fn collate(chunks: &[Vec<u8>]) -> Collated {
         event_schema_versions: event_versions.into_iter().collect(),
         code: codes,
         instances,
-        correlations: corr.into_values().collect(),
+        correlations,
     }
 }
 
@@ -955,7 +1328,7 @@ mod tests {
         ]
         .join("\n")
         .into_bytes();
-        let c = collate(&[chunk]);
+        let c = collate(chunk_lines(&[chunk]));
         assert_eq!(c.lines_in, 5);
         assert_eq!(c.duplicates_dropped, 1);
         assert_eq!(c.events.len(), 4);
@@ -985,6 +1358,32 @@ mod tests {
     }
 
     #[test]
+    fn the_correlation_index_is_in_tape_order_not_id_order() {
+        // A caller reads "the first N correlations" off this list, so its order
+        // has to be a fact about the recording. Ids here sort the OPPOSITE way
+        // to the traffic, which is the only way to tell the two orders apart.
+        let chunk = [
+            envelope("i1", 1, Some("c-z"), "http_incoming"),
+            envelope("i1", 2, Some("c-m"), "http_incoming"),
+            envelope("i1", 3, Some("c-z"), "db"), // c-z reappears; it is not new
+            envelope("i1", 4, Some("c-a"), "http_incoming"),
+        ]
+        .join("\n")
+        .into_bytes();
+        let c = collate(chunk_lines(&[chunk]));
+        let order: Vec<&str> = c
+            .correlations
+            .iter()
+            .filter_map(|r| r.correlation_id.as_deref())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["c-z", "c-m", "c-a"],
+            "rows follow first appearance in the recording, not the ids' sort order"
+        );
+    }
+
+    #[test]
     fn collate_separates_instances() {
         let chunk = [
             envelope("i2", 1, Some("c1"), "db"),
@@ -992,10 +1391,525 @@ mod tests {
         ]
         .join("\n")
         .into_bytes();
-        let c = collate(&[chunk]);
+        let c = collate(chunk_lines(&[chunk]));
         assert_eq!(c.duplicates_dropped, 0);
         assert_eq!(c.events.len(), 2);
         assert_eq!(c.instances.len(), 2);
         assert_eq!(c.events[0].instance_id, "i1"); // sorted by (instance, gseq)
+    }
+
+    // -- sealing ------------------------------------------------------------
+
+    /// A graph-node envelope as the record sink emits it: schema version 1 and
+    /// the payload under `node`, not `event` — the node carries its own
+    /// `recording_run_id` and `global_sequence` that flattening into the
+    /// envelope would collide with.
+    ///
+    /// Copied from the shape the ingest side pins
+    /// (`deja-orchestrator/src/s3`), which took it from the producer. It is
+    /// spelled out rather than described because a fixture that wrote `event`
+    /// here — a shape nothing emits — is exactly how a green test suite once
+    /// coexisted with every graph node being discarded on the way in.
+    fn graph_envelope(inst: &str, gseq: u64) -> String {
+        format!(
+            r#"{{"schema_version":1,"artifact_type":"deja_graph_node","instance_id":"{inst}","recording_run_id":"s1","capture":{{"mode":"session","session_id":"s1"}},"node":{{"recording_run_id":"s1","global_sequence":{gseq},"node_id":{gseq},"span_name":"payments_create"}}}}"#
+        )
+    }
+
+    fn memory() -> DynStore {
+        Arc::new(object_store::memory::InMemory::new())
+    }
+
+    fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+        runtime().unwrap().block_on(f)
+    }
+
+    fn seal(store: &DynStore, session_id: &str, lines: &[String]) -> SessionManifest {
+        block(async {
+            let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+            write_seal(store, session_id, collated, lines.len()).await
+        })
+        .unwrap()
+    }
+
+    fn object_keys(store: &DynStore) -> Vec<String> {
+        block(async {
+            list_keys(store, "sessions")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|p| p.as_ref().to_owned())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_seal_writes_the_manifest_after_every_object_it_names() {
+        // The manifest is the seal, so it may not exist until everything it
+        // declares does. Any other order hands a reader a manifest pointing at
+        // an object that is not there yet — a short read that looks like a
+        // complete recording.
+        let log = Arc::new(WriteLog::new());
+        let store: DynStore = log.clone();
+        let lines = vec![
+            envelope("i1", 1, Some("c1"), "http_incoming"),
+            envelope("i1", 2, Some("c1"), "db"),
+        ];
+        let manifest = seal(&store, "s1", &lines);
+
+        let writes = log.writes();
+        let manifest_key = layout::manifest_key("s1");
+        assert_eq!(
+            writes.last().map(String::as_str),
+            Some(manifest_key.as_str()),
+            "the manifest must be the last write: {writes:?}"
+        );
+        let sealed_at = writes.iter().position(|k| *k == manifest_key).unwrap();
+        for part in &manifest.data_parts {
+            let at = writes.iter().position(|k| k == &part.key).unwrap();
+            assert!(
+                at < sealed_at,
+                "{} is declared complete before it is written",
+                part.key
+            );
+        }
+        let index = layout::correlations_key("s1", &manifest.seal_id);
+        assert!(writes.iter().position(|k| *k == index).unwrap() < sealed_at);
+    }
+
+    #[test]
+    fn an_interrupted_seal_reads_as_a_session_that_is_still_landing() {
+        // Everything but the last PUT landed. A reader must not be able to tell
+        // this from a session Vector is still flushing into, because both
+        // answers are "rescan the landing" — and the alternative, reading the
+        // parts that happen to be there, is a silently short recording.
+        let store = memory();
+        let lines = vec![envelope("i1", 1, Some("c1"), "http_incoming")];
+        let manifest = seal(&store, "s1", &lines);
+        block(async {
+            store
+                .delete(&object_store::path::Path::from(layout::manifest_key("s1")))
+                .await
+        })
+        .unwrap();
+
+        assert!(
+            !object_keys(&store).is_empty(),
+            "the data parts are still there — that is the point"
+        );
+        assert!(
+            block(manifest_of(&store, "s1")).unwrap().is_none(),
+            "no manifest, no seal, whatever is under data/"
+        );
+        // And a re-seal of the same content rewrites the same objects rather
+        // than adding a second copy beside them.
+        assert_eq!(seal(&store, "s1", &lines).seal_id, manifest.seal_id);
+    }
+
+    #[test]
+    fn two_sealers_of_different_snapshots_cannot_truncate_each_others_parts() {
+        // Two runs ingest one recording at once, and one caught the session
+        // mid-flush so it has less of it. Content-addressed part keys make
+        // their writes disjoint, so whichever manifest wins the shared key
+        // names its own complete parts — rather than the longer seal's
+        // manifest pointing at parts the shorter one overwrote.
+        let store = memory();
+        let long: Vec<String> = (1..=4)
+            .map(|n| envelope("i1", n, Some("c1"), "db"))
+            .collect();
+        let short = long[..2].to_vec();
+
+        let sealed_long = seal(&store, "s1", &long);
+        let sealed_short = seal(&store, "s1", &short);
+
+        assert_ne!(sealed_long.seal_id, sealed_short.seal_id);
+        let long_keys: BTreeSet<&str> = sealed_long
+            .data_parts
+            .iter()
+            .map(|p| p.key.as_str())
+            .collect();
+        let short_keys: BTreeSet<&str> = sealed_short
+            .data_parts
+            .iter()
+            .map(|p| p.key.as_str())
+            .collect();
+        assert!(
+            long_keys.is_disjoint(&short_keys),
+            "different content must not share object keys: {long_keys:?} vs {short_keys:?}"
+        );
+
+        // The manifest that won names the two lines its sealer read...
+        let winner = block(manifest_of(&store, "s1")).unwrap().unwrap();
+        assert_eq!(winner.seal_id, sealed_short.seal_id);
+        assert_eq!(block(session_lines(&store, &winner)).unwrap().len(), 2);
+        // ...and the other seal's parts are untouched, not truncated to two.
+        assert_eq!(block(session_lines(&store, &sealed_long)).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn sealing_the_same_content_twice_writes_the_same_objects() {
+        let store = memory();
+        let lines = vec![
+            envelope("i1", 1, Some("c1"), "http_incoming"),
+            envelope("i1", 2, Some("c1"), "db"),
+        ];
+        let first = seal(&store, "s1", &lines);
+        let after_first = object_keys(&store);
+        let second = seal(&store, "s1", &lines);
+
+        assert_eq!(first.seal_id, second.seal_id);
+        assert_eq!(
+            first.data_parts.iter().map(|p| &p.key).collect::<Vec<_>>(),
+            second.data_parts.iter().map(|p| &p.key).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            after_first,
+            object_keys(&store),
+            "a re-seal of unchanged content adds no objects"
+        );
+    }
+
+    #[test]
+    fn a_seal_carries_the_graph_nodes_the_recording_captured() {
+        // The compactor used to look only for `event`, so every graph envelope
+        // read as an envelope with no payload and was dropped. Sealing on
+        // ingest makes that fatal rather than wasteful: the sealed session is
+        // what every later run reads, so a graph the seal discards is gone even
+        // though the landing still has it.
+        let store = memory();
+        let lines = vec![
+            envelope("i1", 0, Some("c1"), "http_incoming"),
+            envelope("i1", 1, Some("c1"), "db"),
+            // The same sequence numbers as the events above: graph nodes are
+            // numbered in a space of their own, so these are not duplicates.
+            graph_envelope("i1", 0),
+            graph_envelope("i1", 1),
+        ];
+        let manifest = seal(&store, "s1", &lines);
+
+        assert_eq!(manifest.counts.duplicates_dropped, 0);
+        assert_eq!(manifest.counts.events, 2);
+        assert_eq!(manifest.counts.graph_nodes, 2);
+        // Coverage and the correlation index describe the boundary events; the
+        // graph's own numbering must not invent gaps or an extra correlation.
+        assert_eq!(manifest.instances.len(), 1);
+        assert_eq!(manifest.instances[0].events, 2);
+        assert!(manifest.instances[0].gaps.is_empty());
+        assert_eq!(manifest.counts.correlations, 1);
+        assert_eq!(manifest.envelope_schema_versions, vec![2]);
+
+        let read_back = block(session_lines(&store, &manifest)).unwrap();
+        assert_eq!(read_back.len(), 4);
+        assert_eq!(
+            read_back
+                .iter()
+                .filter(|l| l.contains("deja_graph_node"))
+                .count(),
+            2,
+            "the graph rides in the data parts or the record side of it is lost"
+        );
+    }
+
+    #[test]
+    fn a_sealed_session_reads_back_the_lines_it_was_sealed_from() {
+        // The seal's whole purpose is that the next run reads the same
+        // recording without rescanning, so what comes out of the parts has to
+        // be what went in — minus the duplicates and markers a rescan would
+        // have dropped too.
+        let store = memory();
+        let lines = vec![
+            envelope("i1", 2, Some("c1"), "db"),
+            envelope("i1", 1, Some("c1"), "http_incoming"),
+            envelope("i1", 2, Some("c1"), "db"), // duplicate
+            r#"{"artifact_type":"deja_sink_marker","instance_id":"i1"}"#.to_owned(),
+        ];
+        let manifest = seal(&store, "s1", &lines);
+        assert_eq!(manifest.counts.lines_in, 4);
+        assert_eq!(manifest.counts.duplicates_dropped, 1);
+
+        let read_back = block(session_lines(&store, &manifest)).unwrap();
+        assert_eq!(read_back, vec![lines[1].clone(), lines[0].clone()]);
+    }
+
+    #[test]
+    fn the_correlation_count_comes_off_the_seal_without_reading_the_tape() {
+        // A caller asking how many correlations a recording has should not pay
+        // for the recording. The manifest holds the count and the index sidecar
+        // holds the rows; neither read touches a data part.
+        let log = Arc::new(WriteLog::new());
+        let store: DynStore = log.clone();
+        let lines = vec![
+            envelope("i1", 1, Some("c1"), "http_incoming"),
+            envelope("i1", 2, Some("c1"), "db"),
+            envelope("i1", 3, Some("c2"), "redis"),
+            // Ambient traffic: shared across cases, so it is not a case.
+            envelope("i1", 4, None, "id_generation"),
+        ];
+        let sealed = seal(&store, "s1", &lines);
+        log.clear_reads();
+
+        let manifest = block(manifest_of(&store, "s1")).unwrap().unwrap();
+        assert_eq!(
+            manifest.counts.correlations, 2,
+            "the count is correlations, not buckets — the uncorrelated one is not a case"
+        );
+
+        let rows = block(correlation_index_of(&store, &manifest)).unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the index still accounts for the uncorrelated events"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.correlation_id.is_none())
+                .map(|r| r.events)
+                .sum::<u64>(),
+            1
+        );
+        let c1 = rows
+            .iter()
+            .find(|r| r.correlation_id.as_deref() == Some("c1"))
+            .unwrap();
+        assert_eq!(c1.events, 2);
+        assert!(
+            c1.has_ingress,
+            "c1 has an http_incoming, so replay can re-drive it"
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|r| r.correlation_id.as_deref() == Some("c2"))
+                .unwrap()
+                .has_ingress
+        );
+
+        let reads = log.reads();
+        let part_keys: Vec<&String> = sealed.data_parts.iter().map(|p| &p.key).collect();
+        assert!(
+            !reads.iter().any(|k| part_keys.contains(&k)),
+            "the count and the index must not pull the tape: {reads:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsealed_recording_has_no_manifest_to_answer_from() {
+        let store = memory();
+        assert!(block(manifest_of(&store, "never-sealed"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_scan_that_found_nothing_is_not_sealed_as_an_empty_recording() {
+        // Sealing is one-way as far as readers are concerned: once a manifest
+        // exists nothing looks at the landing again. So a scan that produced no
+        // records — run too early, pointed at the wrong prefix, or a landing of
+        // nothing but markers — must leave the session unsealed rather than
+        // freeze "this recording is empty" in place.
+        let store = memory();
+        let lines = [
+            r#"{"artifact_type":"deja_sink_marker","instance_id":"i1"}"#.to_owned(),
+            "not-an-envelope".to_owned(),
+        ];
+        let err = block(async {
+            let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+            write_seal(&store, "s1", collated, lines.len()).await
+        })
+        .unwrap_err();
+        assert!(err.contains("refusing to seal"), "{err}");
+        assert!(block(manifest_of(&store, "s1")).unwrap().is_none());
+        assert!(
+            object_keys(&store).is_empty(),
+            "and nothing was written under the session root"
+        );
+    }
+
+    #[test]
+    fn a_body_larger_than_one_chunk_round_trips_through_a_multipart_upload() {
+        // The failure this fixes: a data part is as big as the recording, and a
+        // single-shot PUT sends it in one request that has to finish inside the
+        // client's per-request timeout. Chunking makes each request a fixed
+        // size — but only if the chunking itself is exact, including the case
+        // where the body divides evenly and there is no tail.
+        let store = memory();
+        for len in [3_500usize, 4_096, 1] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let path = object_store::path::Path::from(format!("chunked/{len}"));
+            block(put_chunked(&store, &path, &body, 1024)).unwrap();
+            let got = block(async { store.get(&path).await.unwrap().bytes().await.unwrap() });
+            assert_eq!(got.as_ref(), body.as_slice(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn a_body_over_the_single_put_limit_is_uploaded_in_parts() {
+        let log = Arc::new(WriteLog::new());
+        let store: DynStore = log.clone();
+        let key = "sessions/v1/s1/data/big";
+        block(put(&store, key, vec![7u8; SINGLE_PUT_MAX_BYTES + 1])).unwrap();
+        assert_eq!(
+            log.multiparts(),
+            vec![key.to_owned()],
+            "a body past the single-PUT limit must not go up as one request"
+        );
+
+        block(put(&store, "sessions/v1/s1/data/small", vec![7u8; 1024])).unwrap();
+        assert_eq!(
+            log.multiparts().len(),
+            1,
+            "a small body still goes up as one PUT"
+        );
+    }
+
+    /// An `ObjectStore` that records what was written, in the order the objects
+    /// became visible, and what was read — so the seal's ordering can be
+    /// asserted instead of assumed.
+    #[derive(Debug)]
+    struct WriteLog {
+        inner: object_store::memory::InMemory,
+        writes: Arc<std::sync::Mutex<Vec<String>>>,
+        multiparts: std::sync::Mutex<Vec<String>>,
+        reads: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl WriteLog {
+        fn new() -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                writes: Default::default(),
+                multiparts: Default::default(),
+                reads: Default::default(),
+            }
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn multiparts(&self) -> Vec<String> {
+            self.multiparts.lock().unwrap().clone()
+        }
+
+        fn reads(&self) -> Vec<String> {
+            self.reads.lock().unwrap().clone()
+        }
+
+        fn clear_reads(&self) {
+            self.reads.lock().unwrap().clear();
+        }
+    }
+
+    impl std::fmt::Display for WriteLog {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "WriteLog({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for WriteLog {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let result = self.inner.put_opts(location, payload, opts).await?;
+            self.writes
+                .lock()
+                .unwrap()
+                .push(location.as_ref().to_owned());
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.multiparts
+                .lock()
+                .unwrap()
+                .push(location.as_ref().to_owned());
+            let upload = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(LoggedUpload {
+                inner: upload,
+                key: location.as_ref().to_owned(),
+                writes: Arc::clone(&self.writes),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.reads
+                .lock()
+                .unwrap()
+                .push(location.as_ref().to_owned());
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// Records the key when the upload COMPLETES, because that — not the first
+    /// part — is the moment the object exists.
+    #[derive(Debug)]
+    struct LoggedUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        key: String,
+        writes: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for LoggedUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            let result = self.inner.complete().await?;
+            self.writes.lock().unwrap().push(self.key.clone());
+            Ok(result)
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.inner.abort().await
+        }
     }
 }
