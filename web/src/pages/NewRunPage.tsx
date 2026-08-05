@@ -1,9 +1,11 @@
 import React from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api } from "../lib/api";
+import { api, availableRecordings } from "../lib/api";
 import { useDebug } from "../lib/debug";
 import { RunLaunchModal } from "../components/RunLaunchModal";
+import { RecordingPicker, RecordingSummary } from "../components/RecordingPicker";
+import { spanOf } from "../lib/recordings";
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -35,6 +37,14 @@ function CopyButton({ text, label }: { text: string; label: string }) {
  * the cross-version scenario selector that drove only that recipe's file name,
  * and the candidate binary path — `local_path` is 0 of 29 live runs, and the
  * field's presence made the real input (an image ref) look optional.
+ *
+ * Gone with the picker: the two path fields this form used to open with — an
+ * S3 path and a session id — which asked the caller to know a bucket layout in
+ * order to name something the orchestrator can resolve from its own
+ * environment. Every one of the 33 live runs was launched with a bare
+ * `recording_id` and `s3_source: null`, so the fields were load-bearing for
+ * nobody and confusing for everybody. The explicit prefix survives behind
+ * `?debug=1`, because `s3_source` remains a supported spec field.
  */
 export default function NewRunPage() {
   const [params] = useSearchParams();
@@ -49,8 +59,28 @@ export default function NewRunPage() {
   const [expectation, setExpectation] = React.useState("");
   const [launched, setLaunched] = React.useState<string | null>(null);
 
+  // What EXISTS (the bucket) and what has been PULLED (the catalog). The picker
+  // offers the first; the second is joined on for the counts only it knows.
+  const available = useQuery({
+    queryKey: ["recordings-available"],
+    queryFn: () => availableRecordings(),
+  });
   const recordings = useQuery({ queryKey: ["recordings"], queryFn: api.recordings });
+
+  // Memoized so the preselect effect below depends on a stable array rather
+  // than a fresh `[]` every render.
+  const rows = React.useMemo(() => available.data?.recordings ?? [], [available.data]);
+  const chosen = rows.find((r) => r.recording_id === recordingId.trim());
   const picked = recordings.data?.find((r) => r.recording_id === recordingId.trim());
+
+  // Latest preselected. The server returns newest first (last partition, then
+  // id), so the head of the list IS the latest — no client-side re-sort, which
+  // could only disagree with it. Runs once: a refetch must not overwrite a
+  // choice the caller has since made, and `?recording=` arrives already set.
+  React.useEffect(() => {
+    if (recordingId.trim() || rows.length === 0) return;
+    setRecordingId(rows[0].recording_id);
+  }, [rows, recordingId]);
 
   const corrs = React.useMemo(
     () => corrFilter.split(",").map((s) => s.trim()).filter(Boolean),
@@ -129,43 +159,113 @@ export default function NewRunPage() {
 
         {mode === "replay" && (
           <>
-            <label>
-              recording S3 path{" "}
-              <span className="hint">
-                (a deployed bucket/prefix; empty = pick from the catalog below)
+            <div className="recfield">
+              <span className="reclabel">
+                recording{" "}
+                <span className="hint">(what is in the bucket — newest first)</span>
               </span>
-              <input
-                type="text"
-                placeholder="s3://hyperswitch-art/2026/07/11"
-                value={s3Path}
-                onChange={(e) => setS3Path(e.target.value)}
-              />
-            </label>
 
-            {s3Path ? (
+              {available.isLoading && (
+                <p className="hint">listing the bucket… (this reads S3 and takes a moment)</p>
+              )}
+
+              {/* A FAILURE TO LOOK IS NOT AN ABSENCE. This endpoint lists S3 and
+                  answers 502 when it cannot; rendering that as an empty picker
+                  would read as "no recordings exist" and is the one outcome
+                  that must never happen here. It also must not block a caller
+                  who knows the id, so the fallback is a plain field. */}
+              {available.error && (
+                <div className="recfail">
+                  <p className="err">
+                    <b>Could not list the bucket.</b> {String(available.error)}
+                  </p>
+                  <p className="hint">
+                    This is a failure to look, not an empty bucket — recordings may well exist.
+                    Retry, or name one directly if you already know its id.
+                  </p>
+                  <p>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => void available.refetch()}
+                      disabled={available.isFetching}
+                    >
+                      {available.isFetching ? "retrying…" : "retry"}
+                    </button>
+                  </p>
+                  <input
+                    type="text"
+                    placeholder="run-1785331134782268537"
+                    value={recordingId}
+                    onChange={(e) => setRecordingId(e.target.value)}
+                  />
+                </div>
+              )}
+
+              {available.isSuccess && rows.length === 0 && (
+                <div className="recfail">
+                  <p className="hint">
+                    <b>The bucket holds no recordings.</b> The listing succeeded and found nothing
+                    under the deployment's recording root — nothing has landed yet. Schedule a
+                    record run, or point the orchestrator at the bucket that has them.
+                  </p>
+                </div>
+              )}
+
+              {available.isSuccess && rows.length > 0 && (
+                <>
+                  <RecordingPicker
+                    recordings={rows}
+                    catalog={recordings.data}
+                    value={recordingId}
+                    onChange={setRecordingId}
+                    truncated={
+                      available.data && available.data.total > rows.length
+                        ? available.data.total
+                        : 0
+                    }
+                  />
+                  <RecordingSummary rec={chosen} catalog={picked} />
+                  {/* The catalog is a nicety here (it supplies correlation
+                      counts for pulled recordings); its failure must not
+                      degrade the picker, so it is reported quietly. */}
+                  {recordings.error && (
+                    <p className="hint">
+                      catalog unavailable ({String(recordings.error)}) — correlation counts are not
+                      shown for recordings that have already been pulled.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* ESCAPE HATCH. `s3_source` is still a supported spec field — an
+                arbitrary bucket/prefix in the deployed aggregator layout — and
+                is the only way to reach a recording the index cannot name. It
+                is not on the default form because supplying it is knowing a
+                deployment's bucket layout by hand. */}
+            {debug && (
               <label>
-                recording session id{" "}
+                s3 source override <span className="hint">(?debug=1)</span>
                 <span className="hint">
-                  (optional — auto-resolved when the path holds exactly one session)
+                  A full <code>bucket/prefix</code>. Set it and the recording above becomes the
+                  session FILTER, which may be left empty when the prefix holds exactly one
+                  session. The index reports prefixes without a bucket
+                  {chosen ? (
+                    <>
+                      {" "}
+                      — the selected one is <code className="mono">{chosen.prefix}</code>, so a
+                      path here is <code className="mono">s3://&lt;bucket&gt;/{chosen.prefix}</code>
+                    </>
+                  ) : null}
+                  .
                 </span>
                 <input
                   type="text"
-                  placeholder="sandbox-art-2026-07-11"
-                  value={recordingId}
-                  onChange={(e) => setRecordingId(e.target.value)}
+                  placeholder="s3://hyperswitch-art/landing/v1/dt=2026-08-04/session=run-…"
+                  value={s3Path}
+                  onChange={(e) => setS3Path(e.target.value)}
                 />
-              </label>
-            ) : (
-              <label>
-                recording
-                <select value={recordingId} onChange={(e) => setRecordingId(e.target.value)}>
-                  <option value="">— pick a recording —</option>
-                  {recordings.data?.map((r) => (
-                    <option key={r.recording_id} value={r.recording_id}>
-                      {r.recording_id} ({(r.correlation_count ?? 0).toLocaleString()} requests)
-                    </option>
-                  ))}
-                </select>
               </label>
             )}
 
@@ -209,13 +309,20 @@ export default function NewRunPage() {
             </label>
 
             {/* SCOPE. Leaving the filter empty is not "a small default" — the live
-                recordings hold 42,310 and 170,568 correlations. Say the number. */}
+                recordings hold 42,310 and 170,568 correlations. Say the number.
+                When the catalog has no count (the recording has never been
+                pulled) the number is genuinely unknown; the span is stated
+                instead, and no count is estimated from the object count —
+                22,936 objects hold 170,568 correlations and 1,680 hold 42,310,
+                so any such estimate would be invention. */}
             {wholeSession && (
               <p className="scopewarn">
                 <b>No scope set — this drives the entire session.</b>{" "}
                 {picked?.correlation_count
                   ? `${picked.recording_id} holds ${picked.correlation_count.toLocaleString()} correlations; every one of them will be driven and scored.`
-                  : "A session recording can hold tens of thousands of correlations; every one will be driven and scored."}{" "}
+                  : chosen && spanOf(chosen.dates).multiDay
+                    ? `${chosen.recording_id} is ${spanOf(chosen.dates).partitions} days of one pod's traffic and has never been pulled, so its correlation count is not yet known — it will be whatever those days recorded, and every one will be driven and scored.`
+                    : "A session recording can hold tens of thousands of correlations; every one will be driven and scored."}{" "}
                 List the correlation ids you actually want to test.
               </p>
             )}

@@ -267,3 +267,71 @@ export const api = {
     });
   },
 };
+
+// ===========================================================================
+// THE BUCKET INDEX — appended, so nothing above moves.
+//
+// `GET /api/v1/recordings` above lists the CATALOG: recordings that have been
+// pulled, which is a property of what has been replayed rather than of what
+// exists. A recording made an hour ago is absent from it until something drives
+// it. `GET /api/v1/recordings/available` lists the landing area itself. Live,
+// the first returns 2 and the second returns 7.
+// ===========================================================================
+
+/**
+ * What a recording's id claims about its own provenance, parsed server-side so
+ * two readers cannot disagree about the shape.
+ *
+ * Null on every recording made before ids carried a revision — the normal past,
+ * not an error. When present the facts also live authoritatively in the
+ * recording's envelopes (`code.sha`, `instance_id`).
+ */
+export type RecordingIdentity = {
+  /** Short git sha of the recorded system. */
+  revision: string;
+  /** `MMDDhhmm` UTC — when recording began. No year. */
+  recorded_at: string;
+  /** Discriminator, so two pods starting in the same minute stay distinct. */
+  instance: string;
+};
+
+/** One session found in the bucket. */
+export type AvailableRecording = {
+  /** The session id, minted ONCE PER ROUTER PROCESS — so this names a pod's
+   *  entire lifetime, not a bounded window of traffic. */
+  recording_id: string;
+  /** Daily partitions holding objects, sorted ascending. */
+  dates: string[];
+  latest_date: string | null;
+  /** LANDING OBJECTS — gzipped envelope batches, not requests. */
+  objects: number;
+  /** Whether the catalog already holds it. Degrades to false (never an error)
+   *  when the catalog itself cannot be read, so the bucket stays visible. */
+  pulled: boolean;
+  identity: RecordingIdentity | null;
+  /** The prefix the orchestrator would ingest from — reported so a run can be
+   *  reproduced by hand, NOT so a caller has to supply it. Bucket-relative: a
+   *  `s3_source.path` needs `bucket/` in front of it. */
+  prefix: string;
+};
+
+export type AvailableRecordingsPage = {
+  recordings: AvailableRecording[];
+  /** Sessions in the bucket, before paging — compare against the page length. */
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+/**
+ * List the bucket, newest first (by last partition, then by id, so the order is
+ * total). The server clamps `limit` to 1..200.
+ *
+ * This LISTS S3, so it is slow (~1.8s against the live bucket) and it can fail
+ * with a 502 — which a caller must render as a failure to look, never as an
+ * empty list, because an empty list reads as "no recordings exist".
+ */
+export const availableRecordings = (limit = 200, offset = 0) =>
+  request<AvailableRecordingsPage>(
+    `/api/v1/recordings/available?limit=${limit}&offset=${offset}`,
+  );

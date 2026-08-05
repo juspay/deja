@@ -535,3 +535,93 @@ dialog.launch::backdrop { background: rgba(6, 9, 13, 0.66); }
 
 /* wide layouts */
 main:has(.runlist), main:has(.verdict) { max-width: 1440px; }
+
+/* ==========================================================================
+   RECORDING PICKER + BUCKET INDEX
+   Appended, so nothing above moves.
+
+   A dropdown whose rows have to carry more than a name: a recording id is
+   minted once per router process, so one row can be nine objects on one day or
+   seven days and 42,310 correlations. The row states span, size and pulled
+   state because those are the difference, and a single line of option text
+   cannot hold them.
+   ========================================================================== */
+.recfield { display: grid; gap: var(--s2); color: var(--text-subtle); font-size: var(--fs-12); }
+.reclabel { display: block; }
+
+.recpick { position: relative; }
+.recpick-trigger {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: var(--s2) var(--s3); font: inherit; font-size: var(--fs-13); text-align: left; font-weight: 400;
+}
+.recpick-trigger:hover { background: var(--bg); border-color: var(--border-strong); }
+.recpick-trigger.open, .recpick-trigger:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-muted);
+}
+.recpick-trigger-main { display: grid; gap: 2px; min-width: 0; }
+.recpick-caret { color: var(--text-faint); font-size: var(--fs-11); flex: none; }
+.recpick-id {
+  font-family: var(--font-mono); font-size: var(--fs-13); color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.recpick-sub { color: var(--text-subtle); font-size: var(--fs-11); line-height: 1.45; }
+.recpick-sub.warn { color: var(--amber-fg); }
+
+.recpick-pop {
+  position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; right: 0;
+  background: var(--surface-overlay); border: 1px solid var(--border-strong);
+  border-radius: var(--r-md); box-shadow: var(--shadow-overlay); overflow: hidden;
+}
+.recpick-list {
+  max-height: 340px; overflow-y: auto; margin: 0; padding: var(--s1); list-style: none;
+}
+.recpick-row {
+  display: grid; gap: 3px; padding: var(--s2) var(--s3); border-radius: var(--r-sm); cursor: pointer;
+}
+.recpick-row.active { background: var(--surface-raised); }
+.recpick-row.chosen { box-shadow: inset 2px 0 0 var(--accent); }
+.recpick-row-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); }
+.recpick-chips { display: flex; gap: var(--s1); flex: none; }
+.recpick-row-sub { color: var(--text-subtle); font-size: var(--fs-11); line-height: 1.45; }
+.recpick-row-ident { color: var(--text-faint); font-size: var(--fs-11); font-family: var(--font-mono); }
+.recpick-more {
+  margin: 0; padding: var(--s2) var(--s3); color: var(--text-faint); font-size: var(--fs-11);
+  border-top: 1px solid var(--border-muted);
+}
+
+/* The choice, restated in full under the collapsed control. */
+.recsummary {
+  border: 1px solid var(--border-muted); border-radius: var(--r-sm);
+  background: var(--surface); padding: var(--s3); display: grid; gap: var(--s3);
+}
+.recsummary dl { margin: 0; display: grid; gap: var(--s2); }
+.recsummary dl > div { display: grid; grid-template-columns: 72px 1fr; gap: var(--s3); align-items: baseline; }
+.recsummary dt {
+  color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.05em;
+}
+.recsummary dd { margin: 0; color: var(--text-muted); font-size: var(--fs-12); line-height: 1.55; }
+.recsummary dd.mono { font-family: var(--font-mono); font-size: var(--fs-11); }
+.recsummary-note {
+  margin: 0; border-left: 3px solid var(--diff-mod-edge); background: rgba(210,153,34,0.10);
+  border-radius: var(--r-sm); padding: var(--s2) var(--s3);
+  color: var(--text-muted); font-size: var(--fs-12); line-height: 1.55;
+}
+.recsummary-note b { color: var(--amber-fg); }
+
+/* Loading / empty / failure share one block, so a failure can never be mistaken
+   for the empty case by looking like it. */
+.recfail {
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); padding: var(--s3); display: grid; gap: var(--s2);
+}
+.recfail p { margin: 0; }
+
+.recintro { max-width: 78ch; margin: calc(-1 * var(--s2)) 0 var(--s4); }
+.recspan { white-space: nowrap; }
+.recspan-range { font-family: var(--font-mono); font-size: var(--fs-11); color: var(--text-muted); margin-right: var(--s2); }
+.recident { font-family: var(--font-mono); font-size: var(--fs-11); color: var(--text-subtle); }
+.recdash { color: var(--text-faint); }
+.recorphan td { color: var(--text-subtle); }
+
+main:has(.recintro) { max-width: 1440px; }
