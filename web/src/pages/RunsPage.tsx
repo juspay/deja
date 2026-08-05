@@ -1,110 +1,163 @@
+import React from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { api, RunRow } from "../lib/api";
+import { useDebug, withDebug } from "../lib/debug";
+import {
+  attemptOrdinals,
+  candidateRef,
+  RESULT_STATES,
+  ResultState,
+  resultOf,
+  whatHappened,
+} from "../lib/result";
+import { ResultChip } from "../components/Result";
 
-function shortSha(sha: string | null): string {
-  return sha ? sha.slice(0, 12) : "—";
+function when(iso: string): { short: string; full: string } {
+  const d = new Date(iso);
+  const now = Date.now();
+  const mins = Math.round((now - d.getTime()) / 60000);
+  const short =
+    mins < 1 ? "just now"
+      : mins < 60 ? `${mins}m ago`
+        : mins < 60 * 24 ? `${Math.round(mins / 60)}h ago`
+          : `${Math.round(mins / 1440)}d ago`;
+  return { short, full: d.toLocaleString() };
 }
 
-
-// A run-list outcome badge. value_divergences > 0 on the embedded scorecard
-// means an Execute boundary ran during replay and differed from the recorded
-// baseline; otherwise fall back to the coarse verdict.
-function OutcomeBadge({ r }: { r: RunRow }) {
-  if (r.mode !== "replay") return <>—</>;
-  const vd = r.scorecard?.summary.value_divergences ?? 0;
-  if (vd > 0) {
-    return (
-      <span className="chip solid fail" title={`${vd} value divergence(s) — Execute boundary differed`}>
-        CAUGHT
-      </span>
-    );
-  }
-  if (!r.verdict) return <span className="chip muted">—</span>;
-  if (r.verdict === "pass") return <span className="chip solid pass">PASS</span>;
-  if (r.verdict === "inconclusive")
-    return <span className="chip solid inconclusive">INCONCLUSIVE</span>;
-  return <span className="chip solid fail">FAIL</span>;
+/** Everything a substring search should reach on one row. */
+function haystack(r: RunRow): string {
+  return [
+    r.run_id,
+    r.recording_id ?? "",
+    candidateRef(r).full,
+    r.created_by,
+    r.failure?.message ?? "",
+    r.scorecard?.verdict?.reason ?? "",
+    r.expectation ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
 }
 
 export default function RunsPage() {
-  const nav = useNavigate();
-  const runs = useQuery({
-    queryKey: ["runs"],
-    queryFn: api.runs,
-    refetchInterval: 5000,
-  });
+  const debug = useDebug();
+  const [q, setQ] = React.useState("");
+  const [filter, setFilter] = React.useState<ResultState | "">("");
+
+  const runs = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 5000 });
+
+  const all = runs.data ?? [];
+  // Attempt ordinals are derived over the WHOLE list, not the filtered view —
+  // "attempt 3 of 4" must not change because you typed in the search box.
+  const attempts = React.useMemo(() => attemptOrdinals(all), [all]);
+
+  const rows = React.useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return all.filter((r) => {
+      if (filter && resultOf(r).state !== filter) return false;
+      if (!needle) return true;
+      return haystack(r).includes(needle);
+    });
+  }, [all, q, filter]);
 
   if (runs.isLoading) return <p className="hint">loading…</p>;
   if (runs.error)
     return (
       <p className="err">
-        {String(runs.error)} — is the orchestrator running? (demo/lib.sh starts
-        it, or run deja-orchestrator directly)
+        {String(runs.error)} — is the orchestrator reachable?
       </p>
     );
 
   return (
     <>
-      <h1>Runs</h1>
-      <table>
-        <thead>
-          <tr>
-            <th>run</th>
-            <th>mode</th>
-            <th>outcome</th>
-            <th>state</th>
-            <th>verdict</th>
-            <th>expect</th>
-            <th>recording</th>
-            <th>candidate sha</th>
-            <th>actor</th>
-            <th>created</th>
-          </tr>
-        </thead>
-        <tbody>
-          {runs.data?.map((r) => (
-            <tr
-              key={r.run_id}
-              className="clickable"
-              onClick={() => nav(`/runs/${r.run_id}`)}
-            >
-              <td>
-                <Link to={`/runs/${r.run_id}`}>{r.run_id.slice(0, 16)}…</Link>
-              </td>
-              <td>{r.mode}</td>
-              <td>
-                <OutcomeBadge r={r} />
-              </td>
-              <td>
-                <span className={`chip ${r.state}`}>{r.state}</span>
-              </td>
-              <td>
-                {r.verdict ? (
-                  <span className={`chip ${r.verdict}`}>{r.verdict}</span>
-                ) : (
-                  "—"
-                )}
-              </td>
-              <td>{r.expectation ?? "—"}</td>
-              <td>{r.recording_id ?? "—"}</td>
-              <td title={r.candidate_sha256 ?? undefined}>
-                {shortSha(r.candidate_sha256)}
-              </td>
-              <td>{r.created_by}</td>
-              <td>{new Date(r.created_at).toLocaleTimeString()}</td>
-            </tr>
+      <div className="pagehead">
+        <h1>Runs</h1>
+        <Link className="btn" to={withDebug("/", debug)}>New run</Link>
+      </div>
+
+      <div className="runfilters">
+        <input
+          className="search"
+          type="search"
+          placeholder="search run id, recording, candidate, actor, what happened…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          aria-label="filter runs"
+        />
+        <select
+          value={filter}
+          onChange={(e) => setFilter(e.target.value as ResultState | "")}
+          aria-label="filter by result"
+        >
+          <option value="">all results</option>
+          {RESULT_STATES.map((s) => (
+            <option key={s} value={s}>
+              {s.toLowerCase().replace("_", " ")}
+            </option>
           ))}
-          {runs.data?.length === 0 && (
-            <tr>
-              <td colSpan={11} className="hint">
-                no runs yet — <Link to="/replays/new">schedule one</Link> or run
-                demo/run-deja-demo.sh
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
+        </select>
+        <span className="hint">
+          {rows.length === all.length
+            ? `${all.length} run${all.length === 1 ? "" : "s"}`
+            : `${rows.length} of ${all.length}`}
+        </span>
+      </div>
+
+      <div className="runlist">
+        <div className="runrow runhead" aria-hidden="true">
+          <span>when</span>
+          <span>result</span>
+          <span>candidate</span>
+          <span>recording</span>
+          <span>what happened</span>
+          <span className="num">attempt</span>
+        </div>
+
+        {rows.map((r) => {
+          const res = resultOf(r);
+          const cand = candidateRef(r);
+          const said = whatHappened(r);
+          const at = attempts.get(r.run_id);
+          const t = when(r.created_at);
+          // The whole row is the link: middle-click, copy-link-address and
+          // keyboard focus all work, and there is no dead zone between cells.
+          return (
+            <Link
+              key={r.run_id}
+              className="runrow"
+              to={withDebug(`/r/${r.run_id}`, debug)}
+              title={`${r.run_id} · ${r.created_by} · ${t.full}`}
+            >
+              <span className="rl-when">{t.short}</span>
+              <span className="rl-result"><ResultChip result={res} /></span>
+              <span className="rl-cand mono" title={cand.full}>{cand.label}</span>
+              <span className="rl-rec mono">{r.recording_id ?? "—"}</span>
+              <span className="rl-said" title={said ?? undefined}>{said ?? "—"}</span>
+              <span
+                className="rl-attempt num"
+                title={
+                  at
+                    ? `derived client-side: run ${at.attempt} of ${at.of} with this mode + recording + candidate. The server does not persist a subject key.`
+                    : undefined
+                }
+              >
+                {at ? (at.of > 1 ? `${at.attempt}/${at.of}` : "1") : "—"}
+              </span>
+            </Link>
+          );
+        })}
+
+        {rows.length === 0 && (
+          <p className="hint runempty">
+            {all.length === 0 ? (
+              <>no runs yet — <Link to="/">start one</Link></>
+            ) : (
+              <>no run matches this search</>
+            )}
+          </p>
+        )}
+      </div>
     </>
   );
 }

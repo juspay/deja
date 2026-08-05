@@ -4,7 +4,8 @@ import { api, CallRecord, HttpDiff } from "../lib/api";
 import { JsonView, ValuePair } from "./JsonView";
 import { JsonDiff } from "./JsonDiff";
 import { diffArgs, LeafDiff } from "../lib/argdiff";
-import { ConfidenceBadge, overallConfidence, levelForRank } from "./Confidence";
+import { RunResult } from "../lib/result";
+import { ConfidenceBadge, levelForRank } from "./Confidence";
 
 function leaf(path?: string): string {
   return path ? path.split(">").pop()! : "";
@@ -14,7 +15,7 @@ function where(c: CallRecord): string {
   return s?.call_file ? `${s.call_file}:${s.call_line ?? "?"}` : "";
 }
 function spanOf(c: CallRecord): string {
-  return c.observed?.logical_span_path ?? c.recorded?.logical_span_path ?? "";
+  return c.observed?.span_path ?? c.recorded?.span_path ?? "";
 }
 
 type Group = { key: string; boundary: string; method: string; span: string; novel?: CallRecord; omitted?: CallRecord };
@@ -159,13 +160,24 @@ function HttpBlock({ d }: { d: HttpDiff }) {
   );
 }
 
-export default function DiffView({ runId }: { runId: string }) {
+// EVIDENCE ONLY. This component used to own a verdict strip whose `clean` flag
+// was `modified.length === 0 && cascadeCount === 0 && httpBad.length === 0` —
+// three empty arrays. On the 22 live runs that died before publishing artifacts
+// /calls and /http-diffs both return `[]`, so all three were empty and the strip
+// rendered GREEN ("clean replay … every recorded response and side-effect call
+// was reproduced exactly") over a run whose failure.message was displayed
+// nowhere. Absence of evidence was rendered as evidence of absence.
+//
+// The verdict now lives in exactly one place — `resultOf(run)` in lib/result.ts,
+// rendered by <VerdictBanner>. This component renders what was published and
+// nothing more; `result` is passed in only so the empty case can say which kind
+// of empty it is.
+export default function DiffView({ runId, result }: { runId: string; result: RunResult }) {
   const [showCascade, setShowCascade] = React.useState(false);
   const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId) });
   const https = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId) });
-  const card = useQuery({ queryKey: ["scorecard", runId], queryFn: () => api.scorecard(runId) });
 
-  if (calls.isLoading || https.isLoading || card.isLoading) return <p className="hint">loading diff…</p>;
+  if (calls.isLoading || https.isLoading) return <p className="hint">loading evidence…</p>;
   if (calls.error) return <p className="err">{String(calls.error)}</p>;
 
   const all = calls.data ?? [];
@@ -173,38 +185,25 @@ export default function DiffView({ runId }: { runId: string }) {
   const httpBad = (https.data ?? []).filter((d) => !d.status_match || d.body_diff.length > 0);
   const cascadeCount = added.length + removed.length;
   const envCount = added.filter(isEnvironmental).length;
-  const s = card.data?.summary;
-  const v = card.data?.verdict;
-  const verdict = v?.inconclusive ? "inconclusive" : v?.pass ? "pass" : "fail";
-  const conf = s ? overallConfidence(s.resolved_by_rank ?? {}) : "unmatched";
 
-  const clean = modified.length === 0 && cascadeCount === 0 && httpBad.length === 0;
+  if (modified.length === 0 && cascadeCount === 0 && httpBad.length === 0) {
+    // Which empty is this? Only the run's own result can say — an empty payload
+    // is not a finding.
+    return result.state === "REPRODUCED" ? (
+      <p className="hint">
+        Every recorded response and side-effect call was reproduced exactly — {all.length} reconciled call
+        {all.length === 1 ? "" : "s"}, no divergence rows.
+      </p>
+    ) : (
+      <p className="hint">
+        No call-level or response-level rows were published for this run. That is a statement about the
+        artifacts, not about the candidate — see the result above for what is actually known.
+      </p>
+    );
+  }
 
   return (
     <>
-      <div className={`scorestrip ${clean ? "clean" : "diverged"}`}>
-        <span className={`chip solid ${verdict}`}>{verdict}</span>
-        <ConfidenceBadge level={conf} title="overall run confidence = weakest address rank relied on" />
-        <span className="lede">
-          {clean
-            ? `clean replay — ${s?.matched_correlations ?? 0}/${s?.total_correlations ?? 0} correlations matched, 0 side-effect divergences`
-            : modified.length > 0
-              ? <>behavior forked at <b>{modified.map((g) => leaf(g.span)).join(", ")}</b> — {modified.length} call{modified.length > 1 ? "s" : ""} with changed arguments</>
-              : cascadeCount > 0
-                ? <>{cascadeCount} side-effect{cascadeCount > 1 ? "s" : ""} {added.length === 0 ? "dropped" : removed.length === 0 ? "added" : "changed"} (no argument-level change){httpBad.length === 0 ? " — response unchanged" : ""}</>
-                : <><b>response value changed</b> — {httpBad.length} request{httpBad.length > 1 ? "s" : ""} differ, every side-effect matched</>}
-        </span>
-        {!clean && (
-          <span className="meta">
-            {added.length} added · {removed.length} removed downstream
-            {envCount ? <> · <span title="cold-cache fallback — likely infra noise, not a behavior change">{envCount} environmental</span></> : null}
-            {" "}· {httpBad.length} response diff{httpBad.length === 1 ? "" : "s"}
-          </span>
-        )}
-      </div>
-
-      {clean && <p className="hint">Every recorded response and side-effect call was reproduced exactly. Confidence is {conf.toUpperCase()} — the weakest address rank this run relied on.</p>}
-
       {modified.length > 0 && (
         <section>
           <h2>Root cause — changed calls</h2>

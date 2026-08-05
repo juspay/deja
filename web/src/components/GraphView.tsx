@@ -88,7 +88,7 @@ export default function GraphView({ runId }: { runId: string }) {
     const valueDivByNode = new Map<number, VChip[]>();
     for (const c of cs) {
       const oid = c.observed?.graph_node_id, rid = c.recorded?.graph_node_id;
-      const key = `${c.observed?.logical_span_path ?? c.recorded?.logical_span_path}|${c.boundary}|${c.method_name}`;
+      const key = `${c.observed?.span_path ?? c.recorded?.span_path}|${c.boundary}|${c.method_name}`;
       if (c.kind === "value_diverged") {
         const nid = oid ?? rid;
         if (nid != null) {
