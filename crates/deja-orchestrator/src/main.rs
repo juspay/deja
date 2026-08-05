@@ -229,6 +229,7 @@ fn app_router(state: AppState) -> Router {
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
         .route("/recordings", get(v1_list_recordings))
+        .route("/recordings/available", get(v1_available_recordings))
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
         .route("/runs/{run_id}/kill", kill_run_route)
@@ -652,6 +653,105 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
         Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
         Err(e) => error_resp(500, &format!("list recordings: {e}")),
     }
+}
+
+/// `GET /api/v1/recordings/available` — what is in the bucket, newest first.
+///
+/// The catalog above lists recordings that have been PULLED, which is a
+/// property of what has been replayed rather than of what exists; a recording
+/// made an hour ago does not appear there until something drives it. This
+/// lists the landing area itself, so choosing a recording is choosing from
+/// what was recorded.
+///
+/// Nothing here takes a path. Where recordings land, and how the keys are
+/// partitioned, belong to the deployment (`DEJA_S3_BUCKET`,
+/// `DEJA_RECORDING_ROOT`) — a caller names a recording and the orchestrator
+/// resolves the rest.
+///
+/// `?limit=` and `?offset=` page the result; `pulled` says whether the catalog
+/// already has it, so a picker can show what is ready versus what will be
+/// fetched on first use.
+async fn v1_available_recordings(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<AvailableQuery>,
+) -> Response {
+    let cfg = deja_orchestrator::s3::S3Config::from_env();
+    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    let found = match tokio::task::spawn_blocking(move || {
+        deja_compactor::list_landed_recordings(&cfg, &root)
+    })
+    .await
+    {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => return error_resp(502, &format!("list recordings in bucket: {e}")),
+        Err(e) => return error_resp(500, &format!("list recordings in bucket: {e}")),
+    };
+
+    // Which of them the catalog already holds. A failure to read the catalog
+    // must not hide the bucket's contents, so it degrades to "unknown" rather
+    // than failing the request.
+    let pulled: std::collections::HashSet<String> = match require_store(&st) {
+        Ok(store) => store
+            .list_recordings(500)
+            .await
+            .map(|rows| rows.iter().map(|r| r.recording_id.clone()).collect())
+            .unwrap_or_default(),
+        Err(_) => Default::default(),
+    };
+
+    let total = found.len();
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let page: Vec<serde_json::Value> = found
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|r| {
+            // The id's provenance is parsed HERE, not by the client: a
+            // recording made before ids carried a revision reports none, and
+            // that difference should be one field rather than every reader
+            // reimplementing the same two shapes.
+            let identity = deja_orchestrator::parse_recording_id(&r.session_id);
+            let described = match &identity {
+                deja_orchestrator::RecordingIdentity::Described {
+                    revision,
+                    recorded_at,
+                    instance,
+                } => serde_json::json!({
+                    "revision": revision,
+                    "recorded_at": recorded_at,
+                    "instance": instance,
+                }),
+                deja_orchestrator::RecordingIdentity::Opaque => serde_json::Value::Null,
+            };
+            serde_json::json!({
+                "recording_id": r.session_id,
+                "dates": r.dates,
+                "latest_date": r.latest_date(),
+                "objects": r.objects,
+                "pulled": pulled.contains(&r.session_id),
+                // Null for a recording whose id names no revision; its envelopes
+                // still carry `code.sha` and `instance_id`.
+                "identity": described,
+                // The prefix the orchestrator would ingest from. Reported so a
+                // run can be reproduced by hand, not so a caller has to supply it.
+                "prefix": r.prefix,
+            })
+        })
+        .collect();
+
+    json_ok(serde_json::json!({
+        "recordings": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct AvailableQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 /// `GET /api/v1/runs` — run list (Postgres-backed; newest first).
