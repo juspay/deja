@@ -18,6 +18,7 @@ pub mod executor;
 pub mod lifecycle;
 pub mod lookup;
 pub mod s3;
+pub mod scope;
 pub mod store;
 
 /// Specification of a candidate Hyperswitch identity. All five resolution
@@ -515,12 +516,14 @@ impl HarnessRoot {
     pub fn run_path(&self, run_id: &str) -> PathBuf {
         self.root.join("runs").join(format!("{run_id}.json"))
     }
-    pub fn recording_events_path(&self, recording_id: &str) -> PathBuf {
-        self.root
-            .join("recordings")
-            .join(recording_id)
-            .join("events.jsonl")
-    }
+    // NOTE: the recording tape's location deliberately has NO accessor here. It
+    // is private to `scope`, because a `pub fn` handing out a `&Path` to the
+    // tape is what let three readers ship with no correlation scope at all —
+    // one of them publishing every request in a production session through an
+    // unauthenticated endpoint. Read a recording through
+    // `scope::ScopedRecording`; the three uses that genuinely need the path
+    // (ingest, an existence check, the kernel subprocess) go through
+    // `scope::TapeSlot`. `tests/scope_invariant.rs` enforces it.
     pub fn lookup_table_path(&self, run_id: &str) -> PathBuf {
         self.root
             .join("lookup-tables")

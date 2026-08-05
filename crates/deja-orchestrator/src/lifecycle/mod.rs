@@ -617,7 +617,7 @@ fn drive_record(
     ctx.artifact(
         Some(&recording_id),
         "events",
-        &root.recording_events_path(&recording_id),
+        &crate::scope::TapeSlot::for_write(root, &recording_id),
     );
     Ok(())
 }
@@ -636,12 +636,17 @@ fn drive_replay(
     set_status(root, run, RunStatus::Resolving, None);
     ctx.run_state("resolving");
     let recording_id = stage_resolve_recording(root, run, ctx, total)?;
-    let recording_path = root.recording_events_path(&recording_id);
+    // ONE scope for the whole run: the same object renders the lookup table,
+    // seeds the stores, drives the kernel and scores the result, so the four
+    // stages cannot disagree about which test cases this run covers.
+    let scope = crate::scope::RunScope::of(run);
+    let recording = crate::scope::ScopedRecording::open(root, &recording_id, scope.clone())
+        .map_err(|e| format!("open recording {recording_id}: {e}"))?;
 
     // Render the lookup table (whole-document JSON; round-trips through both the
     // candidate's LocalFileLookupSource and the divergence detector).
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording_path, &recording_id, 1)
+    let table = crate::lookup::render_lookup_table(&recording, &recording_id, 1)
         .map_err(|e| format!("render lookup table: {e}"))?;
     write_json(&root.lookup_table_path(&run.run_id), &table)
         .map_err(|e| format!("write lookup table: {e}"))?;
@@ -713,13 +718,7 @@ fn drive_replay(
     // recorded preconditions into concrete stores before the replay workload
     // runs; materialization remains best-effort because scoring can still report
     // the replay outcome when store seeding is unavailable.
-    let seed_certificate = materialize_seed_plan(
-        &store,
-        root,
-        &recording_id,
-        &run.run_id,
-        run.spec.correlation_filter.as_deref(),
-    );
+    let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
     match write_json(&seed_certificate_path, &seed_certificate) {
         Ok(()) => ctx.artifact(
@@ -736,7 +735,7 @@ fn drive_replay(
         ctx,
         &recording_id,
         &run.run_id,
-        run.spec.correlation_filter.as_deref(),
+        &scope,
     )?;
 
     // Compose: the orchestrator serves artifacts from its own state dir.
@@ -788,7 +787,7 @@ fn stage_resolve_recording(
                 total,
                 "pulling recording from MinIO (S3)",
             );
-            if !root.recording_events_path(&recording_id).exists() {
+            if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
                 pull_recording(root, ctx, &recording_id)?;
             }
             recording_id
@@ -796,7 +795,7 @@ fn stage_resolve_recording(
     };
     run.recording_id = Some(recording_id.clone());
     ctx.run_recording(&recording_id);
-    if !root.recording_events_path(&recording_id).exists() {
+    if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
         return Err(format!(
             "recording {recording_id} not found in S3 or on disk"
         ));
@@ -891,44 +890,104 @@ impl ArtifactSink {
     }
 }
 
-/// Extract the record-side execution-graph nodes (`DejaRecord::GraphNode`) from
-/// a recording's events tape into a compact `record_graph.jsonl`: the STRUCTURE
+/// Extract the record-side execution-graph nodes (`DejaRecord::GraphNode`) for
+/// THIS RUN'S correlations into a compact `record_graph.jsonl`: the STRUCTURE
 /// of the recorded run's cascade (span ids, parents, names, level, timing, span
 /// fields), NOT its boundary payloads (args/results). The in-pod runner already
 /// holds the recording locally (it drove replay off it); emitting just the graph
 /// nodes as a run artifact lets the record side reach the dashboard through the
 /// SAME S3 sink as the replay side, WITHOUT copying the sensitive recording tape
-/// off the pod. Returns the node count (0 ⇒ no local recording / no nodes ⇒
-/// nothing to publish).
+/// off the pod. Returns the node count (0 ⇒ no nodes ⇒ nothing to publish).
+///
+/// This took a raw `&Path` and emitted EVERY node on the tape: 86,204 nodes /
+/// 29 MB against three driven correlations. Nodes carry `fields` (`key`,
+/// `table`, `value`) and a `golden_log_line` on all 42,310 `ROOT_SPAN`s, so
+/// that published the span structure and field values of every request in a
+/// production session to S3 and out through an unauthenticated `GET /graph`.
+/// That is a containment problem, not a size one — hence a `&ScopedRecording`,
+/// which cannot be constructed without saying which cases the run covers.
 fn write_record_graph_nodes(
-    recording_path: &std::path::Path,
+    recording: &crate::scope::ScopedRecording,
     dest: &std::path::Path,
 ) -> Result<usize, String> {
-    let Ok(file) = std::fs::File::open(recording_path) else {
-        return Ok(0); // no recording on disk (nothing to derive the record graph from)
-    };
-    let mut out = String::new();
-    let mut nodes = 0usize;
-    for line in BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Keep ONLY graph nodes — boundary events (the payloads) never leave.
-        if let Ok(deja::DejaRecord::GraphNode(_)) = serde_json::from_str::<deja::DejaRecord>(&line)
-        {
-            out.push_str(&line);
-            out.push('\n');
-            nodes += 1;
-        }
-    }
-    if nodes == 0 {
+    let nodes = recording
+        .graph_nodes()
+        .map_err(|e| format!("scoped record graph: {e}"))?;
+    if nodes.is_empty() {
         return Ok(0);
+    }
+    let mut out = String::new();
+    for node in &nodes {
+        // Round-trip through the wire enum so the artifact keeps the tagged
+        // one-stream shape the dashboard's reader expects.
+        let line = serde_json::to_string(&deja::DejaRecord::GraphNode(node.clone()))
+            .map_err(|e| format!("encode graph node {}: {e}", node.node_id))?;
+        out.push_str(&line);
+        out.push('\n');
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     std::fs::write(dest, out).map_err(|e| format!("write {}: {e}", dest.display()))?;
-    Ok(nodes)
+    Ok(nodes.len())
+}
+
+/// Derive the record-side execution graph for this run and leave it at
+/// `record_graph_path`, ready to publish. Split out of `score_and_register` and
+/// called BEFORE anything scores, because its two refusals are refusals about
+/// the RECORDING, not about the candidate: a run must never persist a verdict it
+/// then disowns. Run after scoring, a pre-`graph_node_id` tape produced a run
+/// record that carried a verdict AND was marked failed, which is harder to read
+/// than either outcome alone.
+///
+/// `Ok(Some(n))` — n nodes extracted, publish them. `Ok(None)` — nothing to
+/// publish, for a reason already named on stderr. `Err` — refuse the run.
+fn extract_record_graph(
+    root: &HarnessRoot,
+    run: &Run,
+    recording_id: &str,
+) -> Result<Option<usize>, String> {
+    // Record-side execution graph: the recorded run's cascade STRUCTURE (graph
+    // nodes only — never the boundary payloads), derived from the recording the
+    // runner already holds locally, scoped to the run's own correlations.
+    let scope = crate::scope::RunScope::of(run);
+    match crate::scope::ScopedRecording::open(root, recording_id, scope) {
+        Ok(recording) => {
+            match write_record_graph_nodes(&recording, &root.record_graph_path(&run.run_id)) {
+                // Nothing to publish, and under a pinned scope this is now
+                // unreachable (the extractor refuses rather than returning an empty
+                // graph). Under EntireSession it means the tape truly carries no
+                // graph. Staying quiet here is what let an entire missing
+                // record-side graph look like an ordinary run for weeks — the
+                // dashboard renders the absence as "skipped" on every row, which
+                // reads as a finding.
+                Ok(0) => {
+                    eprintln!(
+                    "lifecycle: recording {recording_id} carries NO graph nodes — the record side \
+                     of the execution graph will be empty and no comparison is possible"
+                );
+                    Ok(None)
+                }
+                Ok(node_count) => Ok(Some(node_count)),
+                // A DECISION, not a log line. The two refusals this can carry — no
+                // anchors at all, or an in-scope correlation that reaches no root —
+                // both mean the alternative to failing is publishing a graph that is
+                // silently empty or silently missing a case, which reads as "this
+                // run had no cascade". That is strictly worse than the bug. The
+                // message names the correlations, so the refusal is actionable.
+                Err(e) => Err(format!("record-graph extract: {e}")),
+            }
+        }
+        // No tape on this node: a different problem from a tape without a graph,
+        // and not one the record-graph step can decide anything about.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "lifecycle: no recording {recording_id} on disk — record graph not extracted ({e})"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(format!("open recording {recording_id}: {e}")),
+    }
 }
 
 /// replay artifacts (best-effort; absent files are skipped).
@@ -948,6 +1007,12 @@ fn score_and_register(
         total,
         "scoring divergence (byte-exact)",
     );
+    // BEFORE the verdict, deliberately. This step can refuse the run, and a run
+    // that is going to be refused must not first write a scorecard and push a
+    // result the caller then marks failed. `set_stage` above is a label, not a
+    // verdict, so it is safe on this side of the refusal.
+    let record_graph_nodes = extract_record_graph(root, run, recording_id)?;
+
     let card = crate::divergence::detect_and_score(root, &run.run_id)
         .map_err(|e| format!("score: {e}"))?;
     let verdict_line = format!(
@@ -990,49 +1055,24 @@ fn score_and_register(
         }
     }
 
-    // Record-side execution graph: the recorded run's cascade STRUCTURE (graph
-    // nodes only — never the boundary payloads), derived from the recording the
-    // runner already holds locally. Published through the SAME sink so the
-    // dashboard's `/graph` record side renders for in-pod runs too, WITHOUT the
-    // sensitive recording tape ever leaving the pod. (Compose registers the local
-    // path; the orchestrator also reads the recording directly there, so this is
-    // belt-and-suspenders — but it keeps both modes on one artifact contract.)
-    let record_graph_path = root.record_graph_path(&run.run_id);
-    match write_record_graph_nodes(
-        &root.recording_events_path(recording_id),
-        &record_graph_path,
-    ) {
-        // Nothing to publish. Say which of the two reasons it was: an absent
-        // recording is a different problem from a recording that carries no
-        // graph. Staying quiet here is what let an entire missing record-side
-        // graph look like an ordinary run for weeks — the dashboard renders the
-        // absence as "skipped" on every row, which reads as a finding.
-        Ok(0) => {
-            let events = root.recording_events_path(recording_id);
-            if events.exists() {
-                eprintln!(
-                    "lifecycle: recording {recording_id} carries NO graph nodes — the record side \
-                     of the execution graph will be empty and no comparison is possible"
-                );
-            } else {
-                eprintln!(
-                    "lifecycle: no recording at {} — record graph not extracted",
-                    events.display()
-                );
-            }
+    // Record-side execution graph: PUBLISH only — it was extracted (and could
+    // have refused the run) before scoring. Published through the SAME sink as
+    // the replay side so the dashboard's `/graph` record side renders for in-pod
+    // runs too, WITHOUT the sensitive recording tape ever leaving the pod.
+    // (Compose registers the local path; the orchestrator also reads the
+    // recording directly there, so this is belt-and-suspenders — but it keeps
+    // both modes on one artifact contract.)
+    if let Some(node_count) = record_graph_nodes {
+        let record_graph_path = root.record_graph_path(&run.run_id);
+        if let Some((uri, bytes)) =
+            sink.publish(&run.run_id, "record_graph.jsonl", &record_graph_path)
+        {
+            ctx.artifact_uri(Some(recording_id), "record_graph", &uri, Some(bytes));
+            index.insert(
+                "record_graph".to_owned(),
+                serde_json::json!({ "uri": uri, "bytes": bytes, "nodes": node_count }),
+            );
         }
-        Ok(node_count) => {
-            if let Some((uri, bytes)) =
-                sink.publish(&run.run_id, "record_graph.jsonl", &record_graph_path)
-            {
-                ctx.artifact_uri(Some(recording_id), "record_graph", &uri, Some(bytes));
-                index.insert(
-                    "record_graph".to_owned(),
-                    serde_json::json!({ "uri": uri, "bytes": bytes, "nodes": node_count }),
-                );
-            }
-        }
-        Err(e) => eprintln!("lifecycle: record-graph extract failed: {e}"),
     }
 
     // Static HTML visualization (the demo's existing visualize-replay.py);
@@ -1143,10 +1183,15 @@ pub fn drive_replay_in_pod(
     set_status(root, run, RunStatus::Resolving, None);
     ctx.run_state("resolving");
     let recording_id = stage_resolve_recording(root, run, ctx, total)?;
-    let recording_path = root.recording_events_path(&recording_id);
+    // ONE scope for the whole run: the same object renders the lookup table,
+    // seeds the stores, drives the kernel and scores the result, so the four
+    // stages cannot disagree about which test cases this run covers.
+    let scope = crate::scope::RunScope::of(run);
+    let recording = crate::scope::ScopedRecording::open(root, &recording_id, scope.clone())
+        .map_err(|e| format!("open recording {recording_id}: {e}"))?;
 
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording_path, &recording_id, 1)
+    let table = crate::lookup::render_lookup_table(&recording, &recording_id, 1)
         .map_err(|e| format!("render lookup table: {e}"))?;
     write_json(&root.lookup_table_path(&run.run_id), &table)
         .map_err(|e| format!("write lookup table: {e}"))?;
@@ -1220,13 +1265,7 @@ pub fn drive_replay_in_pod(
     }
 
     flush_redis(&store)?;
-    let seed_certificate = materialize_seed_plan(
-        &store,
-        root,
-        &recording_id,
-        &run.run_id,
-        run.spec.correlation_filter.as_deref(),
-    );
+    let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
     match write_json(&seed_certificate_path, &seed_certificate) {
         Ok(()) => ctx.artifact(
@@ -1272,7 +1311,7 @@ pub fn drive_replay_in_pod(
         ctx,
         &recording_id,
         &run.run_id,
-        run.spec.correlation_filter.as_deref(),
+        &scope,
     )?;
 
     // In-pod: DEJA_RUN_ARTIFACT_S3=1 (Job template) uploads artifacts to S3 so
@@ -1794,33 +1833,17 @@ impl SeedReadback {
 /// Best-effort throughout: a missing/unparseable recording, an unmapped row, or
 /// an unreachable store logs and continues rather than failing the replay
 /// (matching the prior hand-coded seeds' best-effort behavior).
-/// Restrict the seed correlation set to the run's test-case subset. `None`
-/// (uncorrelated/ambient) correlations are always kept; a non-empty filter keeps
-/// only the listed correlation ids. An empty/unset filter keeps everything, so
-/// the default (seed all) is unchanged. Pure + separate so the selection
-/// semantics are unit-tested without a live store.
-fn select_seed_correlations(
-    mut correlations: Vec<Option<String>>,
-    correlation_filter: Option<&[String]>,
-) -> Vec<Option<String>> {
-    if let Some(filter) = correlation_filter.filter(|f| !f.is_empty()) {
-        correlations.retain(|c| match c {
-            None => true,
-            Some(id) => filter.iter().any(|f| f == id),
-        });
-    }
-    correlations
-}
-
 fn materialize_seed_plan(
     store: &StoreExec,
-    root: &HarnessRoot,
-    recording_id: &str,
+    recording: &crate::scope::ScopedRecording,
     run_id: &str,
-    correlation_filter: Option<&[String]>,
 ) -> SeedCertificate {
-    let recording_path = root.recording_events_path(recording_id);
-    let events = read_recording_events(&recording_path);
+    let recording_id = recording.recording_id();
+    // Scoped at the READER, not after: the filter used to be re-applied here to
+    // a Vec of every correlation in the session (~42,310 deduped ids compared
+    // against the run's 3), and any future seeding path that forgot the
+    // parameter would silently seed the whole session.
+    let events = read_scoped_events(recording);
     // PER-CORRELATION ISOLATION (R1). Each request is an independent test case;
     // its preconditions are seeded into ITS OWN namespace, NOT a shared/unioned
     // store, so cases can't collide and read-modify-write can't double-apply —
@@ -1834,15 +1857,12 @@ fn materialize_seed_plan(
         events.iter().map(|e| e.correlation_id.clone()).collect();
     correlations.sort();
     correlations.dedup();
-    // Test-case subset (R1): when the run pins a correlation_filter, seed ONLY
-    // those correlations — the SAME subset the kernel drives (run_kernel) and
-    // scoring scopes to (divergence). Without this, seeding clones a full
+    // Test-case subset (R1): `recording` already carries the run's scope, so
+    // these are exactly the correlations the kernel drives (`run_kernel`) and
+    // scoring scopes to (`divergence`). Without it, seeding clones a full
     // public-schema per correlation for EVERY recorded correlation — including
     // the many single-event health checks that are never driven — which is
-    // O(correlations × schema) and dominates runtime on a real recording. The
-    // three (seed/drive/score) stay consistent because they all read the SAME
-    // explicit list off the run spec.
-    correlations = select_seed_correlations(correlations, correlation_filter);
+    // O(correlations x schema) and dominates runtime on a real recording.
 
     // DB isolation + seeding is ON by default (R1: real seeding). `DEJA_SEED_DB=0`
     // is a kill-switch that falls back to the old shared-pg self-rebuild. When on,
@@ -3014,30 +3034,29 @@ fn render_redis_seed_value(value: &serde_json::Value) -> Option<String> {
 /// Read a recording's boundary events JSONL, tolerating non-event records from
 /// the shared `DejaRecord` stream exactly like the lookup renderer does.
 /// Returns an empty vec on any I/O failure (best-effort seeding).
-fn read_recording_events(path: &std::path::Path) -> Vec<deja::BoundaryEvent> {
-    let Ok(file) = std::fs::File::open(path) else {
-        eprintln!(
-            "lifecycle: seed plan: recording {} not readable; skipping seeding",
-            path.display()
-        );
-        return Vec::new();
+/// Drain a scoped recording into memory for seed planning, which needs random
+/// access per correlation. Materializing is acceptable HERE and only here
+/// because the scope has already cut the stream down to the run's own cases; on
+/// a whole session this is the 361 MB the streaming readers exist to avoid.
+/// Best-effort: an unreadable tape logs and yields nothing rather than failing
+/// the replay, matching the prior hand-coded seeds' behavior.
+fn read_scoped_events(recording: &crate::scope::ScopedRecording) -> Vec<deja::BoundaryEvent> {
+    let stream = match recording.events() {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!(
+                "lifecycle: seed plan: recording {} not readable ({e}); skipping seeding",
+                recording.recording_id()
+            );
+            return Vec::new();
+        }
     };
-    let reader = std::io::BufReader::new(file);
-    let mut events = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        // The current wire format is a single `DejaRecord` stream. Boundary
-        // events feed seed planning; graph nodes and replay observations do not.
-        if let Ok(deja::DejaRecord::BoundaryEvent(ev)) =
-            serde_json::from_str::<deja::DejaRecord>(&line)
-        {
-            events.push(*ev);
-        }
-    }
-    events
+    stream
+        .filter_map(|item| match item {
+            crate::scope::TapeItem::Event(event) => Some(*event),
+            crate::scope::TapeItem::Malformed { .. } => None,
+        })
+        .collect()
 }
 
 /// Load the ambient/config template for seed materialization (deliverable 4).
@@ -3141,20 +3160,22 @@ fn run_kernel(
     ctx: &StoreCtx,
     recording_id: &str,
     run_id: &str,
-    correlation_filter: Option<&[String]>,
+    scope: &crate::scope::RunScope,
 ) -> Result<(), String> {
-    let recording_path = root.recording_events_path(recording_id);
     let diff_sink = root.http_diff_path(run_id);
     let mut cmd = Command::new(kernel_bin);
-    cmd.env("KERNEL_RECORDING_PATH", &recording_path)
-        .env("KERNEL_TARGET_HOST", "127.0.0.1")
-        .env("KERNEL_TARGET_PORT", target_port.to_string())
-        .env("KERNEL_HTTP_DIFF_SINK", &diff_sink);
-    // Test-case subset: the kernel drives only these correlations; scoring
-    // scopes to the same list (load_artifacts reads it off the run spec).
-    if let Some(filter) = correlation_filter.filter(|f| !f.is_empty()) {
-        cmd.env("KERNEL_CORRELATION_FILTER", filter.join(","));
-    }
+    // The scope crosses a PROCESS boundary here, so the tape path and the
+    // correlation filter are emitted by ONE call and cannot be set apart: a
+    // caller that set the path and forgot the filter pointed the kernel at the
+    // whole session.
+    cmd.envs(crate::scope::TapeSlot::subprocess(
+        root,
+        recording_id,
+        scope,
+    ))
+    .env("KERNEL_TARGET_HOST", "127.0.0.1")
+    .env("KERNEL_TARGET_PORT", target_port.to_string())
+    .env("KERNEL_HTTP_DIFF_SINK", &diff_sink);
     // empty allowlist by default = byte-exact gate; override via
     // KERNEL_BODY_ALLOWLIST on the harness-api process during bring-up.
     let status = run_streamed(cmd, ctx, "driving recorded requests (kernel)", "kernel")?;
@@ -3348,7 +3369,7 @@ fn wait_s3_objects(recording_id: &str, timeout: Duration) -> Result<(), String> 
 /// artifacts; the recording catalog row upserts from the manifest.
 fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Result<(), String> {
     let cfg = crate::s3::S3Config::from_env();
-    let dest = root.recording_events_path(recording_id);
+    let dest = crate::scope::TapeSlot::for_write(root, recording_id);
     let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &dest)?;
     let gaps: usize = manifest.instances.iter().map(|i| i.gaps.len()).sum();
     let line = format!(
@@ -3412,7 +3433,7 @@ fn resolve_recording_from_source(
     wanted: Option<&str>,
 ) -> Result<String, String> {
     if let Some(id) = wanted {
-        if root.recording_events_path(id).exists() {
+        if crate::scope::TapeSlot::is_materialized(root, id) {
             eprintln!("lifecycle: recording {id} already ingested; reusing");
             return Ok(id.to_owned());
         }
@@ -3420,7 +3441,7 @@ fn resolve_recording_from_source(
     let (cfg, prefix) = source.to_config()?;
     let (report, resolved, seen) =
         crate::s3::pull_recording_from_prefix(&cfg, &prefix, wanted, |sid| {
-            root.recording_events_path(sid)
+            crate::scope::TapeSlot::for_write(root, sid)
         })?;
     if seen.len() > 1 {
         let others = seen
@@ -3452,7 +3473,7 @@ fn resolve_recording_from_source(
             report.prefix
         ));
     }
-    let dest = root.recording_events_path(&resolved);
+    let dest = crate::scope::TapeSlot::for_write(root, &resolved);
     // Same consumer shim as the session-layout pull (deja-tui / metrics).
     let legacy_copy = root.root.join("recording").join("semantic-events.jsonl");
     if let Some(parent) = legacy_copy.parent() {
@@ -3482,28 +3503,39 @@ fn resolve_recording_from_source(
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
     use super::*;
+    use crate::scope::{RunScope, ScopedRecording, TapeSlot};
     use crate::{CandidateSpec, RunSpec};
 
+    /// Write a tape into the canonical slot and open it at `scope`.
+    fn recording(body: &str, scope: RunScope) -> (tempfile::TempDir, ScopedRecording) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let path = TapeSlot::for_write(&root, "rec-1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let opened = ScopedRecording::open(&root, "rec-1", scope).unwrap();
+        (dir, opened)
+    }
+
+    /// Seeding scopes to the run's test cases and always keeps ambient
+    /// (uncorrelated) preconditions, which are shared across cases. This used to
+    /// be a `select_seed_correlations` pass over every correlation in the
+    /// session; the scope now applies at the reader, so the property lives here.
     #[test]
-    fn select_seed_correlations_scopes_to_filter_and_keeps_ambient() {
-        let all = || {
-            vec![
-                None, // ambient / uncorrelated
-                Some("pay-1".to_string()),
-                Some("health-1".to_string()),
-                Some("health-2".to_string()),
-                Some("pay-2".to_string()),
-            ]
-        };
-        // Unset / empty filter -> unchanged (seed everything).
-        assert_eq!(select_seed_correlations(all(), None), all());
-        assert_eq!(select_seed_correlations(all(), Some(&[])), all());
-        // Non-empty filter -> only the listed correlations, plus ambient (None).
-        let filter = vec!["pay-1".to_string(), "pay-2".to_string()];
-        assert_eq!(
-            select_seed_correlations(all(), Some(&filter)),
-            vec![None, Some("pay-1".to_string()), Some("pay-2".to_string())],
-            "keeps ambient + the two payment correlations, drops the health checks"
+    fn seed_scope_keeps_the_listed_cases_and_all_ambient_preconditions() {
+        let unfiltered = RunScope::from_filter(None);
+        for id in ["pay-1", "health-1"] {
+            assert!(unfiltered.contains(Some(id)), "no filter seeds everything");
+        }
+        assert!(RunScope::from_filter(Some(&[])).contains(Some("health-1")));
+
+        let scope = RunScope::from_filter(Some(&["pay-1".to_string(), "pay-2".to_string()]));
+        assert!(scope.contains(Some("pay-1")));
+        assert!(scope.contains(Some("pay-2")));
+        assert!(!scope.contains(Some("health-1")), "health checks drop out");
+        assert!(
+            scope.contains(None),
+            "ambient/uncorrelated preconditions are shared and always seeded"
         );
     }
 
@@ -4138,9 +4170,7 @@ mod tests {
     }
 
     #[test]
-    fn read_recording_events_tolerates_non_event_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
+    fn read_scoped_events_tolerates_non_event_lines() {
         let body = format!(
             "{}\n# a header / non-event line\n\n{}\n{}\n",
             settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
@@ -4148,16 +4178,36 @@ mod tests {
             // graph nodes ride the same tape; they are not seed-plan inputs
             r#"{"record_kind":"graph_node","node_id":1,"global_sequence":1,"sequence":1,"span_name":"root","target":"router","level":"INFO","fields":{},"started_ns":1}"#,
         );
-        std::fs::write(&path, body).unwrap();
-        let events = read_recording_events(&path);
+        let (_dir, rec) = recording(&body, RunScope::entire_session());
+        let events = read_scoped_events(&rec);
         assert_eq!(events.len(), 1, "only the one valid event parses");
         assert_eq!(events[0].read_set, vec!["settlement_rate_default"]);
     }
 
+    /// Seeding must materialize preconditions for the run's cases only: a
+    /// whole-session seed clones a pg schema per recorded correlation, which is
+    /// O(correlations x schema) against the 42,310 on a production tape.
+    #[test]
+    fn read_scoped_events_yields_only_the_run_s_cases() {
+        let body = format!(
+            "{}\n{}\n",
+            settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
+            settlement_read_event_jsonl("c2", "settlement_rate_default", "0.99"),
+        );
+        let (_dir, rec) = recording(&body, RunScope::from_filter(Some(&["c1".to_string()])));
+        let events = read_scoped_events(&rec);
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.correlation_id.clone())
+                .collect::<Vec<_>>(),
+            [Some("c1".to_string())],
+            "an undriven correlation must not be seeded"
+        );
+    }
+
     #[test]
     fn record_graph_extract_keeps_only_graph_nodes_and_drops_payloads() {
-        let dir = tempfile::tempdir().unwrap();
-        let recording = dir.path().join("events.jsonl");
         // A tape interleaving graph-node STRUCTURE with a boundary event that
         // carries a payment payload — the exact thing that must NOT leave the pod.
         let secret_value = "SECRET_SETTLEMENT_PAYLOAD";
@@ -4167,10 +4217,10 @@ mod tests {
             settlement_read_event_jsonl("c1", "settlement_rate_default", secret_value),
             r#"{"record_kind":"graph_node","node_id":2,"global_sequence":3,"sequence":2,"parent_id":1,"span_name":"charge","target":"router","level":"INFO","fields":{},"started_ns":2}"#,
         );
-        std::fs::write(&recording, body).unwrap();
+        let (dir, rec) = recording(&body, RunScope::entire_session());
 
         let dest = dir.path().join("record-graph.jsonl");
-        let n = write_record_graph_nodes(&recording, &dest).unwrap();
+        let n = write_record_graph_nodes(&rec, &dest).unwrap();
         assert_eq!(
             n, 2,
             "both graph nodes extracted, the boundary event dropped"
@@ -4191,16 +4241,217 @@ mod tests {
         }
     }
 
+    /// The reported bug: a run driving three correlations published the span
+    /// structure and field values of EVERY request in the recorded session —
+    /// 86,204 nodes / 29 MB — to S3 and out through an unauthenticated
+    /// `GET /graph`.
+    #[test]
+    fn record_graph_extract_publishes_only_the_run_s_own_correlations() {
+        let mut driven = serde_json::from_str::<serde_json::Value>(&settlement_read_event_jsonl(
+            "c-driven",
+            "settlement_rate_default",
+            "0.10",
+        ))
+        .unwrap();
+        driven["graph_node_id"] = serde_json::json!(2);
+        let mut foreign = serde_json::from_str::<serde_json::Value>(&settlement_read_event_jsonl(
+            "c-foreign",
+            "settlement_rate_default",
+            "0.99",
+        ))
+        .unwrap();
+        foreign["graph_node_id"] = serde_json::json!(11);
+
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"record_kind":"graph_node","node_id":1,"global_sequence":1,"sequence":1,"span_name":"ROOT_SPAN","target":"router","level":"INFO","fields":{},"started_ns":1}"#,
+            r#"{"record_kind":"graph_node","node_id":2,"global_sequence":2,"sequence":2,"parent_id":1,"span_name":"charge","target":"router","level":"INFO","fields":{},"started_ns":2}"#,
+            r#"{"record_kind":"graph_node","node_id":10,"global_sequence":10,"sequence":10,"span_name":"ROOT_SPAN","target":"router","level":"INFO","fields":{"golden_log_line":"OTHER_TENANT_REQUEST"},"started_ns":10}"#,
+            r#"{"record_kind":"graph_node","node_id":11,"global_sequence":11,"sequence":11,"parent_id":10,"span_name":"charge","target":"router","level":"INFO","fields":{},"started_ns":11}"#,
+            [driven.to_string(), foreign.to_string()].join("\n"),
+        );
+        let (dir, rec) = recording(
+            &body,
+            RunScope::from_filter(Some(&["c-driven".to_string()])),
+        );
+        let dest = dir.path().join("record-graph.jsonl");
+        let n = write_record_graph_nodes(&rec, &dest).unwrap();
+
+        let out = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(n, 2, "only the driven request's span tree: {out}");
+        assert!(
+            !out.contains("OTHER_TENANT_REQUEST"),
+            "another request's span fields reached the published artifact: {out}"
+        );
+    }
+
     #[test]
     fn record_graph_extract_absent_recording_is_a_noop() {
+        // No recording on disk (compose without ingest): opening refuses rather
+        // than quietly reporting an empty graph, and score_and_register treats
+        // that NotFound as "nothing to extract" instead of a run failure.
         let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("record-graph.jsonl");
-        // No recording on disk (compose without ingest) → 0 nodes, no file written.
-        let n = write_record_graph_nodes(&dir.path().join("missing.jsonl"), &dest).unwrap();
-        assert_eq!(n, 0);
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        assert!(!TapeSlot::is_materialized(&root, "missing"));
+        let err = ScopedRecording::open(&root, "missing", RunScope::entire_session()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Which cases on the staged tape name a graph node — i.e. which of the two
+    /// refusals, if any, the record-graph extract will raise.
+    enum Anchoring {
+        /// Both driven cases anchor: nothing refuses.
+        All,
+        /// No case anchors: the "tape carries no `graph_node_id`" refusal.
+        None,
+        /// One case anchors and one does not: the "reaches no root" refusal,
+        /// which must NAME the case that would have vanished.
+        Partial,
+    }
+
+    /// Stage the on-disk state a replay run reaches `score_and_register` with:
+    /// a two-case tape in the canonical slot and the run record beside it.
+    fn staged_replay_run(anchoring: &Anchoring) -> (tempfile::TempDir, HarnessRoot, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-order";
+        let recording_id = "rec-order";
+
+        let case = |correlation: &str, anchor: Option<u64>| {
+            let mut event = serde_json::from_str::<serde_json::Value>(
+                &settlement_read_event_jsonl(correlation, "settlement_rate_default", "0.10"),
+            )
+            .unwrap();
+            event["graph_node_id"] = serde_json::json!(anchor);
+            event.to_string()
+        };
+        let (first, second) = match anchoring {
+            Anchoring::All => (Some(2), Some(4)),
+            Anchoring::None => (None, None),
+            Anchoring::Partial => (Some(2), None),
+        };
+        let body = [
+            r#"{"record_kind":"graph_node","node_id":1,"global_sequence":1,"sequence":1,"span_name":"ROOT_SPAN","target":"router","level":"INFO","fields":{},"started_ns":1}"#.to_owned(),
+            r#"{"record_kind":"graph_node","node_id":2,"global_sequence":2,"sequence":2,"parent_id":1,"span_name":"charge","target":"router","level":"INFO","fields":{},"started_ns":2}"#.to_owned(),
+            r#"{"record_kind":"graph_node","node_id":3,"global_sequence":3,"sequence":3,"span_name":"ROOT_SPAN","target":"router","level":"INFO","fields":{},"started_ns":3}"#.to_owned(),
+            r#"{"record_kind":"graph_node","node_id":4,"global_sequence":4,"sequence":4,"parent_id":3,"span_name":"charge","target":"router","level":"INFO","fields":{},"started_ns":4}"#.to_owned(),
+            case("c-driven-1", first),
+            case("c-driven-2", second),
+        ]
+        .join("\n");
+        let tape = TapeSlot::for_write(&root, recording_id);
+        std::fs::create_dir_all(tape.parent().unwrap()).unwrap();
+        std::fs::write(&tape, body + "\n").unwrap();
+
+        let run = Run {
+            run_id: run_id.to_owned(),
+            spec: RunSpec {
+                mode: crate::RunMode::Replay,
+                candidate_spec: CandidateSpec::PrebuiltImage {
+                    image: "deja-demo".to_owned(),
+                },
+                candidate_repo: None,
+                recording_id: Some(recording_id.to_owned()),
+                s3_source: None,
+                correlation_filter: Some(vec!["c-driven-1".to_owned(), "c-driven-2".to_owned()]),
+                workload: serde_json::Value::Null,
+            },
+            status: RunStatus::Running,
+            recording_id: Some(recording_id.to_owned()),
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        write_json(&root.run_path(run_id), &run).unwrap();
+        (dir, root, run)
+    }
+
+    /// ORDERING, and it is the point of the split: the record-graph refusal is a
+    /// statement about the RECORDING, so it has to happen before the run is
+    /// scored. Run after scoring — as it was — a pre-`graph_node_id` tape wrote
+    /// a scorecard, pushed a verdict, and was THEN failed, leaving a run record
+    /// that carried a verdict and was marked failed at the same time. That is
+    /// harder to read than either outcome alone.
+    #[test]
+    fn a_refused_record_graph_fails_the_run_before_any_verdict_is_written() {
+        let (_dir, root, mut run) = staged_replay_run(&Anchoring::None);
+        let ctx = StoreCtx::disabled(&run.run_id);
+        let err = score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
+            .unwrap_err();
+
         assert!(
-            !dest.exists(),
-            "nothing to publish → no empty artifact left behind"
+            err.contains("record-graph extract"),
+            "the failure names the step that refused: {err}"
+        );
+        assert!(
+            err.contains("graph_node_id"),
+            "and the reason, so an old tape is actionable: {err}"
+        );
+        assert!(
+            !root.scorecard_path(&run.run_id).exists(),
+            "a run that is going to be refused must not first persist a verdict"
+        );
+        assert!(
+            !root.call_ledger_path(&run.run_id).exists(),
+            "nor the ledger the scorecard writes alongside it"
+        );
+        assert!(
+            !root
+                .root
+                .join("runs")
+                .join(format!("{}.manifest.json", run.run_id))
+                .exists(),
+            "nor a run manifest claiming artifacts that were never published"
+        );
+    }
+
+    /// The other refusal, end to end: when only SOME cases anchor, the run still
+    /// fails before scoring AND the message names the case whose spans would
+    /// otherwise have been missing with no sign that anything was dropped. The
+    /// name has to survive two wrapping layers to reach the run's failure
+    /// reason, which is the only place an operator will read it.
+    #[test]
+    fn a_partially_anchored_tape_names_the_case_that_would_have_vanished() {
+        let (_dir, root, mut run) = staged_replay_run(&Anchoring::Partial);
+        let ctx = StoreCtx::disabled(&run.run_id);
+        let err = score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
+            .unwrap_err();
+
+        assert!(
+            err.contains("c-driven-2"),
+            "the refusal must name the unreachable case: {err}"
+        );
+        assert!(
+            !err.contains("c-driven-1"),
+            "and only that one — the anchored case is fine: {err}"
+        );
+        assert!(
+            !root.scorecard_path(&run.run_id).exists(),
+            "still refused before any verdict is persisted"
+        );
+    }
+
+    /// The positive control: the same path on a fully ANCHORED tape must still
+    /// score and write the verdict, or the assertions above pass for the wrong
+    /// reason.
+    #[test]
+    fn an_anchored_record_graph_still_scores_and_writes_the_verdict() {
+        let (_dir, root, mut run) = staged_replay_run(&Anchoring::All);
+        let ctx = StoreCtx::disabled(&run.run_id);
+        score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
+            .expect("an anchored tape scores normally");
+        assert!(
+            root.scorecard_path(&run.run_id).exists(),
+            "the verdict is persisted when nothing refuses"
+        );
+        let nodes = std::fs::read_to_string(root.record_graph_path(&run.run_id)).unwrap();
+        assert_eq!(
+            nodes.lines().count(),
+            4,
+            "and both driven cases' span trees are extracted: {nodes}"
         );
     }
 
@@ -4209,14 +4460,11 @@ mod tests {
     /// both to the byte-identical redis values the old hand-coded seeds wrote.
     #[test]
     fn seed_plan_yields_settlement_rates_from_recording_and_template() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
-        std::fs::write(
-            &path,
-            settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
-        )
-        .unwrap();
-        let events = read_recording_events(&path);
+        let (_dir, rec) = recording(
+            &settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
+            RunScope::entire_session(),
+        );
+        let events = read_scoped_events(&rec);
 
         // Build the plan exactly as materialize_seed_plan does (per-correlation,
         // unioned, then ambient-merged).
