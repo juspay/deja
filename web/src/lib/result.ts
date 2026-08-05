@@ -18,7 +18,7 @@
 // `total_correlations === 0` is a GUARD THAT FORBIDS GREEN, not a sixth state:
 // it downgrades to INCONCLUSIVE and carries the reason.
 
-import { RunRow, Scorecard } from "./api";
+import { RunRow, Scorecard, runParams } from "./api";
 
 export type ResultState =
   /** Not terminal yet. Nothing is known. */
@@ -230,15 +230,18 @@ export function candidateRef(run: RunRow): { label: string; full: string } {
 /**
  * Attempt ordinals, DERIVED CLIENT-SIDE from what the list endpoint carries.
  *
- * The server persists `params = {"workload": …}` and drops the rest of the run
- * spec, so there is no stored subject key to group on (no correlation filter, no
- * s3 source). The best subject available here is mode + recording + candidate
- * ref; two runs of the same three that differed only in correlation scope will
- * group together. Labelled "derived" in the UI for exactly that reason.
+ * The subject is what makes two runs the same experiment: mode + recording +
+ * candidate ref + the correlation scope that was driven. The scope comes from
+ * the run's persisted request; rows created before requests were persisted
+ * carry none, and two of those differing only in scope still group together.
+ * Labelled "derived" in the UI for that reason.
  */
 export function attemptOrdinals(runs: RunRow[]): Map<string, { attempt: number; of: number }> {
-  const subject = (r: RunRow) =>
-    `${r.mode}|${(r.recording_id ?? "").trim()}|${candidateRef(r).full}`;
+  const subject = (r: RunRow) => {
+    const scope = runParams(r)?.correlation_filter;
+    const scopeKey = scope ? [...scope].sort().join(",") : "*";
+    return `${r.mode}|${(r.recording_id ?? "").trim()}|${candidateRef(r).full}|${scopeKey}`;
+  };
   const groups = new Map<string, RunRow[]>();
   for (const r of runs) {
     const k = subject(r);

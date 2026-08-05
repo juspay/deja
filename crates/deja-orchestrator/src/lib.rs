@@ -24,7 +24,7 @@ pub mod store;
 /// Specification of a candidate Hyperswitch identity. All five resolution
 /// modes promised in the plan; only `LocalPath` has a real backing impl in
 /// the first cut (task #7 lands the rest).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CandidateSpec {
     LocalPath { binary_or_source: PathBuf },
@@ -161,11 +161,123 @@ pub struct RunSpec {
     pub workload: serde_json::Value,
 }
 
+impl RunSpec {
+    /// How many times the record workload is driven. THE definition of the
+    /// default: the lifecycle worker and the persisted run record both read it
+    /// here, so the record cannot name a different number than the one that ran.
+    pub fn iterations(&self) -> u64 {
+        self.workload
+            .get("iterations")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1)
+    }
+
+    /// The workload arguments with their defaults filled in — what the run
+    /// actually drives, rather than the absence that stood for it. Keys nothing
+    /// reads yet are kept: they are still part of what was asked. Replay has no
+    /// workload at all, and an empty object there would claim otherwise.
+    fn resolved_workload(&self) -> serde_json::Value {
+        if self.mode != RunMode::Record {
+            return serde_json::Value::Null;
+        }
+        let mut args = match &self.workload {
+            serde_json::Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        args.insert("iterations".to_owned(), self.iterations().into());
+        serde_json::Value::Object(args)
+    }
+}
+
+/// What a run was asked to do, as persisted on its store row
+/// (`replay_runs.params`).
+///
+/// The row's other columns carry identity and outcome. This carries the
+/// REQUEST, which is what makes a finished run reproducible from its own record
+/// and what lets a report state "these correlations, from this recording,
+/// against this candidate" instead of leaving a reader to assume it.
+///
+/// Values are recorded RESOLVED, so the record names what ran rather than what
+/// was typed: the correlation filter after the same normalization the run
+/// itself applies ([`scope::RunScope`] — blanks dropped, deduped, and an empty
+/// filter degraded to the whole session), the workload after its defaults, and
+/// the recording id updated to the concrete session once a run that was given
+/// only an `s3_source` prefix has resolved one.
+///
+/// The candidate ref stays AS DECLARED. Resolving a tag to a digest reads the
+/// executor's environment, and the row already carries what that resolved to
+/// (`candidate_sha256`); a guess here would reintroduce exactly the ambiguity
+/// this record exists to remove.
+///
+/// The shape is [`RunSpec`] plus `expectation` — which is the body
+/// `POST /api/v1/runs` accepts, so a stored row can be posted straight back to
+/// re-run it. `expectation` also has its own column for querying; both are
+/// written by the same insert and neither is ever updated, so they cannot drift.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunParams {
+    pub mode: RunMode,
+    pub candidate_spec: CandidateSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_repo: Option<String>,
+    /// The recording the run drives. Serialized even when absent: for an
+    /// `s3_source` run that has not resolved a session yet, "not resolved" is a
+    /// fact about the run, not a field that happens to be missing.
+    #[serde(default)]
+    pub recording_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_source: Option<S3Source>,
+    /// The driven test-case subset, normalized. `None` = the entire session,
+    /// which is a real answer rather than an absent filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_filter: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub workload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expectation: Option<String>,
+}
+
+impl RunParams {
+    /// The record of an accepted request, with every default already applied.
+    pub fn resolved(spec: &RunSpec, expectation: Option<&str>) -> Self {
+        Self {
+            mode: spec.mode,
+            candidate_spec: spec.candidate_spec.clone(),
+            candidate_repo: spec.candidate_repo.clone(),
+            recording_id: spec.recording_id.clone(),
+            s3_source: spec.s3_source.clone(),
+            correlation_filter: scope::RunScope::of_spec(spec)
+                .ids()
+                .map(|ids| ids.iter().cloned().collect()),
+            workload: spec.resolved_workload(),
+            expectation: expectation.map(str::to_owned),
+        }
+    }
+
+    /// Read a persisted `params` value back.
+    ///
+    /// Rows created before the request was persisted carry `{"workload": null}`
+    /// and nothing else. That is a MISSING request, not a malformed one: the row
+    /// is still a real run and a caller still wants the rest of it, so this
+    /// reports `None` rather than failing the row — or the list query it arrived
+    /// in — over a value that was never written.
+    pub fn from_stored(params: &serde_json::Value) -> Option<Self> {
+        // `candidate_spec` is the load-bearing field and doubles as the marker:
+        // a params object without one carries no request to read.
+        params.get("candidate_spec")?;
+        serde_json::from_value(params.clone()).ok()
+    }
+
+    /// The request as the create endpoint would take it back.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_default()
+    }
+}
+
 /// Where a replay's recording lives when it is NOT in the demo MinIO session
 /// layout: a deployed aggregator's bucket/prefix. Credentials come from the
 /// orchestrator's environment (`DEJA_S3_ACCESS_KEY` / `DEJA_S3_SECRET_KEY`,
 /// same as the session-layout path).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Source {
     /// `s3://bucket/prefix` (scheme optional).
     pub path: String,
@@ -749,6 +861,115 @@ mod schema_fingerprint_tests {
     fn new_sorts_and_dedups() {
         let fp = SchemaFingerprint::new(vec!["002".into(), "001".into(), "002".into()]);
         assert_eq!(fp.applied, vec!["001".to_string(), "002".to_string()]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod run_params_tests {
+    use super::*;
+
+    fn replay_spec() -> RunSpec {
+        RunSpec {
+            mode: RunMode::Replay,
+            candidate_spec: CandidateSpec::PrebuiltImage {
+                image: "registry/hyperswitch:pr-42".to_owned(),
+            },
+            candidate_repo: None,
+            recording_id: None,
+            s3_source: Some(S3Source {
+                path: "s3://deja/recordings/2026-08-05".to_owned(),
+                region: None,
+                endpoint: None,
+            }),
+            correlation_filter: Some(vec![
+                " c-2 ".to_owned(),
+                "c-1".to_owned(),
+                "  ".to_owned(),
+                "c-2".to_owned(),
+            ]),
+            workload: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn the_record_carries_the_whole_request() {
+        let params = RunParams::resolved(&replay_spec(), Some("pass"));
+        let json = params.to_json();
+        // Everything a reader needs to say what was run, and what a re-run needs.
+        assert_eq!(json["mode"], "replay");
+        assert_eq!(
+            json["candidate_spec"]["image"],
+            "registry/hyperswitch:pr-42"
+        );
+        assert_eq!(json["s3_source"]["path"], "s3://deja/recordings/2026-08-05");
+        assert_eq!(json["expectation"], "pass");
+        // The recording is not resolved yet, and the record says so out loud
+        // rather than by omission.
+        assert!(json.get("recording_id").is_some());
+        assert!(json["recording_id"].is_null());
+        // A record that says `null` where a default was applied has the defect
+        // this record exists to fix, so the filter is stored NORMALIZED — the
+        // subset the run actually drives, not the string that was typed.
+        assert_eq!(
+            params.correlation_filter.as_deref(),
+            Some(&["c-1".to_owned(), "c-2".to_owned()][..]),
+            "blanks dropped, deduped, sorted — the same normalization the run applies"
+        );
+    }
+
+    #[test]
+    fn the_workload_records_the_iteration_count_that_ran() {
+        let mut spec = replay_spec();
+        spec.mode = RunMode::Record;
+        spec.s3_source = None;
+        spec.correlation_filter = None;
+
+        // An implicit iteration count is recorded as the number that ran.
+        let params = RunParams::resolved(&spec, None);
+        assert_eq!(spec.iterations(), 1);
+        assert_eq!(params.workload, serde_json::json!({ "iterations": 1 }));
+
+        // An explicit one is kept, and so are arguments nothing reads yet.
+        spec.workload = serde_json::json!({ "iterations": 25, "scenario": "3ds" });
+        let params = RunParams::resolved(&spec, None);
+        assert_eq!(
+            params.workload,
+            serde_json::json!({ "iterations": 25, "scenario": "3ds" })
+        );
+
+        // Replay drives no workload; an empty object would claim it drove one.
+        assert!(RunParams::resolved(&replay_spec(), None).workload.is_null());
+    }
+
+    #[test]
+    fn a_stored_request_reads_back_and_can_be_posted_again() {
+        let params = RunParams::resolved(&replay_spec(), Some("pass"));
+        let stored = params.to_json();
+
+        // Round-trips as itself…
+        assert_eq!(RunParams::from_stored(&stored), Some(params.clone()));
+        // …and as the request body the create endpoint accepts, so a finished
+        // run is reproducible from its own record.
+        let spec: RunSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(spec.mode, RunMode::Replay);
+        assert_eq!(spec.correlation_filter, params.correlation_filter);
+        assert_eq!(
+            serde_json::to_value(&spec.candidate_spec).unwrap(),
+            serde_json::to_value(&params.candidate_spec).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_row_written_before_the_request_was_persisted_is_missing_not_broken() {
+        // What every existing row holds. There is no request in it to read, and
+        // the row is still a real run — so this is a missing value, never an
+        // error that would take the row (or its list query) down with it.
+        assert_eq!(
+            RunParams::from_stored(&serde_json::json!({ "workload": null })),
+            None
+        );
+        assert_eq!(RunParams::from_stored(&serde_json::json!({})), None);
     }
 }
 

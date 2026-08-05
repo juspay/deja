@@ -1334,12 +1334,11 @@ pub fn drive_replay_in_pod(
 // Shell-out helpers
 // ---------------------------------------------------------------------------
 
+/// How many times this run drives the workload. The default lives on
+/// [`crate::RunSpec::iterations`] because the run's persisted record reads it
+/// from there too — two copies of it could name two different numbers.
 fn run_iterations(run: &Run) -> u64 {
-    run.spec
-        .workload
-        .get("iterations")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1)
+    run.spec.iterations()
 }
 
 #[allow(clippy::too_many_arguments)] // worker plumbing, internal

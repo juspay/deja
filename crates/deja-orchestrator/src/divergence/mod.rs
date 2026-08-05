@@ -14,9 +14,18 @@
 //!   - resolved hit                         → matched (recorded per address rank)
 //!   - resolved only at rank 6 (sequence)   → Recovered (fragility flag)
 //!   - candidate call with no table hit     → NovelCall (blocking)
+//!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!   - table entry the candidate never hit  → OmittedCall (blocking)
+//!     …uncorrelated, or non-blocking       → OmittedCallTolerated
 //!   - http status / body diffs             → StatusMismatch / BodyMismatch
+//!
+//! Every classification lands in `per_boundary`, and the summary's counters are
+//! FOLDS of that table (see [`Scorecard::counter_disagreements`]) rather than
+//! tallies kept beside it. A blocking kind and the tolerated kind that shares
+//! its shape are named apart for the same reason: a report whose headline and
+//! whose breakdown both say "omitted" while counting different sets of calls
+//! gives two answers for one run.
 //!
 //! V1 is "full mock": the table is the complete source of truth, containers are
 //! empty, and a miss is a divergence — never a legitimate data source. The
@@ -64,6 +73,21 @@ fn tier_for(boundary: &str) -> Tier {
 /// note on `crypto_operation` in `hyperswitch_domain_models::type_encryption`.
 fn is_nonblocking_boundary(boundary: &str) -> bool {
     tier_for(boundary) == Tier::Pure || boundary == "http_incoming"
+}
+
+/// Whether an unconsumed recorded call is a BLOCKING omission — the candidate
+/// failing to do something the recording says it did.
+///
+/// Two omissions are tolerated, and neither is a failure of the candidate: an
+/// UNCORRELATED one belongs to background work no test case owns (the V1
+/// toleration the summary reports as `uncorrelated_events_tolerated`), and one
+/// on a non-blocking boundary was never a side effect to reproduce — see
+/// [`is_nonblocking_boundary`].
+///
+/// THE definition, shared with [`ledger::build`], so a ledger row's `blocking`
+/// flag and the scorecard's count cannot come to mean two different things.
+fn omission_is_blocking(correlation: Option<&str>, boundary: &str) -> bool {
+    correlation.is_some() && !is_nonblocking_boundary(boundary)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,13 +149,42 @@ pub struct Summary {
     pub total_correlations: u64,
     pub matched_correlations: u64,
     pub http_status_mismatches: u64,
+    /// RESPONSES whose body diverged. Counts responses, while the per-boundary
+    /// `BodyMismatch` kind counts diverging FIELDS — one response can carry
+    /// several — so the two are deliberately not the same number.
     pub http_body_mismatches: u64,
-    /// Blocking side-effect divergences (Omitted + Novel on non-egress,
-    /// correlated boundaries).
+    /// Every blocking side-effect divergence:
+    /// `omitted_calls + novel_calls + value_divergences`.
     pub side_effect_divergences: u64,
     pub matched_side_effect_calls: u64,
+    /// BLOCKING omissions: recorded calls the candidate never made, on a
+    /// correlated, blocking boundary. These are what the verdict acts on.
+    ///
+    /// This is a PROJECTION of `per_boundary[*].kinds["OmittedCall"]`, not a
+    /// count kept beside it — the two used to be maintained independently and
+    /// gave a report two different numbers for one ledger.
     pub omitted_calls: u64,
+    /// Omissions the verdict does NOT act on: uncorrelated background work, and
+    /// non-blocking boundaries. Named separately because they are a different
+    /// thing, not a different count of the same thing — a call ledger's
+    /// `omitted` rows are `omitted_calls + omitted_calls_tolerated`, of which
+    /// only the first carry `blocking`.
+    ///
+    /// Projection of `per_boundary[*].kinds["OmittedCallTolerated"]`.
+    #[serde(default)]
+    pub omitted_calls_tolerated: u64,
+    /// BLOCKING novel calls: the candidate did something the recording has no
+    /// baseline for, on a correlated, blocking, non-egress boundary.
+    ///
+    /// Projection of `per_boundary[*].kinds["NovelCall"]`.
     pub novel_calls: u64,
+    /// Novel calls the verdict does NOT act on: uncorrelated background work.
+    /// (An egress miss is counted as an `environmental_misses` instead, and a
+    /// missing baseline as an `inconclusive_seed_gaps`.)
+    ///
+    /// Projection of `per_boundary[*].kinds["NovelCallTolerated"]`.
+    #[serde(default)]
+    pub novel_calls_tolerated: u64,
     /// Execute-mode value divergences: the candidate ran the REAL boundary and
     /// produced a result differing in VALUE from the recorded baseline at the
     /// same args-free call-site + occurrence (the total-derivative catch). A
@@ -200,11 +253,26 @@ pub struct BoundaryStats {
 }
 
 impl BoundaryStats {
-    /// Record a divergence of `kind` (also bumps `diverged`).
+    /// Record a call of `kind` that did not match (also bumps `diverged`).
+    /// `diverged` counts everything that was not a match; `kinds` says why, and
+    /// which of those the verdict acts on.
     fn bump_kind(&mut self, kind: &str) {
         *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
         self.diverged += 1;
     }
+}
+
+/// How many calls across every boundary were classified `kind`.
+///
+/// `per_boundary` is the classified call ledger; the summary's counters are
+/// folds of it. A summary counter maintained BESIDE this table instead of
+/// derived from it is how one run reported 47 omitted calls in its headline and
+/// 62 in its per-boundary breakdown, for one set of calls.
+fn kind_total(per_boundary: &BTreeMap<String, BoundaryStats>, kind: &str) -> u64 {
+    per_boundary
+        .values()
+        .filter_map(|stats| stats.kinds.get(kind))
+        .sum()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +316,133 @@ impl Scorecard {
             correlation_scope: None,
             warnings: Vec::new(),
         }
+    }
+
+    /// Where the summary and the per-boundary ledger it projects disagree.
+    /// Empty when the scorecard tells one story; each entry names a counter that
+    /// does not, so a reader is told which number to distrust rather than being
+    /// left to notice that the report contradicts itself.
+    ///
+    /// Counters that are deliberately NOT projections are absent:
+    /// `http_body_mismatches` counts responses where the per-boundary
+    /// `BodyMismatch` counts fields, and an idempotent-delete demotion names its
+    /// kind after the recorded reply's canon preset, so it has no fixed key to
+    /// fold.
+    pub fn counter_disagreements(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut folds = |what: &str, summary: u64, kinds: &[&str]| {
+            let ledger: u64 = kinds
+                .iter()
+                .map(|kind| kind_total(&self.per_boundary, kind))
+                .sum();
+            if summary != ledger {
+                out.push(format!(
+                    "summary.{what} = {summary}, but per_boundary {} = {ledger}",
+                    kinds.join(" + ")
+                ));
+            }
+        };
+        let s = &self.summary;
+        folds("omitted_calls", s.omitted_calls, &["OmittedCall"]);
+        folds(
+            "omitted_calls_tolerated",
+            s.omitted_calls_tolerated,
+            &["OmittedCallTolerated"],
+        );
+        folds("novel_calls", s.novel_calls, &["NovelCall"]);
+        folds(
+            "novel_calls_tolerated",
+            s.novel_calls_tolerated,
+            &["NovelCallTolerated"],
+        );
+        folds(
+            "environmental_misses",
+            s.environmental_misses,
+            &["EnvironmentalMiss"],
+        );
+        folds(
+            "value_divergences",
+            s.value_divergences,
+            &["ValueDivergedOrigin", "ValueDiverged"],
+        );
+        folds(
+            "inconclusive_seed_gaps",
+            s.inconclusive_seed_gaps,
+            &["InconclusiveSeedGap"],
+        );
+        folds(
+            "inconclusive_races",
+            s.inconclusive_races,
+            &["InconclusiveRace"],
+        );
+        folds(
+            "order_nondeterminism_warnings",
+            s.order_nondeterminism_warnings,
+            &["OrderNondeterministicWarning"],
+        );
+        folds(
+            "undeclared_concurrency_warnings",
+            s.undeclared_concurrency_warnings,
+            &[UNDECLARED_CONCURRENCY_WARNING],
+        );
+        folds(
+            "recovered_rank5_calls",
+            s.recovered_rank5_calls,
+            &["Recovered"],
+        );
+        folds(
+            "http_status_mismatches",
+            s.http_status_mismatches,
+            &["StatusMismatch"],
+        );
+
+        // The headline number: every blocking side-effect divergence, and
+        // nothing else. A demotion that stopped excluding itself here would show
+        // up as a verdict nobody could account for from the breakdown.
+        let blocking = s.omitted_calls + s.novel_calls + s.value_divergences;
+        if s.side_effect_divergences != blocking {
+            out.push(format!(
+                "summary.side_effect_divergences = {}, but omitted + novel + value = {blocking}",
+                s.side_effect_divergences
+            ));
+        }
+
+        // Matched side-effect calls exclude the request boundary, which the
+        // kernel re-drives by construction rather than substituting.
+        let matched: u64 = self
+            .per_boundary
+            .iter()
+            .filter(|(boundary, _)| boundary.as_str() != "http_incoming")
+            .map(|(_, stats)| stats.matched)
+            .sum();
+        if s.matched_side_effect_calls != matched {
+            out.push(format!(
+                "summary.matched_side_effect_calls = {}, but per_boundary matched = {matched}",
+                s.matched_side_effect_calls
+            ));
+        }
+
+        // The fragility histogram, rank by rank.
+        let mut ranks: BTreeMap<&str, u64> = BTreeMap::new();
+        for stats in self.per_boundary.values() {
+            for (rank, n) in &stats.resolved_by_rank {
+                *ranks.entry(rank.as_str()).or_insert(0) += n;
+            }
+        }
+        for (rank, n) in &s.resolved_by_rank {
+            let ledger = ranks.remove(rank.as_str()).unwrap_or(0);
+            if *n != ledger {
+                out.push(format!(
+                    "summary.resolved_by_rank[{rank}] = {n}, but per_boundary = {ledger}"
+                ));
+            }
+        }
+        for (rank, n) in ranks {
+            out.push(format!(
+                "summary.resolved_by_rank[{rank}] is absent, but per_boundary = {n}"
+            ));
+        }
+        out
     }
 }
 
@@ -1584,7 +1779,6 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     let mut resolved_by_rank: BTreeMap<String, u64> = BTreeMap::new();
     let mut matched_side_effect_calls = 0u64;
     let mut recovered_rank5_calls = 0u64;
-    let mut novel_calls = 0u64;
     let mut environmental_misses = 0u64;
     let mut blocking_side_effect = 0u64;
     let mut corr_side_effect: BTreeMap<String, u64> = BTreeMap::new();
@@ -1686,8 +1880,10 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             // (http_incoming) — not a real divergence. See is_nonblocking_boundary.
             stats.bump_kind("DeterministicMiss");
         } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
-            // Background-task call with no correlation — tolerated in V1.
-            stats.bump_kind("NovelCall");
+            // Background-task call with no correlation — tolerated in V1. Named
+            // apart from the blocking `NovelCall` because it is a different
+            // thing, not a different count of the same thing.
+            stats.bump_kind("NovelCallTolerated");
         } else if let Some((twin_seq, recorded)) = recorded_pairing
             .get_mut(&identity_of(
                 &obs.correlation_id,
@@ -1750,7 +1946,6 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             inconclusive_seed_gaps += 1;
         } else {
             stats.bump_kind("NovelCall");
-            novel_calls += 1;
             blocking_side_effect += 1;
             if let Some(corr) = &obs.correlation_id {
                 *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
@@ -1763,27 +1958,37 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // (their execute-mode counterpart was paired args-free above); excluding them
     // here is what collapses a re-keyed write's Omitted+Novel split into ONE
     // ValueDiverged instead of double-counting.
-    let mut omitted_calls = 0u64;
     for (seq, exp) in &expected {
         if consumed.contains(seq) || paired_consumed.contains(seq) {
             continue;
         }
         let boundary = exp.boundary.clone().unwrap_or_else(|| "unknown".to_owned());
+        // One classification, named for what it counts. Lumping the tolerated
+        // omissions — uncorrelated background work, and non-blocking boundaries
+        // — under the same name as the blocking ones is what let this table and
+        // the summary give a report two answers for one set of calls.
+        let blocking = omission_is_blocking(exp.correlation.as_deref(), &boundary);
         let stats = boundary_entry(&mut per_boundary, &boundary);
-        stats.bump_kind("OmittedCall");
-        if exp.correlation.is_none() && uncorrelated_tolerated {
-            // tolerated
-        } else if is_nonblocking_boundary(&boundary) {
-            // tolerated: deterministic-live (crypto/time/id/rng) or the request
-            // boundary (http_incoming). See is_nonblocking_boundary.
+        stats.bump_kind(if blocking {
+            "OmittedCall"
         } else {
-            omitted_calls += 1;
+            "OmittedCallTolerated"
+        });
+        if blocking {
             blocking_side_effect += 1;
             if let Some(corr) = &exp.correlation {
                 *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
             }
         }
     }
+
+    // The summary's call counters are PROJECTIONS of the per-boundary ledger
+    // above, folded out of it once every call has been classified — never a
+    // second tally kept alongside it, which is what let them disagree.
+    let omitted_calls = kind_total(&per_boundary, "OmittedCall");
+    let omitted_calls_tolerated = kind_total(&per_boundary, "OmittedCallTolerated");
+    let novel_calls = kind_total(&per_boundary, "NovelCall");
+    let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
 
     // --- post-finalization correlated work warnings --------------------------
     for warning in &undeclared_concurrency {
@@ -1967,7 +2172,9 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             side_effect_divergences: blocking_side_effect,
             matched_side_effect_calls,
             omitted_calls,
+            omitted_calls_tolerated,
             novel_calls,
+            novel_calls_tolerated,
             value_divergences,
             order_nondeterminism_warnings,
             idempotent_delete_warnings,
@@ -2269,6 +2476,26 @@ mod tests {
     use super::*;
     use deja::{LookupEntry, LookupKey};
     use deja_kernel::JsonFieldDiff;
+
+    /// [`super::detect`], with the report's INTERNAL CONSISTENCY checked on
+    /// every fixture in this module.
+    ///
+    /// This shadows the glob-imported `detect` deliberately, so the ~50 cases
+    /// below all carry the guard without repeating it: whatever a case is
+    /// asserting, a summary that disagrees with the per-boundary ledger it
+    /// projects is a scorer bug. One run reported 47 omitted calls in its
+    /// headline and 62 in its breakdown; a scorecard that contradicts itself
+    /// must not survive a single test in here.
+    fn detect(art: &RunArtifacts) -> Scorecard {
+        let card = super::detect(art);
+        let disagreements = card.counter_disagreements();
+        assert!(
+            disagreements.is_empty(),
+            "the scorecard contradicts itself: {}",
+            disagreements.join("; ")
+        );
+        card
+    }
 
     #[test]
     fn canon_presets_resolve_and_compare_their_declared_shapes() {
@@ -4156,6 +4383,148 @@ mod tests {
         assert_eq!(
             card.per_boundary["redis"].kinds.get("OmittedCall"),
             Some(&1)
+        );
+    }
+
+    /// A recorded event the candidate never reproduced, for the omitted pass.
+    fn omitted_ev(seq: u64, boundary: &str, corr: Option<&str>) -> deja::BoundaryEvent {
+        serde_json::from_value(serde_json::json!({
+            "global_sequence": seq,
+            "request_sequence": 0,
+            "correlation_id": corr,
+            "timestamp_ns": 0,
+            "boundary": boundary,
+            "trait_name": "T",
+            "method_name": "m",
+            "call_file": "x.rs",
+            "call_line": 1,
+            "call_column": 0,
+            "request": {},
+            "args": {},
+            "response": {},
+            "result": "v",
+            "is_error": false,
+            "duration_us": 0,
+            "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+            "provenance": "recorded",
+            "recon": "lossless",
+            "replay_strategy": "substitute",
+            "bucket_id": "root",
+            "fork_seq": 0,
+        }))
+        .expect("valid BoundaryEvent")
+    }
+
+    /// The defect this guards against: one run reported 47 omitted calls in its
+    /// summary while its per-boundary breakdown and its `/calls` ledger both
+    /// reported 62. Nothing was miscounted — the summary counted the BLOCKING
+    /// omissions, the other two counted every omission, and all three called it
+    /// "omitted". The three now name what they count, and the relationship
+    /// between them is arithmetic rather than a coincidence.
+    #[test]
+    fn omitted_means_the_same_thing_in_the_summary_the_breakdown_and_the_ledger() {
+        // Two omissions the verdict acts on, and two it does not: background
+        // work no test case owns, and a pure entropy seam.
+        let a = art_with_events(
+            vec![
+                seq_entry(Some("c1"), "redis", 1),
+                seq_entry(Some("c1"), "db", 2),
+                seq_entry(None, "redis", 3),
+                seq_entry(Some("c1"), "time", 4),
+            ],
+            vec![],
+            vec![http("c1", true, vec![])],
+            vec![
+                omitted_ev(1, "redis", Some("c1")),
+                omitted_ev(2, "db", Some("c1")),
+                omitted_ev(3, "redis", None),
+                omitted_ev(4, "time", Some("c1")),
+            ],
+        );
+        let card = detect(&a);
+
+        assert_eq!(
+            card.summary.omitted_calls, 2,
+            "the headline counts what fails the verdict"
+        );
+        assert_eq!(card.summary.omitted_calls_tolerated, 2);
+        assert_eq!(kind_count(&card, "redis", "OmittedCall"), 1);
+        assert_eq!(kind_count(&card, "db", "OmittedCall"), 1);
+        assert_eq!(kind_count(&card, "redis", "OmittedCallTolerated"), 1);
+        assert_eq!(kind_count(&card, "time", "OmittedCallTolerated"), 1);
+
+        // The `/calls` ledger classifies the same four events, and its split is
+        // the summary's two numbers — not a third answer.
+        let rows = ledger::build(
+            &a.events,
+            &a.observed,
+            &ledger::expected_sequences(&a.table),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let omitted: Vec<&CallRecord> = rows.iter().filter(|r| r.kind == "omitted").collect();
+        assert_eq!(
+            omitted.len() as u64,
+            card.summary.omitted_calls + card.summary.omitted_calls_tolerated,
+            "every omission the ledger shows is one of the two the summary names"
+        );
+        assert_eq!(
+            omitted.iter().filter(|r| r.blocking).count() as u64,
+            card.summary.omitted_calls,
+            "and the blocking ones are exactly the headline number"
+        );
+    }
+
+    /// The invariant itself: a summary counter that drifts from the ledger it
+    /// projects is reported, not served as if the report agreed with itself.
+    #[test]
+    fn a_summary_that_drifts_from_its_breakdown_is_caught() {
+        let mut card = detect(&art(
+            vec![seq_entry(Some("c1"), "redis", 7)],
+            vec![],
+            vec![http("c1", true, vec![])],
+        ));
+        assert!(card.counter_disagreements().is_empty());
+
+        // The original shape of the bug: a headline number maintained beside the
+        // per-boundary ledger instead of folded out of it, drifting from it.
+        card.summary.omitted_calls = 47;
+        let found = card.counter_disagreements();
+        assert!(
+            found
+                .iter()
+                .any(|line| line.starts_with("summary.omitted_calls = 47")),
+            "the disagreement must name the counter to distrust: {found:?}"
+        );
+
+        // The tolerated omissions are a projection too, and so is the headline
+        // side-effect total the verdict is written from.
+        let mut card = detect(&art(vec![seq_entry(None, "redis", 7)], vec![], vec![]));
+        assert_eq!(card.summary.omitted_calls_tolerated, 1);
+        card.summary.omitted_calls_tolerated = 0;
+        assert!(!card.counter_disagreements().is_empty());
+    }
+
+    /// The same split on the novel side, where `NovelCall` had the same defect:
+    /// an uncorrelated background call was counted under the blocking name.
+    #[test]
+    fn a_tolerated_novel_call_is_not_counted_under_the_blocking_name() {
+        let card = detect(&art(
+            vec![],
+            vec![
+                obs("redis", Some("c1"), false, None, None),
+                obs("redis", None, false, None, None),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(card.summary.novel_calls, 1, "the correlated one blocks");
+        assert_eq!(card.summary.novel_calls_tolerated, 1);
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "redis", "NovelCallTolerated"), 1);
+        assert_eq!(
+            card.summary.side_effect_divergences, 1,
+            "background work does not fail a candidate"
         );
     }
 

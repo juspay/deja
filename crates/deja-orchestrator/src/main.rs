@@ -407,9 +407,11 @@ async fn v1_create_run(
     // Store row + audit BEFORE the worker spawns (stage rows FK the run row).
     let ctx = if let Some(store) = &st.store {
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
-        let params = serde_json::json!({
-            "workload": run.spec.workload,
-        });
+        // The whole request, defaults already applied — the run row is the only
+        // durable record of what this run was asked to do, and a report cannot
+        // name a scope, a recording or a candidate it was never told.
+        let params =
+            deja_orchestrator::RunParams::resolved(&run.spec, expectation.as_deref()).to_json();
         if let Err(e) = store
             .insert_run(
                 &run.run_id,

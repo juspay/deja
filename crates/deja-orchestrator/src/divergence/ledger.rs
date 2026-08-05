@@ -22,10 +22,16 @@
 //!   recorded ∧ unconsumed → omitted
 //!
 //! Each row carries `blocking` so the UI can show the same pass/fail split the
-//! verdict used. The value of a *matched* side-effect call is identical on both
-//! sides by construction (replay substitutes the recorded result), so the row
-//! shows both sides for context; the genuine value divergence lives in the HTTP
-//! diff stream and in the novel/omitted set-deltas.
+//! verdict used. `kind` alone does NOT: an `omitted` row may be a divergence the
+//! verdict acted on or one it tolerated, and the scorecard reports those as two
+//! numbers (`omitted_calls` and `omitted_calls_tolerated`) for exactly that
+//! reason. Counting `kind == "omitted"` rows and comparing that total to the
+//! headline is how a report came to give two answers for one run.
+//!
+//! The value of a *matched* side-effect call is identical on both sides by
+//! construction (replay substitutes the recorded result), so the row shows both
+//! sides for context; the genuine value divergence lives in the HTTP diff stream
+//! and in the novel/omitted set-deltas.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,8 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     args_free_effective_values, event_reply_canon_kind, is_nonblocking_boundary,
-    observed_value_diverged, tier_for, values_diverge_under_event, InconclusiveRaceEvidence, Tier,
-    POSITIONAL_FALLBACK_RANK,
+    observed_value_diverged, omission_is_blocking, tier_for, values_diverge_under_event,
+    InconclusiveRaceEvidence, Tier, POSITIONAL_FALLBACK_RANK,
 };
 
 /// One side (recorded or observed) of a call, with everything a diff/graph UI
@@ -401,7 +407,7 @@ pub(crate) fn build_with_inconclusive(
         .collect();
     omitted.sort_by_key(|e| e.global_sequence);
     for ev in omitted {
-        let blocking = ev.correlation_id.is_some() && !is_nonblocking_boundary(&ev.boundary);
+        let blocking = omission_is_blocking(ev.correlation_id.as_deref(), &ev.boundary);
         rows.push(CallRecord {
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),

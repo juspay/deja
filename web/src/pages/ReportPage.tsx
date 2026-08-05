@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow } from "../lib/api";
+import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { VerdictBanner } from "../components/Result";
@@ -37,7 +37,15 @@ function took(run: RunRow): string | null {
 
 function RunHeader({ run }: { run: RunRow }) {
   const cand = candidateRef(run);
-  const scope = run.scorecard?.correlation_scope;
+  const params = runParams(run);
+  // What was SCORED, else what was ASKED FOR. The scorecard's scope is the
+  // stronger claim (it names the cases the verdict judged), but a run that
+  // never scored still knows what it was scoped to, because the request is on
+  // the row. `null` only for rows created before requests were persisted.
+  const scored = run.scorecard?.correlation_scope;
+  const scope = scored ?? params?.correlation_filter ?? null;
+  const scopeSource = scored ? "as scored" : "as requested";
+  const wholeSession = !scope && params !== null;
   const dur = took(run);
   return (
     <div className="rhead">
@@ -56,15 +64,17 @@ function RunHeader({ run }: { run: RunRow }) {
         </div>
         <div>
           <dt>scope</dt>
-          {/* Only the scorecard carries the resolved scope. The run row does not:
-              `insert_run` persists `params = {"workload": …}` and drops the rest
-              of the spec, so an unscored run's scope is genuinely unknown here.
-              Saying "whole session" would be the same class of unsupported claim
-              this page exists to remove. */}
+          {/* "whole session" is only sayable when the row carries the request
+              that says so. Without one — rows created before requests were
+              persisted — the scope is genuinely unknown, and claiming either
+              answer would be the class of unsupported claim this page exists to
+              remove. */}
           <dd title={scope?.join("\n")}>
             {scope
-              ? `${scope.length} correlation${scope.length === 1 ? "" : "s"}`
-              : "not recorded"}
+              ? `${scope.length} correlation${scope.length === 1 ? "" : "s"} (${scopeSource})`
+              : wholeSession
+                ? "whole session"
+                : "not recorded"}
           </dd>
         </div>
         <div>

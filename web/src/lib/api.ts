@@ -12,14 +12,37 @@ export type CandidateSpecRow =
   | { kind: "repo_pr"; repo: string; pr: number }
   | { kind: string; [k: string]: unknown };
 
+// What a run was asked to do, as persisted on the run row
+// (`RunParams`, crates/deja-orchestrator/src/lib.rs). Values are RESOLVED: the
+// correlation filter as normalized, the workload with its defaults applied, and
+// the recording id as the concrete session once an s3_source prefix resolved
+// one. `null` for rows created before the request was persisted — those carry
+// `{"workload": null}` and no request at all.
+export type RunParams = {
+  mode: "record" | "replay";
+  candidate_spec: CandidateSpecRow;
+  candidate_repo?: string;
+  recording_id: string | null;
+  s3_source?: { path: string; region?: string; endpoint?: string };
+  /** Absent = the entire session was driven, which is a real answer. */
+  correlation_filter?: string[];
+  workload?: unknown;
+  expectation?: string;
+};
+
+/** The request a row carries, or null when it predates the record. */
+export function runParams(run: RunRow): RunParams | null {
+  const p = run.params as Partial<RunParams> | null | undefined;
+  return p && p.candidate_spec ? (p as RunParams) : null;
+}
+
 export type RunRow = {
   run_id: string;
   mode: "record" | "replay";
   recording_id: string | null;
   candidate: CandidateSpecRow;
   candidate_sha256: string | null;
-  // Serialized RunSpec params persisted by the API.
-  params: { workload?: unknown; [k: string]: unknown };
+  params: Partial<RunParams> & { [k: string]: unknown };
   state: string;
   verdict: "pass" | "fail" | "inconclusive" | null;
   scorecard: Scorecard | null;
@@ -104,8 +127,16 @@ export type Scorecard = {
     http_status_mismatches: number;
     http_body_mismatches: number;
     side_effect_divergences: number;
+    // BLOCKING omissions/novel calls — what the verdict acts on, and a fold of
+    // per_boundary's `OmittedCall` / `NovelCall`. The `_tolerated` counterparts
+    // are the rest: uncorrelated background work and non-blocking boundaries.
+    // The `/calls` ledger's `omitted` rows are the two added together, so a
+    // count taken there will not match the headline unless it filters
+    // `blocking`.
     omitted_calls?: number;
+    omitted_calls_tolerated?: number;
     novel_calls?: number;
+    novel_calls_tolerated?: number;
     // A non-zero value_divergences means an Execute boundary ran during replay
     // and produced a value differing from the recorded baseline. Lookup /
     // Substitute boundaries serve recorded values.
