@@ -422,11 +422,13 @@ dependencies = [
 name = "deja-compactor"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "flate2",
  "futures",
  "object_store",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "zstd",
 ]

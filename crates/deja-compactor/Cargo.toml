@@ -11,8 +11,17 @@ futures = "0.3"
 object_store = { version = "0.11", features = ["aws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+# Content address of a seal: two sealers that read the same landing must write
+# the same object keys, and two that read different landings must not share any.
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt"] }
 zstd = "0.13"
+
+[dev-dependencies]
+# The seal's write ORDER is the safety property, and asserting it needs an
+# ObjectStore that records what was written when — object_store's own trait is
+# `async_trait`-based, so a test double has to be too.
+async-trait = "0.1"
 
 [[bin]]
 name = "deja-compactor"

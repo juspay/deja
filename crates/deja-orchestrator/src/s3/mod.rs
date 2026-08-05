@@ -2,7 +2,10 @@
 //!
 //! The durable form of a recording is the compacted session
 //! (`sessions/v1/{id}/` — data parts + correlations index + manifest seal,
-//! see `deja-compactor`). Pulling a recording means:
+//! see `deja-compactor`). Both ingest paths here end in that form: the one that
+//! reads a sealed session takes it as given, and the one that scans a raw
+//! landing prefix writes it, so a recording is collated once rather than once
+//! per run. Pulling a recording means:
 //!
 //! 1. read the manifest; if the session is unsealed, compact it first
 //!    (the record lifecycle's quiesce wait has already settled the landing)
@@ -21,6 +24,10 @@ use std::io::Write;
 use std::path::Path;
 
 pub use deja_compactor::S3Config;
+/// How many correlations a sealed recording has, and the per-correlation rows
+/// behind that count, WITHOUT pulling the tape — the seal writes the index, so
+/// answering costs one manifest GET (plus one sidecar GET for the rows).
+pub use deja_compactor::{correlation_count, read_correlation_index, CorrelationSummary};
 
 /// What `pull_recording` reports back (persisted next to the events file,
 /// registered as a run artifact, folded into the catalog row).
@@ -240,6 +247,10 @@ pub type SessionsSeen = Vec<(String, usize)>;
 /// then materialize the chosen session through the same collate (unwrap,
 /// dedup, sort) as the session-layout path.
 ///
+/// The resolved session is SEALED on the way out (`sessions/v1/{id}/`), so this
+/// scan happens once per recording rather than once per run — see the sealing
+/// block below.
+///
 /// `session`: `Some(id)` filters to that session; `None` auto-resolves when
 /// the scan finds exactly ONE session and errors with the discovered list
 /// otherwise. `dest_for` maps the RESOLVED session id to the events.jsonl
@@ -262,9 +273,15 @@ pub fn pull_recording_from_prefix(
     }
 
     let mut by_session: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    // Objects per session, not just lines: the scanned prefix can hold several
+    // sessions (a recording spanning midnight is addressed from the shared
+    // parent), so the object count that belongs to the recording is the number
+    // of objects that carried a line of it, never the size of the scan.
+    let mut objects_by_session: std::collections::BTreeMap<String, usize> = Default::default();
     let mut junk_lines = 0usize;
     for key in &keys {
         let data = deja_compactor::get_object_decoded(cfg, key)?;
+        let mut sessions_here: std::collections::BTreeSet<String> = Default::default();
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
@@ -275,9 +292,15 @@ pub fn pull_recording_from_prefix(
                 .and_then(|p| p.capture)
                 .and_then(|c| c.session_id);
             match sid {
-                Some(sid) => by_session.entry(sid).or_default().push(line_str),
+                Some(sid) => {
+                    sessions_here.insert(sid.clone());
+                    by_session.entry(sid).or_default().push(line_str);
+                }
                 None => junk_lines += 1,
             }
+        }
+        for sid in sessions_here {
+            *objects_by_session.entry(sid).or_default() += 1;
         }
     }
     if junk_lines > 0 {
@@ -344,16 +367,54 @@ pub fn pull_recording_from_prefix(
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
 
+    // Promote what we just read into the durable form.
+    //
+    // A raw prefix is re-listed, re-fetched and re-collated on EVERY run — 8 to
+    // 17 seconds each time, forever, for a recording that cannot change. The
+    // seal is written from the same lines that produced the events file above,
+    // so the manifest fast path the next run takes reads exactly what this run
+    // read. Only the resolved session is sealed: the others under this prefix
+    // were grouped, not ingested, and sealing a session from a scan that was
+    // never meant to cover it would put a completeness claim on partial data.
+    //
+    // A failed seal is not a failed ingest. The events file is written and the
+    // landing is untouched, so the next run falls back to this same rescan —
+    // slow, but correct. It is reported rather than swallowed, because "still
+    // unsealed after an ingest" is the difference between a slow pull and a
+    // pull that will be slow forever.
+    let session_objects = objects_by_session
+        .get(&resolved)
+        .copied()
+        .unwrap_or_default();
+    let sealed = match deja_compactor::seal_session(cfg, &resolved, &lines, session_objects) {
+        Ok(manifest) => {
+            eprintln!(
+                "ingest: sealed {resolved} at s3://{}/{} — {} data part(s), {} correlation(s)",
+                cfg.bucket,
+                deja_compactor::layout::session_root(&resolved),
+                manifest.data_parts.len(),
+                manifest.counts.correlations,
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "ingest: sealing {resolved} failed ({e}) — this run is unaffected, but the next \
+                 pull will rescan s3://{}/{prefix} again",
+                cfg.bucket
+            );
+            false
+        }
+    };
+
     let report = IngestReport {
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
-        landing_objects: keys.len(),
+        landing_objects: session_objects,
         lines_in,
         duplicates_dropped: drops.duplicates,
         events_out: events.len(),
         correlations: correlations.len(),
-        // A raw prefix has no manifest seal; completeness is whatever the
-        // aggregator had flushed when we scanned.
-        sealed: false,
+        sealed,
         markers_dropped: drops.markers,
         non_envelope_dropped: drops.non_envelope,
         unparseable_dropped: drops.unparseable,

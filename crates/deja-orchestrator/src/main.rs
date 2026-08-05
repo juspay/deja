@@ -230,6 +230,10 @@ fn app_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/recordings", get(v1_list_recordings))
         .route("/recordings/available", get(v1_available_recordings))
+        .route(
+            "/recordings/{id}/correlations",
+            get(v1_recording_correlations),
+        )
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
         .route("/runs/{run_id}/kill", kill_run_route)
@@ -400,6 +404,15 @@ async fn v1_create_run(
         Ok(s) => s,
         Err(e) => return error_resp(400, &format!("parse RunSpec: {e}")),
     };
+    // Refuse an oversized filter HERE, where the caller is still listening. The
+    // lifecycle refuses it too — that is the gate no caller can go around — but
+    // a request that will never be honoured should fail as a 400 now rather than
+    // as a failed run several minutes later.
+    if let Err(e) =
+        deja_orchestrator::scope::check_requested_correlations(spec.correlation_filter.as_deref())
+    {
+        return error_resp(400, &e);
+    }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
         Err(e) => return error_resp(500, &format!("create run: {e}")),
@@ -752,6 +765,158 @@ async fn v1_available_recordings(
 struct AvailableQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+/// What the store can say about one recording's correlations.
+///
+/// Three answers, kept apart on purpose. "Sealed, and here they are" and "it is
+/// there but nothing has ingested it yet, so the list is not knowable cheaply"
+/// and "no such recording" are three different facts, and a caller that flattens
+/// them tells a user something false — most damagingly by rendering the middle
+/// one as a recording with zero correlations, i.e. as nothing worth running.
+enum RecordingCorrelations {
+    Sealed(Vec<deja_orchestrator::s3::CorrelationSummary>),
+    /// In the landing area, not yet compacted into a sealed session.
+    Landing {
+        prefix: String,
+    },
+    Unknown,
+}
+
+#[derive(serde::Deserialize)]
+struct CorrelationsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    /// Case-insensitive substring match on the correlation id.
+    q: Option<String>,
+}
+
+/// `GET /api/v1/recordings/{id}/correlations` — the recorded test cases in a
+/// recording, in the order they happened.
+///
+/// Cheap by construction: this reads the sealed session's manifest and its
+/// correlations index, and never a data part. Learning that a recording holds
+/// 455 correlations costs two small GETs instead of the 119 MB the tape itself
+/// is — which is the point of sealing the index next to the data. `q` filters
+/// the rows already in hand, so searching costs nothing beyond that.
+///
+/// Rows are in TAPE ORDER — each correlation's first appearance — and paging
+/// never reorders them. That matters beyond presentation: a run that names no
+/// correlations drives the first [`deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN`]
+/// in this same order, so the head of page zero IS what such a run will drive.
+/// Any other default ordering here would show one set and run another.
+async fn v1_recording_correlations(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<CorrelationsQuery>,
+) -> Response {
+    if id.trim().is_empty() {
+        return error_resp(400, "recording id is required");
+    }
+    let cfg = deja_orchestrator::s3::S3Config::from_env();
+    let bucket = cfg.bucket.clone();
+    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    let scanned = root.clone();
+    let wanted = id.clone();
+    let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
+        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
+            Some(rows) => Ok(RecordingCorrelations::Sealed(rows)),
+            // Not sealed. Whether that means "not ingested yet" or "no such
+            // recording" is a question only the landing area can answer, and
+            // they must not come back as the same thing.
+            None => Ok(
+                match deja_compactor::locate_landing_prefix(&cfg, &wanted, &scanned)? {
+                    Some(prefix) => RecordingCorrelations::Landing { prefix },
+                    None => RecordingCorrelations::Unknown,
+                },
+            ),
+        }
+    })
+    .await
+    {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => return error_resp(502, &format!("read correlations: {e}")),
+        Err(e) => return error_resp(500, &format!("read correlations: {e}")),
+    };
+
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(1000).clamp(1, 5000);
+    let needle = q.q.as_deref().map(str::to_lowercase);
+
+    match found {
+        RecordingCorrelations::Sealed(rows) => {
+            // The index also carries a row for UNCORRELATED events — ambient
+            // background traffic, shared across cases. It is accounted for
+            // there because its events are real, but it is not a test case and
+            // nothing can drive it, so it is not offered as one.
+            let cases: Vec<&deja_orchestrator::s3::CorrelationSummary> = rows
+                .iter()
+                .filter(|row| row.correlation_id.is_some())
+                .collect();
+            let matched: Vec<&&deja_orchestrator::s3::CorrelationSummary> = cases
+                .iter()
+                .filter(|row| match (&needle, row.correlation_id.as_deref()) {
+                    (Some(needle), Some(id)) => id.to_lowercase().contains(needle),
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                })
+                .collect();
+            let page: Vec<&deja_orchestrator::s3::CorrelationSummary> = matched
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|row| **row)
+                .collect();
+            json_ok(serde_json::json!({
+                "recording_id": id,
+                "status": "sealed",
+                // Everything the recording holds, independent of q/limit/offset:
+                // "showing 100 of 455" needs the 455 to stay the recording's.
+                "total": cases.len(),
+                "matched": matched.len(),
+                "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+                "offset": offset,
+                "limit": limit,
+                "correlations": page,
+            }))
+        }
+        RecordingCorrelations::Landing { prefix } => {
+            // The list needs the sealed index, but the COUNT may already be
+            // known: a recording ingested before it could be sealed leaves its
+            // correlation count in the catalog. Report it when it is there —
+            // "cannot be listed yet" is a much weaker thing to tell someone
+            // without the number that says the recording is worth waiting for.
+            let total = match require_store(&st) {
+                Ok(store) => store
+                    .recording_correlation_count(&id)
+                    .await
+                    .unwrap_or(None)
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+                // No catalog configured is not an answer about the recording.
+                Err(_) => serde_json::Value::Null,
+            };
+            json_ok(serde_json::json!({
+                "recording_id": id,
+                "status": "landing",
+                // Null, never zero: nothing has read this recording yet, so how
+                // many correlations it holds is unknown rather than none.
+                "total": total,
+                "matched": serde_json::Value::Null,
+                "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+                "offset": offset,
+                "limit": limit,
+                "correlations": serde_json::Value::Null,
+                "prefix": prefix,
+                "detail": "recording has landed but is not sealed yet — its correlations are not \
+                           knowable without ingesting it, which the first replay run of it does",
+            }))
+        }
+        RecordingCorrelations::Unknown => error_resp(
+            404,
+            &format!("recording {id} is not in s3://{bucket}/{root}"),
+        ),
+    }
 }
 
 /// `GET /api/v1/runs` — run list (Postgres-backed; newest first).
@@ -1364,6 +1529,52 @@ mod tests {
             steps_total: 0,
             stage_updated_ms: 0,
         }
+    }
+
+    /// An unrouted `/api/v1/...` path does NOT 404: `spa_fallback` claims every
+    /// URL the API router does not and answers `index.html` with 200 OK and
+    /// `text/html`. So a route that was never registered fails as a confusing
+    /// success, and no request against it can tell you it is missing. This
+    /// asserts registration by the one thing that differs — who answered.
+    #[tokio::test]
+    async fn the_correlations_route_is_claimed_by_the_api_not_the_spa_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer = |uri: String| {
+            let state = test_state(dir.path());
+            async move {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app_router(state).oneshot(req).await.unwrap();
+                let content_type = resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                (resp.status(), content_type)
+            }
+        };
+
+        // A blank id is refused before any bucket work, so this reaches the
+        // handler without needing a store to talk to.
+        let (status, content_type) = answer("/api/v1/recordings/%20/correlations".to_owned()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            content_type.starts_with("application/json"),
+            "the API must answer this path, not the SPA: {content_type}"
+        );
+
+        // The control: this is what an UNREGISTERED api path does, and why the
+        // assertion above is about content type rather than status.
+        let (status, content_type) = answer("/api/v1/recordings/x/not-a-route".to_owned()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/html"),
+            "expected the SPA fallback to claim an unrouted api path: {content_type}"
+        );
     }
 
     async fn post_event(state: AppState, run_id: &str, body: serde_json::Value) -> StatusCode {
