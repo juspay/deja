@@ -671,6 +671,15 @@ impl HarnessRoot {
             .join("runs")
             .join(format!("{run_id}.record-graph.jsonl"))
     }
+    /// WHY the record graph is absent, when it is absent for a reason worth
+    /// stating (the tape refused to scope). One human-readable sentence. The
+    /// scorer folds it into the scorecard's warnings, so the reason travels
+    /// with the verdict instead of dying on stderr.
+    pub fn record_graph_note_path(&self, run_id: &str) -> PathBuf {
+        self.root
+            .join("runs")
+            .join(format!("{run_id}.record-graph-note.txt"))
+    }
     /// Seed/readback certificate sidecar written before the replay kernel runs.
     pub fn seed_certificate_path(&self, run_id: &str) -> PathBuf {
         self.root

@@ -1134,7 +1134,15 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
     // "this run had no cascade", which is a false finding rather than a missing
     // one.
     let mut record = read_nodes(st.root.record_graph_path(&id));
-    if record.is_empty() {
+    // The run may have completed WITHOUT a record graph, with the reason left
+    // in a note. That is an answer, not an error: return the empty record side
+    // with the reason stated, so the view can say "unavailable because …"
+    // instead of the caller receiving a 500 from a successful run.
+    let mut record_note = std::fs::read_to_string(st.root.record_graph_note_path(&id))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    if record.is_empty() && record_note.is_none() {
         if let Ok(run) = runs::get(&st.root, &id) {
             let scope = deja_orchestrator::scope::RunScope::of(&run);
             if let Some(rec) = run.recording_id.clone().or(run.spec.recording_id.clone()) {
@@ -1145,6 +1153,13 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
                                 .into_iter()
                                 .filter_map(|n| serde_json::to_value(n).ok())
                                 .collect();
+                        }
+                        // The tape's scoping refusal: same contract as the
+                        // extract — an empty record side with its reason
+                        // stated, never an empty side pretending to be a
+                        // cascade-free run, and never a 500.
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            record_note = Some(format!("record graph unavailable: {e}"));
                         }
                         Err(e) => {
                             return error_resp(500, &format!("scoped record graph: {e}"));
@@ -1157,7 +1172,11 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
         }
     }
     let replay = read_nodes(st.root.observed_path(&id));
-    json_ok(serde_json::json!({ "record": record, "replay": replay }))
+    json_ok(serde_json::json!({
+        "record": record,
+        "replay": replay,
+        "record_note": record_note,
+    }))
 }
 
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.

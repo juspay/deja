@@ -170,12 +170,16 @@ fn run() -> Result<(), String> {
                 }
                 driven.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
-                    "deja-kernel: drove {cid} → {}{} (status {} vs {}, body diffs {})",
+                    "deja-kernel: drove {cid} → {}{} (status {} vs {}, body diffs {}{})",
                     driver.method,
                     driver.path,
                     diff.status_candidate,
                     diff.status_baseline,
                     diff.body_diff.len(),
+                    diff.transport_error
+                        .as_deref()
+                        .map(|e| format!("; NO RESPONSE: {e}"))
+                        .unwrap_or_default(),
                 );
             }
             None => {
@@ -275,8 +279,19 @@ fn drive(
             compare_response(driver, status, &body_json, allowlist)
         }
         Err(err) => {
+            // The candidate never answered. Name the reason in its own field
+            // and on stderr: the body diff walks RECORDED fields only, so an
+            // error tucked into the body never surfaces, and "status 0, body
+            // diffs 54" reads as fifty-four findings when it is one — no
+            // response at all.
+            eprintln!(
+                "deja-kernel: NO RESPONSE from candidate for {} {}{} — {err}",
+                driver.correlation_id, driver.method, driver.path,
+            );
             let body = serde_json::json!({ "error": err });
-            compare_response(driver, 0, &body, allowlist)
+            let mut diff = compare_response(driver, 0, &body, allowlist);
+            diff.transport_error = Some(err);
+            diff
         }
     }
 }

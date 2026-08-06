@@ -257,7 +257,13 @@ export type GraphNode = {
   closed_ns: number | null;
 };
 
-export type RunGraph = { record: GraphNode[]; replay: GraphNode[] };
+export type RunGraph = {
+  record: GraphNode[];
+  replay: GraphNode[];
+  /** Why the record side is empty, when it is empty for a stated reason (the
+   * tape refused to scope) rather than because the run had no cascade. */
+  record_note?: string | null;
+};
 
 export function actor(): string {
   return localStorage.getItem("deja-actor") || "";

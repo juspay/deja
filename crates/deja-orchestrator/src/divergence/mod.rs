@@ -2229,6 +2229,43 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     let observed = load_observed_calls(&root.observed_path(run_id), &mut warnings);
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
 
+    // The record graph could not be built for this run: the extract left the
+    // reason in a note instead of failing the run, and this is where the note
+    // becomes part of the verdict's own record. Scoring does not read the
+    // graph, so the verdict below is unaffected — the warning says what the
+    // report's execution view will be missing, and why.
+    if let Ok(note) = std::fs::read_to_string(root.record_graph_note_path(run_id)) {
+        let note = note.trim();
+        if !note.is_empty() {
+            warnings.push(note.to_owned());
+        }
+    }
+
+    // A request the candidate never answered is one finding, not fifty-four:
+    // its field diffs describe an absence. Name each failure and its reason at
+    // the top of the report, grouped by reason so three identical timeouts
+    // read as one fact.
+    {
+        let mut by_reason: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for diff in &http_diffs {
+            if let Some(reason) = diff.transport_error.as_deref() {
+                by_reason
+                    .entry(reason)
+                    .or_default()
+                    .push(diff.correlation_id.as_str());
+            }
+        }
+        for (reason, correlations) in by_reason {
+            warnings.push(format!(
+                "no response from the candidate for {} request(s) ({}): {reason} — their body \
+                 diffs describe the missing response, not changed behaviour",
+                correlations.len(),
+                correlations.join(", "),
+            ));
+        }
+    }
+
     // The tape is read THROUGH the scope, not read and then trimmed: the
     // events this function returns are the only ones any consumer sees, so
     // there is no second, wider view of the same run to disagree with.
@@ -2997,6 +3034,7 @@ mod tests {
             body_diff: body,
             baseline_body: None,
             candidate_body: None,
+            transport_error: None,
         }
     }
 
