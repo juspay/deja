@@ -2221,6 +2221,27 @@ pub struct SeedPlan {
     /// `(boundary, key) -> entry`. A BTreeMap keeps materialization order stable
     /// (so a `redis-cli SET` sequence is deterministic across runs).
     entries: BTreeMap<(String, String), SeedEntry>,
+    /// Reads the planner deliberately did NOT seed, with the rule that dropped
+    /// each. The masks are correct — a read after this correlation's own write
+    /// observes the post-write value, and a read of a table this correlation
+    /// created collides with the replayed create — but a drop with no record
+    /// made `planned` silently under-count the tape's reads, and "the planner
+    /// skipped it on purpose" was indistinguishable from "the planner never saw
+    /// it". Deduped on `(boundary, key, reason)`: the COUNT of masked reads is
+    /// uninteresting, the set of masked keys is the audit surface.
+    masked: BTreeMap<(String, String, MaskReason), ()>,
+}
+
+/// Why [`build_seed_plan`] declined to seed a read it saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskReason {
+    /// A prior event in this correlation WROTE the key; the read observes the
+    /// post-write value, not a precondition.
+    MaskedByWrite,
+    /// This correlation CREATED rows in the table; seeding a later read-back
+    /// would collide with the replayed create.
+    MaskedByCreate,
 }
 
 impl SeedPlan {
@@ -2273,6 +2294,22 @@ impl SeedPlan {
     /// materialization order the harness shells into the store.
     pub fn iter(&self) -> impl Iterator<Item = &SeedEntry> {
         self.entries.values()
+    }
+
+    /// Record a read the planner saw and deliberately declined to seed.
+    fn mask(&mut self, boundary: &str, key: &str, reason: MaskReason) {
+        self.masked
+            .insert((boundary.to_owned(), key.to_owned(), reason), ());
+    }
+
+    /// The reads this plan deliberately did not seed, in deterministic order:
+    /// `(boundary, key, why)`. Together with [`Self::iter`] this accounts for
+    /// every non-error state-read the planner was shown — the property the
+    /// seed certificate asserts.
+    pub fn masked_reads(&self) -> impl Iterator<Item = (&str, &str, MaskReason)> {
+        self.masked
+            .keys()
+            .map(|(b, k, r)| (b.as_str(), k.as_str(), *r))
     }
 
     /// The distinct DB tables whose rows this plan seeds as read-preconditions
@@ -2517,6 +2554,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 let canonical_key = canonical_state_key_wire(key);
                 let written_key = (event.boundary.clone(), canonical_key.clone());
                 if written.contains(&written_key) {
+                    plan.mask(&event.boundary, &canonical_key, MaskReason::MaskedByWrite);
                     continue;
                 }
                 // Don't seed a read of a table this correlation has already created
@@ -2524,6 +2562,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 if event.boundary == "db" {
                     if let Some(table) = db_read_table(event, key) {
                         if created_tables.contains(&(event.boundary.clone(), table)) {
+                            plan.mask(&event.boundary, &canonical_key, MaskReason::MaskedByCreate);
                             continue;
                         }
                     }
@@ -4845,6 +4884,12 @@ mod tests {
             !plan.contains("db", read_key.as_str()),
             "a declared Create masks later DB reads of the created table even when the method name lacks `insert`"
         );
+        assert_eq!(
+            plan.masked_reads().collect::<Vec<_>>(),
+            vec![("db", read_key.as_str(), MaskReason::MaskedByCreate)],
+            "and the decline is on the record — a masked read used to vanish, \
+             making `planned` silently under-count the tape's reads"
+        );
     }
 
     #[test]
@@ -5088,6 +5133,11 @@ mod tests {
             plan.resolve("custom_store", "k").unwrap().value,
             serde_json::json!("before"),
             "the precondition is the pre-write value, not the post-write read"
+        );
+        assert_eq!(
+            plan.masked_reads().collect::<Vec<_>>(),
+            vec![("custom_store", "k", MaskReason::MaskedByWrite)],
+            "the post-write read is declined AND accounted, not silently dropped"
         );
     }
 

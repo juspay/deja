@@ -185,6 +185,13 @@ impl StoreCtx {
         }
     }
 
+    /// The run this context reports for. Publishing an artifact needs the run
+    /// id for its S3 key (`replay-runs/{run_id}/…`), and ingest-time callers
+    /// hold only the ctx.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     /// Out-of-process transport: report through the orchestrator's ingest
     /// endpoint (the in-Job runner's path).
     pub fn http(run_id: &str, base: &str, token: Option<&str>, actor: &str) -> Self {
