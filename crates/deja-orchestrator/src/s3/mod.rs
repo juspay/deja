@@ -2,13 +2,16 @@
 //!
 //! The durable form of a recording is the compacted session
 //! (`sessions/v1/{id}/` — data parts + correlations index + manifest seal,
-//! see `deja-compactor`). Both ingest paths here end in that form: the one that
-//! reads a sealed session takes it as given, and the one that scans a raw
-//! landing prefix writes it, so a recording is collated once rather than once
-//! per run. Pulling a recording means:
+//! see `deja-compactor`). Both ingest paths here READ; neither writes. A replay
+//! is judged against a recording, so it holds `s3:PutObject` on `replay-runs/*`
+//! and nothing else — it cannot alter the tape store, by policy and on purpose.
+//! Producing the durable form is a compaction job's work, not a replay's.
 //!
-//! 1. read the manifest; if the session is unsealed, compact it first
-//!    (the record lifecycle's quiesce wait has already settled the landing)
+//! Pulling a recording means:
+//!
+//! 1. read the manifest; when the session is not sealed yet, fall back to
+//!    scanning its landing prefix — slower every run, and correct every run,
+//!    until a compaction job promotes it
 //! 2. stream the data parts (full envelope lines, already deduped + sorted)
 //! 3. unwrap envelopes — raw event bytes preserved via `RawValue`, no
 //!    reserialization — and re-verify dedup/order by
@@ -367,45 +370,26 @@ pub fn pull_recording_from_prefix(
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
 
-    // Promote what we just read into the durable form.
+    // A replay READS the tape store and never writes it.
     //
-    // A raw prefix is re-listed, re-fetched and re-collated on EVERY run — 8 to
-    // 17 seconds each time, forever, for a recording that cannot change. The
-    // seal is written from the same lines that produced the events file above,
-    // so the manifest fast path the next run takes reads exactly what this run
-    // read. Only the resolved session is sealed: the others under this prefix
-    // were grouped, not ingested, and sealing a session from a scan that was
-    // never meant to cover it would put a completeness claim on partial data.
+    // Promoting this landing prefix into a sealed session used to happen right
+    // here, from these same lines. It is gone, and not for tidiness: the replay
+    // Job's role is deliberately least-privilege — `s3:PutObject` on
+    // `replay-runs/*` and nothing else, because a replay must not be able to
+    // alter the recordings it is judged against. A seal writes `sessions/v1/*`,
+    // so every attempt was denied, and the denial did not fail fast — the
+    // object store retried with backoff, several multipart pieces at a time,
+    // turning a read into an hour-long hang that the watch deadline eventually
+    // killed. One recording spent 3,589s here and never reached stage 2.
     //
-    // A failed seal is not a failed ingest. The events file is written and the
-    // landing is untouched, so the next run falls back to this same rescan —
-    // slow, but correct. It is reported rather than swallowed, because "still
-    // unsealed after an ingest" is the difference between a slow pull and a
-    // pull that will be slow forever.
+    // Sealing belongs to a job that is ALLOWED to write tapes, run on its own
+    // schedule against recordings that are no longer being written to. Until
+    // that job seals a recording, this rescan is what a replay uses: slower,
+    // but correct, and it cannot hang on a permission it was never given.
     let session_objects = objects_by_session
         .get(&resolved)
         .copied()
         .unwrap_or_default();
-    let sealed = match deja_compactor::seal_session(cfg, &resolved, &lines, session_objects) {
-        Ok(manifest) => {
-            eprintln!(
-                "ingest: sealed {resolved} at s3://{}/{} — {} data part(s), {} correlation(s)",
-                cfg.bucket,
-                deja_compactor::layout::session_root(&resolved),
-                manifest.data_parts.len(),
-                manifest.counts.correlations,
-            );
-            true
-        }
-        Err(e) => {
-            eprintln!(
-                "ingest: sealing {resolved} failed ({e}) — this run is unaffected, but the next \
-                 pull will rescan s3://{}/{prefix} again",
-                cfg.bucket
-            );
-            false
-        }
-    };
 
     let report = IngestReport {
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
@@ -414,7 +398,9 @@ pub fn pull_recording_from_prefix(
         duplicates_dropped: drops.duplicates,
         events_out: events.len(),
         correlations: correlations.len(),
-        sealed,
+        // This pull read a landing prefix. It is sealed only if a compaction job
+        // has already promoted it, which a replay neither does nor may do.
+        sealed: false,
         markers_dropped: drops.markers,
         non_envelope_dropped: drops.non_envelope,
         unparseable_dropped: drops.unparseable,
