@@ -303,7 +303,7 @@ impl ScopedRecording {
                 serde_json::from_str::<deja::DejaRecord>(line)
             {
                 if resolved.keep.contains(&node.node_id) {
-                    nodes.push(node);
+                    nodes.push(*node);
                 }
             }
         })?;
@@ -351,6 +351,20 @@ impl ScopedRecording {
             match serde_json::from_str::<RecordHead>(line) {
                 Ok(RecordHead::GraphNode(node)) => {
                     index.parent_of.insert(node.node_id, node.parent_id);
+                    // A node that states its own correlation anchors that case
+                    // directly, with no join. Older tapes state none, so this
+                    // adds anchors and never removes any: a case is reachable if
+                    // EITHER its events name a node or a node names the case.
+                    if let Some(correlation) = node.correlation_id {
+                        if self.scope.contains(Some(correlation.as_str())) {
+                            index.nodes_stating_correlation += 1;
+                            index
+                                .anchors_by_correlation
+                                .entry(correlation)
+                                .or_default()
+                                .insert(node.node_id);
+                        }
+                    }
                 }
                 Ok(RecordHead::BoundaryEvent(event)) => {
                     index.events_in += 1;
@@ -438,6 +452,12 @@ impl ScopedRecording {
                 roots.insert(root);
             }
         }
+        // Two distinguishable causes, kept apart. "Names no node" is a CAPTURE
+        // gap — nothing on the tape ties the case to a span. "Names a node the
+        // tape does not carry" is a DELIVERY gap — the tie exists and the node
+        // is missing. They are fixed in different places, so one blanket message
+        // sends the reader looking in the wrong half of the system.
+        let mut names_nothing: Vec<String> = Vec::new();
         for (correlation, ids) in &index.anchors_by_correlation {
             let mut reached = false;
             for anchor in ids {
@@ -447,21 +467,51 @@ impl ScopedRecording {
                 }
             }
             if !reached {
-                unreachable.push(correlation.clone());
+                if ids.is_empty() {
+                    names_nothing.push(correlation.clone());
+                } else {
+                    unreachable.push(correlation.clone());
+                }
             }
         }
 
-        if !unreachable.is_empty() {
+        if !names_nothing.is_empty() || !unreachable.is_empty() {
+            let cases = index.anchors_by_correlation.len();
+            let stated = if index.nodes_stating_correlation > 0 {
+                format!(
+                    "{} in-scope node(s) state their own correlation, so a case named here is \
+                     one no node claims",
+                    index.nodes_stating_correlation,
+                )
+            } else {
+                "no graph node on this tape states its own correlation, so a case can only be \
+                 tied to the graph through an event naming a node — a tape recorded before \
+                 nodes carried a correlation cannot do better"
+                    .to_owned()
+            };
+            let mut detail = String::new();
+            if !names_nothing.is_empty() {
+                detail.push_str(&format!(
+                    " {} of {cases} case(s) name NO execution-graph node at all ({}) — a \
+                     capture gap: nothing on the tape ties them to a span.",
+                    names_nothing.len(),
+                    names_nothing.join(", "),
+                ));
+            }
+            if !unreachable.is_empty() {
+                detail.push_str(&format!(
+                    " {} of {cases} case(s) name node(s) the tape does not carry ({}) — a \
+                     delivery gap: the tie exists but the nodes are missing.",
+                    unreachable.len(),
+                    unreachable.join(", "),
+                ));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "recording {}: {} of {} in-scope correlation(s) reach NO execution-graph \
-                     root ({}). Their spans would be missing from the record graph with no \
-                     sign that anything was dropped.",
+                    "recording {}:{detail} Their spans would be missing from the record graph \
+                     with no sign that anything was dropped. Context: {stated}.",
                     self.recording_id,
-                    unreachable.len(),
-                    index.anchors_by_correlation.len(),
-                    unreachable.join(", "),
                 ),
             ));
         }
@@ -498,6 +548,10 @@ struct TapeIndex {
     ambient_anchors: BTreeSet<u64>,
     events_in: u64,
     events_kept: u64,
+    /// How many in-scope graph nodes stated their own correlation. Zero means
+    /// the tape predates the field, which is what separates "this recording
+    /// cannot say" from "this recording says these spans belong nowhere".
+    nodes_stating_correlation: u64,
 }
 
 impl TapeIndex {
@@ -571,6 +625,11 @@ struct GraphNodeHead {
     node_id: u64,
     #[serde(default)]
     parent_id: Option<u64>,
+    /// The case this span belongs to, when the tape states it. Absent on tapes
+    /// recorded before graph nodes carried a correlation, which is why it can
+    /// only ever ADD anchors — absence means "not stated", not "uncorrelated".
+    #[serde(default)]
+    correlation_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]

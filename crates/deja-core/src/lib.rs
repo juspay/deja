@@ -132,6 +132,19 @@ pub struct ExecutionGraphNode {
     #[serde(default)]
     pub causal_parent_ids: Vec<u64>,
     pub sequence: u64,
+    /// The request this span belongs to, carried on the node itself rather than
+    /// inferred by joining through a boundary event that names it. Correlation
+    /// is the partition key of the whole system — a schema per correlation, a
+    /// redis namespace per correlation, one correlation per independent test
+    /// case — so a record that cannot state its own is a record that can only be
+    /// scoped indirectly, and only as far as the join holds.
+    ///
+    /// `None` is meaningful, not missing: ambient spans (startup, background
+    /// work, anything outside a request) genuinely belong to no correlation.
+    /// It is also what a tape recorded before this field existed carries, so a
+    /// reader must treat absence as "not stated" rather than "not correlated".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_run_id: Option<String>,
     pub span_name: String,

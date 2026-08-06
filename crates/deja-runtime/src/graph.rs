@@ -107,6 +107,35 @@ where
         }
 
         if let Some(span) = ctx.span(id) {
+            // The span's correlation, resolved HERE rather than read from
+            // anywhere else. Two nearer-looking sources are both wrong:
+            //
+            //  * `DejaCorrelationLayer`'s `SpanContext` extension does not exist
+            //    yet. `Layered::on_new_span` runs the inner layer first, and the
+            //    subscriber is built `.with(graph).with(correlation)`, so this
+            //    layer runs first. Reading that extension would yield `None` for
+            //    every node, and swapping the two `.with` calls would silently
+            //    "fix" it — correctness must not depend on registration order.
+            //
+            //  * `deja_context::current_correlation_id()` is engaged on ENTER,
+            //    not on new-span. At this point the ambient value is still the
+            //    parent's, so a request's ROOT span — the one that establishes
+            //    the correlation, and the one a scoped graph needs most — would
+            //    be attributed to whatever ran before it.
+            //
+            // A span's own `request_id` field is the source of truth; a span
+            // without one belongs to whatever its parent belongs to. That is the
+            // same rule `DejaCorrelationLayer` applies, over the same field
+            // constant and visitor, so the two layers cannot drift.
+            let mut correlation_visitor = crate::correlation_layer::CorrelationVisitor(None);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                attrs.record(&mut correlation_visitor);
+            }));
+            let correlation = correlation_visitor
+                .0
+                .map(Arc::<str>::from)
+                .or_else(|| parent_correlation(attrs, &ctx));
+
             let node_id = self.next_node_id();
             if let Ok(mut map) = graph_node_map().lock() {
                 map.insert(id.into_u64(), node_id);
@@ -115,6 +144,7 @@ where
             span.extensions_mut().insert(GraphSpanState {
                 node_id,
                 parent_id,
+                correlation,
                 causal_parent_ids: Vec::new(),
                 sequence: self.next_sequence(),
                 span_name: metadata.name().to_owned(),
@@ -211,6 +241,29 @@ where
         })
 }
 
+/// The correlation of the span this one hangs under, resolved over the same
+/// parent the node's `parent_id` uses so a node's correlation and its place in
+/// the tree can never come from different ancestors.
+fn parent_correlation<S>(attrs: &Attributes<'_>, ctx: &Context<'_, S>) -> Option<Arc<str>>
+where
+    S: Subscriber,
+    S: for<'lookup> LookupSpan<'lookup>,
+{
+    let correlation_of = |id: &Id| -> Option<Arc<str>> {
+        ctx.span(id).and_then(|span| {
+            span.extensions()
+                .get::<GraphSpanState>()
+                .and_then(|state| state.correlation.clone())
+        })
+    };
+    attrs.parent().and_then(&correlation_of).or_else(|| {
+        attrs
+            .is_contextual()
+            .then(|| ctx.current_span().id().and_then(&correlation_of))
+            .flatten()
+    })
+}
+
 fn node_id_for_span<S>(id: &Id, ctx: &Context<'_, S>) -> Option<u64>
 where
     S: Subscriber,
@@ -235,7 +288,7 @@ pub fn read_execution_graph_records(
             continue;
         }
         if let Ok(DejaRecord::GraphNode(node)) = serde_json::from_str::<DejaRecord>(line) {
-            nodes.push(node);
+            nodes.push(*node);
         }
     }
     Ok(nodes)
@@ -245,6 +298,9 @@ pub fn read_execution_graph_records(
 struct GraphSpanState {
     node_id: u64,
     parent_id: Option<u64>,
+    /// This span's request, from its own `request_id` field or inherited from
+    /// the parent. `None` for ambient spans that belong to no request.
+    correlation: Option<Arc<str>>,
     causal_parent_ids: Vec<u64>,
     sequence: u64,
     span_name: String,
@@ -264,6 +320,7 @@ impl GraphSpanState {
             parent_id: self.parent_id,
             causal_parent_ids: self.causal_parent_ids,
             sequence: self.sequence,
+            correlation_id: self.correlation.as_deref().map(str::to_owned),
             recording_run_id: None,
             span_name: self.span_name,
             target: self.target,

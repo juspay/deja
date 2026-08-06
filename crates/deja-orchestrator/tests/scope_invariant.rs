@@ -66,12 +66,26 @@ fn write_session_tape(root: &HarnessRoot, recording_id: &str) {
 }
 
 fn graph_node(id: u64, parent: Option<u64>, name: &str, correlation: &str) -> String {
+    graph_node_stating(id, parent, name, correlation, Some(correlation))
+}
+
+/// A node whose stated correlation is controlled separately from the one its
+/// log field mentions, so a tape can be built the way older ones actually are:
+/// nodes that belong to a case without saying so.
+fn graph_node_stating(
+    id: u64,
+    parent: Option<u64>,
+    name: &str,
+    correlation: &str,
+    states: Option<&str>,
+) -> String {
     serde_json::json!({
         "record_kind": "graph_node",
         "node_id": id,
         "global_sequence": id,
         "parent_id": parent,
         "sequence": id,
+        "correlation_id": states,
         "span_name": name,
         "target": "router",
         "level": "INFO",
@@ -398,5 +412,134 @@ fn the_raw_tape_path_has_exactly_one_home() {
     assert!(
         found_in_scope_rs > 0,
         "scope.rs no longer defines the tape path — this guard is now vacuous"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A node that states its own case can anchor it, with no join.
+//
+// Scoping a graph used to be possible only through a boundary event that named
+// a node: correlation -> event.graph_node_id -> node.parent_id* -> root. That
+// join has three independent ways to fail and one message for all of them. A
+// node that states its correlation anchors its case directly, so a case is
+// reachable if EITHER side of the join holds.
+// ---------------------------------------------------------------------------
+
+/// A tape whose events name no graph node at all — the shape that used to be
+/// unscopable — but whose nodes state which case they belong to.
+fn write_tape_anchored_only_by_nodes(root: &HarnessRoot, recording_id: &str) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut node_id = 1u64;
+    for (seq, correlation) in (1u64..).zip(DRIVEN.iter()) {
+        let root_node = node_id;
+        node_id += 1;
+        let child_node = node_id;
+        node_id += 1;
+        lines.push(graph_node(root_node, None, "ROOT_SPAN", correlation));
+        lines.push(graph_node(
+            child_node,
+            Some(root_node),
+            "charge",
+            correlation,
+        ));
+        // No `graph_node_id`: the only tie to the graph is the node's own claim.
+        lines.push(boundary_event(seq, Some(correlation), None));
+    }
+    let path = TapeSlot::for_write(root, recording_id);
+    std::fs::create_dir_all(path.parent().expect("tape has a parent")).expect("mkdir");
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write tape");
+}
+
+fn scoped(root: &HarnessRoot, recording_id: &str, run_id: &str) -> ScopedRecording {
+    write_run(
+        root,
+        run_id,
+        recording_id,
+        Some(DRIVEN.map(str::to_owned).to_vec()),
+    );
+    let run: Run = deja_orchestrator::read_json(&root.run_path(run_id)).expect("read run");
+    ScopedRecording::open(root, recording_id, RunScope::of(&run)).expect("open recording")
+}
+
+#[test]
+fn a_case_is_reachable_when_only_its_nodes_name_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = HarnessRoot::new(tmp.path()).expect("harness root");
+    write_tape_anchored_only_by_nodes(&root, "rec-node-anchored");
+    let recording = scoped(&root, "rec-node-anchored", "run-node-anchored");
+
+    let nodes = recording
+        .graph_nodes()
+        .expect("nodes that state their case anchor it without an event naming them");
+    assert!(
+        !nodes.is_empty(),
+        "the scoped graph must carry the spans of a case its nodes claimed",
+    );
+    for node in &nodes {
+        let stated = node.correlation_id.as_deref();
+        assert!(
+            stated.is_none() || DRIVEN.contains(&stated.unwrap_or_default()),
+            "a scoped graph must not carry another case's spans, got {stated:?}",
+        );
+    }
+}
+
+#[test]
+fn a_case_naming_nothing_is_refused_as_a_capture_gap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = HarnessRoot::new(tmp.path()).expect("harness root");
+    // One case anchors normally, so the whole-tape "nothing anchors anywhere"
+    // guard does not fire and the PER-CASE check is what refuses. The other has
+    // a node that claims nothing and an event that names nothing: tied to the
+    // graph by neither side.
+    let lines: Vec<String> = vec![
+        graph_node(1, None, "ROOT_SPAN", DRIVEN[1]),
+        boundary_event(1, Some(DRIVEN[1]), Some(1)),
+        graph_node_stating(2, None, "ROOT_SPAN", DRIVEN[0], None),
+        boundary_event(2, Some(DRIVEN[0]), None),
+    ];
+    let path = TapeSlot::for_write(&root, "rec-capture-gap");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write tape");
+
+    let recording = scoped(&root, "rec-capture-gap", "run-capture-gap");
+    let err = recording
+        .graph_nodes()
+        .expect_err("a case tied to the graph by nothing must be refused, not silently dropped");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("name NO execution-graph node") && msg.contains("capture gap"),
+        "the refusal must say nothing tied the case to a span, so the reader looks \
+         at capture rather than delivery: {msg}",
+    );
+}
+
+#[test]
+fn a_case_naming_absent_nodes_is_refused_as_a_delivery_gap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = HarnessRoot::new(tmp.path()).expect("harness root");
+    // The tie exists — the event names node 99 — but no such node is on the
+    // tape. That is delivery losing a record, not capture never making one.
+    let lines: Vec<String> = vec![
+        graph_node(1, None, "ROOT_SPAN", DRIVEN[1]),
+        boundary_event(1, Some(DRIVEN[1]), Some(1)),
+        boundary_event(2, Some(DRIVEN[0]), Some(99)),
+    ];
+    let path = TapeSlot::for_write(&root, "rec-delivery-gap");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write tape");
+
+    let recording = scoped(&root, "rec-delivery-gap", "run-delivery-gap");
+    let err = recording
+        .graph_nodes()
+        .expect_err("a case naming a node the tape does not carry must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("the tape does not carry") && msg.contains("delivery gap"),
+        "the refusal must distinguish a missing node from a missing tie: {msg}",
+    );
+    assert!(
+        msg.contains(DRIVEN[0]) && !msg.contains(&format!("({}", DRIVEN[1])),
+        "only the case that failed should be named: {msg}",
     );
 }
