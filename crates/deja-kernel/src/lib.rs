@@ -55,6 +55,15 @@ pub struct HttpDiff {
     pub baseline_body: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_body: Option<serde_json::Value>,
+    /// Why there is no candidate response, when there is none. A transport
+    /// failure used to be encoded as `status_candidate: 0` with the error
+    /// buried in the body — and the field diff only walks RECORDED fields, so
+    /// the one string that says WHY (connection refused vs read timeout) never
+    /// surfaced anywhere. Every k8s run to date failed exactly this way and
+    /// nothing said so. `Some` here means "the candidate never answered";
+    /// field diffs on such a row describe the absence, not behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
 }
 
 /// A single mismatched JSON path between baseline and candidate bodies.
@@ -281,6 +290,7 @@ pub fn compare_response(
         body_diff,
         baseline_body: driver.baseline_response.body_json.clone(),
         candidate_body: Some(candidate_body.clone()),
+        transport_error: None,
     }
 }
 

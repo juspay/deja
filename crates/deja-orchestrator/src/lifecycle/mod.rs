@@ -979,17 +979,11 @@ impl ArtifactSink {
 /// That is a containment problem, not a size one — hence a `&ScopedRecording`,
 /// which cannot be constructed without saying which cases the run covers.
 fn write_record_graph_nodes(
-    recording: &crate::scope::ScopedRecording,
+    nodes: &[deja_core::ExecutionGraphNode],
     dest: &std::path::Path,
 ) -> Result<usize, String> {
-    let nodes = recording
-        .graph_nodes()
-        .map_err(|e| format!("scoped record graph: {e}"))?;
-    if nodes.is_empty() {
-        return Ok(0);
-    }
     let mut out = String::new();
-    for node in &nodes {
+    for node in nodes {
         // Round-trip through the wire enum so the artifact keeps the tagged
         // one-stream shape the dashboard's reader expects.
         let line = serde_json::to_string(&deja::DejaRecord::GraphNode(node.clone()))
@@ -1006,14 +1000,23 @@ fn write_record_graph_nodes(
 
 /// Derive the record-side execution graph for this run and leave it at
 /// `record_graph_path`, ready to publish. Split out of `score_and_register` and
-/// called BEFORE anything scores, because its two refusals are refusals about
-/// the RECORDING, not about the candidate: a run must never persist a verdict it
-/// then disowns. Run after scoring, a pre-`graph_node_id` tape produced a run
-/// record that carried a verdict AND was marked failed, which is harder to read
-/// than either outcome alone.
+/// called BEFORE anything scores so a run record never carries a verdict it
+/// then disowns.
 ///
-/// `Ok(Some(n))` — n nodes extracted, publish them. `Ok(None)` — nothing to
-/// publish, for a reason already named on stderr. `Err` — refuse the run.
+/// `Ok(Some(n))` — n nodes extracted, publish them. `Ok(None)` — no graph, for
+/// a reason written to `record_graph_note_path` (and stderr) rather than only
+/// logged: the scorer folds that note into the scorecard's warnings, so the
+/// reason travels with the verdict. `Err` — a real I/O failure.
+///
+/// The tape's scoping refusals — no anchors at all, or an in-scope case that
+/// reaches no graph root — used to be `Err`, failing the whole run. That
+/// coupling destroyed the scorecard over an artifact it does not read:
+/// divergence detection never consults the graph, and on tapes recorded before
+/// graph nodes carried a correlation, the refusal mostly means "this tape
+/// cannot say", not "this run is invalid". The refusal's PURPOSE — never
+/// publish a partial graph as if it were whole — is kept: nothing is
+/// published, and the absence explains itself in the run's own record instead
+/// of on a dead stderr.
 fn extract_record_graph(
     root: &HarnessRoot,
     run: &Run,
@@ -1023,43 +1026,57 @@ fn extract_record_graph(
     // nodes only — never the boundary payloads), derived from the recording the
     // runner already holds locally, scoped to the run's own correlations.
     let scope = crate::scope::RunScope::of(run);
-    match crate::scope::ScopedRecording::open(root, recording_id, scope) {
-        Ok(recording) => {
-            match write_record_graph_nodes(&recording, &root.record_graph_path(&run.run_id)) {
-                // Nothing to publish, and under a pinned scope this is now
-                // unreachable (the extractor refuses rather than returning an empty
-                // graph). Under EntireSession it means the tape truly carries no
-                // graph. Staying quiet here is what let an entire missing
-                // record-side graph look like an ordinary run for weeks — the
-                // dashboard renders the absence as "skipped" on every row, which
-                // reads as a finding.
-                Ok(0) => {
-                    eprintln!(
-                    "lifecycle: recording {recording_id} carries NO graph nodes — the record side \
-                     of the execution graph will be empty and no comparison is possible"
-                );
-                    Ok(None)
-                }
-                Ok(node_count) => Ok(Some(node_count)),
-                // A DECISION, not a log line. The two refusals this can carry — no
-                // anchors at all, or an in-scope correlation that reaches no root —
-                // both mean the alternative to failing is publishing a graph that is
-                // silently empty or silently missing a case, which reads as "this
-                // run had no cascade". That is strictly worse than the bug. The
-                // message names the correlations, so the refusal is actionable.
-                Err(e) => Err(format!("record-graph extract: {e}")),
-            }
-        }
+    let recording = match crate::scope::ScopedRecording::open(root, recording_id, scope) {
+        Ok(recording) => recording,
         // No tape on this node: a different problem from a tape without a graph,
         // and not one the record-graph step can decide anything about.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "lifecycle: no recording {recording_id} on disk — record graph not extracted ({e})"
             );
-            Ok(None)
+            return Ok(None);
         }
-        Err(e) => Err(format!("open recording {recording_id}: {e}")),
+        Err(e) => return Err(format!("open recording {recording_id}: {e}")),
+    };
+    let nodes = match recording.graph_nodes() {
+        Ok(nodes) => nodes,
+        // The scoping refusal (InvalidData is the kind both refusals carry).
+        // Publish NOTHING, and leave the reason where the scorer will pick it
+        // up — a run whose graph cannot be built still gets its verdict, with
+        // the gap stated in the same record.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let note = format!("record graph unavailable: {e}");
+            eprintln!("lifecycle: {note}");
+            let note_path = root.record_graph_note_path(&run.run_id);
+            if let Some(parent) = note_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(write_err) = std::fs::write(&note_path, &note) {
+                // The note is the reason's ride into the scorecard; losing it
+                // silently would recreate the exact failure mode this exists
+                // to end.
+                return Err(format!(
+                    "record-graph note write failed ({write_err}) while degrading: {note}"
+                ));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("record-graph extract: {e}")),
+    };
+    if nodes.is_empty() {
+        // Under EntireSession this means the tape truly carries no graph.
+        // Staying quiet here is what let an entire missing record-side graph
+        // look like an ordinary run for weeks — the dashboard renders the
+        // absence as "skipped" on every row, which reads as a finding.
+        eprintln!(
+            "lifecycle: recording {recording_id} carries NO graph nodes — the record side \
+             of the execution graph will be empty and no comparison is possible"
+        );
+        return Ok(None);
     }
+    let node_count = write_record_graph_nodes(&nodes, &root.record_graph_path(&run.run_id))
+        .map_err(|e| format!("record-graph extract: {e}"))?;
+    Ok(Some(node_count))
 }
 
 /// replay artifacts (best-effort; absent files are skipped).
@@ -4499,7 +4516,7 @@ mod tests {
         let (dir, rec) = recording(&body, RunScope::entire_session());
 
         let dest = dir.path().join("record-graph.jsonl");
-        let n = write_record_graph_nodes(&rec, &dest).unwrap();
+        let n = write_record_graph_nodes(&rec.graph_nodes().unwrap(), &dest).unwrap();
         assert_eq!(
             n, 2,
             "both graph nodes extracted, the boundary event dropped"
@@ -4554,7 +4571,7 @@ mod tests {
             RunScope::from_filter(Some(&["c-driven".to_string()])),
         );
         let dest = dir.path().join("record-graph.jsonl");
-        let n = write_record_graph_nodes(&rec, &dest).unwrap();
+        let n = write_record_graph_nodes(&rec.graph_nodes().unwrap(), &dest).unwrap();
 
         let out = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(n, 2, "only the driven request's span tree: {out}");
@@ -4648,68 +4665,103 @@ mod tests {
         (dir, root, run)
     }
 
-    /// ORDERING, and it is the point of the split: the record-graph refusal is a
-    /// statement about the RECORDING, so it has to happen before the run is
-    /// scored. Run after scoring — as it was — a pre-`graph_node_id` tape wrote
-    /// a scorecard, pushed a verdict, and was THEN failed, leaving a run record
-    /// that carried a verdict and was marked failed at the same time. That is
-    /// harder to read than either outcome alone.
+    /// The graph refusal DEGRADES the run instead of destroying it. It used to
+    /// be fatal — refuse before scoring so a run never carried a verdict it
+    /// then disowned — but the scorer does not read the graph, and on tapes
+    /// recorded before `graph_node_id` the refusal mostly means "this tape
+    /// cannot say". So the run keeps its verdict, publishes NO graph (the
+    /// refusal's actual point), and the reason rides the scorecard's own
+    /// warnings instead of dying on stderr.
     #[test]
-    fn a_refused_record_graph_fails_the_run_before_any_verdict_is_written() {
+    fn a_refused_record_graph_degrades_to_a_scored_run_that_states_the_gap() {
         let (_dir, root, mut run) = staged_replay_run(&Anchoring::None);
         let ctx = StoreCtx::disabled(&run.run_id);
-        let err = score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
-            .unwrap_err();
+        score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
+            .expect("a tape that cannot scope its graph still scores");
 
         assert!(
-            err.contains("record-graph extract"),
-            "the failure names the step that refused: {err}"
+            root.scorecard_path(&run.run_id).exists(),
+            "the verdict is persisted — the graph is not evidence scoring reads"
         );
         assert!(
-            err.contains("graph_node_id"),
-            "and the reason, so an old tape is actionable: {err}"
+            !root.record_graph_path(&run.run_id).exists(),
+            "and NOTHING is published as the graph — a partial or empty graph \
+             pretending to be whole is the failure mode the old refusal existed for"
         );
+        let note = std::fs::read_to_string(root.record_graph_note_path(&run.run_id))
+            .expect("the reason is written where the scorer picks it up");
         assert!(
-            !root.scorecard_path(&run.run_id).exists(),
-            "a run that is going to be refused must not first persist a verdict"
+            note.contains("graph_node_id"),
+            "and it carries the actionable reason: {note}"
         );
+        let card: serde_json::Value = crate::read_json(&root.scorecard_path(&run.run_id)).unwrap();
+        let warnings = card["warnings"].to_string();
         assert!(
-            !root.call_ledger_path(&run.run_id).exists(),
-            "nor the ledger the scorecard writes alongside it"
-        );
-        assert!(
-            !root
-                .root
-                .join("runs")
-                .join(format!("{}.manifest.json", run.run_id))
-                .exists(),
-            "nor a run manifest claiming artifacts that were never published"
+            warnings.contains("record graph unavailable"),
+            "the gap is stated in the verdict's own record, not only on stderr: {warnings}"
         );
     }
 
-    /// The other refusal, end to end: when only SOME cases anchor, the run still
-    /// fails before scoring AND the message names the case whose spans would
-    /// otherwise have been missing with no sign that anything was dropped. The
-    /// name has to survive two wrapping layers to reach the run's failure
-    /// reason, which is the only place an operator will read it.
+    /// The other refusal, end to end: when only SOME cases anchor, no graph is
+    /// published — a graph silently missing one case's spans is the exact thing
+    /// the refusal exists to prevent — and the warning names the case whose
+    /// spans would have vanished. The name has to survive into the scorecard's
+    /// warnings, which is where an operator will actually read it.
     #[test]
     fn a_partially_anchored_tape_names_the_case_that_would_have_vanished() {
         let (_dir, root, mut run) = staged_replay_run(&Anchoring::Partial);
         let ctx = StoreCtx::disabled(&run.run_id);
-        let err = score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
-            .unwrap_err();
+        score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local)
+            .expect("a partially anchored tape still scores");
 
         assert!(
-            err.contains("c-driven-2"),
-            "the refusal must name the unreachable case: {err}"
+            !root.record_graph_path(&run.run_id).exists(),
+            "no graph is published when a case's spans would silently vanish from it"
+        );
+        let note = std::fs::read_to_string(root.record_graph_note_path(&run.run_id)).unwrap();
+        assert!(
+            note.contains("c-driven-2"),
+            "the warning must name the unreachable case: {note}"
         );
         assert!(
-            !err.contains("c-driven-1"),
-            "and only that one — the anchored case is fine: {err}"
+            !note.contains("(c-driven-1"),
+            "and only that one — the anchored case is fine: {note}"
         );
         assert!(
-            !root.scorecard_path(&run.run_id).exists(),
-            "still refused before any verdict is persisted"
+            root.scorecard_path(&run.run_id).exists(),
+            "while the verdict is still persisted"
+        );
+    }
+
+    /// A request the candidate never answered is one stated fact, not
+    /// fifty-four field diffs. The kernel now carries the transport error on
+    /// the diff row; scoring folds it into the scorecard's warnings, naming
+    /// the correlation and the reason — the line that was missing every time
+    /// someone asked "why is every status 0".
+    #[test]
+    fn a_candidate_that_never_answered_is_named_in_the_scorecards_warnings() {
+        let (_dir, root, mut run) = staged_replay_run(&Anchoring::All);
+        let diff = serde_json::json!({
+            "correlation_id": "c-driven-1",
+            "request_sequence": 0,
+            "request_path": "/payments",
+            "status_baseline": 200,
+            "status_candidate": 0,
+            "status_match": false,
+            "body_diff": [],
+            "transport_error": "read /payments: Resource temporarily unavailable (os error 11)",
+        });
+        std::fs::write(root.http_diff_path(&run.run_id), format!("{diff}\n")).unwrap();
+
+        let ctx = StoreCtx::disabled(&run.run_id);
+        score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local).unwrap();
+        let card: serde_json::Value = crate::read_json(&root.scorecard_path(&run.run_id)).unwrap();
+        let warnings = card["warnings"].to_string();
+        assert!(
+            warnings.contains("no response from the candidate")
+                && warnings.contains("c-driven-1")
+                && warnings.contains("os error 11"),
+            "the reason travels with the verdict: {warnings}"
         );
     }
 

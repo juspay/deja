@@ -639,6 +639,23 @@ export default function UnifiedView({
   if (calls.isLoading || https.isLoading || graph.isLoading)
     return <p className="hint">loading execution…</p>;
   if (calls.error) return <p className="err">{String(calls.error)}</p>;
+  // The tree below is spined on the call ledger, so it renders without the
+  // graph — but a missing graph changes what the view can claim (no span
+  // durations, no hidden-span counts), and silence here once let a wholly
+  // missing record graph read as an ordinary run. Say it, with the server's
+  // stated reason when there is one.
+  const graphNote =
+    (graph.data?.record_note ?? null) ||
+    (graph.error ? `the graph could not be read: ${String(graph.error)}` : null);
+  const graphBanner =
+    model.graphMissing || graphNote ? (
+      <p className="hint uv-graphgap">
+        The execution graph is not available for this run
+        {graphNote ? ` — ${graphNote}` : " — the run published no graph nodes"}. The tree below
+        is built from the call ledger, so structure and evidence are complete; span timings and
+        span-only rows are what is missing.
+      </p>
+    ) : null;
   if (model.cases.length === 0)
     return (
       <p className="hint">
@@ -654,6 +671,7 @@ export default function UnifiedView({
 
   return (
     <div className="uv">
+      {graphBanner}
       <div className="uvtabs">
         {model.cases.map((c) => {
           const on = c.caseId === active.caseId;
