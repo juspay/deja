@@ -41,7 +41,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 /// The span field carrying the request correlation id (set by the ingress root
 /// span — see `router_env::root_span`).
-const CORRELATION_FIELD: &str = "request_id";
+pub(crate) const CORRELATION_FIELD: &str = "request_id";
 
 /// Everything `on_new_span` resolves for a span, written once into its extensions
 /// and read on every enter/exit. `Arc` payloads keep the per-poll cursor moves
@@ -186,7 +186,11 @@ impl DejaCorrelationLayer {
 }
 
 /// Visitor that extracts the `request_id` field as a string.
-struct CorrelationVisitor(Option<String>);
+/// Extracts [`CORRELATION_FIELD`] from a span's fields. Shared with the
+/// execution-graph layer so both resolve a span's correlation from the same
+/// definition of what carries one — the two layers must agree, and the graph
+/// layer cannot read this layer's answer (see its `on_new_span`).
+pub(crate) struct CorrelationVisitor(pub(crate) Option<String>);
 
 impl Visit for CorrelationVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {

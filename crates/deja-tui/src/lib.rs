@@ -847,7 +847,7 @@ fn read_tape(path: &Path) -> Result<TapeLoad> {
 
         match serde_json::from_str::<DejaRecord>(&line) {
             Ok(DejaRecord::BoundaryEvent(event)) => events.push(*event),
-            Ok(DejaRecord::GraphNode(node)) => graph_records.push(node),
+            Ok(DejaRecord::GraphNode(node)) => graph_records.push(*node),
             Ok(DejaRecord::Observed(_)) | Err(_) => {
                 if let Some(event) = parse_semantic_event(&line) {
                     events.push(event);
@@ -916,7 +916,7 @@ fn parse_graph_record(line: &str) -> Option<ExecutionGraphNode> {
     serde_json::from_value::<DejaRecord>(value.clone())
         .ok()
         .and_then(|record| match record {
-            DejaRecord::GraphNode(node) => Some(node),
+            DejaRecord::GraphNode(node) => Some(*node),
             _ => None,
         })
         .or_else(|| serde_json::from_value::<ExecutionGraphNode>(value.clone()).ok())

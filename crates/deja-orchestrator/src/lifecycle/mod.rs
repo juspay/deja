@@ -992,7 +992,7 @@ fn write_record_graph_nodes(
     for node in &nodes {
         // Round-trip through the wire enum so the artifact keeps the tagged
         // one-stream shape the dashboard's reader expects.
-        let line = serde_json::to_string(&deja::DejaRecord::GraphNode(node.clone()))
+        let line = serde_json::to_string(&deja::DejaRecord::GraphNode(Box::new(node.clone())))
             .map_err(|e| format!("encode graph node {}: {e}", node.node_id))?;
         out.push_str(&line);
         out.push('\n');

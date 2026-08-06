@@ -259,3 +259,105 @@ fn skip_decision_records_no_graph_nodes() {
         "a Skip request must produce zero graph nodes (layer inert)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A node states its own correlation.
+//
+// These assert WHERE the correlation comes from, which is the whole point: two
+// nearer-looking sources are wrong in ways that pass a shallower test. Reading
+// `DejaCorrelationLayer`'s span extension yields `None` (that layer runs after
+// this one), and reading the ambient `deja_context` correlation attributes a
+// request's ROOT span to whatever ran before it, because the ambient scope is
+// engaged on enter and not on new-span. `with_decision` sets an ambient
+// correlation that is deliberately NOT the one these spans name, so a node that
+// picked up the ambient value instead of the span field fails loudly here.
+// ---------------------------------------------------------------------------
+
+fn node_named<'a>(nodes: &'a [ExecutionGraphNode], name: &str) -> &'a ExecutionGraphNode {
+    nodes
+        .iter()
+        .find(|n| n.span_name == name)
+        .unwrap_or_else(|| panic!("no node named {name} in {nodes:#?}"))
+}
+
+#[test]
+fn a_span_carrying_a_request_id_states_that_correlation() {
+    let nodes = collect_graph(|| {
+        let span = span!(Level::INFO, "ingress", request_id = "corr-a");
+        drop(span);
+    });
+    assert_eq!(
+        node_named(&nodes, "ingress").correlation_id.as_deref(),
+        Some("corr-a"),
+        "the root span establishes the correlation and must state it — it is the \
+         node a scoped graph needs most, and the one an ambient read gets wrong",
+    );
+}
+
+#[test]
+fn a_child_inherits_the_correlation_it_never_names() {
+    let nodes = collect_graph(|| {
+        let root = span!(Level::INFO, "ingress", request_id = "corr-b");
+        let _root = root.enter();
+        let child = span!(Level::INFO, "payments_core");
+        let _child = child.enter();
+        let leaf = span!(Level::INFO, "update_trackers");
+        drop(leaf);
+    });
+    for name in ["payments_core", "update_trackers"] {
+        assert_eq!(
+            node_named(&nodes, name).correlation_id.as_deref(),
+            Some("corr-b"),
+            "{name} runs under the request and must say so",
+        );
+    }
+}
+
+#[test]
+fn a_span_outside_any_request_states_no_correlation() {
+    let nodes = collect_graph(|| {
+        let span = span!(Level::INFO, "scheduler_tick");
+        drop(span);
+    });
+    assert_eq!(
+        node_named(&nodes, "scheduler_tick").correlation_id,
+        None,
+        "ambient work belongs to no case; None is the honest answer, and a reader \
+         must not confuse it with a tape that predates the field",
+    );
+}
+
+#[test]
+fn a_spans_own_request_id_wins_over_the_one_it_would_inherit() {
+    let nodes = collect_graph(|| {
+        let outer = span!(Level::INFO, "outer", request_id = "corr-outer");
+        let _outer = outer.enter();
+        let inner = span!(Level::INFO, "inner", request_id = "corr-inner");
+        drop(inner);
+    });
+    assert_eq!(
+        node_named(&nodes, "inner").correlation_id.as_deref(),
+        Some("corr-inner"),
+    );
+    assert_eq!(
+        node_named(&nodes, "outer").correlation_id.as_deref(),
+        Some("corr-outer"),
+    );
+}
+
+#[test]
+fn a_later_request_does_not_inherit_the_earlier_one() {
+    let nodes = collect_graph(|| {
+        {
+            let first = span!(Level::INFO, "first", request_id = "corr-1");
+            let _first = first.enter();
+        }
+        let second = span!(Level::INFO, "second", request_id = "corr-2");
+        drop(second);
+    });
+    assert_eq!(
+        node_named(&nodes, "second").correlation_id.as_deref(),
+        Some("corr-2"),
+        "a closed request must not bleed into the next one",
+    );
+}

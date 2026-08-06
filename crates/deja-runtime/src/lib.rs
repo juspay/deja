@@ -243,8 +243,11 @@ pub enum DejaRecord {
     /// the writer channel and every `GraphNode`/`Observed` line to match.
     BoundaryEvent(Box<BoundaryEvent>),
     /// An execution-graph span node (open/close lifecycle with parent and
-    /// `follows_from` edges).
-    GraphNode(deja_core::ExecutionGraphNode),
+    /// `follows_from` edges). Boxed for the same reason as the other two: with
+    /// the node stating its own correlation it became the largest remaining
+    /// variant, and an unboxed largest variant sizes every queued `DejaRecord`
+    /// in the writer channel to it.
+    GraphNode(Box<deja_core::ExecutionGraphNode>),
     /// A replay-side observation (lookup resolution or shadow execution);
     /// carried on the replay observed stream, never on record-mode tapes.
     /// Boxed for the same reason as `BoundaryEvent` — it is the largest of the
@@ -1156,7 +1159,7 @@ impl crate::graph::GraphNodeSink for RecordingHook {
     fn graph_node(&self, mut node: deja_core::ExecutionGraphNode) {
         node.global_sequence = self.graph_counter.fetch_add(1, Ordering::SeqCst);
         node.recording_run_id = Some(self.recording_run_id.clone());
-        let _ = self.writer.record(DejaRecord::GraphNode(node));
+        let _ = self.writer.record(DejaRecord::GraphNode(Box::new(node)));
     }
 }
 
@@ -3949,6 +3952,7 @@ mod tests {
             parent_id: Some(3),
             causal_parent_ids: vec![1],
             sequence: 5,
+            correlation_id: Some("corr-x".to_owned()),
             recording_run_id: Some("run-x".to_owned()),
             span_name: "payment.request".to_owned(),
             target: "router".to_owned(),
@@ -3957,16 +3961,20 @@ mod tests {
             started_ns: 10,
             closed_ns: Some(20),
         };
-        let json = serde_json::to_value(DejaRecord::GraphNode(node.clone())).unwrap();
+        let json = serde_json::to_value(DejaRecord::GraphNode(Box::new(node.clone()))).unwrap();
         // One flat object: the tag sits beside the node's own fields.
         assert_eq!(json["record_kind"], "graph_node");
         assert_eq!(json["node_id"], 7);
         assert_eq!(json["global_sequence"], 42);
+        // A node states its own case, so scoping a graph is a filter on the key
+        // everything else partitions by, not a join through an event that
+        // happens to name the node.
+        assert_eq!(json["correlation_id"], "corr-x");
 
         let back: DejaRecord = serde_json::from_value(json).unwrap();
         assert_eq!(back.global_sequence(), 42);
         match back {
-            DejaRecord::GraphNode(n) => assert_eq!(n, node),
+            DejaRecord::GraphNode(n) => assert_eq!(*n, node),
             other => panic!("expected GraphNode, got {other:?}"),
         }
     }
