@@ -1740,11 +1740,11 @@ struct SeedCertificateSummary {
     skipped: usize,
     failed: usize,
     unsupported: usize,
-    /// Reads deliberately not seeded (post-write / created-table); disjoint
-    /// from `planned`. `#[serde(default)]` so certificates written before the
-    /// field parse as zero.
+    /// Reads the planner concluded are not preconditions (read-after-write /
+    /// self-created table); disjoint from `planned`. `#[serde(default)]` so
+    /// certificates written before the field parse as zero.
     #[serde(default)]
-    masked: usize,
+    not_preconditions: usize,
     readback_matched: usize,
     readback_missing: usize,
     readback_mismatched: usize,
@@ -1771,12 +1771,14 @@ enum SeedMaterializationStatus {
     Skipped,
     Failed,
     Unsupported,
-    /// The planner saw the read and deliberately declined to seed it (a prior
-    /// write in the correlation, or a table the correlation itself creates).
-    /// Recorded so `planned + masked` accounts for every state-read the tape
-    /// showed the planner — a masked read used to leave no trace, making the
-    /// under-count indistinguishable from a planner that never saw the read.
-    Masked,
+    /// The planner saw the read and concluded it is not a precondition (a
+    /// prior write in the correlation, or a table the correlation itself
+    /// creates). Recorded so `planned + not_preconditions` accounts for every
+    /// state-read the tape showed the planner — such a read used to leave no
+    /// trace, making the under-count indistinguishable from a planner that
+    /// never saw the read. Distinct from `Skipped` (planned, but the
+    /// materializer had nothing to do): this was never planned at all.
+    NotAPrecondition,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -1818,12 +1820,15 @@ impl SeedCertificate {
     }
 
     fn push(&mut self, entry: SeedCertificateEntry) {
-        // A masked read was never planned: it has no materialization outcome
-        // and no readback to account. It is carried for the accounting
-        // identity (`planned + masked` = every state-read shown to the
-        // planner), not as work.
-        if matches!(entry.materialization, SeedMaterializationStatus::Masked) {
-            self.summary.masked += 1;
+        // A not-a-precondition read was never planned: it has no
+        // materialization outcome and no readback to account. It is carried
+        // for the accounting identity (`planned + not_preconditions` = every
+        // state-read shown to the planner), not as work.
+        if matches!(
+            entry.materialization,
+            SeedMaterializationStatus::NotAPrecondition
+        ) {
+            self.summary.not_preconditions += 1;
             self.entries.push(entry);
             return;
         }
@@ -1833,7 +1838,7 @@ impl SeedCertificate {
             SeedMaterializationStatus::Skipped => self.summary.skipped += 1,
             SeedMaterializationStatus::Failed => self.summary.failed += 1,
             SeedMaterializationStatus::Unsupported => self.summary.unsupported += 1,
-            SeedMaterializationStatus::Masked => unreachable!("handled above"),
+            SeedMaterializationStatus::NotAPrecondition => unreachable!("handled above"),
         }
         match entry.readback.status {
             SeedReadbackStatus::Matched => self.summary.readback_matched += 1,
@@ -1869,20 +1874,20 @@ impl SeedCertificateEntry {
         }
     }
 
-    /// A read the planner deliberately declined to seed. Carried in the
+    /// A read the planner concluded is not a precondition. Carried in the
     /// certificate so the accounting closes; the readback names the rule.
-    fn masked(
+    fn not_a_precondition(
         correlation_id: &Option<String>,
         boundary: &str,
         key: &str,
-        reason: deja::MaskReason,
+        reason: deja::NotPreconditionReason,
     ) -> Self {
         let why = match reason {
-            deja::MaskReason::MaskedByWrite => {
-                "not a precondition: a prior write in this correlation owns the key"
+            deja::NotPreconditionReason::ReadAfterWrite => {
+                "not a precondition: the read observes this correlation's own prior write of the key"
             }
-            deja::MaskReason::MaskedByCreate => {
-                "not a precondition: this correlation creates the table's rows itself"
+            deja::NotPreconditionReason::SelfCreatedTable => {
+                "not a precondition: this correlation creates the table's rows itself on replay"
             }
         };
         Self {
@@ -1892,7 +1897,7 @@ impl SeedCertificateEntry {
             physical_key: None,
             db_schema: None,
             origin: deja::SeedOrigin::Recording,
-            materialization: SeedMaterializationStatus::Masked,
+            materialization: SeedMaterializationStatus::NotAPrecondition,
             readback: SeedReadback::not_run(why),
         }
     }
@@ -2054,10 +2059,12 @@ fn materialize_seed_plan(
         }
 
         // Account for the reads the planner declined BEFORE the empty-plan
-        // skip: a correlation can plan nothing and still have masked reads,
-        // and dropping them here would reopen the silent under-count.
-        for (boundary, key, reason) in plan.masked_reads() {
-            certificate.push(SeedCertificateEntry::masked(corr, boundary, key, reason));
+        // skip: a correlation can plan nothing and still have not-a-precondition
+        // reads, and dropping them here would reopen the silent under-count.
+        for (boundary, key, reason) in plan.non_precondition_reads() {
+            certificate.push(SeedCertificateEntry::not_a_precondition(
+                corr, boundary, key, reason,
+            ));
         }
 
         if plan.is_empty() {
@@ -3935,13 +3942,14 @@ mod tests {
             SeedReadback::unsupported("seed materialization only supports redis and db boundaries"),
         ));
 
-        // A masked read joins the entries but NOT `planned`: it was never work,
-        // it is accounting — planned + masked = every state-read the planner saw.
-        certificate.push(SeedCertificateEntry::masked(
+        // A not-a-precondition read joins the entries but NOT `planned`: it was
+        // never work, it is accounting — planned + not_preconditions = every
+        // state-read the planner saw.
+        certificate.push(SeedCertificateEntry::not_a_precondition(
             &Some("c1".to_owned()),
             "db",
             "deja:state:v1:db_row:7573657273:6964:31",
-            deja::MaskReason::MaskedByWrite,
+            deja::NotPreconditionReason::ReadAfterWrite,
         ));
 
         assert_eq!(
@@ -3952,7 +3960,7 @@ mod tests {
                 skipped: 1,
                 failed: 1,
                 unsupported: 1,
-                masked: 1,
+                not_preconditions: 1,
                 readback_matched: 1,
                 readback_missing: 1,
                 readback_mismatched: 1,

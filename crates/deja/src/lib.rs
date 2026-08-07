@@ -41,8 +41,8 @@ pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_exe
 /// classification, ambient template) so the harness materializes seeds from
 /// explicit event read/write captures.
 pub use deja_runtime::replay::{
-    build_seed_plan, build_write_target_tables, AmbientTemplate, MaskReason, ReadClassification,
-    SeedEntry, SeedOrigin, SeedPlan,
+    build_seed_plan, build_write_target_tables, AmbientTemplate, NotPreconditionReason,
+    ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
 };
 /// Re-export the correlation-propagation tracing layer, which mirrors the ingress
 /// `request_id` span field into deja-context so spawned-task boundary events
