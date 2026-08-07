@@ -2241,6 +2241,45 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         }
     }
 
+    // Seeding failures change what a divergence MEANS: a candidate that 404s
+    // because its precondition row never materialized is not a behaviour
+    // change. The certificate records every failure per entry; this is where
+    // that fact reaches the same page as the verdict it re-frames. Parsed
+    // loosely (the certificate is the lifecycle's type, this is a reader) —
+    // absence of the file, an old shape, or zero failures all mean no warning.
+    if let Ok(text) = std::fs::read_to_string(root.seed_certificate_path(run_id)) {
+        if let Ok(cert) = serde_json::from_str::<serde_json::Value>(&text) {
+            let failed = cert["summary"]["failed"].as_u64().unwrap_or(0);
+            if failed > 0 {
+                let mut tables: Vec<String> = cert["entries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| e["materialization"] == "failed" && e["boundary"] == "db")
+                    .filter_map(|e| e["logical_key"].as_str())
+                    .filter_map(|k| {
+                        deja::StateKey::parse(k)
+                            .ok()
+                            .and_then(|sk| sk.db_table().map(str::to_owned))
+                    })
+                    .collect();
+                tables.sort();
+                tables.dedup();
+                warnings.push(format!(
+                    "{failed} seed entr{} FAILED to materialize{} — reads of those rows replay \
+                     against an empty table, so their divergences describe the missing seed, \
+                     not the candidate (full detail per entry in the seed certificate)",
+                    if failed == 1 { "y" } else { "ies" },
+                    if tables.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (tables: {})", tables.join(", "))
+                    },
+                ));
+            }
+        }
+    }
+
     // A request the candidate never answered is one finding, not fifty-four:
     // its field diffs describe an absence. Name each failure and its reason at
     // the top of the report, grouped by reason so three identical timeouts

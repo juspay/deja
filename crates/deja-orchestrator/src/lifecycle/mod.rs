@@ -720,13 +720,12 @@ fn drive_replay(
     // the replay outcome when store seeding is unavailable.
     let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
-    match write_json(&seed_certificate_path, &seed_certificate) {
-        Ok(()) => ctx.artifact(
-            Some(&recording_id),
-            "seed_certificate",
-            &seed_certificate_path,
-        ),
-        Err(e) => eprintln!("lifecycle: seed certificate write failed: {e}; continuing"),
+    // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
+    // publish loop like every other stream artifact. Registering here as well
+    // stored the runner pod's local path verbatim — a row that answered every
+    // read with ENOENT once the pod died — and would now duplicate the row.
+    if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
+        eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
     }
     run_kernel(
         &demo.kernel_bin,
@@ -880,12 +879,20 @@ fn resolve_correlation_filter(
 /// `(kind, s3-filename)`. One list so the sink loop and the DB-constraint
 /// coverage test stay in agreement. `observed` also carries the replay-side
 /// execution-graph nodes (`DejaRecord::GraphNode`).
-const REPLAY_STREAM_ARTIFACTS: [(&str, &str); 5] = [
+const REPLAY_STREAM_ARTIFACTS: [(&str, &str); 6] = [
     ("lookup_table", "lookup_table.jsonl"),
     ("observed", "observed.jsonl"),
     ("http_diffs", "http_diffs.jsonl"),
     ("scorecard", "scorecard.json"),
     ("call_ledger", "call_ledger.jsonl"),
+    // The seed certificate is the run's own account of what seeding did —
+    // planned/materialized/failed per entry, with readback. It used to be
+    // registered with the runner pod's LOCAL path (never uploaded), so on k8s
+    // the one artifact that explains a seed-shaped divergence was unreadable
+    // the moment the pod died. It publishes like every other stream; the same
+    // prefix already carries the full lookup table, so this adds no new kind
+    // of egress.
+    ("seed_certificate", "seed-certificate.json"),
 ];
 
 /// Where a run's replay artifacts are published so the dashboard can read them
@@ -1133,6 +1140,7 @@ fn score_and_register(
             "http_diffs" => root.http_diff_path(&run.run_id),
             "scorecard" => root.scorecard_path(&run.run_id),
             "call_ledger" => root.call_ledger_path(&run.run_id),
+            "seed_certificate" => root.seed_certificate_path(&run.run_id),
             _ => continue,
         };
         if let Some((uri, bytes)) = sink.publish(&run.run_id, filename, &path) {
@@ -1356,13 +1364,12 @@ pub fn drive_replay_in_pod(
     flush_redis(&store)?;
     let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
     let seed_certificate_path = root.seed_certificate_path(&run.run_id);
-    match write_json(&seed_certificate_path, &seed_certificate) {
-        Ok(()) => ctx.artifact(
-            Some(&recording_id),
-            "seed_certificate",
-            &seed_certificate_path,
-        ),
-        Err(e) => eprintln!("lifecycle: seed certificate write failed: {e}; continuing"),
+    // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
+    // publish loop like every other stream artifact. Registering here as well
+    // stored the runner pod's local path verbatim — a row that answered every
+    // read with ENOENT once the pod died — and would now duplicate the row.
+    if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
+        eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
     }
 
     // A2: the candidate boots as a pod sibling with no ordering guarantee vs
@@ -1733,6 +1740,11 @@ struct SeedCertificateSummary {
     skipped: usize,
     failed: usize,
     unsupported: usize,
+    /// Reads deliberately not seeded (post-write / created-table); disjoint
+    /// from `planned`. `#[serde(default)]` so certificates written before the
+    /// field parse as zero.
+    #[serde(default)]
+    masked: usize,
     readback_matched: usize,
     readback_missing: usize,
     readback_mismatched: usize,
@@ -1759,6 +1771,12 @@ enum SeedMaterializationStatus {
     Skipped,
     Failed,
     Unsupported,
+    /// The planner saw the read and deliberately declined to seed it (a prior
+    /// write in the correlation, or a table the correlation itself creates).
+    /// Recorded so `planned + masked` accounts for every state-read the tape
+    /// showed the planner — a masked read used to leave no trace, making the
+    /// under-count indistinguishable from a planner that never saw the read.
+    Masked,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -1800,12 +1818,22 @@ impl SeedCertificate {
     }
 
     fn push(&mut self, entry: SeedCertificateEntry) {
+        // A masked read was never planned: it has no materialization outcome
+        // and no readback to account. It is carried for the accounting
+        // identity (`planned + masked` = every state-read shown to the
+        // planner), not as work.
+        if matches!(entry.materialization, SeedMaterializationStatus::Masked) {
+            self.summary.masked += 1;
+            self.entries.push(entry);
+            return;
+        }
         self.summary.planned += 1;
         match entry.materialization {
             SeedMaterializationStatus::Materialized => self.summary.materialized += 1,
             SeedMaterializationStatus::Skipped => self.summary.skipped += 1,
             SeedMaterializationStatus::Failed => self.summary.failed += 1,
             SeedMaterializationStatus::Unsupported => self.summary.unsupported += 1,
+            SeedMaterializationStatus::Masked => unreachable!("handled above"),
         }
         match entry.readback.status {
             SeedReadbackStatus::Matched => self.summary.readback_matched += 1,
@@ -1838,6 +1866,34 @@ impl SeedCertificateEntry {
             origin: entry.origin,
             materialization,
             readback,
+        }
+    }
+
+    /// A read the planner deliberately declined to seed. Carried in the
+    /// certificate so the accounting closes; the readback names the rule.
+    fn masked(
+        correlation_id: &Option<String>,
+        boundary: &str,
+        key: &str,
+        reason: deja::MaskReason,
+    ) -> Self {
+        let why = match reason {
+            deja::MaskReason::MaskedByWrite => {
+                "not a precondition: a prior write in this correlation owns the key"
+            }
+            deja::MaskReason::MaskedByCreate => {
+                "not a precondition: this correlation creates the table's rows itself"
+            }
+        };
+        Self {
+            correlation_id: correlation_id.clone(),
+            boundary: boundary.to_owned(),
+            logical_key: key.to_owned(),
+            physical_key: None,
+            db_schema: None,
+            origin: deja::SeedOrigin::Recording,
+            materialization: SeedMaterializationStatus::Masked,
+            readback: SeedReadback::not_run(why),
         }
     }
 }
@@ -1995,6 +2051,13 @@ fn materialize_seed_plan(
                 needed.extend(deja::build_write_target_tables(&events, corr.as_deref()));
                 create_db_schema(store, schema, &needed);
             }
+        }
+
+        // Account for the reads the planner declined BEFORE the empty-plan
+        // skip: a correlation can plan nothing and still have masked reads,
+        // and dropping them here would reopen the silent under-count.
+        for (boundary, key, reason) in plan.masked_reads() {
+            certificate.push(SeedCertificateEntry::masked(corr, boundary, key, reason));
         }
 
         if plan.is_empty() {
@@ -3513,16 +3576,27 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
     if let Err(e) = std::fs::copy(&dest, &legacy_copy) {
         eprintln!("lifecycle: semantic-events.jsonl shim copy failed: {e}");
     }
+    // Published through the sink, not registered by local path: on k8s this
+    // code runs in the Job pod, and a row holding the pod's path answers every
+    // later read with ENOENT. The sink uploads in-pod and degrades to the local
+    // path under compose — the same contract as every stream artifact.
+    let sink = ArtifactSink::from_env();
     let report_path = dest.with_file_name("ingest-report.json");
     if let Err(e) = write_json(&report_path, &report) {
         eprintln!("lifecycle: ingest report write failed: {e}");
     }
-    ctx.artifact(Some(recording_id), "ingest_report", &report_path);
+    if let Some((uri, bytes)) = sink.publish(ctx.run_id(), "ingest-report.json", &report_path) {
+        ctx.artifact_uri(Some(recording_id), "ingest_report", &uri, Some(bytes));
+    }
     let manifest_path = dest.with_file_name("manifest.json");
     if let Err(e) = write_json(&manifest_path, &manifest) {
         eprintln!("lifecycle: manifest copy write failed: {e}");
     }
-    ctx.artifact(Some(recording_id), "manifest", &manifest_path);
+    if let Some((uri, bytes)) =
+        sink.publish(ctx.run_id(), "recording-manifest.json", &manifest_path)
+    {
+        ctx.artifact_uri(Some(recording_id), "manifest", &uri, Some(bytes));
+    }
     let bytes = std::fs::metadata(&dest).ok().map(|m| m.len() as i64);
     ctx.recording(
         recording_id,
@@ -3608,7 +3682,13 @@ fn resolve_recording_from_source(
     if let Err(e) = write_json(&report_path, &report) {
         eprintln!("lifecycle: ingest report write failed: {e}");
     }
-    ctx.artifact(Some(&resolved), "ingest_report", &report_path);
+    // Sink-published for the same reason as the session-layout pull above: a
+    // pod-local path in the artifacts table is a read that can never succeed.
+    if let Some((uri, bytes)) =
+        ArtifactSink::from_env().publish(ctx.run_id(), "ingest-report.json", &report_path)
+    {
+        ctx.artifact_uri(Some(&resolved), "ingest_report", &uri, Some(bytes));
+    }
     let bytes = std::fs::metadata(&dest).ok().map(|m| m.len() as i64);
     ctx.recording(
         &resolved,
@@ -3855,6 +3935,15 @@ mod tests {
             SeedReadback::unsupported("seed materialization only supports redis and db boundaries"),
         ));
 
+        // A masked read joins the entries but NOT `planned`: it was never work,
+        // it is accounting — planned + masked = every state-read the planner saw.
+        certificate.push(SeedCertificateEntry::masked(
+            &Some("c1".to_owned()),
+            "db",
+            "deja:state:v1:db_row:7573657273:6964:31",
+            deja::MaskReason::MaskedByWrite,
+        ));
+
         assert_eq!(
             certificate.summary,
             SeedCertificateSummary {
@@ -3863,6 +3952,7 @@ mod tests {
                 skipped: 1,
                 failed: 1,
                 unsupported: 1,
+                masked: 1,
                 readback_matched: 1,
                 readback_missing: 1,
                 readback_mismatched: 1,
@@ -4762,6 +4852,43 @@ mod tests {
                 && warnings.contains("c-driven-1")
                 && warnings.contains("os error 11"),
             "the reason travels with the verdict: {warnings}"
+        );
+    }
+
+    /// A seed that failed to materialize re-frames every divergence downstream
+    /// of it: the candidate read an empty table, not different behaviour. The
+    /// certificate knows; this asserts the fact reaches the scorecard's own
+    /// warnings, naming the table — the page where someone reads the verdict.
+    #[test]
+    fn a_failed_seed_is_named_in_the_scorecards_warnings() {
+        let (_dir, root, mut run) = staged_replay_run(&Anchoring::All);
+        // hex("payment_attempt") / hex("attempt_id") / hex("x") — a real v1
+        // db_row wire key, so the warning derives the table the way readers do.
+        let key = "deja:state:v1:db_row:7061796d656e745f617474656d7074:617474656d70745f6964:78";
+        let cert = serde_json::json!({
+            "schema_version": 1, "type": "seed_certificate",
+            "recording_id": "rec-order", "run_id": run.run_id, "seed_db_enabled": true,
+            "summary": { "planned": 2, "materialized": 0, "skipped": 0, "failed": 2,
+                          "unsupported": 0, "readback_matched": 0, "readback_missing": 0,
+                          "readback_mismatched": 0, "readback_errors": 2, "readback_not_run": 0 },
+            "entries": [
+                { "correlation_id": "c-driven-1", "boundary": "db", "logical_key": key,
+                  "origin": "recording", "materialization": "failed",
+                  "readback": { "status": "error", "message": "could not render an insert" } },
+                { "correlation_id": "c-driven-2", "boundary": "db", "logical_key": key,
+                  "origin": "recording", "materialization": "failed",
+                  "readback": { "status": "error", "message": "could not render an insert" } }
+            ]
+        });
+        crate::write_json(&root.seed_certificate_path(&run.run_id), &cert).unwrap();
+
+        let ctx = StoreCtx::disabled(&run.run_id);
+        score_and_register(&root, &mut run, &ctx, "rec-order", 6, &ArtifactSink::Local).unwrap();
+        let card: serde_json::Value = crate::read_json(&root.scorecard_path(&run.run_id)).unwrap();
+        let warnings = card["warnings"].to_string();
+        assert!(
+            warnings.contains("2 seed entries FAILED") && warnings.contains("payment_attempt"),
+            "the verdict's own record names the seed failure and its table: {warnings}"
         );
     }
 
