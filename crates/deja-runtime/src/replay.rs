@@ -2192,6 +2192,12 @@ pub struct SeedEntry {
     /// Optional typed state image/precondition to materialize instead of `value`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<serde_json::Value>,
+    /// The recorded event's `method_name`, when the entry derives from the
+    /// recording (`None` for ambient entries). Materialization consults it
+    /// where the value alone is ambiguous — a redis `Array` is an `RPUSH`
+    /// list unless the method that read it names a sorted set (`ZADD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     /// How this entry entered the plan: derived from the recording's read-set,
     /// or supplied by the ambient/config template.
     pub origin: SeedOrigin,
@@ -2587,6 +2593,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     // other boundary seeds the raw recorded result unchanged.
                     value: redis_seedable_result(event).clone(),
                     image: preferred_seed_image(event, &canonical_key),
+                    method: Some(event.method_name.clone()),
                     origin: SeedOrigin::Recording,
                 });
             }
@@ -2685,6 +2692,7 @@ impl AmbientTemplate {
             key: key.into(),
             value,
             image: None,
+            method: None,
             origin: SeedOrigin::Ambient,
         });
     }

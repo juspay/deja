@@ -382,13 +382,14 @@ pub mod value {
     ///
     /// # Scope
     ///
-    /// Only the SCALAR variants a plain redis string read (GET-family) can return
-    /// are modelled — those are the values the seeder materializes. Non-scalar
-    /// RESP3 shapes (arrays, maps, sets, push, verbatim, …) are deliberately
-    /// absent: deserializing one fails, and the seeder treats that failure as an
-    /// explicit, logged "cannot represent as a string SET" rather than guessing.
-    /// The compiler enforces the seeder handles every variant here (no wildcard),
-    /// so adding a scalar variant is a build error, not a 2am corruption.
+    /// The scalar variants a plain redis string read (GET-family) can return,
+    /// plus the structured families the seeder can write back natively
+    /// (`Array` → `RPUSH`/`ZADD`, `Map` → `HSET`, `Set` → `SADD`, per #39).
+    /// Wire shapes with no faithful write command (push, verbatim, attribute,
+    /// …) are deliberately absent: deserializing one fails, and the seeder
+    /// treats that failure as an explicit, logged refusal rather than guessing.
+    /// The compiler enforces the seeder handles every variant here (no
+    /// wildcard), so adding a variant is a build error, not a 2am corruption.
     // No `Eq`: the `Double(f64)` variant is only `PartialEq`.
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     pub enum RedisWireValue {
@@ -409,6 +410,16 @@ pub mod value {
         Double(f64),
         /// A boolean.
         Boolean(bool),
+        /// An ordered sequence — a list range read, or a sorted-set range read
+        /// (the recorded method name disambiguates; the wire shape is the same).
+        /// Both backend dialects name this variant `Array`.
+        Array(Vec<RedisWireValue>),
+        /// Field/value pairs in wire order — a hash read (HGETALL-family).
+        /// Both backend dialects name this variant `Map`.
+        Map(Vec<(RedisWireValue, RedisWireValue)>),
+        /// An unordered member collection — a set read (`redis_rs` dialect;
+        /// `fred` returns sets as `Array`).
+        Set(Vec<RedisWireValue>),
     }
 
     impl RedisWireValue {
@@ -420,7 +431,9 @@ pub mod value {
         /// (UUIDs, tokens, JSON configs) are UTF-8, and the seed transport is a
         /// string-argument `redis-cli SET`; a genuinely binary value is a
         /// pre-existing limitation of that transport, not this decode. `Null`
-        /// yields `None` (nothing to seed).
+        /// yields `None` (nothing to seed), as do the structured families
+        /// (`Array`/`Map`/`Set`) — those are not one string, and the seeder
+        /// maps them to their own write commands instead (#39).
         pub fn to_redis_string(&self) -> Option<String> {
             match self {
                 Self::Null => None,
@@ -429,6 +442,7 @@ pub mod value {
                 Self::SimpleString(s) => Some(s.clone()),
                 Self::Double(d) => Some(d.to_string()),
                 Self::Boolean(b) => Some(if *b { "1" } else { "0" }.to_owned()),
+                Self::Array(_) | Self::Map(_) | Self::Set(_) => None,
             }
         }
     }
