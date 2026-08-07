@@ -14,11 +14,11 @@ lookup table, observed stream, call ledger, scorecard.
 | materialized | 621 | landed in the correlation's store and (mostly) read back |
 | failed | **153** | renderer refused — **every one `payment_attempt`**, message `could not render an insert` |
 | skipped | 163 | nothing to seed (Err/miss results; non-scalar redis values) |
-| masked | 219 | reads deliberately not seeded (post-write / created-table), now on the record |
+| not_preconditions | 219 | reads concluded not to be preconditions (read-after-write / self-created table), now on the record — named `masked` on this run's certificate, renamed since (#40) |
 | readback_matched / missing | 528 / 93 | seeded rows verified / not found on readback |
 
-`planned + masked` now accounts for every state-read the planner was shown —
-the identity that used to be unverifiable.
+`planned + not_preconditions` now accounts for every state-read the planner was
+shown — the identity that used to be unverifiable.
 
 ## Verdict trajectory
 
