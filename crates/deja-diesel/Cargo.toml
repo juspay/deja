@@ -30,6 +30,12 @@ diesel = { version = "~2.2.10", default-features = false, features = [
 # `PgConnection` to wrap.
 diesel = { version = "~2.2.10", features = ["postgres"] }
 tempfile = "3"
+# Pool-path probe: mirrors hyperswitch's execution stack exactly (it drives
+# diesel through async-bb8-diesel over a bb8 pool), so the handoff is proven
+# through the same call path production uses, not just a bare connection.
+async-bb8-diesel = "0.2.1"
+bb8 = "0.8.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
