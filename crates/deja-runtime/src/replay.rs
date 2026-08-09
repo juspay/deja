@@ -2221,27 +2221,28 @@ pub struct SeedPlan {
     /// `(boundary, key) -> entry`. A BTreeMap keeps materialization order stable
     /// (so a `redis-cli SET` sequence is deterministic across runs).
     entries: BTreeMap<(String, String), SeedEntry>,
-    /// Reads the planner deliberately did NOT seed, with the rule that dropped
-    /// each. The masks are correct — a read after this correlation's own write
-    /// observes the post-write value, and a read of a table this correlation
-    /// created collides with the replayed create — but a drop with no record
-    /// made `planned` silently under-count the tape's reads, and "the planner
-    /// skipped it on purpose" was indistinguishable from "the planner never saw
-    /// it". Deduped on `(boundary, key, reason)`: the COUNT of masked reads is
-    /// uninteresting, the set of masked keys is the audit surface.
-    masked: BTreeMap<(String, String, MaskReason), ()>,
+    /// Reads the planner concluded are NOT preconditions, with the rule that
+    /// reached each conclusion. The conclusions are correct — a read after this
+    /// correlation's own write observes the post-write value, and a read of a
+    /// table this correlation created collides with the replayed create — but a
+    /// drop with no record made `planned` silently under-count the tape's
+    /// reads, and "the planner declined on purpose" was indistinguishable from
+    /// "the planner never saw it". Deduped on `(boundary, key, reason)`: the
+    /// COUNT of these reads is uninteresting, the set of keys is the audit
+    /// surface.
+    non_preconditions: BTreeMap<(String, String, NotPreconditionReason), ()>,
 }
 
-/// Why [`build_seed_plan`] declined to seed a read it saw.
+/// Why [`build_seed_plan`] concluded a read it saw is not a precondition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MaskReason {
+pub enum NotPreconditionReason {
     /// A prior event in this correlation WROTE the key; the read observes the
     /// post-write value, not a precondition.
-    MaskedByWrite,
+    ReadAfterWrite,
     /// This correlation CREATED rows in the table; seeding a later read-back
     /// would collide with the replayed create.
-    MaskedByCreate,
+    SelfCreatedTable,
 }
 
 impl SeedPlan {
@@ -2296,18 +2297,21 @@ impl SeedPlan {
         self.entries.values()
     }
 
-    /// Record a read the planner saw and deliberately declined to seed.
-    fn mask(&mut self, boundary: &str, key: &str, reason: MaskReason) {
-        self.masked
+    /// Record a read the planner saw and concluded is not a precondition.
+    fn note_non_precondition(&mut self, boundary: &str, key: &str, reason: NotPreconditionReason) {
+        self.non_preconditions
             .insert((boundary.to_owned(), key.to_owned(), reason), ());
     }
 
-    /// The reads this plan deliberately did not seed, in deterministic order:
-    /// `(boundary, key, why)`. Together with [`Self::iter`] this accounts for
-    /// every non-error state-read the planner was shown — the property the
-    /// seed certificate asserts.
-    pub fn masked_reads(&self) -> impl Iterator<Item = (&str, &str, MaskReason)> {
-        self.masked
+    /// The reads this plan concluded are not preconditions, in deterministic
+    /// order: `(boundary, key, why)`. Together with [`Self::iter`] this
+    /// accounts for every non-error state-read the planner was shown — the
+    /// property the seed certificate asserts. (Known as `masked_reads` before
+    /// the #40 rename: the status now names the conclusion, not the mechanism.)
+    pub fn non_precondition_reads(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, NotPreconditionReason)> {
+        self.non_preconditions
             .keys()
             .map(|(b, k, r)| (b.as_str(), k.as_str(), *r))
     }
@@ -2539,12 +2543,12 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
             continue;
         }
 
-        // Seed THIS event's reads FIRST — masked only by writes from PRIOR events,
+        // Seed THIS event's reads FIRST — excluded only by writes from PRIOR events,
         // not this event's own write. This matters for a mutating op whose read-set
         // key equals its write-set key. Such an op reads a PRE-EXISTING row (the one
         // it mutates) — a genuine precondition — even when the correlation never
         // issued a separate SELECT. If we marked the write before seeding, that
-        // pre-image read would be masked as "already written", the pre-existing row
+        // pre-image read would be declined as "already written", the pre-existing row
         // would never materialize into the correlation's schema, and the replayed
         // UPDATE would hit an empty table. `created_tables` still skips reads of a
         // table this correlation created (it reconstructs those via its own replayed
@@ -2554,7 +2558,11 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 let canonical_key = canonical_state_key_wire(key);
                 let written_key = (event.boundary.clone(), canonical_key.clone());
                 if written.contains(&written_key) {
-                    plan.mask(&event.boundary, &canonical_key, MaskReason::MaskedByWrite);
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::ReadAfterWrite,
+                    );
                     continue;
                 }
                 // Don't seed a read of a table this correlation has already created
@@ -2562,7 +2570,11 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 if event.boundary == "db" {
                     if let Some(table) = db_read_table(event, key) {
                         if created_tables.contains(&(event.boundary.clone(), table)) {
-                            plan.mask(&event.boundary, &canonical_key, MaskReason::MaskedByCreate);
+                            plan.note_non_precondition(
+                                &event.boundary,
+                                &canonical_key,
+                                NotPreconditionReason::SelfCreatedTable,
+                            );
                             continue;
                         }
                     }
@@ -2581,7 +2593,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         }
         // THEN mark this event's writes: subsequent reads of these keys observe the
         // post-write value (no longer a precondition), and a create additionally
-        // masks later read-backs of the whole table (they'd collide with the
+        // declines later read-backs of the whole table (they'd collide with the
         // replayed create).
         for key in &event.write_set {
             written.insert((event.boundary.clone(), canonical_state_key_wire(key)));
@@ -4885,9 +4897,13 @@ mod tests {
             "a declared Create masks later DB reads of the created table even when the method name lacks `insert`"
         );
         assert_eq!(
-            plan.masked_reads().collect::<Vec<_>>(),
-            vec![("db", read_key.as_str(), MaskReason::MaskedByCreate)],
-            "and the decline is on the record — a masked read used to vanish, \
+            plan.non_precondition_reads().collect::<Vec<_>>(),
+            vec![(
+                "db",
+                read_key.as_str(),
+                NotPreconditionReason::SelfCreatedTable
+            )],
+            "and the decline is on the record — a declined read used to vanish, \
              making `planned` silently under-count the tape's reads"
         );
     }
@@ -5135,8 +5151,8 @@ mod tests {
             "the precondition is the pre-write value, not the post-write read"
         );
         assert_eq!(
-            plan.masked_reads().collect::<Vec<_>>(),
-            vec![("custom_store", "k", MaskReason::MaskedByWrite)],
+            plan.non_precondition_reads().collect::<Vec<_>>(),
+            vec![("custom_store", "k", NotPreconditionReason::ReadAfterWrite)],
             "the post-write read is declined AND accounted, not silently dropped"
         );
     }
