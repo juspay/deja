@@ -124,6 +124,19 @@ Both directions pass through the client's own types at the edges, with the
 protocol shape — not the client shape — as the thing that persists. Feed back
 what the protocol produced: RESP values for redis, `typsend` bytes for pg.
 
+One correction this review surfaced (tracked as issue #45): today the owned
+type exists TWICE — `RedisWireValue` in the deja crate and a private
+`DejaRedisValue` twin inside each of hyperswitch's client modules, coupled only
+by variant-name agreement through serde. That is a one-definition violation and
+exactly the unchecked drift this section argues against; the exhaustive `From`
+protects client→twin but nothing checks twin→`RedisWireValue`. The end state:
+`RedisWireValue` is the ONLY definition, and the client conversions live next
+to it as optional deja cargo features (`fred`, `redis-rs`) — the orphan rule
+permits it since the target type is deja's, and single-lockfile pinning keeps
+client versions aligned. The vendor twins get deleted; capture and replay call
+`.into()`/`.try_into()`, and the whole chain — client enum → tape → seeder →
+client write — is checked by one compiler run.
+
 ## Tape shape: two representations, one escape hatch
 
 The carrier already exists and is already dead code waiting for this:
