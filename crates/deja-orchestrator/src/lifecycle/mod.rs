@@ -3648,18 +3648,21 @@ enum RedisSeedRender {
 ///   (no wildcard): scalars → `SET`, `Map` → `HSET`, `Array` → `RPUSH` (or
 ///   `ZADD` when `method` names a sorted-set read — the value alone cannot
 ///   distinguish a list range from a zset range), `Set` → `SADD`, `Null` →
-///   nothing. A new wire variant is a compile error here, not a silent replay
-///   gap.
+///   nothing, and the non-value shapes (status replies, attribute/verbatim/
+///   push frames, the unsupported catch) → a named skip. A new wire variant
+///   is a compile error here, not a silent replay gap.
 /// - **Ambient/config template** — a bare JSON string (e.g. `"0.20"`) that is
 ///   *already* the raw text redis holds. Passed through byte-for-byte.
 ///
-/// Anything else — a wire shape the canonical type deliberately does not model
-/// (push/verbatim/attribute/…), or a structure with members that are not
-/// scalars — is [`RedisSeedRender::Unrepresentable`]: the caller records an
-/// explicit skip in the seed certificate instead of writing garbage. This is
-/// what replaced the old `to_string()` fallback, which wrote the enum wrapper
-/// text (`{"BulkString":[…]}`) into redis and made the replayed router branch
-/// on garbage — a false divergence.
+/// Anything else — a wire shape with no faithful write command
+/// (push/verbatim/attribute/status replies; modelled by the canonical type
+/// since #45 so the client adapters stay total, but still not seedable), or a
+/// structure with members that are not scalars — is
+/// [`RedisSeedRender::Unrepresentable`]: the caller records an explicit skip
+/// in the seed certificate instead of writing garbage. This is what replaced
+/// the old `to_string()` fallback, which wrote the enum wrapper text
+/// (`{"BulkString":[…]}`) into redis and made the replayed router branch on
+/// garbage — a false divergence.
 fn render_redis_seed_payload(value: &serde_json::Value, method: Option<&str>) -> RedisSeedRender {
     // Recording-derived: decode into the canonical shared type FIRST. This also
     // correctly treats a bare-string unit variant (`"Null"`, a miss that leaked
@@ -3777,6 +3780,38 @@ fn wire_value_seed_render(
             }
             RedisSeedRender::Payload(RedisSeedPayload::Set(members))
         }
+        // Status acknowledgements (`+OK`, `+QUEUED`): command outcomes, not
+        // stored state — there is nothing a write could faithfully reproduce.
+        // Before #45 these bare-string tags slipped past the wire decode into
+        // the ambient-string branch and were seeded as the literal text
+        // "Okay"/"Queued"; the exhaustive arm turns that silent garbage into a
+        // named skip.
+        Wire::Okay => RedisSeedRender::Unrepresentable(
+            "redis wire variant `Okay` is a status reply, not stored state; refusing to seed it"
+                .to_owned(),
+        ),
+        Wire::Queued => RedisSeedRender::Unrepresentable(
+            "redis wire variant `Queued` is a status reply, not stored state; refusing to seed it"
+                .to_owned(),
+        ),
+        // Wire shapes with no faithful write command. Modelled since #45 (the
+        // client adapters must be total over both client enums), so the loud
+        // skip moved from "deserializing fails" to this exhaustive match —
+        // same certificate entry, now compiler-enforced.
+        Wire::Attribute { .. } => RedisSeedRender::Unrepresentable(
+            "redis wire variant `Attribute` has no faithful write command; refusing to guess"
+                .to_owned(),
+        ),
+        Wire::VerbatimString { .. } => RedisSeedRender::Unrepresentable(
+            "redis wire variant `VerbatimString` has no faithful write command; refusing to guess"
+                .to_owned(),
+        ),
+        Wire::Push { .. } => RedisSeedRender::Unrepresentable(
+            "redis wire variant `Push` has no faithful write command; refusing to guess".to_owned(),
+        ),
+        Wire::UnsupportedSuccessfulValue { variant } => RedisSeedRender::Unrepresentable(format!(
+            "redis value recorded as unsupported ({variant}); refusing to guess"
+        )),
     }
 }
 
@@ -5764,7 +5799,8 @@ mod tests {
     /// named reason — never a stringified `SET` of the wrapper text.
     #[test]
     fn redis_unsupported_wire_shapes_stay_loud_skips() {
-        // A wire variant the canonical type deliberately does not model.
+        // A wire variant with no faithful write command (modelled since #45,
+        // still refused — now by the exhaustive match instead of at decode).
         match render_redis_seed_payload(
             &serde_json::json!({ "VerbatimString": { "format": "txt", "text": "x" } }),
             None,
@@ -5774,6 +5810,29 @@ mod tests {
                 "the refusal names the variant: {reason}"
             ),
             other => panic!("an unmodelled variant must be Unrepresentable, got {other:?}"),
+        }
+        // Status acknowledgements are not stored state. Before the wire type
+        // modelled them (#45), these bare-string tags slipped into the
+        // ambient-string branch and seeded the LITERAL TEXT "Okay"/"Queued".
+        for tag in ["Okay", "Queued"] {
+            match render_redis_seed_payload(&serde_json::json!(tag), None) {
+                RedisSeedRender::Unrepresentable(reason) => assert!(
+                    reason.contains(tag),
+                    "the refusal names the status reply: {reason}"
+                ),
+                other => panic!("a status reply must be Unrepresentable, got {other:?}"),
+            }
+        }
+        // A recording the capture side flagged as unsupported stays named.
+        match render_redis_seed_payload(
+            &serde_json::json!({ "UnsupportedSuccessfulValue": { "variant": "BigNumber" } }),
+            None,
+        ) {
+            RedisSeedRender::Unrepresentable(reason) => assert!(
+                reason.contains("BigNumber"),
+                "the refusal names what was recorded: {reason}"
+            ),
+            other => panic!("an unsupported recording must be Unrepresentable, got {other:?}"),
         }
         // A structure whose members are not scalars cannot flatten into HSET.
         match render_redis_seed_payload(
