@@ -71,6 +71,41 @@ impl StoreExec {
         }
     }
 
+    /// Prepared `psql -v ON_ERROR_STOP=<0|1> … -c cmd1 -c cmd2 …` against the
+    /// replay pg: one SESSION, one command per `-c`, executed in order. This
+    /// is what lets a `\copy … from pstdin` meta-command compose with
+    /// session-temporary state (a TEMP staging table created by an earlier
+    /// `-c` is visible to the later ones). The caller attaches stdin when a
+    /// command reads `pstdin`; both transports forward it (`docker compose
+    /// exec -T` keeps stdin piped).
+    pub(crate) fn psql_script(&self, on_error_stop: bool, commands: &[String]) -> Command {
+        let stop = if on_error_stop {
+            "ON_ERROR_STOP=1"
+        } else {
+            "ON_ERROR_STOP=0"
+        };
+        let mut cmd = match self {
+            Self::Compose { base_args, env } => {
+                let mut cmd = Command::new("docker");
+                cmd.args(base_args)
+                    .args(["exec", "-T", "pg", "psql"])
+                    .args(["-v", stop, "-U", "db_user", "-d", "hyperswitch_db"])
+                    .envs(env.iter().cloned())
+                    .env("PGPASSWORD", "db_pass");
+                cmd
+            }
+            Self::Direct { database_url, .. } => {
+                let mut cmd = Command::new("psql");
+                cmd.args(["-v", stop, "-d", database_url]);
+                cmd
+            }
+        };
+        for command in commands {
+            cmd.args(["-c", command]);
+        }
+        cmd
+    }
+
     /// Prepared `psql <shape_flags…> -v ON_ERROR_STOP=<0|1> … -c <sql>` against
     /// the replay pg. `shape_flags` are output-shape flags only (`-A -t -F \t`);
     /// connection identity (user/db/password) belongs to the transport.
@@ -188,6 +223,59 @@ mod tests {
             .get_envs()
             .any(|(k, v)| k == "PGPASSWORD" && v == Some("db_pass".as_ref()));
         assert!(has_pgpassword);
+    }
+
+    #[test]
+    fn psql_script_runs_one_session_with_one_dash_c_per_command() {
+        let commands = vec![
+            "CREATE TEMP TABLE _deja_wire_seed AS SELECT \"a\" FROM \"t\" WITH NO DATA".to_string(),
+            "\\copy _deja_wire_seed from pstdin with (format binary)".to_string(),
+            "INSERT INTO \"t\" (\"a\") SELECT \"a\" FROM _deja_wire_seed ON CONFLICT DO NOTHING"
+                .to_string(),
+        ];
+
+        let compose = StoreExec::compose(vec!["compose".into()], vec![]);
+        assert_eq!(
+            argv(&compose.psql_script(true, &commands)),
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "pg",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-U",
+                "db_user",
+                "-d",
+                "hyperswitch_db",
+                "-c",
+                &commands[0],
+                "-c",
+                &commands[1],
+                "-c",
+                &commands[2],
+            ]
+        );
+
+        let direct = StoreExec::direct("127.0.0.1".into(), 6379, "postgres://u:p@h/db".into());
+        assert_eq!(
+            argv(&direct.psql_script(true, &commands)),
+            [
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                "postgres://u:p@h/db",
+                "-c",
+                &commands[0],
+                "-c",
+                &commands[1],
+                "-c",
+                &commands[2],
+            ]
+        );
     }
 
     #[test]

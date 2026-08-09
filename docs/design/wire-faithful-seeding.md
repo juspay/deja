@@ -1,6 +1,17 @@
 # Wire-faithful seeding — capture at the protocol, once per protocol
 
-**Status: DECIDED (direction) + SPIKE ITEMS NAMED.** The db seed round trip moves from
+**Status: DECIDED + pg half BUILT (deja side).** `DejaLoadConnection<C>` ships as the
+`deja-diesel` crate (facade feature `diesel-pg`); the tape carries the physical image on the row
+image's `wire`/`wire_format` fields; the seeder lands wire-carrying rows through binary COPY. Two
+deltas against the sketch below, both from the spike: (1) the capture→boundary handoff is a keyed
+process-global registry, NOT a thread-local — async-bb8-diesel runs every load on a
+`spawn_blocking` thread while the boundary's result producer runs on the async task (see
+`deja-runtime/src/wire_capture.rs` for the verified analysis); (2) the container-OID hazard is
+resolved as a per-VALUE eligibility rule: verbatim COPY for captured type OIDs < 10000 (built-in,
+cluster-stable, including built-in containers whose embedded element OIDs are equally stable) plus
+user-defined values whose wire bytes equal the semantic string byte-for-byte (the pg enum label
+case, proven per value); everything else falls back to the serde INSERT path, fail-closed arm
+intact. The vendor swap (hyperswitch pool alias) is still open under #35. The db seed round trip moves from
 serde JSON to the database's own wire format, captured by a `DejaLoadConnection<C>` wrapper at the
 diesel connection seam and seeded back through postgres's paired input functions. Redis gets the
 same treatment by completing the backward half of the transform `RedisWireValue` already carries

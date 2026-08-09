@@ -1,0 +1,35 @@
+[package]
+name = "deja-diesel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Diesel connection wrapper for Deja: captures each result row's binary wire values + type OIDs verbatim (before FromSql) for wire-faithful DB seeding."
+
+[dependencies]
+deja-runtime = { path = "../deja-runtime" }
+# The wrapper reads rows through diesel's generic row API on the Pg backend
+# and must name `LoadConnection::load` / `ConnectionSealed` / `PgValue::new`,
+# all public only under diesel's third-party-backend opt-in feature.
+# `postgres_backend` gives the Pg backend types WITHOUT linking libpq (the
+# wrapped connection type supplies the actual connection implementation);
+# `r2d2` gives the `R2D2Connection` trait the bb8/r2d2 pool managers require.
+# Pinned to the 2.2 line: the wrapper is compiled into hosts that pin their
+# own diesel (hyperswitch: 2.2.10), and this trait surface is exempt from
+# diesel's semver promise — revisit the pin together with the host.
+diesel = { version = "~2.2.10", default-features = false, features = [
+    "postgres_backend",
+    "r2d2",
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
+
+[dev-dependencies]
+# Real-postgres round-trip test (ignored by default; needs a reachable
+# database): the full `postgres` feature links libpq and provides
+# `PgConnection` to wrap.
+diesel = { version = "~2.2.10", features = ["postgres"] }
+tempfile = "3"
+
+[lints]
+workspace = true
