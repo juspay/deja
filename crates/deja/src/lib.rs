@@ -382,13 +382,19 @@ pub mod value {
     ///
     /// # Scope
     ///
-    /// The scalar variants a plain redis string read (GET-family) can return,
-    /// plus the structured families the seeder can write back natively
-    /// (`Array` → `RPUSH`/`ZADD`, `Map` → `HSET`, `Set` → `SADD`, per #39).
-    /// Wire shapes with no faithful write command (push, verbatim, attribute,
-    /// …) are deliberately absent: deserializing one fails, and the seeder
-    /// treats that failure as an explicit, logged refusal rather than guessing.
-    /// The compiler enforces the seeder handles every variant here (no
+    /// The full union of what either client's value enum can observably carry
+    /// (#45): the scalar variants a plain redis string read (GET-family)
+    /// returns, the structured families the seeder can write back natively
+    /// (`Array` → `RPUSH`/`ZADD`, `Map` → `HSET`, `Set` → `SADD`, per #39),
+    /// and the protocol shapes with no faithful write command (status replies,
+    /// push, verbatim, attribute, plus the loud
+    /// [`UnsupportedSuccessfulValue`](Self::UnsupportedSuccessfulValue)
+    /// catch). The latter group exists because the client adapters below must
+    /// be TOTAL — `From<client::Value>` cannot fail — and because tapes the
+    /// vendor twins already wrote contain those tags. The refusal to seed them
+    /// did not disappear; it moved from "deserializing fails" to the seeder's
+    /// exhaustive match, which answers every variant with either a write
+    /// command or a named, logged skip. The compiler enforces that (no
     /// wildcard), so adding a variant is a build error, not a 2am corruption.
     // No `Eq`: the `Double(f64)` variant is only `PartialEq`.
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -420,6 +426,36 @@ pub mod value {
         /// An unordered member collection — a set read (`redis_rs` dialect;
         /// `fred` returns sets as `Array`).
         Set(Vec<RedisWireValue>),
+        /// The `+OK` status reply (`redis_rs` dialect; `fred` decodes the same
+        /// frame as `String("OK")`). A command acknowledgement, not stored
+        /// state — the seeder refuses it with a named skip.
+        Okay,
+        /// The MULTI-queued acknowledgement (`fred` dialect; `redis_rs`
+        /// decodes the same `+QUEUED` frame as `SimpleString("QUEUED")`).
+        /// Not stored state — the seeder refuses it with a named skip.
+        Queued,
+        /// A RESP3 attribute-decorated reply (`redis_rs` dialect): the actual
+        /// `data` plus out-of-band `attributes` metadata pairs.
+        Attribute {
+            data: Box<RedisWireValue>,
+            attributes: Vec<(RedisWireValue, RedisWireValue)>,
+        },
+        /// A RESP3 verbatim string (`redis_rs` dialect): a `format` marker
+        /// (`"txt"`, `"mkd"`, …) plus the text.
+        VerbatimString { format: String, text: String },
+        /// A RESP3 push frame (`redis_rs` dialect): the push `kind`
+        /// (`"message"`, `"invalidate"`, …) plus its payload values.
+        Push {
+            kind: String,
+            data: Vec<RedisWireValue>,
+        },
+        /// The loud catch for client values with no faithful wire mapping:
+        /// `redis_rs`'s `BigNumber` and `ServerError`, and — required by
+        /// `#[non_exhaustive]` on `redis::Value` — any variant a future client
+        /// version adds. Recording it named (instead of dropping or guessing)
+        /// keeps the tape honest; replaying it back into a client is an error,
+        /// and seeding it is a named skip.
+        UnsupportedSuccessfulValue { variant: String },
     }
 
     impl RedisWireValue {
@@ -433,7 +469,9 @@ pub mod value {
         /// pre-existing limitation of that transport, not this decode. `Null`
         /// yields `None` (nothing to seed), as do the structured families
         /// (`Array`/`Map`/`Set`) — those are not one string, and the seeder
-        /// maps them to their own write commands instead (#39).
+        /// maps them to their own write commands instead (#39) — and the
+        /// non-value shapes (status replies, attribute/verbatim/push frames,
+        /// the unsupported catch), which no `SET` can faithfully reproduce.
         pub fn to_redis_string(&self) -> Option<String> {
             match self {
                 Self::Null => None,
@@ -443,6 +481,274 @@ pub mod value {
                 Self::Double(d) => Some(d.to_string()),
                 Self::Boolean(b) => Some(if *b { "1" } else { "0" }.to_owned()),
                 Self::Array(_) | Self::Map(_) | Self::Set(_) => None,
+                Self::Okay
+                | Self::Queued
+                | Self::Attribute { .. }
+                | Self::VerbatimString { .. }
+                | Self::Push { .. }
+                | Self::UnsupportedSuccessfulValue { .. } => None,
+            }
+        }
+    }
+
+    // ─── Client adapters (#45) ──────────────────────────────────────────────
+    //
+    // One definition, adapters at the edges: capture converts client →
+    // protocol-shaped tape value, replay converts tape value → client and lets
+    // the client write it. These impls live NEXT TO the wire type (the orphan
+    // rule permits it — the target type is ours) behind optional features, so
+    // a vendor's capture/replay path is `.into()` / `.try_into()` and the
+    // whole chain — client enum → tape → seeder → client write — is checked by
+    // one compiler run instead of two repos agreeing on serde variant names.
+    //
+    // Drift policy: NO wildcard arms in these conversions (a `_` here is a bug
+    // per docs/design/wire-faithful-seeding.md) — an exhaustive match is the
+    // compile-time drift detector when a client upgrade changes its enum. The
+    // single exception is the wildcard `#[non_exhaustive]` forces (see the
+    // `redis::Value` impl), which maps to the loud
+    // [`RedisWireValue::UnsupportedSuccessfulValue`], never to a silent guess.
+
+    /// Capture-side adapter: total — every fred value has a wire form.
+    #[cfg(feature = "fred")]
+    impl From<fred::types::RedisValue> for RedisWireValue {
+        fn from(value: fred::types::RedisValue) -> Self {
+            use fred::types::RedisValue as R;
+            match value {
+                R::Null => Self::Null,
+                R::Boolean(b) => Self::Boolean(b),
+                R::Integer(i) => Self::Int(i),
+                R::Double(d) => Self::Double(d),
+                R::String(s) => Self::SimpleString(s.to_string()),
+                R::Bytes(b) => Self::BulkString(b.to_vec()),
+                R::Queued => Self::Queued,
+                R::Array(a) => Self::Array(a.into_iter().map(Self::from).collect()),
+                // Map keys are `RedisKey` (bytes): route them through fred's
+                // own key→value conversion (`RedisValue::Bytes`) and recurse,
+                // so a key takes the same wire form a value with those bytes
+                // would.
+                R::Map(m) => Self::Map(
+                    m.inner()
+                        .into_iter()
+                        .map(|(k, v)| (Self::from(R::from(k)), Self::from(v)))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    /// Replay-side adapter: fallible — the wire type is the UNION of both
+    /// clients' shapes, and fred cannot represent all of them.
+    ///
+    /// Cross-dialect variants are mapped exactly where fred itself would have
+    /// decoded the same RESP frame to a known shape (`Okay` → `String("OK")`,
+    /// `Set` → `Array` — fred returns sets as arrays); everything fred has no
+    /// representation for is a loud error naming the variant, never a guess.
+    #[cfg(feature = "fred")]
+    impl TryFrom<RedisWireValue> for fred::types::RedisValue {
+        type Error = fred::error::RedisError;
+
+        fn try_from(value: RedisWireValue) -> Result<Self, Self::Error> {
+            use RedisWireValue as W;
+            match value {
+                W::Null => Ok(Self::Null),
+                W::Boolean(b) => Ok(Self::Boolean(b)),
+                W::Int(i) => Ok(Self::Integer(i)),
+                W::Double(d) => Ok(Self::Double(d)),
+                W::SimpleString(s) => Ok(Self::String(s.into())),
+                W::BulkString(b) => Ok(Self::Bytes(b.into())),
+                W::Queued => Ok(Self::Queued),
+                W::Array(a) => Ok(Self::Array(
+                    a.into_iter()
+                        .map(Self::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                W::Map(m) => {
+                    let pairs = m
+                        .into_iter()
+                        .map(|(k, v)| Ok((Self::try_from(k)?, Self::try_from(v)?)))
+                        .collect::<Result<Vec<_>, Self::Error>>()?;
+                    pairs.try_into().map(Self::Map)
+                }
+                // `redis_rs` dialect, protocol-equivalent in fred: the `+OK`
+                // status frame decodes to `String("OK")` in fred, and fred
+                // returns RESP set replies as `Array`.
+                W::Okay => Ok(Self::String("OK".into())),
+                W::Set(items) => Ok(Self::Array(
+                    items
+                        .into_iter()
+                        .map(Self::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                // No fred representation: refuse loudly rather than invent one.
+                W::Attribute { .. } => Err(fred::error::RedisError::new(
+                    fred::error::RedisErrorKind::InvalidArgument,
+                    "recorded redis value `Attribute` has no fred representation",
+                )),
+                W::VerbatimString { .. } => Err(fred::error::RedisError::new(
+                    fred::error::RedisErrorKind::InvalidArgument,
+                    "recorded redis value `VerbatimString` has no fred representation",
+                )),
+                W::Push { .. } => Err(fred::error::RedisError::new(
+                    fred::error::RedisErrorKind::InvalidArgument,
+                    "recorded redis value `Push` has no fred representation",
+                )),
+                W::UnsupportedSuccessfulValue { variant } => Err(fred::error::RedisError::new(
+                    fred::error::RedisErrorKind::InvalidArgument,
+                    format!("unsupported redis value variant recorded on the tape: {variant}"),
+                )),
+            }
+        }
+    }
+
+    /// Capture-side adapter: total — every redis-rs value has a wire form.
+    #[cfg(feature = "redis-rs")]
+    impl From<redis::Value> for RedisWireValue {
+        fn from(value: redis::Value) -> Self {
+            match value {
+                redis::Value::Nil => Self::Null,
+                redis::Value::Int(i) => Self::Int(i),
+                redis::Value::BulkString(bytes) => Self::BulkString(bytes),
+                redis::Value::Array(values) => {
+                    Self::Array(values.into_iter().map(Self::from).collect())
+                }
+                redis::Value::SimpleString(s) => Self::SimpleString(s),
+                redis::Value::Okay => Self::Okay,
+                redis::Value::Map(pairs) => Self::Map(
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| (Self::from(k), Self::from(v)))
+                        .collect(),
+                ),
+                redis::Value::Attribute { data, attributes } => Self::Attribute {
+                    data: Box::new(Self::from(*data)),
+                    attributes: attributes
+                        .into_iter()
+                        .map(|(k, v)| (Self::from(k), Self::from(v)))
+                        .collect(),
+                },
+                redis::Value::Set(values) => {
+                    Self::Set(values.into_iter().map(Self::from).collect())
+                }
+                redis::Value::Double(d) => Self::Double(d),
+                redis::Value::Boolean(b) => Self::Boolean(b),
+                redis::Value::VerbatimString { format, text } => Self::VerbatimString {
+                    format: format.to_string(),
+                    text,
+                },
+                redis::Value::Push { kind, data } => Self::Push {
+                    kind: kind.to_string(),
+                    data: data.into_iter().map(Self::from).collect(),
+                },
+                // Carried named, not dropped: these decode from real server
+                // frames but have no faithful wire mapping (a big number does
+                // not fit `Int`; an in-array server error is not a value).
+                redis::Value::BigNumber(_) => Self::UnsupportedSuccessfulValue {
+                    variant: "BigNumber".to_owned(),
+                },
+                redis::Value::ServerError(error) => Self::UnsupportedSuccessfulValue {
+                    variant: match error.details() {
+                        Some(details) => format!("ServerError({}: {details})", error.code()),
+                        None => format!("ServerError({})", error.code()),
+                    },
+                },
+                // `redis::Value` is #[non_exhaustive], so the compiler REQUIRES
+                // this wildcard even with every variant of the pinned version
+                // matched above — the one arm the "no `_` in adapter
+                // conversions" rule cannot delete. The trade-off: a client
+                // upgrade that adds a variant is caught at RUNTIME (as this
+                // loud tape value, refused by the seeder and erroring on
+                // replay-back) instead of at compile time. It must therefore
+                // never be silent and never guess.
+                _ => Self::UnsupportedSuccessfulValue {
+                    variant: "unknown non-exhaustive redis::Value variant".to_owned(),
+                },
+            }
+        }
+    }
+
+    /// Replay-side adapter: fallible — an
+    /// [`UnsupportedSuccessfulValue`](RedisWireValue::UnsupportedSuccessfulValue)
+    /// cannot be handed back to the client and is a loud error naming what was
+    /// recorded.
+    ///
+    /// The fred-dialect `Queued` maps to `SimpleString("QUEUED")` — exactly how
+    /// redis-rs decodes the `+QUEUED` status frame (only `+OK` gets `Okay`).
+    #[cfg(feature = "redis-rs")]
+    impl TryFrom<RedisWireValue> for redis::Value {
+        type Error = redis::RedisError;
+
+        fn try_from(value: RedisWireValue) -> Result<Self, Self::Error> {
+            use RedisWireValue as W;
+            match value {
+                W::Null => Ok(Self::Nil),
+                W::Int(i) => Ok(Self::Int(i)),
+                W::BulkString(bytes) => Ok(Self::BulkString(bytes)),
+                W::Array(values) => Ok(Self::Array(
+                    values
+                        .into_iter()
+                        .map(Self::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                W::SimpleString(s) => Ok(Self::SimpleString(s)),
+                W::Okay => Ok(Self::Okay),
+                W::Map(pairs) => Ok(Self::Map(
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| Ok((Self::try_from(k)?, Self::try_from(v)?)))
+                        .collect::<Result<Vec<_>, Self::Error>>()?,
+                )),
+                W::Attribute { data, attributes } => Ok(Self::Attribute {
+                    data: Box::new(Self::try_from(*data)?),
+                    attributes: attributes
+                        .into_iter()
+                        .map(|(k, v)| Ok((Self::try_from(k)?, Self::try_from(v)?)))
+                        .collect::<Result<Vec<_>, Self::Error>>()?,
+                }),
+                W::Set(values) => Ok(Self::Set(
+                    values
+                        .into_iter()
+                        .map(Self::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                W::Double(d) => Ok(Self::Double(d)),
+                W::Boolean(b) => Ok(Self::Boolean(b)),
+                W::VerbatimString { format, text } => Ok(Self::VerbatimString {
+                    format: match format.as_str() {
+                        "mkd" => redis::VerbatimFormat::Markdown,
+                        "txt" => redis::VerbatimFormat::Text,
+                        other => redis::VerbatimFormat::Unknown(other.to_owned()),
+                    },
+                    text,
+                }),
+                W::Push { kind, data } => Ok(Self::Push {
+                    kind: match kind.as_str() {
+                        "disconnection" => redis::PushKind::Disconnection,
+                        "invalidate" => redis::PushKind::Invalidate,
+                        "message" => redis::PushKind::Message,
+                        "pmessage" => redis::PushKind::PMessage,
+                        "smessage" => redis::PushKind::SMessage,
+                        "unsubscribe" => redis::PushKind::Unsubscribe,
+                        "punsubscribe" => redis::PushKind::PUnsubscribe,
+                        "sunsubscribe" => redis::PushKind::SUnsubscribe,
+                        "subscribe" => redis::PushKind::Subscribe,
+                        "psubscribe" => redis::PushKind::PSubscribe,
+                        "ssubscribe" => redis::PushKind::SSubscribe,
+                        other => redis::PushKind::Other(other.to_owned()),
+                    },
+                    data: data
+                        .into_iter()
+                        .map(Self::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
+                }),
+                // `fred` dialect, protocol-equivalent in redis-rs: `+QUEUED`
+                // is a plain status string here (only `+OK` gets `Okay`).
+                W::Queued => Ok(Self::SimpleString("QUEUED".to_owned())),
+                W::UnsupportedSuccessfulValue { variant } => Err((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "unsupported redis value variant recorded on the tape",
+                    variant,
+                )
+                    .into()),
             }
         }
     }
