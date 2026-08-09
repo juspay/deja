@@ -84,6 +84,46 @@ transform — non-scalar variants have no write command. Part 3 of this stack co
 exhaustive match (Map → `HSET`, Array → `RPUSH`/`ZADD`, Set → `SADD`, Null → nothing), with the
 same discipline: an unmappable variant is a loud skip, never a stringified guess.
 
+## Why an owned wire type, not the client library's (the `DejaRedisValue` question)
+
+A fair challenge: `DejaRedisValue` is a type deja invented. Why mirror the
+client's value enum instead of using the client's own types — wouldn't the
+library's type information give drift-detection for free, the same way the pg
+plan feeds back exactly what the protocol produced?
+
+Three facts decide it, and the first one alone is sufficient:
+
+1. **There are two client libraries in this codebase, today.** Hyperswitch's
+   `redis_interface` compiles against fred (`module/fred/`) *and* redis-rs
+   (`module/redis_rs/`). The tape must replay across builds regardless of which
+   client produced it — a fred-shaped tape cannot seed a redis-rs build. The
+   neutral type is not a stylistic choice; it is forced by the module structure.
+   Client libraries are replaceable; the protocol is the stable interface. That
+   is the same reason the pg side captures wire bytes + OID rather than
+   diesel's internal value types.
+
+2. **The drift alarm the client's types would provide already exists — at the
+   conversion, where it belongs.** `From<fred::RedisValue> for DejaRedisValue`
+   (`redis_interface/src/module/fred/commands.rs`) is an exhaustive match with
+   no wildcard arm. If a client upgrade adds a variant, that `From` stops
+   compiling and forces a mapping decision. The mirror plus an exhaustive
+   conversion IS the compile-time drift detector; a `_` arm anywhere in these
+   conversions would be a bug against this design.
+
+3. **The tape is a persistence format, and its schema must be sovereign.**
+   Serializing a third-party enum directly ties bytes-on-tape to that crate's
+   semver: a minor bump that renames or restructures a variant would rewrite
+   the tape format silently — drift landing in stored artifacts instead of
+   surfacing as a compile error. Owning the wire type means the tape changes
+   only when deja changes it, deliberately, with a schema version.
+
+The symmetry the challenge asks for does hold — one level down. Capture
+converts client → protocol-shaped tape value; replay converts tape value →
+client (`TryFrom<DejaRedisValue> for RedisValue`) and lets the client write it.
+Both directions pass through the client's own types at the edges, with the
+protocol shape — not the client shape — as the thing that persists. Feed back
+what the protocol produced: RESP values for redis, `typsend` bytes for pg.
+
 ## Tape shape: two representations, one escape hatch
 
 The carrier already exists and is already dead code waiting for this:
