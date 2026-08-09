@@ -1576,81 +1576,209 @@ fn flush_redis(store: &StoreExec) -> Result<(), String> {
     }
 }
 
-/// Seed a single redis key the EU-settlement demo reads. The settlement READ is
-/// now a RAW fred GET (leaf boundary) against redis, so the seed lives in redis,
-/// not pg. Mirrors `flush_redis`'s `docker compose exec -T redis-standalone
-/// redis-cli ...` pattern. Best-effort: a failure logs and continues.
+/// Seed a single redis STRING key (the EU-settlement demo's record-side seed,
+/// and the ambient-template scalar path). The settlement READ is a RAW fred GET
+/// (leaf boundary) against redis, so the seed lives in redis, not pg.
+/// Best-effort: a failure logs and continues.
 fn seed_redis(
     store: &StoreExec,
     key: &str,
     value: &str,
 ) -> (SeedMaterializationStatus, SeedReadback) {
-    let image = RedisSeedImage::string(key, value);
-    match seed_redis_image(store, &image) {
-        Ok(()) => (
-            SeedMaterializationStatus::Materialized,
-            readback_redis(store, key, value),
-        ),
-        Err(message) => (
-            SeedMaterializationStatus::Failed,
-            SeedReadback::error(message),
-        ),
-    }
+    seed_redis_image(
+        store,
+        &RedisSeedImage {
+            physical_key: key.to_string(),
+            payload: RedisSeedPayload::String(value.to_string()),
+            ttl_seconds: None,
+        },
+    )
 }
 
+/// The typed write-shape a redis seed materializes as — the backward half of
+/// the [`deja::value::RedisWireValue`] transform (#39). One variant per value
+/// family the wire type carries; each maps to the native write command whose
+/// type-appropriate read returns the recorded value. Members are already
+/// rendered to the raw strings redis holds (via
+/// [`deja::value::RedisWireValue::to_redis_string`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RedisSeedValueType {
-    String,
+enum RedisSeedPayload {
+    /// Scalar → `SET`; read back with `GET`.
+    String(String),
+    /// Map → `HSET` field/value pairs in recorded order; read back with
+    /// `HGETALL`.
+    Hash(Vec<(String, String)>),
+    /// Array → `RPUSH` members in recorded order; read back with `LRANGE`.
+    List(Vec<String>),
+    /// Array recorded by a sorted-set method → `ZADD`; read back with
+    /// `ZRANGE`. A range read without `WITHSCORES` records member ORDER but no
+    /// scores, so each member's index is its score — that reproduces exactly
+    /// what the recorded read observed (the order), fabricating nothing the
+    /// replay can see.
+    SortedSet(Vec<String>),
+    /// Set → `SADD`; read back with `SMEMBERS` (unordered).
+    Set(Vec<String>),
+}
+
+impl RedisSeedPayload {
+    /// The `redis-cli` argv that writes this payload under `key`.
+    fn write_args(&self, key: &str) -> Vec<String> {
+        let mut args: Vec<String>;
+        match self {
+            Self::String(value) => {
+                args = vec!["SET".into(), key.into(), value.clone()];
+            }
+            Self::Hash(pairs) => {
+                args = Vec::with_capacity(2 + pairs.len() * 2);
+                args.push("HSET".into());
+                args.push(key.into());
+                for (field, value) in pairs {
+                    args.push(field.clone());
+                    args.push(value.clone());
+                }
+            }
+            Self::List(items) => {
+                args = Vec::with_capacity(2 + items.len());
+                args.push("RPUSH".into());
+                args.push(key.into());
+                args.extend(items.iter().cloned());
+            }
+            Self::SortedSet(members) => {
+                args = Vec::with_capacity(2 + members.len() * 2);
+                args.push("ZADD".into());
+                args.push(key.into());
+                for (index, member) in members.iter().enumerate() {
+                    args.push(index.to_string());
+                    args.push(member.clone());
+                }
+            }
+            Self::Set(members) => {
+                args = Vec::with_capacity(2 + members.len());
+                args.push("SADD".into());
+                args.push(key.into());
+                args.extend(members.iter().cloned());
+            }
+        }
+        args
+    }
+
+    /// The `redis-cli` argv of the type-appropriate readback READ for `key`.
+    fn readback_args(&self, key: &str) -> Vec<String> {
+        match self {
+            Self::String(_) => vec!["GET".into(), key.into()],
+            Self::Hash(_) => vec!["HGETALL".into(), key.into()],
+            Self::List(_) => vec!["LRANGE".into(), key.into(), "0".into(), "-1".into()],
+            Self::SortedSet(_) => vec!["ZRANGE".into(), key.into(), "0".into(), "-1".into()],
+            Self::Set(_) => vec!["SMEMBERS".into(), key.into()],
+        }
+    }
+
+    /// The `--raw` line image the readback READ must print if the seed landed:
+    /// one element per line, in command order (`HGETALL` alternates
+    /// field/value). `SMEMBERS` order is not defined — [`Self::compare`]
+    /// handles that, not this image.
+    fn expected_readback_lines(&self) -> Vec<String> {
+        match self {
+            Self::String(value) => vec![value.clone()],
+            Self::Hash(pairs) => pairs
+                .iter()
+                .flat_map(|(field, value)| [field.clone(), value.clone()])
+                .collect(),
+            Self::List(items) => items.clone(),
+            Self::SortedSet(members) => members.clone(),
+            Self::Set(members) => members.clone(),
+        }
+    }
+
+    /// Compare a `--raw` readback against this payload. Line-oriented, like the
+    /// `redis-cli` transport itself: an element containing a newline cannot be
+    /// distinguished from two elements (a pre-existing transport limitation,
+    /// #26 owns the transport). `Set` compares order-insensitively; everything
+    /// else is order-exact.
+    fn compare(&self, observed: &[u8]) -> Result<(), (Vec<String>, Vec<String>)> {
+        let mut expected = self.expected_readback_lines();
+        let observed_text = String::from_utf8_lossy(observed);
+        let mut observed_lines: Vec<String> = if observed_text.is_empty() {
+            Vec::new()
+        } else {
+            observed_text.split('\n').map(str::to_owned).collect()
+        };
+        if matches!(self, Self::Set(_)) {
+            expected.sort();
+            observed_lines.sort();
+        }
+        if expected == observed_lines {
+            Ok(())
+        } else {
+            Err((expected, observed_lines))
+        }
+    }
+
+    /// The command verb, for log/error messages.
+    fn write_verb(&self) -> &'static str {
+        match self {
+            Self::String(_) => "SET",
+            Self::Hash(_) => "HSET",
+            Self::List(_) => "RPUSH",
+            Self::SortedSet(_) => "ZADD",
+            Self::Set(_) => "SADD",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RedisSeedImage {
     physical_key: String,
-    physical_key_bytes: Vec<u8>,
-    value_type: RedisSeedValueType,
-    raw_value: String,
-    raw_value_bytes: Vec<u8>,
+    payload: RedisSeedPayload,
     ttl_seconds: Option<i64>,
 }
 
-impl RedisSeedImage {
-    fn string(key: &str, value: &str) -> Self {
-        Self {
-            physical_key: key.to_string(),
-            physical_key_bytes: key.as_bytes().to_vec(),
-            value_type: RedisSeedValueType::String,
-            raw_value: value.to_string(),
-            raw_value_bytes: value.as_bytes().to_vec(),
-            ttl_seconds: None,
-        }
-    }
-}
-
-fn seed_redis_image(store: &StoreExec, image: &RedisSeedImage) -> Result<(), String> {
-    let mut cmd = store.redis_cli(&["SET", image.physical_key.as_str(), image.raw_value.as_str()]);
+/// Materialize one typed redis seed and read it back. Best-effort: a failure
+/// logs, is recorded on the certificate, and never fails the replay.
+fn seed_redis_image(
+    store: &StoreExec,
+    image: &RedisSeedImage,
+) -> (SeedMaterializationStatus, SeedReadback) {
+    let write_args = image.payload.write_args(&image.physical_key);
+    let write_refs: Vec<&str> = write_args.iter().map(String::as_str).collect();
+    let mut cmd = store.redis_cli(&write_refs);
     eprintln!(
-        "lifecycle: {} (redis key {} byte(s), value {:?}, ttl {:?})",
+        "lifecycle: {} (redis key {} byte(s), write {}, ttl {:?})",
         store_exec::describe(&cmd),
-        image.physical_key_bytes.len(),
-        image.value_type,
+        image.physical_key.len(),
+        image.payload.write_verb(),
         image.ttl_seconds
     );
     match cmd.status() {
-        Ok(status) if status.success() => Ok(()),
+        Ok(status) if status.success() => (
+            SeedMaterializationStatus::Materialized,
+            readback_redis(store, image),
+        ),
         Ok(status) => {
-            let message = format!("seed_redis exited {status}");
+            let message = format!("seed_redis {} exited {status}", image.payload.write_verb());
             eprintln!("lifecycle: {message}; continuing (best-effort)");
-            Err(message)
+            (
+                SeedMaterializationStatus::Failed,
+                SeedReadback::error(message),
+            )
         }
         Err(e) => {
-            let message = format!("could not run seed_redis: {e}");
+            let message = format!(
+                "could not run seed_redis {}: {e}",
+                image.payload.write_verb()
+            );
             eprintln!("lifecycle: {message}; continuing (best-effort)");
-            Err(message)
+            (
+                SeedMaterializationStatus::Failed,
+                SeedReadback::error(message),
+            )
         }
     }
 }
 
-fn readback_redis(store: &StoreExec, key: &str, expected: &str) -> SeedReadback {
+fn readback_redis(store: &StoreExec, image: &RedisSeedImage) -> SeedReadback {
+    let key = image.physical_key.as_str();
+    let expected_lines = image.payload.expected_readback_lines();
     let exists = match redis_cli_output(store, &["EXISTS", key]) {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_owned()
@@ -1666,16 +1794,23 @@ fn readback_redis(store: &StoreExec, key: &str, expected: &str) -> SeedReadback 
     };
     if exists != "1" {
         return SeedReadback::missing(
-            serde_json::json!(expected),
-            format!("redis EXISTS returned {exists:?} after SET"),
+            serde_json::json!(expected_lines),
+            format!(
+                "redis EXISTS returned {exists:?} after {}",
+                image.payload.write_verb()
+            ),
         );
     }
 
-    let output = match redis_cli_output(store, &["--raw", "GET", key]) {
+    let read_args = image.payload.readback_args(key);
+    let mut raw_args: Vec<&str> = vec!["--raw"];
+    raw_args.extend(read_args.iter().map(String::as_str));
+    let output = match redis_cli_output(store, &raw_args) {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             return SeedReadback::error(format!(
-                "redis GET readback exited {}; stderr='{}'",
+                "redis {} readback exited {}; stderr='{}'",
+                read_args[0],
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
@@ -1683,24 +1818,28 @@ fn readback_redis(store: &StoreExec, key: &str, expected: &str) -> SeedReadback 
         Err(message) => return SeedReadback::error(message),
     };
     let observed_bytes = strip_redis_cli_terminator(&output.stdout);
-    let expected_bytes = expected.as_bytes();
-    if observed_bytes == expected_bytes {
-        SeedReadback::matched(
-            serde_json::json!(expected),
-            serde_json::json!(String::from_utf8_lossy(observed_bytes).to_string()),
-        )
-    } else {
-        SeedReadback::mismatched(
+    match image.payload.compare(observed_bytes) {
+        Ok(()) => SeedReadback::matched(
+            serde_json::json!(expected_lines),
+            serde_json::json!(String::from_utf8_lossy(observed_bytes)
+                .split('\n')
+                .collect::<Vec<_>>()),
+        ),
+        Err((expected, observed)) => SeedReadback::mismatched(
             serde_json::json!({
-                "utf8": expected,
-                "len": expected_bytes.len(),
+                "lines": expected,
+                "len": expected.len(),
             }),
             serde_json::json!({
-                "utf8": String::from_utf8_lossy(observed_bytes).to_string(),
-                "len": observed_bytes.len(),
+                "lines": observed,
+                "len": observed.len(),
             }),
-            "redis GET returned a different value after SET",
-        )
+            format!(
+                "redis {} returned a different value after {}",
+                read_args[0],
+                image.payload.write_verb()
+            ),
+        ),
     }
 }
 
@@ -2074,26 +2213,36 @@ fn materialize_seed_plan(
         entries.sort_by_key(|entry| seed_materialization_priority(entry));
         for entry in entries {
             match entry.boundary.as_str() {
-                // REDIS — render the value to the raw string redis holds (a JSON
-                // string becomes its inner text, so "0.20" not "\"0.20\""), then
-                // write it under the per-correlation namespace.
+                // REDIS — render the recorded wire value to its typed write
+                // (scalar → SET, Map → HSET, Array → RPUSH/ZADD, Set → SADD),
+                // then write it under the per-correlation namespace. A shape
+                // with no faithful write command is skipped LOUDLY (an explicit
+                // certificate entry with the named reason), never seeded as
+                // wrapper text.
                 "redis" => {
                     let key = match corr {
                         Some(c) => format!("{c}:{}", entry.key),
                         None => entry.key.clone(),
                     };
-                    // A non-scalar RESP3 value the string `SET` seeder can't
-                    // represent is skipped LOUDLY (an explicit certificate
-                    // entry), never seeded as wrapper text.
-                    let (materialization, readback) = match render_redis_seed_value(&entry.value) {
-                        Some(value) => seed_redis(store, &key, &value),
-                        None => (
-                            SeedMaterializationStatus::Skipped,
-                            SeedReadback::not_run(
-                                "redis value is not a scalar string SET can materialize",
+                    let (materialization, readback) =
+                        match render_redis_seed_payload(&entry.value, entry.method.as_deref()) {
+                            RedisSeedRender::Payload(payload) => seed_redis_image(
+                                store,
+                                &RedisSeedImage {
+                                    physical_key: key.clone(),
+                                    payload,
+                                    ttl_seconds: None,
+                                },
                             ),
-                        ),
-                    };
+                            RedisSeedRender::Absent(reason) => (
+                                SeedMaterializationStatus::Skipped,
+                                SeedReadback::not_run(reason),
+                            ),
+                            RedisSeedRender::Unrepresentable(reason) => (
+                                SeedMaterializationStatus::Skipped,
+                                SeedReadback::not_run(reason),
+                            ),
+                        };
                     certificate.push(SeedCertificateEntry::new(
                         corr,
                         entry,
@@ -3152,41 +3301,187 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Reconstruct the raw value redis holds from a recorded redis result, or
-/// `None` when the value cannot be materialized as a string `SET`.
+/// Outcome of rendering a recorded redis seed value into a write payload.
+/// The three arms are the three honest answers, and each maps to a distinct
+/// certificate story: write it, correctly write nothing, or refuse loudly.
+#[derive(Debug, Clone, PartialEq)]
+enum RedisSeedRender {
+    /// A faithful write exists: materialize it.
+    Payload(RedisSeedPayload),
+    /// The recorded value IS absence (a `Null` miss, an empty collection):
+    /// seeding nothing reproduces it. Skipped on the certificate, reason named.
+    Absent(&'static str),
+    /// No faithful write command exists for this shape. Skipped LOUDLY on the
+    /// certificate with the named reason — never stringified into a `SET`.
+    Unrepresentable(String),
+}
+
+/// Reconstruct the typed write a recorded redis read implies — the backward
+/// half of the wire transform (#39; the wire-faithful-seeding scaling rule:
+/// per-protocol adapters, never per-type patches).
 ///
 /// Two genuinely different sources feed this, and the branch reflects that:
 ///
+/// - **Recording-derived** — a serialized [`deja::value::RedisWireValue`], the
+///   canonical shared type. Decoded FIRST, then mapped by an exhaustive match
+///   (no wildcard): scalars → `SET`, `Map` → `HSET`, `Array` → `RPUSH` (or
+///   `ZADD` when `method` names a sorted-set read — the value alone cannot
+///   distinguish a list range from a zset range), `Set` → `SADD`, `Null` →
+///   nothing. A new wire variant is a compile error here, not a silent replay
+///   gap.
 /// - **Ambient/config template** — a bare JSON string (e.g. `"0.20"`) that is
 ///   *already* the raw text redis holds. Passed through byte-for-byte.
-/// - **Recording-derived** — a serialized [`deja::value::RedisWireValue`], the
-///   canonical shared type. We deserialize into it and let
-///   [`RedisWireValue::to_redis_string`] produce the value redis returns. The
-///   match there is exhaustive with no wildcard, so a new scalar variant is a
-///   compile error rather than a silent fall-through to corruption.
 ///
-/// `None` (a non-scalar RESP3 shape, or a `Null` miss) means "do not SET this":
-/// the caller records an explicit skip in the seed certificate instead of
-/// writing garbage. This is what replaced the old `to_string()` fallback, which
-/// wrote the enum wrapper text (`{"BulkString":[…]}`) into redis and made the
-/// replayed router branch on garbage — a false divergence.
-fn render_redis_seed_value(value: &serde_json::Value) -> Option<String> {
+/// Anything else — a wire shape the canonical type deliberately does not model
+/// (push/verbatim/attribute/…), or a structure with members that are not
+/// scalars — is [`RedisSeedRender::Unrepresentable`]: the caller records an
+/// explicit skip in the seed certificate instead of writing garbage. This is
+/// what replaced the old `to_string()` fallback, which wrote the enum wrapper
+/// text (`{"BulkString":[…]}`) into redis and made the replayed router branch
+/// on garbage — a false divergence.
+fn render_redis_seed_payload(value: &serde_json::Value, method: Option<&str>) -> RedisSeedRender {
     // Recording-derived: decode into the canonical shared type FIRST. This also
     // correctly treats a bare-string unit variant (`"Null"`, a miss that leaked
     // past the upstream filter) as "nothing to seed" rather than the literal
     // text "Null".
     if let Ok(v) = serde_json::from_value::<deja::value::RedisWireValue>(value.clone()) {
-        return v.to_redis_string();
+        return wire_value_seed_render(&v, method);
     }
     // Ambient/config template: a bare string that is NOT a `RedisWireValue`
     // (e.g. `"0.20"`) is already the raw text redis holds. Preserved
     // byte-for-byte, exactly as before.
     if let serde_json::Value::String(s) = value {
-        return Some(s.clone());
+        return RedisSeedRender::Payload(RedisSeedPayload::String(s.clone()));
     }
-    // A non-scalar RESP3 shape (Array/Map/Set/…) the string `SET` seeder cannot
-    // represent: an explicit skip, never a silent stringify of the wrapper.
-    None
+    // A wire shape the canonical type does not model: an explicit, named skip,
+    // never a silent stringify of the wrapper.
+    let tag = value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.keys().next().cloned());
+    RedisSeedRender::Unrepresentable(match tag {
+        Some(tag) => {
+            format!("redis wire variant `{tag}` has no faithful write command; refusing to guess")
+        }
+        None => "redis value is neither a RedisWireValue nor an ambient string; refusing to guess"
+            .to_owned(),
+    })
+}
+
+/// Map one decoded wire value to its write payload. Exhaustive over
+/// [`deja::value::RedisWireValue`] — the compiler enforces the seeder answers
+/// for every variant the codec can carry.
+fn wire_value_seed_render(
+    value: &deja::value::RedisWireValue,
+    method: Option<&str>,
+) -> RedisSeedRender {
+    use deja::value::RedisWireValue as Wire;
+    match value {
+        Wire::Null => RedisSeedRender::Absent(
+            "recorded redis miss (Null): absence is the correct seed, nothing written",
+        ),
+        Wire::Int(_)
+        | Wire::BulkString(_)
+        | Wire::SimpleString(_)
+        | Wire::Double(_)
+        | Wire::Boolean(_) => match value.to_redis_string() {
+            Some(rendered) => RedisSeedRender::Payload(RedisSeedPayload::String(rendered)),
+            // Unreachable for the scalar variants matched above; stated rather
+            // than unwrapped so a rendering change cannot panic the seeder.
+            None => RedisSeedRender::Unrepresentable(
+                "scalar redis value did not render to a string".to_owned(),
+            ),
+        },
+        Wire::Map(pairs) => {
+            if pairs.is_empty() {
+                return RedisSeedRender::Absent(
+                    "recorded empty hash: redis holds no key for it; absence is the correct seed",
+                );
+            }
+            let mut rendered = Vec::with_capacity(pairs.len());
+            for (field, field_value) in pairs {
+                match (field.to_redis_string(), field_value.to_redis_string()) {
+                    (Some(field), Some(field_value)) => rendered.push((field, field_value)),
+                    _ => {
+                        return RedisSeedRender::Unrepresentable(
+                            "redis Map carries a non-scalar field or value; HSET cannot represent it"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            RedisSeedRender::Payload(RedisSeedPayload::Hash(rendered))
+        }
+        Wire::Array(items) => {
+            if items.is_empty() {
+                return RedisSeedRender::Absent(
+                    "recorded empty list/range: redis holds no key for it; absence is the correct seed",
+                );
+            }
+            let mut members = Vec::with_capacity(items.len());
+            for item in items {
+                match item.to_redis_string() {
+                    Some(member) => members.push(member),
+                    None => {
+                        return RedisSeedRender::Unrepresentable(
+                            "redis Array carries a non-scalar member; RPUSH/ZADD cannot represent it"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            if method.is_some_and(method_names_sorted_set) {
+                RedisSeedRender::Payload(RedisSeedPayload::SortedSet(members))
+            } else {
+                RedisSeedRender::Payload(RedisSeedPayload::List(members))
+            }
+        }
+        Wire::Set(items) => {
+            if items.is_empty() {
+                return RedisSeedRender::Absent(
+                    "recorded empty set: redis holds no key for it; absence is the correct seed",
+                );
+            }
+            let mut members = Vec::with_capacity(items.len());
+            for item in items {
+                match item.to_redis_string() {
+                    Some(member) => members.push(member),
+                    None => {
+                        return RedisSeedRender::Unrepresentable(
+                            "redis Set carries a non-scalar member; SADD cannot represent it"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            RedisSeedRender::Payload(RedisSeedPayload::Set(members))
+        }
+    }
+}
+
+/// Whether a recorded method name identifies a SORTED-SET read — the one case
+/// where the wire value (`Array`) does not determine the write command. The
+/// stems cover the redis Z-command family; matched as substrings so wrapper
+/// names (`get_sorted_set_range`, `zrange_withscores_raw`) resolve too.
+/// Conservative default: no match → list (`RPUSH`), and a wrongly-listed zset
+/// surfaces as a readback/replay divergence, not silent corruption.
+fn method_names_sorted_set(method: &str) -> bool {
+    const SORTED_SET_STEMS: [&str; 12] = [
+        "zadd",
+        "zrange",
+        "zscore",
+        "zincr",
+        "zrem",
+        "zcard",
+        "zcount",
+        "zrank",
+        "zscan",
+        "zpop",
+        "zrandmember",
+        "sorted_set",
+    ];
+    let method = method.to_ascii_lowercase();
+    SORTED_SET_STEMS.iter().any(|stem| method.contains(stem))
 }
 
 /// Read a recording's boundary events JSONL, tolerating non-event records from
@@ -3866,6 +4161,7 @@ mod tests {
             key: key.to_owned(),
             value: serde_json::json!({"seed": key}),
             image: None,
+            method: None,
             origin: deja::SeedOrigin::Recording,
         }
     }
@@ -4945,20 +5241,26 @@ mod tests {
             .resolve("redis", "settlement_rate_default")
             .expect("default seeded from recording");
         assert_eq!(default.origin, deja::SeedOrigin::Recording);
-        assert_eq!(
-            render_redis_seed_value(&default.value).as_deref(),
-            Some("0.10")
-        );
+        assert_eq!(rendered_string(&default.value).as_deref(), Some("0.10"));
 
         let premium = plan
             .resolve("redis", "settlement_rate_premium")
             .expect("premium seeded from ambient template");
         assert_eq!(premium.origin, deja::SeedOrigin::Ambient);
         assert_eq!(
-            render_redis_seed_value(&premium.value).as_deref(),
+            rendered_string(&premium.value).as_deref(),
             Some("0.20"),
             "premium rate renders byte-identically to the old `redis-cli SET ... 0.20`"
         );
+    }
+
+    /// Scalar rendering shorthand: the `SET` payload's value, when the render
+    /// is one.
+    fn rendered_string(value: &serde_json::Value) -> Option<String> {
+        match render_redis_seed_payload(value, None) {
+            RedisSeedRender::Payload(RedisSeedPayload::String(s)) => Some(s),
+            _ => None,
+        }
     }
 
     #[test]
@@ -4968,7 +5270,7 @@ mod tests {
         assert!(!template.is_empty());
         let plan = deja::SeedPlan::new().with_ambient(&template);
         assert_eq!(
-            render_redis_seed_value(
+            rendered_string(
                 &plan
                     .resolve("redis", "settlement_rate_premium")
                     .unwrap()
@@ -4997,7 +5299,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            render_redis_seed_value(&bulk).as_deref(),
+            rendered_string(&bulk).as_deref(),
             Some("019f41b1-220e-7282-80e3-5876da8cde9c"),
             "BulkString must decode to the raw UUID redis holds, not the wrapper"
         );
@@ -5005,38 +5307,164 @@ mod tests {
         // fred backend uses different variant names for the same shapes; the
         // shared type's serde aliases fold both dialects into one decode.
         assert_eq!(
-            render_redis_seed_value(&serde_json::json!({ "Bytes": [104, 105] })).as_deref(),
+            rendered_string(&serde_json::json!({ "Bytes": [104, 105] })).as_deref(),
             Some("hi"),
         );
         assert_eq!(
-            render_redis_seed_value(&serde_json::json!({ "String": "merchant_xyz" })).as_deref(),
+            rendered_string(&serde_json::json!({ "String": "merchant_xyz" })).as_deref(),
             Some("merchant_xyz"),
         );
         // redis_rs scalar variants.
         assert_eq!(
-            render_redis_seed_value(&serde_json::json!({ "SimpleString": "OK" })).as_deref(),
+            rendered_string(&serde_json::json!({ "SimpleString": "OK" })).as_deref(),
             Some("OK"),
         );
         assert_eq!(
-            render_redis_seed_value(&serde_json::json!({ "Int": 42 })).as_deref(),
+            rendered_string(&serde_json::json!({ "Int": 42 })).as_deref(),
             Some("42"),
         );
 
         // Backwards-compat: an ambient/template bare string is preserved
         // byte-for-byte (this is the path the demo relied on).
         assert_eq!(
-            render_redis_seed_value(&serde_json::Value::String("0.20".to_owned())).as_deref(),
+            rendered_string(&serde_json::Value::String("0.20".to_owned())).as_deref(),
             Some("0.20"),
         );
 
-        // A miss and a non-scalar RESP3 shape both decline to seed (loud skip at
-        // the call site) rather than writing garbage.
-        assert_eq!(render_redis_seed_value(&serde_json::json!("Null")), None);
+        // A miss is correct ABSENCE — seed nothing, named on the certificate.
+        assert!(matches!(
+            render_redis_seed_payload(&serde_json::json!("Null"), None),
+            RedisSeedRender::Absent(_)
+        ));
+    }
+
+    /// #39: a recorded hash read (`Map`, HGETALL-family) seeds via `HSET` with
+    /// field/value pairs in recorded order, and reads back with `HGETALL`.
+    #[test]
+    fn redis_map_seed_renders_hset_and_reads_back() {
+        // Mixed dialects/scalar kinds inside one map, as the wire allows.
+        let map = serde_json::json!({ "Map": [
+            [{ "BulkString": [102, 49] }, { "BulkString": [118, 49] }],
+            [{ "SimpleString": "f2" }, { "Int": 7 }],
+        ]});
+        let payload = match render_redis_seed_payload(&map, Some("get_hash_fields")) {
+            RedisSeedRender::Payload(payload) => payload,
+            other => panic!("a Map must render a write payload, got {other:?}"),
+        };
         assert_eq!(
-            render_redis_seed_value(&serde_json::json!({ "Array": [{ "Int": 1 }] })),
-            None,
-            "a non-scalar value must be skipped, never stringified into redis"
+            payload.write_args("k"),
+            ["HSET", "k", "f1", "v1", "f2", "7"],
+            "HSET carries the pairs in recorded order"
         );
+        assert_eq!(payload.readback_args("k"), ["HGETALL", "k"]);
+        assert!(
+            payload.compare(b"f1\nv1\nf2\n7").is_ok(),
+            "the --raw HGETALL line image reads back"
+        );
+        assert!(
+            payload.compare(b"f1\nv1\nf2\n8").is_err(),
+            "a changed field value is a readback mismatch, not a pass"
+        );
+    }
+
+    /// #39: a recorded list range (`Array`) seeds via `RPUSH` in recorded
+    /// order — order is part of the value a list read observed.
+    #[test]
+    fn redis_array_seed_renders_rpush_preserving_order() {
+        let array = serde_json::json!({ "Array": [
+            { "SimpleString": "a" }, { "SimpleString": "c" }, { "SimpleString": "b" },
+        ]});
+        let payload = match render_redis_seed_payload(&array, Some("get_list_elements")) {
+            RedisSeedRender::Payload(payload) => payload,
+            other => panic!("an Array must render a write payload, got {other:?}"),
+        };
+        assert_eq!(
+            payload.write_args("k"),
+            ["RPUSH", "k", "a", "c", "b"],
+            "RPUSH pushes members in recorded order"
+        );
+        assert_eq!(payload.readback_args("k"), ["LRANGE", "k", "0", "-1"]);
+        assert!(payload.compare(b"a\nc\nb").is_ok());
+        assert!(
+            payload.compare(b"a\nb\nc").is_err(),
+            "a reordered list is a readback mismatch — order is recorded state"
+        );
+    }
+
+    /// #39: the SAME `Array` wire shape recorded by a sorted-set method seeds
+    /// via `ZADD` — the value alone cannot distinguish a list range from a
+    /// zset range; the recorded method name can. Index-as-score reproduces the
+    /// member order the (score-less) range read observed.
+    #[test]
+    fn redis_array_from_sorted_set_method_renders_zadd() {
+        let array = serde_json::json!({ "Array": [
+            { "SimpleString": "m1" }, { "SimpleString": "m2" },
+        ]});
+        let payload = match render_redis_seed_payload(&array, Some("zrange_by_rank")) {
+            RedisSeedRender::Payload(payload) => payload,
+            other => panic!("a zset Array must render a write payload, got {other:?}"),
+        };
+        assert_eq!(payload.write_args("k"), ["ZADD", "k", "0", "m1", "1", "m2"]);
+        assert_eq!(payload.readback_args("k"), ["ZRANGE", "k", "0", "-1"]);
+        assert!(payload.compare(b"m1\nm2").is_ok());
+        assert!(
+            !method_names_sorted_set("get_list_elements"),
+            "a plain list method must NOT trip the zset detection"
+        );
+    }
+
+    /// #39: a recorded set (`Set`, `redis_rs` dialect) seeds via `SADD`;
+    /// SMEMBERS has no defined order, so its readback compares as a set.
+    #[test]
+    fn redis_set_seed_renders_sadd_with_unordered_readback() {
+        let set = serde_json::json!({ "Set": [
+            { "SimpleString": "b" }, { "SimpleString": "a" },
+        ]});
+        let payload = match render_redis_seed_payload(&set, Some("smembers")) {
+            RedisSeedRender::Payload(payload) => payload,
+            other => panic!("a Set must render a write payload, got {other:?}"),
+        };
+        assert_eq!(payload.write_args("k"), ["SADD", "k", "b", "a"]);
+        assert_eq!(payload.readback_args("k"), ["SMEMBERS", "k"]);
+        assert!(
+            payload.compare(b"a\nb").is_ok(),
+            "SMEMBERS order is not part of the value"
+        );
+        assert!(payload.compare(b"a\nc").is_err());
+    }
+
+    /// #39: a shape with no faithful write command stays a LOUD skip with a
+    /// named reason — never a stringified `SET` of the wrapper text.
+    #[test]
+    fn redis_unsupported_wire_shapes_stay_loud_skips() {
+        // A wire variant the canonical type deliberately does not model.
+        match render_redis_seed_payload(
+            &serde_json::json!({ "VerbatimString": { "format": "txt", "text": "x" } }),
+            None,
+        ) {
+            RedisSeedRender::Unrepresentable(reason) => assert!(
+                reason.contains("VerbatimString"),
+                "the refusal names the variant: {reason}"
+            ),
+            other => panic!("an unmodelled variant must be Unrepresentable, got {other:?}"),
+        }
+        // A structure whose members are not scalars cannot flatten into HSET.
+        match render_redis_seed_payload(
+            &serde_json::json!({ "Map": [[{ "SimpleString": "f" }, { "Array": [] }]] }),
+            None,
+        ) {
+            RedisSeedRender::Unrepresentable(reason) => assert!(
+                reason.contains("HSET"),
+                "the refusal names the command that cannot represent it: {reason}"
+            ),
+            other => panic!("a nested non-scalar must be Unrepresentable, got {other:?}"),
+        }
+        // An empty collection is ABSENCE (redis holds no key for it), not work
+        // and not a refusal.
+        assert!(matches!(
+            render_redis_seed_payload(&serde_json::json!({ "Array": [] }), None),
+            RedisSeedRender::Absent(_)
+        ));
     }
 
     #[test]
@@ -5221,6 +5649,7 @@ mod tests {
             key: query_key.clone(),
             value: query_fallback,
             image: None,
+            method: None,
             origin: deja::SeedOrigin::Recording,
         });
         plan.upsert(deja::SeedEntry {
@@ -5228,6 +5657,7 @@ mod tests {
             key: row_key.clone(),
             value: row_precondition,
             image: None,
+            method: None,
             origin: deja::SeedOrigin::Recording,
         });
 
@@ -5859,14 +6289,18 @@ mod tests {
     }
 
     #[test]
-    fn redis_seed_image_keeps_physical_key_raw_value_and_ttl_advisory() {
-        let image = RedisSeedImage::string("corr:settlement_rate_default", "0.10");
+    fn redis_seed_image_keeps_physical_key_typed_payload_and_ttl_advisory() {
+        let image = RedisSeedImage {
+            physical_key: "corr:settlement_rate_default".to_owned(),
+            payload: RedisSeedPayload::String("0.10".to_owned()),
+            ttl_seconds: None,
+        };
 
         assert_eq!(image.physical_key, "corr:settlement_rate_default");
-        assert_eq!(image.physical_key_bytes, b"corr:settlement_rate_default");
-        assert_eq!(image.value_type, RedisSeedValueType::String);
-        assert_eq!(image.raw_value, "0.10");
-        assert_eq!(image.raw_value_bytes, b"0.10");
+        assert_eq!(
+            image.payload.write_args(&image.physical_key),
+            ["SET", "corr:settlement_rate_default", "0.10"]
+        );
         assert_eq!(image.ttl_seconds, None);
     }
 
