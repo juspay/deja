@@ -78,3 +78,16 @@ fn wrapper_captures_binary_wire_values_from_a_real_result() {
     assert_eq!(columns[2].name, "missing");
     assert_eq!(columns[2].bytes, None);
 }
+
+/// The wrapper must be transparent for diesel's pg metadata lookup, not just
+/// for queries. `PgMetadataLookup` is blanket-implemented for any
+/// `Connection<Backend = Pg> + GetPgMetadataCache + LoadConnection`, and
+/// `QueryFragment::collect_binds` requires it — so this bound holding is what
+/// lets a host serialize a query's binds through the wrapper instead of
+/// reaching past it for the concrete connection. Compile-time: if the
+/// delegation is dropped, this stops building.
+#[test]
+fn the_wrapper_satisfies_the_pg_metadata_lookup_bound() {
+    fn assert_lookup<T: diesel::pg::PgMetadataLookup>() {}
+    assert_lookup::<DejaLoadConnection<PgConnection>>();
+}

@@ -60,7 +60,7 @@
 use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, Instrumentation, LoadConnection, SimpleConnection,
 };
-use diesel::pg::Pg;
+use diesel::pg::{GetPgMetadataCache, Pg, PgMetadataCache};
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::row::{Field as _, Row};
 use diesel::{Connection, ConnectionResult, QueryResult};
@@ -79,19 +79,40 @@ impl<C> DejaLoadConnection<C> {
         Self { inner }
     }
 
-    /// The wrapped connection.
+    /// The wrapped connection, immutably. Diesel needs `&mut` to execute
+    /// anything, so this cannot be used to run a query around the capture.
     pub fn inner(&self) -> &C {
         &self.inner
     }
 
-    /// The wrapped connection, mutably.
-    pub fn inner_mut(&mut self) -> &mut C {
-        &mut self.inner
-    }
-
-    /// Unwrap.
+    /// Unwrap. Takes the wrapper by value, so nothing that reaches a pooled
+    /// connection can use it to escape the capture.
     pub fn into_inner(self) -> C {
         self.inner
+    }
+}
+
+/// Delegating the metadata cache is what makes the wrapper transparent for
+/// diesel's *non-query* pg capability: diesel auto-implements
+/// [`diesel::pg::PgMetadataLookup`] for any
+/// `Connection<Backend = Pg> + GetPgMetadataCache + LoadConnection`, so with
+/// this one method the wrapper satisfies the bound that user-defined type
+/// lookups (and therefore `QueryFragment::collect_binds`) require.
+///
+/// This exists to close a hole rather than to add a feature. Without it a
+/// caller needing the lookup — hyperswitch's KV bind collection is the one in
+/// practice — had to reach past the wrapper for the concrete connection, and
+/// the accessor that allowed it (`inner_mut`) was an unenforced way to execute
+/// a query with no capture at all: silent, because a missing physical image is
+/// indistinguishable from a tape that never had one. The accessor is gone; the
+/// capability it was reached for is delegated here instead. Compare the tape
+/// seam, where the same "no raw handle out" rule is enforced mechanically.
+impl<C> GetPgMetadataCache for DejaLoadConnection<C>
+where
+    C: GetPgMetadataCache,
+{
+    fn get_metadata_cache(&mut self) -> &mut PgMetadataCache {
+        self.inner.get_metadata_cache()
     }
 }
 
