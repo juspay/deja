@@ -42,6 +42,7 @@ use tracing::Instrument;
 pub mod correlation_layer;
 pub mod graph;
 pub mod replay;
+pub mod wire_capture;
 pub mod writer;
 pub use correlation_layer::{current_span_path, DejaCorrelationLayer};
 pub use graph::{

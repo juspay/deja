@@ -18,14 +18,22 @@ serde_json = "1"
 # `Result<T, error_stack::Report<E>>`. Optional so the core facade stays
 # dependency-lean for consumers that don't use error-stack.
 error-stack = { version = "0.4", default-features = false, optional = true }
+# Optional: the diesel connection wrapper for wire-faithful DB row capture
+# (`DejaLoadConnection`). Optional so the facade stays diesel-free for
+# consumers that don't wrap a pg pool.
+deja-diesel = { path = "../deja-diesel", optional = true }
 
 [features]
 error-stack = ["dep:error-stack"]
+diesel-pg = ["dep:deja-diesel"]
 
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
 error-stack = { version = "0.4", default-features = false }
+# Tests publish into the wire-capture handoff registry directly (the role the
+# deja-diesel wrapper plays in production).
+deja-runtime = { path = "../deja-runtime" }
 
 [lints.clippy]
 dbg_macro = "deny"

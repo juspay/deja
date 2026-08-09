@@ -2369,8 +2369,31 @@ fn seed_db(
         );
     }
 
-    let mut sql = String::new();
+    // Split rows by seeding mechanism: a row carrying a COPY-eligible
+    // physical wire image seeds through binary COPY (the store parses its own
+    // `typsend` output — no type-shape knowledge here); everything else
+    // renders through the serde INSERT path exactly as before, fail-closed
+    // arm and all. Old tapes carry no wire images, so they take the insert
+    // path byte-identically.
+    let mut copy_rows: Vec<&DbRowImage> = Vec::new();
+    let mut insert_rows: Vec<&DbRowImage> = Vec::new();
     for row in &rows {
+        match wire_copy_eligibility(row) {
+            Ok(()) => copy_rows.push(row),
+            Err(reason) => {
+                if row.wire.is_some() {
+                    eprintln!(
+                        "lifecycle: seed_db {} {}: physical image not COPY-eligible ({reason}); using the serde insert path for this row",
+                        target.kind, target.table
+                    );
+                }
+                insert_rows.push(row);
+            }
+        }
+    }
+
+    let mut sql = String::new();
+    for row in &insert_rows {
         let Some(stmt) = build_insert_sql(schema, row) else {
             let message = format!(
                 "seed_db {} {} could not render an insert for a seedable row",
@@ -2385,22 +2408,36 @@ fn seed_db(
         sql.push_str(&stmt);
         sql.push('\n');
     }
-    if sql.is_empty() {
-        return (
-            SeedMaterializationStatus::Skipped,
-            SeedReadback::not_run("seed_db rendered no insert SQL"),
-        );
-    }
-    let row_count = sql.lines().count();
 
     eprintln!(
-        "lifecycle: seed_db {} {} ({row_count} row(s))",
-        target.kind, target.table
+        "lifecycle: seed_db {} {} ({} row(s): {} via binary COPY, {} via insert)",
+        target.kind,
+        target.table,
+        rows.len(),
+        copy_rows.len(),
+        insert_rows.len()
     );
     if seed_contains_null_column(&rows, "totp_secret") {
         eprintln!(
             "lifecycle: seed_db {} {} NULL columns: totp_secret=NULL",
             target.kind, target.table
+        );
+    }
+
+    if !copy_rows.is_empty() {
+        if let Err(message) = seed_db_wire_copy(store, schema, &target.table, &copy_rows) {
+            eprintln!("lifecycle: {message}; continuing (best-effort)");
+            return (
+                SeedMaterializationStatus::Failed,
+                SeedReadback::error(message),
+            );
+        }
+    }
+
+    if sql.is_empty() {
+        return (
+            SeedMaterializationStatus::Materialized,
+            readback_db(store, schema, &target, &rows),
         );
     }
     match store.psql(&[], true, &sql).output() {
@@ -2433,6 +2470,152 @@ fn seed_db(
             )
         }
     }
+}
+
+/// Materialize rows that carry COPY-eligible physical wire images: stream the
+/// captured `typsend` bytes back through `COPY ... WITH (FORMAT binary)`, so
+/// the only parser involved is the paired `typreceive` of the store itself
+/// (docs/design/wire-faithful-seeding.md, the binary-format decision).
+///
+/// Mechanics: rows are grouped by column list; each group COPYs into a
+/// session-temporary staging table (`CREATE TEMP TABLE ... AS SELECT cols ...
+/// WITH NO DATA` — exact column types, none of the target's NOT NULL/identity
+/// baggage) and lands with `INSERT ... SELECT ... ON CONFLICT DO NOTHING`,
+/// preserving the insert path's duplicate tolerance (a bare COPY into the
+/// target would abort the whole batch on one duplicate key). The stream
+/// travels on psql's stdin (`\copy ... from pstdin`), which both StoreExec
+/// transports forward; the three commands share one psql session so the temp
+/// table survives across them.
+fn seed_db_wire_copy(
+    store: &StoreExec,
+    schema: Option<&str>,
+    table: &str,
+    rows: &[&DbRowImage],
+) -> Result<(), String> {
+    let mut groups: Vec<(Vec<&str>, Vec<&DbRowImage>)> = Vec::new();
+    for row in rows {
+        let names: Vec<&str> = row
+            .columns
+            .iter()
+            .map(|column| column.metadata.name.as_str())
+            .collect();
+        match groups.iter_mut().find(|(group, _)| *group == names) {
+            Some((_, group_rows)) => group_rows.push(row),
+            None => groups.push((names, vec![row])),
+        }
+    }
+    let qualified = qualified_table(schema, table);
+    for (names, group_rows) in groups {
+        let stream = build_binary_copy_stream(&group_rows)?;
+        let commands = wire_copy_commands(&qualified, &names);
+        run_psql_script_with_stdin(store, &commands, &stream)
+            .map_err(|e| format!("seed_db binary copy into {qualified} failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The three-command psql session that lands one binary COPY group: stage
+/// into a session-temp table with the target's exact column types (`CREATE
+/// TEMP TABLE ... AS SELECT ... WITH NO DATA` copies types but none of the
+/// target's NOT NULL/identity constraints), stream the captured bytes into it
+/// (`\copy ... from pstdin`), then land with the insert path's duplicate
+/// tolerance. Pure — unit-tested.
+fn wire_copy_commands(qualified_table: &str, column_names: &[&str]) -> Vec<String> {
+    let column_list = column_names
+        .iter()
+        .map(|name| quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let staging = "_deja_wire_seed";
+    vec![
+        format!(
+            "CREATE TEMP TABLE {staging} AS SELECT {column_list} FROM {qualified_table} WITH NO DATA"
+        ),
+        format!("\\copy {staging} from pstdin with (format binary)"),
+        format!(
+            "INSERT INTO {qualified_table} ({column_list}) SELECT {column_list} FROM {staging} ON CONFLICT DO NOTHING"
+        ),
+    ]
+}
+
+/// Construct a binary COPY data stream from captured wire images: the fixed
+/// 19-byte header (`PGCOPY\n\xff\r\n\0` signature + int32 flags + int32
+/// extension length), then per row an int16 field count and per field an
+/// int32 byte length (`-1` for NULL) followed by the verbatim captured bytes,
+/// closed by the int16 `-1` trailer. Pure — golden-tested against the
+/// documented format.
+fn build_binary_copy_stream(rows: &[&DbRowImage]) -> Result<Vec<u8>, String> {
+    const SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+    let mut out = Vec::new();
+    out.extend_from_slice(SIGNATURE);
+    out.extend_from_slice(&0_i32.to_be_bytes()); // flags
+    out.extend_from_slice(&0_i32.to_be_bytes()); // header extension length
+    for row in rows {
+        let wire = row.wire.as_ref().ok_or_else(|| {
+            "binary copy stream requested for a row without a wire image".to_string()
+        })?;
+        let field_count = i16::try_from(row.columns.len())
+            .map_err(|_| format!("row has too many columns ({})", row.columns.len()))?;
+        out.extend_from_slice(&field_count.to_be_bytes());
+        for column in &row.columns {
+            let name = &column.metadata.name;
+            let bytes = wire
+                .columns
+                .get(name)
+                .ok_or_else(|| format!("wire image missing column {name}"))?;
+            match bytes {
+                None => out.extend_from_slice(&(-1_i32).to_be_bytes()),
+                Some(bytes) => {
+                    let length = i32::try_from(bytes.len())
+                        .map_err(|_| format!("wire value for column {name} is too large"))?;
+                    out.extend_from_slice(&length.to_be_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&(-1_i16).to_be_bytes());
+    Ok(out)
+}
+
+/// Run a multi-command psql session with the given bytes on stdin. The stream
+/// is staged in a temp file so the child reads a real file descriptor (no
+/// pipe-writer bookkeeping); the file is removed afterwards, best-effort.
+fn run_psql_script_with_stdin(
+    store: &StoreExec,
+    commands: &[String],
+    stdin_bytes: &[u8],
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED_STREAM_SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "deja-wire-seed-{}-{}.pgcopy",
+        std::process::id(),
+        SEED_STREAM_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, stdin_bytes)
+        .map_err(|e| format!("could not stage the copy stream at {}: {e}", path.display()))?;
+    let result = (|| {
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("could not reopen the staged copy stream: {e}"))?;
+        let mut cmd = store.psql_script(true, commands);
+        cmd.stdin(std::process::Stdio::from(file));
+        let output = cmd
+            .output()
+            .map_err(|e| format!("could not run psql: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "psql exited {}; stderr='{}' stdout='{}'",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim(),
+                String::from_utf8_lossy(&output.stdout).trim()
+            ))
+        }
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
 }
 fn readback_db(
     store: &StoreExec,
@@ -2543,7 +2726,27 @@ fn build_count_sql(
         None => {
             let mut predicates = Vec::with_capacity(row.columns.len());
             for column in &row.columns {
-                predicates.push(db_comparison_predicate(&column.metadata.name, column)?);
+                match db_comparison_predicate(&column.metadata.name, column) {
+                    Some(predicate) => predicates.push(predicate),
+                    // A wire-seeded column the renderer cannot express (the
+                    // exact case binary-COPY seeding exists for, e.g. the
+                    // tagged-enum-in-varchar poison value) is excluded from
+                    // the full-row readback predicate: presence is verified
+                    // through the remaining columns and the key predicate.
+                    // Rows without a wire image keep the old all-or-nothing
+                    // behavior.
+                    None if row
+                        .wire
+                        .as_ref()
+                        .is_some_and(|wire| wire.columns.contains_key(&column.metadata.name)) =>
+                    {
+                        continue;
+                    }
+                    None => return None,
+                }
+            }
+            if predicates.is_empty() {
+                return None;
             }
             predicates
         }
@@ -2958,10 +3161,25 @@ struct DbColumnImage {
     value: serde_json::Value,
 }
 
+/// The PHYSICAL half of a typed row image, when the tape carried one: per
+/// column (keyed by name), the verbatim binary wire bytes (`typsend` output)
+/// the recording store sent, hex-decoded; `None` is SQL NULL. Produced by the
+/// `deja-diesel` connection wrapper and carried on the row image next to the
+/// serde values (`deja::db::DbColumnImage::wire`). Consumed by seeding ONLY —
+/// never diffed, never substituted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DbRowWireImage {
+    columns: BTreeMap<String, Option<Vec<u8>>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct DbRowImage {
     table: String,
     columns: Vec<DbColumnImage>,
+    /// `Some` iff the typed payload declared `wire_format: "binary"` and every
+    /// column's wire hex decoded — the row is a candidate for binary-COPY
+    /// seeding (see [`wire_copy_eligibility`]).
+    wire: Option<DbRowWireImage>,
 }
 
 impl DbRowImage {
@@ -2983,6 +3201,7 @@ impl DbRowImage {
         Some(Self {
             table: table.to_string(),
             columns,
+            wire: None,
         })
     }
 }
@@ -3060,6 +3279,7 @@ fn typed_db_row_image(
         return None;
     }
     let has_producer_metadata = payload.columns.iter().any(typed_column_has_metadata);
+    let wire = wire_image_from_typed(&payload);
     let columns = payload
         .columns
         .iter()
@@ -3074,9 +3294,110 @@ fn typed_db_row_image(
         DbRowImage {
             table: payload.table,
             columns,
+            wire,
         },
         has_producer_metadata,
     ))
+}
+
+/// Decode the physical wire image off a typed row payload. `None` when the
+/// producer attached none (old tape / unjoined capture) or when any column's
+/// hex fails to decode or repeats — a physical image that cannot be trusted
+/// wholesale is ignored wholesale, and the row seeds through the serde path.
+fn wire_image_from_typed(payload: &deja::db::DbRowImage) -> Option<DbRowWireImage> {
+    if payload.wire_format.as_deref() != Some(deja::db::DbRowImage::WIRE_FORMAT_BINARY) {
+        return None;
+    }
+    let mut columns = BTreeMap::new();
+    for column in &payload.columns {
+        let bytes = match &column.wire {
+            Some(wire_hex) => match hex::decode(wire_hex) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => {
+                    eprintln!(
+                        "lifecycle: undecodable wire hex for column {} of {}; ignoring the row's physical image",
+                        column.name, payload.table
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
+        if columns.insert(column.name.clone(), bytes).is_some() {
+            eprintln!(
+                "lifecycle: duplicate column {} in wire image for {}; ignoring the row's physical image",
+                column.name, payload.table
+            );
+            return None;
+        }
+    }
+    Some(DbRowWireImage { columns })
+}
+
+/// First OID postgres hands out for user-defined objects is 16384, and
+/// everything below 10000 is a hand-assigned built-in pinned at initdb —
+/// identical on every cluster of every supported version. (10000–16383 are
+/// initdb-time leftovers no application column type ever gets.)
+const FIRST_NON_BUILTIN_OID: u32 = 10_000;
+
+/// The v1 wire-seeding boundary (the design doc's "container types embed
+/// element OIDs" spike, resolved): a row seeds via binary COPY only when
+/// EVERY column is provably portable across clusters —
+///
+/// - SQL NULL: no bytes to interpret;
+/// - built-in type (captured OID < 10000): built-in OIDs are pinned and
+///   cluster-stable, and any OID a built-in CONTAINER value embeds (the
+///   element OID in a binary array header, e.g. `json[]` embedding 114) is
+///   itself built-in and equally stable;
+/// - user-defined type whose wire bytes EQUAL the semantic string's UTF-8:
+///   the value is then plain label text with no embedded OIDs — the pg enum
+///   case (`enum_send` output IS the label, `enum_recv` resolves it by name
+///   on the target cluster). Proven per VALUE, byte-for-byte, not assumed
+///   per type.
+///
+/// Everything else — user-defined composites, arrays of user-defined
+/// elements (their binary header embeds the recording cluster's element
+/// OID), any user-defined value without textual evidence — sends the WHOLE
+/// row down the serde INSERT path (a row lands in one statement). That
+/// fallback keeps the fail-closed renderer: a poison column in a fallback
+/// row still refuses loudly rather than guessing.
+fn wire_copy_eligibility(row: &DbRowImage) -> Result<(), String> {
+    let Some(wire) = row.wire.as_ref() else {
+        return Err("no physical image".to_string());
+    };
+    for column in &row.columns {
+        let name = &column.metadata.name;
+        let Some(bytes) = wire.columns.get(name) else {
+            return Err(format!("column {name} has no wire capture"));
+        };
+        match bytes {
+            None => {
+                if !column.value.is_null() {
+                    return Err(format!(
+                        "column {name}: wire value is NULL but the semantic value is not"
+                    ));
+                }
+            }
+            Some(bytes) => {
+                let Some(type_oid) = column.metadata.type_oid else {
+                    return Err(format!("column {name} carries wire bytes but no type oid"));
+                };
+                if type_oid < FIRST_NON_BUILTIN_OID {
+                    continue;
+                }
+                let is_label_text = column
+                    .value
+                    .as_str()
+                    .is_some_and(|text| text.as_bytes() == bytes.as_slice());
+                if !is_label_text {
+                    return Err(format!(
+                        "column {name}: user-defined type oid {type_oid} without label-text evidence"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build `INSERT INTO <table> (cols...) VALUES (...) ON CONFLICT DO NOTHING`
@@ -4292,6 +4613,7 @@ mod tests {
             "users",
             vec![
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "user_id".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -4299,6 +4621,7 @@ mod tests {
                     value: serde_json::json!(user_id),
                 },
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "email".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -4312,6 +4635,7 @@ mod tests {
             "users",
             vec![
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "user_id".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -4319,6 +4643,7 @@ mod tests {
                     value: serde_json::json!(user_id),
                 },
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "name".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -4332,6 +4657,7 @@ mod tests {
             "users",
             vec![
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "user_id".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -4339,6 +4665,7 @@ mod tests {
                     value: serde_json::json!(user_id),
                 },
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "name".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -5892,6 +6219,7 @@ mod tests {
             "merchant_key_store",
             vec![
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "merchant_id".into(),
                     type_oid: Some(25),
                     type_name: Some("text".into()),
@@ -5899,6 +6227,7 @@ mod tests {
                     value: serde_json::json!("merch_typed"),
                 },
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "key".into(),
                     type_oid: Some(17),
                     type_name: Some("bytea".into()),
@@ -5938,6 +6267,7 @@ mod tests {
             "merchant_key_store",
             vec![
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "merchant_id".into(),
                     type_oid: None,
                     type_name: None,
@@ -5945,6 +6275,7 @@ mod tests {
                     value: serde_json::json!("merch_typed"),
                 },
                 deja::db::DbColumnImage {
+                    wire: None,
                     name: "key".into(),
                     type_oid: None,
                     type_name: None,
@@ -6341,6 +6672,349 @@ mod tests {
         assert!(
             sql.contains("ARRAY['users', 'weird''name']"),
             "dedup + single-quote escape; got: {sql}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wire-faithful seeding: eligibility boundary, binary COPY stream,
+    // typed-payload decode, readback predicate (issue #35).
+    // ------------------------------------------------------------------
+
+    /// One column of a [`wire_row_image`] fixture:
+    /// `(name, type_oid, semantic value, wire bytes)`.
+    type WireColumnFixture<'a> = (&'a str, Option<u32>, serde_json::Value, Option<Vec<u8>>);
+
+    /// Row fixture with the wire half mirrored into the row's physical image.
+    fn wire_row_image(table: &str, columns: Vec<WireColumnFixture<'_>>) -> DbRowImage {
+        let wire = DbRowWireImage {
+            columns: columns
+                .iter()
+                .map(|(name, _, _, bytes)| ((*name).to_string(), bytes.clone()))
+                .collect(),
+        };
+        DbRowImage {
+            table: table.to_string(),
+            columns: columns
+                .into_iter()
+                .map(|(name, type_oid, value, _)| DbColumnImage {
+                    metadata: DbColumnMetadata {
+                        name: name.to_string(),
+                        type_oid,
+                        type_name: None,
+                        nullable: None,
+                    },
+                    value,
+                })
+                .collect(),
+            wire: Some(wire),
+        }
+    }
+
+    #[test]
+    fn binary_copy_stream_golden_bytes() {
+        // Hand-assembled from the documented COPY binary format: 11-byte
+        // signature, int32 flags 0, int32 extension length 0; per row an
+        // int16 field count and length-prefixed fields (-1 = NULL); int16 -1
+        // trailer.
+        let row = wire_row_image(
+            "t",
+            vec![
+                ("id", Some(25), serde_json::json!("a"), Some(b"a".to_vec())),
+                (
+                    "amount",
+                    Some(20),
+                    serde_json::json!(42),
+                    Some(42_i64.to_be_bytes().to_vec()),
+                ),
+                ("gone", Some(1043), serde_json::Value::Null, None),
+            ],
+        );
+        let stream = build_binary_copy_stream(&[&row]).expect("stream builds");
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        expected.extend_from_slice(&[0, 0, 0, 0]); // flags
+        expected.extend_from_slice(&[0, 0, 0, 0]); // extension length
+        expected.extend_from_slice(&[0, 3]); // field count
+        expected.extend_from_slice(&[0, 0, 0, 1]); // len("a")
+        expected.push(b'a');
+        expected.extend_from_slice(&[0, 0, 0, 8]); // len(int8)
+        expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 42]);
+        expected.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]); // NULL
+        expected.extend_from_slice(&[0xff, 0xff]); // trailer
+        assert_eq!(stream, expected);
+    }
+
+    #[test]
+    fn binary_copy_stream_passes_every_type_family_verbatim() {
+        // The builder interprets NOTHING: whatever `typsend` produced at
+        // record time is emitted length-prefixed, byte for byte. One field
+        // per family, fixtures written out from the documented binary forms.
+        let families: Vec<(&str, u32, serde_json::Value, Vec<u8>)> = vec![
+            ("c_text", 25, serde_json::json!("abc"), b"abc".to_vec()),
+            ("c_varchar", 1043, serde_json::json!("v"), b"v".to_vec()),
+            (
+                "c_int8",
+                20,
+                serde_json::json!(7),
+                7_i64.to_be_bytes().to_vec(),
+            ),
+            ("c_bool", 16, serde_json::json!(true), vec![0x01]),
+            // numeric 1.5: ndigits=2? No — opaque fixture: the builder must
+            // not care whether these bytes are even valid numeric internals.
+            (
+                "c_numeric",
+                1700,
+                serde_json::json!("1.5"),
+                vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01],
+            ),
+            // timestamptz: microseconds since 2000-01-01 as int8.
+            (
+                "c_timestamptz",
+                1184,
+                serde_json::json!("2000-01-01T00:00:01Z"),
+                1_000_000_i64.to_be_bytes().to_vec(),
+            ),
+            // jsonb: version byte 0x01 + document text.
+            ("c_jsonb", 3802, serde_json::json!({"a": 1}), {
+                let mut bytes = vec![0x01];
+                bytes.extend_from_slice(br#"{"a": 1}"#);
+                bytes
+            }),
+            ("c_bytea", 17, serde_json::json!([0, 255]), vec![0x00, 0xff]),
+        ];
+        let row = wire_row_image(
+            "t",
+            families
+                .iter()
+                .map(|(name, oid, value, bytes)| {
+                    (*name, Some(*oid), value.clone(), Some(bytes.clone()))
+                })
+                .collect(),
+        );
+        let stream = build_binary_copy_stream(&[&row]).expect("stream builds");
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&(families.len() as i16).to_be_bytes());
+        for (_, _, _, bytes) in &families {
+            expected.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            expected.extend_from_slice(bytes);
+        }
+        expected.extend_from_slice(&[0xff, 0xff]);
+        assert_eq!(stream, expected);
+
+        // And the whole row is COPY-eligible: every family above is built-in.
+        assert_eq!(wire_copy_eligibility(&row), Ok(()));
+    }
+
+    #[test]
+    fn eligibility_accepts_builtin_oids_and_nulls() {
+        let row = wire_row_image(
+            "payment_attempt",
+            vec![
+                (
+                    "attempt_id",
+                    Some(1043),
+                    serde_json::json!("att_1"),
+                    Some(b"att_1".to_vec()),
+                ),
+                // The poison column: tagged-enum SEMANTIC value in a varchar
+                // column; the PHYSICAL bytes are the raw text. Covered —
+                // varchar is OID 1043, built-in.
+                (
+                    "connector_transaction_id",
+                    Some(1043),
+                    serde_json::json!({"TxnId": "txn_raw"}),
+                    Some(b"txn_raw".to_vec()),
+                ),
+                ("capture_on", Some(1114), serde_json::Value::Null, None),
+            ],
+        );
+        assert_eq!(wire_copy_eligibility(&row), Ok(()));
+    }
+
+    #[test]
+    fn eligibility_accepts_user_defined_types_only_with_label_text_evidence() {
+        // pg enum: wire bytes ARE the label text — provably portable.
+        let enum_row = wire_row_image(
+            "payment_attempt",
+            vec![(
+                "status",
+                Some(16385),
+                serde_json::json!("charged"),
+                Some(b"charged".to_vec()),
+            )],
+        );
+        assert_eq!(wire_copy_eligibility(&enum_row), Ok(()));
+
+        // Same OID, but bytes differ from the semantic string (a serde rename,
+        // or a non-textual user-defined type): no evidence, no COPY.
+        let renamed = wire_row_image(
+            "payment_attempt",
+            vec![(
+                "status",
+                Some(16385),
+                serde_json::json!("Charged"),
+                Some(b"charged".to_vec()),
+            )],
+        );
+        assert!(wire_copy_eligibility(&renamed).is_err());
+
+        // Non-string semantic value in a user-defined column (composite,
+        // array of enums): never eligible.
+        let composite = wire_row_image(
+            "t",
+            vec![(
+                "extra",
+                Some(16400),
+                serde_json::json!({"a": 1}),
+                Some(vec![0x00, 0x01]),
+            )],
+        );
+        assert!(wire_copy_eligibility(&composite).is_err());
+    }
+
+    #[test]
+    fn eligibility_rejects_unsound_rows() {
+        // No physical image at all (old tape).
+        let mut plain = wire_row_image(
+            "t",
+            vec![("id", Some(25), serde_json::json!("a"), Some(b"a".to_vec()))],
+        );
+        plain.wire = None;
+        assert_eq!(
+            wire_copy_eligibility(&plain),
+            Err("no physical image".to_string())
+        );
+
+        // Wire NULL under a non-null semantic value.
+        let misaligned = wire_row_image("t", vec![("id", Some(25), serde_json::json!("a"), None)]);
+        assert!(wire_copy_eligibility(&misaligned).is_err());
+
+        // Wire bytes without a type oid.
+        let no_oid = wire_row_image(
+            "t",
+            vec![("id", None, serde_json::json!("a"), Some(b"a".to_vec()))],
+        );
+        assert!(wire_copy_eligibility(&no_oid).is_err());
+
+        // A column missing from the wire map.
+        let mut missing = wire_row_image(
+            "t",
+            vec![("id", Some(25), serde_json::json!("a"), Some(b"a".to_vec()))],
+        );
+        if let Some(wire) = missing.wire.as_mut() {
+            wire.columns.clear();
+        }
+        assert!(wire_copy_eligibility(&missing).is_err());
+    }
+
+    #[test]
+    fn typed_payload_wire_half_decodes_onto_the_row() {
+        let payload = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "payment_attempt",
+            "wire_format": "binary",
+            "columns": [
+                {"name": "attempt_id", "type_oid": 1043, "value": "att_1", "wire": "6174745f31"},
+                {"name": "capture_on", "value": null},
+            ],
+        });
+        let catalog = DbCatalog::default();
+        let rows = db_row_images_from_typed_payload("payment_attempt", &payload, &catalog)
+            .expect("typed rows");
+        assert_eq!(rows.len(), 1);
+        let wire = rows[0].wire.as_ref().expect("wire image decoded");
+        assert_eq!(
+            wire.columns.get("attempt_id"),
+            Some(&Some(b"att_1".to_vec()))
+        );
+        assert_eq!(wire.columns.get("capture_on"), Some(&None));
+        assert_eq!(wire_copy_eligibility(&rows[0]), Ok(()));
+    }
+
+    #[test]
+    fn typed_payload_bad_hex_or_missing_flag_yields_no_wire_image() {
+        let bad_hex = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "t",
+            "wire_format": "binary",
+            "columns": [
+                {"name": "id", "type_oid": 25, "value": "a", "wire": "zz"},
+            ],
+        });
+        let catalog = DbCatalog::default();
+        let rows = db_row_images_from_typed_payload("t", &bad_hex, &catalog).expect("typed rows");
+        assert_eq!(rows[0].wire, None, "undecodable hex drops the wire half");
+
+        let no_flag = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "t",
+            "columns": [
+                {"name": "id", "type_oid": 25, "value": "a", "wire": "61"},
+            ],
+        });
+        let rows = db_row_images_from_typed_payload("t", &no_flag, &catalog).expect("typed rows");
+        assert_eq!(
+            rows[0].wire, None,
+            "wire bytes without the row-level binary flag are not a physical image"
+        );
+    }
+
+    #[test]
+    fn readback_predicate_skips_unrenderable_wire_seeded_columns_only() {
+        // Wire-seeded row with the poison column (typed varchar + tagged
+        // object → fail-closed renderer refuses a literal): the full-row
+        // readback predicate is built WITHOUT that column instead of failing.
+        let wire_row = wire_row_image(
+            "payment_attempt",
+            vec![
+                (
+                    "attempt_id",
+                    Some(1043),
+                    serde_json::json!("att_1"),
+                    Some(b"att_1".to_vec()),
+                ),
+                (
+                    "connector_transaction_id",
+                    Some(1043),
+                    serde_json::json!({"TxnId": "txn_raw"}),
+                    Some(b"txn_raw".to_vec()),
+                ),
+            ],
+        );
+        let sql = build_count_sql(Some("corr_1"), &wire_row, None).expect("readback renders");
+        assert!(sql.contains("\"attempt_id\""));
+        assert!(
+            !sql.contains("connector_transaction_id"),
+            "unrenderable wire column excluded from the predicate: {sql}"
+        );
+
+        // Control: the same row WITHOUT a wire image keeps the old
+        // all-or-nothing behavior.
+        let mut plain = wire_row;
+        plain.wire = None;
+        assert!(build_count_sql(Some("corr_1"), &plain, None).is_none());
+    }
+
+    #[test]
+    fn wire_copy_commands_stage_copy_and_land_with_conflict_tolerance() {
+        let commands = wire_copy_commands(
+            "\"corr_1\".\"payment_attempt\"",
+            &["attempt_id", "connector_transaction_id"],
+        );
+        assert_eq!(
+            commands,
+            vec![
+                "CREATE TEMP TABLE _deja_wire_seed AS SELECT \"attempt_id\", \"connector_transaction_id\" FROM \"corr_1\".\"payment_attempt\" WITH NO DATA".to_string(),
+                "\\copy _deja_wire_seed from pstdin with (format binary)".to_string(),
+                "INSERT INTO \"corr_1\".\"payment_attempt\" (\"attempt_id\", \"connector_transaction_id\") SELECT \"attempt_id\", \"connector_transaction_id\" FROM _deja_wire_seed ON CONFLICT DO NOTHING".to_string(),
+            ]
         );
     }
 }

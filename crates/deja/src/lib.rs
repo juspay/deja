@@ -84,6 +84,13 @@ pub use deja_runtime::{
     Reconstructed, ReplayStrategy, ReturnSemantics,
 };
 
+/// Re-export the diesel connection wrapper that captures result rows' binary
+/// wire values for wire-faithful DB seeding (issue #35). The vendor swap is
+/// one type change at pool construction:
+/// `async_bb8_diesel::ConnectionManager<deja::DejaLoadConnection<PgConnection>>`.
+#[cfg(feature = "diesel-pg")]
+pub use deja_diesel::DejaLoadConnection;
+
 /// The deja library version, for sinks that stamp provenance on the wire
 /// (the recording envelope's `code.deja_version`).
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -757,6 +764,17 @@ pub mod db {
     /// One typed database column image. Metadata is optional because a producer
     /// may know only names/values; consumers must prefer present metadata and may
     /// fill gaps from a catalog.
+    ///
+    /// `value` is the SEMANTIC representation (serde projection of the row
+    /// type) — what identity, diffing, and Substitute consume. `wire` is the
+    /// PHYSICAL representation: the hex-encoded binary wire bytes (`typsend`
+    /// output) postgres sent for this column, captured verbatim by the
+    /// `deja-diesel` connection wrapper before `FromSql` consumed them.
+    /// Physical is seeding-only — never diffed, never substituted (design:
+    /// docs/design/wire-faithful-seeding.md, "two representations, one escape
+    /// hatch"). `wire: None` on a row whose [`DbRowImage::wire_format`] is
+    /// `"binary"` means SQL NULL; on any other row it means "not captured"
+    /// (old tape / no wrapper).
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
     pub struct DbColumnImage {
         pub name: String,
@@ -767,6 +785,8 @@ pub mod db {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub nullable: Option<bool>,
         pub value: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub wire: Option<String>,
     }
 
     type MetadataByName<'a> = HashMap<&'a str, &'a DbColumnMetadata>;
@@ -789,6 +809,7 @@ pub mod db {
             type_name: metadata.and_then(|column| column.type_name.clone()),
             nullable: metadata.and_then(|column| column.nullable),
             value: value.clone(),
+            wire: None,
         }
     }
 
@@ -816,11 +837,21 @@ pub mod db {
         pub version: u8,
         pub table: String,
         pub columns: Vec<DbColumnImage>,
+        /// `Some("binary")` when EVERY column of this row carries its physical
+        /// wire image ([`DbColumnImage::wire`]; `wire: None` under this flag
+        /// is SQL NULL). Absent on old tapes and on rows whose capture could
+        /// not be joined — consumers fall back to the semantic path then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub wire_format: Option<String>,
     }
 
     impl DbRowImage {
         pub const KIND: &'static str = "db_row";
         pub const VERSION: u8 = 1;
+        /// The one wire format the capture produces: verbatim binary
+        /// (`typsend`) bytes. Diesel receives results in binary format,
+        /// always — see the design doc's binary-format decision.
+        pub const WIRE_FORMAT_BINARY: &'static str = "binary";
 
         pub fn new(table: impl Into<String>, columns: Vec<DbColumnImage>) -> Self {
             Self {
@@ -828,6 +859,7 @@ pub mod db {
                 version: Self::VERSION,
                 table: table.into(),
                 columns,
+                wire_format: None,
             }
         }
 
@@ -905,6 +937,103 @@ pub mod db {
                 images.into_iter().map(|image| image.to_value()).collect(),
             )),
         }
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            // Writing to a String cannot fail.
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    /// Attach wrapper-captured physical wire rows
+    /// ([`deja_runtime::wire_capture::WireRow`]) to the serde row images and
+    /// render the compact event image payload. This is the producer side of
+    /// the two-representation split: the serde value stays the semantic
+    /// record; each column additionally carries its verbatim binary wire
+    /// bytes + type OID for seeding.
+    ///
+    /// The join is validated before anything is attached — ALL of:
+    /// - at least as many captured rows as serde rows, paired by index
+    ///   (result-set order on both sides; `get_result` consumes only the
+    ///   first row of a wider set, hence prefix pairing);
+    /// - every serde column name present exactly once among the captured
+    ///   columns of its row;
+    /// - NULL alignment per column (serde `null` ⇔ captured SQL NULL).
+    ///
+    /// Any violation drops the ENTIRE physical attachment and returns the
+    /// plain semantic payload — a capture that cannot be joined with
+    /// confidence is discarded, never misattached. Note what is deliberately
+    /// NOT compared: the semantic value's content against the wire bytes.
+    /// The two are independent projections of the row type and their
+    /// disagreement (e.g. `{"TxnId": …}` in a varchar column, issue #35) is
+    /// the reason the physical image exists.
+    pub fn row_image_payload_with_wire(
+        table: &str,
+        value: &serde_json::Value,
+        wire_rows: &[deja_runtime::wire_capture::WireRow],
+    ) -> Option<serde_json::Value> {
+        let mut images = row_images_with_metadata(table, value, &[]);
+        if images.is_empty() {
+            return None;
+        }
+        if !wire_rows.is_empty()
+            && wire_rows.len() >= images.len()
+            && wire_join_is_sound(&images, wire_rows)
+        {
+            for (image, wire_row) in images.iter_mut().zip(wire_rows) {
+                attach_wire_row(image, wire_row);
+            }
+        }
+        match images.len() {
+            1 => images.pop().map(|image| image.to_value()),
+            _ => Some(serde_json::Value::Array(
+                images.into_iter().map(|image| image.to_value()).collect(),
+            )),
+        }
+    }
+
+    /// Validate the serde-row ↔ wire-row pairing described on
+    /// [`row_image_payload_with_wire`]. Pure check, attaches nothing.
+    fn wire_join_is_sound(
+        images: &[DbRowImage],
+        wire_rows: &[deja_runtime::wire_capture::WireRow],
+    ) -> bool {
+        images.iter().zip(wire_rows).all(|(image, wire_row)| {
+            image.columns.iter().all(|column| {
+                let mut matches = wire_row
+                    .columns
+                    .iter()
+                    .filter(|wire| wire.name == column.name);
+                match (matches.next(), matches.next()) {
+                    // Exactly one captured column with this name, and NULLs
+                    // line up on both sides.
+                    (Some(wire), None) => column.value.is_null() == wire.bytes.is_none(),
+                    // Missing or ambiguous (duplicate name): unsound.
+                    _ => false,
+                }
+            })
+        })
+    }
+
+    fn attach_wire_row(image: &mut DbRowImage, wire_row: &deja_runtime::wire_capture::WireRow) {
+        for column in &mut image.columns {
+            // Soundness was checked: exactly one wire column matches.
+            if let Some(wire) = wire_row
+                .columns
+                .iter()
+                .find(|wire| wire.name == column.name)
+            {
+                column.wire = wire.bytes.as_deref().map(to_hex);
+                if column.type_oid.is_none() {
+                    column.type_oid = wire.type_oid;
+                }
+            }
+        }
+        image.wire_format = Some(DbRowImage::WIRE_FORMAT_BINARY.to_string());
     }
 
     /// Build a typed DB row key from one structured row/object when a pragmatic
@@ -1013,6 +1142,11 @@ pub mod db {
         let ok_value = (!is_error)
             .then(|| envelope.get("value").cloned())
             .flatten();
+        // Take this statement's wrapper-captured physical wire rows (if a
+        // `deja-diesel` connection wrapper is in the stack) UNCONDITIONALLY —
+        // an Err result must still clear its parked capture. See
+        // `deja_runtime::wire_capture` for the handoff contract.
+        let wire_rows = deja_runtime::wire_capture::take_captured_wire_rows(sql);
         let mut output = crate::RecordedOutput::new(envelope, is_error);
 
         // Row-exact keys from rows the result actually carried.
@@ -1040,7 +1174,11 @@ pub mod db {
         }
 
         if let Some(value) = ok_value {
-            if let Some(image) = row_image_payload(table, &value) {
+            let image = match &wire_rows {
+                Some(rows) => row_image_payload_with_wire(table, &value, rows),
+                None => row_image_payload(table, &value),
+            };
+            if let Some(image) = image {
                 output = output.with_result_image(image);
             }
         }

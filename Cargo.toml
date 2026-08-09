@@ -5,6 +5,7 @@ members = [
     "crates/deja-core",
     "crates/deja-derive",
     "crates/deja-compactor",
+    "crates/deja-diesel",
     "crates/deja-runtime",
     "crates/deja-tui",
     "crates/deja-kernel",
