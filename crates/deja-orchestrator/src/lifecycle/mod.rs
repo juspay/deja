@@ -1889,6 +1889,34 @@ struct SeedCertificateSummary {
     readback_mismatched: usize,
     readback_errors: usize,
     readback_not_run: usize,
+    /// Which mechanism actually materialized each table's DB rows, and how many
+    /// entries reached the seeder with no physical row image to use.
+    ///
+    /// Without this the two mechanisms are indistinguishable from outside the
+    /// pod: a certificate showing `failed: 35` said nothing about whether the
+    /// tape carried wire images, whether they were rejected, or which column
+    /// refused to render — and the tape itself is deliberately not exposed
+    /// through any API, so answering it meant reading pod logs (or a Kafka
+    /// topic) that outlive nothing. The counts belong next to the outcome they
+    /// explain.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    db_rows_by_table: BTreeMap<String, SeedTableMechanism>,
+}
+
+/// Per-table materialization accounting: `via_copy + via_insert` is every row
+/// the seeder rendered for the table.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SeedTableMechanism {
+    /// Rows materialized from their verbatim physical wire image (binary COPY).
+    via_copy: usize,
+    /// Rows materialized through the serde INSERT renderer.
+    via_insert: usize,
+    /// Entries where every row seeded from its own physical image.
+    entries_with_physical_image: usize,
+    /// Entries where at least one row had no usable physical image — the
+    /// population exposed to the fail-closed renderer. `with + without` is
+    /// every entry the seeder rendered for the table.
+    entries_without_physical_image: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -1901,6 +1929,28 @@ struct SeedCertificateEntry {
     origin: deja::SeedOrigin,
     materialization: SeedMaterializationStatus,
     readback: SeedReadback,
+    /// Which mechanism materialized this DB entry's rows. Absent for redis
+    /// entries and for entries the seeder never got as far as rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mechanism: Option<SeedEntryMechanism>,
+}
+
+/// How one DB seed entry's rows were materialized. A `Failed` entry carries
+/// this too: the split is exactly what says whether the tape's physical image
+/// was available and unused, or never captured in the first place.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SeedEntryMechanism {
+    table: String,
+    rows: usize,
+    /// Rows materialized from their verbatim physical wire image (binary COPY).
+    via_copy: usize,
+    /// Rows materialized through the serde INSERT renderer.
+    via_insert: usize,
+    /// Why the insert-path rows did not use a physical image — the tape carried
+    /// none, or it carried one that is not portable across clusters. `None`
+    /// when every row seeded from its wire image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    physical_image_gap: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1959,6 +2009,20 @@ impl SeedCertificate {
     }
 
     fn push(&mut self, entry: SeedCertificateEntry) {
+        if let Some(mechanism) = &entry.mechanism {
+            let table = self
+                .summary
+                .db_rows_by_table
+                .entry(mechanism.table.clone())
+                .or_default();
+            table.via_copy += mechanism.via_copy;
+            table.via_insert += mechanism.via_insert;
+            if mechanism.physical_image_gap.is_some() {
+                table.entries_without_physical_image += 1;
+            } else {
+                table.entries_with_physical_image += 1;
+            }
+        }
         // A not-a-precondition read was never planned: it has no
         // materialization outcome and no readback to account. It is carried
         // for the accounting identity (`planned + not_preconditions` = every
@@ -2010,7 +2074,14 @@ impl SeedCertificateEntry {
             origin: entry.origin,
             materialization,
             readback,
+            mechanism: None,
         }
+    }
+
+    /// Attach the DB materialization split (see [`SeedEntryMechanism`]).
+    fn with_mechanism(mut self, mechanism: Option<SeedEntryMechanism>) -> Self {
+        self.mechanism = mechanism;
+        self
     }
 
     /// A read the planner concluded is not a precondition. Carried in the
@@ -2038,6 +2109,7 @@ impl SeedCertificateEntry {
             origin: deja::SeedOrigin::Recording,
             materialization: SeedMaterializationStatus::NotAPrecondition,
             readback: SeedReadback::not_run(why),
+            mechanism: None,
         }
     }
 }
@@ -2255,7 +2327,7 @@ fn materialize_seed_plan(
                 // DB seed-from-result-by-PK, into the correlation's schema. ON by
                 // default; DEJA_SEED_DB=0 is the kill-switch.
                 "db" if seed_db_enabled => {
-                    let (materialization, readback) = seed_db(
+                    let outcome = seed_db(
                         store,
                         db_schema.as_deref(),
                         &db_catalog,
@@ -2263,14 +2335,17 @@ fn materialize_seed_plan(
                         entry.image.as_ref(),
                         &entry.value,
                     );
-                    certificate.push(SeedCertificateEntry::new(
-                        corr,
-                        entry,
-                        None,
-                        db_schema.clone(),
-                        materialization,
-                        readback,
-                    ));
+                    certificate.push(
+                        SeedCertificateEntry::new(
+                            corr,
+                            entry,
+                            None,
+                            db_schema.clone(),
+                            outcome.status,
+                            outcome.readback,
+                        )
+                        .with_mechanism(outcome.mechanism),
+                    );
                 }
                 "db" => certificate.push(SeedCertificateEntry::new(
                     corr,
@@ -2303,6 +2378,15 @@ fn materialize_seed_plan(
         certificate.summary.readback_mismatched,
         certificate.summary.readback_errors
     );
+    for (table, mechanism) in &certificate.summary.db_rows_by_table {
+        eprintln!(
+            "lifecycle: seed mechanism {table}: {} row(s) via binary COPY, {} via insert; {} entr(ies) had a physical image, {} did not",
+            mechanism.via_copy,
+            mechanism.via_insert,
+            mechanism.entries_with_physical_image,
+            mechanism.entries_without_physical_image
+        );
+    }
     certificate
 }
 
@@ -2340,11 +2424,11 @@ fn seed_db(
     key: &str,
     image: Option<&serde_json::Value>,
     envelope: &serde_json::Value,
-) -> (SeedMaterializationStatus, SeedReadback) {
+) -> SeedDbOutcome {
     let target = match db_seed_target_from_key(key) {
         Some(target) => target,
         None => {
-            return (
+            return SeedDbOutcome::unrendered(
                 SeedMaterializationStatus::Unsupported,
                 SeedReadback::unsupported("unsupported or opaque db state key"),
             );
@@ -2363,7 +2447,7 @@ fn seed_db(
             target.kind, key
         );
         eprintln!("lifecycle: {message}");
-        return (
+        return SeedDbOutcome::unrendered(
             SeedMaterializationStatus::Skipped,
             SeedReadback::not_run(message),
         );
@@ -2377,6 +2461,7 @@ fn seed_db(
     // path byte-identically.
     let mut copy_rows: Vec<&DbRowImage> = Vec::new();
     let mut insert_rows: Vec<&DbRowImage> = Vec::new();
+    let mut physical_image_gap: Option<String> = None;
     for row in &rows {
         match wire_copy_eligibility(row) {
             Ok(()) => copy_rows.push(row),
@@ -2387,35 +2472,34 @@ fn seed_db(
                         target.kind, target.table
                     );
                 }
+                if physical_image_gap.is_none() {
+                    physical_image_gap = Some(reason);
+                }
                 insert_rows.push(row);
             }
         }
     }
+    let mechanism = SeedEntryMechanism {
+        table: target.table.clone(),
+        rows: rows.len(),
+        via_copy: copy_rows.len(),
+        via_insert: insert_rows.len(),
+        physical_image_gap,
+    };
 
-    let mut sql = String::new();
-    for row in &insert_rows {
-        let Some(stmt) = build_insert_sql(schema, row) else {
-            let message = format!(
-                "seed_db {} {} could not render an insert for a seedable row",
-                target.kind, target.table
-            );
-            eprintln!("lifecycle: {message}; skipping this seed entry");
-            return (
-                SeedMaterializationStatus::Failed,
-                SeedReadback::error(message),
-            );
-        };
-        sql.push_str(&stmt);
-        sql.push('\n');
-    }
-
+    // Log the split BEFORE rendering: a row the renderer refuses is exactly
+    // when knowing whether a physical image existed matters most.
     eprintln!(
-        "lifecycle: seed_db {} {} ({} row(s): {} via binary COPY, {} via insert)",
+        "lifecycle: seed_db {} {} ({} row(s): {} via binary COPY, {} via insert{})",
         target.kind,
         target.table,
-        rows.len(),
-        copy_rows.len(),
-        insert_rows.len()
+        mechanism.rows,
+        mechanism.via_copy,
+        mechanism.via_insert,
+        match &mechanism.physical_image_gap {
+            Some(reason) => format!(" — no physical image used: {reason}"),
+            None => String::new(),
+        }
     );
     if seed_contains_null_column(&rows, "totp_secret") {
         eprintln!(
@@ -2424,26 +2508,50 @@ fn seed_db(
         );
     }
 
+    let mut sql = String::new();
+    for row in &insert_rows {
+        let stmt = match build_insert_sql(schema, row) {
+            Ok(stmt) => stmt,
+            Err(reason) => {
+                let message = format!(
+                    "seed_db {} {} could not render an insert for a seedable row: {reason}",
+                    target.kind, target.table
+                );
+                eprintln!("lifecycle: {message}; skipping this seed entry");
+                return SeedDbOutcome::rendered(
+                    SeedMaterializationStatus::Failed,
+                    SeedReadback::error(message),
+                    mechanism,
+                );
+            }
+        };
+        sql.push_str(&stmt);
+        sql.push('\n');
+    }
+
     if !copy_rows.is_empty() {
         if let Err(message) = seed_db_wire_copy(store, schema, &target.table, &copy_rows) {
             eprintln!("lifecycle: {message}; continuing (best-effort)");
-            return (
+            return SeedDbOutcome::rendered(
                 SeedMaterializationStatus::Failed,
                 SeedReadback::error(message),
+                mechanism,
             );
         }
     }
 
     if sql.is_empty() {
-        return (
+        return SeedDbOutcome::rendered(
             SeedMaterializationStatus::Materialized,
             readback_db(store, schema, &target, &rows),
+            mechanism,
         );
     }
     match store.psql(&[], true, &sql).output() {
-        Ok(output) if output.status.success() => (
+        Ok(output) if output.status.success() => SeedDbOutcome::rendered(
             SeedMaterializationStatus::Materialized,
             readback_db(store, schema, &target, &rows),
+            mechanism,
         ),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2456,18 +2564,52 @@ fn seed_db(
                 stdout.trim()
             );
             eprintln!("lifecycle: {message}; continuing (best-effort)");
-            (
+            SeedDbOutcome::rendered(
                 SeedMaterializationStatus::Failed,
                 SeedReadback::error(message),
+                mechanism,
             )
         }
         Err(e) => {
             let message = format!("could not run seed_db {}: {e}", target.table);
             eprintln!("lifecycle: {message}; continuing (best-effort)");
-            (
+            SeedDbOutcome::rendered(
                 SeedMaterializationStatus::Failed,
                 SeedReadback::error(message),
+                mechanism,
             )
+        }
+    }
+}
+
+/// What one [`seed_db`] call concluded: the outcome, its readback, and — once
+/// rows were actually rendered — which mechanism rendered them.
+struct SeedDbOutcome {
+    status: SeedMaterializationStatus,
+    readback: SeedReadback,
+    mechanism: Option<SeedEntryMechanism>,
+}
+
+impl SeedDbOutcome {
+    /// An outcome reached before any row was rendered (an opaque key, or a
+    /// payload with no rows in it).
+    fn unrendered(status: SeedMaterializationStatus, readback: SeedReadback) -> Self {
+        Self {
+            status,
+            readback,
+            mechanism: None,
+        }
+    }
+
+    fn rendered(
+        status: SeedMaterializationStatus,
+        readback: SeedReadback,
+        mechanism: SeedEntryMechanism,
+    ) -> Self {
+        Self {
+            status,
+            readback,
+            mechanism: Some(mechanism),
         }
     }
 }
@@ -3405,9 +3547,9 @@ fn wire_copy_eligibility(row: &DbRowImage) -> Result<(), String> {
 /// available; unknown metadata falls back to generic JSON-as-SQL-literal
 /// rendering. `bytea` handling is gated solely by the column type metadata, not
 /// by guessing object shapes globally.
-fn build_insert_sql(schema: Option<&str>, row: &DbRowImage) -> Option<String> {
+fn build_insert_sql(schema: Option<&str>, row: &DbRowImage) -> Result<String, String> {
     if row.columns.is_empty() {
-        return None;
+        return Err("row image has no columns".to_string());
     }
     let col_list = row
         .columns
@@ -3417,7 +3559,27 @@ fn build_insert_sql(schema: Option<&str>, row: &DbRowImage) -> Option<String> {
         .join(", ");
     let mut values = Vec::with_capacity(row.columns.len());
     for column in &row.columns {
-        values.push(sql_literal_for_column(column)?);
+        // Name the column that refused. A bare "could not render" makes every
+        // cause look alike from outside the pod, which is how a serde-shaped
+        // value in a scalar column (`{"TxnId": …}` in a varchar) read as a
+        // generic seeding failure for a full sandbox cycle.
+        // The column name and its type are the whole diagnosis; the value
+        // itself stays out of the message (it is row data, and the certificate
+        // is served over the API).
+        let literal = sql_literal_for_column(column).ok_or_else(|| {
+            format!(
+                "column {} (type oid {:?}, name {:?}) holds a {} value the fail-closed renderer refuses to guess at",
+                column.metadata.name,
+                column.metadata.type_oid,
+                column.metadata.type_name,
+                match &column.value {
+                    serde_json::Value::Object(_) => "structured object",
+                    serde_json::Value::Array(_) => "array",
+                    _ => "scalar",
+                },
+            )
+        })?;
+        values.push(literal);
     }
     let value_list = values.join(", ");
     // Qualify the target with the per-correlation schema when isolating (R1), so
@@ -3426,7 +3588,7 @@ fn build_insert_sql(schema: Option<&str>, row: &DbRowImage) -> Option<String> {
     // knowledge: the cloned schema starts empty, so this only no-ops on the rare
     // intra-seed duplicate. Unqualified (→ search_path/public) when no schema.
     let qualified_table = qualified_table(schema, &row.table);
-    Some(format!(
+    Ok(format!(
         "INSERT INTO {qualified_table} ({col_list}) VALUES ({value_list}) ON CONFLICT DO NOTHING;"
     ))
 }
@@ -4618,6 +4780,10 @@ mod tests {
                 readback_mismatched: 1,
                 readback_errors: 1,
                 readback_not_run: 2,
+                // These entries were pushed without a mechanism (the split is
+                // attached by `seed_db` itself); the per-table block is
+                // exercised by `seed_certificate_accounts_the_materialization_mechanism_per_table`.
+                db_rows_by_table: BTreeMap::new(),
             },
             "the certificate summary must distinguish materialization outcomes and readback evidence"
         );
@@ -4627,6 +4793,90 @@ mod tests {
         assert_eq!(json["entries"][1]["readback"]["status"], "mismatched");
         assert_eq!(json["entries"][2]["materialization"], "skipped");
         assert_eq!(json["entries"][3]["readback"]["status"], "error");
+    }
+
+    /// The per-table mechanism block answers, from the artifact alone, whether
+    /// the tape's physical row images reached the seeder and which rows they
+    /// materialized. That question previously had no answer outside the pod —
+    /// the recording is deliberately not exposed through any API — so a
+    /// certificate reporting `failed` could not say whether the wire image was
+    /// missing, rejected, or simply unused. A FAILED entry carries its split
+    /// too, which is the case that matters.
+    #[test]
+    fn seed_certificate_accounts_the_materialization_mechanism_per_table() {
+        let corr = Some("c1".to_owned());
+        let db = certificate_seed_entry(
+            "db",
+            &deja::StateKey::DbQuery {
+                table: "payment_attempt".to_owned(),
+                fingerprint: "f439efeb0ad8b2f4".to_owned(),
+            }
+            .to_wire(),
+        );
+        let mut certificate = SeedCertificate::new("rec-1", "run-1", true);
+
+        certificate.push(
+            SeedCertificateEntry::new(
+                &corr,
+                &db,
+                None,
+                None,
+                SeedMaterializationStatus::Materialized,
+                SeedReadback::matched(
+                    serde_json::json!({"rows": 2}),
+                    serde_json::json!({"rows": 2}),
+                ),
+            )
+            .with_mechanism(Some(SeedEntryMechanism {
+                table: "payment_attempt".to_owned(),
+                rows: 2,
+                via_copy: 2,
+                via_insert: 0,
+                physical_image_gap: None,
+            })),
+        );
+        certificate.push(
+            SeedCertificateEntry::new(
+                &corr,
+                &db,
+                None,
+                None,
+                SeedMaterializationStatus::Failed,
+                SeedReadback::error("could not render an insert"),
+            )
+            .with_mechanism(Some(SeedEntryMechanism {
+                table: "payment_attempt".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: Some("no physical image".to_owned()),
+            })),
+        );
+
+        let table = certificate
+            .summary
+            .db_rows_by_table
+            .get("payment_attempt")
+            .expect("the failing table must appear in the per-table accounting");
+        assert_eq!(
+            table,
+            &SeedTableMechanism {
+                via_copy: 2,
+                via_insert: 1,
+                entries_with_physical_image: 1,
+                entries_without_physical_image: 1,
+            },
+            "rows must be attributed to the mechanism that rendered them, and entries counted by whether a physical image was available"
+        );
+        let json = serde_json::to_value(&certificate).expect("certificate serializes");
+        assert_eq!(
+            json["summary"]["db_rows_by_table"]["payment_attempt"]["via_copy"],
+            2
+        );
+        assert_eq!(
+            json["entries"][1]["mechanism"]["physical_image_gap"], "no physical image",
+            "a failed entry must still name why it had no physical image to use"
+        );
     }
 
     #[test]
