@@ -2516,11 +2516,22 @@ fn preferred_seed_image(event: &BoundaryEvent, canonical_key: &str) -> Option<se
             .iter()
             .any(|key| canonical_state_key_wire(key) == canonical_key);
     if read_write_same_key {
-        // A DB read+write on the same state key is an RMW precondition. The
-        // post-write `result_image` is the wrong state to seed; use an explicit
-        // pre-image when the producer captured one, otherwise fall back to the
-        // legacy `value = event.result` path by leaving `image` absent.
-        event.pre_image.clone()
+        // A DB read+write on the same state key is an RMW precondition, so an
+        // explicit pre-image is the state to seed and wins when the producer
+        // captured one.
+        //
+        // When it did not, the alternative is NOT "seed nothing": leaving
+        // `image` absent sends materialization down the `value = event.result`
+        // path, which is that same post-write state in a LOSSIER
+        // representation — serde shapes with no physical bytes behind them
+        // (`{"TxnId": …}` in a varchar column), which the fail-closed SQL
+        // renderer must refuse rather than guess at. Both routes seed the post
+        // state; only one of them can be materialized faithfully. So prefer
+        // the physical post-image: identical state, wire-exact bytes.
+        event
+            .pre_image
+            .clone()
+            .or_else(|| event.result_image.clone())
     } else {
         event.result_image.clone()
     }
@@ -4778,14 +4789,25 @@ mod tests {
         );
     }
 
+    /// An RMW event whose producer captured no pre-image falls back to the
+    /// post-write RESULT image — not to nothing.
+    ///
+    /// The state seeded is the same either way: with `image` absent,
+    /// materialization renders the post-write `value` instead. The two differ
+    /// only in representation, and only one of them is materializable — a
+    /// serde shape with no physical bytes behind it (`{"TxnId": …}` in a
+    /// varchar column) is refused by the fail-closed SQL renderer, which is
+    /// how 35 `payment_attempt` preconditions failed to materialize while the
+    /// wire-exact image of those very rows sat unused on the event.
     #[test]
-    fn seed_plan_does_not_use_result_image_for_rmw_without_pre_image() {
+    fn seed_plan_falls_back_to_the_result_image_for_rmw_without_pre_image() {
         let update_key = StateKey::DbRow {
             table: "merchant_account".to_owned(),
             pk_column: "merchant_id".to_owned(),
             pk_value: "m2".to_owned(),
         }
         .to_wire();
+        let post_image = serde_json::json!({"merchant_id": "m2", "status": "after"});
         let mut rmw = state_event(
             0,
             Some("c1"),
@@ -4797,21 +4819,74 @@ mod tests {
             &[update_key.as_str()],
             false,
         );
-        rmw.result_image = Some(serde_json::json!({"merchant_id": "m2", "status": "after"}));
+        rmw.result_image = Some(post_image.clone());
 
         let plan = build_seed_plan(&[rmw], Some("c1"));
         let update_seed = plan
             .resolve("db", update_key.as_str())
-            .expect("self-referential UPDATE still seeds through legacy value");
+            .expect("self-referential UPDATE must seed the row it mutates");
         assert_eq!(
-            update_seed.image, None,
-            "RMW without a pre-image must not fall back to a post-write result image"
+            update_seed.image,
+            Some(post_image),
+            "RMW without a pre-image must seed the physical post-image, since the alternative fallback is the same state rendered from serde"
         );
         assert_eq!(
             update_seed.value,
             serde_json::json!({"merchant_id": "m2", "status": "after"}),
             "legacy raw value remains available for old tapes"
         );
+    }
+
+    /// The same fallback on the QUERY key of an RMW event — the shape that
+    /// produced the sandbox failure. `generic_update_with_results` carries the
+    /// query key and the row key in BOTH its read and write sets, so both keys
+    /// take the RMW branch and both must reach the physical image.
+    #[test]
+    fn seed_plan_falls_back_to_the_result_image_for_an_rmw_query_key() {
+        let query_key = StateKey::DbQuery {
+            table: "payment_attempt".to_owned(),
+            fingerprint: "f439efeb0ad8b2f4".to_owned(),
+        }
+        .to_wire();
+        let row_key = StateKey::DbRow {
+            table: "payment_attempt".to_owned(),
+            pk_column: "attempt_id".to_owned(),
+            pk_value: "a1".to_owned(),
+        }
+        .to_wire();
+        let post_image = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "payment_attempt",
+            "wire_format": "binary",
+            "columns": [
+                {"name": "attempt_id", "type_oid": 1043, "value": "a1", "wire": "6131"},
+                {"name": "connector_transaction_id", "type_oid": 1043,
+                 "value": {"TxnId": "pi_1"}, "wire": "70695f31"},
+            ],
+        });
+        let mut rmw = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "generic_update_with_results",
+            serde_json::json!({"table": "payment_attempt"}),
+            serde_json::json!([{"attempt_id": "a1", "connector_transaction_id": {"TxnId": "pi_1"}}]),
+            &[query_key.as_str(), row_key.as_str()],
+            &[query_key.as_str(), row_key.as_str()],
+            false,
+        );
+        rmw.result_image = Some(post_image.clone());
+
+        let plan = build_seed_plan(&[rmw], Some("c1"));
+        for key in [query_key.as_str(), row_key.as_str()] {
+            let seed = plan.resolve("db", key).expect("RMW key must seed");
+            assert_eq!(
+                seed.image,
+                Some(post_image.clone()),
+                "both RMW keys must carry the physical image, so the wire bytes reach binary COPY instead of the serde renderer refusing {{\"TxnId\": …}}"
+            );
+        }
     }
 
     /// But an UPDATE of a table this correlation explicitly declared as created

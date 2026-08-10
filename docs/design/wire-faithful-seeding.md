@@ -230,6 +230,25 @@ Old tapes (no wire metadata) fall back to the current serde renderer path, fail-
 all. Per the no-legacy-compat policy this is a fallback, not a compatibility commitment:
 re-record rather than teach the new path old shapes.
 
+### Which image an RMW read seeds
+
+A read-modify-write boundary (`generic_update_with_results`) carries the same state keys in its
+read set and its write set, so its keys describe a row that existed *before* the update. The
+pre-image is therefore the right precondition, and an explicit `pre_image` wins whenever the
+producer captured one.
+
+No producer captures one today. The consequence used to be that seed planning attached no image
+at all for those keys — which does **not** mean "seed nothing": materialization then renders the
+event's post-write `value` instead. Both routes seed the same post-write state; they differ only
+in representation, and the serde one cannot always be materialized (`{"TxnId": …}` in a varchar
+column is refused by the fail-closed renderer, by design). So planning falls back to the physical
+post-image: identical state, wire-exact bytes, materializable.
+
+Concretely, in one sandbox replay this was 35 `payment_attempt` preconditions failing to
+materialize while the wire-exact image of those exact rows sat unused on the same event. The
+pre-image remains the correct long-term capture (issue #35); until it exists, the fallback is the
+faithful representation of the state we are already seeding.
+
 ## The binary-format question (decided: capture binary verbatim, seed through binary COPY)
 
 The load-bearing complication: **diesel receives results in binary format, always.** This is not

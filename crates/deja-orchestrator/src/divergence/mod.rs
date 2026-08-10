@@ -2265,15 +2265,39 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
                     .collect();
                 tables.sort();
                 tables.dedup();
+                // The distinct reasons, not one per entry: thirty-five entries
+                // refusing the same column is one fact, and it is the fact that
+                // says whether the seed or the candidate is at fault.
+                let mut reasons: Vec<String> = cert["entries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| e["materialization"] == "failed" && e["boundary"] == "db")
+                    .filter_map(|e| e["readback"]["message"].as_str())
+                    // A store's own error text can carry row data and run long;
+                    // the warning is a pointer to the certificate, not a copy.
+                    .map(|message| match message.char_indices().nth(240) {
+                        Some((cut, _)) => format!("{}…", &message[..cut]),
+                        None => message.to_owned(),
+                    })
+                    .collect();
+                reasons.sort();
+                reasons.dedup();
+                reasons.truncate(3);
                 warnings.push(format!(
                     "{failed} seed entr{} FAILED to materialize{} — reads of those rows replay \
                      against an empty table, so their divergences describe the missing seed, \
-                     not the candidate (full detail per entry in the seed certificate)",
+                     not the candidate (full detail per entry in the seed certificate){}",
                     if failed == 1 { "y" } else { "ies" },
                     if tables.is_empty() {
                         String::new()
                     } else {
                         format!(" (tables: {})", tables.join(", "))
+                    },
+                    if reasons.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", reasons.join("; "))
                     },
                 ));
             }
