@@ -45,8 +45,8 @@ redis-rs = ["dep:redis"]
 serde_json = "1"
 tempfile = "3"
 error-stack = { version = "0.4", default-features = false }
-# Tests publish into the wire-capture handoff registry directly (the role the
-# deja-diesel wrapper plays in production).
+# Tests put captures into a wire slot directly (the role the deja-diesel
+# wrapper plays in production) and take them back through the boundary.
 deja-runtime = { path = "../deja-runtime" }
 
 [lints.clippy]

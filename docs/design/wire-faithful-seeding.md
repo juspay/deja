@@ -3,10 +3,13 @@
 **Status: DECIDED + pg half BUILT (deja side).** `DejaLoadConnection<C>` ships as the
 `deja-diesel` crate (facade feature `diesel-pg`); the tape carries the physical image on the row
 image's `wire`/`wire_format` fields; the seeder lands wire-carrying rows through binary COPY. Two
-deltas against the sketch below, both from the spike: (1) the capture→boundary handoff is a keyed
-process-global registry, NOT a thread-local — async-bb8-diesel runs every load on a
-`spawn_blocking` thread while the boundary's result producer runs on the async task (see
-`deja-runtime/src/wire_capture.rs` for the verified analysis); (2) the container-OID hazard is
+deltas against the sketch below, both from the spike: (1) the capture→boundary handoff is a slot ON
+the connection that produced the rows, NOT a thread-local — async-bb8-diesel runs every load on a
+`spawn_blocking` thread while the boundary's result producer runs on the async task, so the host
+installs one slot per connection checkout and registers it as the current slot for the request's
+async task, and the boundary takes from there (`deja-runtime/src/wire_capture.rs`; the first shape
+of this handoff was a statement-keyed bounded global queue, which #50/#51 measured losing every
+capture under concurrent traffic); (2) the container-OID hazard is
 resolved as a per-VALUE eligibility rule: verbatim COPY for captured type OIDs < 10000 (built-in,
 cluster-stable, including built-in containers whose embedded element OIDs are equally stable) plus
 user-defined values whose wire bytes equal the semantic string byte-for-byte (the pg enum label
@@ -76,9 +79,48 @@ impl<'a> Field<'a, Pg> for PgField<'a> {
 Per column that yields `(name, type_oid, wire bytes)` — the exact bytes postgres sent, with the
 authoritative type identity, captured without deserializing anything. The capture is a pure
 observer (the row is handed onward untouched), the same discipline as the imc lookup tee
-(docs/design/cache-isolation.md). Correlation comes from `deja_context` ambient state, as at every
-other boundary; the wire rows are stowed for the enclosing `#[deja::db]` boundary to attach to its
-event (see tape shape below).
+(docs/design/cache-isolation.md). The wire rows are stowed for the enclosing `#[deja::db]`
+boundary to attach to its event (see tape shape below).
+
+### The capture→boundary handoff: a slot on the connection (#50)
+
+The wrapper's cursor runs on a `spawn_blocking` thread (async-bb8-diesel) while the boundary's
+result producer runs on the async task afterwards, so the capture must be parked somewhere between
+the two. The first shape was a process-global `VecDeque` keyed on the rendered statement, bounded
+at `MAX_PENDING = 64` with oldest-first eviction and 10-second aging. It does not work under load,
+and PR #51 measured the failure exactly: the capture gate is process-level, so every statement the
+process runs publishes — including the majority from requests the sampler excluded, which never
+run a result producer and never take — and those unclaimed captures fill the queue and evict the
+recorded request's image. Survives 63 competing statements in its window; lost at 64. On a live
+pod that is every recorded request: the reference recording carried zero physical images and
+seeding silently fell back to serde (45 `payment_attempt` refusals).
+
+The shape that replaces it: a **`WireSlot` on the connection itself**. A connection executes one
+statement at a time, so its slot has exactly one occupant, and the entire shared apparatus is
+deleted — the registry, the sql join key, the `LIMIT $n` normalization that tracked a diesel
+implementation detail, `MAX_PENDING`, `MAX_AGE`, the FIFO tie-break. Overflow is not mitigated;
+it is impossible. The host installs one slot per connection checkout (inside `conn.run`, the only
+place `&mut` on the wrapped connection is reachable) and registers the same `Arc` as the async
+task's CURRENT slot (a tokio task-local — exclusive per task by construction, which a thread-local
+or the inheriting `deja-context` snapshot cannot give); `recorded_output` takes from the current
+slot, no statement text involved.
+
+The residual limitation, accepted and instrumented: the current-slot handle is per-task and
+last-installed-wins, so a task holding two pooled connections at once that queries the first after
+checking out the second reads the wrong (empty) slot — no physical image, serde fallback. A
+coverage loss, never a wrong value; hyperswitch checks out immediately before querying, so it is
+rare, and the handoff counts itself (`put` / `taken` / `overwritten_unclaimed` /
+`takes_without_slot` / `installs_without_scope`) so a coverage regression is a number, not a
+silence. `overwritten_unclaimed` in particular is the visibility for captures nobody claimed.
+
+One alternative was evaluated and rejected: emitting the wire image as its own durable record at
+capture time (a tape-side join instead of an in-process handoff). A wire image is only meaningful
+paired with a SPECIFIC boundary event, so a durable side-record re-imports offline exactly the
+join this design deletes — (correlation, sql, occurrence) matching plus the `LIMIT` normalization
+— and adds a new record kind through all six pipeline stages (sink, upload, compaction, ingest,
+seed-planning, dashboard), including the ingest-probe class of bug that produced the graph-node
+loss. The connection-owned slot keeps the pairing where both halves already exist, in process, at
+the moment they are adjacent.
 
 Seeding then becomes: hand postgres back its own output, with the cast the catalog already knows
 (`INSERT … VALUES ('<wire text>'::<type>, …)` in the text world; see the binary section for what

@@ -1,7 +1,7 @@
 //! The physical/semantic two-representation split on db row images
 //! (docs/design/wire-faithful-seeding.md): `row_image_payload_with_wire`
 //! attaches wrapper-captured binary wire values to the serde row images, and
-//! `recorded_output` picks captures up from the ambient handoff registry.
+//! `recorded_output` picks captures up from the slot the request installed.
 //! Every rejection path must fall back to the plain semantic payload — a
 //! physical image is dropped on doubt, never misattached.
 
@@ -195,7 +195,7 @@ fn plain_payload_carries_no_wire_keys() {
 mod recorded_output_handoff {
     use super::*;
     use deja::db::{recorded_output, StateAxis};
-    use deja_runtime::wire_capture::publish_captured_wire_rows;
+    use deja_runtime::wire_capture::{scope_sync, set_current_slot, WireSlot};
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     enum DbError {
@@ -216,26 +216,26 @@ mod recorded_output_handoff {
 
     #[test]
     fn recorded_output_takes_the_capture_and_attaches_the_physical_image() {
-        // The wrapper published under the EXECUTED statement (first_async
-        // appended LIMIT); the boundary passes its own pre-limit rendering —
-        // the registry's key normalization joins them.
-        let executed = r#"SELECT * FROM "wi_attempt" WHERE "wi_attempt"."attempt_id" = $1 LIMIT $2 -- binds: ["att_1", 1]"#;
+        // The boundary's `sql` no longer takes part in the handoff: the capture
+        // arrives through the slot the request installed, so the statement the
+        // wrapper executed (`first_async` appends a LIMIT) and the rendering the
+        // boundary holds need not agree on anything.
         let boundary = r#"SELECT * FROM "wi_attempt" WHERE "wi_attempt"."attempt_id" = $1 -- binds: ["att_1"]"#;
-        publish_captured_wire_rows(
-            executed,
-            vec![WireRow {
+        let slot = WireSlot::new_shared();
+        let output = scope_sync(|| {
+            assert!(set_current_slot(std::sync::Arc::clone(&slot)));
+            slot.put(vec![WireRow {
                 columns: vec![
                     wire_column("attempt_id", 1043, b"att_1"),
                     wire_column("connector_transaction_id", 1043, b"txn_raw"),
                 ],
-            }],
-        );
-
-        let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
-            attempt_id: "att_1".into(),
-            connector_transaction_id: Some(serde_json::json!({"TxnId": "txn_raw"})),
+            }]);
+            let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
+                attempt_id: "att_1".into(),
+                connector_transaction_id: Some(serde_json::json!({"TxnId": "txn_raw"})),
+            });
+            recorded_output(StateAxis::Read, "wi_attempt", boundary, &ok)
         });
-        let output = recorded_output(StateAxis::Read, "wi_attempt", boundary, &ok);
         let image = output.result_image.expect("row image expected");
         let row: DbRowImage = serde_json::from_value(image).expect("typed image");
         assert_eq!(row.wire_format.as_deref(), Some("binary"));
@@ -249,22 +249,24 @@ mod recorded_output_handoff {
     }
 
     #[test]
-    fn err_results_still_consume_their_capture() {
+    fn err_results_still_empty_the_slot() {
         let sql = r#"SELECT * FROM "wi_gone" WHERE "wi_gone"."id" = $1 -- binds: ["g1"]"#;
-        publish_captured_wire_rows(
-            sql,
-            vec![WireRow {
+        let slot = WireSlot::new_shared();
+        scope_sync(|| {
+            set_current_slot(std::sync::Arc::clone(&slot));
+            slot.put(vec![WireRow {
                 columns: vec![wire_column("id", 1043, b"g1")],
-            }],
-        );
-        let err: Result<AttemptRow, error_stack::Report<DbError>> =
-            Err(error_stack::report!(DbError::NotFound));
-        let output = recorded_output(StateAxis::Read, "wi_gone", sql, &err);
-        assert!(output.is_error);
-        assert!(output.result_image.is_none());
+            }]);
+            let err: Result<AttemptRow, error_stack::Report<DbError>> =
+                Err(error_stack::report!(DbError::NotFound));
+            let output = recorded_output(StateAxis::Read, "wi_gone", sql, &err);
+            assert!(output.is_error);
+            assert!(output.result_image.is_none());
+        });
         assert!(
-            deja_runtime::wire_capture::take_captured_wire_rows(sql).is_none(),
-            "the Err boundary must clear its parked capture"
+            !slot.is_occupied(),
+            "an Err boundary must empty the slot, or its capture lands on the \
+             next statement's event"
         );
     }
 
@@ -282,5 +284,35 @@ mod recorded_output_handoff {
             !rendered.contains("wire"),
             "old-tape behavior: no wire keys without a capture"
         );
+    }
+
+    #[test]
+    fn a_capture_in_another_scope_is_not_visible_here() {
+        // The failure this design deletes: one request's physical image can no
+        // longer be handed to another request's boundary, whatever the
+        // statements look like. Same table, same sql, same process.
+        let sql = r#"SELECT * FROM "wi_shared" WHERE "wi_shared"."id" = $1 -- binds: ["p1"]"#;
+        let theirs = WireSlot::new_shared();
+        scope_sync(|| {
+            set_current_slot(std::sync::Arc::clone(&theirs));
+            theirs.put(vec![WireRow {
+                columns: vec![wire_column("attempt_id", 1043, b"not_mine")],
+            }]);
+        });
+
+        let output = scope_sync(|| {
+            let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
+                attempt_id: "p1".into(),
+                connector_transaction_id: None,
+            });
+            recorded_output(StateAxis::Read, "wi_shared", sql, &ok)
+        });
+        let rendered = serde_json::to_string(&output.result_image.expect("row image expected"))
+            .expect("serializes");
+        assert!(
+            !rendered.contains("wire"),
+            "no slot of ours, no physical image — never another request's bytes"
+        );
+        assert!(theirs.is_occupied(), "their capture stays theirs");
     }
 }
