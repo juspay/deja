@@ -143,7 +143,7 @@ pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String),
     match spec {
         CandidateSpec::PrebuiltImage { image } => {
             let image = qualify_candidate_image(image);
-            let sha = image_tag(&image).to_owned();
+            let sha = build_ref_from_tag(image_tag(&image)).to_owned();
             Ok((image, sha))
         }
         CandidateSpec::RepoSha { .. }
@@ -179,12 +179,42 @@ fn qualify_candidate_image(reference: &str) -> String {
     if already_qualified {
         return reference.to_owned();
     }
-    match std::env::var("DEJA_CANDIDATE_IMAGE_REPO") {
-        Ok(repo) if !repo.trim().is_empty() => {
-            format!("{}:{}", repo.trim().trim_end_matches('/'), reference)
+    let repo = match std::env::var("DEJA_CANDIDATE_IMAGE_REPO") {
+        Ok(repo) if !repo.trim().is_empty() => repo.trim().trim_end_matches('/').to_owned(),
+        _ => return reference.to_owned(),
+    };
+    match reference.split_once(':') {
+        // `name:tag` with no registry: a caller restating the repo by its last
+        // path segment (`hyperswitch-router:671034e3eb`). Prepending the repo
+        // to THAT — as this function used to — minted a double-tag reference
+        // (`…/hyperswitch-router:hyperswitch-router:671034e3eb`) that no
+        // registry serves; the pod sat in ImagePullBackOff until the watch
+        // deadline killed the run. When the name IS the configured repo's last
+        // segment, the caller means the configured repo; a name that is not is
+        // a different repo and is left verbatim rather than silently repointed
+        // — the pull then fails naming exactly the image that was asked for.
+        Some((name, tag)) if !name.is_empty() && !tag.is_empty() => {
+            if repo.rsplit('/').next() == Some(name) {
+                format!("{repo}:{tag}")
+            } else {
+                reference.to_owned()
+            }
         }
-        _ => reference.to_owned(),
+        _ => format!("{repo}:{reference}"),
     }
+}
+
+/// The git ref that built a tag: a recognized build-profile suffix is dropped,
+/// everything else is itself. The build pipelines tag non-release images
+/// `<sha>-<profile>` so the bare tag in the registry always means the release
+/// build — but the SOURCE of a fast build is the same commit, so everything
+/// keyed by code identity (the codeload migrations fetch, the staged bundle,
+/// `code_sha` on the candidate) wants the suffix gone. The image reference
+/// itself keeps the full tag; only the ref derived from it is stripped.
+fn build_ref_from_tag(tag: &str) -> &str {
+    tag.strip_suffix("-release-fast")
+        .or_else(|| tag.strip_suffix("-dev"))
+        .unwrap_or(tag)
 }
 
 /// The tag portion of an image ref (after the last `:`), skipping a `:port` in
@@ -219,6 +249,27 @@ mod tests {
         .expect("prebuilt resolves");
         assert_eq!(img, "ecr.io/hyperswitch:ff191d7f");
         assert_eq!(sha, "ff191d7f");
+    }
+
+    #[test]
+    fn a_profile_suffix_is_stripped_from_the_ref_but_kept_on_the_image() {
+        for (tag, want_ref) in [
+            ("7cd937aa1c-release-fast", "7cd937aa1c"),
+            ("7cd937aa1c-dev", "7cd937aa1c"),
+            // Not a profile suffix — a hyphen alone must not truncate a tag.
+            ("2026.08.01.0-hotfix", "2026.08.01.0-hotfix"),
+        ] {
+            let (img, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
+                image: format!("ecr.io/hyperswitch:{tag}"),
+            })
+            .expect("prebuilt resolves");
+            assert_eq!(
+                img,
+                format!("ecr.io/hyperswitch:{tag}"),
+                "image keeps the tag"
+            );
+            assert_eq!(sha, want_ref, "ref drops only a recognized profile suffix");
+        }
     }
 
     #[test]
@@ -285,6 +336,34 @@ mod candidate_reference_tests {
         .unwrap();
         assert_eq!(image, format!("{REPO}:dcb9f9e955"));
         assert_eq!(sha, "dcb9f9e955");
+
+        // `name:tag` with no registry, where the name is the repo's own last
+        // segment: a caller restating where builds live. This used to get the
+        // repo prepended wholesale, minting a double-tag reference no registry
+        // serves — the pod sat in ImagePullBackOff until the watch deadline.
+        assert_eq!(
+            qualify_candidate_image("hyperswitch-router:671034e3eb"),
+            format!("{REPO}:671034e3eb")
+        );
+
+        // A name that is NOT the configured repo names a different repo: left
+        // verbatim, never silently repointed — the pull then fails naming
+        // exactly what was asked for.
+        assert_eq!(
+            qualify_candidate_image("hyperswitch-app:671034e3eb"),
+            "hyperswitch-app:671034e3eb"
+        );
+
+        // A build-profile suffix stays on the image (the registry copy really
+        // is tagged that way) and comes OFF the code identity — the source of
+        // a fast build is the same commit, and the migrations fetch treats
+        // this as a git ref.
+        let (image, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
+            image: "7cd937aa1c-release-fast".into(),
+        })
+        .unwrap();
+        assert_eq!(image, format!("{REPO}:7cd937aa1c-release-fast"));
+        assert_eq!(sha, "7cd937aa1c");
 
         // With no registry configured a bare ref is untouched — compose builds
         // a local tag and has no registry to resolve against.
