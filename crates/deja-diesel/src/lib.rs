@@ -11,18 +11,35 @@
 //! `COPY` consumes on the seeding side. The wrapper delegates everything to
 //! the wrapped connection; its one addition is a cursor adapter that walks
 //! each row's columns through diesel's generic row API (`Row`/`Field`,
-//! yielding `PgValue::as_bytes()` + `get_oid()`) and publishes the captured
-//! rows to [`deja_runtime::wire_capture`], keyed by the executed statement's
-//! `debug_query` rendering. The row is handed onward untouched — a pure
-//! observer.
+//! yielding `PgValue::as_bytes()` + `get_oid()`) and puts the captured rows
+//! into the [`WireSlot`] installed on this connection. The row is handed
+//! onward untouched — a pure observer.
 //!
 //! The enclosing `#[deja::boundary]` result producer
-//! (`deja::db::recorded_output`) takes the capture by the same key and
-//! attaches it to the recorded event as the physical row image. The handoff
-//! is a keyed process-global registry, NOT a thread-local: the wrapped load
-//! runs on a `spawn_blocking` thread (async-bb8-diesel) while the take runs
-//! on the async task — see `deja_runtime::wire_capture` for the verified
-//! execution-model analysis.
+//! (`deja::db::recorded_output`) takes the capture from the slot the request
+//! installed and attaches it to the recorded event as the physical row image.
+//! The slot belongs to the connection, not to a shared queue: a connection
+//! executes one statement at a time, so its slot has exactly one occupant and
+//! there is nothing to key, evict, or age out. See
+//! `deja_runtime::wire_capture` for the handoff contract, the measured failure
+//! of the global-registry shape it replaces, and how the boundary finds the
+//! slot across the `spawn_blocking` thread that ran the load.
+//!
+//! # Installing a slot
+//!
+//! Capture requires a slot; without one the wrapper is a plain delegating
+//! connection. The host installs one per checkout, where it also has the async
+//! context the boundary will run in:
+//!
+//! ```text
+//! let slot = deja::new_wire_slot();
+//! let for_connection = std::sync::Arc::clone(&slot);
+//! conn.run(move |c| { c.install_wire_slot(for_connection); Ok(()) }).await?;
+//! deja::set_current_wire_slot(slot);
+//! ```
+//!
+//! Every checkout must install, so that a connection handed to a new request
+//! never still points at the previous request's slot.
 //!
 //! # Adoption
 //!
@@ -47,15 +64,16 @@
 //!
 //! Capture is gated on the process-level deja runtime mode, resolved through
 //! the SAME installed hook the boundary macros use
-//! ([`deja_runtime::runtime_mode`]). The gate is process-level rather than
-//! per-correlation by necessity: the load executes on a blocking-pool thread
-//! where the ambient correlation (and with it the per-request sampling
-//! decision) does not exist. Sampling still applies at the TAKE side — a
-//! sampled-out request's boundary never runs its result producer, so the
-//! unclaimed capture ages out of the bounded registry. With no hook installed
-//! (mode Disabled — the feature-off/observation-off posture) `load` renders
-//! nothing, captures nothing, and allocates nothing beyond the wrapped
-//! cursor.
+//! ([`deja_runtime::runtime_mode`]), AND on a slot being installed. The mode
+//! gate is process-level rather than per-correlation by necessity: the load
+//! executes on a blocking-pool thread where the ambient correlation (and with
+//! it the per-request sampling decision) does not exist. Per-request selection
+//! comes from the slot instead — a request nobody installed a slot for
+//! captures nothing at all. With no hook installed (mode Disabled — the
+//! feature-off/observation-off posture) or no slot on the connection, `load`
+//! captures nothing and allocates nothing beyond the wrapped cursor.
+
+use std::sync::Arc;
 
 use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, Instrumentation, LoadConnection, SimpleConnection,
@@ -65,18 +83,36 @@ use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::row::{Field as _, Row};
 use diesel::{Connection, ConnectionResult, QueryResult};
 
-use deja_runtime::wire_capture::{self, WireColumn, WireRow};
+use deja_runtime::wire_capture::{WireColumn, WireRow, WireSlot};
 
 /// Connection wrapper capturing result rows' binary wire values for
 /// wire-faithful seeding. See the crate docs.
 pub struct DejaLoadConnection<C> {
     inner: C,
+    /// Where this connection's captures go, installed per checkout by the host
+    /// (see the crate docs). `None` — the default, and the state of every
+    /// connection in a process that never installs one — captures nothing.
+    wire_slot: Option<Arc<WireSlot>>,
 }
 
 impl<C> DejaLoadConnection<C> {
     /// Wrap an established connection.
     pub fn from_inner(inner: C) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            wire_slot: None,
+        }
+    }
+
+    /// Direct this connection's captures at `slot`, replacing any previous one.
+    ///
+    /// Called inside the host's `conn.run(|c| …)` closure at checkout, where
+    /// `&mut` on the wrapped connection is available; the same slot is handed
+    /// to the async task as its current slot
+    /// ([`deja_runtime::wire_capture::set_current_slot`]) so the boundary that
+    /// follows can take what this connection captures.
+    pub fn install_wire_slot(&mut self, slot: Arc<WireSlot>) {
+        self.wire_slot = Some(slot);
     }
 
     /// The wrapped connection, immutably. Diesel needs `&mut` to execute
@@ -145,7 +181,7 @@ where
     type TransactionManager = AnsiTransactionManager;
 
     fn establish(database_url: &str) -> ConnectionResult<Self> {
-        C::establish(database_url).map(|inner| Self { inner })
+        C::establish(database_url).map(Self::from_inner)
     }
 
     fn execute_returning_count<T>(&mut self, source: &T) -> QueryResult<usize>
@@ -189,13 +225,15 @@ where
         T: Query + QueryFragment<Self::Backend> + QueryId + 'query,
         Self::Backend: diesel::expression::QueryMetadata<T::SqlType>,
     {
-        // Render the statement key BEFORE executing (the source is consumed by
-        // the inner load). Same rendering function the boundary uses for its
-        // `sql` argument, so the two sides join exactly (modulo the
-        // `first()`-applied LIMIT, normalized inside wire_capture).
-        let sql = capture_is_active().then(|| diesel::debug_query::<Pg, _>(&source).to_string());
+        // Where this statement's capture goes. Cloned out of the connection
+        // BEFORE the load borrows it mutably — the cursor holds `&'conn mut
+        // self` for its whole life and so cannot borrow a field of the
+        // connection; the slot is an `Arc` for exactly this reason.
+        let slot = capture_is_active()
+            .then(|| self.wire_slot.clone())
+            .flatten();
         let inner = self.inner.load(source)?;
-        Ok(DejaCursor::new(inner, sql, capture_wire_row))
+        Ok(DejaCursor::new(inner, slot, capture_wire_row))
     }
 }
 
@@ -239,30 +277,30 @@ where
 }
 
 struct CursorCapture<R> {
-    sql: String,
+    slot: Arc<WireSlot>,
     rows: Vec<WireRow>,
     /// Set when any row could not be captured faithfully (a mid-stream load
     /// error, an unreadable row). A poisoned capture is discarded wholesale —
-    /// publishing a subset would pair wrong wire rows with serde rows.
+    /// storing a subset would pair wrong wire rows with serde rows.
     poisoned: bool,
     extract: fn(&R) -> Option<WireRow>,
 }
 
 /// Pass-through cursor teeing each yielded row into a [`CursorCapture`]. On
 /// drop — i.e. once the result set has been handed to the application, still
-/// inside the blocking closure that ran the load — the capture is published
-/// for the enclosing boundary to take.
+/// inside the blocking closure that ran the load — the capture is put into the
+/// connection's slot for the enclosing boundary to take.
 pub struct DejaCursor<I, R> {
     inner: I,
     capture: Option<CursorCapture<R>>,
 }
 
 impl<I, R> DejaCursor<I, R> {
-    fn new(inner: I, sql: Option<String>, extract: fn(&R) -> Option<WireRow>) -> Self {
+    fn new(inner: I, slot: Option<Arc<WireSlot>>, extract: fn(&R) -> Option<WireRow>) -> Self {
         Self {
             inner,
-            capture: sql.map(|sql| CursorCapture {
-                sql,
+            capture: slot.map(|slot| CursorCapture {
+                slot,
                 rows: Vec::new(),
                 poisoned: false,
                 extract,
@@ -301,7 +339,7 @@ impl<I, R> Drop for DejaCursor<I, R> {
     fn drop(&mut self) {
         if let Some(capture) = self.capture.take() {
             if !capture.poisoned && !capture.rows.is_empty() {
-                wire_capture::publish_captured_wire_rows(&capture.sql, capture.rows);
+                capture.slot.put(capture.rows);
             }
         }
     }
@@ -460,21 +498,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Cursor tee semantics, against the process-global registry.
+    // Cursor tee semantics, against the connection's own slot. No process
+    // state is involved, so these tests cannot interfere with each other.
     // -----------------------------------------------------------------
 
     fn cursor_with_capture(
         items: Vec<QueryResult<FakeRow>>,
-        sql: Option<&str>,
+        slot: Option<Arc<WireSlot>>,
     ) -> DejaCursor<std::vec::IntoIter<QueryResult<FakeRow>>, FakeRow> {
-        DejaCursor::new(items.into_iter(), sql.map(str::to_string), |row| {
-            capture_wire_row(row)
-        })
+        DejaCursor::new(items.into_iter(), slot, capture_wire_row)
     }
 
     #[test]
-    fn cursor_publishes_captured_rows_on_drop() {
-        let sql = r#"SELECT "w_pub"."a" FROM "w_pub" -- binds: []"#;
+    fn cursor_puts_captured_rows_in_the_slot_on_drop() {
+        let slot = WireSlot::new_shared();
         let cursor = cursor_with_capture(
             vec![
                 Ok(FakeRow {
@@ -484,32 +521,31 @@ mod tests {
                     columns: vec![varchar_column("a", "two")],
                 }),
             ],
-            Some(sql),
+            Some(Arc::clone(&slot)),
         );
         let yielded: Vec<_> = cursor.collect();
         assert_eq!(yielded.len(), 2, "rows pass through untouched");
-        let taken = wire_capture::take_captured_wire_rows(sql).expect("published on drop");
+        let taken = slot.take().expect("put on drop");
         assert_eq!(taken.len(), 2);
         assert_eq!(taken[0].columns[0].bytes.as_deref(), Some(b"one".as_ref()));
         assert_eq!(taken[1].columns[0].bytes.as_deref(), Some(b"two".as_ref()));
     }
 
     #[test]
-    fn cursor_without_capture_publishes_nothing() {
-        let sql = r#"SELECT "w_off"."a" FROM "w_off" -- binds: []"#;
+    fn cursor_without_a_slot_captures_nothing() {
         let cursor = cursor_with_capture(
             vec![Ok(FakeRow {
                 columns: vec![varchar_column("a", "one")],
             })],
             None,
         );
-        let _ = cursor.count();
-        assert!(wire_capture::take_captured_wire_rows(sql).is_none());
+        let yielded: Vec<_> = cursor.collect();
+        assert_eq!(yielded.len(), 1, "rows still pass through");
     }
 
     #[test]
     fn mid_stream_error_poisons_the_capture() {
-        let sql = r#"SELECT "w_err"."a" FROM "w_err" -- binds: []"#;
+        let slot = WireSlot::new_shared();
         let cursor = cursor_with_capture(
             vec![
                 Ok(FakeRow {
@@ -517,26 +553,26 @@ mod tests {
                 }),
                 Err(diesel::result::Error::BrokenTransactionManager),
             ],
-            Some(sql),
+            Some(Arc::clone(&slot)),
         );
         let _ = cursor.count();
         assert!(
-            wire_capture::take_captured_wire_rows(sql).is_none(),
-            "a partial capture must be discarded, not published"
+            slot.take().is_none(),
+            "a partial capture must be discarded, not stored"
         );
     }
 
     #[test]
-    fn empty_result_publishes_nothing() {
-        let sql = r#"SELECT "w_empty"."a" FROM "w_empty" -- binds: []"#;
-        let cursor = cursor_with_capture(Vec::new(), Some(sql));
+    fn empty_result_leaves_the_slot_empty() {
+        let slot = WireSlot::new_shared();
+        let cursor = cursor_with_capture(Vec::new(), Some(Arc::clone(&slot)));
         let _ = cursor.count();
-        assert!(wire_capture::take_captured_wire_rows(sql).is_none());
+        assert!(slot.take().is_none());
     }
 
     #[test]
-    fn partial_drain_publishes_the_consumed_prefix() {
-        let sql = r#"SELECT "w_part"."a" FROM "w_part" -- binds: []"#;
+    fn partial_drain_captures_the_consumed_prefix() {
+        let slot = WireSlot::new_shared();
         let mut cursor = cursor_with_capture(
             vec![
                 Ok(FakeRow {
@@ -546,16 +582,40 @@ mod tests {
                     columns: vec![varchar_column("a", "two")],
                 }),
             ],
-            Some(sql),
+            Some(Arc::clone(&slot)),
         );
         let first = cursor.next();
         assert!(first.is_some());
         drop(cursor);
-        let taken = wire_capture::take_captured_wire_rows(sql).expect("prefix published");
+        let taken = slot.take().expect("prefix captured");
         assert_eq!(
             taken.len(),
             1,
             "only rows the application consumed are captured — matching what serde saw"
+        );
+    }
+
+    #[test]
+    fn a_second_statement_on_the_same_connection_replaces_an_unclaimed_capture() {
+        // One connection, two statements, nobody taking in between: the slot
+        // holds the LATEST capture. This is the whole eviction question, and
+        // the answer is now local to the connection — there is no shared queue
+        // for unrelated traffic to overflow.
+        let slot = WireSlot::new_shared();
+        for value in ["first", "second"] {
+            let cursor = cursor_with_capture(
+                vec![Ok(FakeRow {
+                    columns: vec![varchar_column("a", value)],
+                })],
+                Some(Arc::clone(&slot)),
+            );
+            let _ = cursor.count();
+        }
+        let taken = slot.take().expect("a capture is present");
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            taken[0].columns[0].bytes.as_deref(),
+            Some(b"second".as_ref())
         );
     }
 }

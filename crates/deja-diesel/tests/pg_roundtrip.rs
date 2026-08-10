@@ -11,7 +11,8 @@
 //! ```
 
 use deja_diesel::DejaLoadConnection;
-use deja_runtime::{wire_capture, RecordingHook, RuntimeHook};
+use deja_runtime::wire_capture::{self, WireSlot};
+use deja_runtime::{RecordingHook, RuntimeHook};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Nullable, Text};
@@ -44,19 +45,26 @@ fn wrapper_captures_binary_wire_values_from_a_real_result() {
     let mut conn =
         DejaLoadConnection::<PgConnection>::establish(&url).expect("establish through wrapper");
 
+    // What a host does at checkout: one slot, installed on the connection and
+    // registered as the current one for the work that follows.
+    let slot = WireSlot::new_shared();
+    conn.install_wire_slot(Arc::clone(&slot));
+
     let query = diesel::sql_query(
         "SELECT 'poison'::varchar AS label, 42::int8 AS amount, NULL::text AS missing",
     );
-    let sql = diesel::debug_query::<diesel::pg::Pg, _>(&query).to_string();
 
-    let rows: Vec<WireProbe> = query.load(&mut conn).expect("load through wrapper");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].label, "poison");
-    assert_eq!(rows[0].amount, 42);
-    assert!(rows[0].missing.is_none());
-
-    let captured = wire_capture::take_captured_wire_rows(&sql)
-        .expect("wrapper published the result's wire rows");
+    let captured = wire_capture::scope_sync(|| {
+        assert!(wire_capture::set_current_slot(Arc::clone(&slot)));
+        let rows: Vec<WireProbe> = query.load(&mut conn).expect("load through wrapper");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "poison");
+        assert_eq!(rows[0].amount, 42);
+        assert!(rows[0].missing.is_none());
+        // The boundary's side of the handoff: no statement text involved.
+        wire_capture::take_current_rows()
+    })
+    .expect("the wrapper captured the result's wire rows");
     assert_eq!(captured.len(), 1);
     let columns = &captured[0].columns;
     assert_eq!(columns.len(), 3);

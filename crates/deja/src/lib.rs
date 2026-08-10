@@ -91,6 +91,50 @@ pub use deja_runtime::{
 #[cfg(feature = "diesel-pg")]
 pub use deja_diesel::DejaLoadConnection;
 
+/// The wire-capture handoff types (issue #50): a captured physical row image
+/// travels from the connection that produced it to the boundary that records it
+/// through a slot ON that connection, never a shared queue. Feature-independent
+/// — a host wires the slot through here even when it does not compile the diesel
+/// wrapper itself.
+pub use deja_runtime::wire_capture::{WireCaptureCounts, WireSlot};
+
+/// A fresh, empty capture slot. The host creates one per connection checkout,
+/// installs one `Arc` on the connection (`DejaLoadConnection::install_wire_slot`,
+/// inside the `conn.run` closure where `&mut` on the wrapped connection is
+/// available) and registers the other as the task's current slot
+/// ([`set_current_wire_slot`]).
+#[must_use]
+pub fn new_wire_slot() -> std::sync::Arc<WireSlot> {
+    WireSlot::new_shared()
+}
+
+/// Establish the per-task carrier for the current capture slot around one unit
+/// of work — a request, in a host. Wrap the request future ONCE, at ingress:
+/// [`set_current_wire_slot`] has nowhere to put the handle outside this scope,
+/// and reports that as a wiring defect
+/// ([`WireCaptureCounts::installs_without_scope`]).
+pub fn wire_capture_scope<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    deja_runtime::wire_capture::scope(future)
+}
+
+/// Register `slot` as the capture slot for the work running now, so the db
+/// boundaries that follow attach what this connection captures. Returns `false`
+/// when no [`wire_capture_scope`] is established around the caller.
+pub fn set_current_wire_slot(slot: std::sync::Arc<WireSlot>) -> bool {
+    deja_runtime::wire_capture::set_current_slot(slot)
+}
+
+/// The wire-capture handoff's counters: captures put, taken, overwritten
+/// unclaimed, takes that found no slot, installs that found no scope. Read as a
+/// delta across a run — a coverage regression in this handoff is otherwise
+/// invisible, which is how it went unnoticed once already.
+#[must_use]
+pub fn wire_capture_counts() -> WireCaptureCounts {
+    deja_runtime::wire_capture::counts()
+}
+
 /// The deja library version, for sinks that stamp provenance on the wire
 /// (the recording envelope's `code.deja_version`).
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1448,11 +1492,14 @@ pub mod db {
         let ok_value = (!is_error)
             .then(|| envelope.get("value").cloned())
             .flatten();
-        // Take this statement's wrapper-captured physical wire rows (if a
-        // `deja-diesel` connection wrapper is in the stack) UNCONDITIONALLY —
-        // an Err result must still clear its parked capture. See
-        // `deja_runtime::wire_capture` for the handoff contract.
-        let wire_rows = deja_runtime::wire_capture::take_captured_wire_rows(sql);
+        // Take the physical wire rows captured by the connection this statement
+        // ran on (if a `deja-diesel` wrapper is in the stack with a slot
+        // installed) UNCONDITIONALLY — an Err result must still empty the slot,
+        // or its capture would be attached to the NEXT statement's event. The
+        // handoff no longer uses `sql`: the capture is found through the slot
+        // the request installed, not by matching statement text. See
+        // `deja_runtime::wire_capture` for the contract.
+        let wire_rows = deja_runtime::wire_capture::take_current_rows();
         let mut output = crate::RecordedOutput::new(envelope, is_error);
 
         // Row-exact keys from rows the result actually carried.
