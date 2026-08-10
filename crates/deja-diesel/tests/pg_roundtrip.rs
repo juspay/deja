@@ -2,6 +2,9 @@
 //! wrapper satisfies diesel's connection stack against the real backend and
 //! captures verbatim binary wire values under `DefaultLoadingMode` (the mode
 //! async-bb8-diesel drives — its `load_async` calls `RunQueryDsl::load`).
+//! Nothing is installed and no scope is established: the connection owns its
+//! capture, and `take_captured_rows` right after the load is the whole
+//! handoff.
 //!
 //! Ignored by default: needs a reachable database. Run with
 //!
@@ -11,7 +14,6 @@
 //! ```
 
 use deja_diesel::DejaLoadConnection;
-use deja_runtime::wire_capture::{self, WireSlot};
 use deja_runtime::{RecordingHook, RuntimeHook};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
@@ -45,26 +47,20 @@ fn wrapper_captures_binary_wire_values_from_a_real_result() {
     let mut conn =
         DejaLoadConnection::<PgConnection>::establish(&url).expect("establish through wrapper");
 
-    // What a host does at checkout: one slot, installed on the connection and
-    // registered as the current one for the work that follows.
-    let slot = WireSlot::new_shared();
-    conn.install_wire_slot(Arc::clone(&slot));
-
     let query = diesel::sql_query(
         "SELECT 'poison'::varchar AS label, 42::int8 AS amount, NULL::text AS missing",
     );
 
-    let captured = wire_capture::scope_sync(|| {
-        assert!(wire_capture::set_current_slot(Arc::clone(&slot)));
-        let rows: Vec<WireProbe> = query.load(&mut conn).expect("load through wrapper");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "poison");
-        assert_eq!(rows[0].amount, 42);
-        assert!(rows[0].missing.is_none());
-        // The boundary's side of the handoff: no statement text involved.
-        wire_capture::take_current_rows()
-    })
-    .expect("the wrapper captured the result's wire rows");
+    let rows: Vec<WireProbe> = query.load(&mut conn).expect("load through wrapper");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "poison");
+    assert_eq!(rows[0].amount, 42);
+    assert!(rows[0].missing.is_none());
+
+    // The whole handoff: take from the connection that just ran the load.
+    let captured = conn
+        .take_captured_rows()
+        .expect("the wrapper captured the result's wire rows");
     assert_eq!(captured.len(), 1);
     let columns = &captured[0].columns;
     assert_eq!(columns.len(), 3);
@@ -85,6 +81,9 @@ fn wrapper_captures_binary_wire_values_from_a_real_result() {
     // SQL NULL: no bytes, no OID.
     assert_eq!(columns[2].name, "missing");
     assert_eq!(columns[2].bytes, None);
+
+    // A take consumes: the next take has nothing until the next load.
+    assert!(conn.take_captured_rows().is_none());
 }
 
 /// The wrapper must be transparent for diesel's pg metadata lookup, not just

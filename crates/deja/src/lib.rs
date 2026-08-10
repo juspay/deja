@@ -86,54 +86,14 @@ pub use deja_runtime::{
 
 /// Re-export the diesel connection wrapper that captures result rows' binary
 /// wire values for wire-faithful DB seeding (issue #35). The vendor swap is
-/// one type change at pool construction:
-/// `async_bb8_diesel::ConnectionManager<deja::DejaLoadConnection<PgConnection>>`.
+/// one type change at pool construction
+/// (`async_bb8_diesel::ConnectionManager<deja::DejaLoadConnection<PgConnection>>`)
+/// plus calling the paired query helpers ([`db::get_result_captured`] and
+/// friends) at result-returning sites. There is nothing else to wire: no slot
+/// to install per checkout, no scope to wrap around a request — the capture
+/// rides the query's own return path.
 #[cfg(feature = "diesel-pg")]
 pub use deja_diesel::DejaLoadConnection;
-
-/// The wire-capture handoff types (issue #50): a captured physical row image
-/// travels from the connection that produced it to the boundary that records it
-/// through a slot ON that connection, never a shared queue. Feature-independent
-/// — a host wires the slot through here even when it does not compile the diesel
-/// wrapper itself.
-pub use deja_runtime::wire_capture::{WireCaptureCounts, WireSlot};
-
-/// A fresh, empty capture slot. The host creates one per connection checkout,
-/// installs one `Arc` on the connection (`DejaLoadConnection::install_wire_slot`,
-/// inside the `conn.run` closure where `&mut` on the wrapped connection is
-/// available) and registers the other as the task's current slot
-/// ([`set_current_wire_slot`]).
-#[must_use]
-pub fn new_wire_slot() -> std::sync::Arc<WireSlot> {
-    WireSlot::new_shared()
-}
-
-/// Establish the per-task carrier for the current capture slot around one unit
-/// of work — a request, in a host. Wrap the request future ONCE, at ingress:
-/// [`set_current_wire_slot`] has nowhere to put the handle outside this scope,
-/// and reports that as a wiring defect
-/// ([`WireCaptureCounts::installs_without_scope`]).
-pub fn wire_capture_scope<F: std::future::Future>(
-    future: F,
-) -> impl std::future::Future<Output = F::Output> {
-    deja_runtime::wire_capture::scope(future)
-}
-
-/// Register `slot` as the capture slot for the work running now, so the db
-/// boundaries that follow attach what this connection captures. Returns `false`
-/// when no [`wire_capture_scope`] is established around the caller.
-pub fn set_current_wire_slot(slot: std::sync::Arc<WireSlot>) -> bool {
-    deja_runtime::wire_capture::set_current_slot(slot)
-}
-
-/// The wire-capture handoff's counters: captures put, taken, overwritten
-/// unclaimed, takes that found no slot, installs that found no scope. Read as a
-/// delta across a run — a coverage regression in this handoff is otherwise
-/// invisible, which is how it went unnoticed once already.
-#[must_use]
-pub fn wire_capture_counts() -> WireCaptureCounts {
-    deja_runtime::wire_capture::counts()
-}
 
 /// The deja library version, for sinks that stamp provenance on the wire
 /// (the recording envelope's `code.deja_version`).
@@ -1024,6 +984,32 @@ pub mod codec {
             }
         }
     }
+
+    /// Codec adapter for boundaries whose return value is the IN-BAND
+    /// wire-capture pair `(value, Option<Vec<WireRow>>)` — a db query result
+    /// carrying the physical rows its own connection captured
+    /// (`deja::db::get_result_captured` and friends). The tape shape is the
+    /// inner codec's, unchanged: the wire rows travel on the event's row image
+    /// (attached by `deja::db::recorded_output_with_wire`), never in the
+    /// result envelope. Substitution reconstructs the inner value with `None`
+    /// wire rows — a physical image is a record-side artifact, meaningless to
+    /// fabricate on replay.
+    pub struct WithWireCodec<C>(PhantomData<fn() -> C>);
+
+    impl<C> ReplayCodec for WithWireCodec<C>
+    where
+        C: ReplayCodec,
+    {
+        type Value = (C::Value, Option<Vec<crate::db::WireRow>>);
+
+        fn capture(value: &Self::Value) -> (serde_json::Value, bool) {
+            C::capture(&value.0)
+        }
+
+        fn reconstruct(recorded: serde_json::Value) -> Option<Self::Value> {
+            C::reconstruct(recorded).map(|value| (value, None))
+        }
+    }
 }
 
 /// Helpers for HTTP request/response boundary payloads.
@@ -1068,6 +1054,22 @@ pub mod http {
 /// Helpers for database boundary payloads.
 pub mod db {
     use std::{collections::HashMap, fmt::Debug};
+
+    /// The wire-capture value types: one captured result row / column, binary
+    /// wire bytes + type OID verbatim. Produced by the `deja-diesel` wrapper,
+    /// carried to the boundary IN-BAND as the second half of the pair the
+    /// captured query helpers return.
+    pub use deja_runtime::wire_capture::{WireColumn, WireRow};
+
+    /// The in-band captured query helpers: each runs the query through
+    /// async-bb8-diesel's `run` closure and takes the wire rows from the SAME
+    /// connection in the SAME lexical scope, returning `(result, wire rows)`.
+    /// The pair rides the future to the boundary — no ambient state pairs a
+    /// capture with a statement, so misattachment is unrepresentable. Call
+    /// these instead of `get_result_async` / `get_results_async` /
+    /// `first_async` at result-returning sites on an instrumented pool.
+    #[cfg(feature = "diesel-pg")]
+    pub use deja_diesel::{first_captured, get_result_captured, get_results_captured};
 
     /// Build the database request payload common to Diesel helpers. Borrows
     /// its inputs so boundary-attribute exprs can evaluate it eagerly while the
@@ -1300,7 +1302,7 @@ pub mod db {
     }
 
     /// Attach wrapper-captured physical wire rows
-    /// ([`deja_runtime::wire_capture::WireRow`]) to the serde row images and
+    /// ([`WireRow`]) to the serde row images and
     /// render the compact event image payload. This is the producer side of
     /// the two-representation split: the serde value stays the semantic
     /// record; each column additionally carries its verbatim binary wire
@@ -1324,7 +1326,7 @@ pub mod db {
     pub fn row_image_payload_with_wire(
         table: &str,
         value: &serde_json::Value,
-        wire_rows: &[deja_runtime::wire_capture::WireRow],
+        wire_rows: &[WireRow],
     ) -> Option<serde_json::Value> {
         let mut images = row_images_with_metadata(table, value, &[]);
         if images.is_empty() {
@@ -1348,10 +1350,7 @@ pub mod db {
 
     /// Validate the serde-row ↔ wire-row pairing described on
     /// [`row_image_payload_with_wire`]. Pure check, attaches nothing.
-    fn wire_join_is_sound(
-        images: &[DbRowImage],
-        wire_rows: &[deja_runtime::wire_capture::WireRow],
-    ) -> bool {
+    fn wire_join_is_sound(images: &[DbRowImage], wire_rows: &[WireRow]) -> bool {
         images.iter().zip(wire_rows).all(|(image, wire_row)| {
             image.columns.iter().all(|column| {
                 let mut matches = wire_row
@@ -1369,7 +1368,7 @@ pub mod db {
         })
     }
 
-    fn attach_wire_row(image: &mut DbRowImage, wire_row: &deja_runtime::wire_capture::WireRow) {
+    fn attach_wire_row(image: &mut DbRowImage, wire_row: &WireRow) {
         for column in &mut image.columns {
             // Soundness was checked: exactly one wire column matches.
             if let Some(wire) = wire_row
@@ -1474,6 +1473,12 @@ pub mod db {
     /// producer, and improving its derivation (e.g. the binds parser) is a
     /// deja-side change needing no vendor edit.
     ///
+    /// Attaches NO physical wire image: use this for writes, scalar results,
+    /// and any path without an in-band capture. A result-returning read whose
+    /// query ran through the captured helpers hands its wire rows to
+    /// [`recorded_output_with_wire`] instead — there is no ambient channel a
+    /// capture could arrive through.
+    ///
     /// Requires the `error-stack` cargo feature.
     #[cfg(feature = "error-stack")]
     pub fn recorded_output<T, E>(
@@ -1486,20 +1491,38 @@ pub mod db {
         T: serde::Serialize + serde::de::DeserializeOwned,
         E: serde::Serialize + serde::de::DeserializeOwned + error_stack::Context,
     {
+        recorded_output_with_wire(axis, table, sql, result, None)
+    }
+
+    /// [`recorded_output`] with the physical wire rows the query's own
+    /// connection captured, passed IN-BAND by the caller: the boundary fn
+    /// returns the `(result, wire)` pair the captured query helpers produce
+    /// (`get_result_captured` and friends), and its `result = …` expression
+    /// hands both halves here. The rows are attached to the serde row images
+    /// via the same validated join as ever
+    /// ([`row_image_payload_with_wire`]) — an unjoinable capture is dropped,
+    /// never misattached — and `wire: None` yields exactly
+    /// [`recorded_output`]'s payload.
+    ///
+    /// Requires the `error-stack` cargo feature.
+    #[cfg(feature = "error-stack")]
+    pub fn recorded_output_with_wire<T, E>(
+        axis: StateAxis,
+        table: &str,
+        sql: &str,
+        result: &Result<T, error_stack::Report<E>>,
+        wire: Option<&[WireRow]>,
+    ) -> crate::RecordedOutput
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        E: serde::Serialize + serde::de::DeserializeOwned + error_stack::Context,
+    {
         use crate::codec::{ReplayCodec, ResultCodec};
 
         let (envelope, is_error) = ResultCodec::<T, E>::capture(result);
         let ok_value = (!is_error)
             .then(|| envelope.get("value").cloned())
             .flatten();
-        // Take the physical wire rows captured by the connection this statement
-        // ran on (if a `deja-diesel` wrapper is in the stack with a slot
-        // installed) UNCONDITIONALLY — an Err result must still empty the slot,
-        // or its capture would be attached to the NEXT statement's event. The
-        // handoff no longer uses `sql`: the capture is found through the slot
-        // the request installed, not by matching statement text. See
-        // `deja_runtime::wire_capture` for the contract.
-        let wire_rows = deja_runtime::wire_capture::take_current_rows();
         let mut output = crate::RecordedOutput::new(envelope, is_error);
 
         // Row-exact keys from rows the result actually carried.
@@ -1527,7 +1550,7 @@ pub mod db {
         }
 
         if let Some(value) = ok_value {
-            let image = match &wire_rows {
+            let image = match wire {
                 Some(rows) => row_image_payload_with_wire(table, &value, rows),
                 None => row_image_payload(table, &value),
             };

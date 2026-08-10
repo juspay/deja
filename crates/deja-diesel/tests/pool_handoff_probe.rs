@@ -1,17 +1,17 @@
-//! Does the wire-capture handoff survive the execution stack hyperswitch
-//! actually uses? The round-trip test drives a BARE `DejaLoadConnection`.
-//! Production instead goes through `async-bb8-diesel` over a `bb8` pool
-//! (`query.get_result_async(conn)` → `asc.run(|c| self.get_result(c))` on a
-//! `spawn_blocking` thread), and the boundary takes the capture LATER, on the
-//! async task. That crossing is what a real recording exercises, and a run
-//! against the deployed recorder produced ZERO physical row images while the
-//! serde path worked normally.
+//! Does the in-band pairing survive the execution stack hyperswitch actually
+//! uses? Production drives diesel through `async-bb8-diesel` over a `bb8`
+//! pool: the query runs inside `conn.run(|c| …)` on a `spawn_blocking`
+//! thread. The captured helpers take the wire rows in that SAME closure and
+//! return them paired with the result — these tests pin that the pair
+//! arrives intact on the async side, through the real pool, and that each
+//! concurrent request's pair carries its own rows by construction.
 //!
-//! With the capture slot living on the connection, the crossing is exactly
-//! what these tests must pin: the cursor puts through an `Arc` on a blocking
-//! thread, the boundary takes through the async task's current slot, and the
-//! two are the same slot because the checkout installed both halves. The
-//! checkout sequence below is the one the vendor hook performs.
+//! Two ambient predecessors of this handoff passed their tests and failed in
+//! production (a keyed global queue: evicted under load; a per-checkout slot
+//! handle in a task-local scope: zero captures in the deployed router). The
+//! in-band pair has no ambient half to go wrong, and the concurrency test
+//! below asserts the pairing on CONTENT — each pair's wire bytes must decode
+//! to the very result they rode with — not merely on presence.
 //!
 //! Ignored by default; needs a scratch database:
 //!
@@ -20,17 +20,15 @@
 //!     cargo test -p deja-diesel --test pool_handoff_probe -- --ignored --nocapture
 //! ```
 
-use deja_diesel::DejaLoadConnection;
-use deja_runtime::wire_capture::{self, WireSlot};
+use deja_diesel::{get_result_captured, get_results_captured, DejaLoadConnection};
 use deja_runtime::{RecordingHook, RuntimeHook};
 use diesel::pg::PgConnection;
-use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
+use diesel::QueryableByName;
 use std::sync::Arc;
 
 type DejaPgConnection = DejaLoadConnection<PgConnection>;
-type PooledDejaConnection =
-    bb8::PooledConnection<'static, async_bb8_diesel::ConnectionManager<DejaPgConnection>>;
+type DejaPool = bb8::Pool<async_bb8_diesel::ConnectionManager<DejaPgConnection>>;
 
 #[derive(QueryableByName, Debug)]
 struct Row {
@@ -38,6 +36,12 @@ struct Row {
     label: String,
     #[diesel(sql_type = BigInt)]
     amount: i64,
+}
+
+#[derive(QueryableByName, Debug)]
+struct PidRow {
+    #[diesel(sql_type = BigInt)]
+    pid: i64,
 }
 
 fn open_gate() {
@@ -52,10 +56,7 @@ fn open_gate() {
     );
 }
 
-async fn pool(
-    url: String,
-    size: u32,
-) -> bb8::Pool<async_bb8_diesel::ConnectionManager<DejaPgConnection>> {
+async fn pool(url: String, size: u32) -> DejaPool {
     let manager = async_bb8_diesel::ConnectionManager::<DejaPgConnection>::new(url);
     bb8::Pool::builder()
         .max_size(size)
@@ -64,79 +65,63 @@ async fn pool(
         .expect("pool")
 }
 
-/// The vendor's checkout hook, verbatim in shape: create one slot, install it
-/// on the leased connection inside `conn.run` (the only place `&mut` on the
-/// wrapped connection is reachable), and register the same slot as the current
-/// one for the async task that will run the boundary.
-async fn checkout_and_install(
-    pool: &bb8::Pool<async_bb8_diesel::ConnectionManager<DejaPgConnection>>,
-) -> PooledDejaConnection {
-    use async_bb8_diesel::AsyncConnection;
-    let conn = pool.get_owned().await.expect("checkout");
-    let slot = WireSlot::new_shared();
-    let for_connection = Arc::clone(&slot);
-    conn.run(move |c| {
-        c.install_wire_slot(for_connection);
-        Ok::<(), diesel::result::Error>(())
-    })
-    .await
-    .expect("install the slot on the leased connection");
-    assert!(
-        wire_capture::set_current_slot(slot),
-        "the request must be inside a wire-capture scope"
-    );
-    conn
+fn wire_bytes<'a>(
+    rows: &'a [deja_runtime::wire_capture::WireRow],
+    column: &str,
+) -> Option<&'a [u8]> {
+    rows.first()?
+        .columns
+        .iter()
+        .find(|c| c.name == column)?
+        .bytes
+        .as_deref()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a reachable postgres; set DEJA_DIESEL_TEST_DATABASE_URL"]
-async fn the_handoff_survives_the_pool_and_the_blocking_thread() {
+async fn the_pair_survives_the_pool_and_the_blocking_thread() {
     let url = std::env::var("DEJA_DIESEL_TEST_DATABASE_URL")
         .expect("DEJA_DIESEL_TEST_DATABASE_URL must point at a scratch database");
     open_gate();
 
     // The production stack: bb8 pool of async-bb8-diesel connections whose
-    // inner diesel connection is the deja wrapper.
+    // inner diesel connection is the deja wrapper. Nothing is installed at
+    // checkout; the helper pairs inside the run closure.
     let pool = pool(url, 2).await;
+    let conn = pool.get().await.expect("checkout");
 
-    wire_capture::scope(async move {
-        let conn = checkout_and_install(&pool).await;
+    let query = diesel::sql_query("SELECT 'poison'::varchar AS label, 42::int8 AS amount");
+    let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+    let row = result.expect("get_result");
+    assert_eq!(row.label, "poison");
+    assert_eq!(row.amount, 42);
 
-        use async_bb8_diesel::AsyncRunQueryDsl;
-        let query = diesel::sql_query("SELECT 'poison'::varchar AS label, 42::int8 AS amount");
-        let row: Row = query
-            .get_result_async(&*conn)
-            .await
-            .expect("get_result_async");
-        assert_eq!(row.label, "poison");
-        assert_eq!(row.amount, 42);
-
-        // The boundary's take, on the async task, after the blocking thread put.
-        let captured = wire_capture::take_current_rows();
-        match &captured {
-            Some(rows) => println!(
-                "PROBE TAKE OK: {} row(s), {} column(s)",
-                rows.len(),
-                rows[0].columns.len()
-            ),
-            None => println!("PROBE TAKE FAILED: the task's slot was empty"),
-        }
-        assert!(
-            captured.is_some(),
-            "the pool path must carry a capture the boundary can take — this is \
-             the crossing production exercises"
-        );
-    })
-    .await;
+    let wire = wire.expect(
+        "the pair must carry the capture across the pool and the blocking \
+         thread — this is the crossing production exercises",
+    );
+    println!(
+        "PROBE PAIR OK: {} row(s), {} column(s)",
+        wire.len(),
+        wire[0].columns.len()
+    );
+    assert_eq!(wire_bytes(&wire, "label"), Some(b"poison".as_ref()));
+    assert_eq!(
+        wire_bytes(&wire, "amount"),
+        Some(42i64.to_be_bytes().as_ref()),
+        "int8 arrives as 8-byte big-endian binary — the seeding representation"
+    );
 }
 
-/// The collision the old query-text join admitted by design: the same statement,
-/// byte-identical, executed concurrently by four requests. Each request now has
-/// its own slot on its own connection, so each takes its own rows and no take
-/// can reach another request's capture.
+/// The collision the old query-text join admitted by design, and the pairing
+/// the task-local design could only promise: the same statement,
+/// byte-identical, executed concurrently by four requests. The statement
+/// returns per-connection state (`pg_backend_pid()`), so each pair's wire
+/// bytes must decode to the SAME pid its own serde result carries — pairing
+/// asserted on content, not presence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a reachable postgres; set DEJA_DIESEL_TEST_DATABASE_URL"]
-async fn concurrent_identical_statements_each_take_their_own_capture() {
+async fn concurrent_identical_statements_each_pair_with_their_own_rows() {
     let url = std::env::var("DEJA_DIESEL_TEST_DATABASE_URL")
         .expect("DEJA_DIESEL_TEST_DATABASE_URL must point at a scratch database");
     open_gate();
@@ -146,25 +131,78 @@ async fn concurrent_identical_statements_each_take_their_own_capture() {
     let mut handles = Vec::new();
     for request in 0..4 {
         let pool = pool.clone();
-        handles.push(tokio::spawn(wire_capture::scope(async move {
-            use async_bb8_diesel::AsyncRunQueryDsl;
-            let conn = checkout_and_install(&pool).await;
+        handles.push(tokio::spawn(async move {
+            let conn = pool.get().await.expect("checkout");
             // Byte-identical across all four requests, binds included.
-            let query = diesel::sql_query("SELECT 'poison'::varchar AS label, 42::int8 AS amount");
-            let _: Row = query.get_result_async(&*conn).await.expect("query");
-            let captured = wire_capture::take_current_rows();
+            let query = diesel::sql_query("SELECT pg_backend_pid()::int8 AS pid");
+            let (result, wire) = get_result_captured::<PgConnection, _, PidRow>(&conn, query).await;
+            let row = result.expect("query");
+            let wire = wire.expect("each request's pair carries a capture");
+            let captured_pid = wire_bytes(&wire, "pid").expect("pid bytes captured");
             println!(
-                "PROBE request {request}: {}",
-                if captured.is_some() { "HIT" } else { "MISS" }
+                "PROBE request {request}: pid {} / wire {:?}",
+                row.pid, captured_pid
             );
-            captured.is_some()
-        })));
+            assert_eq!(
+                captured_pid,
+                row.pid.to_be_bytes().as_ref(),
+                "the wire rows must belong to the very result they rode with"
+            );
+        }));
     }
     for handle in handles {
-        assert!(
-            handle.await.expect("join"),
-            "every concurrent request must take its OWN capture — identical \
-             statement text is no longer part of the handoff"
-        );
+        handle.await.expect("join");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a reachable postgres; set DEJA_DIESEL_TEST_DATABASE_URL"]
+async fn zero_rows_yield_no_wire() {
+    let url = std::env::var("DEJA_DIESEL_TEST_DATABASE_URL")
+        .expect("DEJA_DIESEL_TEST_DATABASE_URL must point at a scratch database");
+    open_gate();
+
+    let pool = pool(url, 1).await;
+    let conn = pool.get().await.expect("checkout");
+
+    let query = diesel::sql_query("SELECT 'x'::varchar AS label, 1::int8 AS amount WHERE false");
+    let (result, wire) = get_results_captured::<PgConnection, _, Row>(&conn, query).await;
+    assert_eq!(result.expect("empty result set").len(), 0);
+    assert!(
+        wire.is_none(),
+        "no rows, no physical image — the boundary keeps the semantic path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a reachable postgres; set DEJA_DIESEL_TEST_DATABASE_URL"]
+async fn an_err_result_returns_the_pair_without_panicking() {
+    let url = std::env::var("DEJA_DIESEL_TEST_DATABASE_URL")
+        .expect("DEJA_DIESEL_TEST_DATABASE_URL must point at a scratch database");
+    open_gate();
+
+    let pool = pool(url, 1).await;
+    let conn = pool.get().await.expect("checkout");
+
+    // NotFound: get_result over an empty result set.
+    let query = diesel::sql_query("SELECT 'x'::varchar AS label, 1::int8 AS amount WHERE false");
+    let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+    assert!(matches!(result, Err(diesel::result::Error::NotFound)));
+    assert!(wire.is_none());
+
+    // A statement postgres rejects outright: the load fails before any cursor
+    // exists; the pair still comes back, Err plus nothing.
+    let query = diesel::sql_query("SELECT no_such_column FROM no_such_table");
+    let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+    assert!(result.is_err());
+    assert!(wire.is_none());
+
+    // And the connection is still usable for the next captured query.
+    let query = diesel::sql_query("SELECT 'after'::varchar AS label, 7::int8 AS amount");
+    let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+    assert_eq!(result.expect("recovered").label, "after");
+    assert_eq!(
+        wire_bytes(&wire.expect("captured"), "label"),
+        Some(b"after".as_ref())
+    );
 }

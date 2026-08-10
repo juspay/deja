@@ -12,34 +12,28 @@
 //! the wrapped connection; its one addition is a cursor adapter that walks
 //! each row's columns through diesel's generic row API (`Row`/`Field`,
 //! yielding `PgValue::as_bytes()` + `get_oid()`) and puts the captured rows
-//! into the [`WireSlot`] installed on this connection. The row is handed
-//! onward untouched — a pure observer.
+//! into the slot every `DejaLoadConnection` owns. The row is handed onward
+//! untouched — a pure observer.
 //!
-//! The enclosing `#[deja::boundary]` result producer
-//! (`deja::db::recorded_output`) takes the capture from the slot the request
-//! installed and attaches it to the recorded event as the physical row image.
-//! The slot belongs to the connection, not to a shared queue: a connection
-//! executes one statement at a time, so its slot has exactly one occupant and
-//! there is nothing to key, evict, or age out. See
-//! `deja_runtime::wire_capture` for the handoff contract, the measured failure
-//! of the global-registry shape it replaces, and how the boundary finds the
-//! slot across the `spawn_blocking` thread that ran the load.
+//! # The handoff is IN-BAND
 //!
-//! # Installing a slot
+//! The capture leaves the connection through [`take_captured_rows`]
+//! (`DejaLoadConnection::take_captured_rows`), called in the SAME closure that
+//! ran the query, on the same blocking thread, on the same connection — the
+//! async pool helpers below do exactly that and return the query result PAIRED
+//! with its own wire rows. The pair rides the future's value to the enclosing
+//! `#[deja::boundary]`, whose result producer attaches the physical image
+//! (`deja::db::recorded_output_with_wire`). Nothing ambient — no registry, no
+//! task-local, no per-checkout install — connects the two halves; the pairing
+//! is lexical, so cross-statement or cross-request misattachment is
+//! unrepresentable. (Two ambient predecessors of this handoff failed in
+//! production; `deja_runtime::wire_capture` records the history.)
 //!
-//! Capture requires a slot; without one the wrapper is a plain delegating
-//! connection. The host installs one per checkout, where it also has the async
-//! context the boundary will run in:
-//!
-//! ```text
-//! let slot = deja::new_wire_slot();
-//! let for_connection = std::sync::Arc::clone(&slot);
-//! conn.run(move |c| { c.install_wire_slot(for_connection); Ok(()) }).await?;
-//! deja::set_current_wire_slot(slot);
-//! ```
-//!
-//! Every checkout must install, so that a connection handed to a new request
-//! never still points at the previous request's slot.
+//! The slot invariant the wrapper maintains: [`load`](LoadConnection::load)
+//! empties the slot BEFORE executing, and the cursor fills it as the result
+//! streams. A take after a load therefore yields that load's rows or nothing —
+//! never a leftover from an earlier statement on the same (pooled, long-lived)
+//! connection.
 //!
 //! # Adoption
 //!
@@ -54,24 +48,32 @@
 //!     async_bb8_diesel::Connection<DejaLoadConnection<PgConnection>>;
 //! ```
 //!
+//! Result-returning query sites then call [`get_result_captured`] /
+//! [`get_results_captured`] / [`first_captured`] instead of async-bb8-diesel's
+//! `get_result_async` / `get_results_async` / `first_async`, and receive
+//! `(result, wire rows)` instead of `result`.
+//!
 //! The wrapper implements exactly the trait surface that pool stack needs —
 //! [`Connection`], [`LoadConnection`] (generic over the loading mode),
 //! [`SimpleConnection`], and `diesel::r2d2::R2D2Connection` (what
 //! `r2d2::ConnectionManager`/`async_bb8_diesel::ConnectionManager` require) —
 //! not a whole third-party backend.
 //!
-//! # Inertness
+//! # Inertness, and the accepted waste
 //!
 //! Capture is gated on the process-level deja runtime mode, resolved through
 //! the SAME installed hook the boundary macros use
-//! ([`deja_runtime::runtime_mode`]), AND on a slot being installed. The mode
-//! gate is process-level rather than per-correlation by necessity: the load
-//! executes on a blocking-pool thread where the ambient correlation (and with
-//! it the per-request sampling decision) does not exist. Per-request selection
-//! comes from the slot instead — a request nobody installed a slot for
-//! captures nothing at all. With no hook installed (mode Disabled — the
-//! feature-off/observation-off posture) or no slot on the connection, `load`
-//! captures nothing and allocates nothing beyond the wrapped cursor.
+//! ([`deja_runtime::runtime_mode`]). The gate is process-level rather than
+//! per-correlation by necessity: the load executes on a blocking-pool thread
+//! where the ambient correlation (and with it the per-request sampling
+//! decision) does not exist. So while the mode is Record, capture runs for
+//! sampled-out requests too; their rows are taken in the helper and dropped
+//! immediately when the boundary declines to record — bounded, short-lived
+//! waste (one result set's bytes, freed within the same call), the same waste
+//! every earlier shape of this capture paid, now with the simplest possible
+//! lifecycle. With no hook installed (mode Disabled — the
+//! feature-off/observation-off posture), `load` captures nothing and allocates
+//! nothing beyond the wrapped cursor.
 
 use std::sync::Arc;
 
@@ -80,8 +82,9 @@ use diesel::connection::{
 };
 use diesel::pg::{GetPgMetadataCache, Pg, PgMetadataCache};
 use diesel::query_builder::{Query, QueryFragment, QueryId};
+use diesel::query_dsl::methods::{LimitDsl, LoadQuery};
 use diesel::row::{Field as _, Row};
-use diesel::{Connection, ConnectionResult, QueryResult};
+use diesel::{Connection, ConnectionResult, QueryResult, RunQueryDsl};
 
 use deja_runtime::wire_capture::{WireColumn, WireRow, WireSlot};
 
@@ -89,10 +92,12 @@ use deja_runtime::wire_capture::{WireColumn, WireRow, WireSlot};
 /// wire-faithful seeding. See the crate docs.
 pub struct DejaLoadConnection<C> {
     inner: C,
-    /// Where this connection's captures go, installed per checkout by the host
-    /// (see the crate docs). `None` — the default, and the state of every
-    /// connection in a process that never installs one — captures nothing.
-    wire_slot: Option<Arc<WireSlot>>,
+    /// Where this connection's captures go. Always present, created with the
+    /// connection; `Arc`-shared INTERNALLY because the cursor cannot borrow a
+    /// field of the connection it is reading (the cursor holds the
+    /// connection's `&mut` for its whole life). The `Arc` never leaves the
+    /// wrapper.
+    wire_slot: Arc<WireSlot>,
 }
 
 impl<C> DejaLoadConnection<C> {
@@ -100,19 +105,27 @@ impl<C> DejaLoadConnection<C> {
     pub fn from_inner(inner: C) -> Self {
         Self {
             inner,
-            wire_slot: None,
+            wire_slot: WireSlot::new_shared(),
         }
     }
 
-    /// Direct this connection's captures at `slot`, replacing any previous one.
+    /// Take the rows the most recent load on this connection captured,
+    /// emptying the slot. `None` when there is nothing to hand over: the
+    /// statement returned no rows, the capture could not be read faithfully,
+    /// or capture is gated off.
     ///
-    /// Called inside the host's `conn.run(|c| …)` closure at checkout, where
-    /// `&mut` on the wrapped connection is available; the same slot is handed
-    /// to the async task as its current slot
-    /// ([`deja_runtime::wire_capture::set_current_slot`]) so the boundary that
-    /// follows can take what this connection captures.
-    pub fn install_wire_slot(&mut self, slot: Arc<WireSlot>) {
-        self.wire_slot = Some(slot);
+    /// Call this in the same closure that ran the query (the pool helpers
+    /// below do) — that lexical adjacency IS the pairing.
+    pub fn take_captured_rows(&mut self) -> Option<Vec<WireRow>> {
+        // Always empty the slot; only hand rows out under an open gate. After
+        // a mode flip a lingering capture from the active era must not attach
+        // to a statement executed while capture was off.
+        let rows = self.wire_slot.take();
+        if capture_is_active() {
+            rows
+        } else {
+            None
+        }
     }
 
     /// The wrapped connection, immutably. Diesel needs `&mut` to execute
@@ -229,9 +242,15 @@ where
         // BEFORE the load borrows it mutably — the cursor holds `&'conn mut
         // self` for its whole life and so cannot borrow a field of the
         // connection; the slot is an `Arc` for exactly this reason.
-        let slot = capture_is_active()
-            .then(|| self.wire_slot.clone())
-            .flatten();
+        let slot = capture_is_active().then(|| Arc::clone(&self.wire_slot));
+        // SLOT INVARIANT: empty the slot before executing, so whatever a take
+        // finds afterwards belongs to THIS statement. A pooled connection
+        // lives across requests, and a previous statement whose caller never
+        // took (a write, a plain combinator) must not leak its capture into
+        // the next taker's pair.
+        if let Some(slot) = &slot {
+            drop(slot.take());
+        }
         let inner = self.inner.load(source)?;
         Ok(DejaCursor::new(inner, slot, capture_wire_row))
     }
@@ -249,6 +268,116 @@ where
     fn is_broken(&mut self) -> bool {
         self.inner.is_broken()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Async pool helpers: the in-band pairing point
+// ---------------------------------------------------------------------------
+// async-bb8-diesel's combinators (`get_result_async` and friends) each expand
+// to `conn.run(|c| query.method(c))` — the query executes inside a
+// `spawn_blocking` closure holding `&mut` on the wrapped connection. That
+// closure is the ONE place where the statement's result and the connection
+// that captured its wire rows exist in the same lexical scope, so these
+// helpers do the take right there and return the pair. Bounds mirror
+// async-bb8-diesel 0.2.1's `AsyncRunQueryDsl` methods exactly, narrowed to the
+// instrumented connection type (only wrapped pools have anything to take).
+//
+// Error shape: `run`'s own error type folds into the returned `Result` — the
+// caller sees one `Result` plus one `Option`, and an `Err` still carries
+// whatever the take found (dropped by the boundary, which attaches images only
+// to `Ok` results).
+
+/// Fold `conn.run`'s outer (connection-level) error into the inner query
+/// result, so callers destructure one `(Result, Option)` pair.
+fn fold_run_outcome<U>(
+    outcome: Result<(QueryResult<U>, Option<Vec<WireRow>>), diesel::result::Error>,
+) -> (QueryResult<U>, Option<Vec<WireRow>>) {
+    match outcome {
+        Ok(pair) => pair,
+        Err(error) => (Err(error), None),
+    }
+}
+
+/// `get_result` on the query's own connection, returning the result PAIRED
+/// with the wire rows that same statement produced. Mirrors
+/// `async_bb8_diesel::AsyncRunQueryDsl::get_result_async`.
+pub async fn get_result_captured<C, Q, U>(
+    conn: &async_bb8_diesel::Connection<DejaLoadConnection<C>>,
+    query: Q,
+) -> (QueryResult<U>, Option<Vec<WireRow>>)
+where
+    C: diesel::r2d2::R2D2Connection
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>
+        + 'static,
+    Q: RunQueryDsl<DejaLoadConnection<C>>
+        + LoadQuery<'static, DejaLoadConnection<C>, U>
+        + Send
+        + 'static,
+    U: Send + 'static,
+{
+    use async_bb8_diesel::AsyncConnection;
+    fold_run_outcome(
+        conn.run(move |c| {
+            let result = query.get_result(c);
+            let wire = c.take_captured_rows();
+            Ok::<_, diesel::result::Error>((result, wire))
+        })
+        .await,
+    )
+}
+
+/// `get_results` on the query's own connection, returning the row vector
+/// PAIRED with the wire rows that same statement produced. Mirrors
+/// `async_bb8_diesel::AsyncRunQueryDsl::get_results_async`.
+pub async fn get_results_captured<C, Q, U>(
+    conn: &async_bb8_diesel::Connection<DejaLoadConnection<C>>,
+    query: Q,
+) -> (QueryResult<Vec<U>>, Option<Vec<WireRow>>)
+where
+    C: diesel::r2d2::R2D2Connection
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>
+        + 'static,
+    Q: RunQueryDsl<DejaLoadConnection<C>>
+        + LoadQuery<'static, DejaLoadConnection<C>, U>
+        + Send
+        + 'static,
+    U: Send + 'static,
+{
+    use async_bb8_diesel::AsyncConnection;
+    fold_run_outcome(
+        conn.run(move |c| {
+            let result = query.get_results(c);
+            let wire = c.take_captured_rows();
+            Ok::<_, diesel::result::Error>((result, wire))
+        })
+        .await,
+    )
+}
+
+/// `first` (applies `LIMIT 1`) on the query's own connection, returning the
+/// result PAIRED with the wire rows that same statement produced. Mirrors
+/// `async_bb8_diesel::AsyncRunQueryDsl::first_async`.
+pub async fn first_captured<C, Q, U>(
+    conn: &async_bb8_diesel::Connection<DejaLoadConnection<C>>,
+    query: Q,
+) -> (QueryResult<U>, Option<Vec<WireRow>>)
+where
+    C: diesel::r2d2::R2D2Connection
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>
+        + 'static,
+    Q: RunQueryDsl<DejaLoadConnection<C>> + LimitDsl + Send + 'static,
+    diesel::dsl::Limit<Q>: LoadQuery<'static, DejaLoadConnection<C>, U>,
+    U: Send + 'static,
+{
+    use async_bb8_diesel::AsyncConnection;
+    fold_run_outcome(
+        conn.run(move |c| {
+            let result = query.first(c);
+            let wire = c.take_captured_rows();
+            Ok::<_, diesel::result::Error>((result, wire))
+        })
+        .await,
+    )
 }
 
 /// Read one row's columns through the generic row API: `(name, type OID,
@@ -289,7 +418,7 @@ struct CursorCapture<R> {
 /// Pass-through cursor teeing each yielded row into a [`CursorCapture`]. On
 /// drop — i.e. once the result set has been handed to the application, still
 /// inside the blocking closure that ran the load — the capture is put into the
-/// connection's slot for the enclosing boundary to take.
+/// connection's slot for the same closure's take to collect.
 pub struct DejaCursor<I, R> {
     inner: I,
     capture: Option<CursorCapture<R>>,
@@ -595,27 +724,49 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Error folding in the pool helpers: the run's outer error becomes the
+    // pair's inner Err, wire None — one Result, one Option, no third channel.
+    // -----------------------------------------------------------------
+
     #[test]
-    fn a_second_statement_on_the_same_connection_replaces_an_unclaimed_capture() {
-        // One connection, two statements, nobody taking in between: the slot
-        // holds the LATEST capture. This is the whole eviction question, and
-        // the answer is now local to the connection — there is no shared queue
-        // for unrelated traffic to overflow.
-        let slot = WireSlot::new_shared();
-        for value in ["first", "second"] {
-            let cursor = cursor_with_capture(
-                vec![Ok(FakeRow {
-                    columns: vec![varchar_column("a", value)],
-                })],
-                Some(Arc::clone(&slot)),
-            );
-            let _ = cursor.count();
-        }
-        let taken = slot.take().expect("a capture is present");
-        assert_eq!(taken.len(), 1);
-        assert_eq!(
-            taken[0].columns[0].bytes.as_deref(),
-            Some(b"second".as_ref())
+    fn fold_run_outcome_passes_the_pair_through() {
+        let pair: (QueryResult<u64>, _) = fold_run_outcome(Ok((
+            Ok(7),
+            Some(vec![WireRow {
+                columns: vec![WireColumn {
+                    name: "n".into(),
+                    type_oid: Some(20),
+                    bytes: Some(7i64.to_be_bytes().to_vec()),
+                }],
+            }]),
+        )));
+        assert_eq!(pair.0, Ok(7));
+        assert!(pair.1.is_some());
+    }
+
+    #[test]
+    fn fold_run_outcome_folds_the_outer_error_into_the_result() {
+        let (result, wire): (QueryResult<u64>, _) =
+            fold_run_outcome(Err(diesel::result::Error::BrokenTransactionManager));
+        assert!(matches!(
+            result,
+            Err(diesel::result::Error::BrokenTransactionManager)
+        ));
+        assert!(
+            wire.is_none(),
+            "a connection-level failure captures nothing"
         );
+    }
+
+    #[test]
+    fn an_inner_err_still_carries_the_take() {
+        // The pair shape holds for Err results too: the take ran in the same
+        // closure and its outcome rides along; the boundary decides what to do
+        // with it (attach nothing).
+        let (result, wire): (QueryResult<u64>, _) =
+            fold_run_outcome(Ok((Err(diesel::result::Error::NotFound), None)));
+        assert!(matches!(result, Err(diesel::result::Error::NotFound)));
+        assert!(wire.is_none());
     }
 }
