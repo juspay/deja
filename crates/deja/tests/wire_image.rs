@@ -1,12 +1,12 @@
 //! The physical/semantic two-representation split on db row images
 //! (docs/design/wire-faithful-seeding.md): `row_image_payload_with_wire`
 //! attaches wrapper-captured binary wire values to the serde row images, and
-//! `recorded_output` picks captures up from the slot the request installed.
-//! Every rejection path must fall back to the plain semantic payload — a
-//! physical image is dropped on doubt, never misattached.
+//! `recorded_output_with_wire` receives the capture IN-BAND from the boundary
+//! that took it off the query's own return path. Every rejection path must
+//! fall back to the plain semantic payload — a physical image is dropped on
+//! doubt, never misattached.
 
-use deja::db::{row_image_payload, row_image_payload_with_wire, DbRowImage};
-use deja_runtime::wire_capture::{WireColumn, WireRow};
+use deja::db::{row_image_payload, row_image_payload_with_wire, DbRowImage, WireColumn, WireRow};
 
 fn wire_column(name: &str, oid: u32, bytes: &[u8]) -> WireColumn {
     WireColumn {
@@ -192,10 +192,9 @@ fn plain_payload_carries_no_wire_keys() {
 }
 
 #[cfg(feature = "error-stack")]
-mod recorded_output_handoff {
+mod recorded_output_in_band {
     use super::*;
-    use deja::db::{recorded_output, StateAxis};
-    use deja_runtime::wire_capture::{scope_sync, set_current_slot, WireSlot};
+    use deja::db::{recorded_output, recorded_output_with_wire, StateAxis};
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     enum DbError {
@@ -215,27 +214,23 @@ mod recorded_output_handoff {
     }
 
     #[test]
-    fn recorded_output_takes_the_capture_and_attaches_the_physical_image() {
-        // The boundary's `sql` no longer takes part in the handoff: the capture
-        // arrives through the slot the request installed, so the statement the
-        // wrapper executed (`first_async` appends a LIMIT) and the rendering the
-        // boundary holds need not agree on anything.
+    fn the_passed_wire_rows_become_the_physical_image() {
+        // The capture arrives as an argument — the same pair the captured
+        // query helpers return — so there is nothing ambient to be evicted or
+        // out of scope. The `sql` plays no part in the pairing.
         let boundary = r#"SELECT * FROM "wi_attempt" WHERE "wi_attempt"."attempt_id" = $1 -- binds: ["att_1"]"#;
-        let slot = WireSlot::new_shared();
-        let output = scope_sync(|| {
-            assert!(set_current_slot(std::sync::Arc::clone(&slot)));
-            slot.put(vec![WireRow {
-                columns: vec![
-                    wire_column("attempt_id", 1043, b"att_1"),
-                    wire_column("connector_transaction_id", 1043, b"txn_raw"),
-                ],
-            }]);
-            let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
-                attempt_id: "att_1".into(),
-                connector_transaction_id: Some(serde_json::json!({"TxnId": "txn_raw"})),
-            });
-            recorded_output(StateAxis::Read, "wi_attempt", boundary, &ok)
+        let wire = vec![WireRow {
+            columns: vec![
+                wire_column("attempt_id", 1043, b"att_1"),
+                wire_column("connector_transaction_id", 1043, b"txn_raw"),
+            ],
+        }];
+        let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
+            attempt_id: "att_1".into(),
+            connector_transaction_id: Some(serde_json::json!({"TxnId": "txn_raw"})),
         });
+        let output =
+            recorded_output_with_wire(StateAxis::Read, "wi_attempt", boundary, &ok, Some(&wire));
         let image = output.result_image.expect("row image expected");
         let row: DbRowImage = serde_json::from_value(image).expect("typed image");
         assert_eq!(row.wire_format.as_deref(), Some("binary"));
@@ -249,70 +244,40 @@ mod recorded_output_handoff {
     }
 
     #[test]
-    fn err_results_still_empty_the_slot() {
+    fn an_err_result_attaches_no_image_whatever_rode_along() {
+        // The pair shape delivers a wire Option even for Err results (the take
+        // ran in the same closure); the producer must ignore it — there is no
+        // Ok value to image.
         let sql = r#"SELECT * FROM "wi_gone" WHERE "wi_gone"."id" = $1 -- binds: ["g1"]"#;
-        let slot = WireSlot::new_shared();
-        scope_sync(|| {
-            set_current_slot(std::sync::Arc::clone(&slot));
-            slot.put(vec![WireRow {
-                columns: vec![wire_column("id", 1043, b"g1")],
-            }]);
-            let err: Result<AttemptRow, error_stack::Report<DbError>> =
-                Err(error_stack::report!(DbError::NotFound));
-            let output = recorded_output(StateAxis::Read, "wi_gone", sql, &err);
-            assert!(output.is_error);
-            assert!(output.result_image.is_none());
-        });
-        assert!(
-            !slot.is_occupied(),
-            "an Err boundary must empty the slot, or its capture lands on the \
-             next statement's event"
-        );
+        let stale = vec![WireRow {
+            columns: vec![wire_column("id", 1043, b"g1")],
+        }];
+        let err: Result<AttemptRow, error_stack::Report<DbError>> =
+            Err(error_stack::report!(DbError::NotFound));
+        let output = recorded_output_with_wire(StateAxis::Read, "wi_gone", sql, &err, Some(&stale));
+        assert!(output.is_error);
+        assert!(output.result_image.is_none());
     }
 
     #[test]
-    fn no_capture_means_the_plain_image_unchanged() {
+    fn no_wire_means_the_plain_image_unchanged() {
         let sql = r#"SELECT * FROM "wi_plain" WHERE "wi_plain"."id" = $1 -- binds: ["p1"]"#;
         let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
             attempt_id: "p1".into(),
             connector_transaction_id: None,
         });
-        let output = recorded_output(StateAxis::Read, "wi_plain", sql, &ok);
-        let image = output.result_image.expect("row image expected");
+        let with_none = recorded_output_with_wire(StateAxis::Read, "wi_plain", sql, &ok, None);
+        let image = with_none.result_image.clone().expect("row image expected");
         let rendered = serde_json::to_string(&image).expect("serializes");
         assert!(
             !rendered.contains("wire"),
             "old-tape behavior: no wire keys without a capture"
         );
-    }
 
-    #[test]
-    fn a_capture_in_another_scope_is_not_visible_here() {
-        // The failure this design deletes: one request's physical image can no
-        // longer be handed to another request's boundary, whatever the
-        // statements look like. Same table, same sql, same process.
-        let sql = r#"SELECT * FROM "wi_shared" WHERE "wi_shared"."id" = $1 -- binds: ["p1"]"#;
-        let theirs = WireSlot::new_shared();
-        scope_sync(|| {
-            set_current_slot(std::sync::Arc::clone(&theirs));
-            theirs.put(vec![WireRow {
-                columns: vec![wire_column("attempt_id", 1043, b"not_mine")],
-            }]);
-        });
-
-        let output = scope_sync(|| {
-            let ok: Result<AttemptRow, error_stack::Report<DbError>> = Ok(AttemptRow {
-                attempt_id: "p1".into(),
-                connector_transaction_id: None,
-            });
-            recorded_output(StateAxis::Read, "wi_shared", sql, &ok)
-        });
-        let rendered = serde_json::to_string(&output.result_image.expect("row image expected"))
-            .expect("serializes");
-        assert!(
-            !rendered.contains("wire"),
-            "no slot of ours, no physical image — never another request's bytes"
-        );
-        assert!(theirs.is_occupied(), "their capture stays theirs");
+        // And the plain producer is exactly the `wire: None` case — writes and
+        // uncaptured paths keep their byte-identical payload.
+        let plain = recorded_output(StateAxis::Read, "wi_plain", sql, &ok);
+        assert_eq!(plain.result_image, with_none.result_image);
+        assert_eq!(plain.result, with_none.result);
     }
 }

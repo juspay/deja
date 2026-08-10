@@ -45,8 +45,7 @@ redis-rs = ["dep:redis"]
 serde_json = "1"
 tempfile = "3"
 error-stack = { version = "0.4", default-features = false }
-# Tests put captures into a wire slot directly (the role the deja-diesel
-# wrapper plays in production) and take them back through the boundary.
+# Tests drive the runtime surface (hooks, dispatch, wire value types) directly.
 deja-runtime = { path = "../deja-runtime" }
 
 [lints.clippy]

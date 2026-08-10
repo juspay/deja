@@ -23,6 +23,12 @@ diesel = { version = "~2.2.10", default-features = false, features = [
     "r2d2",
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ] }
+# The in-band pool helpers (`get_result_captured` and friends) pair a query's
+# result with its own connection's capture inside async-bb8-diesel's `run`
+# closure — the one place both exist in the same lexical scope. Pinned to the
+# exact version hyperswitch resolves (0.2.1; diesel with default-features off,
+# no libpq linkage) so the helper bounds mirror its combinators one-to-one.
+async-bb8-diesel = "0.2.1"
 
 [dev-dependencies]
 # Real-postgres round-trip test (ignored by default; needs a reachable
@@ -31,11 +37,10 @@ diesel = { version = "~2.2.10", default-features = false, features = [
 diesel = { version = "~2.2.10", features = ["postgres"] }
 tempfile = "3"
 # Pool-path tests: they mirror hyperswitch's execution stack exactly (it drives
-# diesel through async-bb8-diesel over a bb8 pool), so the handoff is proven
-# through the same call path production uses — the capture put on a
-# `spawn_blocking` thread, the take on the async task afterwards — and not just
-# through a bare connection.
-async-bb8-diesel = "0.2.1"
+# diesel through async-bb8-diesel over a bb8 pool), so the pairing is proven
+# through the same call path production uses — the capture put and take on the
+# `spawn_blocking` thread, the pair riding the future back to the async task —
+# and not just through a bare connection.
 bb8 = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

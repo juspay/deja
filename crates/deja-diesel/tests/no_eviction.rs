@@ -1,19 +1,21 @@
-//! The failure this design deletes, turned into a test that the design cannot
-//! exhibit it.
+//! The failures the in-band design deletes, turned into tests the design
+//! cannot exhibit them.
 //!
-//! This replaces `registry_eviction_probe.rs` (PR #51), which measured the
-//! defect: the capture handoff used to be a process-global 64-entry deque with
-//! oldest-first eviction, while the capture gate was process-level — so every
-//! statement the process ran published, including the majority from requests
-//! the sampler excluded, which never take. A recorded request's image survived
-//! 63 competing statements in its window and was lost at 64, which on a pod
-//! serving live traffic is every recorded request.
+//! The first ambient shape of this handoff (a process-global 64-entry deque
+//! keyed on statement text) lost a recorded request's capture to the 64th
+//! competing statement — measured in PR #51, fatal on any loaded pod. The
+//! second (a per-checkout slot handle in a tokio task-local) had nothing to
+//! evict but could silently be out of scope. In-band there is no window
+//! between capture and take at all: the take happens inside the same
+//! `conn.run` closure that executed the statement, so competing traffic has
+//! nowhere to intrude and no scope has to be active.
 //!
-//! There is nothing to evict any more: the capture lives in a slot on the
-//! connection that produced it. The test below runs an order of magnitude more
-//! competing traffic than the old bound, on other connections, in other tasks,
-//! while a recorded request's capture waits — and the request still takes its
-//! own rows.
+//! The second test pins the one residual hazard the wrapper must own: a
+//! pooled connection lives across requests, and a statement whose caller
+//! never takes (a plain combinator) leaves rows in the connection's slot.
+//! The wrapper empties the slot at the start of every load, so the next
+//! captured query on that same connection pairs with ITS OWN rows, never a
+//! predecessor's.
 //!
 //! Ignored by default; needs a scratch database:
 //!
@@ -22,21 +24,17 @@
 //!     cargo test -p deja-diesel --test no_eviction -- --ignored --nocapture
 //! ```
 
-use deja_diesel::DejaLoadConnection;
-use deja_runtime::wire_capture::{self, WireSlot};
+use deja_diesel::{get_result_captured, DejaLoadConnection};
 use deja_runtime::{RecordingHook, RuntimeHook};
 use diesel::pg::PgConnection;
-use diesel::prelude::*;
 use diesel::sql_types::Text;
+use diesel::QueryableByName;
 use std::sync::Arc;
 
 type DejaPgConnection = DejaLoadConnection<PgConnection>;
 type DejaPool = bb8::Pool<async_bb8_diesel::ConnectionManager<DejaPgConnection>>;
-type PooledDejaConnection =
-    bb8::PooledConnection<'static, async_bb8_diesel::ConnectionManager<DejaPgConnection>>;
 
-/// How much competing traffic to run while the recorded capture waits. The old
-/// registry lost the capture at 64.
+/// An order of magnitude past the old registry's bound (lost at 64).
 const COMPETING_STATEMENTS: usize = 70;
 
 #[derive(QueryableByName, Debug)]
@@ -56,167 +54,109 @@ fn open_gate() {
     );
 }
 
-/// The vendor's checkout hook in shape: one slot, installed on the leased
-/// connection and registered as the current slot for this task.
-async fn checkout_and_install(pool: &DejaPool) -> PooledDejaConnection {
-    use async_bb8_diesel::AsyncConnection;
-    let conn = pool.get_owned().await.expect("checkout");
-    let slot = WireSlot::new_shared();
-    let for_connection = Arc::clone(&slot);
-    conn.run(move |c| {
-        c.install_wire_slot(for_connection);
-        Ok::<(), diesel::result::Error>(())
-    })
-    .await
-    .expect("install the slot");
-    wire_capture::set_current_slot(slot);
-    conn
+async fn pool(url: String, size: u32) -> DejaPool {
+    let manager = async_bb8_diesel::ConnectionManager::<DejaPgConnection>::new(url);
+    bb8::Pool::builder()
+        .max_size(size)
+        .build(manager)
+        .await
+        .expect("pool")
 }
 
-async fn read_one(conn: &PooledDejaConnection, label: &str) {
-    use async_bb8_diesel::AsyncRunQueryDsl;
-    let query = diesel::sql_query(format!("SELECT '{label}'::varchar AS label"));
-    let row: Row = query.get_result_async(&**conn).await.expect("query");
-    assert_eq!(row.label, label);
+fn label_bytes(rows: &[deja_runtime::wire_capture::WireRow]) -> Option<Vec<u8>> {
+    rows.first()?
+        .columns
+        .iter()
+        .find(|column| column.name == "label")?
+        .bytes
+        .clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a reachable postgres; set DEJA_DIESEL_TEST_DATABASE_URL"]
-async fn competing_traffic_on_other_connections_cannot_displace_this_capture() {
+async fn competing_traffic_cannot_touch_anyones_pair() {
     let url = std::env::var("DEJA_DIESEL_TEST_DATABASE_URL")
         .expect("DEJA_DIESEL_TEST_DATABASE_URL must point at a scratch database");
     open_gate();
 
-    let manager = async_bb8_diesel::ConnectionManager::<DejaPgConnection>::new(url);
-    let pool: DejaPool = bb8::Pool::builder()
-        .max_size(4)
-        .build(manager)
-        .await
-        .expect("pool");
+    let pool = pool(url, 4).await;
 
-    let before = wire_capture::counts();
-
-    wire_capture::scope(async {
-        // The recorded request reads, and its capture waits in its own slot
-        // while the boundary's result producer has not run yet.
-        let conn = checkout_and_install(&pool).await;
-        read_one(&conn, "recorded").await;
-
-        // Competing traffic: other requests, on other pooled connections, in
-        // other tasks, each capturing and none of them taking — the shape that
-        // used to flood the shared queue.
-        let mut handles = Vec::new();
-        for _ in 0..COMPETING_STATEMENTS {
-            let pool = pool.clone();
-            handles.push(tokio::spawn(wire_capture::scope(async move {
-                let other = checkout_and_install(&pool).await;
-                read_one(&other, "ambient").await;
-                // Deliberately no take: an unclaimed capture.
-            })));
-        }
-        for handle in handles {
-            handle.await.expect("join");
-        }
-
-        let captured = wire_capture::take_current_rows();
-        println!(
-            "after {COMPETING_STATEMENTS} competing statements: recorded capture {}",
-            if captured.is_some() {
-                "SURVIVED"
-            } else {
-                "LOST"
-            }
-        );
-        let captured = captured.expect(
-            "a capture on this connection cannot be displaced by traffic on \
-             other connections — there is no shared queue to overflow",
-        );
-        assert_eq!(captured.len(), 1);
-        assert_eq!(
-            captured[0]
-                .columns
-                .iter()
-                .find(|column| column.name == "label")
-                .and_then(|column| column.bytes.as_deref()),
-            Some(b"recorded".as_ref()),
-            "and the rows taken are this request's own, not a neighbour's"
-        );
-    })
-    .await;
-
-    // Diagnostics only — the harness may run other tests in this binary at the
-    // same time, so these deltas are not exclusively ours. The claim above is
-    // local to the recorded request's own slot, which is what makes it sound.
-    let after = wire_capture::counts();
-    println!(
-        "counts delta: put={} taken={} overwritten_unclaimed={} takes_without_slot={}",
-        after.put - before.put,
-        after.taken - before.taken,
-        after.overwritten_unclaimed - before.overwritten_unclaimed,
-        after.takes_without_slot - before.takes_without_slot,
-    );
+    // Every request is simultaneously the "recorded" one and everyone else's
+    // competing traffic — an order of magnitude more than the load that used
+    // to evict every capture. Each asserts its pair carries its OWN label.
+    let mut handles = Vec::new();
+    for index in 0..COMPETING_STATEMENTS {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let conn = pool.get().await.expect("checkout");
+            let label = format!("request_{index}");
+            let query = diesel::sql_query(format!("SELECT '{label}'::varchar AS label"));
+            let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+            assert_eq!(result.expect("query").label, label);
+            let wire = wire.expect("every pair carries its capture");
+            assert_eq!(
+                label_bytes(&wire).as_deref(),
+                Some(label.as_bytes()),
+                "there is no shared capacity, and no window between capture \
+                 and take for anything to intrude on"
+            );
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("join");
+    }
+    println!("{COMPETING_STATEMENTS} concurrent captured statements: every pair its own");
 }
 
-/// The adoption requirement, pinned. A pooled connection outlives the request
-/// that leased it, so a checkout that does NOT install a slot leaves the
-/// connection pointing at the previous request's slot, and its statement lands
-/// there. Nobody takes it here, so nothing is misattributed — but if the earlier
-/// request were still alive and took afterwards, it would receive rows from a
-/// statement it never issued. Hence: every checkout site installs, which is what
-/// makes the previous slot unreachable before the next statement runs.
+/// A pooled connection outlives the request that leased it. A statement whose
+/// caller never takes — a plain async-bb8-diesel combinator, exactly what the
+/// write paths still use — leaves its capture in the connection's slot. The
+/// wrapper empties the slot at the start of every load, so the NEXT captured
+/// query on the same connection can only pair with its own rows; and if that
+/// next query produces nothing to capture, the taker gets nothing, never the
+/// predecessor's rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a reachable postgres; set DEJA_DIESEL_TEST_DATABASE_URL"]
-async fn a_checkout_that_skips_the_install_inherits_the_previous_slot() {
+async fn a_previous_statements_untaken_capture_never_leaks_into_the_next_pair() {
     let url = std::env::var("DEJA_DIESEL_TEST_DATABASE_URL")
         .expect("DEJA_DIESEL_TEST_DATABASE_URL must point at a scratch database");
     open_gate();
 
-    // One connection, so the second checkout is guaranteed to be the same one.
-    let manager = async_bb8_diesel::ConnectionManager::<DejaPgConnection>::new(url);
-    let pool: DejaPool = bb8::Pool::builder()
-        .max_size(1)
-        .build(manager)
+    // One connection, so every statement below is guaranteed to share a slot.
+    let pool = pool(url, 1).await;
+    let conn = pool.get().await.expect("checkout");
+
+    // Statement 1: a captured load whose caller does NOT take — the plain
+    // combinator path. Its rows stay in the connection's slot.
+    use async_bb8_diesel::AsyncRunQueryDsl;
+    let untaken: Row = diesel::sql_query("SELECT 'untaken'::varchar AS label")
+        .get_result_async(&*conn)
         .await
-        .expect("pool");
+        .expect("plain combinator");
+    assert_eq!(untaken.label, "untaken");
 
-    let slot = WireSlot::new_shared();
-    wire_capture::scope(async {
-        use async_bb8_diesel::AsyncConnection;
-        let conn = pool.get_owned().await.expect("checkout");
-        let for_connection = Arc::clone(&slot);
-        conn.run(move |c| {
-            c.install_wire_slot(for_connection);
-            Ok::<(), diesel::result::Error>(())
-        })
-        .await
-        .expect("install the slot");
-        read_one(&conn, "first_request").await;
-    })
-    .await;
-
-    // A second lease of the same connection, with no install: its statement has
-    // nowhere of its own to go.
-    wire_capture::scope(async {
-        let conn = pool.get_owned().await.expect("re-checkout");
-        read_one(&conn, "second_request").await;
-        assert!(
-            wire_capture::take_current_rows().is_none(),
-            "this request installed no slot, so it takes nothing"
-        );
-    })
-    .await;
-
-    let inherited = slot
-        .take()
-        .expect("the first request's slot holds a capture");
+    // Statement 2, same connection, through the captured helper: the pair
+    // must carry statement 2's rows.
+    let query = diesel::sql_query("SELECT 'mine'::varchar AS label");
+    let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+    assert_eq!(result.expect("query").label, "mine");
     assert_eq!(
-        inherited[0]
-            .columns
-            .iter()
-            .find(|column| column.name == "label")
-            .and_then(|column| column.bytes.as_deref()),
-        Some(b"second_request".as_ref()),
-        "an uninstalled checkout publishes into the previous request's slot — \
-         which is why every checkout site must install one"
+        label_bytes(&wire.expect("captured")).as_deref(),
+        Some(b"mine".as_ref()),
+        "the load must have displaced the untaken capture before executing"
+    );
+
+    // Statement 3 leaves another untaken capture; statement 4 returns zero
+    // rows — its pair must carry NOTHING, not statement 3's leftovers.
+    let _: Row = diesel::sql_query("SELECT 'leftover'::varchar AS label")
+        .get_result_async(&*conn)
+        .await
+        .expect("plain combinator");
+    let query = diesel::sql_query("SELECT 'never'::varchar AS label WHERE false");
+    let (result, wire) = get_result_captured::<PgConnection, _, Row>(&conn, query).await;
+    assert!(matches!(result, Err(diesel::result::Error::NotFound)));
+    assert!(
+        wire.is_none(),
+        "an empty result must never inherit an earlier statement's rows"
     );
 }
