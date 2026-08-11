@@ -241,6 +241,24 @@ pub fn db_pk_column(table: &str) -> Option<&'static str> {
         "users" => Some("user_id"),
         "api_keys" => Some("key_id"),
         "user_authentication_methods" => Some("id"),
+        // Added from the tables this workload UPDATES — an RMW event needs row
+        // identity to find the row's earlier observation (see
+        // `preferred_seed_image`), and without an entry here that lookup
+        // cannot fire. Each mirrors the vendor's own diesel declaration
+        // (`primary_key(…)`), not a guess: payment_methods(payment_method_id),
+        // address(address_id), captures(capture_id), configs(key). Read-only
+        // tables are deliberately absent — they need no row identity, and each
+        // entry changes which keys a recording emits, so the registry grows
+        // with evidence rather than in bulk.
+        //
+        // v2 renames some of these primary keys (payment_methods is keyed by
+        // `id` there). `db_pk_column_for_table` requires the column to be
+        // present and non-null in the row, so a v2 row falls back to the query
+        // fingerprint instead of mis-keying.
+        "payment_methods" => Some("payment_method_id"),
+        "address" => Some("address_id"),
+        "captures" => Some("capture_id"),
+        "configs" => Some("key"),
         _ => None,
     }
 }
@@ -2521,32 +2539,115 @@ fn db_created_table(event: &BoundaryEvent) -> Option<String> {
     })
 }
 
-fn preferred_seed_image(event: &BoundaryEvent, canonical_key: &str) -> Option<serde_json::Value> {
+/// The row-state key a typed row-image payload denotes, for indexing images by
+/// the row they describe. Reads the pragmatic PK out of the payload's own
+/// columns, so it works on the physical (wire) image shape as well as the
+/// semantic one.
+fn image_row_state_key(payload: &serde_json::Value) -> Option<String> {
+    let object = payload.as_object()?;
+    if object.get("deja_image").and_then(serde_json::Value::as_str) != Some("db_row") {
+        return None;
+    }
+    let table = object.get("table")?.as_str()?;
+    let pk_column = db_pk_column(table)?;
+    let pk_value = object
+        .get("columns")?
+        .as_array()?
+        .iter()
+        .find(|column| column.get("name").and_then(serde_json::Value::as_str) == Some(pk_column))?
+        .get("value")?;
+    Some(
+        StateKey::DbRow {
+            table: table.to_owned(),
+            pk_column: pk_column.to_owned(),
+            pk_value: db_pk_wire_value(pk_value),
+        }
+        .to_wire(),
+    )
+}
+
+/// Split a row-image payload into its per-row payloads (an image is a single
+/// row object or an array of them).
+fn image_rows(image: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match image {
+        serde_json::Value::Array(rows) => rows.iter().collect(),
+        row => vec![row],
+    }
+}
+
+/// Reassemble per-row payloads into an image payload of the same shape.
+fn image_from_rows(rows: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    match rows.len() {
+        0 => None,
+        1 => rows.into_iter().next(),
+        _ => Some(serde_json::Value::Array(rows)),
+    }
+}
+
+/// The images observed for each row so far in a correlation, keyed by row-state
+/// key. Rebuilt per correlation by [`build_seed_plan`]; the value is always the
+/// LAST image seen strictly before the event currently being planned.
+type ObservedRowImages = std::collections::HashMap<String, serde_json::Value>;
+
+fn preferred_seed_image(
+    event: &BoundaryEvent,
+    canonical_key: &str,
+    observed_rows: &ObservedRowImages,
+) -> Option<serde_json::Value> {
     let read_write_same_key = event.boundary == "db"
         && event
             .write_set
             .iter()
             .any(|key| canonical_state_key_wire(key) == canonical_key);
-    if read_write_same_key {
-        // A DB read+write on the same state key is an RMW precondition, so an
-        // explicit pre-image is the state to seed and wins when the producer
-        // captured one.
-        //
-        // When it did not, the alternative is NOT "seed nothing": leaving
-        // `image` absent sends materialization down the `value = event.result`
-        // path, which is that same post-write state in a LOSSIER
-        // representation — serde shapes with no physical bytes behind them
-        // (`{"TxnId": …}` in a varchar column), which the fail-closed SQL
-        // renderer must refuse rather than guess at. Both routes seed the post
-        // state; only one of them can be materialized faithfully. So prefer
-        // the physical post-image: identical state, wire-exact bytes.
-        event
-            .pre_image
-            .clone()
-            .or_else(|| event.result_image.clone())
-    } else {
-        event.result_image.clone()
+    if !read_write_same_key {
+        return event.result_image.clone();
     }
+    // A DB read+write on the same state key is an RMW precondition: the state
+    // to seed is the row as it was BEFORE this event, and this event's
+    // `result_image` is the row AFTER. An explicit `pre_image` wins whenever a
+    // producer captured one.
+    if let Some(pre_image) = event.pre_image.clone() {
+        return Some(pre_image);
+    }
+    // No producer captures one, and none can: the pre-state is not in an
+    // `UPDATE … RETURNING` response, and postgres before 18 has no
+    // `RETURNING OLD.*`. But it does not need capturing — a correlation that
+    // updates a row has almost always READ it first (216 of 217 RMW events on
+    // the sandbox tape), so the pre-state is already on the tape a few events
+    // earlier. Substitute each row of the post-image with the last image
+    // observed for that same row, per row, so a multi-row update mixes
+    // correctly.
+    //
+    // Seeding the post-image instead is what made an earlier read diverge:
+    // two entries denoting one row raced into the store, `ON CONFLICT DO
+    // NOTHING` kept whichever landed first, and reads of the pre-state
+    // returned post-state values (13 payment_methods timestamp divergences
+    // and their 13 readback misses on run-0811).
+    let post_image = event.result_image.clone()?;
+    let rows = image_rows(&post_image);
+    let mut substituted = 0usize;
+    let resolved: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            image_row_state_key(row)
+                .and_then(|key| observed_rows.get(&key))
+                .map(|prior| {
+                    substituted += 1;
+                    prior.clone()
+                })
+                .unwrap_or_else(|| (*row).clone())
+        })
+        .collect();
+    if substituted == 0 {
+        // Nothing earlier was observed for any of these rows. The post-image
+        // is the only evidence there is; seeding it keeps the replayed UPDATE
+        // from hitting an empty table, and is sound whenever the update's
+        // predicate does not test a column it also writes. Left as-is rather
+        // than skipped — an absent row makes the write vanish, which is
+        // strictly worse than a post-state stand-in.
+        return Some(post_image);
+    }
+    image_from_rows(resolved)
 }
 
 pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -> SeedPlan {
@@ -2566,6 +2667,10 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     // to seed. Built in event order, so a read BEFORE any create still seeds.
     let mut created_tables: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // The last image observed for each row so far, so an RMW event can seed the
+    // state its row was in BEFORE it (see `preferred_seed_image`). Updated
+    // AFTER each event is planned, so an event never sees its own image.
+    let mut observed_rows: ObservedRowImages = std::collections::HashMap::new();
 
     for event in events {
         if !correlation_matches(event, correlation_id) {
@@ -2615,7 +2720,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     // Redis typed-codec envelopes seed their inner value; every
                     // other boundary seeds the raw recorded result unchanged.
                     value: redis_seedable_result(event).clone(),
-                    image: preferred_seed_image(event, &canonical_key),
+                    image: preferred_seed_image(event, &canonical_key, &observed_rows),
                     method: Some(event.method_name.clone()),
                     origin: SeedOrigin::Recording,
                     source_sequence: event.global_sequence,
@@ -2632,6 +2737,19 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         if event.boundary == "db" && is_db_create_event(event) {
             if let Some(table) = db_created_table(event) {
                 created_tables.insert((event.boundary.clone(), table));
+            }
+        }
+        // This event's rows become the latest observed state for anything
+        // planned after it. Recorded for every DB event that carries a typed
+        // image, including creates and RMWs: a later RMW's pre-state is
+        // whatever the most recent observation says, whoever wrote it.
+        if event.boundary == "db" {
+            if let Some(image) = &event.result_image {
+                for row in image_rows(image) {
+                    if let Some(key) = image_row_state_key(row) {
+                        observed_rows.insert(key, row.clone());
+                    }
+                }
             }
         }
     }
@@ -4848,6 +4966,94 @@ mod tests {
             update_seed.value,
             serde_json::json!({"merchant_id": "m2", "status": "after"}),
             "legacy raw value remains available for old tapes"
+        );
+    }
+
+    /// The run-0811 payment_methods shape, end to end: a correlation READS a
+    /// row (two query fingerprints, one pre-state), then UPDATES it. The
+    /// update's read-set keys are RMW keys, and its own image is the POST
+    /// state — so seeding it makes two entries denote one row with different
+    /// contents, and `ON CONFLICT DO NOTHING` keeps whichever lands first. The
+    /// planner must resolve the RMW key to the row's LAST OBSERVED state
+    /// instead, which the earlier read put on the tape: then every entry for
+    /// that row agrees, the reads reproduce, and insert order stops mattering.
+    #[test]
+    fn seed_plan_resolves_an_rmw_key_to_the_rows_last_observed_state() {
+        let table = "payment_methods";
+        let pk = "pm_1";
+        let row_image = |stamp: &str| {
+            serde_json::json!({
+                "deja_image": "db_row",
+                "version": 1,
+                "table": table,
+                "wire_format": "binary",
+                "columns": [
+                    {"name": "payment_method_id", "type_oid": 1043, "value": pk, "wire": "706d5f31"},
+                    {"name": "last_modified", "type_oid": 1114, "value": stamp, "wire": "00"},
+                ],
+            })
+        };
+        let pre = row_image("2026-08-11 13:06:28.821026");
+        let post = row_image("2026-08-11 13:06:29.002555");
+        let read_key = StateKey::DbQuery {
+            table: table.to_owned(),
+            fingerprint: "read-fingerprint".to_owned(),
+        }
+        .to_wire();
+        // The update's own read-set key is a DIFFERENT query fingerprint — the
+        // per-key upsert cannot dedup it against the read's entry.
+        let update_key = StateKey::DbQuery {
+            table: table.to_owned(),
+            fingerprint: "update-fingerprint".to_owned(),
+        }
+        .to_wire();
+
+        let mut read = state_event(
+            10,
+            Some("c1"),
+            "db",
+            "generic_find_one_core",
+            serde_json::json!({"table": table}),
+            serde_json::json!({"payment_method_id": pk}),
+            &[read_key.as_str()],
+            &[],
+            false,
+        );
+        read.result_image = Some(pre.clone());
+        let mut update = state_event(
+            20,
+            Some("c1"),
+            "db",
+            "generic_update_with_results",
+            serde_json::json!({"table": table}),
+            serde_json::json!([{"payment_method_id": pk}]),
+            &[update_key.as_str()],
+            &[update_key.as_str()],
+            false,
+        );
+        update.result_image = Some(post.clone());
+
+        let plan = build_seed_plan(&[read, update], Some("c1"));
+        assert_eq!(
+            plan.resolve("db", read_key.as_str())
+                .expect("the read seeds")
+                .image,
+            Some(pre.clone()),
+            "the read seeds the state it observed"
+        );
+        assert_eq!(
+            plan.resolve("db", update_key.as_str())
+                .expect("the RMW key seeds")
+                .image,
+            Some(pre),
+            "the RMW key seeds the row's last observed state, NOT its own post-image"
+        );
+        assert_ne!(
+            plan.resolve("db", update_key.as_str())
+                .expect("the RMW key seeds")
+                .image,
+            Some(post),
+            "post-image seeding is what made the earlier read diverge"
         );
     }
 
