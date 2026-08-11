@@ -229,36 +229,83 @@ pub fn db_table_from_event_args(args: &serde_json::Value) -> Option<&str> {
 /// Rule A cannot group unrelated rows by a merely common column such as
 /// `merchant_id`. Public as a PRODUCER api: the facade's binds-parser derives
 /// row-exact read keys for reads whose result carries no row (e.g. NotFound).
-pub fn db_pk_column(table: &str) -> Option<&'static str> {
-    match table {
-        "payment_attempt" => Some("attempt_id"),
-        "payment_intent" => Some("payment_id"),
-        "merchant_account" | "merchant_key_store" => Some("merchant_id"),
-        "business_profile" => Some("profile_id"),
-        "merchant_connector_account" => Some("merchant_connector_id"),
-        "customers" => Some("customer_id"),
-        "organization" | "organizations" => Some("organization_id"),
-        "users" => Some("user_id"),
-        "api_keys" => Some("key_id"),
-        "user_authentication_methods" => Some("id"),
-        // Added from the tables this workload UPDATES — an RMW event needs row
-        // identity to find the row's earlier observation (see
-        // `preferred_seed_image`), and without an entry here that lookup
-        // cannot fire. Each mirrors the vendor's own diesel declaration
-        // (`primary_key(…)`), not a guess: payment_methods(payment_method_id),
-        // address(address_id), captures(capture_id), configs(key). Read-only
-        // tables are deliberately absent — they need no row identity, and each
-        // entry changes which keys a recording emits, so the registry grows
-        // with evidence rather than in bulk.
-        //
-        // v2 renames some of these primary keys (payment_methods is keyed by
-        // `id` there). `db_pk_column_for_table` requires the column to be
-        // present and non-null in the row, so a v2 row falls back to the query
-        // fingerprint instead of mis-keying.
-        "payment_methods" => Some("payment_method_id"),
-        "address" => Some("address_id"),
-        "captures" => Some("capture_id"),
-        "configs" => Some("key"),
+/// Primary-key columns per table, as reported by the database that holds them.
+///
+/// Row identity is a fact about the SCHEMA, so it is read from the schema —
+/// never listed in this library. A hardcoded `table → column` map was both
+/// application-specific (the tables of one particular product living in a
+/// generic engine) and structurally unable to describe what it claimed: a
+/// composite primary key has no single column, so every composite table it
+/// covered, it covered wrongly.
+///
+/// Populated by whoever holds a connection to the schema in question — the
+/// `deja-diesel` wrapper when recording, the orchestrator's catalog read when
+/// replaying — through [`register_table_identity`]. Empty until then, which
+/// makes row keys absent rather than wrong: consumers fall back to query
+/// fingerprints, the same path a table with an unknown key has always taken.
+static TABLE_IDENTITY: std::sync::RwLock<Option<BTreeMap<String, Vec<String>>>> =
+    std::sync::RwLock::new(None);
+
+/// The statement that answers "which columns identify a row of each table",
+/// asked of the database that owns the schema. Published here so every
+/// populator asks the same question rather than reinventing it:
+/// `pg_index.indisprimary` is the constraint the database enforces, so a
+/// composite key arrives as the several columns it actually has, in key order.
+/// Yields `(table_name, column_name)` rows.
+pub const TABLE_IDENTITY_SQL: &str =
+    "SELECT cls.relname AS table_name, attr.attname AS column_name \
+     FROM pg_catalog.pg_index idx \
+     JOIN pg_catalog.pg_class cls ON cls.oid = idx.indrelid \
+     JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace \
+     JOIN pg_catalog.pg_attribute attr \
+       ON attr.attrelid = cls.oid AND attr.attnum = ANY(idx.indkey) \
+     WHERE idx.indisprimary AND ns.nspname = 'public' \
+     ORDER BY cls.relname, array_position(idx.indkey, attr.attnum)";
+
+/// Register the primary-key columns of each table, keyed by table name. Merges
+/// into whatever is already known, so a process that learns about more schemas
+/// (a second store, a second database) accumulates rather than replaces.
+pub fn register_table_identity(entries: impl IntoIterator<Item = (String, Vec<String>)>) {
+    let Ok(mut guard) = TABLE_IDENTITY.write() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(BTreeMap::new);
+    for (table, columns) in entries {
+        map.insert(table, columns);
+    }
+}
+
+/// The registered primary-key columns of a table, in key order.
+pub fn table_identity_columns(table: &str) -> Option<Vec<String>> {
+    TABLE_IDENTITY
+        .read()
+        .ok()?
+        .as_ref()?
+        .get(table)
+        .filter(|columns| !columns.is_empty())
+        .cloned()
+}
+
+/// Whether any schema identity has been registered — the difference between
+/// "this table has no single-column key" and "nobody has told us the schema".
+pub fn table_identity_is_registered() -> bool {
+    TABLE_IDENTITY
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|map| !map.is_empty()))
+        .unwrap_or(false)
+}
+
+/// The single column that identifies a row of `table`, when the schema says
+/// there is exactly one.
+///
+/// A composite key deliberately yields `None`: the row-key grammar addresses
+/// one column, so a composite table takes the query-fingerprint path — now
+/// because the schema says the key has several columns, not because a list
+/// forgot the table.
+pub fn db_pk_column(table: &str) -> Option<String> {
+    match table_identity_columns(table)?.as_slice() {
+        [only] => Some(only.clone()),
         _ => None,
     }
 }
@@ -269,10 +316,10 @@ pub fn db_pk_column(table: &str) -> Option<&'static str> {
 fn db_pk_column_for_table(
     table: &str,
     object: &serde_json::Map<String, serde_json::Value>,
-) -> Option<&'static str> {
+) -> Option<String> {
     let candidate = db_pk_column(table)?;
     object
-        .get(candidate)
+        .get(&candidate)
         .filter(|value| !value.is_null())
         .map(|_| candidate)
 }
@@ -283,10 +330,10 @@ fn db_pk_column_for_table(
 pub fn db_row_state_key(table: &str, row: &serde_json::Value) -> Option<StateKey> {
     let object = row.as_object()?;
     let column = db_pk_column_for_table(table, object)?;
-    let value = object.get(column)?;
+    let value = object.get(&column)?;
     Some(StateKey::DbRow {
         table: table.to_owned(),
-        pk_column: column.to_owned(),
+        pk_column: column.clone(),
         pk_value: db_pk_wire_value(value),
     })
 }
@@ -2554,7 +2601,9 @@ fn image_row_state_key(payload: &serde_json::Value) -> Option<String> {
         .get("columns")?
         .as_array()?
         .iter()
-        .find(|column| column.get("name").and_then(serde_json::Value::as_str) == Some(pk_column))?
+        .find(|column| {
+            column.get("name").and_then(serde_json::Value::as_str) == Some(pk_column.as_str())
+        })?
         .get("value")?;
     Some(
         StateKey::DbRow {
@@ -3042,6 +3091,77 @@ mod body_identity_tests {
 mod tests {
     use super::*;
     use crate::{now_ns, BoundaryEvent};
+
+    /// Row identity comes from a real schema at run time; tests stand in for
+    /// that read with the same shape the statement returns. Registered once for
+    /// the whole test binary, and idempotently, so any test that needs row keys
+    /// can call it without ordering assumptions.
+    fn register_test_schema_identity() {
+        register_table_identity([
+            ("payment_attempt".to_owned(), vec!["attempt_id".to_owned()]),
+            ("payment_intent".to_owned(), vec!["payment_id".to_owned()]),
+            (
+                "payment_methods".to_owned(),
+                vec!["payment_method_id".to_owned()],
+            ),
+            (
+                "merchant_account".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            (
+                "merchant_key_store".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            ("business_profile".to_owned(), vec!["profile_id".to_owned()]),
+            (
+                "merchant_connector_account".to_owned(),
+                vec!["merchant_connector_id".to_owned()],
+            ),
+            ("customers".to_owned(), vec!["customer_id".to_owned()]),
+            ("users".to_owned(), vec!["user_id".to_owned()]),
+            ("api_keys".to_owned(), vec!["key_id".to_owned()]),
+            ("address".to_owned(), vec!["address_id".to_owned()]),
+            ("configs".to_owned(), vec!["key".to_owned()]),
+            // A composite key, to keep the "no single identifying column"
+            // branch honest: this table must take the query-fingerprint path.
+            (
+                "incremental_authorization".to_owned(),
+                vec!["authorization_id".to_owned(), "merchant_id".to_owned()],
+            ),
+        ]);
+    }
+
+    /// Identity is a fact read from the schema, and the shape it arrives in
+    /// decides the row-key grammar: exactly one column identifies a row, a
+    /// composite key does not (so those tables use query fingerprints), and an
+    /// unregistered table yields nothing rather than a guess.
+    #[test]
+    fn row_identity_comes_from_the_registered_schema() {
+        register_test_schema_identity();
+        assert_eq!(
+            db_pk_column("payment_intent").as_deref(),
+            Some("payment_id")
+        );
+        assert_eq!(
+            db_pk_column("incremental_authorization"),
+            None,
+            "a composite key has no single identifying column"
+        );
+        assert_eq!(
+            table_identity_columns("incremental_authorization"),
+            Some(vec![
+                "authorization_id".to_owned(),
+                "merchant_id".to_owned()
+            ]),
+            "but the schema's actual key columns are still available, in key order"
+        );
+        assert_eq!(
+            db_pk_column("a_table_nobody_registered"),
+            None,
+            "an unregistered table yields no key rather than a guess"
+        );
+        assert!(table_identity_is_registered());
+    }
 
     fn make_event(
         req_seq: u64,
@@ -4713,6 +4833,7 @@ mod tests {
 
     #[test]
     fn db_row_state_keys_use_only_known_unique_pk_columns() {
+        register_test_schema_identity();
         let keys = db_row_state_keys(
             "payment_attempt",
             &serde_json::json!([
@@ -4739,6 +4860,7 @@ mod tests {
 
     #[test]
     fn db_result_envelopes_emit_non_id_row_keys_and_keep_query_fallback() {
+        register_test_schema_identity();
         let users_query = db_query_state_key(
             "find_user_by_id",
             "users",

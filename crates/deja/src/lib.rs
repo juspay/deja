@@ -37,12 +37,24 @@ pub use deja_runtime::replay::{
     LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
 };
 pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_execute_mode};
-/// Re-export the generic seed-plan pipeline (pure builder, diverged-read
-/// classification, ambient template) so the harness materializes seeds from
-/// explicit event read/write captures.
 pub use deja_runtime::replay::{
     build_seed_plan, build_write_target_tables, AmbientTemplate, NotPreconditionReason,
     ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
+};
+/// Re-export the generic seed-plan pipeline (pure builder, diverged-read
+/// classification, ambient template) so the harness materializes seeds from
+/// explicit event read/write captures.
+/// Whether observation is off entirely (feature on, deja idle). Lets a caller
+/// skip boot-time work that only recording or replay needs.
+pub fn runtime_mode_is_disabled() -> bool {
+    deja_runtime::runtime_mode().is_disabled()
+}
+
+/// Row identity is read from the schema that owns it, never listed here: the
+/// statement, the registry it feeds, and the lookup consumers use.
+pub use deja_runtime::replay::{
+    register_table_identity, table_identity_columns, table_identity_is_registered,
+    TABLE_IDENTITY_SQL,
 };
 /// Re-export the correlation-propagation tracing layer, which mirrors the ingress
 /// `request_id` span field into deja-context so spawned-task boundary events
@@ -1069,7 +1081,9 @@ pub mod db {
     /// these instead of `get_result_async` / `get_results_async` /
     /// `first_async` at result-returning sites on an instrumented pool.
     #[cfg(feature = "diesel-pg")]
-    pub use deja_diesel::{first_captured, get_result_captured, get_results_captured};
+    pub use deja_diesel::{
+        first_captured, get_result_captured, get_results_captured, TableIdentityRow,
+    };
 
     /// Build the database request payload common to Diesel helpers. Borrows
     /// its inputs so boundary-attribute exprs can evaluate it eagerly while the
@@ -1270,6 +1284,18 @@ pub mod db {
         }
     }
 
+    /// Register schema identity from `(table, column)` rows in key order — the
+    /// shape [`crate::TABLE_IDENTITY_SQL`] returns. Groups the rows and hands
+    /// them to the registry, so every populator folds them the same way.
+    pub fn register_table_identity_rows(rows: impl IntoIterator<Item = (String, String)>) {
+        let mut by_table: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (table, column) in rows {
+            by_table.entry(table).or_default().push(column);
+        }
+        crate::register_table_identity(by_table);
+    }
+
     /// Convert row images into the compact event image payload.
     pub fn row_image_payload(table: &str, value: &serde_json::Value) -> Option<serde_json::Value> {
         row_image_payload_with_metadata(table, value, &[])
@@ -1451,7 +1477,7 @@ pub mod db {
             let Some(value) = position.checked_sub(1).and_then(|i| binds.get(i)) else {
                 continue;
             };
-            let row = serde_json::json!({ pk: value });
+            let row = serde_json::json!({ pk.clone(): value });
             if let Some(key) = deja_runtime::replay::db_row_state_key(table, &row) {
                 let wire = key.to_wire();
                 if !keys.contains(&wire) {
