@@ -51,21 +51,96 @@ Three properties, each load-bearing:
    find_business_profile` is not the same call under `server_wrap >
    release_lock`, whatever its method name. This is the identity that the
    flat scorer's method-name pairing threw away, and that the span-scoped
-   pairing (the flat fix preceding this design) restores as a string prefix.
+   pairing (the flat fix preceding this design) restores as full-path
+   equality.
 2. **Order-free among siblings.** The recording ran concurrent traffic;
    replay may serialize it differently. Sibling sets compare as multisets
    grouped by name; wall-clock interleaving carries no meaning. A flat
    stream cannot make this distinction — it conflates causal order with
    temporal order, which is why concurrency demanded special-case demotion
    rules.
-3. **Occurrence scoped to the parent.** Same-named repeats (a loop, a retry)
-   disambiguate by index *within their aligned parent*, not globally. Where
-   sibling names repeat across concurrent lineages, the task lineage fields
-   (`bucket_id`, `fork_seq`) discriminate before occurrence does.
+3. **Occurrence scoped to the parent — a declared trade, not a free lunch.**
+   Same-named repeats (a loop, a retry) disambiguate by index *within their
+   aligned parent*, not globally. Inside one same-named group, though, the
+   k-th↔k-th pairing reuses each side's local creation order — the very
+   temporal signal property 2 discards across names. Optimal within-group
+   matching (an assignment problem over subtree similarity) is deliberately
+   not attempted in v1; that omission is what makes the O(nodes) claim
+   true. Where the group's nodes carry boundary events, the events'
+   task-lineage fields (`bucket_id`, `fork_seq`) discriminate before
+   occurrence does — but a bare span node has no lineage of its own
+   (`ExecutionGraphNode` carries none today), so a wrong k-pairing inside a
+   concurrent same-named group is possible and would surface as a paired
+   `ValueDiverged` across two subtrees. The report must therefore present
+   same-named sibling groups with more than one member as lower-confidence
+   alignments, named as such.
 
 Alignment is a single top-down pass, O(nodes), no search: align roots, then
 recursively align same-named children in order, and everything that fails to
 align is *itself* the finding.
+
+## The object being aligned: an activation forest
+
+Worth stating precisely, because every guarantee above rests on it — and
+because "execution graph" invites the wrong intuition (the natural read is
+enter-a-span-then-pop-back, which sounds like a cycle).
+
+**Acyclic by construction.** Nodes are ACTIVATIONS, not code sites. A static
+call graph — nodes = functions — is genuinely cyclic under recursion
+(`A → B → A`). Here the graph layer mints a fresh `node_id` per span
+instance, so recursion produces a new node under the previous one and
+unrolls into a chain. Each node carries exactly one structural edge,
+`parent_id`, pointing at the span it was created under; a parent must exist
+before its child, so creation order is a topological order and a cycle is
+unrepresentable. The enter–descend–exit pop-back lives in the WALK — the
+Euler tour a flamegraph draws — not in the structure being walked. Async
+does not change this: a tracing span enters and exits once per poll across
+awaits, and all of it collapses into one node with one
+first-enter-to-last-close interval. The structure is creation-ancestry,
+never time-nesting — a span can even close after its correlation scope
+exited.
+
+**`causal_parent_ids` makes it a DAG; alignment ignores those edges.** The
+follows-from edges cross subtrees and exist for race attribution. Alignment
+walks `parent_id` only — causal edges are annotations carried through to the
+ported race-evidence rules, never alignment structure — so aligned-parent
+occurrence scoping stays well-defined on a tree.
+
+**Forests, not trees.** The scoped reader promotes a node whose parent the
+tape does not carry to a root (`scope.rs`; the replay side of the evidence
+run carried 175 promoted roots), so a correlation is a forest. Roots align
+as the sibling set of a virtual top node — the same (span_name, occurrence)
+rule — and an unaligned root is a pruned or novel subtree like any other.
+
+**A malformed tape can still fabricate a cycle, and the reader already
+defends against it.** `parent_id` is a u64 that must survive a JSON pipeline
+known to mangle large integers; `root_for` carries an explicit cycle-break
+(an entry point on a cycle becomes its own root) — semantically unreachable,
+defensively necessary. The aligner adopts the same guard, because
+`PrunedSubtree`/`NovelSubtree` are only well-defined over acyclic structure:
+a detected cycle demotes the correlation to the flat tier, declared in the
+scorecard like every other degradation.
+
+## Serving identity vs scoring identity
+
+Replay SERVES results through the lookup ladder — `LookupKey::occurrence` is
+FIFO per (correlation, bucket, address, args) — while the aligner SCORES by
+k-th-child-of-aligned-parent. Two different occurrence schemes, and nothing
+forces them to agree: on a loop of same-named calls the ladder may bind
+recorded result *n* to the node alignment calls *k*. Scoring a node with a
+value the server bound crosswise would manufacture exactly the
+plausible-and-wrong finding this design exists to kill — the repo's
+canonical producer/consumer split, one layer up.
+
+The reconciliation is evidence, not assumption: every observed call already
+records which recorded event the ladder actually served
+(`source_event_global_sequence`). The aligner joins through that field. When
+the served event is attached to the very node the alignment paired, the two
+identities agree and the comparison is anchored; when they disagree, the
+node classifies as `IdentitySkew` — counted, non-silent, listed with both
+bindings — rather than being scored as a value divergence. Migration step
+2's golden tests must include a same-named loop where the two schemes
+disagree, asserting the skew is reported, not scored.
 
 ## Classification falls out
 
@@ -130,6 +205,23 @@ and each ports to where it natively lives:
 - **Request-only cases** (validation rejections): an empty tree aligned with
   an empty tree. Trivially matched, no warning — the graph-note fix already
   encodes this judgment.
+- **Attachment gaps**: `graph_node_id` is optional on events. An event
+  inside a graphed correlation that carries no node id joins by span path
+  only when that join is unambiguous — exactly one candidate node —
+  otherwise the event scores through the flat tier and the correlation's
+  report says how many events did. Never a silent guess among the
+  occurrence-siblings alignment exists to disambiguate.
+- **Span-rename drift is a known blind spot — detected, not solved.** The
+  record graph is the baseline's code and the replay graph is the
+  candidate's, different by design. A renamed ancestor span makes its whole
+  subtree unalignable and reads as a Pruned+Novel pair, indistinguishable
+  from a real wall. The v1 mitigation is honest rather than clever: when a
+  pruned and a novel subtree under the same aligned parent have matching
+  shape (same child-name multiset, same boundary-event count), the report
+  flags the pair as a suspected rename instead of two independent findings.
+  A real name-mapping story — declared renames, or content-based matching —
+  is future work, and this document says so instead of pretending the case
+  cannot arise.
 
 ## Accounting
 
@@ -138,7 +230,9 @@ Asserted, not logged, same standard as the flat scorer's new backstop:
 ```
 |record nodes| = aligned + pruned-under-some-root
 |replay nodes| = aligned + novel-under-some-root
+aligned = matched + value-diverged + identity-skew
 every boundary event maps to exactly one node outcome
+  (flat-tier events counted and named per correlation)
 summary counters are projections of the node table — never a second tally
 ```
 
