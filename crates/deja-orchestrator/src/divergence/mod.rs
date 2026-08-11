@@ -2640,6 +2640,37 @@ mod tests {
     use deja::{LookupEntry, LookupKey};
     use deja_kernel::JsonFieldDiff;
 
+    /// Row identity is read from the schema at run time (see
+    /// `register_table_identity`); tests stand in for that read with the same
+    /// shape the statement returns. Idempotent, so every test that needs row
+    /// keys can call it without ordering assumptions.
+    fn register_test_schema_identity() {
+        deja::register_table_identity([
+            ("payment_attempt".to_owned(), vec!["attempt_id".to_owned()]),
+            ("payment_intent".to_owned(), vec!["payment_id".to_owned()]),
+            (
+                "payment_methods".to_owned(),
+                vec!["payment_method_id".to_owned()],
+            ),
+            (
+                "merchant_account".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            (
+                "merchant_key_store".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            ("business_profile".to_owned(), vec!["profile_id".to_owned()]),
+            (
+                "merchant_connector_account".to_owned(),
+                vec!["merchant_connector_id".to_owned()],
+            ),
+            ("customers".to_owned(), vec!["customer_id".to_owned()]),
+            ("users".to_owned(), vec!["user_id".to_owned()]),
+            ("address".to_owned(), vec!["address_id".to_owned()]),
+            ("configs".to_owned(), vec!["key".to_owned()]),
+        ]);
+    }
     /// [`super::detect`], with the report's INTERNAL CONSISTENCY checked on
     /// every fixture in this module.
     ///
@@ -3831,6 +3862,7 @@ mod tests {
 
     #[test]
     fn rule_a_demotes_declared_renamed_update_returning() {
+        register_test_schema_identity();
         let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
         let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
         let card = detect(&art_with_events(
@@ -3867,6 +3899,7 @@ mod tests {
 
     #[test]
     fn canon_final_state_preserves_rule_a_demotion_and_lost_update_guard() {
+        register_test_schema_identity();
         let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
         let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
 
@@ -4137,6 +4170,7 @@ mod tests {
     // evidence (modulo volatile columns) must demote it.
     #[test]
     fn rule_a_demotes_order_swap_when_observed_equals_recorded_final() {
+        register_test_schema_identity();
         let pre = serde_json::json!({"attempt_id": "pay_1", "status": "pending",
             "connector_transaction_id": null, "modified_at": "2026-07-02T18:43:47.101Z"});
         let final_rec = serde_json::json!({"attempt_id": "pay_1", "status": "charged",
@@ -4931,6 +4965,7 @@ mod tests {
 
     #[test]
     fn recognized_read_write_lineage_race_is_inconclusive_with_auto_rerun() {
+        register_test_schema_identity();
         let corr = "race-corr";
         let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
         let raced_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
@@ -5028,6 +5063,7 @@ mod tests {
 
     #[test]
     fn race_attributed_http_body_diff_is_inconclusive_not_blocking() {
+        register_test_schema_identity();
         let corr = "race-body-corr";
         let recorded_row = serde_json::json!({
             "attempt_id": "pay_1",
@@ -5129,6 +5165,7 @@ mod tests {
 
     #[test]
     fn build_ledger_mirrors_race_attributed_http_body_classification() {
+        register_test_schema_identity();
         let run_id = "run-ledger-race-body";
         let recording_id = "rec-ledger-race-body";
         let corr = "race-body-ledger-corr";
@@ -5263,6 +5300,7 @@ mod tests {
 
     #[test]
     fn unattributed_http_body_diff_keeps_race_run_blocking() {
+        register_test_schema_identity();
         let corr = "race-body-blocking-corr";
         let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
         let raced_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});

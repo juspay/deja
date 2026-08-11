@@ -2282,7 +2282,15 @@ fn materialize_seed_plan(
             continue;
         }
         let mut entries = plan.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| seed_materialization_priority(entry));
+        // Chronology FIRST: a tape can carry two versions of one row under
+        // different state keys (an early read's image, a post-update read's
+        // image); one store holds one, and `ON CONFLICT DO NOTHING` keeps
+        // whichever lands first. First must mean FIRST OBSERVED — key-string
+        // order let a later version land before an earlier read's, and every
+        // read of the early state diverged by the update's delta. The
+        // row-before-query priority survives as the tiebreak WITHIN one
+        // source event (its row-key and query-key entries share a sequence).
+        entries.sort_by_key(|entry| (entry.source_sequence, seed_materialization_priority(entry)));
         for entry in entries {
             match entry.boundary.as_str() {
                 // REDIS — render the recorded wire value to its typed write
@@ -3224,6 +3232,53 @@ impl DbCatalog {
     }
 }
 
+/// Teach the replay side which columns identify a row, by asking the database
+/// that holds the schema.
+///
+/// Row identity is a fact about the SCHEMA, so it is read from the schema.
+/// Both halves of deja used to consult a hardcoded `table → column` map — the
+/// tables of one particular application listed inside a generic engine, and a
+/// shape that cannot describe a composite key at all. The statement lives in
+/// the runtime (`TABLE_IDENTITY_SQL`) so every populator asks the same
+/// question; this one runs it against the replay store.
+fn register_table_identity(store: &StoreExec) {
+    let mut command = store.psql(&["-A", "-t", "-F", "\t"], false, deja::TABLE_IDENTITY_SQL);
+    let Ok(output) = command.output() else {
+        eprintln!(
+            "lifecycle: could not read row identity from the schema; row keys will fall back to query fingerprints"
+        );
+        return;
+    };
+    if !output.status.success() {
+        eprintln!(
+            "lifecycle: row identity read exited {}; row keys will fall back to query fingerprints",
+            output.status
+        );
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.split('\t');
+        let (Some(table), Some(column)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        by_table
+            .entry(table.to_owned())
+            .or_default()
+            .push(column.to_owned());
+    }
+    let composite = by_table
+        .values()
+        .filter(|columns| columns.len() > 1)
+        .count();
+    eprintln!(
+        "lifecycle: row identity read from the schema: {} table(s), {composite} with composite keys",
+        by_table.len()
+    );
+    deja::register_table_identity(by_table);
+}
+
 fn load_db_catalog(store: &StoreExec) -> DbCatalog {
     let sql =
         "SELECT cls.relname, attr.attname, typ.oid::int4, typ.typname, (NOT attr.attnotnull) \
@@ -3271,6 +3326,7 @@ fn load_db_catalog(store: &StoreExec) -> DbCatalog {
                     "lifecycle: db catalog is EMPTY — every seeded column will be rendered without type information"
                 );
             }
+            register_table_identity(store);
             catalog
         }
         Ok(output) => {
@@ -4715,6 +4771,37 @@ mod tests {
     use crate::scope::{RunScope, ScopedRecording, TapeSlot};
     use crate::{CandidateSpec, RunSpec};
 
+    /// Row identity is read from the schema at run time (see
+    /// `register_table_identity`); tests stand in for that read with the same
+    /// shape the statement returns. Idempotent, so every test that needs row
+    /// keys can call it without ordering assumptions.
+    fn register_test_schema_identity() {
+        deja::register_table_identity([
+            ("payment_attempt".to_owned(), vec!["attempt_id".to_owned()]),
+            ("payment_intent".to_owned(), vec!["payment_id".to_owned()]),
+            (
+                "payment_methods".to_owned(),
+                vec!["payment_method_id".to_owned()],
+            ),
+            (
+                "merchant_account".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            (
+                "merchant_key_store".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            ("business_profile".to_owned(), vec!["profile_id".to_owned()]),
+            (
+                "merchant_connector_account".to_owned(),
+                vec!["merchant_connector_id".to_owned()],
+            ),
+            ("customers".to_owned(), vec!["customer_id".to_owned()]),
+            ("users".to_owned(), vec!["user_id".to_owned()]),
+            ("address".to_owned(), vec!["address_id".to_owned()]),
+            ("configs".to_owned(), vec!["key".to_owned()]),
+        ]);
+    }
     /// Write a tape into the canonical slot and open it at `scope`.
     fn recording(body: &str, scope: RunScope) -> (tempfile::TempDir, ScopedRecording) {
         let dir = tempfile::tempdir().unwrap();
@@ -4868,6 +4955,7 @@ mod tests {
             image: None,
             method: None,
             origin: deja::SeedOrigin::Recording,
+            source_sequence: 0,
         }
     }
 
@@ -6474,6 +6562,7 @@ mod tests {
             image: None,
             method: None,
             origin: deja::SeedOrigin::Recording,
+            source_sequence: 0,
         });
         plan.upsert(deja::SeedEntry {
             boundary: "db".to_owned(),
@@ -6482,6 +6571,7 @@ mod tests {
             image: None,
             method: None,
             origin: deja::SeedOrigin::Recording,
+            source_sequence: 0,
         });
 
         let query_seed = plan.resolve("db", &query_key).expect("query seed present");
@@ -6527,6 +6617,56 @@ mod tests {
         assert!(
             second_sql.contains("'succeeded'"),
             "the query fallback snapshot is still materialized after the exact row; got: {second_sql}"
+        );
+    }
+
+    /// A tape can carry TWO versions of one row under different state keys —
+    /// an early read's image and a post-update read's. One store holds one,
+    /// and `ON CONFLICT DO NOTHING` keeps whichever lands first, so first
+    /// must mean FIRST OBSERVED: key-string order let a later version land
+    /// before an earlier read's, and every read of the early state diverged
+    /// by the update's delta (13 payment_methods timestamp divergences plus
+    /// 13 readback misses on run-0811). Within one source event, the
+    /// row-before-query priority survives as the tiebreak.
+    #[test]
+    fn seed_materialization_orders_by_source_sequence_before_kind() {
+        let entry = |key: &str, seq: u64| deja::SeedEntry {
+            boundary: "db".to_owned(),
+            key: key.to_owned(),
+            value: serde_json::json!({}),
+            image: None,
+            method: None,
+            origin: deja::SeedOrigin::Recording,
+            source_sequence: seq,
+        };
+        let row_key = |table: &str, val: &str| {
+            deja::StateKey::DbRow {
+                table: table.to_owned(),
+                pk_column: "id".to_owned(),
+                pk_value: val.to_owned(),
+            }
+            .to_wire()
+        };
+        let query_key = |table: &str, fp: &str| {
+            deja::StateKey::DbQuery {
+                table: table.to_owned(),
+                fingerprint: fp.to_owned(),
+            }
+            .to_wire()
+        };
+        // Deliberately key-string-inverted: the LATER event's keys sort first
+        // alphabetically ("aaa" < "zzz").
+        let late_row = entry(&row_key("aaa_table", "1"), 20);
+        let early_query = entry(&query_key("zzz_table", "ff"), 10);
+        let early_row = entry(&row_key("zzz_table", "1"), 10);
+        let mut entries = [&late_row, &early_query, &early_row];
+        entries.sort_by_key(|entry| (entry.source_sequence, seed_materialization_priority(entry)));
+        let order: Vec<u64> = entries.iter().map(|e| e.source_sequence).collect();
+        assert_eq!(order, [10, 10, 20], "earliest observed version lands first");
+        assert_eq!(
+            seed_materialization_priority(entries[0]),
+            0,
+            "within one source event the exact row still precedes the query snapshot"
         );
     }
 
@@ -7303,6 +7443,7 @@ mod tests {
     /// pragmatic-PK extraction that mints row state keys.
     #[test]
     fn wire_readback_predicate_finds_the_pragmatic_pk() {
+        register_test_schema_identity();
         let row = wire_row_image(
             "payment_intent",
             vec![

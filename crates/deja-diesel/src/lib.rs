@@ -88,6 +88,21 @@ use diesel::{Connection, ConnectionResult, QueryResult, RunQueryDsl};
 
 use deja_runtime::wire_capture::{WireColumn, WireRow, WireSlot};
 
+/// One row of `deja::TABLE_IDENTITY_SQL`: a table and one of its primary-key
+/// columns, in key order.
+///
+/// Row identity is a fact about the SCHEMA, so a recorder reads it from the
+/// schema rather than carrying a list of table names. This type lives here
+/// because it needs diesel's row derive; the statement and the registry it
+/// feeds live in the runtime, so every populator asks the same question.
+#[derive(diesel::QueryableByName)]
+pub struct TableIdentityRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub table_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub column_name: String,
+}
+
 /// Connection wrapper capturing result rows' binary wire values for
 /// wire-faithful seeding. See the crate docs.
 pub struct DejaLoadConnection<C> {

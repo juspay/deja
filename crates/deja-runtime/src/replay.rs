@@ -229,18 +229,83 @@ pub fn db_table_from_event_args(args: &serde_json::Value) -> Option<&str> {
 /// Rule A cannot group unrelated rows by a merely common column such as
 /// `merchant_id`. Public as a PRODUCER api: the facade's binds-parser derives
 /// row-exact read keys for reads whose result carries no row (e.g. NotFound).
-pub fn db_pk_column(table: &str) -> Option<&'static str> {
-    match table {
-        "payment_attempt" => Some("attempt_id"),
-        "payment_intent" => Some("payment_id"),
-        "merchant_account" | "merchant_key_store" => Some("merchant_id"),
-        "business_profile" => Some("profile_id"),
-        "merchant_connector_account" => Some("merchant_connector_id"),
-        "customers" => Some("customer_id"),
-        "organization" | "organizations" => Some("organization_id"),
-        "users" => Some("user_id"),
-        "api_keys" => Some("key_id"),
-        "user_authentication_methods" => Some("id"),
+/// Primary-key columns per table, as reported by the database that holds them.
+///
+/// Row identity is a fact about the SCHEMA, so it is read from the schema —
+/// never listed in this library. A hardcoded `table → column` map was both
+/// application-specific (the tables of one particular product living in a
+/// generic engine) and structurally unable to describe what it claimed: a
+/// composite primary key has no single column, so every composite table it
+/// covered, it covered wrongly.
+///
+/// Populated by whoever holds a connection to the schema in question — the
+/// `deja-diesel` wrapper when recording, the orchestrator's catalog read when
+/// replaying — through [`register_table_identity`]. Empty until then, which
+/// makes row keys absent rather than wrong: consumers fall back to query
+/// fingerprints, the same path a table with an unknown key has always taken.
+static TABLE_IDENTITY: std::sync::RwLock<Option<BTreeMap<String, Vec<String>>>> =
+    std::sync::RwLock::new(None);
+
+/// The statement that answers "which columns identify a row of each table",
+/// asked of the database that owns the schema. Published here so every
+/// populator asks the same question rather than reinventing it:
+/// `pg_index.indisprimary` is the constraint the database enforces, so a
+/// composite key arrives as the several columns it actually has, in key order.
+/// Yields `(table_name, column_name)` rows.
+pub const TABLE_IDENTITY_SQL: &str =
+    "SELECT cls.relname AS table_name, attr.attname AS column_name \
+     FROM pg_catalog.pg_index idx \
+     JOIN pg_catalog.pg_class cls ON cls.oid = idx.indrelid \
+     JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace \
+     JOIN pg_catalog.pg_attribute attr \
+       ON attr.attrelid = cls.oid AND attr.attnum = ANY(idx.indkey) \
+     WHERE idx.indisprimary AND ns.nspname = 'public' \
+     ORDER BY cls.relname, array_position(idx.indkey, attr.attnum)";
+
+/// Register the primary-key columns of each table, keyed by table name. Merges
+/// into whatever is already known, so a process that learns about more schemas
+/// (a second store, a second database) accumulates rather than replaces.
+pub fn register_table_identity(entries: impl IntoIterator<Item = (String, Vec<String>)>) {
+    let Ok(mut guard) = TABLE_IDENTITY.write() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(BTreeMap::new);
+    for (table, columns) in entries {
+        map.insert(table, columns);
+    }
+}
+
+/// The registered primary-key columns of a table, in key order.
+pub fn table_identity_columns(table: &str) -> Option<Vec<String>> {
+    TABLE_IDENTITY
+        .read()
+        .ok()?
+        .as_ref()?
+        .get(table)
+        .filter(|columns| !columns.is_empty())
+        .cloned()
+}
+
+/// Whether any schema identity has been registered — the difference between
+/// "this table has no single-column key" and "nobody has told us the schema".
+pub fn table_identity_is_registered() -> bool {
+    TABLE_IDENTITY
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|map| !map.is_empty()))
+        .unwrap_or(false)
+}
+
+/// The single column that identifies a row of `table`, when the schema says
+/// there is exactly one.
+///
+/// A composite key deliberately yields `None`: the row-key grammar addresses
+/// one column, so a composite table takes the query-fingerprint path — now
+/// because the schema says the key has several columns, not because a list
+/// forgot the table.
+pub fn db_pk_column(table: &str) -> Option<String> {
+    match table_identity_columns(table)?.as_slice() {
+        [only] => Some(only.clone()),
         _ => None,
     }
 }
@@ -251,10 +316,10 @@ pub fn db_pk_column(table: &str) -> Option<&'static str> {
 fn db_pk_column_for_table(
     table: &str,
     object: &serde_json::Map<String, serde_json::Value>,
-) -> Option<&'static str> {
+) -> Option<String> {
     let candidate = db_pk_column(table)?;
     object
-        .get(candidate)
+        .get(&candidate)
         .filter(|value| !value.is_null())
         .map(|_| candidate)
 }
@@ -265,10 +330,10 @@ fn db_pk_column_for_table(
 pub fn db_row_state_key(table: &str, row: &serde_json::Value) -> Option<StateKey> {
     let object = row.as_object()?;
     let column = db_pk_column_for_table(table, object)?;
-    let value = object.get(column)?;
+    let value = object.get(&column)?;
     Some(StateKey::DbRow {
         table: table.to_owned(),
-        pk_column: column.to_owned(),
+        pk_column: column.clone(),
         pk_value: db_pk_wire_value(value),
     })
 }
@@ -2201,6 +2266,18 @@ pub struct SeedEntry {
     /// How this entry entered the plan: derived from the recording's read-set,
     /// or supplied by the ambient/config template.
     pub origin: SeedOrigin,
+    /// `global_sequence` of the recorded event this entry's value came from
+    /// (`0` for ambient entries). Materialization orders by it: a tape can
+    /// carry TWO versions of one row under different state keys (an early
+    /// read's image and a post-update read's image), one store can only hold
+    /// one, and `ON CONFLICT DO NOTHING` keeps whichever lands first — so
+    /// first must mean FIRST OBSERVED, not first in key-string order.
+    /// Otherwise a later version can land before an earlier read's version
+    /// and every read of the early state diverges by the update's delta
+    /// (run-0811: 13 payment_methods timestamp divergences + 13 readback
+    /// misses from exactly this).
+    #[serde(default)]
+    pub source_sequence: u64,
 }
 
 /// Where a [`SeedEntry`] came from.
@@ -2509,32 +2586,117 @@ fn db_created_table(event: &BoundaryEvent) -> Option<String> {
     })
 }
 
-fn preferred_seed_image(event: &BoundaryEvent, canonical_key: &str) -> Option<serde_json::Value> {
+/// The row-state key a typed row-image payload denotes, for indexing images by
+/// the row they describe. Reads the pragmatic PK out of the payload's own
+/// columns, so it works on the physical (wire) image shape as well as the
+/// semantic one.
+fn image_row_state_key(payload: &serde_json::Value) -> Option<String> {
+    let object = payload.as_object()?;
+    if object.get("deja_image").and_then(serde_json::Value::as_str) != Some("db_row") {
+        return None;
+    }
+    let table = object.get("table")?.as_str()?;
+    let pk_column = db_pk_column(table)?;
+    let pk_value = object
+        .get("columns")?
+        .as_array()?
+        .iter()
+        .find(|column| {
+            column.get("name").and_then(serde_json::Value::as_str) == Some(pk_column.as_str())
+        })?
+        .get("value")?;
+    Some(
+        StateKey::DbRow {
+            table: table.to_owned(),
+            pk_column: pk_column.to_owned(),
+            pk_value: db_pk_wire_value(pk_value),
+        }
+        .to_wire(),
+    )
+}
+
+/// Split a row-image payload into its per-row payloads (an image is a single
+/// row object or an array of them).
+fn image_rows(image: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match image {
+        serde_json::Value::Array(rows) => rows.iter().collect(),
+        row => vec![row],
+    }
+}
+
+/// Reassemble per-row payloads into an image payload of the same shape.
+fn image_from_rows(rows: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    match rows.len() {
+        0 => None,
+        1 => rows.into_iter().next(),
+        _ => Some(serde_json::Value::Array(rows)),
+    }
+}
+
+/// The images observed for each row so far in a correlation, keyed by row-state
+/// key. Rebuilt per correlation by [`build_seed_plan`]; the value is always the
+/// LAST image seen strictly before the event currently being planned.
+type ObservedRowImages = std::collections::HashMap<String, serde_json::Value>;
+
+fn preferred_seed_image(
+    event: &BoundaryEvent,
+    canonical_key: &str,
+    observed_rows: &ObservedRowImages,
+) -> Option<serde_json::Value> {
     let read_write_same_key = event.boundary == "db"
         && event
             .write_set
             .iter()
             .any(|key| canonical_state_key_wire(key) == canonical_key);
-    if read_write_same_key {
-        // A DB read+write on the same state key is an RMW precondition, so an
-        // explicit pre-image is the state to seed and wins when the producer
-        // captured one.
-        //
-        // When it did not, the alternative is NOT "seed nothing": leaving
-        // `image` absent sends materialization down the `value = event.result`
-        // path, which is that same post-write state in a LOSSIER
-        // representation — serde shapes with no physical bytes behind them
-        // (`{"TxnId": …}` in a varchar column), which the fail-closed SQL
-        // renderer must refuse rather than guess at. Both routes seed the post
-        // state; only one of them can be materialized faithfully. So prefer
-        // the physical post-image: identical state, wire-exact bytes.
-        event
-            .pre_image
-            .clone()
-            .or_else(|| event.result_image.clone())
-    } else {
-        event.result_image.clone()
+    if !read_write_same_key {
+        return event.result_image.clone();
     }
+    // A DB read+write on the same state key is an RMW precondition: the state
+    // to seed is the row as it was BEFORE this event, and this event's
+    // `result_image` is the row AFTER. An explicit `pre_image` wins whenever a
+    // producer captured one.
+    if let Some(pre_image) = event.pre_image.clone() {
+        return Some(pre_image);
+    }
+    // No producer captures one, and none can: the pre-state is not in an
+    // `UPDATE … RETURNING` response, and postgres before 18 has no
+    // `RETURNING OLD.*`. But it does not need capturing — a correlation that
+    // updates a row has almost always READ it first (216 of 217 RMW events on
+    // the sandbox tape), so the pre-state is already on the tape a few events
+    // earlier. Substitute each row of the post-image with the last image
+    // observed for that same row, per row, so a multi-row update mixes
+    // correctly.
+    //
+    // Seeding the post-image instead is what made an earlier read diverge:
+    // two entries denoting one row raced into the store, `ON CONFLICT DO
+    // NOTHING` kept whichever landed first, and reads of the pre-state
+    // returned post-state values (13 payment_methods timestamp divergences
+    // and their 13 readback misses on run-0811).
+    let post_image = event.result_image.clone()?;
+    let rows = image_rows(&post_image);
+    let mut substituted = 0usize;
+    let resolved: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            image_row_state_key(row)
+                .and_then(|key| observed_rows.get(&key))
+                .map(|prior| {
+                    substituted += 1;
+                    prior.clone()
+                })
+                .unwrap_or_else(|| (*row).clone())
+        })
+        .collect();
+    if substituted == 0 {
+        // Nothing earlier was observed for any of these rows. The post-image
+        // is the only evidence there is; seeding it keeps the replayed UPDATE
+        // from hitting an empty table, and is sound whenever the update's
+        // predicate does not test a column it also writes. Left as-is rather
+        // than skipped — an absent row makes the write vanish, which is
+        // strictly worse than a post-state stand-in.
+        return Some(post_image);
+    }
+    image_from_rows(resolved)
 }
 
 pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -> SeedPlan {
@@ -2554,6 +2716,10 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     // to seed. Built in event order, so a read BEFORE any create still seeds.
     let mut created_tables: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // The last image observed for each row so far, so an RMW event can seed the
+    // state its row was in BEFORE it (see `preferred_seed_image`). Updated
+    // AFTER each event is planned, so an event never sees its own image.
+    let mut observed_rows: ObservedRowImages = std::collections::HashMap::new();
 
     for event in events {
         if !correlation_matches(event, correlation_id) {
@@ -2603,9 +2769,10 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     // Redis typed-codec envelopes seed their inner value; every
                     // other boundary seeds the raw recorded result unchanged.
                     value: redis_seedable_result(event).clone(),
-                    image: preferred_seed_image(event, &canonical_key),
+                    image: preferred_seed_image(event, &canonical_key, &observed_rows),
                     method: Some(event.method_name.clone()),
                     origin: SeedOrigin::Recording,
+                    source_sequence: event.global_sequence,
                 });
             }
         }
@@ -2619,6 +2786,19 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         if event.boundary == "db" && is_db_create_event(event) {
             if let Some(table) = db_created_table(event) {
                 created_tables.insert((event.boundary.clone(), table));
+            }
+        }
+        // This event's rows become the latest observed state for anything
+        // planned after it. Recorded for every DB event that carries a typed
+        // image, including creates and RMWs: a later RMW's pre-state is
+        // whatever the most recent observation says, whoever wrote it.
+        if event.boundary == "db" {
+            if let Some(image) = &event.result_image {
+                for row in image_rows(image) {
+                    if let Some(key) = image_row_state_key(row) {
+                        observed_rows.insert(key, row.clone());
+                    }
+                }
             }
         }
     }
@@ -2705,6 +2885,7 @@ impl AmbientTemplate {
             image: None,
             method: None,
             origin: SeedOrigin::Ambient,
+            source_sequence: 0,
         });
     }
 
@@ -2910,6 +3091,77 @@ mod body_identity_tests {
 mod tests {
     use super::*;
     use crate::{now_ns, BoundaryEvent};
+
+    /// Row identity comes from a real schema at run time; tests stand in for
+    /// that read with the same shape the statement returns. Registered once for
+    /// the whole test binary, and idempotently, so any test that needs row keys
+    /// can call it without ordering assumptions.
+    fn register_test_schema_identity() {
+        register_table_identity([
+            ("payment_attempt".to_owned(), vec!["attempt_id".to_owned()]),
+            ("payment_intent".to_owned(), vec!["payment_id".to_owned()]),
+            (
+                "payment_methods".to_owned(),
+                vec!["payment_method_id".to_owned()],
+            ),
+            (
+                "merchant_account".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            (
+                "merchant_key_store".to_owned(),
+                vec!["merchant_id".to_owned()],
+            ),
+            ("business_profile".to_owned(), vec!["profile_id".to_owned()]),
+            (
+                "merchant_connector_account".to_owned(),
+                vec!["merchant_connector_id".to_owned()],
+            ),
+            ("customers".to_owned(), vec!["customer_id".to_owned()]),
+            ("users".to_owned(), vec!["user_id".to_owned()]),
+            ("api_keys".to_owned(), vec!["key_id".to_owned()]),
+            ("address".to_owned(), vec!["address_id".to_owned()]),
+            ("configs".to_owned(), vec!["key".to_owned()]),
+            // A composite key, to keep the "no single identifying column"
+            // branch honest: this table must take the query-fingerprint path.
+            (
+                "incremental_authorization".to_owned(),
+                vec!["authorization_id".to_owned(), "merchant_id".to_owned()],
+            ),
+        ]);
+    }
+
+    /// Identity is a fact read from the schema, and the shape it arrives in
+    /// decides the row-key grammar: exactly one column identifies a row, a
+    /// composite key does not (so those tables use query fingerprints), and an
+    /// unregistered table yields nothing rather than a guess.
+    #[test]
+    fn row_identity_comes_from_the_registered_schema() {
+        register_test_schema_identity();
+        assert_eq!(
+            db_pk_column("payment_intent").as_deref(),
+            Some("payment_id")
+        );
+        assert_eq!(
+            db_pk_column("incremental_authorization"),
+            None,
+            "a composite key has no single identifying column"
+        );
+        assert_eq!(
+            table_identity_columns("incremental_authorization"),
+            Some(vec![
+                "authorization_id".to_owned(),
+                "merchant_id".to_owned()
+            ]),
+            "but the schema's actual key columns are still available, in key order"
+        );
+        assert_eq!(
+            db_pk_column("a_table_nobody_registered"),
+            None,
+            "an unregistered table yields no key rather than a guess"
+        );
+        assert!(table_identity_is_registered());
+    }
 
     fn make_event(
         req_seq: u64,
@@ -4581,6 +4833,7 @@ mod tests {
 
     #[test]
     fn db_row_state_keys_use_only_known_unique_pk_columns() {
+        register_test_schema_identity();
         let keys = db_row_state_keys(
             "payment_attempt",
             &serde_json::json!([
@@ -4607,6 +4860,7 @@ mod tests {
 
     #[test]
     fn db_result_envelopes_emit_non_id_row_keys_and_keep_query_fallback() {
+        register_test_schema_identity();
         let users_query = db_query_state_key(
             "find_user_by_id",
             "users",
@@ -4834,6 +5088,94 @@ mod tests {
             update_seed.value,
             serde_json::json!({"merchant_id": "m2", "status": "after"}),
             "legacy raw value remains available for old tapes"
+        );
+    }
+
+    /// The run-0811 payment_methods shape, end to end: a correlation READS a
+    /// row (two query fingerprints, one pre-state), then UPDATES it. The
+    /// update's read-set keys are RMW keys, and its own image is the POST
+    /// state — so seeding it makes two entries denote one row with different
+    /// contents, and `ON CONFLICT DO NOTHING` keeps whichever lands first. The
+    /// planner must resolve the RMW key to the row's LAST OBSERVED state
+    /// instead, which the earlier read put on the tape: then every entry for
+    /// that row agrees, the reads reproduce, and insert order stops mattering.
+    #[test]
+    fn seed_plan_resolves_an_rmw_key_to_the_rows_last_observed_state() {
+        let table = "payment_methods";
+        let pk = "pm_1";
+        let row_image = |stamp: &str| {
+            serde_json::json!({
+                "deja_image": "db_row",
+                "version": 1,
+                "table": table,
+                "wire_format": "binary",
+                "columns": [
+                    {"name": "payment_method_id", "type_oid": 1043, "value": pk, "wire": "706d5f31"},
+                    {"name": "last_modified", "type_oid": 1114, "value": stamp, "wire": "00"},
+                ],
+            })
+        };
+        let pre = row_image("2026-08-11 13:06:28.821026");
+        let post = row_image("2026-08-11 13:06:29.002555");
+        let read_key = StateKey::DbQuery {
+            table: table.to_owned(),
+            fingerprint: "read-fingerprint".to_owned(),
+        }
+        .to_wire();
+        // The update's own read-set key is a DIFFERENT query fingerprint — the
+        // per-key upsert cannot dedup it against the read's entry.
+        let update_key = StateKey::DbQuery {
+            table: table.to_owned(),
+            fingerprint: "update-fingerprint".to_owned(),
+        }
+        .to_wire();
+
+        let mut read = state_event(
+            10,
+            Some("c1"),
+            "db",
+            "generic_find_one_core",
+            serde_json::json!({"table": table}),
+            serde_json::json!({"payment_method_id": pk}),
+            &[read_key.as_str()],
+            &[],
+            false,
+        );
+        read.result_image = Some(pre.clone());
+        let mut update = state_event(
+            20,
+            Some("c1"),
+            "db",
+            "generic_update_with_results",
+            serde_json::json!({"table": table}),
+            serde_json::json!([{"payment_method_id": pk}]),
+            &[update_key.as_str()],
+            &[update_key.as_str()],
+            false,
+        );
+        update.result_image = Some(post.clone());
+
+        let plan = build_seed_plan(&[read, update], Some("c1"));
+        assert_eq!(
+            plan.resolve("db", read_key.as_str())
+                .expect("the read seeds")
+                .image,
+            Some(pre.clone()),
+            "the read seeds the state it observed"
+        );
+        assert_eq!(
+            plan.resolve("db", update_key.as_str())
+                .expect("the RMW key seeds")
+                .image,
+            Some(pre),
+            "the RMW key seeds the row's last observed state, NOT its own post-image"
+        );
+        assert_ne!(
+            plan.resolve("db", update_key.as_str())
+                .expect("the RMW key seeds")
+                .image,
+            Some(post),
+            "post-image seeding is what made the earlier read diverge"
         );
     }
 
