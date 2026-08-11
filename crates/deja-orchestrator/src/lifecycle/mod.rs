@@ -2282,7 +2282,15 @@ fn materialize_seed_plan(
             continue;
         }
         let mut entries = plan.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| seed_materialization_priority(entry));
+        // Chronology FIRST: a tape can carry two versions of one row under
+        // different state keys (an early read's image, a post-update read's
+        // image); one store holds one, and `ON CONFLICT DO NOTHING` keeps
+        // whichever lands first. First must mean FIRST OBSERVED — key-string
+        // order let a later version land before an earlier read's, and every
+        // read of the early state diverged by the update's delta. The
+        // row-before-query priority survives as the tiebreak WITHIN one
+        // source event (its row-key and query-key entries share a sequence).
+        entries.sort_by_key(|entry| (entry.source_sequence, seed_materialization_priority(entry)));
         for entry in entries {
             match entry.boundary.as_str() {
                 // REDIS — render the recorded wire value to its typed write
@@ -4868,6 +4876,7 @@ mod tests {
             image: None,
             method: None,
             origin: deja::SeedOrigin::Recording,
+            source_sequence: 0,
         }
     }
 
@@ -6474,6 +6483,7 @@ mod tests {
             image: None,
             method: None,
             origin: deja::SeedOrigin::Recording,
+            source_sequence: 0,
         });
         plan.upsert(deja::SeedEntry {
             boundary: "db".to_owned(),
@@ -6482,6 +6492,7 @@ mod tests {
             image: None,
             method: None,
             origin: deja::SeedOrigin::Recording,
+            source_sequence: 0,
         });
 
         let query_seed = plan.resolve("db", &query_key).expect("query seed present");
@@ -6527,6 +6538,56 @@ mod tests {
         assert!(
             second_sql.contains("'succeeded'"),
             "the query fallback snapshot is still materialized after the exact row; got: {second_sql}"
+        );
+    }
+
+    /// A tape can carry TWO versions of one row under different state keys —
+    /// an early read's image and a post-update read's. One store holds one,
+    /// and `ON CONFLICT DO NOTHING` keeps whichever lands first, so first
+    /// must mean FIRST OBSERVED: key-string order let a later version land
+    /// before an earlier read's, and every read of the early state diverged
+    /// by the update's delta (13 payment_methods timestamp divergences plus
+    /// 13 readback misses on run-0811). Within one source event, the
+    /// row-before-query priority survives as the tiebreak.
+    #[test]
+    fn seed_materialization_orders_by_source_sequence_before_kind() {
+        let entry = |key: &str, seq: u64| deja::SeedEntry {
+            boundary: "db".to_owned(),
+            key: key.to_owned(),
+            value: serde_json::json!({}),
+            image: None,
+            method: None,
+            origin: deja::SeedOrigin::Recording,
+            source_sequence: seq,
+        };
+        let row_key = |table: &str, val: &str| {
+            deja::StateKey::DbRow {
+                table: table.to_owned(),
+                pk_column: "id".to_owned(),
+                pk_value: val.to_owned(),
+            }
+            .to_wire()
+        };
+        let query_key = |table: &str, fp: &str| {
+            deja::StateKey::DbQuery {
+                table: table.to_owned(),
+                fingerprint: fp.to_owned(),
+            }
+            .to_wire()
+        };
+        // Deliberately key-string-inverted: the LATER event's keys sort first
+        // alphabetically ("aaa" < "zzz").
+        let late_row = entry(&row_key("aaa_table", "1"), 20);
+        let early_query = entry(&query_key("zzz_table", "ff"), 10);
+        let early_row = entry(&row_key("zzz_table", "1"), 10);
+        let mut entries = [&late_row, &early_query, &early_row];
+        entries.sort_by_key(|entry| (entry.source_sequence, seed_materialization_priority(entry)));
+        let order: Vec<u64> = entries.iter().map(|e| e.source_sequence).collect();
+        assert_eq!(order, [10, 10, 20], "earliest observed version lands first");
+        assert_eq!(
+            seed_materialization_priority(entries[0]),
+            0,
+            "within one source event the exact row still precedes the query snapshot"
         );
     }
 

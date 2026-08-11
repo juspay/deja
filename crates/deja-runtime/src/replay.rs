@@ -2201,6 +2201,18 @@ pub struct SeedEntry {
     /// How this entry entered the plan: derived from the recording's read-set,
     /// or supplied by the ambient/config template.
     pub origin: SeedOrigin,
+    /// `global_sequence` of the recorded event this entry's value came from
+    /// (`0` for ambient entries). Materialization orders by it: a tape can
+    /// carry TWO versions of one row under different state keys (an early
+    /// read's image and a post-update read's image), one store can only hold
+    /// one, and `ON CONFLICT DO NOTHING` keeps whichever lands first — so
+    /// first must mean FIRST OBSERVED, not first in key-string order.
+    /// Otherwise a later version can land before an earlier read's version
+    /// and every read of the early state diverges by the update's delta
+    /// (run-0811: 13 payment_methods timestamp divergences + 13 readback
+    /// misses from exactly this).
+    #[serde(default)]
+    pub source_sequence: u64,
 }
 
 /// Where a [`SeedEntry`] came from.
@@ -2606,6 +2618,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     image: preferred_seed_image(event, &canonical_key),
                     method: Some(event.method_name.clone()),
                     origin: SeedOrigin::Recording,
+                    source_sequence: event.global_sequence,
                 });
             }
         }
@@ -2705,6 +2718,7 @@ impl AmbientTemplate {
             image: None,
             method: None,
             origin: SeedOrigin::Ambient,
+            source_sequence: 0,
         });
     }
 
