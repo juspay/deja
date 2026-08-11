@@ -1700,12 +1700,31 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // Substitute hits resolve through lookup with observed_result == recorded_result,
     // so they never enter this path and ValueDiverged stays inert.
 
-    // Recorded side: unconsumed expected events grouped by args-free identity,
-    // ordered by source sequence, occurrence = position within the group.
-    type Identity = (Option<String>, String, String);
-    let identity_of = |corr: &Option<String>, boundary: &str, method: &str| -> Identity {
-        (corr.clone(), boundary.to_owned(), method.to_owned())
-    };
+    // Recorded side: unconsumed expected events grouped by args-free CALL
+    // identity, ordered by source sequence, occurrence = position within the
+    // group (FIFO). Identity is the rank-2 axis MINUS args — (correlation,
+    // span path, boundary, method) — never the method name alone. A method
+    // name is shared by every call through the same kit function, so
+    // name-only pairing let an error path's novel call claim an unrelated
+    // recorded event of the same method: the run-0810 phantom, where the
+    // uninstrumented cache fallthrough's `get_key(business_profile…) → Null`
+    // stole the API_LOCK release GET's recorded event and scored 24
+    // fabricated lock divergences. The span path is the pairing identity the
+    // lookup ladder itself uses (rank 2); pairing at anything weaker than
+    // what the ladder already tried and rejected can only manufacture pairs.
+    // An event with no rank-2 span address does not participate — it stays an
+    // honest OmittedCall, and a span-less observed call stays a NovelCall.
+    let recorded_span_paths = ledger::recorded_span_paths(&art.table);
+    type Identity = (Option<String>, String, String, String);
+    let identity_of =
+        |corr: &Option<String>, span: &str, boundary: &str, method: &str| -> Identity {
+            (
+                corr.clone(),
+                span.to_owned(),
+                boundary.to_owned(),
+                method.to_owned(),
+            )
+        };
     // (identity -> queue of (source_seq, recorded_result)); FIFO by source order.
     let mut recorded_pairing: BTreeMap<
         Identity,
@@ -1718,8 +1737,11 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         let (Some(boundary), Some(method)) = (&exp.boundary, &exp.method) else {
             continue;
         };
+        let Some(span) = recorded_span_paths.get(seq) else {
+            continue;
+        };
         recorded_pairing
-            .entry(identity_of(&exp.correlation, boundary, method))
+            .entry(identity_of(&exp.correlation, span, boundary, method))
             .or_default()
             .push_back((*seq, exp.result.clone()));
     }
@@ -1739,7 +1761,6 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // leaf values are proven attributable to the same race evidence.
     let http_status_clean =
         !art.http_diffs.is_empty() && art.http_diffs.iter().all(|d| d.status_match);
-    let recorded_span_paths = ledger::recorded_span_paths(&art.table);
     let inconclusive_race = inconclusive_race_evidence(
         &art.events,
         &art.observed,
@@ -1783,12 +1804,25 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     let mut blocking_side_effect = 0u64;
     let mut corr_side_effect: BTreeMap<String, u64> = BTreeMap::new();
 
+    // PASS 1 — resolved calls claim their recorded events. The verdict must be
+    // a function of the two SETS (recorded events × observed calls), never of
+    // their stream interleaving: the args-free pairing consults `consumed`, so
+    // every lookup resolution must be complete before the first pairing
+    // decision. A mid-stream guard let an unresolved call processed early
+    // steal a recorded event that a later resolved call owned — one event
+    // classified twice (ValueDiverged AND matched), which is how the run-0810
+    // phantom entered the scorecard.
+    let mut deferred: Vec<&ObservedCall> = Vec::new();
     for obs in &art.observed {
         if obs.boundary == "http_incoming" {
             continue;
         }
+        if !obs.resolved {
+            deferred.push(obs);
+            continue;
+        }
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-        if obs.resolved {
+        {
             // The recorded baseline was found (args still aligned). Under lookup
             // mode observed_result == recorded_result (substituted) so this is a
             // plain match. Under execute mode the recorded baseline was located by
@@ -1872,7 +1906,15 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                 // without bumping `diverged`.
                 *stats.kinds.entry("Recovered".to_owned()).or_insert(0) += 1;
             }
-        } else if tier_for(&obs.boundary) == Tier::Environmental {
+        }
+    }
+
+    // PASS 2 — unresolved calls, in stream order (which keeps args-free FIFO
+    // occurrence stable). `consumed` is complete: no pairing decision below
+    // can bind a recorded event that a resolved call owns.
+    for obs in deferred {
+        let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+        if tier_for(&obs.boundary) == Tier::Environmental {
             stats.bump_kind("EnvironmentalMiss");
             environmental_misses += 1;
         } else if is_nonblocking_boundary(&obs.boundary) {
@@ -1884,12 +1926,17 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             // apart from the blocking `NovelCall` because it is a different
             // thing, not a different count of the same thing.
             stats.bump_kind("NovelCallTolerated");
-        } else if let Some((twin_seq, recorded)) = recorded_pairing
-            .get_mut(&identity_of(
-                &obs.correlation_id,
-                &obs.boundary,
-                &obs.method_name,
-            ))
+        } else if let Some((twin_seq, recorded)) = obs
+            .span_path
+            .as_deref()
+            .and_then(|span| {
+                recorded_pairing.get_mut(&identity_of(
+                    &obs.correlation_id,
+                    span,
+                    &obs.boundary,
+                    &obs.method_name,
+                ))
+            })
             .and_then(|q| {
                 // Pop the next recorded twin for this identity, skipping any that a
                 // resolved (args-aligned) call already claimed — so a mixed run that
@@ -1981,6 +2028,22 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             }
         }
     }
+
+    // The accounting identity, asserted: every recorded event resolves through
+    // EXACTLY one arm — resolved (`consumed`), args-free paired
+    // (`paired_consumed`), or the omitted pass above. The two claim sets
+    // intersecting means one event was scored twice (matched AND diverged) —
+    // the double-claim that manufactured the run-0810 phantom lock
+    // divergences. Two-pass resolution makes this disjoint by construction;
+    // this assertion is the backstop that turns the next pairing defect into
+    // a loud failure at scoring time instead of a fabricated divergence that
+    // misdirects an investigation.
+    let double_claimed: Vec<u64> = consumed.intersection(&paired_consumed).copied().collect();
+    assert!(
+        double_claimed.is_empty(),
+        "scorer accounting violation: recorded event(s) {double_claimed:?} were classified by \
+         both the resolved arm and the args-free pairing — one event, two verdict outcomes"
+    );
 
     // The summary's call counters are PROJECTIONS of the per-boundary ledger
     // above, folded out of it once every call has been classified — never a
@@ -2746,6 +2809,26 @@ mod tests {
 
     fn seq_entry(corr: Option<&str>, boundary: &str, src: u64) -> LookupEntry {
         seq_entry_res(corr, boundary, src, serde_json::json!("v"))
+    }
+
+    /// Rank-2 `SpanPath` table entry for `src`. Args-free pairing is
+    /// span-scoped — the recorded event (via this address) and the observed
+    /// call (via [`ObservedCall::span_path`]) must present the same call
+    /// identity to pair; a bare method name is not an identity. Append AFTER
+    /// the event's `Sequence` entry: the `expected` fold keeps the FIRST
+    /// entry's result per source sequence.
+    fn span_entry(corr: Option<&str>, src: u64, path: &str) -> LookupEntry {
+        let mut entry = seq_entry(corr, "span", src);
+        entry.key.address = Address::SpanPath {
+            path: path.to_owned(),
+        };
+        entry
+    }
+
+    /// Stamp the span path an observed call fired within (pairing identity).
+    fn with_span(mut o: ObservedCall, path: &str) -> ObservedCall {
+        o.span_path = Some(path.to_owned());
+        o
     }
 
     /// A correlation filter must scope scoring to the DRIVEN subset: an
@@ -4742,6 +4825,11 @@ mod tests {
                     b_prime_recorded.clone(),
                 ),
                 seq_entry_method_res(Some(corr), "db", "read_b_prime", 13, c_recorded_read),
+                // Span identities for the re-keyed consequences: pairing is
+                // span-scoped, so each unresolved call pairs only with its own
+                // call site's recorded twin.
+                span_entry(Some(corr), 12, "root>flow>write_b_prime"),
+                span_entry(Some(corr), 13, "root>flow>read_b_prime"),
             ],
             vec![
                 exec_obs_method(
@@ -4762,23 +4850,29 @@ mod tests {
                     Some(b_recorded_read),
                     b_candidate_read,
                 ),
-                exec_obs_method(
-                    "storage",
-                    Some(corr),
-                    "write_b_prime",
-                    false,
-                    None,
-                    None,
-                    b_prime_candidate,
+                with_span(
+                    exec_obs_method(
+                        "storage",
+                        Some(corr),
+                        "write_b_prime",
+                        false,
+                        None,
+                        None,
+                        b_prime_candidate,
+                    ),
+                    "root>flow>write_b_prime",
                 ),
-                exec_obs_method(
-                    "db",
-                    Some(corr),
-                    "read_b_prime",
-                    false,
-                    None,
-                    None,
-                    c_candidate_read,
+                with_span(
+                    exec_obs_method(
+                        "db",
+                        Some(corr),
+                        "read_b_prime",
+                        false,
+                        None,
+                        None,
+                        c_candidate_read,
+                    ),
+                    "root>flow>read_b_prime",
                 ),
             ],
             vec![http(corr, true, vec![])],
@@ -4875,25 +4969,31 @@ mod tests {
             Some(envelope(recorded_row)),
             envelope(raced_row.clone()),
         );
-        let mut downstream_observation = exec_obs_method(
-            "storage",
-            Some(corr),
-            "write_branch",
-            false,
-            None,
-            None,
-            downstream_observed,
+        let mut downstream_observation = with_span(
+            exec_obs_method(
+                "storage",
+                Some(corr),
+                "write_branch",
+                false,
+                None,
+                None,
+                downstream_observed,
+            ),
+            "root>flow>write_branch",
         );
         downstream_observation.args = serde_json::json!({"source": envelope(raced_row.clone())});
 
         let card = detect(&art_with_events(
-            vec![seq_entry_method_res(
-                Some(corr),
-                "storage",
-                "write_branch",
-                302,
-                downstream_recorded,
-            )],
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "storage",
+                    "write_branch",
+                    302,
+                    downstream_recorded,
+                ),
+                span_entry(Some(corr), 302, "root>flow>write_branch"),
+            ],
             vec![read_observation, downstream_observation],
             vec![http(corr, true, vec![])],
             vec![read_event, conflicting_write],
@@ -5372,19 +5472,20 @@ mod tests {
         // call would be Novel. The args-free pairing must collapse them into ONE
         // ValueDiverged (NOT Novel+Omitted), and flip the correlation to diverged.
         let card = detect(&art(
-            vec![seq_entry_res(
-                Some("c1"),
-                "storage",
-                7,
-                serde_json::json!(100),
-            )],
-            vec![exec_obs(
-                "storage",
-                Some("c1"),
-                false,                  // re-keyed args missed the baseline → unresolved
-                None,                   // no source_event_global_sequence (it didn't resolve)
-                None, // hook found no args-aligned baseline (seed_gap on hook side)
-                serde_json::json!(200), // the doubled amount
+            vec![
+                seq_entry_res(Some("c1"), "storage", 7, serde_json::json!(100)),
+                span_entry(Some("c1"), 7, "root>write_amount"),
+            ],
+            vec![with_span(
+                exec_obs(
+                    "storage",
+                    Some("c1"),
+                    false,                  // re-keyed args missed the baseline → unresolved
+                    None,                   // no source_event_global_sequence (it didn't resolve)
+                    None, // hook found no args-aligned baseline (seed_gap on hook side)
+                    serde_json::json!(200), // the doubled amount
+                ),
+                "root>write_amount", // same call site — the identity that pairs
             )],
             vec![http("c1", true, vec![])],
         ));
@@ -5557,19 +5658,20 @@ mod tests {
         // A re-keyed call (args missed) whose VALUE nonetheless reproduced is
         // paired args-free and counted as a match — never a Novel+Omitted split.
         let card = detect(&art(
-            vec![seq_entry_res(
-                Some("c1"),
-                "storage",
-                7,
-                serde_json::json!("v"),
-            )],
-            vec![exec_obs(
-                "storage",
-                Some("c1"),
-                false,
-                None,
-                None,
-                serde_json::json!("v"),
+            vec![
+                seq_entry_res(Some("c1"), "storage", 7, serde_json::json!("v")),
+                span_entry(Some("c1"), 7, "root>write_v"),
+            ],
+            vec![with_span(
+                exec_obs(
+                    "storage",
+                    Some("c1"),
+                    false,
+                    None,
+                    None,
+                    serde_json::json!("v"),
+                ),
+                "root>write_v",
             )],
             vec![http("c1", true, vec![])],
         ));
@@ -5578,5 +5680,77 @@ mod tests {
         assert_eq!(card.summary.omitted_calls, 0);
         assert_eq!(card.summary.matched_side_effect_calls, 1);
         assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// The run-0810 phantom-lock shape. An error path makes a novel call of a
+    /// COMMON method (`get_key`) the recording never made — the uninstrumented
+    /// cache fallthrough reading `business_profile_…` and getting `Null` —
+    /// while the recording holds a same-method event at a DIFFERENT call site
+    /// (the API_LOCK release GET) that a later observed call resolves
+    /// normally. Method-name pairing let the novel call steal the lock event
+    /// (`ValueDiverged`: Null vs lock id), which the resolved call then ALSO
+    /// claimed as matched — one recorded event, two verdict outcomes, 24
+    /// fabricated lock divergences in the sandbox scorecard. Span-scoped
+    /// pairing plus two-pass resolution make the theft unrepresentable —
+    /// whichever side of the stream the novel call arrives on, which is the
+    /// other half of the defect: the verdict must be a function of the sets,
+    /// not the interleaving.
+    #[test]
+    fn novel_call_of_a_common_method_cannot_steal_another_call_sites_event() {
+        let corr = "c1";
+        let lock_value = serde_json::json!({"BulkString": "recording-request-id"});
+        let build = |novel_first: bool| {
+            let mut novel = obs("redis", Some(corr), false, None, None);
+            novel.method_name = "get_key".to_owned();
+            novel.observed_result = Some(serde_json::json!("Null"));
+            let novel = with_span(
+                novel,
+                "root>get_trackers>find_business_profile>get_or_populate_redis",
+            );
+            let resolved = with_span(
+                exec_obs_method(
+                    "redis",
+                    Some(corr),
+                    "get_key",
+                    true,
+                    Some(127),
+                    Some(lock_value.clone()),
+                    lock_value.clone(),
+                ),
+                "root>server_wrap>release_lock",
+            );
+            let observed = if novel_first {
+                vec![novel, resolved]
+            } else {
+                vec![resolved, novel]
+            };
+            detect(&art(
+                vec![
+                    seq_entry_method_res(Some(corr), "redis", "get_key", 127, lock_value.clone()),
+                    span_entry(Some(corr), 127, "root>server_wrap>release_lock"),
+                ],
+                observed,
+                vec![http(corr, true, vec![])],
+            ))
+        };
+        for (label, card) in [("novel first", build(true)), ("novel last", build(false))] {
+            assert_eq!(
+                card.summary.value_divergences, 0,
+                "{label}: no fabricated divergence on the lock event"
+            );
+            assert_eq!(
+                card.summary.matched_side_effect_calls, 1,
+                "{label}: the real lock GET matches"
+            );
+            assert_eq!(
+                kind_count(&card, "redis", "NovelCall"),
+                1,
+                "{label}: the fallthrough call reports as ITSELF — a novel call"
+            );
+            assert_eq!(
+                card.summary.omitted_calls, 0,
+                "{label}: the lock event is claimed exactly once"
+            );
+        }
     }
 }
