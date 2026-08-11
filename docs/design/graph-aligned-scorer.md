@@ -79,6 +79,23 @@ Alignment is a single top-down pass, O(nodes), no search: align roots, then
 recursively align same-named children in order, and everything that fails to
 align is *itself* the finding.
 
+**Alignment operates over the event-bearing skeleton.** Before aligning,
+each graph prunes every node whose subtree carries no boundary events. This
+is not an optimization — it is what keeps the classification meaningful.
+The replay graph of the evidence run carries thousands of h2/tonic
+transport activations (`try_reclaim_frame`, `poll_ready`,
+`FramedRead::poll_next`, `pop_frame`, `poll`, …) whose COUNT is
+load-dependent nondeterminism: two runs of identical behaviour never poll
+the same number of times, so under naive alignment every count mismatch
+becomes a fabricated Pruned/Novel finding — thousands per run, drowning
+the real ones. The rule is principled, not a name list: a subtree with no
+boundary events cannot affect any comparison, so structure without effects
+is filler, and a span that carries events on one side only still
+participates — its absence IS the finding. Each graph prunes by its own
+events, which is sound: if the record side has events where replay has
+none, the record subtree survives and reports as pruned, which is exactly
+the omission it is.
+
 ## The object being aligned: an activation forest
 
 Worth stating precisely, because every guarantee above rests on it — and
@@ -141,6 +158,35 @@ node classifies as `IdentitySkew` — counted, non-silent, listed with both
 bindings — rather than being scored as a value divergence. Migration step
 2's golden tests must include a same-named loop where the two schemes
 disagree, asserting the skew is reported, not scored.
+
+## Empirical grounding
+
+The hard cases above are measured, not hypothetical — run
+`rp-sbx-fb699c1181-fb699c1-08101431-in-0810210113104` (100 correlations,
+4,553 recorded calls, 24,451 replay graph nodes):
+
+| ambiguity class | measured |
+| --- | --- |
+| calls sharing (correlation, span path, method) with ≥1 sibling | 45.4% of calls (801 groups) |
+| …of those, IDENTICAL args too — true loops, the only case FIFO occurrence decides | **8.7%** (178 groups, 396 calls) |
+| …of those, outside the tolerated `time`/`id` tiers — the real `IdentitySkew` exposure | **≈3%** of calls (~70 groups) |
+| correlation-stamped graph nodes in multi-member same-named sibling groups | 42.6% (9,108 nodes) |
+| …of those groups, six transport span names (poll-driven, count-nondeterministic) | **92%** — the skeleton rule exists for exactly these |
+| domain-level remainder | **230 groups, every one of size 2 or 3** |
+
+Three readings of that table shape the design's confidence claims. First,
+the aligner's worst domain-level pairing decision on a real run is choosing
+among THREE same-named siblings, and the boundary events attached inside
+those groups almost always differ in args (different encrypted fields,
+different lock keys, different address ids) — precisely what the
+`IdentitySkew` evidence-join disambiguates; the irreducible residue is the
+~3% row. Second, the largest same-named group in the data — all 100
+`HTTP request` roots sharing a null parent — is resolved by per-correlation
+root scoping alone, which is why that scoping is load-bearing rather than
+cosmetic. Third, the dominant `crypto_operation` groups (110 of 230) shrink
+under the keymanager boundary: substituted encryption never executes the
+per-field spans on replay, so the measured exposure is an upper bound on
+the post-boundary system.
 
 ## Classification falls out
 
