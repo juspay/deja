@@ -376,6 +376,11 @@ impl ScopedRecording {
                         // A CASE. It gets a bucket whether or not it anchors,
                         // so a case that reaches no graph root can be named.
                         Some(correlation) => {
+                            if event.boundary != "http_incoming" {
+                                index
+                                    .instrumented_work_by_correlation
+                                    .insert(correlation.clone());
+                            }
                             let bucket =
                                 index.anchors_by_correlation.entry(correlation).or_default();
                             bucket.extend(event.graph_node_id);
@@ -468,7 +473,16 @@ impl ScopedRecording {
             }
             if !reached {
                 if ids.is_empty() {
-                    names_nothing.push(correlation.clone());
+                    // A case whose ONLY event is the http_incoming request
+                    // performed no instrumented work — a validation
+                    // rejection. It has no span tree to be missing; "names
+                    // no node" is the correct state, not a capture gap.
+                    if index
+                        .instrumented_work_by_correlation
+                        .contains(correlation.as_str())
+                    {
+                        names_nothing.push(correlation.clone());
+                    }
                 } else {
                     unreachable.push(correlation.clone());
                 }
@@ -542,6 +556,13 @@ struct TapeIndex {
     /// can be NAMED in the refusal. A case with events but no anchors gets an
     /// empty entry, which is exactly the condition that must be refused.
     anchors_by_correlation: BTreeMap<String, BTreeSet<u64>>,
+    /// Cases with at least one event BESIDES the `http_incoming` request
+    /// marker. A request rejected before any instrumented work (a 400 at
+    /// validation) records only its request/response — its absence from the
+    /// execution graph is CORRECT, not a capture gap, and flagging it taught
+    /// two clean 400→400 correlations to read as graph-capture failures on
+    /// every run report.
+    instrumented_work_by_correlation: BTreeSet<String>,
     /// Anchors from uncorrelated (ambient) events. They contribute roots — the
     /// background traffic's spans belong to the run too — but they are NOT a
     /// case, so they are exempt from the reach-a-root requirement.
@@ -636,6 +657,13 @@ struct GraphNodeHead {
 struct BoundaryEventHead {
     #[serde(default)]
     correlation_id: Option<String>,
+    /// Which boundary produced the event. `http_incoming` is the request
+    /// marker itself — a case whose ONLY event is that marker performed no
+    /// instrumented work and legitimately has no graph node. Defaulted so a
+    /// pre-field tape parses (and then every event counts as work, the old
+    /// behavior).
+    #[serde(default)]
+    boundary: String,
     /// `Option<u64>`, and the Kafka -> Vector -> S3 pipeline stringifies u64s
     /// above `i64::MAX`, so this must accept both forms exactly like the full
     /// `BoundaryEvent` does — otherwise pass 1 silently loses anchors that
@@ -992,6 +1020,58 @@ mod tests {
         assert!(
             err.to_string().contains("c-2"),
             "the refusal names the correlation that would vanish: {err}"
+        );
+    }
+
+    fn http_incoming_event(seq: u64, correlation: &str) -> serde_json::Value {
+        let mut ev = event(seq, correlation, None);
+        ev["boundary"] = serde_json::json!("http_incoming");
+        ev
+    }
+
+    /// A case whose ONLY event is its `http_incoming` request marker — a 400
+    /// rejected at validation — performed no instrumented work: no graph node
+    /// is its CORRECT state, not a capture gap. Every run report was carrying
+    /// a "record graph unavailable" warning for two clean 400→400 cases. A
+    /// case with real boundary work that names nothing is still refused.
+    #[test]
+    fn a_request_only_case_with_no_graph_node_is_not_a_capture_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        tape(
+            &root,
+            "rec",
+            &[
+                node(1, None, "ROOT_SPAN"),
+                node(2, Some(1), "handler"),
+                event(1, "c-ok", Some(2)),
+                // Validation rejection: request/response recorded, no
+                // instrumented work, no graph node — correct, not a gap.
+                http_incoming_event(2, "c-400"),
+            ],
+        );
+        let rec = ScopedRecording::open(&root, "rec", scope_of(&["c-ok", "c-400"])).unwrap();
+        let nodes = rec
+            .graph_nodes()
+            .expect("a request-only case must not refuse the record graph");
+        assert_eq!(nodes.len(), 2, "the anchored case's tree is kept");
+
+        // Control: real boundary work that names no node is still a capture
+        // gap and still refuses, naming the case.
+        tape(
+            &root,
+            "rec2",
+            &[
+                node(1, None, "ROOT_SPAN"),
+                event(1, "c-ok", Some(1)),
+                event(2, "c-gap", None),
+            ],
+        );
+        let rec2 = ScopedRecording::open(&root, "rec2", scope_of(&["c-ok", "c-gap"])).unwrap();
+        let err = rec2.graph_nodes().unwrap_err();
+        assert!(
+            err.to_string().contains("c-gap"),
+            "instrumented work with no anchor is still refused: {err}"
         );
     }
 

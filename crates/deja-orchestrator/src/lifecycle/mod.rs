@@ -2759,30 +2759,217 @@ fn run_psql_script_with_stdin(
     let _ = std::fs::remove_file(&path);
     result
 }
+/// Outcome of one wire-faithful row readback.
+enum WireReadback {
+    Matched,
+    Missing,
+    Mismatched { column: String },
+}
+
+/// The pragmatic-PK predicate for reading one seeded row back, when the row
+/// image carries a known primary-key column. PK values are plain identifier
+/// strings — the one column class whose serde rendering IS faithful, which is
+/// why row-state keys exist at all.
+fn wire_readback_row_predicate(row: &DbRowImage) -> Option<(String, String)> {
+    let object: serde_json::Map<String, serde_json::Value> = row
+        .columns
+        .iter()
+        .map(|column| (column.metadata.name.clone(), column.value.clone()))
+        .collect();
+    match deja::db::row_state_key(&row.table, &serde_json::Value::Object(object)) {
+        Some(deja::StateKey::DbRow {
+            pk_column,
+            pk_value,
+            ..
+        }) => Some((pk_column, pk_value)),
+        _ => None,
+    }
+}
+
+/// Render the COPY-OUT command that reads one seeded row back in binary —
+/// the exact inverse of the seed path, so the only codec involved is the
+/// store's own `typsend`.
+fn wire_copy_out_command(
+    schema: Option<&str>,
+    table: &str,
+    column_names: &[&str],
+    pk_column: &str,
+    pk_value: &str,
+) -> String {
+    let column_list = column_names
+        .iter()
+        .map(|name| quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let qualified = qualified_table(schema, table);
+    let predicate = format!(
+        "{} = {}",
+        quote_ident(pk_column),
+        sql_literal(&serde_json::Value::String(pk_value.to_owned()))
+    );
+    format!(
+        "\\copy (SELECT {column_list} FROM {qualified} WHERE {predicate}) TO PSTDOUT WITH (FORMAT binary)"
+    )
+}
+
+/// Parse a binary COPY stream back into per-row, per-field bytes — the
+/// inverse of [`build_binary_copy_stream`], golden-tested against it.
+fn parse_binary_copy_stream(buf: &[u8]) -> Result<Vec<Vec<Option<Vec<u8>>>>, String> {
+    const SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+    let mut at = 0usize;
+    let take = |at: &mut usize, n: usize| -> Result<&[u8], String> {
+        let slice = buf
+            .get(*at..*at + n)
+            .ok_or_else(|| format!("copy stream truncated at byte {at}"))?;
+        *at += n;
+        Ok(slice)
+    };
+    if take(&mut at, SIGNATURE.len())? != SIGNATURE {
+        return Err("copy stream does not start with the PGCOPY signature".to_string());
+    }
+    take(&mut at, 4)?; // flags
+    let ext_len = i32::from_be_bytes(take(&mut at, 4)?.try_into().expect("4 bytes"));
+    take(&mut at, usize::try_from(ext_len).unwrap_or(0))?;
+    let mut rows = Vec::new();
+    loop {
+        let field_count = i16::from_be_bytes(take(&mut at, 2)?.try_into().expect("2 bytes"));
+        if field_count == -1 {
+            return Ok(rows); // trailer
+        }
+        let mut row = Vec::with_capacity(field_count.max(0) as usize);
+        for _ in 0..field_count {
+            let len = i32::from_be_bytes(take(&mut at, 4)?.try_into().expect("4 bytes"));
+            if len == -1 {
+                row.push(None);
+            } else {
+                row.push(Some(
+                    take(
+                        &mut at,
+                        usize::try_from(len).map_err(|_| "negative field length")?,
+                    )?
+                    .to_vec(),
+                ));
+            }
+        }
+        rows.push(row);
+    }
+}
+
+/// Verify one wire-seeded row through the seed's exact inverse: COPY it back
+/// OUT in binary and byte-compare against the captured `typsend` bytes.
+fn readback_db_wire_row(
+    store: &StoreExec,
+    schema: Option<&str>,
+    row: &DbRowImage,
+) -> Result<WireReadback, String> {
+    let wire = row
+        .wire
+        .as_ref()
+        .ok_or("wire readback requested for a row without a physical image")?;
+    let (pk_column, pk_value) = wire_readback_row_predicate(row)
+        .ok_or("wire readback requested for a row with no pragmatic primary key")?;
+    let names: Vec<&str> = row
+        .columns
+        .iter()
+        .map(|column| column.metadata.name.as_str())
+        .collect();
+    let command = wire_copy_out_command(schema, &row.table, &names, &pk_column, &pk_value);
+    let output = store
+        .psql(&["-q"], true, &command)
+        .output()
+        .map_err(|e| format!("could not run wire readback: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "wire readback exited {}; stderr='{}'",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let observed_rows = parse_binary_copy_stream(&output.stdout)?;
+    let Some(observed) = observed_rows.first() else {
+        return Ok(WireReadback::Missing);
+    };
+    for (index, name) in names.iter().enumerate() {
+        let expected_bytes = wire.columns.get(*name).cloned().flatten();
+        let observed_bytes = observed.get(index).cloned().flatten();
+        if expected_bytes != observed_bytes {
+            return Ok(WireReadback::Mismatched {
+                column: (*name).to_owned(),
+            });
+        }
+    }
+    Ok(WireReadback::Matched)
+}
+
 fn readback_db(
     store: &StoreExec,
     schema: Option<&str>,
     target: &DbSeedTarget,
     rows: &[DbRowImage],
 ) -> SeedReadback {
-    let mut full_sql = String::new();
+    // Wire-seeded rows verify through the seed's exact inverse — binary COPY
+    // OUT, byte-compared against the captured `typsend` bytes. The serde path
+    // below renders recorded values as SQL literals and compares those; a
+    // serde shape that cannot faithfully render is the REASON wire seeding
+    // exists, so it can never satisfy a literal-equality predicate — which is
+    // how correctly-seeded rows scored as 365 missing/mismatched readback
+    // entries (the codec-mismatch theorem, applied to verification).
+    let mut wire_rows: Vec<&DbRowImage> = Vec::new();
+    let mut serde_rows: Vec<&DbRowImage> = Vec::new();
     for row in rows {
+        if wire_copy_eligibility(row).is_ok() && wire_readback_row_predicate(row).is_some() {
+            wire_rows.push(row);
+        } else {
+            serde_rows.push(row);
+        }
+    }
+    let expected = serde_json::json!({
+        "rows": rows.len(),
+        "table": target.table,
+        "kind": target.kind,
+    });
+    for row in &wire_rows {
+        match readback_db_wire_row(store, schema, row) {
+            Ok(WireReadback::Matched) => {}
+            Ok(WireReadback::Missing) => {
+                return SeedReadback::missing(
+                    expected,
+                    "db seed readback found no row at the seeded primary key",
+                );
+            }
+            Ok(WireReadback::Mismatched { column }) => {
+                return SeedReadback::mismatched(
+                    expected,
+                    serde_json::json!({"wire_mismatched_column": column, "table": row.table}),
+                    format!(
+                        "db row exists by key after seed, but column {column} differs from the captured wire bytes"
+                    ),
+                );
+            }
+            Err(message) => return SeedReadback::error(message),
+        }
+    }
+    if serde_rows.is_empty() {
+        return SeedReadback::matched(
+            expected,
+            serde_json::json!({"wire_row_matches": wire_rows.len()}),
+        );
+    }
+
+    let mut full_sql = String::new();
+    for row in &serde_rows {
         let Some(stmt) = build_count_sql(schema, row, None) else {
             return SeedReadback::error("cannot render db readback full-row predicate");
         };
         full_sql.push_str(&stmt);
         full_sql.push('\n');
     }
-    let full_counts = match run_db_readback_counts(store, &full_sql, rows.len()) {
+    let full_counts = match run_db_readback_counts(store, &full_sql, serde_rows.len()) {
         Ok(counts) => counts,
         Err(message) => return SeedReadback::error(message),
     };
-    let expected = serde_json::json!({
-        "rows": rows.len(),
-        "table": target.table,
-        "kind": target.kind,
-    });
     let mut observed = serde_json::json!({
+        "wire_row_matches": wire_rows.len(),
         "full_row_matches": full_counts.clone(),
     });
     if full_counts.iter().all(|count| *count > 0) {
@@ -2791,14 +2978,14 @@ fn readback_db(
 
     if let Some(filter) = &target.row_filter {
         let mut key_sql = String::new();
-        for row in rows {
+        for row in &serde_rows {
             let Some(stmt) = build_count_sql(schema, row, Some(filter)) else {
                 return SeedReadback::error("cannot render db readback key predicate");
             };
             key_sql.push_str(&stmt);
             key_sql.push('\n');
         }
-        let key_counts = match run_db_readback_counts(store, &key_sql, rows.len()) {
+        let key_counts = match run_db_readback_counts(store, &key_sql, serde_rows.len()) {
             Ok(counts) => counts,
             Err(message) => return SeedReadback::error(message),
         };
@@ -7052,6 +7239,91 @@ mod tests {
         expected.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]); // NULL
         expected.extend_from_slice(&[0xff, 0xff]); // trailer
         assert_eq!(stream, expected);
+    }
+
+    /// The readback parser is the builder's exact inverse: parsing a built
+    /// stream returns the captured field bytes, byte for byte, NULLs
+    /// preserved. This round trip is what makes wire readback the seed's
+    /// inverse rather than a second, disagreeing codec.
+    #[test]
+    fn binary_copy_stream_parse_is_the_builders_inverse() {
+        let row = wire_row_image(
+            "t",
+            vec![
+                ("id", Some(25), serde_json::json!("a"), Some(b"a".to_vec())),
+                (
+                    "amount",
+                    Some(20),
+                    serde_json::json!(42),
+                    Some(42_i64.to_be_bytes().to_vec()),
+                ),
+                ("gone", Some(1043), serde_json::Value::Null, None),
+            ],
+        );
+        let stream = build_binary_copy_stream(&[&row]).expect("stream builds");
+        let parsed = parse_binary_copy_stream(&stream).expect("stream parses");
+        assert_eq!(
+            parsed,
+            vec![vec![
+                Some(b"a".to_vec()),
+                Some(42_i64.to_be_bytes().to_vec()),
+                None,
+            ]]
+        );
+        // Zero tuples (header + trailer only) parses to an empty set — the
+        // "row not found" signal.
+        let empty = build_binary_copy_stream(&[]).expect("empty stream builds");
+        assert_eq!(
+            parse_binary_copy_stream(&empty).expect("empty parses"),
+            Vec::<Vec<Option<Vec<u8>>>>::new()
+        );
+        // A truncated stream refuses loudly instead of returning partial rows.
+        assert!(parse_binary_copy_stream(&stream[..stream.len() - 3]).is_err());
+    }
+
+    /// The COPY-OUT readback command selects the image's columns in capture
+    /// order, keyed by the pragmatic primary key, quoted like every other
+    /// identifier on the seed path.
+    #[test]
+    fn wire_copy_out_command_renders_quoted_and_keyed() {
+        let command = wire_copy_out_command(
+            Some("deja_c1"),
+            "payment_attempt",
+            &["attempt_id", "connector_transaction_id"],
+            "attempt_id",
+            "pay_x_1",
+        );
+        assert_eq!(
+            command,
+            "\\copy (SELECT \"attempt_id\", \"connector_transaction_id\" FROM \"deja_c1\".\"payment_attempt\" WHERE \"attempt_id\" = 'pay_x_1') TO PSTDOUT WITH (FORMAT binary)"
+        );
+    }
+
+    /// The wire readback predicate comes from the row image itself — the same
+    /// pragmatic-PK extraction that mints row state keys.
+    #[test]
+    fn wire_readback_predicate_finds_the_pragmatic_pk() {
+        let row = wire_row_image(
+            "payment_intent",
+            vec![
+                (
+                    "payment_id",
+                    Some(1043),
+                    serde_json::json!("pay_1"),
+                    Some(b"pay_1".to_vec()),
+                ),
+                (
+                    "status",
+                    Some(19465),
+                    serde_json::json!("succeeded"),
+                    Some(b"succeeded".to_vec()),
+                ),
+            ],
+        );
+        assert_eq!(
+            wire_readback_row_predicate(&row),
+            Some(("payment_id".to_owned(), "pay_1".to_owned()))
+        );
     }
 
     #[test]
