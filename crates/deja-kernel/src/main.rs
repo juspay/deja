@@ -309,33 +309,7 @@ fn drive_inner(host: &str, port: u16, driver: &DriverRequest) -> Result<(u16, Ve
         .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
 
-    let mut request_line = format!("{} {}", driver.method, driver.path);
-    if let Some(q) = &driver.query {
-        request_line.push('?');
-        request_line.push_str(q);
-    }
-    request_line.push_str(" HTTP/1.1\r\n");
-
-    let mut head = request_line;
-    head.push_str(&format!("Host: {host}\r\n"));
-    head.push_str("Connection: close\r\n");
-    let mut have_content_length = false;
-    for (k, v) in &driver.headers {
-        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("connection") {
-            continue;
-        }
-        if k.eq_ignore_ascii_case("content-length") {
-            have_content_length = true;
-        }
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    if let Some(body) = &driver.body {
-        if !have_content_length {
-            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-    }
-    head.push_str("\r\n");
-
+    let head = build_request_head(driver, host);
     stream
         .write_all(head.as_bytes())
         .map_err(|e| format!("write head: {e}"))?;
@@ -349,8 +323,70 @@ fn drive_inner(host: &str, port: u16, driver: &DriverRequest) -> Result<(u16, Ve
     stream
         .read_to_end(&mut response)
         .map_err(|e| format!("read response: {e}"))?;
+    if response.is_empty() {
+        // An empty close is its own fact — the candidate accepted the
+        // connection and closed it without writing one byte. Reporting it as
+        // a parse failure ("no header/body separator") pointed every
+        // investigation at the parser instead of at the request that made the
+        // server hang up (#37).
+        return Err(
+            "server closed the connection without writing a response (0 bytes read)".to_string(),
+        );
+    }
 
     parse_http_response(&response)
+}
+
+/// Render the request head. The kernel OWNS the transport framing of the
+/// connection it opens: `Host` names the candidate, `Connection: close`
+/// matches the read-to-EOF client, and `Content-Length` is computed from the
+/// body actually written. Recorded framing headers are dropped, never
+/// forwarded — `Transfer-Encoding`, `Content-Length`, `Expect`, keep-alive
+/// and friends describe how the ORIGINAL bytes moved over the recorder's
+/// connection; replaying them against a body deja re-materialized
+/// desynchronizes the candidate's request parser from the bytes actually on
+/// the wire (a chunked header over an unchunked body, a stale length), and a
+/// desynchronized parser hangs up at the protocol level — an empty close,
+/// #37's transport signature. Semantic headers (auth, content-type,
+/// idempotency keys…) pass through untouched.
+fn build_request_head(driver: &DriverRequest, host: &str) -> String {
+    /// Connection- and framing-level headers the kernel sets (or deliberately
+    /// omits) itself.
+    const KERNEL_OWNED: &[&str] = &[
+        "host",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "expect",
+        "te",
+        "upgrade",
+        "keep-alive",
+        "proxy-connection",
+    ];
+    let mut request_line = format!("{} {}", driver.method, driver.path);
+    if let Some(q) = &driver.query {
+        request_line.push('?');
+        request_line.push_str(q);
+    }
+    request_line.push_str(" HTTP/1.1\r\n");
+
+    let mut head = request_line;
+    head.push_str(&format!("Host: {host}\r\n"));
+    head.push_str("Connection: close\r\n");
+    for (k, v) in &driver.headers {
+        if KERNEL_OWNED
+            .iter()
+            .any(|owned| k.eq_ignore_ascii_case(owned))
+        {
+            continue;
+        }
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(body) = &driver.body {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    head
 }
 
 /// Parse a minimal HTTP/1.1 response. Returns (status_code, body_bytes).
@@ -379,6 +415,12 @@ fn parse_http_response(buf: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let status: u16 = status_str
         .parse()
         .map_err(|e| format!("status parse: {e}"))?;
+
+    // An interim 1xx (e.g. "100 Continue") is not the response — it precedes
+    // the real one on the same stream. Skip past it and parse what follows.
+    if (100..200).contains(&status) {
+        return parse_http_response(body);
+    }
 
     Ok((status, body.to_vec()))
 }
@@ -430,5 +472,82 @@ mod tests {
         let (status, body) = parse_http_response(raw).expect("parse");
         assert_eq!(status, 204);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn parse_http_response_skips_interim_1xx() {
+        let raw =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok";
+        let (status, body) = parse_http_response(raw).expect("parse");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"ok");
+    }
+
+    fn driver(headers: Vec<(&str, &str)>, body: Option<&[u8]>) -> DriverRequest {
+        use deja_kernel::BaselineResponse;
+        DriverRequest {
+            correlation_id: "c1".to_owned(),
+            request_sequence: 0,
+            method: "POST".to_owned(),
+            path: "/accounts".to_owned(),
+            query: None,
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            body: body.map(<[u8]>::to_vec),
+            baseline_response: BaselineResponse {
+                status: 200,
+                body_json: None,
+                body_text: None,
+            },
+        }
+    }
+
+    /// The kernel owns the framing of the connection it opens: recorded
+    /// transport headers must be dropped (a recorded `Transfer-Encoding:
+    /// chunked` over deja's unchunked body desynchronizes the candidate's
+    /// request parser — the #37 empty-close class), `Content-Length` must
+    /// describe the body actually written (never the recorded value), and
+    /// semantic headers must pass through untouched.
+    #[test]
+    fn request_head_owns_framing_and_forwards_semantics() {
+        let head = build_request_head(
+            &driver(
+                vec![
+                    ("Transfer-Encoding", "chunked"),
+                    ("Content-Length", "999999"),
+                    ("Expect", "100-continue"),
+                    ("Connection", "keep-alive"),
+                    ("Host", "recorded-host.internal"),
+                    ("api-key", "snd_k1"),
+                    ("Content-Type", "application/json"),
+                ],
+                Some(b"{\"company_name\":\"x\"}"),
+            ),
+            "candidate",
+        );
+        assert!(head.starts_with("POST /accounts HTTP/1.1\r\n"));
+        assert!(head.contains("Host: candidate\r\n"));
+        assert!(head.contains("Connection: close\r\n"));
+        assert!(head.contains("Content-Length: 20\r\n"), "{head}");
+        assert!(head.contains("api-key: snd_k1\r\n"));
+        assert!(head.contains("Content-Type: application/json\r\n"));
+        for forbidden in [
+            "Transfer-Encoding",
+            "999999",
+            "Expect",
+            "keep-alive",
+            "recorded-host",
+        ] {
+            assert!(!head.contains(forbidden), "{forbidden} leaked into: {head}");
+        }
+    }
+
+    /// A bodyless request advertises no Content-Length at all.
+    #[test]
+    fn request_head_omits_content_length_without_a_body() {
+        let head = build_request_head(&driver(vec![("api-key", "k")], None), "candidate");
+        assert!(!head.to_ascii_lowercase().contains("content-length"));
     }
 }
