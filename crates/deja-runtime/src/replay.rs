@@ -32,12 +32,22 @@ pub enum StateKey {
     /// A legacy or non-typed key. Seed planning preserves it exactly, but treats it
     /// as opaque (no `table:sql` splitting).
     Opaque(String),
-    /// Exact database row identity. `pk_column` is part of the identity so a
-    /// non-unique value from the wrong column can never group unrelated rows.
+    /// Exact database row identity: the table's primary-key columns and their
+    /// values, in the schema's key order.
+    ///
+    /// Several pairs, because a primary key genuinely has several columns —
+    /// `payment_intent` is keyed by `(payment_id, merchant_id)` and
+    /// `payment_attempt` by `(attempt_id, merchant_id)`. A one-column grammar
+    /// could not address those rows at all, so they fell back to
+    /// query fingerprints and every row-exact consumer went blind on the two
+    /// busiest tables in the workload.
+    ///
+    /// The columns are part of the identity, not just the values, so a
+    /// non-unique value read from the wrong column can never group unrelated
+    /// rows.
     DbRow {
         table: String,
-        pk_column: String,
-        pk_value: String,
+        key: Vec<(String, String)>,
     },
     /// Database query fallback identity, used when the row primary key is not
     /// available from the structured result.
@@ -81,11 +91,23 @@ impl StateKey {
             .ok_or_else(|| StateKeyParseError::new("typed state key missing kind separator"))?;
         let parts: Vec<&str> = rest.split(':').collect();
         match parts.as_slice() {
-            ["db_row", table, pk_column, pk_value] => Ok(StateKey::DbRow {
-                table: decode_hex_component(table)?,
-                pk_column: decode_hex_component(pk_column)?,
-                pk_value: decode_hex_component(pk_value)?,
-            }),
+            // `db_row:<table>:<column>:<value>[:<column>:<value>]*` — the key's
+            // columns appended in schema order, so a single-column key renders
+            // and parses byte-identically to the one-column grammar this
+            // replaced and recordings made under it still read.
+            ["db_row", table, pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {
+                let mut key = Vec::with_capacity(pairs.len() / 2);
+                for pair in pairs.chunks_exact(2) {
+                    key.push((
+                        decode_hex_component(pair[0])?,
+                        decode_hex_component(pair[1])?,
+                    ));
+                }
+                Ok(StateKey::DbRow {
+                    table: decode_hex_component(table)?,
+                    key,
+                })
+            }
             ["db_query", table, fingerprint] => Ok(StateKey::DbQuery {
                 table: decode_hex_component(table)?,
                 fingerprint: decode_hex_component(fingerprint)?,
@@ -105,16 +127,19 @@ impl StateKey {
     pub fn to_wire(&self) -> String {
         match self {
             StateKey::Opaque(raw) => raw.clone(),
-            StateKey::DbRow {
-                table,
-                pk_column,
-                pk_value,
-            } => format!(
-                "{STATE_KEY_V1_PREFIX}:db_row:{}:{}:{}",
-                encode_hex_component(table),
-                encode_hex_component(pk_column),
-                encode_hex_component(pk_value)
-            ),
+            StateKey::DbRow { table, key } => {
+                let mut wire = format!(
+                    "{STATE_KEY_V1_PREFIX}:db_row:{}",
+                    encode_hex_component(table)
+                );
+                for (column, value) in key {
+                    wire.push(':');
+                    wire.push_str(&encode_hex_component(column));
+                    wire.push(':');
+                    wire.push_str(&encode_hex_component(value));
+                }
+                wire
+            }
             StateKey::DbQuery { table, fingerprint } => format!(
                 "{STATE_KEY_V1_PREFIX}:db_query:{}:{}",
                 encode_hex_component(table),
@@ -296,45 +321,33 @@ pub fn table_identity_is_registered() -> bool {
         .unwrap_or(false)
 }
 
-/// The single column that identifies a row of `table`, when the schema says
-/// there is exactly one.
+/// The row-identity columns and values for a serialized row, when the schema's
+/// key is fully present in it.
 ///
-/// A composite key deliberately yields `None`: the row-key grammar addresses
-/// one column, so a composite table takes the query-fingerprint path — now
-/// because the schema says the key has several columns, not because a list
-/// forgot the table.
-pub fn db_pk_column(table: &str) -> Option<String> {
-    match table_identity_columns(table)?.as_slice() {
-        [only] => Some(only.clone()),
-        _ => None,
-    }
-}
-
-/// Return the known primary-key column for tables where Phase C can prove row
-/// uniqueness from a serialized result (the column must be present and non-null
-/// in the row object).
-fn db_pk_column_for_table(
+/// EVERY key column must be present and non-null: a partial key does not
+/// identify a row, so the caller falls back to the query fingerprint rather
+/// than addressing rows by a prefix of their key.
+fn db_row_key_for_table(
     table: &str,
     object: &serde_json::Map<String, serde_json::Value>,
-) -> Option<String> {
-    let candidate = db_pk_column(table)?;
-    object
-        .get(&candidate)
-        .filter(|value| !value.is_null())
-        .map(|_| candidate)
+) -> Option<Vec<(String, String)>> {
+    let columns = table_identity_columns(table)?;
+    let mut key = Vec::with_capacity(columns.len());
+    for column in columns {
+        let value = object.get(&column).filter(|value| !value.is_null())?;
+        key.push((column, db_pk_wire_value(value)));
+    }
+    Some(key)
 }
 
-/// Build a row-exact DB state key from a serialized row/object only when this
-/// table's real primary-key column is known and present. Unknown tables return
-/// `None` and must use the query-fingerprint fallback.
+/// Build a row-exact DB state key from a serialized row/object, when the
+/// schema's key for this table is fully present in it. A table whose identity
+/// nobody registered, or a row missing part of its key, returns `None` and must
+/// use the query-fingerprint fallback.
 pub fn db_row_state_key(table: &str, row: &serde_json::Value) -> Option<StateKey> {
-    let object = row.as_object()?;
-    let column = db_pk_column_for_table(table, object)?;
-    let value = object.get(&column)?;
     Some(StateKey::DbRow {
         table: table.to_owned(),
-        pk_column: column.clone(),
-        pk_value: db_pk_wire_value(value),
+        key: db_row_key_for_table(table, row.as_object()?)?,
     })
 }
 
@@ -2587,29 +2600,34 @@ fn db_created_table(event: &BoundaryEvent) -> Option<String> {
 }
 
 /// The row-state key a typed row-image payload denotes, for indexing images by
-/// the row they describe. Reads the pragmatic PK out of the payload's own
-/// columns, so it works on the physical (wire) image shape as well as the
-/// semantic one.
+/// the row they describe. Reads the schema's key columns out of the payload's
+/// own column list, so it works on the physical (wire) image shape as well as
+/// the semantic one — and on a composite key, which is what
+/// `payment_intent`/`payment_attempt` have and what makes this lookup reach
+/// them at all.
 fn image_row_state_key(payload: &serde_json::Value) -> Option<String> {
     let object = payload.as_object()?;
     if object.get("deja_image").and_then(serde_json::Value::as_str) != Some("db_row") {
         return None;
     }
     let table = object.get("table")?.as_str()?;
-    let pk_column = db_pk_column(table)?;
-    let pk_value = object
-        .get("columns")?
-        .as_array()?
-        .iter()
-        .find(|column| {
-            column.get("name").and_then(serde_json::Value::as_str) == Some(pk_column.as_str())
-        })?
-        .get("value")?;
+    let columns = object.get("columns")?.as_array()?;
+    let mut key = Vec::new();
+    for identity_column in table_identity_columns(table)? {
+        let value = columns
+            .iter()
+            .find(|column| {
+                column.get("name").and_then(serde_json::Value::as_str)
+                    == Some(identity_column.as_str())
+            })?
+            .get("value")
+            .filter(|value| !value.is_null())?;
+        key.push((identity_column, db_pk_wire_value(value)));
+    }
     Some(
         StateKey::DbRow {
             table: table.to_owned(),
-            pk_column: pk_column.to_owned(),
-            pk_value: db_pk_wire_value(pk_value),
+            key,
         }
         .to_wire(),
     )
@@ -3131,21 +3149,16 @@ mod tests {
         ]);
     }
 
-    /// Identity is a fact read from the schema, and the shape it arrives in
-    /// decides the row-key grammar: exactly one column identifies a row, a
-    /// composite key does not (so those tables use query fingerprints), and an
+    /// Identity is read from the schema, and the row-key grammar carries
+    /// whatever shape it arrives in: one column or several, in key order. An
     /// unregistered table yields nothing rather than a guess.
     #[test]
     fn row_identity_comes_from_the_registered_schema() {
         register_test_schema_identity();
         assert_eq!(
-            db_pk_column("payment_intent").as_deref(),
-            Some("payment_id")
-        );
-        assert_eq!(
-            db_pk_column("incremental_authorization"),
-            None,
-            "a composite key has no single identifying column"
+            table_identity_columns("users"),
+            Some(vec!["user_id".to_owned()]),
+            "a single-column key"
         );
         assert_eq!(
             table_identity_columns("incremental_authorization"),
@@ -3153,10 +3166,10 @@ mod tests {
                 "authorization_id".to_owned(),
                 "merchant_id".to_owned()
             ]),
-            "but the schema's actual key columns are still available, in key order"
+            "a composite key, in the schema's key order"
         );
         assert_eq!(
-            db_pk_column("a_table_nobody_registered"),
+            table_identity_columns("a_table_nobody_registered"),
             None,
             "an unregistered table yields no key rather than a guess"
         );
@@ -4807,8 +4820,7 @@ mod tests {
     fn state_key_v1_roundtrips_and_legacy_is_opaque() {
         let key = StateKey::DbRow {
             table: "payment_intent".to_owned(),
-            pk_column: "payment_id".to_owned(),
-            pk_value: "pay_123".to_owned(),
+            key: vec![("payment_id".to_owned(), "pay_123".to_owned())],
         };
         let wire = key.to_wire();
         assert_eq!(StateKey::parse(&wire).unwrap(), key);
@@ -4847,8 +4859,7 @@ mod tests {
             keys,
             vec![StateKey::DbRow {
                 table: "payment_attempt".to_owned(),
-                pk_column: "attempt_id".to_owned(),
-                pk_value: "att_1".to_owned(),
+                key: vec![("attempt_id".to_owned(), "att_1".to_owned())],
             }],
             "payment_attempt must group only by its real PK, not any *_id column"
         );
@@ -4884,8 +4895,7 @@ mod tests {
             user_row_keys,
             vec![StateKey::DbRow {
                 table: "users".to_owned(),
-                pk_column: "user_id".to_owned(),
-                pk_value: "user_123".to_owned(),
+                key: vec![("user_id".to_owned(), "user_123".to_owned())],
             }],
             "users must key by user_id, never by the generic id field or merchant_id"
         );
@@ -4905,8 +4915,7 @@ mod tests {
             db_row_state_keys("merchant_key_store", &merchant_rows),
             vec![StateKey::DbRow {
                 table: "merchant_key_store".to_owned(),
-                pk_column: "merchant_id".to_owned(),
-                pk_value: "merch_123".to_owned(),
+                key: vec![("merchant_id".to_owned(), "merch_123".to_owned())],
             }],
             "merchant_key_store must key by merchant_id even though the table has no id column"
         );
@@ -4922,9 +4931,10 @@ mod tests {
                 StateKey::parse(key).unwrap(),
                 StateKey::DbRow {
                     ref table,
-                    ref pk_column,
-                    ref pk_value
-                } if table == "users" && pk_column == "user_id" && pk_value == "user_123"
+                    ref key
+                } if table == "users"
+                    && key.as_slice()
+                        == [("user_id".to_owned(), "user_123".to_owned())].as_slice()
             )),
             "augmented read_set must carry the exact users row key"
         );
@@ -4983,14 +4993,12 @@ mod tests {
     fn seed_plan_prefers_pre_image_for_rmw_and_result_image_for_read_only_db_rows() {
         let update_key = StateKey::DbRow {
             table: "merchant_account".to_owned(),
-            pk_column: "merchant_id".to_owned(),
-            pk_value: "m1".to_owned(),
+            key: vec![("merchant_id".to_owned(), "m1".to_owned())],
         }
         .to_wire();
         let read_key = StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "u1".to_owned(),
+            key: vec![("user_id".to_owned(), "u1".to_owned())],
         }
         .to_wire();
         let pre_image = serde_json::json!({"merchant_id": "m1", "status": "before"});
@@ -5057,8 +5065,7 @@ mod tests {
     fn seed_plan_falls_back_to_the_result_image_for_rmw_without_pre_image() {
         let update_key = StateKey::DbRow {
             table: "merchant_account".to_owned(),
-            pk_column: "merchant_id".to_owned(),
-            pk_value: "m2".to_owned(),
+            key: vec![("merchant_id".to_owned(), "m2".to_owned())],
         }
         .to_wire();
         let post_image = serde_json::json!({"merchant_id": "m2", "status": "after"});
@@ -5088,6 +5095,87 @@ mod tests {
             update_seed.value,
             serde_json::json!({"merchant_id": "m2", "status": "after"}),
             "legacy raw value remains available for old tapes"
+        );
+    }
+
+    /// The reason the row-key grammar carries several columns: a
+    /// read-modify-write precondition on a COMPOSITE-keyed table.
+    ///
+    /// `payment_intent` is keyed by `(payment_id, merchant_id)`. While the
+    /// grammar addressed one column, its rows had no row-state key at all, so
+    /// the pre-image lookup could not resolve them and the read-modify-write
+    /// fix was inert on the two busiest tables in the workload — 197 of 217
+    /// such rows on the sandbox tape. This asserts the lookup now reaches them:
+    /// the RMW key seeds the state observed BEFORE the update, not the update's
+    /// own post-image.
+    #[test]
+    fn seed_plan_resolves_a_composite_keyed_rmw_to_its_prior_state() {
+        register_test_schema_identity();
+        let table = "payment_intent";
+        let image = |status: &str| {
+            serde_json::json!({
+                "deja_image": "db_row",
+                "version": 1,
+                "table": table,
+                "columns": [
+                    {"name": "payment_id", "type_oid": 1043, "value": "pay_1"},
+                    {"name": "merchant_id", "type_oid": 1043, "value": "merch_1"},
+                    {"name": "status", "type_oid": 1043, "value": status},
+                ],
+            })
+        };
+        let before = image("requires_capture");
+        let after = image("succeeded");
+
+        // The row key the producer mints for this row — both key columns.
+        let row_key = StateKey::DbRow {
+            table: table.to_owned(),
+            key: vec![
+                ("payment_id".to_owned(), "pay_1".to_owned()),
+                ("merchant_id".to_owned(), "merch_1".to_owned()),
+            ],
+        }
+        .to_wire();
+
+        let mut read = state_event(
+            10,
+            Some("c1"),
+            "db",
+            "generic_find_one_core",
+            serde_json::json!({"table": table}),
+            serde_json::json!({"payment_id": "pay_1", "merchant_id": "merch_1"}),
+            &[row_key.as_str()],
+            &[],
+            false,
+        );
+        read.result_image = Some(before.clone());
+
+        let mut update = state_event(
+            20,
+            Some("c1"),
+            "db",
+            "generic_update_with_results",
+            serde_json::json!({"table": table}),
+            serde_json::json!([{"payment_id": "pay_1", "merchant_id": "merch_1"}]),
+            &[row_key.as_str()],
+            &[row_key.as_str()],
+            false,
+        );
+        update.result_image = Some(after.clone());
+
+        let plan = build_seed_plan(&[read, update], Some("c1"));
+        let seed = plan
+            .resolve("db", row_key.as_str())
+            .expect("a composite-keyed row must seed");
+        assert_eq!(
+            seed.image,
+            Some(before),
+            "the RMW key resolves to the row's last observed state"
+        );
+        assert_ne!(
+            seed.image,
+            Some(after),
+            "seeding the post-image is what made the earlier read diverge"
         );
     }
 
@@ -5192,8 +5280,7 @@ mod tests {
         .to_wire();
         let row_key = StateKey::DbRow {
             table: "payment_attempt".to_owned(),
-            pk_column: "attempt_id".to_owned(),
-            pk_value: "a1".to_owned(),
+            key: vec![("attempt_id".to_owned(), "a1".to_owned())],
         }
         .to_wire();
         let post_image = serde_json::json!({
@@ -5955,14 +6042,15 @@ redis\tcurrency\tusd
     fn touched_db_tables_lists_only_read_precondition_tables() {
         let users_key = StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "u1".to_owned(),
+            key: vec![("user_id".to_owned(), "u1".to_owned())],
         }
         .to_wire();
         let mca_key = StateKey::DbRow {
             table: "merchant_connector_account".to_owned(),
-            pk_column: "merchant_connector_account_id".to_owned(),
-            pk_value: "mca1".to_owned(),
+            key: vec![(
+                "merchant_connector_account_id".to_owned(),
+                "mca1".to_owned(),
+            )],
         }
         .to_wire();
         // Two reads of `users` (one is a dup) + one read of `mca`; a redis read
@@ -6029,8 +6117,7 @@ redis\tcurrency\tusd
     fn build_write_target_tables_lists_write_isolation_tables() {
         let pi_key = StateKey::DbRow {
             table: "payment_intent".to_owned(),
-            pk_column: "payment_id".to_owned(),
-            pk_value: "pay_1".to_owned(),
+            key: vec![("payment_id".to_owned(), "pay_1".to_owned())],
         }
         .to_wire();
         // A write to payment_intent; a read of users (must NOT appear in the
@@ -6083,8 +6170,7 @@ redis\tcurrency\tusd
     fn table_sets_are_correlation_scoped() {
         let key = StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "u1".to_owned(),
+            key: vec![("user_id".to_owned(), "u1".to_owned())],
         }
         .to_wire();
         let events = vec![

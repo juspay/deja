@@ -1037,17 +1037,21 @@ fn declared_idempotent_delete(ev: &deja::BoundaryEvent) -> Option<bool> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DbRowKey {
     table: String,
-    pk_column: String,
-    pk_value: String,
+    /// The row's identity: the schema key's columns and values, in key order.
+    /// Several, because a primary key genuinely has several columns.
+    key: Vec<(String, String)>,
     wire: String,
 }
 
 impl DbRowKey {
     fn label(&self) -> String {
-        format!(
-            "{} {}={} ({})",
-            self.table, self.pk_column, self.pk_value, self.wire
-        )
+        let key = self
+            .key
+            .iter()
+            .map(|(column, value)| format!("{column}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{} {key} ({})", self.table, self.wire)
     }
 }
 
@@ -1086,16 +1090,7 @@ fn db_row_key_from_state_key(raw: &str) -> Option<DbRowKey> {
     let wire = parsed.to_wire();
     let table = parsed.db_table()?.to_owned();
     match parsed {
-        deja::StateKey::DbRow {
-            pk_column,
-            pk_value,
-            ..
-        } => Some(DbRowKey {
-            table,
-            pk_column,
-            pk_value,
-            wire,
-        }),
+        deja::StateKey::DbRow { key, .. } => Some(DbRowKey { table, key, wire }),
         _ => None,
     }
 }
@@ -1106,11 +1101,10 @@ fn event_db_row_key(ev: &deja::BoundaryEvent) -> Option<DbRowKey> {
         let Some(next) = db_row_key_from_state_key(raw) else {
             continue;
         };
-        if row_key.as_ref().is_some_and(|seen| {
-            seen.table != next.table
-                || seen.pk_column != next.pk_column
-                || seen.pk_value != next.pk_value
-        }) {
+        if row_key
+            .as_ref()
+            .is_some_and(|seen| seen.table != next.table || seen.key != next.key)
+        {
             return None;
         }
         row_key.get_or_insert(next);
@@ -1169,7 +1163,10 @@ pub(crate) fn order_nondeterministic_demotions(
     // event state sets contain exactly one typed DB-row identity. Typed row keys
     // are the only grouping input; legacy table strings and row JSON never form
     // identity. If a PK row key is absent or ambiguous, Rule A refuses demotion.
-    type Key = (Option<String>, String, String, String);
+    // Grouped by correlation and the row's canonical wire key — which already
+    // encodes the table and every key column, so it identifies the row whether
+    // its primary key has one column or several.
+    type Key = (Option<String>, String);
     let mut groups: HashMap<Key, Vec<(&deja::BoundaryEvent, DbRowKey)>> = HashMap::new();
     for ev in events {
         if !is_update_returning_event(ev) {
@@ -1179,12 +1176,7 @@ pub(crate) fn order_nondeterministic_demotions(
             continue;
         };
         groups
-            .entry((
-                ev.correlation_id.clone(),
-                row_key.table.clone(),
-                row_key.pk_column.clone(),
-                row_key.pk_value.clone(),
-            ))
+            .entry((ev.correlation_id.clone(), row_key.wire.clone()))
             .or_default()
             .push((ev, row_key));
     }
@@ -1279,8 +1271,7 @@ pub(crate) fn order_nondeterministic_demotions(
             other.global_sequence > seq
                 && other.correlation_id == ev.correlation_id
                 && other_key.table == row_key.table
-                && other_key.pk_column == row_key.pk_column
-                && other_key.pk_value == row_key.pk_value
+                && other_key.key == row_key.key
                 && matched_seq.contains(&other.global_sequence)
                 && overlaps(ev, other)
                 && db_returning_row(&other.result).is_some_and(|final_row| {
@@ -1479,9 +1470,7 @@ fn db_row_keys_from_set(raw_keys: &[String]) -> Vec<DbRowKey> {
 
 fn single_db_row_key(raw_keys: &[String]) -> Option<DbRowKey> {
     let mut keys = db_row_keys_from_set(raw_keys);
-    keys.dedup_by(|a, b| {
-        a.table == b.table && a.pk_column == b.pk_column && a.pk_value == b.pk_value
-    });
+    keys.dedup_by(|a, b| a.table == b.table && a.key == b.key);
     match keys.as_slice() {
         [key] => Some(key.clone()),
         _ => None,
@@ -1489,7 +1478,7 @@ fn single_db_row_key(raw_keys: &[String]) -> Option<DbRowKey> {
 }
 
 fn same_db_row(a: &DbRowKey, b: &DbRowKey) -> bool {
-    a.table == b.table && a.pk_column == b.pk_column && a.pk_value == b.pk_value
+    a.table == b.table && a.key == b.key
 }
 
 fn lineage_bucket(ev: &deja::BoundaryEvent) -> Option<&str> {
