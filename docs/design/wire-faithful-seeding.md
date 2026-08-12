@@ -237,17 +237,43 @@ read set and its write set, so its keys describe a row that existed *before* the
 pre-image is therefore the right precondition, and an explicit `pre_image` wins whenever the
 producer captured one.
 
-No producer captures one today. The consequence used to be that seed planning attached no image
-at all for those keys — which does **not** mean "seed nothing": materialization then renders the
-event's post-write `value` instead. Both routes seed the same post-write state; they differ only
-in representation, and the serde one cannot always be materialized (`{"TxnId": …}` in a varchar
-column is refused by the fail-closed renderer, by design). So planning falls back to the physical
-post-image: identical state, wire-exact bytes, materializable.
+No producer captures one, and none can from the result alone: the pre-state is absent from an
+`UPDATE … RETURNING` response, and postgres before 18 has no `RETURNING OLD.*`.
 
-Concretely, in one sandbox replay this was 35 `payment_attempt` preconditions failing to
-materialize while the wire-exact image of those exact rows sat unused on the same event. The
-pre-image remains the correct long-term capture (issue #35); until it exists, the fallback is the
-faithful representation of the state we are already seeding.
+It does not need capturing. A correlation that updates a row has almost always READ it first, so
+the pre-state is already on the tape a few events earlier — **216 of 217 read-modify-write rows on
+a sandbox tape resolve to an earlier observation, and in every one of those the earlier state
+differs from the post state.** Planning therefore carries the last image seen for each row and
+resolves a read-modify-write key against it, per row, so a multi-row update mixes correctly. The
+precedence is: an explicit `pre_image` when a producer ever captures one → the row's last observed
+state → the post-image as a stand-in when nothing earlier was observed (that last tier fired once
+on that tape; an absent row would make the replayed write vanish, which is worse).
+
+Seeding the post-image instead is what made an earlier read diverge: two entries denoting one row
+raced into the store, `ON CONFLICT DO NOTHING` kept whichever landed first, and reads of the
+pre-state returned post-state values — 13 `payment_methods` timestamp divergences and their 13
+readback misses. Materialization now also orders entries by the sequence of the event that
+produced them, so "first" means first *observed* rather than first in key-string order.
+
+### Row identity comes from the schema, and a key can have several columns
+
+Resolving a read-modify-write key to the row's prior observation requires knowing which row an
+image describes — row identity. That is a fact about the SCHEMA, so it is read from the schema
+(`pg_index.indisprimary`, the constraint the database itself enforces) rather than listed in the
+engine: the recorder asks at pool construction, the orchestrator asks during its catalog read, and
+both feed one registry. A hardcoded `table → column` map preceded this and was wrong in two ways
+at once — it put one application's tables inside a generic engine, and it could not express a
+composite key at all.
+
+Composite keys are not hypothetical here: `payment_intent` is keyed by `(payment_id, merchant_id)`
+and `payment_attempt` by `(attempt_id, merchant_id)`. So a row key carries the key's columns and
+values in schema order, and its wire form appends them —
+`db_row:<table>:<column>:<value>[:<column>:<value>]*` — which renders a single-column key
+byte-identically to the one-column grammar this replaced, so recordings made under it still read.
+
+Everything requires the WHOLE key. A row carrying only part of one produces no row key and falls
+back to the query fingerprint, because half a composite key does not identify a row: a predicate
+on `payment_id` alone would read back a different merchant's row and call it a match.
 
 ## The binary-format question (decided: capture binary verbatim, seed through binary COPY)
 
