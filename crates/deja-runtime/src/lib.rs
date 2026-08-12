@@ -4226,14 +4226,12 @@ mod tests {
         });
         let explicit_read = crate::replay::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "explicit_read_user".to_owned(),
+            key: vec![("user_id".to_owned(), "explicit_read_user".to_owned())],
         }
         .to_wire();
         let explicit_write = crate::replay::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "explicit_write_user".to_owned(),
+            key: vec![("user_id".to_owned(), "explicit_write_user".to_owned())],
         }
         .to_wire();
         let result_image = serde_json::json!({"image": "post"});
@@ -5016,14 +5014,12 @@ mod tests {
         let hook = FakeHook::new(true);
         let explicit_read = crate::replay::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "explicit_read_user".to_owned(),
+            key: vec![("user_id".to_owned(), "explicit_read_user".to_owned())],
         }
         .to_wire();
         let explicit_write = crate::replay::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "explicit_write_user".to_owned(),
+            key: vec![("user_id".to_owned(), "explicit_write_user".to_owned())],
         }
         .to_wire();
         let pre_image = serde_json::json!({"phase": "pre", "user_id": "explicit_read_user"});

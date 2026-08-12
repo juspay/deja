@@ -2778,18 +2778,14 @@ enum WireReadback {
 /// image carries a known primary-key column. PK values are plain identifier
 /// strings — the one column class whose serde rendering IS faithful, which is
 /// why row-state keys exist at all.
-fn wire_readback_row_predicate(row: &DbRowImage) -> Option<(String, String)> {
+fn wire_readback_row_predicate(row: &DbRowImage) -> Option<Vec<(String, String)>> {
     let object: serde_json::Map<String, serde_json::Value> = row
         .columns
         .iter()
         .map(|column| (column.metadata.name.clone(), column.value.clone()))
         .collect();
     match deja::db::row_state_key(&row.table, &serde_json::Value::Object(object)) {
-        Some(deja::StateKey::DbRow {
-            pk_column,
-            pk_value,
-            ..
-        }) => Some((pk_column, pk_value)),
+        Some(deja::StateKey::DbRow { key, .. }) => Some(key),
         _ => None,
     }
 }
@@ -2801,8 +2797,7 @@ fn wire_copy_out_command(
     schema: Option<&str>,
     table: &str,
     column_names: &[&str],
-    pk_column: &str,
-    pk_value: &str,
+    key: &[(String, String)],
 ) -> String {
     let column_list = column_names
         .iter()
@@ -2810,11 +2805,19 @@ fn wire_copy_out_command(
         .collect::<Vec<_>>()
         .join(", ");
     let qualified = qualified_table(schema, table);
-    let predicate = format!(
-        "{} = {}",
-        quote_ident(pk_column),
-        sql_literal(&serde_json::Value::String(pk_value.to_owned()))
-    );
+    // Every key column, ANDed: a composite key addresses one row only when all
+    // of its columns are constrained.
+    let predicate = key
+        .iter()
+        .map(|(column, value)| {
+            format!(
+                "{} = {}",
+                quote_ident(column),
+                sql_literal(&serde_json::Value::String(value.clone()))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
     format!(
         "\\copy (SELECT {column_list} FROM {qualified} WHERE {predicate}) TO PSTDOUT WITH (FORMAT binary)"
     )
@@ -2874,14 +2877,14 @@ fn readback_db_wire_row(
         .wire
         .as_ref()
         .ok_or("wire readback requested for a row without a physical image")?;
-    let (pk_column, pk_value) = wire_readback_row_predicate(row)
-        .ok_or("wire readback requested for a row with no pragmatic primary key")?;
+    let key = wire_readback_row_predicate(row)
+        .ok_or("wire readback requested for a row whose schema key is not fully present")?;
     let names: Vec<&str> = row
         .columns
         .iter()
         .map(|column| column.metadata.name.as_str())
         .collect();
-    let command = wire_copy_out_command(schema, &row.table, &names, &pk_column, &pk_value);
+    let command = wire_copy_out_command(schema, &row.table, &names, &key);
     let output = store
         .psql(&["-q"], true, &command)
         .output()
@@ -3095,18 +3098,28 @@ fn build_count_sql(
 }
 
 fn db_filter_predicate(row: &DbRowImage, filter: &DbRowFilter) -> Option<String> {
-    if let Some(column) = row
-        .columns
-        .iter()
-        .find(|column| column.metadata.name == filter.pk_column)
-    {
-        return db_comparison_predicate(&column.metadata.name, column);
+    let mut predicates = Vec::with_capacity(filter.key.len());
+    for (key_column, key_value) in &filter.key {
+        // Prefer the row's own typed column: its catalog metadata renders the
+        // comparison correctly (a json column compares as jsonb, and so on).
+        // Absent that, fall back to the key's value as an untyped literal.
+        let predicate = match row
+            .columns
+            .iter()
+            .find(|column| &column.metadata.name == key_column)
+        {
+            Some(column) => db_comparison_predicate(&column.metadata.name, column)?,
+            None => {
+                let column = DbColumnImage {
+                    metadata: DbColumnMetadata::unknown(key_column),
+                    value: serde_json::Value::String(key_value.clone()),
+                };
+                db_comparison_predicate(key_column, &column)?
+            }
+        };
+        predicates.push(predicate);
     }
-    let column = DbColumnImage {
-        metadata: DbColumnMetadata::unknown(&filter.pk_column),
-        value: serde_json::Value::String(filter.pk_value.clone()),
-    };
-    db_comparison_predicate(&filter.pk_column, &column)
+    (!predicates.is_empty()).then(|| predicates.join(" AND "))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3118,8 +3131,9 @@ struct DbSeedTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DbRowFilter {
-    pk_column: String,
-    pk_value: String,
+    /// The schema key's columns and values, in key order. All of them must
+    /// match: a composite key identifies a row only as a whole.
+    key: Vec<(String, String)>,
 }
 
 impl DbSeedTarget {
@@ -3149,17 +3163,10 @@ fn db_seed_target_from_key(key: &str) -> Option<DbSeedTarget> {
         return None;
     };
     match &state_key {
-        deja::StateKey::DbRow {
-            pk_column,
-            pk_value,
-            ..
-        } => Some(DbSeedTarget {
+        deja::StateKey::DbRow { key, .. } => Some(DbSeedTarget {
             table,
             kind: "row",
-            row_filter: Some(DbRowFilter {
-                pk_column: pk_column.clone(),
-                pk_value: pk_value.clone(),
-            }),
+            row_filter: Some(DbRowFilter { key: key.clone() }),
         }),
         deja::StateKey::DbQuery { .. } => Some(DbSeedTarget {
             table,
@@ -3177,9 +3184,10 @@ fn db_seed_target_from_key(key: &str) -> Option<DbSeedTarget> {
 }
 
 fn db_row_matches_filter(row: &DbRowImage, filter: &DbRowFilter) -> bool {
-    row.columns.iter().any(|column| {
-        column.metadata.name == filter.pk_column
-            && db_seed_wire_value(&column.value) == filter.pk_value
+    filter.key.iter().all(|(key_column, key_value)| {
+        row.columns.iter().any(|column| {
+            &column.metadata.name == key_column && &db_seed_wire_value(&column.value) == key_value
+        })
     })
 }
 
@@ -4777,8 +4785,17 @@ mod tests {
     /// keys can call it without ordering assumptions.
     fn register_test_schema_identity() {
         deja::register_table_identity([
-            ("payment_attempt".to_owned(), vec!["attempt_id".to_owned()]),
-            ("payment_intent".to_owned(), vec!["payment_id".to_owned()]),
+            // The real schema keys: migration 2024-06-03-090859 made both of
+            // these composite, which is why the row-key grammar has to carry
+            // several columns.
+            (
+                "payment_attempt".to_owned(),
+                vec!["attempt_id".to_owned(), "merchant_id".to_owned()],
+            ),
+            (
+                "payment_intent".to_owned(),
+                vec!["payment_id".to_owned(), "merchant_id".to_owned()],
+            ),
             (
                 "payment_methods".to_owned(),
                 vec!["payment_method_id".to_owned()],
@@ -4967,8 +4984,7 @@ mod tests {
             "db",
             &deja::StateKey::DbRow {
                 table: "users".to_owned(),
-                pk_column: "user_id".to_owned(),
-                pk_value: "user_123".to_owned(),
+                key: vec![("user_id".to_owned(), "user_123".to_owned())],
             }
             .to_wire(),
         );
@@ -5165,8 +5181,7 @@ mod tests {
         .to_wire();
         let row_key = deja::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: user_id.to_owned(),
+            key: vec![("user_id".to_owned(), user_id.to_owned())],
         }
         .to_wire();
         let query_result_image = deja::db::DbRowImage::new(
@@ -5413,8 +5428,7 @@ mod tests {
         let image =
             DbRowImage::from_json_object("users", &row, &DbCatalog::default()).expect("row image");
         let key_filter = DbRowFilter {
-            pk_column: "user_id".to_owned(),
-            pk_value: "user_123".to_owned(),
+            key: vec![("user_id".to_owned(), "user_123".to_owned())],
         };
 
         let full_row_sql =
@@ -6463,8 +6477,7 @@ mod tests {
     fn db_row_seed_filters_multi_row_envelope_to_keyed_row() {
         let row_key = deja::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: "user_123".to_owned(),
+            key: vec![("user_id".to_owned(), "user_123".to_owned())],
         }
         .to_wire();
         let target = db_seed_target_from_key(&row_key).expect("DbRow key is seedable");
@@ -6525,8 +6538,7 @@ mod tests {
         let payment_id = "pay_precondition_123";
         let row_key = deja::StateKey::DbRow {
             table: "payment_intent".to_owned(),
-            pk_column: "payment_id".to_owned(),
-            pk_value: payment_id.to_owned(),
+            key: vec![("payment_id".to_owned(), payment_id.to_owned())],
         }
         .to_wire();
         let query_key = deja::StateKey::DbQuery {
@@ -6642,8 +6654,7 @@ mod tests {
         let row_key = |table: &str, val: &str| {
             deja::StateKey::DbRow {
                 table: table.to_owned(),
-                pk_column: "id".to_owned(),
-                pk_value: val.to_owned(),
+                key: vec![("id".to_owned(), val.to_owned())],
             }
             .to_wire()
         };
@@ -6681,8 +6692,7 @@ mod tests {
         .to_wire();
         let row_key = deja::StateKey::DbRow {
             table: "users".to_owned(),
-            pk_column: "user_id".to_owned(),
-            pk_value: user_id.to_owned(),
+            key: vec![("user_id".to_owned(), user_id.to_owned())],
         }
         .to_wire();
         let users_row = serde_json::json!({
@@ -7422,48 +7432,73 @@ mod tests {
     }
 
     /// The COPY-OUT readback command selects the image's columns in capture
-    /// order, keyed by the pragmatic primary key, quoted like every other
-    /// identifier on the seed path.
+    /// order, keyed by EVERY column of the row's schema key, quoted like every
+    /// other identifier on the seed path. `payment_attempt` is keyed by
+    /// `(attempt_id, merchant_id)`, so a one-column predicate would read back
+    /// the wrong row — or several.
     #[test]
     fn wire_copy_out_command_renders_quoted_and_keyed() {
         let command = wire_copy_out_command(
             Some("deja_c1"),
             "payment_attempt",
             &["attempt_id", "connector_transaction_id"],
-            "attempt_id",
-            "pay_x_1",
-        );
-        assert_eq!(
-            command,
-            "\\copy (SELECT \"attempt_id\", \"connector_transaction_id\" FROM \"deja_c1\".\"payment_attempt\" WHERE \"attempt_id\" = 'pay_x_1') TO PSTDOUT WITH (FORMAT binary)"
-        );
-    }
-
-    /// The wire readback predicate comes from the row image itself — the same
-    /// pragmatic-PK extraction that mints row state keys.
-    #[test]
-    fn wire_readback_predicate_finds_the_pragmatic_pk() {
-        register_test_schema_identity();
-        let row = wire_row_image(
-            "payment_intent",
-            vec![
-                (
-                    "payment_id",
-                    Some(1043),
-                    serde_json::json!("pay_1"),
-                    Some(b"pay_1".to_vec()),
-                ),
-                (
-                    "status",
-                    Some(19465),
-                    serde_json::json!("succeeded"),
-                    Some(b"succeeded".to_vec()),
-                ),
+            &[
+                ("attempt_id".to_owned(), "pay_x_1".to_owned()),
+                ("merchant_id".to_owned(), "merch_1".to_owned()),
             ],
         );
         assert_eq!(
-            wire_readback_row_predicate(&row),
-            Some(("payment_id".to_owned(), "pay_1".to_owned()))
+            command,
+            "\\copy (SELECT \"attempt_id\", \"connector_transaction_id\" FROM \"deja_c1\".\"payment_attempt\" \
+             WHERE \"attempt_id\" = 'pay_x_1' AND \"merchant_id\" = 'merch_1') TO PSTDOUT WITH (FORMAT binary)"
+        );
+    }
+
+    /// The wire readback predicate comes from the row image itself, and carries
+    /// EVERY column of the schema key — in key order. A row missing part of its
+    /// key yields no predicate at all rather than one that addresses a prefix:
+    /// reading back "some row with this payment_id" would pass against a
+    /// different merchant's row.
+    #[test]
+    fn wire_readback_predicate_carries_the_whole_schema_key() {
+        register_test_schema_identity();
+        let payment_id = (
+            "payment_id",
+            Some(1043),
+            serde_json::json!("pay_1"),
+            Some(b"pay_1".to_vec()),
+        );
+        let merchant_id = (
+            "merchant_id",
+            Some(1043),
+            serde_json::json!("merch_1"),
+            Some(b"merch_1".to_vec()),
+        );
+        let status = (
+            "status",
+            Some(19465),
+            serde_json::json!("succeeded"),
+            Some(b"succeeded".to_vec()),
+        );
+
+        let whole = wire_row_image(
+            "payment_intent",
+            vec![payment_id.clone(), merchant_id, status.clone()],
+        );
+        assert_eq!(
+            wire_readback_row_predicate(&whole),
+            Some(vec![
+                ("payment_id".to_owned(), "pay_1".to_owned()),
+                ("merchant_id".to_owned(), "merch_1".to_owned()),
+            ]),
+            "both key columns, in schema key order"
+        );
+
+        let partial = wire_row_image("payment_intent", vec![payment_id, status]);
+        assert_eq!(
+            wire_readback_row_predicate(&partial),
+            None,
+            "half a composite key identifies no row"
         );
     }
 

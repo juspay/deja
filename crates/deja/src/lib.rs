@@ -1442,11 +1442,12 @@ pub mod db {
     /// NotFound read, which otherwise records an empty read set and starves
     /// seed planning of the read's identity.
     ///
-    /// Conservative by construction: only equality binds on the table's known
-    /// pragmatic primary-key column produce keys, and any bind list that does
-    /// not parse yields no keys (never a guess).
+    /// Conservative by construction: a key is produced only when EVERY column
+    /// of the table's schema key is bound by equality in this statement — a
+    /// partial key does not identify a row — and any bind list that does not
+    /// parse yields no keys (never a guess).
     pub fn binds_read_keys(table: &str, sql: &str) -> Vec<String> {
-        let Some(pk) = deja_runtime::replay::db_pk_column(table) else {
+        let Some(identity) = deja_runtime::replay::table_identity_columns(table) else {
             return Vec::new();
         };
         let Some(binds_at) = sql.rfind(" -- binds: ") else {
@@ -1461,24 +1462,69 @@ pub mod db {
             return Vec::new();
         };
 
-        let needle = format!("\"{pk}\" = $");
+        /// Every value this statement binds by equality to `column`, in the
+        /// order the predicates appear.
+        fn bound_values<'a>(
+            query: &str,
+            binds: &'a [serde_json::Value],
+            column: &str,
+        ) -> Vec<&'a serde_json::Value> {
+            let needle = format!("\"{column}\" = $");
+            let mut values = Vec::new();
+            let mut cursor = 0;
+            while let Some(found) = query[cursor..].find(&needle) {
+                let digits_start = cursor + found + needle.len();
+                let digits: String = query[digits_start..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                cursor = digits_start;
+                if let Some(value) = digits
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|position| position.checked_sub(1))
+                    .and_then(|index| binds.get(index))
+                {
+                    values.push(value);
+                }
+            }
+            values
+        }
+
+        // One row per equality predicate on the FIRST key column, each
+        // completed by the other key columns' bound values. A statement that
+        // binds one key column several times (an `IN`-style rewrite) but the
+        // rest only once still addresses one row per leading value, so the
+        // remaining columns reuse their single binding.
+        let mut per_column: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+        for column in identity {
+            let values = bound_values(query, &binds, &column);
+            if values.is_empty() {
+                // A key column this statement does not constrain: the
+                // predicate cannot name a single row, so produce nothing.
+                return Vec::new();
+            }
+            per_column.push((column, values));
+        }
+        let Some((_, leading)) = per_column.first() else {
+            return Vec::new();
+        };
+
         let mut keys = Vec::new();
-        let mut cursor = 0;
-        while let Some(found) = query[cursor..].find(&needle) {
-            let digits_start = cursor + found + needle.len();
-            let digits: String = query[digits_start..]
-                .chars()
-                .take_while(char::is_ascii_digit)
+        for index in 0..leading.len() {
+            let row: serde_json::Map<String, serde_json::Value> = per_column
+                .iter()
+                .map(|(column, values)| {
+                    let value = values.get(index).or_else(|| values.first());
+                    (
+                        column.clone(),
+                        value.map_or(serde_json::Value::Null, |value| (*value).clone()),
+                    )
+                })
                 .collect();
-            cursor = digits_start;
-            let Ok(position) = digits.parse::<usize>() else {
-                continue;
-            };
-            let Some(value) = position.checked_sub(1).and_then(|i| binds.get(i)) else {
-                continue;
-            };
-            let row = serde_json::json!({ pk.clone(): value });
-            if let Some(key) = deja_runtime::replay::db_row_state_key(table, &row) {
+            if let Some(key) =
+                deja_runtime::replay::db_row_state_key(table, &serde_json::Value::Object(row))
+            {
                 let wire = key.to_wire();
                 if !keys.contains(&wire) {
                     keys.push(wire);
