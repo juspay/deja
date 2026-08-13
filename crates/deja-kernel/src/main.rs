@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use deja_kernel::{
-    compare_response, group_by_correlation, reconstruct_driver_request, BoundaryEvent,
-    DriverRequest, HttpDiff,
+    compare_response, group_by_correlation, project_body, reconstruct_driver_request,
+    BoundaryEvent, DriverRequest, HttpDiff,
 };
 
 fn main() -> ExitCode {
@@ -273,9 +273,13 @@ fn drive(
 ) -> HttpDiff {
     match drive_inner(target_host, target_port, driver) {
         Ok((status, body)) => {
-            let body_text = String::from_utf8_lossy(&body).into_owned();
-            let body_json: serde_json::Value =
-                serde_json::from_str(&body_text).unwrap_or(serde_json::Value::String(body_text));
+            // Same projection the baseline half applies to the recorded bytes.
+            // This used to be an open-coded copy of it, and the two copies
+            // drifted: the recorded side read `response_body.json` only, which
+            // is `null` for every body that is not JSON, so every text/html
+            // reply reported a whole-body diff at `$` whether or not the two
+            // documents differed at all.
+            let body_json = project_body(&body);
             compare_response(driver, status, &body_json, allowlist)
         }
         Err(err) => {
@@ -498,8 +502,7 @@ mod tests {
             body: body.map(<[u8]>::to_vec),
             baseline_response: BaselineResponse {
                 status: 200,
-                body_json: None,
-                body_text: None,
+                body: None,
             },
         }
     }

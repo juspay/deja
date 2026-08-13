@@ -33,8 +33,42 @@ pub struct DriverRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineResponse {
     pub status: u16,
-    pub body_json: Option<serde_json::Value>,
-    pub body_text: Option<String>,
+    /// The recorded response body as BYTES, recovered from whichever
+    /// representation the tape carries. Bytes, not a pre-picked `json`/`text`
+    /// pair: the recorder writes both halves of every body (`text` always,
+    /// `json` only when the bytes happen to parse), and holding both here is
+    /// what let the comparison read one field while the candidate side read
+    /// the other. There is one representation now, and `project_body` is the
+    /// only way it becomes a comparable value.
+    ///
+    /// `None` means the tape carried no body object at all for this response.
+    /// `Some(empty)` means the recorder captured zero bytes.
+    pub body: Option<Vec<u8>>,
+}
+
+impl BaselineResponse {
+    /// The recorded body exactly as the comparison sees it, or `None` when the
+    /// tape carried no body at all. Same function as the candidate side.
+    pub fn projected_body(&self) -> Option<serde_json::Value> {
+        self.body.as_deref().map(project_body)
+    }
+}
+
+/// The ONE projection from captured response bytes to the value a diff is
+/// taken over. Both halves call it — the baseline half on the bytes the
+/// recorder wrote, the candidate half on the bytes it read off the wire — so
+/// "same bytes" implies "same value" by construction rather than by two
+/// hand-matched implementations.
+///
+/// Bytes that parse as JSON become that JSON (including the literal `null`
+/// body, which becomes `Value::Null` on BOTH sides and so still compares
+/// equal). Bytes that do not parse — an HTML redirect form, a plain-text
+/// error, an empty body — become the string of those bytes. Non-UTF-8 bytes
+/// go through `from_utf8_lossy`, which is lossy but symmetric: identical
+/// bytes still project identically.
+pub fn project_body(bytes: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
 }
 
 /// Per-request comparison output, posted to the orchestrator's HTTP diff sink.
@@ -139,17 +173,47 @@ fn baseline_from_event(event: &BoundaryEvent) -> BaselineResponse {
         .map(|n| n as u16)
         .unwrap_or(0);
     // The recorder stores the response body under `response_body`, not `body`.
-    let body = resp.get("response_body").or_else(|| resp.get("body"));
-    let body_json = body.and_then(|b| b.get("json")).cloned();
-    let body_text = body
-        .and_then(|b| b.get("text"))
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-    BaselineResponse {
-        status,
-        body_json,
-        body_text,
+    let body = resp
+        .get("response_body")
+        .or_else(|| resp.get("body"))
+        .and_then(captured_body_bytes);
+    BaselineResponse { status, body }
+}
+
+/// Recover the recorded body BYTES from a capture object, in descending order
+/// of fidelity: the exact wire bytes, then the UTF-8 text, then a
+/// re-serialization of the parsed JSON (old fixtures carry only `json`).
+///
+/// `Some(empty)` for `captured: false`. The recorder cannot tell an empty body
+/// from a stream it never finished draining — its own reason string says
+/// "empty body or stream incomplete" — so this projects the common case (a
+/// genuinely bodyless response) and ACCEPTS that a truncated capture will
+/// compare equal to an empty candidate response instead of raising a body
+/// divergence. The alternative, treating it as `null`, made every bodyless
+/// response diff against the candidate's empty body forever.
+///
+/// `None` only when the tape says nothing about a body at all.
+fn captured_body_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(arr) = body.get("raw_bytes").and_then(|v| v.as_array()) {
+        return Some(
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .collect(),
+        );
     }
+    if let Some(text) = body.get("text").and_then(|v| v.as_str()) {
+        return Some(text.as_bytes().to_vec());
+    }
+    // A `json` of literal `null` is the recorder saying "these bytes did not
+    // parse", not "the body was null" — the body that WAS null still carries
+    // `text: "null"` and is caught above.
+    if let Some(json) = body.get("json").filter(|j| !j.is_null()) {
+        return serde_json::to_vec(json).ok();
+    }
+    if body.get("captured").and_then(|v| v.as_bool()) == Some(false) {
+        return Some(Vec::new());
+    }
+    None
 }
 
 /// Extract request headers as flat (name, value) pairs. The recorder emits a
@@ -192,6 +256,11 @@ fn extract_headers(value: Option<&serde_json::Value>) -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// Request-side sibling of `captured_body_bytes`, deliberately NOT the same
+/// function: here `None` and "zero bytes" mean the same thing — no body is
+/// written and no `Content-Length` is sent — whereas on the response side the
+/// difference between "no body recorded" and "an empty body was recorded" is
+/// exactly what a diff has to report.
 fn extract_body_bytes(body: Option<&serde_json::Value>) -> Option<Vec<u8>> {
     let body = body?;
     // Prefer raw_bytes (exact wire bytes), fall back to text, then to a
@@ -274,11 +343,11 @@ pub fn compare_response(
     candidate_body: &serde_json::Value,
     allowlist: &[&str],
 ) -> HttpDiff {
-    let baseline_json = driver
-        .baseline_response
-        .body_json
-        .clone()
-        .unwrap_or(serde_json::Value::Null);
+    // `baseline_body` IS the value that was diffed — not a second, separately
+    // derived view of the same bytes. That equality is the invariant this
+    // function exists to hold.
+    let baseline_body = driver.baseline_response.projected_body();
+    let baseline_json = baseline_body.clone().unwrap_or(serde_json::Value::Null);
     let body_diff = diff_json(&baseline_json, candidate_body, "$", allowlist);
     HttpDiff {
         correlation_id: driver.correlation_id.clone(),
@@ -288,7 +357,7 @@ pub fn compare_response(
         status_candidate: candidate_status,
         status_match: driver.baseline_response.status == candidate_status,
         body_diff,
-        baseline_body: driver.baseline_response.body_json.clone(),
+        baseline_body,
         candidate_body: Some(candidate_body.clone()),
         transport_error: None,
     }
@@ -369,7 +438,7 @@ mod tests {
         assert_eq!(drv.body.as_deref(), Some(b"{\"amount\":100}".as_slice()));
         assert_eq!(drv.baseline_response.status, 200);
         assert_eq!(
-            drv.baseline_response.body_json,
+            drv.baseline_response.projected_body(),
             Some(serde_json::json!({ "id": "pay_1", "status": "succeeded" }))
         );
     }
@@ -400,9 +469,9 @@ mod tests {
             .any(|(k, v)| k == "content-type" && v == "application/json"));
         assert_eq!(drv.baseline_response.status, 200);
         assert_eq!(
-            drv.baseline_response.body_json,
+            drv.baseline_response.projected_body(),
             Some(serde_json::json!({ "id": "pay_1", "status": "succeeded" })),
-            "response_body.json read as baseline"
+            "response_body read as baseline"
         );
     }
 
@@ -446,6 +515,149 @@ mod tests {
         assert_eq!(diff_json(&baseline, &candidate, "$", &[]).len(), 1);
         // With $.id allowlisted: 0 diffs.
         assert_eq!(diff_json(&baseline, &candidate, "$", &["$.id"]).len(), 0);
+    }
+
+    /// Byte-for-byte what `deja-runtime`'s `inject_body_json` writes for a
+    /// non-empty body: BOTH representations, with `json` null whenever the
+    /// bytes do not parse. The tests below drive the real recorder shape so a
+    /// change to that shape breaks them here rather than in a run.
+    fn captured_body(bytes: &[u8]) -> serde_json::Value {
+        let text = std::str::from_utf8(bytes).ok().map(str::to_string);
+        let parsed = text
+            .as_deref()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+        serde_json::json!({
+            "captured": true,
+            "bytes_len": bytes.len(),
+            "utf8": text.is_some(),
+            "text": text,
+            "json": parsed,
+            "raw_bytes": bytes,
+        })
+    }
+
+    /// What the recorder writes when it captured no bytes.
+    fn captured_nothing() -> serde_json::Value {
+        serde_json::json!({
+            "captured": false,
+            "reason": "empty body or stream incomplete",
+        })
+    }
+
+    /// Drive one recorded body against one candidate body, both as raw bytes,
+    /// through the exact path a real run takes.
+    fn compare_bodies(recorded: serde_json::Value, candidate: &[u8]) -> HttpDiff {
+        let req = serde_json::json!({ "method": "GET", "path": "/payments/redirect/x" });
+        let resp = serde_json::json!({ "status": 200, "response_body": recorded });
+        let drv = reconstruct_driver_request(&[json_event(req, resp, 0)]).expect("reconstruct");
+        compare_response(&drv, 200, &project_body(candidate), &[])
+    }
+
+    const HTML: &[u8] =
+        b"<!DOCTYPE html><html><body><form method=\"post\" action=\"https://psp/pay\"></form></body></html>";
+
+    /// The defect: `text/html` never parses as JSON, so the recorder's `json`
+    /// field is null while `text` holds the document. Reading only `json` on
+    /// the baseline side while the candidate side kept non-JSON as a string
+    /// reported one whole-body divergence at `$` for EVERY html reply — bodies
+    /// that were identical included. Identical bytes must diff nowhere.
+    #[test]
+    fn identical_html_bodies_are_not_a_divergence() {
+        let diff = compare_bodies(captured_body(HTML), HTML);
+        assert!(
+            diff.body_diff.is_empty(),
+            "identical html reported as divergence: {:?}",
+            diff.body_diff
+        );
+        assert_eq!(
+            diff.baseline_body,
+            Some(serde_json::Value::String(
+                String::from_utf8_lossy(HTML).into_owned()
+            )),
+            "baseline_body must carry the document, not null"
+        );
+        assert_eq!(diff.baseline_body, diff.candidate_body);
+    }
+
+    /// …and the other half of the property: suppressing the false positive
+    /// must not suppress the true one. An html body that really changed still
+    /// diffs, with both sides visible.
+    #[test]
+    fn differing_html_bodies_still_diverge() {
+        let candidate = b"<!DOCTYPE html><html><body><form method=\"post\" action=\"https://other/pay\"></form></body></html>";
+        let diff = compare_bodies(captured_body(HTML), candidate);
+        assert_eq!(diff.body_diff.len(), 1, "{:?}", diff.body_diff);
+        assert_eq!(diff.body_diff[0].json_path, "$");
+        assert!(
+            diff.body_diff[0].baseline.is_string(),
+            "baseline side must be the recorded document, not null: {:?}",
+            diff.body_diff[0].baseline
+        );
+        assert_ne!(diff.body_diff[0].baseline, diff.body_diff[0].candidate);
+    }
+
+    /// The ambiguity `json` alone cannot resolve: a body whose bytes ARE the
+    /// JSON literal `null` records `json: null` too — indistinguishable from
+    /// "did not parse" on that field. Projecting from bytes settles it: both
+    /// sides parse `null` to `Value::Null` and agree.
+    #[test]
+    fn literal_null_body_stays_null_on_both_sides() {
+        let diff = compare_bodies(captured_body(b"null"), b"null");
+        assert!(diff.body_diff.is_empty(), "{:?}", diff.body_diff);
+        assert_eq!(diff.baseline_body, Some(serde_json::Value::Null));
+    }
+
+    /// A bodyless response is the same false positive in miniature: the
+    /// candidate's zero bytes project to `""`, so a baseline projected as
+    /// `null` diffed against every 204 forever.
+    #[test]
+    fn empty_body_matches_an_empty_candidate() {
+        let diff = compare_bodies(captured_nothing(), b"");
+        assert!(diff.body_diff.is_empty(), "{:?}", diff.body_diff);
+        assert_eq!(diff.baseline_body, Some(serde_json::json!("")));
+    }
+
+    /// Non-UTF-8 bytes have no `text` at all — only `raw_bytes`. The
+    /// projection is lossy there, but symmetrically lossy: equal bytes still
+    /// compare equal, and unequal bytes still diverge.
+    #[test]
+    fn non_utf8_body_projects_from_raw_bytes() {
+        let raw: &[u8] = &[0xff, 0xfe, 0x00, 0x42];
+        let recorded = captured_body(raw);
+        assert!(
+            recorded["text"].is_null() && recorded["json"].is_null(),
+            "fixture must reproduce a capture with neither text nor json"
+        );
+        let same = compare_bodies(recorded.clone(), raw);
+        assert!(same.body_diff.is_empty(), "{:?}", same.body_diff);
+        let other = compare_bodies(recorded, &[0xff, 0xfe, 0x00, 0x43]);
+        assert_eq!(other.body_diff.len(), 1, "{:?}", other.body_diff);
+    }
+
+    /// A JSON reply must survive the change untouched: it projects to the
+    /// parsed object, and a real field change is still reported at its own
+    /// path rather than as one opaque whole-body diff.
+    #[test]
+    fn json_bodies_still_diff_field_by_field() {
+        let diff = compare_bodies(
+            captured_body(br#"{"id":"pay_1","amount":100}"#),
+            br#"{"id":"pay_1","amount":200}"#,
+        );
+        assert_eq!(diff.body_diff.len(), 1, "{:?}", diff.body_diff);
+        assert_eq!(diff.body_diff[0].json_path, "$.amount");
+    }
+
+    /// A response the tape says nothing about stays `null`, and stays absent
+    /// from the record: "not recorded" is not "recorded empty".
+    #[test]
+    fn absent_body_reports_no_baseline_body() {
+        let req = serde_json::json!({ "method": "GET", "path": "/x" });
+        let resp = serde_json::json!({ "status": 200 });
+        let drv = reconstruct_driver_request(&[json_event(req, resp, 0)]).expect("reconstruct");
+        assert_eq!(drv.baseline_response.body, None);
+        let diff = compare_response(&drv, 200, &serde_json::json!({"a": 1}), &[]);
+        assert_eq!(diff.baseline_body, None);
+        assert_eq!(diff.body_diff.len(), 1);
     }
 
     #[test]
