@@ -18,6 +18,11 @@
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!   - table entry the candidate never hit  → OmittedCall (blocking)
 //!     …uncorrelated, or non-blocking       → OmittedCallTolerated
+//!   - db value diff confined to columns
+//!     both statements fill with `DEFAULT`  → SchemaDefaultDivergence (tolerated)
+//!     …the statement wrote none of them, and
+//!     the correlation's history says the
+//!     schema did                           → SchemaDefaultInherited (tolerated)
 //!   - http status / body diffs             → StatusMismatch / BodyMismatch
 //!
 //! Every classification lands in `per_boundary`, and the summary's counters are
@@ -200,6 +205,17 @@ pub struct Summary {
     /// `value_divergences`/`side_effect_divergences`; does NOT fail the verdict.
     #[serde(default)]
     pub order_nondeterminism_warnings: u64,
+    /// Db value divergences classified as SCHEMA-DERIVED: every column that
+    /// differed was one the statement filled with the literal SQL keyword
+    /// `DEFAULT`, on both the recorded and the observed side, so the value came
+    /// from the schema and not from the application. These are evidence that the
+    /// two databases disagree about a column default — a fact about the
+    /// environment — so they are counted and named here rather than counted in
+    /// `value_divergences`/`side_effect_divergences`, and they do NOT fail the
+    /// verdict. A divergence touching one bound (`$n`) column as well stays
+    /// blocking; see `schema_default_divergence`.
+    #[serde(default)]
+    pub schema_default_divergences: u64,
     /// Redis idempotent-delete divergences DEMOTED to a non-blocking warning: a
     /// `delete_key`/DEL that recorded `KeyDeleted` but observed `KeyNotDeleted` —
     /// the key is ABSENT afterward either way, so only the "did it exist" reply
@@ -381,6 +397,11 @@ impl Scorecard {
             &["OrderNondeterministicWarning"],
         );
         folds(
+            "schema_default_divergences",
+            s.schema_default_divergences,
+            &["SchemaDefaultDivergence", "SchemaDefaultInherited"],
+        );
+        folds(
             "undeclared_concurrency_warnings",
             s.undeclared_concurrency_warnings,
             &[UNDECLARED_CONCURRENCY_WARNING],
@@ -490,40 +511,7 @@ fn is_db_boundary(boundary: &str) -> bool {
 /// only ignored inside structured `{result:"Err", kind, message}` payloads; `Ok`
 /// rows and error `kind` changes remain strict.
 fn db_equiv_modulo_infra(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    fn is_structured_db_err(m: &serde_json::Map<String, serde_json::Value>) -> bool {
-        m.get("result").and_then(serde_json::Value::as_str) == Some("Err")
-            && m.get("kind").and_then(serde_json::Value::as_str).is_some()
-            && m.get("message")
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-    }
-
-    fn normalize(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::Object(m) => {
-                let structured_err = is_structured_db_err(m);
-                serde_json::Value::Object(
-                    m.iter()
-                        .filter(|(k, val)| !(k.as_str() == "id" && (val.is_i64() || val.is_u64())))
-                        .map(|(k, val)| {
-                            let normalized = if structured_err && k == "message" {
-                                serde_json::Value::String("<diagnostic>".to_owned())
-                            } else {
-                                normalize(val)
-                            };
-                            (k.clone(), normalized)
-                        })
-                        .collect(),
-                )
-            }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(normalize).collect())
-            }
-            other => other.clone(),
-        }
-    }
-
-    normalize(a) == normalize(b)
+    db_normalize_infra(a) == db_normalize_infra(b)
         || matches!(
             (a.as_object(), b.as_object()),
             (Some(a_obj), Some(b_obj))
@@ -531,6 +519,623 @@ fn db_equiv_modulo_infra(a: &serde_json::Value, b: &serde_json::Value) -> bool {
                     && is_structured_db_err(b_obj)
                     && projected_db_error_equiv(a, b)
         )
+}
+
+/// Whether a value is a structured DB `Err` payload (`{result:"Err", kind, message}`).
+fn is_structured_db_err(m: &serde_json::Map<String, serde_json::Value>) -> bool {
+    m.get("result").and_then(serde_json::Value::as_str) == Some("Err")
+        && m.get("kind").and_then(serde_json::Value::as_str).is_some()
+        && m.get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+/// A db result with replay-local DB infrastructure normalized away — the relation
+/// [`db_equiv_modulo_infra`] tests, exposed as a value.
+///
+/// Lifted out of that function because [`db_row_column_diff`] has to answer WHICH
+/// columns differ under the SAME relation that decided they differ at all.
+/// Compared raw, a fresh postgres SERIAL `id` would show up as a differing column
+/// and make a divergence the equality itself ignores look like it reached a
+/// column the application supplied.
+fn db_normalize_infra(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let structured_err = is_structured_db_err(m);
+            serde_json::Value::Object(
+                m.iter()
+                    .filter(|(k, val)| !(k.as_str() == "id" && (val.is_i64() || val.is_u64())))
+                    .map(|(k, val)| {
+                        let normalized = if structured_err && k == "message" {
+                            serde_json::Value::String("<diagnostic>".to_owned())
+                        } else {
+                            db_normalize_infra(val)
+                        };
+                        (k.clone(), normalized)
+                    })
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(db_normalize_infra).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema-derived divergence: columns the SQL fills with the DEFAULT keyword
+// ---------------------------------------------------------------------------
+
+/// The statement without its operands. Diesel renders a query as
+/// `<sql> -- binds: [...]`, so everything before that tail is the statement and
+/// everything after it is the values it was handed. One definition, because
+/// [`pairing_shape`] and [`parse_write_statement`] have to agree on where the
+/// statement ends.
+fn sql_statement(sql: &str) -> &str {
+    match sql.rfind(" -- binds: ") {
+        Some(at) => &sql[..at],
+        None => sql,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteKind {
+    Insert,
+    Update,
+}
+
+/// One INSERT or UPDATE, read as a record of WHO supplied each column it writes.
+///
+/// Diesel emits `DEFAULT` as the VALUES entry (or the SET right-hand side) for a
+/// `None` field, so those columns are filled by the SCHEMA; everything else it
+/// writes is a bind (`$n`) and is filled by the APPLICATION. A recorded
+/// `INSERT INTO "payment_intent"` carries 80 columns, 48 schema-filled and 32
+/// application-filled. That split is the whole basis of the classification: a
+/// candidate that supplies a value can never land in the schema-filled set.
+///
+/// Positions in the VALUES list do NOT line up with positions in the bind list —
+/// a `DEFAULT` entry consumes no bind — so the VALUES list is read directly and
+/// the binds are never consulted. Reading the binds positionally is what once put
+/// an `Encryption {…}` where `business_label` should have been.
+///
+/// Conservative in the shape of `deja::db::binds_read_keys`: anything that does
+/// not parse exactly yields nothing rather than a guess. That includes an
+/// identifier carrying an escaped `""`, which ends the parse instead of being
+/// decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteStatement {
+    kind: WriteKind,
+    table: String,
+    /// Columns whose value is the literal `DEFAULT` keyword.
+    schema_filled: BTreeSet<String>,
+    /// Every other column this statement writes — a bind, or an expression.
+    application_filled: BTreeSet<String>,
+}
+
+impl WriteStatement {
+    fn writes(&self, column: &str) -> bool {
+        self.schema_filled.contains(column) || self.application_filled.contains(column)
+    }
+}
+
+fn parse_write_statement(sql: &str) -> Option<WriteStatement> {
+    /// Sort `(column, value)` pairs into the two provenance sets.
+    fn split_provenance<'a>(
+        assignments: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> (BTreeSet<String>, BTreeSet<String>) {
+        let (mut schema, mut application) = (BTreeSet::new(), BTreeSet::new());
+        for (column, value) in assignments {
+            let Some(column) = unquote_identifier(column) else {
+                continue;
+            };
+            if is_default_keyword(value) {
+                schema.insert(column);
+            } else {
+                application.insert(column);
+            }
+        }
+        (schema, application)
+    }
+
+    let statement = sql_statement(sql).trim_start();
+    let (verb, rest) = split_leading_word(statement);
+    if verb.eq_ignore_ascii_case("INSERT") {
+        let (into, rest) = split_leading_word(rest.trim_start());
+        if !into.eq_ignore_ascii_case("INTO") {
+            return None;
+        }
+        let (table, rest) = quoted_identifier(rest.trim_start())?;
+        let (columns, rest) = parenthesized(rest.trim_start())?;
+        let (values, rest) = split_leading_word(rest.trim_start());
+        if !values.eq_ignore_ascii_case("VALUES") {
+            return None;
+        }
+        let (values, _) = parenthesized(rest.trim_start())?;
+        let columns = split_top_level(columns);
+        let values = split_top_level(values);
+        // A column list and a VALUES list of different lengths is a statement
+        // this parser did not understand; refuse rather than pair them up by
+        // position and name the wrong column.
+        if columns.len() != values.len() {
+            return None;
+        }
+        let (schema_filled, application_filled) = split_provenance(columns.into_iter().zip(values));
+        Some(WriteStatement {
+            kind: WriteKind::Insert,
+            table,
+            schema_filled,
+            application_filled,
+        })
+    } else if verb.eq_ignore_ascii_case("UPDATE") {
+        let (table, rest) = quoted_identifier(rest.trim_start())?;
+        let (set, rest) = split_leading_word(rest.trim_start());
+        if !set.eq_ignore_ascii_case("SET") {
+            return None;
+        }
+        let assignments = match top_level_keyword(rest, &["WHERE", "RETURNING"]) {
+            Some(at) => &rest[..at],
+            None => rest,
+        };
+        let (schema_filled, application_filled) = split_provenance(
+            split_top_level(assignments)
+                .into_iter()
+                .filter_map(split_assignment),
+        );
+        Some(WriteStatement {
+            kind: WriteKind::Update,
+            table,
+            schema_filled,
+            application_filled,
+        })
+    } else {
+        None
+    }
+}
+
+fn is_default_keyword(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("DEFAULT")
+}
+
+fn split_leading_word(s: &str) -> (&str, &str) {
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    (&s[..end], &s[end..])
+}
+
+/// A `"quoted identifier"` at the head of `s`, plus what follows it.
+fn quoted_identifier(s: &str) -> Option<(String, &str)> {
+    let rest = s.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some((rest[..end].to_owned(), &rest[end + 1..]))
+}
+
+fn unquote_identifier(s: &str) -> Option<String> {
+    let (name, rest) = quoted_identifier(s.trim())?;
+    if name.is_empty() || !rest.trim().is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+/// The contents of the parenthesized group at the head of `s`, plus what follows
+/// its closing paren.
+fn parenthesized(s: &str) -> Option<(&str, &str)> {
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (at, ch) in s.char_indices() {
+        if quoted {
+            quoted = ch != '"';
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[1..at], &s[at + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split on commas that are outside both parentheses and quoted identifiers.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut start = 0usize;
+    for (at, ch) in s.char_indices() {
+        if quoted {
+            quoted = ch != '"';
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Split one `"column" = value` assignment on the `=` that binds it, ignoring any
+/// `=` inside a quoted identifier or a parenthesized expression.
+fn split_assignment(assignment: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (at, ch) in assignment.char_indices() {
+        if quoted {
+            quoted = ch != '"';
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => {
+                return Some((&assignment[..at], &assignment[at + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where the first of `keywords` appears as a whole word outside parentheses and
+/// quoted identifiers. Keywords are ASCII, so the scan compares bytes and can
+/// never slice through a character.
+fn top_level_keyword(s: &str, keywords: &[&str]) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (at, ch) in s.char_indices() {
+        if quoted {
+            quoted = ch != '"';
+            continue;
+        }
+        match ch {
+            '"' => {
+                quoted = true;
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                continue;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            _ => {}
+        }
+        if depth != 0 || (at > 0 && is_word(bytes[at - 1])) {
+            continue;
+        }
+        for keyword in keywords {
+            let end = at + keyword.len();
+            if end <= bytes.len()
+                && bytes[at..end].eq_ignore_ascii_case(keyword.as_bytes())
+                && bytes.get(end).is_none_or(|b| !is_word(*b))
+            {
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
+/// Which columns of two db results differ, under the same relation
+/// [`db_equiv_modulo_infra`] used to decide that they differ at all. `None` when
+/// either side is not a single row, so a caller refuses rather than guesses.
+fn db_row_column_diff(
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> Option<BTreeSet<String>> {
+    let recorded = db_normalize_infra(recorded);
+    let observed = db_normalize_infra(observed);
+    let recorded = db_returning_row(&recorded)?;
+    let observed = db_returning_row(&observed)?;
+    Some(
+        recorded
+            .keys()
+            .chain(observed.keys())
+            .filter(|column| recorded.get(*column) != observed.get(*column))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Who supplied each column, per correlation and table, across every statement
+/// the run ran on either side.
+///
+/// This exists because a returned row is not only what its own statement wrote.
+/// An `UPDATE … RETURNING` hands back the whole row, so a column the statement
+/// never mentions comes back carrying INHERITED state — whatever put it there
+/// earlier. Attributing that value needs the row's history, and deja cannot
+/// currently name a `payment_intent` row (RC4: the payment tables record no
+/// typed row keys, because `binds_read_keys` looks for `"merchant_id" = $` and
+/// their predicate is `"processor_merchant_id" = $n`). The CORRELATION is the
+/// available approximation of the row: one request's statements.
+///
+/// So this index is a stand-in for a row-provenance index deja should have
+/// anyway, and it is deliberately built to fail closed:
+///   - `bound` is the union across BOTH sides — one statement anywhere in the
+///     correlation supplying a value disqualifies the column for the whole
+///     correlation, in either direction and regardless of order.
+///   - `inserted_schema_filled` requires the row's CREATION to be in scope. A
+///     correlation that only updates a pre-existing row proves nothing about
+///     where that row's untouched columns came from — they may have come from
+///     the seed — so it yields no claim at all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CorrelationColumnProvenance {
+    /// (correlation, table) -> columns some INSERT left to the schema.
+    inserted_schema_filled: HashMap<(String, String), BTreeSet<String>>,
+    /// (correlation, table) -> columns some statement supplied a value for.
+    bound: HashMap<(String, String), BTreeSet<String>>,
+}
+
+impl CorrelationColumnProvenance {
+    fn observe(&mut self, correlation: Option<&str>, sql: Option<&str>) {
+        let (Some(correlation), Some(statement)) =
+            (correlation, sql.and_then(parse_write_statement))
+        else {
+            return;
+        };
+        let key = (correlation.to_owned(), statement.table.clone());
+        if statement.kind == WriteKind::Insert {
+            self.inserted_schema_filled
+                .entry(key.clone())
+                .or_default()
+                .extend(statement.schema_filled.iter().cloned());
+        }
+        self.bound
+            .entry(key)
+            .or_default()
+            .extend(statement.application_filled);
+    }
+
+    /// Whether `column` of `table` was created by the schema inside this
+    /// correlation and never supplied a value by anything in it.
+    fn inherited_from_schema(&self, correlation: Option<&str>, table: &str, column: &str) -> bool {
+        let Some(correlation) = correlation else {
+            // Background work has no request scope to reason within.
+            return false;
+        };
+        let key = (correlation.to_owned(), table.to_owned());
+        self.inserted_schema_filled
+            .get(&key)
+            .is_some_and(|columns| columns.contains(column))
+            && !self
+                .bound
+                .get(&key)
+                .is_some_and(|columns| columns.contains(column))
+    }
+}
+
+/// Build the index from both sides of the run: the recorded tape and the
+/// candidate's own calls. A column either side supplied is disqualified.
+pub(crate) fn correlation_column_provenance(
+    events: &[deja::BoundaryEvent],
+    observed: &[ObservedCall],
+) -> CorrelationColumnProvenance {
+    let mut provenance = CorrelationColumnProvenance::default();
+    for ev in events {
+        provenance.observe(
+            ev.correlation_id.as_deref(),
+            ev.args.get("sql").and_then(|s| s.as_str()),
+        );
+    }
+    for obs in observed {
+        provenance.observe(
+            obs.correlation_id.as_deref(),
+            obs.args.get("sql").and_then(|s| s.as_str()),
+        );
+    }
+    provenance
+}
+
+/// How strong the evidence for a schema-derived divergence is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaDefaultProvenance {
+    /// Read straight off this statement: it fills the column with `DEFAULT`.
+    Statement,
+    /// INFERRED: this statement does not write the column at all, and within
+    /// this correlation the row was created with the column left to the schema
+    /// and nothing ever supplied a value for it.
+    InheritedInCorrelation,
+}
+
+impl SchemaDefaultProvenance {
+    /// Named apart in the ledger so a reader can see how much of a clean run
+    /// rests on a direct reading and how much on an inference.
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Statement => "SchemaDefaultDivergence",
+            Self::InheritedInCorrelation => "SchemaDefaultInherited",
+        }
+    }
+}
+
+/// A db divergence whose every differing column was filled by the schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaDefaultDivergence {
+    table: String,
+    columns: Vec<String>,
+    provenance: SchemaDefaultProvenance,
+}
+
+impl SchemaDefaultDivergence {
+    /// `table.column` for a single column, `table.(a,b)` for several — the
+    /// grouping key the warning counts by, so thirty divergences in one column
+    /// read as one fact.
+    pub(crate) fn label(&self) -> String {
+        match self.columns.as_slice() {
+            [column] => format!("{}.{column}", self.table),
+            columns => format!("{}.({})", self.table, columns.join(",")),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        self.provenance.kind()
+    }
+
+    fn is_inherited(&self) -> bool {
+        self.provenance == SchemaDefaultProvenance::InheritedInCorrelation
+    }
+}
+
+/// What the statements say about a db divergence's provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchemaDefaultVerdict {
+    /// Both statements fill every differing column with `DEFAULT`. The divergence
+    /// is evidence about the two databases' schemas, not about the candidate.
+    Confirmed(SchemaDefaultDivergence),
+    /// The candidate's statement says schema-filled, but the recorded statement
+    /// is not on hand to confirm it. Stays blocking, and says so — without the
+    /// recorded side we cannot tell a schema-filled column from one the candidate
+    /// STOPPED supplying.
+    RecordedStatementUnavailable,
+    /// Not schema-derived.
+    No,
+}
+
+/// Classify a db divergence by the provenance the run's own statements declare.
+///
+/// A column whose `VALUES` entry (or SET right-hand side) is the literal keyword
+/// `DEFAULT` was filled by the schema. A divergence confined to such columns
+/// therefore says the two databases disagree about a column default, which is a
+/// fact about the environment and not about the candidate — so it is counted and
+/// named rather than blocking.
+///
+/// Two arms, and they are not equally strong:
+///   - STATEMENT: this statement fills every differing column with `DEFAULT`.
+///     Read directly off the artifact, no inference.
+///   - INHERITED: this statement writes none of the differing columns, so their
+///     values came back out of stored state. The claim is then about the ROW's
+///     history, and it is granted only where
+///     [`CorrelationColumnProvenance`] can stand in for it. Strictly weaker, and
+///     named apart for that reason.
+///
+/// What keeps a real divergence out, in both arms:
+///   - EVERY differing column must qualify. One column the application supplied
+///     and the whole divergence stays blocking, because a statement that supplies
+///     a value is the candidate speaking.
+///   - BOTH statements must agree. A recorded statement that BOUND the column
+///     against a candidate one that left it to the schema is a candidate that
+///     stopped supplying a value — the most interesting divergence of all, and it
+///     stays blocking.
+///   - Neither arm is gated on an otherwise-clean run, unlike the interleaving
+///     demotions, because the evidence is the statements themselves rather than
+///     some other call's outcome. Nothing about the rest of the run changes what
+///     `DEFAULT` means.
+pub(crate) fn schema_default_divergence(
+    boundary: &str,
+    correlation: Option<&str>,
+    recorded_sql: Option<&str>,
+    observed_sql: Option<&str>,
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+    provenance: &CorrelationColumnProvenance,
+) -> SchemaDefaultVerdict {
+    if !is_db_boundary(boundary) {
+        return SchemaDefaultVerdict::No;
+    }
+    let Some(observed_statement) = observed_sql.and_then(parse_write_statement) else {
+        return SchemaDefaultVerdict::No;
+    };
+    let Some(differing) = db_row_column_diff(recorded, observed) else {
+        return SchemaDefaultVerdict::No;
+    };
+    if differing.is_empty() {
+        return SchemaDefaultVerdict::No;
+    }
+    let table = observed_statement.table.as_str();
+    // A column is schema-filled for THIS statement either because the statement
+    // says so, or because the statement did not write it and the correlation's
+    // history says the schema did. The two are tracked apart: a divergence that
+    // needs the inference anywhere is reported as inferred, not as read.
+    let qualifies = |statement: &WriteStatement, column: &String| -> Option<bool> {
+        if statement.schema_filled.contains(column) {
+            Some(false)
+        } else if !statement.writes(column)
+            && provenance.inherited_from_schema(correlation, &statement.table, column)
+        {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let Some(observed_inference) = differing
+        .iter()
+        .map(|column| qualifies(&observed_statement, column))
+        .try_fold(false, |acc, inferred| Some(acc | inferred?))
+    else {
+        return SchemaDefaultVerdict::No;
+    };
+    match recorded_sql.and_then(parse_write_statement) {
+        Some(recorded_statement) if recorded_statement.table == observed_statement.table => {
+            let Some(recorded_inference) = differing
+                .iter()
+                .map(|column| qualifies(&recorded_statement, column))
+                .try_fold(false, |acc, inferred| Some(acc | inferred?))
+            else {
+                // The recorded statement supplied one of these columns: the
+                // candidate stopped supplying a value it used to supply.
+                return SchemaDefaultVerdict::No;
+            };
+            SchemaDefaultVerdict::Confirmed(SchemaDefaultDivergence {
+                table: table.to_owned(),
+                columns: differing.into_iter().collect(),
+                provenance: if observed_inference || recorded_inference {
+                    SchemaDefaultProvenance::InheritedInCorrelation
+                } else {
+                    SchemaDefaultProvenance::Statement
+                },
+            })
+        }
+        // The recorded statement parsed and addressed another table.
+        Some(_) => SchemaDefaultVerdict::No,
+        None => SchemaDefaultVerdict::RecordedStatementUnavailable,
+    }
+}
+
+/// [`schema_default_divergence`] for an args-aligned call, whose two operands are
+/// the call's own recorded and observed results. Mirrors
+/// [`observed_value_diverged`], and shares its precondition: call it only where
+/// that one already said the values diverge.
+pub(crate) fn observed_schema_default_divergence(
+    obs: &ObservedCall,
+    event: Option<&deja::BoundaryEvent>,
+    provenance: &CorrelationColumnProvenance,
+) -> SchemaDefaultVerdict {
+    let (Some(recorded), Some(observed)) = (&obs.recorded_result, &obs.observed_result) else {
+        return SchemaDefaultVerdict::No;
+    };
+    schema_default_divergence(
+        &obs.boundary,
+        obs.correlation_id.as_deref(),
+        event
+            .and_then(|ev| ev.args.get("sql"))
+            .and_then(|s| s.as_str()),
+        obs.args.get("sql").and_then(|s| s.as_str()),
+        recorded,
+        observed,
+        provenance,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -704,13 +1309,7 @@ fn pairing_shape(args: &serde_json::Value) -> String {
         }
     }
     match args.get("sql").and_then(serde_json::Value::as_str) {
-        Some(sql) => {
-            let skeleton = match sql.rfind(" -- binds: ") {
-                Some(at) => &sql[..at],
-                None => sql,
-            };
-            parts.push(format!("sql={skeleton}"));
-        }
+        Some(sql) => parts.push(format!("sql={}", sql_statement(sql))),
         None => {
             let mut paths = Vec::new();
             collect_args_shape(args, String::new(), &mut paths);
@@ -737,6 +1336,139 @@ fn collect_args_shape(value: &serde_json::Value, prefix: String, out: &mut Vec<S
         }
         serde_json::Value::Array(items) => out.push(format!("{prefix}[{}]", items.len())),
         _ => out.push(prefix),
+    }
+}
+
+/// What a call must agree on to be the same call: correlation, span path,
+/// boundary, method, and the shape of its args. Every component is one the
+/// lookup ladder itself addresses by; the shape is `None` when the args are not
+/// visible.
+type PairingIdentity = (Option<String>, String, String, String, Option<String>);
+
+/// Which recorded twin an unresolved (re-keyed) observed call may claim.
+///
+/// THE args-free pairing, shared by [`detect`] and [`ledger::build`]. It used to
+/// be two implementations of one rule, and they drifted. The scorecard's copy
+/// grew the discriminators that two production incidents forced — the span path
+/// after the run-0810 phantom, the statement shape after run-0812's cross-table
+/// claims — while the ledger's copy stayed keyed on `(correlation, boundary,
+/// method)` alone. A method name is shared by every call through the same kit
+/// function, so that key married a recorded event to any unrelated observed
+/// call of the same method: on run-0813 it produced eight `value_diverged` rows
+/// whose two sides ran DIFFERENT SQL statements, inside a report whose own
+/// scorecard had already refused those pairs. The ledger and the scorecard
+/// describing the same run differently is the failure this type exists to make
+/// impossible — one rule, one place, both callers.
+///
+/// The identity is the rank-2 lookup address (correlation + span path) plus the
+/// boundary and method the rank-6 `Sequence` address carries, plus the part of
+/// the args a VALUE divergence cannot change ([`pairing_shape`]). Pairing at
+/// anything weaker than what the lookup ladder already tried and rejected can
+/// only manufacture pairs. An event with no rank-2 span address does not
+/// participate — it stays an honest `OmittedCall`, and a span-less observed call
+/// stays a `NovelCall`.
+///
+/// `None` shape means "we cannot see this call's args" — a WILDCARD that still
+/// pairs the way it always did, not a claim that the call had no args. Only a
+/// KNOWN shape narrows the pool. In a real run every table-covered sequence has
+/// its event, so the wildcard queue is empty and only the shape-matched arm
+/// fires; it is reachable when the tape is missing an event the table covers.
+pub(crate) struct ArgsFreePairing {
+    /// Recorded source sequences per identity, FIFO by source order.
+    queues: BTreeMap<PairingIdentity, std::collections::VecDeque<u64>>,
+}
+
+impl ArgsFreePairing {
+    /// Build the pool from the run's own two streams: the lookup table (which
+    /// says which sequences are expected, and at which address) and the tape
+    /// (which says what each call's args looked like). Both callers pass the
+    /// SAME two, so neither can see a pool the other does not.
+    pub(crate) fn build(table: &LookupTable, events: &[deja::BoundaryEvent]) -> Self {
+        let events_by_seq: HashMap<u64, &deja::BoundaryEvent> =
+            events.iter().map(|ev| (ev.global_sequence, ev)).collect();
+        let span_paths = ledger::recorded_span_paths(table);
+
+        // The addressable identity per recorded sequence: correlation off the
+        // entry, boundary and method off the rank-6 `Sequence` address (which
+        // every event emits). A sequence the table covers only at a weaker rank
+        // has no boundary/method and does not pair.
+        struct Addressed {
+            correlation: Option<String>,
+            boundary: Option<String>,
+            method: Option<String>,
+        }
+        let mut addressed: BTreeMap<u64, Addressed> = BTreeMap::new();
+        for entry in &table.entries {
+            let slot = addressed
+                .entry(entry.source_event_global_sequence)
+                .or_insert(Addressed {
+                    correlation: entry.key.correlation_id.clone(),
+                    boundary: None,
+                    method: None,
+                });
+            if let Address::Sequence {
+                boundary, method, ..
+            } = &entry.key.address
+            {
+                slot.boundary = Some(boundary.clone());
+                slot.method = Some(method.clone());
+            }
+        }
+
+        // `addressed` is ordered by sequence, so each queue comes out in source
+        // order and `take_twin`'s pop_front is FIFO occurrence.
+        let mut queues: BTreeMap<_, std::collections::VecDeque<u64>> = BTreeMap::new();
+        for (seq, entry) in &addressed {
+            let (Some(boundary), Some(method)) = (&entry.boundary, &entry.method) else {
+                continue;
+            };
+            let Some(span) = span_paths.get(seq) else {
+                continue;
+            };
+            let shape = events_by_seq.get(seq).map(|ev| pairing_shape(&ev.args));
+            queues
+                .entry((
+                    entry.correlation.clone(),
+                    span.clone(),
+                    boundary.clone(),
+                    method.clone(),
+                    shape,
+                ))
+                .or_default()
+                .push_back(*seq);
+        }
+        Self { queues }
+    }
+
+    /// Pop the next unclaimed recorded twin for `obs`, or `None` if this call
+    /// has no twin it is entitled to. Skips any sequence a resolved
+    /// (args-aligned) call already claimed, so a mixed run that resolves some
+    /// calls normally and re-keys others never double-binds one recorded event.
+    pub(crate) fn take_twin(&mut self, obs: &ObservedCall, consumed: &HashSet<u64>) -> Option<u64> {
+        let span = obs.span_path.as_deref()?;
+        // Same statement first; then the shape-unknown queue, whose events carry
+        // no args to compare and so pair as they always did.
+        let shape = pairing_shape(&obs.args);
+        for candidate in [Some(shape.clone()), None] {
+            let key = (
+                obs.correlation_id.clone(),
+                span.to_owned(),
+                obs.boundary.clone(),
+                obs.method_name.clone(),
+                candidate,
+            );
+            let Some(queue) = self.queues.get_mut(&key) else {
+                continue;
+            };
+            while let Some(seq) = queue.front().copied() {
+                if consumed.contains(&seq) {
+                    queue.pop_front();
+                } else {
+                    return queue.pop_front();
+                }
+            }
+        }
+        None
     }
 }
 
@@ -1756,82 +2488,32 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
 
     // Recorded side: unconsumed expected events grouped by args-free CALL
     // identity, ordered by source sequence, occurrence = position within the
-    // group (FIFO). Identity is the rank-2 axis MINUS args — (correlation,
-    // span path, boundary, method) — never the method name alone. A method
-    // name is shared by every call through the same kit function, so
-    // name-only pairing let an error path's novel call claim an unrelated
-    // recorded event of the same method: the run-0810 phantom, where the
-    // uninstrumented cache fallthrough's `get_key(business_profile…) → Null`
-    // stole the API_LOCK release GET's recorded event and scored 24
-    // fabricated lock divergences. The span path is the pairing identity the
-    // lookup ladder itself uses (rank 2); pairing at anything weaker than
-    // what the ladder already tried and rejected can only manufacture pairs.
-    // An event with no rank-2 span address does not participate — it stays an
-    // honest OmittedCall, and a span-less observed call stays a NovelCall.
+    // group (FIFO). The rule and its scars live on `ArgsFreePairing`, which the
+    // ledger builds from the same two streams so the scorecard and the per-call
+    // table cannot describe one run two ways.
     let recorded_span_paths = ledger::recorded_span_paths(&art.table);
     let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = art
         .events
         .iter()
         .map(|ev| (ev.global_sequence, ev))
         .collect();
-    // Identity carries the call's SHAPE as well as its address. Dropping args
-    // entirely made the pool too wide: every call through one kit function at
-    // one span shared a single FIFO queue, so on run-0812 a 12-column
-    // connector-response UPDATE popped a 20-column confirm UPDATE, and a
-    // `payment_attempt` event was claimed by a call whose result was a
-    // `payment_intent` row — ten fabricated value divergences. The shape is the
-    // part of the args a VALUE divergence cannot change, so GOTCHA #1's
-    // re-keyed write still pairs (see `pairing_shape`).
-    // `None` shape means "we cannot see this call's args" — a WILDCARD that
-    // still pairs the way it always did, not a claim that the call had no args.
-    // Only a KNOWN shape narrows the pool.
-    type Identity = (Option<String>, String, String, String, Option<String>);
-    let identity_of = |corr: &Option<String>,
-                       span: &str,
-                       boundary: &str,
-                       method: &str,
-                       shape: Option<&str>|
-     -> Identity {
-        (
-            corr.clone(),
-            span.to_owned(),
-            boundary.to_owned(),
-            method.to_owned(),
-            shape.map(str::to_owned),
-        )
-    };
-    // (identity -> queue of (source_seq, recorded_result)); FIFO by source order.
-    let mut recorded_pairing: BTreeMap<
-        Identity,
-        std::collections::VecDeque<(u64, serde_json::Value)>,
-    > = BTreeMap::new();
-    for (seq, exp) in &expected {
-        // Only events that carry a concrete boundary+method (every event does, via
-        // the rank-6 Sequence address) are pair-able; uncorrelated/tolerated events
-        // still queue but are filtered out when we decide to emit (see below).
-        let (Some(boundary), Some(method)) = (&exp.boundary, &exp.method) else {
-            continue;
-        };
-        let Some(span) = recorded_span_paths.get(seq) else {
-            continue;
-        };
-        let shape = events_by_seq.get(seq).map(|ev| pairing_shape(&ev.args));
-        recorded_pairing
-            .entry(identity_of(
-                &exp.correlation,
-                span,
-                boundary,
-                method,
-                shape.as_deref(),
-            ))
-            .or_default()
-            .push_back((*seq, exp.result.clone()));
-    }
+    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events);
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
     let mut order_nondeterminism_warnings = 0u64;
     let mut idempotent_delete_warnings = 0u64;
+    // Schema-derived divergences, counted by the column they name so that
+    // fifteen inserts disagreeing about one column default read as one fact —
+    // and, beside them, the ones we could not confirm because the recorded
+    // statement was missing, so an empty class says which cause applies.
+    let mut schema_default_divergences = 0u64;
+    let mut schema_default_inherited = 0u64;
+    let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut schema_default_unconfirmed = 0u64;
+    // Who supplied each column, per correlation — the stand-in for the row
+    // provenance deja cannot yet name on the payment tables.
+    let column_provenance = correlation_column_provenance(&art.events, &art.observed);
     // Race evidence needs to be discovered before HTTP body classification:
     // a race can flow into the response body itself. Status mismatches still
     // block evidence up front; body mismatches are neutralized only when their
@@ -1914,6 +2596,35 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
             if diverged {
+                // Rule C: every column that differs is one the statement filled
+                // with the SQL keyword DEFAULT, on both sides — the schema
+                // supplied the value, so this describes the two databases and
+                // not the candidate. Checked before the sequence-keyed rules
+                // because it needs no recorded sequence: its evidence is the
+                // statement, which both sides carry on the call itself.
+                match observed_schema_default_divergence(
+                    obs,
+                    obs.source_event_global_sequence
+                        .and_then(|seq| events_by_seq.get(&seq).copied()),
+                    &column_provenance,
+                ) {
+                    SchemaDefaultVerdict::Confirmed(schema_default) => {
+                        stats.bump_kind(schema_default.kind());
+                        schema_default_divergences += 1;
+                        schema_default_inherited += u64::from(schema_default.is_inherited());
+                        *schema_default_columns_seen
+                            .entry(schema_default.label())
+                            .or_insert(0) += 1;
+                        if let Some(seq) = obs.source_event_global_sequence {
+                            consumed.insert(seq);
+                        }
+                        continue;
+                    }
+                    SchemaDefaultVerdict::RecordedStatementUnavailable => {
+                        schema_default_unconfirmed += 1;
+                    }
+                    SchemaDefaultVerdict::No => {}
+                }
                 // Rule A: a concurrent same-row UPDATE-RETURNING interleaving
                 // artifact is NOT a blocking divergence — the final row state is
                 // reproduced by a matched write; only this earlier write's RETURNING
@@ -2003,38 +2714,18 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             // apart from the blocking `NovelCall` because it is a different
             // thing, not a different count of the same thing.
             stats.bump_kind("NovelCallTolerated");
-        } else if let Some((twin_seq, recorded)) = obs.span_path.as_deref().and_then(|span| {
-            // Pop the next recorded twin for this identity, skipping any that a
-            // resolved (args-aligned) call already claimed — so a mixed run that
-            // resolves some calls normally and re-keys others never double-binds
-            // a single recorded event.
-            let take_twin = |q: &mut std::collections::VecDeque<(u64, serde_json::Value)>| {
-                while let Some((seq, _)) = q.front() {
-                    if consumed.contains(seq) {
-                        q.pop_front();
-                    } else {
-                        return q.pop_front();
-                    }
-                }
-                None
-            };
-            // Same statement first; then the shape-unknown queue, whose
-            // events carry no args to compare and so pair as they always did.
-            let shape = pairing_shape(&obs.args);
-            for candidate in [Some(shape.as_str()), None] {
-                let key = identity_of(
-                    &obs.correlation_id,
-                    span,
-                    &obs.boundary,
-                    &obs.method_name,
-                    candidate,
-                );
-                if let Some(twin) = recorded_pairing.get_mut(&key).and_then(take_twin) {
-                    return Some(twin);
-                }
-            }
-            None
-        }) {
+        } else if let Some((twin_seq, recorded)) =
+            recorded_pairing.take_twin(obs, &consumed).map(|seq| {
+                // The recorded operand this twin compares against is the lookup
+                // entry's own result, the same one the strict-args path would
+                // have substituted.
+                let result = expected
+                    .get(&seq)
+                    .map(|exp| exp.result.clone())
+                    .unwrap_or(serde_json::Value::Null);
+                (seq, result)
+            })
+        {
             // GOTCHA #1 resolution: this unresolved observed call pairs args-free
             // (correlation+boundary+method, FIFO occurrence) with a recorded twin
             // that the candidate "omitted" because its args were re-keyed. The
@@ -2045,7 +2736,37 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                 args_free_effective_values(&recorded, obs, twin_event);
             let value_diverged =
                 values_diverge_under_event(&obs.boundary, &recorded_val, &observed_val, twin_event);
-            if value_diverged {
+            let schema_default = if value_diverged {
+                schema_default_divergence(
+                    &obs.boundary,
+                    obs.correlation_id.as_deref(),
+                    twin_event
+                        .and_then(|ev| ev.args.get("sql"))
+                        .and_then(|s| s.as_str()),
+                    obs.args.get("sql").and_then(|s| s.as_str()),
+                    &recorded_val,
+                    &observed_val,
+                    &column_provenance,
+                )
+            } else {
+                SchemaDefaultVerdict::No
+            };
+            if matches!(
+                schema_default,
+                SchemaDefaultVerdict::RecordedStatementUnavailable
+            ) {
+                schema_default_unconfirmed += 1;
+            }
+            if let SchemaDefaultVerdict::Confirmed(schema_default) = schema_default {
+                // Rule C, on the args-free arm: same statement-borne evidence,
+                // same non-blocking class.
+                stats.bump_kind(schema_default.kind());
+                schema_default_divergences += 1;
+                schema_default_inherited += u64::from(schema_default.is_inherited());
+                *schema_default_columns_seen
+                    .entry(schema_default.label())
+                    .or_insert(0) += 1;
+            } else if value_diverged {
                 if inconclusive_race
                     .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
                 {
@@ -2246,13 +2967,27 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             "{idempotent_delete_warnings} idempotent-delete warning(s) (non-blocking)"
         ));
     }
+    // Rule C: a divergence the statements themselves attribute to the schema
+    // describes the two databases, not the candidate. Reported, non-blocking.
+    if schema_default_divergences > 0 {
+        // The split is in the headline, not buried: a reader has to be able to
+        // see how much of this rests on a statement and how much on an
+        // inference, without opening the breakdown.
+        reasons.push(format!(
+            "{schema_default_divergences} schema-derived divergence(s) (non-blocking; \
+             {} read off the statement, {schema_default_inherited} inherited within a \
+             correlation)",
+            schema_default_divergences - schema_default_inherited
+        ));
+    }
     if undeclared_concurrency_warnings > 0 {
         reasons.push(format!(
             "{undeclared_concurrency_warnings} undeclared_concurrency warning(s) (non-blocking)"
         ));
     }
     // Seed-gap + race + order-nondeterminism + idempotent-delete +
-    // undeclared_concurrency lines are informational, not divergences; exclude
+    // schema-derived + undeclared_concurrency lines are informational, not
+    // divergences the candidate caused; exclude
     // them from the blocking count so a run whose only "reasons" are those still
     // avoids a blocking failure (race becomes an explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
@@ -2260,6 +2995,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         - usize::from(inconclusive_races > 0)
         - usize::from(order_nondeterminism_warnings > 0)
         - usize::from(idempotent_delete_warnings > 0)
+        - usize::from(schema_default_divergences > 0)
         - usize::from(undeclared_concurrency_warnings > 0);
     let inconclusive = nothing || (inconclusive_races > 0 && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
@@ -2287,6 +3023,38 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     for (seq, row) in &inconclusive_race.row_labels {
         warnings.push(format!(
             "inconclusive_race event {seq} on db row {row}: auto-rerun recommended"
+        ));
+    }
+    // One line per COLUMN, not per call: fifteen inserts disagreeing about one
+    // column default is one fact about the two schemas, and it is the fact that
+    // says where to look.
+    for (column, n) in &schema_default_columns_seen {
+        warnings.push(format!(
+            "{n} db divergence(s) confined to {column} classified as schema-derived: the \
+             recording's database and the replay's disagree about that column's default, and \
+             no statement on either side ever supplied a value for it — the candidate did not \
+             cause this"
+        ));
+    }
+    // The inference names itself and its limit. It stands in for a row
+    // provenance deja cannot yet express on these tables, and a reader who does
+    // not know that cannot judge how far to trust the green.
+    if schema_default_inherited > 0 {
+        warnings.push(format!(
+            "{schema_default_inherited} of those were INFERRED, not read: the statement did not \
+             write the column, so its value came out of stored state, and the claim rests on \
+             the correlation having created the row with that column left to the schema. \
+             Correlation stands in for the row here because the payment tables record no typed \
+             row keys; a write to the same row from another correlation would not be seen"
+        ));
+    }
+    // An empty class has two causes and they need opposite fixes; say which.
+    if schema_default_unconfirmed > 0 {
+        warnings.push(format!(
+            "{schema_default_unconfirmed} db divergence(s) look schema-derived from the \
+             candidate's statement alone, but the recorded statement was unavailable to confirm \
+             it, so they stay blocking — without it a schema-filled column cannot be told from \
+             one the candidate stopped supplying"
         ));
     }
     for warning in &undeclared_concurrency {
@@ -2323,6 +3091,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             novel_calls_tolerated,
             value_divergences,
             order_nondeterminism_warnings,
+            schema_default_divergences,
             idempotent_delete_warnings,
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
@@ -2570,7 +3339,6 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 /// drove attached to its ledger rows.
 pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     let events = &art.events;
-    let expected = ledger::expected_sequences(&art.table);
     let span_paths = ledger::recorded_span_paths(&art.table);
     // Mirror scorecard classification: discover race evidence under status-clean
     // HTTP first, then treat only unattributable body diffs as blocking.
@@ -2598,8 +3366,7 @@ pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     Ok(ledger::build_with_inconclusive(
         events,
         &art.observed,
-        &expected,
-        &span_paths,
+        &art.table,
         &demote.sequences,
         &idempotent_delete,
         &inconclusive_race,
@@ -4759,8 +5526,7 @@ mod tests {
         let rows = ledger::build(
             &a.events,
             &a.observed,
-            &ledger::expected_sequences(&a.table),
-            &HashMap::new(),
+            &a.table,
             &HashSet::new(),
             &HashSet::new(),
         );
@@ -5920,5 +6686,659 @@ mod tests {
                 "{label}: the lock event is claimed exactly once"
             );
         }
+    }
+
+    // ---- Rule C: schema-derived divergence (columns filled with DEFAULT) ----
+
+    /// The statement shape diesel actually emits, abridged to the columns the
+    /// tests reason about but keeping the property that makes it interesting:
+    /// the VALUES list interleaves binds and `DEFAULT`, so a column's position
+    /// in the column list does NOT index the bind list. `business_label` is the
+    /// fourth column and the SECOND `DEFAULT`; the bind list has three entries
+    /// and no third bind to mis-read it from.
+    const PAYMENT_INTENT_INSERT: &str = "INSERT INTO \"payment_intent\" (\"payment_id\", \
+        \"merchant_id\", \"amount_captured\", \"business_label\", \"currency\") VALUES ($1, $2, \
+        DEFAULT, DEFAULT, $3) -- binds: [PaymentId(\"pay_1\"), MerchantId(\"m_1\"), USD]";
+
+    /// The same statement from a candidate that SUPPLIES `business_label`: the
+    /// column is a bind, not `DEFAULT`.
+    const PAYMENT_INTENT_INSERT_BINDING_LABEL: &str =
+        "INSERT INTO \"payment_intent\" (\"payment_id\", \"merchant_id\", \"amount_captured\", \
+        \"business_label\", \"currency\") VALUES ($1, $2, DEFAULT, $3, $4) -- binds: \
+        [PaymentId(\"pay_1\"), MerchantId(\"m_1\"), \"retail\", USD]";
+
+    fn payment_intent_row(business_label: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "payment_id": "pay_1",
+            "merchant_id": "m_1",
+            "amount_captured": serde_json::Value::Null,
+            "business_label": business_label,
+            "currency": "USD",
+        })
+    }
+
+    /// A recorded db INSERT carrying its rendered SQL, the way a real tape does.
+    fn db_insert_ev(
+        corr: &str,
+        seq: u64,
+        sql: &str,
+        row: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut ev = db_update_ev(corr, "payment_intent", seq, row, 100, 110);
+        ev.method_name = "generic_insert".to_owned();
+        ev.args = serde_json::json!({"table": "payment_intent", "sql": sql});
+        ev
+    }
+
+    /// An args-aligned execute-shadow call against `sql` whose real result
+    /// differs from the recorded baseline in the given row values.
+    fn db_exec_obs_with_sql(
+        corr: &str,
+        seq: u64,
+        sql: &str,
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> ObservedCall {
+        let mut o = exec_obs_method(
+            "db",
+            Some(corr),
+            "generic_insert",
+            true,
+            Some(seq),
+            Some(envelope(recorded)),
+            envelope(observed),
+        );
+        o.args = serde_json::json!({"table": "payment_intent", "sql": sql});
+        o
+    }
+
+    /// One correlation, one db INSERT that diverges from `recorded` to
+    /// `observed`. The tape carries the recorded statement `recorded_sql`, which
+    /// defaults to the candidate's `observed_sql` — the byte-identical case a
+    /// same-image replay actually produces.
+    fn schema_default_card(
+        recorded_sql: Option<&str>,
+        observed_sql: &str,
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> Scorecard {
+        let corr = "c1";
+        let ev = db_insert_ev(
+            corr,
+            7,
+            recorded_sql.unwrap_or(observed_sql),
+            recorded.clone(),
+        );
+        detect(&art_with_events(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "generic_insert",
+                7,
+                envelope(recorded.clone()),
+            )],
+            vec![db_exec_obs_with_sql(
+                corr,
+                7,
+                observed_sql,
+                recorded,
+                observed,
+            )],
+            vec![http(corr, true, vec![])],
+            vec![ev],
+        ))
+    }
+
+    #[test]
+    fn insert_values_list_names_the_columns_the_schema_filled() {
+        let defaults =
+            parse_write_statement(PAYMENT_INTENT_INSERT).expect("the INSERT shape parses");
+        assert_eq!(defaults.table, "payment_intent");
+        assert_eq!(
+            defaults.schema_filled,
+            ["amount_captured", "business_label"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            "only the columns whose VALUES entry is the DEFAULT keyword — read off the VALUES \
+             list, which the binds list does not index because a DEFAULT consumes no bind"
+        );
+        // A candidate that supplies the value emits $n, so the column moves out
+        // of the schema-filled set and into the application-filled one.
+        let supplied = parse_write_statement(PAYMENT_INTENT_INSERT_BINDING_LABEL).expect("parses");
+        assert_eq!(
+            supplied.schema_filled,
+            ["amount_captured"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(supplied.application_filled.contains("business_label"));
+    }
+
+    /// The parser, calibrated against a statement lifted verbatim off a tape
+    /// rather than one written to suit it. Writing this parser was the easy
+    /// half; the shape it has to survive is 80 columns whose VALUES list
+    /// interleaves 32 binds with 48 `DEFAULT`s across 2.3 KB of text, and a
+    /// fixture invented alongside the code proves nothing about that.
+    #[test]
+    fn the_parser_reads_a_real_recorded_payment_intent_insert() {
+        let defaults = parse_write_statement(include_str!("fixtures/payment_intent_insert.sql"))
+            .expect("the recorded statement parses");
+        assert_eq!(defaults.table, "payment_intent");
+        assert_eq!(
+            defaults.schema_filled.len(),
+            48,
+            "every column diesel left to the schema, not just the one that differs today"
+        );
+        assert!(defaults.schema_filled.contains("business_label"));
+        // Columns the request supplied are binds, and stay out.
+        for supplied in ["payment_id", "merchant_id", "status", "amount", "currency"] {
+            assert!(
+                !defaults.schema_filled.contains(supplied),
+                "{supplied} is bound in this statement"
+            );
+        }
+    }
+
+    #[test]
+    fn update_set_clause_names_the_columns_the_schema_filled() {
+        let defaults = parse_write_statement(
+            "UPDATE \"payment_intent\" SET \"status\" = $1, \"business_label\" = DEFAULT, \
+             \"modified_at\" = $2 WHERE ((\"payment_intent\".\"payment_id\" = $3) AND \
+             (\"payment_intent\".\"processor_merchant_id\" = $4)) RETURNING * \
+             -- binds: [Pending, 2026-08-13, \"pay_1\", \"m_1\"]",
+        )
+        .expect("the UPDATE shape parses");
+        assert_eq!(defaults.table, "payment_intent");
+        assert_eq!(
+            defaults.schema_filled,
+            ["business_label"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            "the SET list ends at the top-level WHERE — a quoted column inside the predicate is \
+             not an assignment"
+        );
+    }
+
+    #[test]
+    fn a_statement_this_parser_does_not_understand_names_no_columns() {
+        // A column list and a VALUES list of different lengths cannot be paired
+        // by position without naming the wrong column, so it names none.
+        assert_eq!(
+            parse_write_statement(
+                "INSERT INTO \"payment_intent\" (\"a\", \"b\") VALUES ($1, DEFAULT, DEFAULT)"
+            ),
+            None
+        );
+        // Not an INSERT or an UPDATE at all.
+        assert_eq!(
+            parse_write_statement("SELECT \"payment_intent\".\"business_label\" FROM x"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_divergence_confined_to_schema_filled_columns_is_named_and_does_not_block() {
+        let card = schema_default_card(
+            None,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+            payment_intent_row(serde_json::json!("default")),
+        );
+        assert_eq!(
+            kind_count(&card, "db", "SchemaDefaultDivergence"),
+            1,
+            "the column the statement left to the schema is its own class"
+        );
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "and it is NOT a value divergence"
+        );
+        assert_eq!(card.summary.side_effect_divergences, 0);
+        assert!(card.verdict.pass, "reason: {}", card.verdict.reason);
+        assert!(
+            card.verdict.reason.contains(
+                "1 schema-derived divergence(s) (non-blocking; 1 read off the statement, 0 \
+                 inherited within a correlation)"
+            ),
+            "counted and named in the verdict, never silently dropped, and the strength of the \
+             evidence is in the headline: {}",
+            card.verdict.reason
+        );
+        assert!(
+            card.warnings.iter().any(
+                |w| w.contains("payment_intent.business_label") && w.contains("schema-derived")
+            ),
+            "the warning names the column, which is what says where to look: {:?}",
+            card.warnings
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    #[test]
+    fn a_divergence_in_a_bound_column_stays_blocking() {
+        // `currency` is $3 in this statement: the application supplied it.
+        let card = schema_default_card(
+            None,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+            serde_json::json!({
+                "payment_id": "pay_1",
+                "merchant_id": "m_1",
+                "amount_captured": serde_json::Value::Null,
+                "business_label": serde_json::Value::Null,
+                "currency": "EUR",
+            }),
+        );
+        assert_eq!(card.summary.schema_default_divergences, 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.side_effect_divergences, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn a_divergence_spanning_a_schema_filled_and_a_bound_column_stays_blocking() {
+        let card = schema_default_card(
+            None,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+            serde_json::json!({
+                "payment_id": "pay_1",
+                "merchant_id": "m_1",
+                "amount_captured": serde_json::Value::Null,
+                "business_label": "default",
+                "currency": "EUR",
+            }),
+        );
+        assert_eq!(
+            card.summary.schema_default_divergences, 0,
+            "one bound column in the set and the whole divergence is the candidate's"
+        );
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.side_effect_divergences, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn a_candidate_that_stopped_supplying_a_value_stays_blocking() {
+        // The RECORDING bound `business_label`; the candidate left it to the
+        // schema. The column is schema-filled on the observed side alone, and
+        // that is exactly the divergence that must not be absorbed.
+        let card = schema_default_card(
+            Some(PAYMENT_INTENT_INSERT_BINDING_LABEL),
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::json!("retail")),
+            payment_intent_row(serde_json::json!("default")),
+        );
+        assert_eq!(card.summary.schema_default_divergences, 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn an_unavailable_recorded_statement_stays_blocking_and_says_why() {
+        // Same divergence as the passing case, but the tape carries no event, so
+        // the recorded statement cannot confirm the provenance.
+        let corr = "c1";
+        let recorded = payment_intent_row(serde_json::Value::Null);
+        let card = detect(&art(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "generic_insert",
+                7,
+                envelope(recorded.clone()),
+            )],
+            vec![db_exec_obs_with_sql(
+                corr,
+                7,
+                PAYMENT_INTENT_INSERT,
+                recorded,
+                payment_intent_row(serde_json::json!("default")),
+            )],
+            vec![http(corr, true, vec![])],
+        ));
+        assert_eq!(card.summary.schema_default_divergences, 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("recorded statement was unavailable")),
+            "an empty class names which of its causes applies: {:?}",
+            card.warnings
+        );
+    }
+
+    // ---- the inherited arm: a column the statement did not write -----------
+
+    /// An UPDATE that writes some columns and returns the whole row, so every
+    /// other column in the RETURNING row is inherited stored state.
+    const PAYMENT_INTENT_UPDATE: &str = "UPDATE \"payment_intent\" SET \"currency\" = $1 WHERE \
+        (\"payment_intent\".\"payment_id\" = $2) RETURNING * -- binds: [USD, \"pay_1\"]";
+
+    /// The same UPDATE, but this one also supplies `business_label`.
+    const PAYMENT_INTENT_UPDATE_BINDING_LABEL: &str =
+        "UPDATE \"payment_intent\" SET \"currency\" = $1, \"business_label\" = $2 WHERE \
+        (\"payment_intent\".\"payment_id\" = $3) RETURNING * -- binds: [USD, \"retail\", \"pay_1\"]";
+
+    /// A correlation whose INSERT created the row and whose UPDATE then returns
+    /// it with `business_label` diverging. `also_ran` are extra statements in
+    /// the same correlation, which is what the inference is scoped to.
+    fn inherited_card(also_ran: &[&str], insert_sql: Option<&str>) -> Scorecard {
+        let corr = "c1";
+        let recorded = payment_intent_row(serde_json::Value::Null);
+        let mut update = db_insert_ev(corr, 8, PAYMENT_INTENT_UPDATE, recorded.clone());
+        update.method_name = "generic_update_with_results".to_owned();
+        let mut events = vec![update];
+        if let Some(insert_sql) = insert_sql {
+            events.push(db_insert_ev(corr, 7, insert_sql, recorded.clone()));
+        }
+        let mut observed = vec![{
+            let mut o = db_exec_obs_with_sql(
+                corr,
+                8,
+                PAYMENT_INTENT_UPDATE,
+                recorded.clone(),
+                payment_intent_row(serde_json::json!("default")),
+            );
+            o.method_name = "generic_update_with_results".to_owned();
+            o
+        }];
+        // The INSERT itself matched on replay; only the later UPDATE diverges,
+        // so the inference is doing the work rather than the statement rule.
+        if insert_sql.is_some() {
+            observed.push(substituted_obs_method(
+                "db",
+                Some(corr),
+                "generic_insert",
+                7,
+                envelope(recorded.clone()),
+            ));
+        }
+        for (n, sql) in also_ran.iter().enumerate() {
+            let seq = 20 + n as u64;
+            let mut ev = db_insert_ev(corr, seq, sql, recorded.clone());
+            ev.method_name = "generic_update_with_results".to_owned();
+            events.push(ev);
+            observed.push(substituted_obs_method(
+                "db",
+                Some(corr),
+                "generic_update_with_results",
+                seq,
+                envelope(recorded.clone()),
+            ));
+        }
+        let entries = events
+            .iter()
+            .map(|ev| {
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    &ev.method_name,
+                    ev.global_sequence,
+                    envelope(recorded.clone()),
+                )
+            })
+            .collect();
+        detect(&art_with_events(
+            entries,
+            observed,
+            vec![http(corr, true, vec![])],
+            events,
+        ))
+    }
+
+    #[test]
+    fn a_column_the_statement_never_wrote_is_inherited_from_the_correlations_insert() {
+        let card = inherited_card(&[], Some(PAYMENT_INTENT_INSERT));
+        assert_eq!(
+            kind_count(&card, "db", "SchemaDefaultInherited"),
+            1,
+            "the UPDATE writes only `currency`; `business_label` came back out of the row the \
+             correlation's INSERT left to the schema"
+        );
+        assert_eq!(
+            kind_count(&card, "db", "SchemaDefaultDivergence"),
+            0,
+            "and it is NOT reported as read off the statement — the two are named apart"
+        );
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert!(card.verdict.pass, "reason: {}", card.verdict.reason);
+        assert!(
+            card.verdict
+                .reason
+                .contains("0 read off the statement, 1 inherited within a correlation"),
+            "the headline says how much rests on the inference: {}",
+            card.verdict.reason
+        );
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("INFERRED, not read")),
+            "the inference names itself and its limit: {:?}",
+            card.warnings
+        );
+        assert!(card.counter_disagreements().is_empty());
+    }
+
+    #[test]
+    fn a_correlation_that_ever_supplied_the_column_gets_no_inference() {
+        // One statement elsewhere in the same correlation binds
+        // `business_label`. The application wrote that column in this request,
+        // so nothing in the request can claim the schema owns it — regardless of
+        // whether that statement ran before or after the diverging one.
+        let card = inherited_card(
+            &[PAYMENT_INTENT_UPDATE_BINDING_LABEL],
+            Some(PAYMENT_INTENT_INSERT),
+        );
+        assert_eq!(card.summary.schema_default_divergences, 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn an_inherited_claim_needs_a_schema_filled_insert_in_the_same_correlation() {
+        // The correlation's INSERT supplies `business_label` rather than leaving
+        // it to the schema, so the row's stored value is the application's and
+        // the later UPDATE's divergence in it is blocking.
+        let card = inherited_card(&[], Some(PAYMENT_INTENT_INSERT_BINDING_LABEL));
+        assert_eq!(card.summary.schema_default_divergences, 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn an_update_on_a_row_this_correlation_did_not_create_gets_no_inference() {
+        // THE limit of the approximation, pinned. Nothing in this correlation
+        // binds `business_label` and nothing contradicts the inference — but the
+        // correlation never created the row either, so the row is a SEEDED one
+        // whose stored value came from outside the request. Where that value came
+        // from is exactly what the inference cannot see, so it must not be made:
+        // a seed carrying a real value would otherwise be laundered into "the
+        // schema did it".
+        let card = inherited_card(&[], None);
+        assert_eq!(
+            card.summary.schema_default_divergences, 0,
+            "no INSERT in scope means no claim about where the row's columns came from"
+        );
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    #[test]
+    fn the_ledger_and_the_scorecard_agree_a_schema_derived_row_is_not_blocking() {
+        let corr = "c1";
+        let recorded = payment_intent_row(serde_json::Value::Null);
+        let ev = db_insert_ev(corr, 7, PAYMENT_INTENT_INSERT, recorded.clone());
+        let art = art_with_events(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "generic_insert",
+                7,
+                envelope(recorded.clone()),
+            )],
+            vec![db_exec_obs_with_sql(
+                corr,
+                7,
+                PAYMENT_INTENT_INSERT,
+                recorded,
+                payment_intent_row(serde_json::json!("default")),
+            )],
+            vec![http(corr, true, vec![])],
+            vec![ev],
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        let schema_default: Vec<_> = rows.iter().filter(|r| r.kind == "schema_default").collect();
+        assert_eq!(schema_default.len(), 1, "rows: {rows:?}");
+        assert!(!schema_default[0].blocking);
+        assert!(
+            rows.iter().all(|r| r.kind != "value_diverged"),
+            "the ledger must not call blocking what the scorecard called schema-derived"
+        );
+    }
+
+    /// One `payment_attempt` UPDATE per side at one span, running DIFFERENT
+    /// statements: the tape's sets `status`, the candidate's sets
+    /// `connector_transaction_id`.
+    const ATTEMPT_UPDATE_STATUS: &str = "UPDATE \"payment_attempt\" SET \"status\" = $1 WHERE \
+                                         \"attempt_id\" = $2 -- binds: [\"charged\", \"pay_1\"]";
+    const ATTEMPT_UPDATE_TXN_ID: &str = "UPDATE \"payment_attempt\" SET \
+                                         \"connector_transaction_id\" = $1 WHERE \"attempt_id\" = \
+                                         $2 -- binds: [\"txn_9\", \"pay_1\"]";
+    /// The SAME statement as `ATTEMPT_UPDATE_STATUS`, differing only in its bind
+    /// values — GOTCHA #1's re-keyed write, which must still pair.
+    const ATTEMPT_UPDATE_STATUS_REKEYED: &str =
+        "UPDATE \"payment_attempt\" SET \"status\" = $1 WHERE \"attempt_id\" = $2 -- binds: \
+         [\"refunded\", \"pay_1\"]";
+
+    fn attempt_update_ev(
+        corr: &str,
+        seq: u64,
+        sql: &str,
+        row: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut ev = db_update_ev(corr, "payment_attempt", seq, row, 100, 110);
+        ev.method_name = "generic_update".to_owned();
+        ev.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        ev
+    }
+
+    /// A re-keyed WRITE: it ran the real boundary and its args missed the
+    /// recorded baseline, so it arrives unresolved and must find its twin (or
+    /// not) through the args-free pairing alone.
+    fn attempt_update_obs(corr: &str, sql: &str, row: serde_json::Value) -> ObservedCall {
+        let mut o = exec_obs_method(
+            "db",
+            Some(corr),
+            "generic_update",
+            false,
+            None,
+            None,
+            envelope(row),
+        );
+        // The hook ran the real write and had a baseline to compare against; the
+        // ARGS are what missed, which is the whole premise of this pairing.
+        o.seed_gap = false;
+        o.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        with_span(o, "root>update_attempt")
+    }
+
+    fn one_update_each(recorded_sql: &str, observed_sql: &str) -> RunArtifacts {
+        let corr = "c1";
+        let recorded = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    7,
+                    envelope(recorded.clone()),
+                ),
+                span_entry(Some(corr), 7, "root>update_attempt"),
+            ],
+            vec![attempt_update_obs(corr, observed_sql, observed)],
+            vec![http(corr, true, vec![])],
+            vec![attempt_update_ev(corr, 7, recorded_sql, recorded)],
+        )
+    }
+
+    /// Two writes at one span running different statements are not one logical
+    /// write, so nothing may marry them: the recorded event is an omission and
+    /// the observed call is novel — on the scorecard AND in the ledger.
+    ///
+    /// This is run-0813's eight fabricated pairs. The scorecard had already
+    /// refused them (the statement shape separates the pool); the ledger, keyed
+    /// on `(correlation, boundary, method)` alone, made them anyway and shipped
+    /// eight `value_diverged` rows whose two sides ran DIFFERENT SQL. What this
+    /// pins is not that either half is right on its own — it is that ONE rule
+    /// answers for both, so the pool can never again be narrowed on one side of
+    /// the report and left wide on the other.
+    #[test]
+    fn a_different_statement_at_the_same_span_pairs_on_neither_side() {
+        let art = one_update_each(ATTEMPT_UPDATE_STATUS, ATTEMPT_UPDATE_TXN_ID);
+
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "two different statements are not one write with a diverged operand"
+        );
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the candidate's write is novel"
+        );
+        assert_eq!(card.summary.omitted_calls, 1, "the tape's write is omitted");
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(
+            rows.iter().all(|r| r.kind != "value_diverged"),
+            "the ledger fabricated a pair the scorecard refused: {rows:?}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.kind == "novel").count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.kind == "omitted").count(), 1);
+    }
+
+    /// The other half of the same rule, so narrowing the pool can never be
+    /// mistaken for closing it: the SAME statement differing only in its bind
+    /// values is GOTCHA #1's re-keyed write, and it must still collapse into ONE
+    /// `value_diverged` — again on both sides of the report.
+    #[test]
+    fn a_rekeyed_statement_at_the_same_span_still_pairs_on_both_sides() {
+        let art = one_update_each(ATTEMPT_UPDATE_STATUS, ATTEMPT_UPDATE_STATUS_REKEYED);
+
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 1,
+            "one logical write whose operand diverged"
+        );
+        assert_eq!(card.summary.novel_calls, 0, "not a Novel");
+        assert_eq!(card.summary.omitted_calls, 0, "not an Omitted");
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        assert!(
+            !diverged[0].origin,
+            "the write is the consequence, not the cause"
+        );
+        assert_eq!(
+            diverged[0].source_event_global_sequence,
+            Some(7),
+            "paired to the recorded twin at its own span"
+        );
+        assert!(
+            rows.iter().all(|r| r.kind != "omitted"),
+            "the twin is accounted for by the pair, not omitted as well"
+        );
     }
 }
