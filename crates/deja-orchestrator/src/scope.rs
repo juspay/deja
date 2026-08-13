@@ -701,6 +701,19 @@ impl TapeSlot {
         recording_events_path(root, recording_id).exists()
     }
 
+    /// The ingest report written BESIDE the tape when it was pulled.
+    ///
+    /// It rides here rather than in memory because a run that reuses an
+    /// already-materialized tape never re-ingests it, and the question the
+    /// report answers — did this recording stop growing before it was read —
+    /// is a property of the TAPE, not of the run that happened to pull it. A
+    /// door of its own, for the same reason the tape has one: the alternative
+    /// is every caller rebuilding `for_write(..).with_file_name(..)`, which is
+    /// how the raw path escaped last time.
+    pub fn ingest_report_path(root: &HarnessRoot, recording_id: &str) -> PathBuf {
+        recording_events_path(root, recording_id).with_file_name("ingest-report.json")
+    }
+
     /// CHOOSING a scope: the recording's correlations in tape order — each one
     /// at its first appearance, earliest first.
     ///

@@ -51,9 +51,26 @@ pub struct IngestReport {
     /// does not balance is the only signal that the ingest is discarding a
     /// record shape it does not understand, so all of them are reported and
     /// [`IngestReport::balances`] asserts they add up.
+    ///
+    /// `markers_dropped` is the count of marker lines, which is the term the
+    /// balance needs — a marker is not a `DejaRecord` and never joins the event
+    /// stream. It is no longer the whole story: what those lines SAID is read
+    /// into [`IngestReport::delivery`] rather than thrown away.
     pub markers_dropped: usize,
     pub non_envelope_dropped: usize,
     pub unparseable_dropped: usize,
+    /// Whether the recording had stopped growing when this pull read it.
+    ///
+    /// A replay is scored against the tape it was handed. Reading a recording
+    /// that is still landing scores a PREFIX of it, and the verdict looks
+    /// exactly like a complete one — run
+    /// `rp-sbx-1868bb92e9-1868bb9-08120623-rk-0812064511654` scored 9/44 on a
+    /// recording that later reported 87 correlations. This is the fact that
+    /// says which happened; acting on it is the lifecycle's job.
+    pub completeness: Completeness,
+    /// What the sink's own markers, plus the event stream's per-correlation
+    /// ordering, establish about delivery.
+    pub delivery: DeliveryCertificate,
 }
 
 impl IngestReport {
@@ -107,14 +124,345 @@ pub struct DropCounts {
     pub unparseable: usize,
 }
 
-/// Minimal probe of an event for identity (dedup/sort key) — everything else
-/// stays raw.
+// -- delivery accounting -----------------------------------------------------
+
+/// Whether more of this recording could still arrive.
+///
+/// `sealed` alone cannot answer this. A replay holds `s3:PutObject` on
+/// `replay-runs/*` and nothing else, so it may not seal what it reads: every
+/// prefix-scan pull reports `sealed: false`, including pulls of recordings that
+/// finished hours ago. Gating on it would refuse the normal path.
+///
+/// The recorder answers it instead. The writer's `eof` marker is emitted on
+/// shutdown after a real producer drain — "everything before this landed" — so
+/// a recording that has stopped growing has one per producer instance, and a
+/// recording still being written has none. The record lifecycle stops the
+/// router before it waits for the landing precisely so the `eof` is in the
+/// prefix before anything reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Completeness {
+    /// A compaction job promoted this into a sealed session. The seal is
+    /// terminal, and it is taken on trust here for the same reason the manifest
+    /// is: the compactor is the component allowed to make it.
+    Sealed,
+    /// Not sealed, but every producer instance that spoke also said goodbye.
+    EofObserved { instances: usize },
+    /// Nothing here proves the recording stopped growing. Scoring a replay
+    /// against it scores a prefix.
+    StillLanding { reason: String },
+}
+
+impl Completeness {
+    /// Whether the recording can be shown to have stopped growing.
+    pub fn is_complete(&self) -> bool {
+        !matches!(self, Completeness::StillLanding { .. })
+    }
+
+    /// Why not, when not.
+    pub fn incomplete_reason(&self) -> Option<&str> {
+        match self {
+            Completeness::StillLanding { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// One line naming the state and how it was established.
+    pub fn describe(&self) -> String {
+        match self {
+            Completeness::Sealed => "sealed session — the recording is final".to_owned(),
+            Completeness::EofObserved { instances } => format!(
+                "complete — {instances} producer instance(s) emitted their `eof` marker, so \
+                 nothing more is coming"
+            ),
+            Completeness::StillLanding { reason } => format!("INCOMPLETE — {reason}"),
+        }
+    }
+}
+
+/// What delivery can be established for this recording.
+///
+/// Two independent sources, and it matters which says what:
+///
+/// * The EVENT STREAM proves per-correlation continuity. `request_sequence` is
+///   a dense per-correlation counter allocated in `next_request_sequence`, and
+///   a sampled-out or sink-down boundary no-ops BEFORE any sequence is
+///   allocated (`capture_verdict`), so within a correlation the recorder emits
+///   0, 1, 2, … with no legitimate holes. A hole is loss.
+/// * The MARKERS prove nothing per-correlation — they carry no `correlation_id`
+///   and their sequence space is `global_sequence`, not `request_sequence`. What
+///   they carry is the producer's own claim: which `global_sequence` ranges it
+///   knows it dropped, how many records it wrote, and whether it finished.
+///
+/// So the certificate asserts continuity from the events and uses the markers
+/// to say whether a break is loss the producer ADMITS (a `dropped` marker
+/// covering it) or loss nobody admits — which is worse, because it means the
+/// records left the writer and went missing in transport.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DeliveryCertificate {
+    /// Marker lines read (equal to `IngestReport::markers_dropped`).
+    pub markers_seen: usize,
+    /// Marker lines whose body could not be read. Counted rather than ignored:
+    /// an unreadable marker is a marker whose claim is lost.
+    pub markers_unreadable: usize,
+    pub checkpoints: usize,
+    /// One row per producer instance that emitted a marker.
+    pub instances: Vec<InstanceDelivery>,
+    /// Correlations whose `request_sequence` run was checked.
+    pub correlations_checked: usize,
+    /// Correlations whose run had a hole, and which sequence numbers are gone.
+    pub gaps: Vec<DeliveryGap>,
+}
+
+impl DeliveryCertificate {
+    /// Whether every checked correlation's `request_sequence` run is contiguous
+    /// from zero — the property the certificate exists to assert.
+    pub fn continuous(&self) -> bool {
+        self.gaps.is_empty()
+    }
+
+    /// One line naming what the markers and the event stream established.
+    pub fn describe(&self) -> String {
+        let admitted: usize = self
+            .gaps
+            .iter()
+            .filter(|g| g.explained_by_sink_drop)
+            .count();
+        let unexplained = self.gaps.len() - admitted;
+        format!(
+            "delivery: {} marker(s) consumed ({} checkpoint(s), {} instance(s), {} unreadable); \
+             {} correlation(s) checked for request_sequence continuity, {} gap(s) ({} admitted by \
+             a `dropped` marker, {} unexplained)",
+            self.markers_seen,
+            self.checkpoints,
+            self.instances.len(),
+            self.markers_unreadable,
+            self.correlations_checked,
+            self.gaps.len(),
+            admitted,
+            unexplained,
+        )
+    }
+}
+
+/// What one producer instance's markers claim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct InstanceDelivery {
+    pub instance_id: String,
+    /// The writer emitted its shutdown marker: everything before it landed.
+    pub eof: bool,
+    /// Highest `global_sequence` the writer claims to have written.
+    pub last_seq: Option<u64>,
+    pub records_written: Option<u64>,
+    pub records_dropped: Option<u64>,
+    /// Inclusive `global_sequence` ranges the writer KNOWS it lost — fail-open
+    /// enqueue drops and batches lost to a transient sink failure.
+    pub dropped_ranges: Vec<[u64; 2]>,
+}
+
+/// A correlation whose `request_sequence` run is not contiguous: the recorder
+/// allocated these numbers and their events never reached the tape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeliveryGap {
+    pub correlation_id: String,
+    /// The `request_sequence` values that never arrived.
+    pub missing: Vec<u64>,
+    /// The `global_sequence` span of the events that DID arrive for this
+    /// correlation — the window a `dropped` marker has to overlap to explain
+    /// the hole.
+    pub gseq_span: [u64; 2],
+    /// A `dropped` marker overlaps that window, so the producer itself
+    /// accounted for this loss. False means nothing did: the records were
+    /// written and then lost downstream.
+    pub explained_by_sink_drop: bool,
+}
+
+/// The markers of one pull, folded per producer instance.
+#[derive(Debug, Clone, Default)]
+struct MarkerLedger {
+    seen: usize,
+    unreadable: usize,
+    checkpoints: usize,
+    by_instance: std::collections::BTreeMap<String, InstanceDelivery>,
+}
+
+impl MarkerLedger {
+    fn record(&mut self, line: &str) {
+        self.seen += 1;
+        let Ok(probe) = serde_json::from_str::<MarkerProbe>(line) else {
+            self.unreadable += 1;
+            return;
+        };
+        let Some(body) = probe.marker else {
+            // A `deja_sink_marker` envelope with no `marker` body claims
+            // nothing. Counting it as read would inflate the audit trail.
+            self.unreadable += 1;
+            return;
+        };
+        let instance_id = probe.instance_id.unwrap_or_else(|| "unknown".to_owned());
+        let entry = self
+            .by_instance
+            .entry(instance_id.clone())
+            .or_insert_with(|| InstanceDelivery {
+                instance_id,
+                ..Default::default()
+            });
+        match body.kind.as_str() {
+            "checkpoint" => {
+                self.checkpoints += 1;
+                fold_totals(entry, &body);
+            }
+            "eof" => {
+                entry.eof = true;
+                fold_totals(entry, &body);
+            }
+            "dropped" => entry.dropped_ranges.extend(body.ranges.iter().copied()),
+            // A kind this build does not know is still a marker line, and
+            // pretending to have read it would be the defect being fixed.
+            _ => self.unreadable += 1,
+        }
+    }
+
+    /// What the markers say about the recording having stopped growing.
+    fn completeness(&self) -> Completeness {
+        if self.by_instance.is_empty() {
+            return Completeness::StillLanding {
+                reason: format!(
+                    "no readable sink marker under this prefix ({} marker line(s), {} unreadable) \
+                     — the recorder's `eof` stamp is what says a recording stopped growing, and \
+                     none arrived",
+                    self.seen, self.unreadable
+                ),
+            };
+        }
+        let silent: Vec<&str> = self
+            .by_instance
+            .values()
+            .filter(|i| !i.eof)
+            .map(|i| i.instance_id.as_str())
+            .collect();
+        if silent.is_empty() {
+            return Completeness::EofObserved {
+                instances: self.by_instance.len(),
+            };
+        }
+        Completeness::StillLanding {
+            reason: format!(
+                "instance(s) {} emitted checkpoints but no `eof` — that writer has not shut down \
+                 and drained, so this prefix is a snapshot of a recording still being written",
+                silent.join(", ")
+            ),
+        }
+    }
+
+    fn into_instances(self) -> Vec<InstanceDelivery> {
+        self.by_instance.into_values().collect()
+    }
+}
+
+/// Monotonic counters: the highest value seen is the latest, whatever order the
+/// markers arrived in after a dedup+sort.
+fn fold_totals(entry: &mut InstanceDelivery, body: &MarkerBody) {
+    entry.last_seq = entry.last_seq.max(body.last_seq);
+    entry.records_written = entry.records_written.max(body.records_written);
+    entry.records_dropped = entry.records_dropped.max(body.records_dropped);
+}
+
+/// Build the certificate: continuity from the events, cause from the markers.
+fn certify(
+    per_correlation: std::collections::BTreeMap<String, Vec<(u64, u64)>>,
+    markers: MarkerLedger,
+) -> DeliveryCertificate {
+    let dropped_ranges: Vec<[u64; 2]> = markers
+        .by_instance
+        .values()
+        .flat_map(|i| i.dropped_ranges.iter().copied())
+        .collect();
+
+    let correlations_checked = per_correlation.len();
+    let mut gaps = Vec::new();
+    for (correlation_id, mut seen) in per_correlation {
+        seen.sort_unstable();
+        let highest = seen.last().map(|(rseq, _)| *rseq).unwrap_or_default();
+        let present: std::collections::BTreeSet<u64> = seen.iter().map(|(rseq, _)| *rseq).collect();
+        // The recorder starts every correlation at 0 and increments by one, so
+        // the run it emitted is exactly `0..=highest`. Anything in that range
+        // that did not arrive was allocated and then lost.
+        let missing: Vec<u64> = (0..=highest).filter(|r| !present.contains(r)).collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let gseq_lo = seen.iter().map(|(_, g)| *g).min().unwrap_or_default();
+        let gseq_hi = seen.iter().map(|(_, g)| *g).max().unwrap_or_default();
+        let explained_by_sink_drop = dropped_ranges
+            .iter()
+            .any(|[from, to]| *from <= gseq_hi && *to >= gseq_lo);
+        gaps.push(DeliveryGap {
+            correlation_id,
+            missing,
+            gseq_span: [gseq_lo, gseq_hi],
+            explained_by_sink_drop,
+        });
+    }
+
+    DeliveryCertificate {
+        markers_seen: markers.seen,
+        markers_unreadable: markers.unreadable,
+        checkpoints: markers.checkpoints,
+        correlations_checked,
+        gaps,
+        instances: markers.into_instances(),
+    }
+}
+
+/// Minimal probe of an event for identity (dedup/sort key) plus the two fields
+/// the delivery certificate is computed from — everything else stays raw.
 #[derive(serde::Deserialize)]
 struct EventProbe {
     #[serde(default)]
     recording_run_id: Option<String>,
     #[serde(default)]
     global_sequence: u64,
+    /// Absent on graph nodes and on ambient (uncorrelated) traffic. Both are
+    /// excluded from continuity: a graph node is numbered in another space
+    /// entirely, and an uncorrelated event's `request_sequence` comes from a
+    /// process-wide counter rather than a per-correlation one, so folding
+    /// either in would invent gaps.
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default)]
+    request_sequence: u64,
+}
+
+/// A sink marker, as the record sink puts it on the wire: the payload the
+/// writer built is flattened under `marker` alongside its `kind`.
+///
+/// Note where the body is. It is not under `event`, and it is not at the top
+/// level — the same producer/consumer split that made every graph envelope
+/// (payload under `node`) read as "not an envelope at all". These shapes are
+/// copied from the sink's `MarkerEnvelope`, not invented here.
+#[derive(serde::Deserialize)]
+struct MarkerProbe {
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    marker: Option<MarkerBody>,
+}
+
+#[derive(serde::Deserialize)]
+struct MarkerBody {
+    #[serde(default)]
+    kind: String,
+    /// `checkpoint` / `eof`: the writer's own progress claim.
+    #[serde(default)]
+    last_seq: Option<u64>,
+    #[serde(default)]
+    records_written: Option<u64>,
+    #[serde(default)]
+    records_dropped: Option<u64>,
+    /// `dropped`: inclusive `global_sequence` ranges the writer lost.
+    #[serde(default)]
+    ranges: Vec<[u64; 2]>,
 }
 
 /// Envelope shape: the payload is kept as raw bytes.
@@ -173,14 +521,6 @@ struct CaptureProbe {
     session_id: Option<String>,
 }
 
-/// Per-event correlation probe (for the ingest report's correlation count —
-/// the session layout gets this from the manifest; a raw prefix has none).
-#[derive(serde::Deserialize)]
-struct CorrelationProbe {
-    #[serde(default)]
-    correlation_id: Option<String>,
-}
-
 /// Count landing objects for a recording (the "did Vector land anything yet /
 /// has the flush settled" poll the lifecycle runs before compacting).
 pub fn count_session_objects(cfg: &S3Config, recording_id: &str) -> Result<usize, String> {
@@ -201,7 +541,7 @@ pub fn pull_recording(
     };
     let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
     let chunk = lines.join("\n").into_bytes();
-    let (events, lines_in, drops) = collate(&[chunk]);
+    let collated = collate(&[chunk]);
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -209,7 +549,7 @@ pub fn pull_recording(
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
-    for (_, _, _, line) in &events {
+    for (_, _, _, line) in &collated.events {
         out.write_all(line.as_bytes())
             .and_then(|_| out.write_all(b"\n"))
             .map_err(|e| format!("write {}: {e}", dest.display()))?;
@@ -219,19 +559,26 @@ pub fn pull_recording(
     let report = IngestReport {
         prefix: deja_compactor::layout::session_root(recording_id),
         landing_objects: manifest.counts.landing_objects,
-        lines_in,
+        lines_in: collated.lines_in,
         // The manifest's own duplicates were dropped when the session was
         // sealed, so they are outside this pass's line accounting and are
         // reported separately from what collate saw.
-        duplicates_dropped: manifest.counts.duplicates_dropped + drops.duplicates,
-        events_out: events.len(),
+        duplicates_dropped: manifest.counts.duplicates_dropped + collated.drops.duplicates,
+        events_out: collated.events.len(),
         correlations: manifest.counts.correlations,
         sealed: true,
-        markers_dropped: drops.markers,
-        non_envelope_dropped: drops.non_envelope,
-        unparseable_dropped: drops.unparseable,
+        markers_dropped: collated.drops.markers,
+        non_envelope_dropped: collated.drops.non_envelope,
+        unparseable_dropped: collated.drops.unparseable,
+        // The seal is terminal, so this recording has stopped growing whatever
+        // the markers say. They will say nothing: the compactor skips marker
+        // lines when it builds a session, so a sealed session carries no audit
+        // trail and the certificate below rests on the event stream alone.
+        completeness: Completeness::Sealed,
+        delivery: certify(collated.per_correlation, collated.markers),
     };
     eprintln!("{}", report.accounting());
+    eprintln!("{}", report.delivery.describe());
     Ok((report, manifest))
 }
 
@@ -347,7 +694,7 @@ pub fn pull_recording_from_prefix(
 
     let lines = by_session.remove(&resolved).unwrap_or_default();
     let chunk = lines.join("\n").into_bytes();
-    let (events, lines_in, drops) = collate(&[chunk]);
+    let collated = collate(&[chunk]);
 
     let dest = dest_for(&resolved);
     let dest = dest.as_path();
@@ -357,13 +704,7 @@ pub fn pull_recording_from_prefix(
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
-    let mut correlations = std::collections::HashSet::new();
-    for (_, _, _, line) in &events {
-        if let Ok(probe) = serde_json::from_str::<CorrelationProbe>(line) {
-            if let Some(corr) = probe.correlation_id {
-                correlations.insert(corr);
-            }
-        }
+    for (_, _, _, line) in &collated.events {
         out.write_all(line.as_bytes())
             .and_then(|_| out.write_all(b"\n"))
             .map_err(|e| format!("write {}: {e}", dest.display()))?;
@@ -391,21 +732,30 @@ pub fn pull_recording_from_prefix(
         .copied()
         .unwrap_or_default();
 
+    // The markers answer "has this recording stopped growing" BEFORE they are
+    // folded into the certificate, because that question decides whether the
+    // run may report a verdict at all.
+    let completeness = collated.markers.completeness();
     let report = IngestReport {
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
         landing_objects: session_objects,
-        lines_in,
-        duplicates_dropped: drops.duplicates,
-        events_out: events.len(),
-        correlations: correlations.len(),
+        lines_in: collated.lines_in,
+        duplicates_dropped: collated.drops.duplicates,
+        events_out: collated.events.len(),
+        correlations: collated.per_correlation.len(),
         // This pull read a landing prefix. It is sealed only if a compaction job
-        // has already promoted it, which a replay neither does nor may do.
+        // has already promoted it, which a replay neither does nor may do — so
+        // this is NOT the completeness signal; `completeness` is.
         sealed: false,
-        markers_dropped: drops.markers,
-        non_envelope_dropped: drops.non_envelope,
-        unparseable_dropped: drops.unparseable,
+        markers_dropped: collated.drops.markers,
+        non_envelope_dropped: collated.drops.non_envelope,
+        unparseable_dropped: collated.drops.unparseable,
+        completeness,
+        delivery: certify(collated.per_correlation, collated.markers),
     };
     eprintln!("{}", report.accounting());
+    eprintln!("{}", report.delivery.describe());
+    eprintln!("ingest: {}", report.completeness.describe());
     Ok((report, resolved, seen))
 }
 
@@ -449,15 +799,12 @@ fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
 /// spaces start at zero in one recording, so a key without the kind makes graph
 /// node N collide with boundary event N.
 #[allow(clippy::type_complexity)]
-fn collate(
-    raw_chunks: &[Vec<u8>],
-) -> (
-    Vec<(Option<String>, &'static str, u64, String)>,
-    usize,
-    DropCounts,
-) {
+fn collate(raw_chunks: &[Vec<u8>]) -> Collated {
     let mut seen = std::collections::HashSet::new();
     let mut events: Vec<(Option<String>, &'static str, u64, String)> = Vec::new();
+    let mut per_correlation: std::collections::BTreeMap<String, Vec<(u64, u64)>> =
+        Default::default();
+    let mut markers = MarkerLedger::default();
     let mut lines_in = 0usize;
     let mut drops = DropCounts::default();
     for chunk in raw_chunks {
@@ -470,9 +817,13 @@ fn collate(
             // Landing lines are envelopes; the payload's raw bytes are kept.
             let (record_kind, event_raw): (&'static str, String) =
                 match serde_json::from_str::<EnvelopeProbe>(&line_str) {
-                    // Loss accounting, not events — counted so the totals balance.
+                    // Loss accounting, not events. Still counted, because the
+                    // line balance needs the term — but READ, because what a
+                    // marker says is the recording's own audit trail and the
+                    // only producer-side account of what it lost.
                     Ok(probe) if probe.is_marker() => {
                         drops.markers += 1;
+                        markers.record(&line_str);
                         continue;
                     }
                     // The canonical events.jsonl is a `DejaRecord` stream, internally
@@ -507,6 +858,17 @@ fn collate(
                 drops.duplicates += 1;
                 continue;
             }
+            // AFTER the dedup check, so a correlation's run is the events that
+            // actually reached the tape rather than the lines that mentioned
+            // them. Boundary events only — see `EventProbe::correlation_id`.
+            if record_kind == "boundary_event" {
+                if let Some(correlation_id) = &probe.correlation_id {
+                    per_correlation
+                        .entry(correlation_id.clone())
+                        .or_default()
+                        .push((probe.request_sequence, probe.global_sequence));
+                }
+            }
             events.push((
                 probe.recording_run_id,
                 record_kind,
@@ -518,7 +880,28 @@ fn collate(
     // Sequence first so a kind's own order is preserved and boundary-event
     // ordering is unchanged; kind only breaks the tie between the two spaces.
     events.sort_by(|a, b| (&a.0, a.2, a.1).cmp(&(&b.0, b.2, b.1)));
-    (events, lines_in, drops)
+    Collated {
+        events,
+        per_correlation,
+        lines_in,
+        drops,
+        markers,
+    }
+}
+
+/// Everything ONE pass over the landing lines produces.
+///
+/// One pass, not two: the correlation index and the marker ledger are computed
+/// beside the event stream from the same lines, because a second pass over the
+/// same input is exactly the producer/consumer split that keeps failing here.
+struct Collated {
+    events: Vec<(Option<String>, &'static str, u64, String)>,
+    /// `correlation_id -> [(request_sequence, global_sequence)]` for the
+    /// boundary events that survived dedup.
+    per_correlation: std::collections::BTreeMap<String, Vec<(u64, u64)>>,
+    lines_in: usize,
+    drops: DropCounts,
+    markers: MarkerLedger,
 }
 
 #[cfg(test)]
@@ -531,21 +914,72 @@ mod tests {
         )
     }
 
+    /// A boundary event carrying the two fields continuity is computed from.
+    fn correlated(instance: &str, gseq: u64, correlation: &str, rseq: u64) -> String {
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"{instance}","event":{{"recording_run_id":"r1","global_sequence":{gseq},"correlation_id":"{correlation}","request_sequence":{rseq}}}}}"#
+        )
+    }
+
+    /// A sink marker EXACTLY as the record sink emits it.
+    ///
+    /// The body is under `marker` — `{kind, ...flattened payload}` — copied
+    /// from the producer's `MarkerEnvelope`, not invented here. This repo has
+    /// already paid once for a fixture that described a wire shape nothing
+    /// wrote (the graph envelope below), so the marker fixtures are the
+    /// producer's shape or they are worthless.
+    fn marker_envelope(instance: &str, body: &str) -> String {
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_sink_marker","instance_id":"{instance}","recording_run_id":"r1","capture":{{"mode":"session","session_id":"r1"}},"marker":{body}}}"#
+        )
+    }
+
+    fn checkpoint(instance: &str, last_seq: u64) -> String {
+        marker_envelope(
+            instance,
+            &format!(
+                r#"{{"kind":"checkpoint","last_seq":{last_seq},"records_written":{last_seq},"records_dropped":0}}"#
+            ),
+        )
+    }
+
+    fn eof(instance: &str, last_seq: u64) -> String {
+        marker_envelope(
+            instance,
+            &format!(
+                r#"{{"kind":"eof","last_seq":{last_seq},"records_written":{last_seq},"records_dropped":0}}"#
+            ),
+        )
+    }
+
+    fn dropped(instance: &str, from: u64, to: u64) -> String {
+        marker_envelope(
+            instance,
+            &format!(r#"{{"kind":"dropped","ranges":[[{from},{to}]]}}"#),
+        )
+    }
+
     #[test]
     fn collate_unwraps_dedups_and_sorts() {
         // Two objects, out-of-order gseq, one duplicate across objects, one
         // sink marker, one junk line.
         let obj1 = format!(
-            "{}\n{}\n{{\"artifact_type\":\"deja_sink_marker\",\"event\":{{\"kind\":\"checkpoint\"}}}}\n",
+            "{}\n{}\n{}\n",
             envelope("r1", 3, r#","k":"c""#),
             envelope("r1", 1, r#","k":"a""#),
+            checkpoint("router-h-1", 3),
         );
         let obj2 = format!(
             "{}\n{}\nnot-json\n",
             envelope("r1", 1, r#","k":"a""#), // duplicate of obj1's gseq 1
             envelope("r1", 2, r#","k":"b""#),
         );
-        let (events, lines_in, drops) = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
+        let Collated {
+            events,
+            lines_in,
+            drops,
+            ..
+        } = collate(&[obj1.into_bytes(), obj2.into_bytes()]);
         assert_eq!(lines_in, 6);
         assert_eq!(drops.duplicates, 1);
         assert_eq!(drops.markers, 1);
@@ -579,7 +1013,12 @@ mod tests {
         // payload and was discarded as "not an envelope" before its
         // artifact_type was ever consulted.
         let chunk = format!("{}\n", graph_envelope("r1", 5)).into_bytes();
-        let (events, lines_in, drops) = collate(&[chunk]);
+        let Collated {
+            events,
+            lines_in,
+            drops,
+            ..
+        } = collate(&[chunk]);
         assert_eq!(lines_in, 1);
         assert_eq!(
             drops.non_envelope, 0,
@@ -605,11 +1044,16 @@ mod tests {
             envelope("r1", 1, ""), // duplicate
             graph_envelope("r1", 1),
             graph_envelope("r1", 1), // duplicate
-            r#"{"artifact_type":"deja_sink_marker","recording_run_id":"r1"}"#,
+            eof("router-h-1", 1),
             r#"{"artifact_type":"deja_artifact_record","instance_id":"h"}"#, // no payload
         )
         .into_bytes();
-        let (events, lines_in, drops) = collate(&[chunk]);
+        let Collated {
+            events,
+            lines_in,
+            drops,
+            ..
+        } = collate(&[chunk]);
         assert_eq!(lines_in, 7);
         assert_eq!(events.len(), 2);
         assert_eq!(drops.duplicates, 2);
@@ -627,6 +1071,8 @@ mod tests {
             markers_dropped: drops.markers,
             non_envelope_dropped: drops.non_envelope,
             unparseable_dropped: drops.unparseable,
+            completeness: Completeness::Sealed,
+            delivery: DeliveryCertificate::default(),
         };
         assert!(report.balances(), "{}", report.accounting());
         assert!(!report.accounting().contains("UNACCOUNTED"));
@@ -646,6 +1092,8 @@ mod tests {
             markers_dropped: 0,
             non_envelope_dropped: 0,
             unparseable_dropped: 0,
+            completeness: Completeness::Sealed,
+            delivery: DeliveryCertificate::default(),
         };
         assert!(!report.balances());
         assert!(report.accounting().contains("UNACCOUNTED: 97309"));
@@ -668,7 +1116,7 @@ mod tests {
             graph_envelope("r1", 1),
         )
         .into_bytes();
-        let (events, _, drops) = collate(&[chunk]);
+        let Collated { events, drops, .. } = collate(&[chunk]);
         assert_eq!(
             drops.duplicates, 0,
             "no record may be dropped as a duplicate here"
@@ -701,16 +1149,243 @@ mod tests {
             graph_envelope("r1", 7),
         )
         .into_bytes();
-        let (events, _, drops) = collate(&[chunk]);
+        let Collated { events, drops, .. } = collate(&[chunk]);
         assert_eq!(drops.duplicates, 2);
         assert_eq!(events.len(), 2);
+    }
+
+    // -- defect 2: markers are consumed, not discarded ----------------------
+
+    #[test]
+    fn a_marker_is_read_rather_than_only_counted() {
+        // The defect: ingest counted 83 marker lines on a real recording and
+        // threw every one away, so nothing could establish that a correlation's
+        // events arrived intact. The count still exists — the line balance
+        // needs it — but the CLAIM each marker carries now lands somewhere.
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n",
+            correlated("router-h-1", 0, "c-1", 0),
+            checkpoint("router-h-1", 0),
+            dropped("router-h-1", 40, 41),
+            eof("router-h-1", 7),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        assert_eq!(collated.drops.markers, 3, "still counted for the balance");
+
+        let cert = certify(collated.per_correlation, collated.markers);
+        assert_eq!(cert.markers_seen, 3);
+        assert_eq!(cert.markers_unreadable, 0, "the producer's shape parses");
+        assert_eq!(cert.checkpoints, 1);
+        assert_eq!(cert.instances.len(), 1);
+
+        let instance = &cert.instances[0];
+        assert_eq!(instance.instance_id, "router-h-1");
+        assert!(instance.eof, "the eof marker was read, not discarded");
+        // Monotonic counters fold to their highest value, so the eof's totals
+        // win over the earlier checkpoint's whatever order they arrived in.
+        assert_eq!(instance.last_seq, Some(7));
+        assert_eq!(instance.records_written, Some(7));
+        assert_eq!(instance.dropped_ranges, vec![[40, 41]]);
+    }
+
+    #[test]
+    fn a_marker_whose_body_cannot_be_read_is_named_not_assumed_fine() {
+        // A marker line whose claim is unreadable is a LOST claim. Counting it
+        // as read would be the same silent-drop shape one layer up.
+        let chunk = format!(
+            "{}\n{}\n{}\n",
+            r#"{"artifact_type":"deja_sink_marker","instance_id":"h","recording_run_id":"r1"}"#,
+            marker_envelope("h", r#"{"kind":"a_kind_this_build_never_heard_of"}"#),
+            eof("h", 1),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+        assert_eq!(cert.markers_seen, 3);
+        assert_eq!(
+            cert.markers_unreadable, 2,
+            "a body-less marker and an unknown kind each lose a claim"
+        );
+    }
+
+    #[test]
+    fn a_correlation_missing_a_request_sequence_is_a_named_gap() {
+        // THE continuity property. `request_sequence` is a dense per-correlation
+        // counter (`next_request_sequence`), and a sampled-out or sink-down
+        // boundary no-ops BEFORE any sequence is allocated (`capture_verdict`),
+        // so 0,1,3 means the event numbered 2 was allocated and then lost.
+        let chunk = format!(
+            "{}\n{}\n{}\n",
+            correlated("router-h-1", 10, "c-1", 0),
+            correlated("router-h-1", 11, "c-1", 1),
+            correlated("router-h-1", 13, "c-1", 3),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+
+        assert_eq!(cert.correlations_checked, 1);
+        assert!(!cert.continuous(), "a hole must not pass as intact");
+        assert_eq!(cert.gaps.len(), 1);
+        assert_eq!(cert.gaps[0].correlation_id, "c-1");
+        assert_eq!(cert.gaps[0].missing, vec![2]);
+        assert_eq!(cert.gaps[0].gseq_span, [10, 13]);
+        assert!(
+            !cert.gaps[0].explained_by_sink_drop,
+            "no `dropped` marker covers it — the producer does not admit this loss"
+        );
+        assert!(cert.describe().contains("1 unexplained"));
+    }
+
+    #[test]
+    fn a_gap_the_writer_admits_is_told_apart_from_one_nobody_admits() {
+        // The markers cannot prove continuity — they carry no correlation_id
+        // and their sequence space is global_sequence. What they CAN do is say
+        // whether the producer accounted for the loss. A hole covered by a
+        // `dropped` marker is loss the writer admits (fail-open backpressure);
+        // a hole nobody admits means the records left the writer and vanished
+        // in transport, which is the worse of the two.
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            correlated("router-h-1", 10, "c-admitted", 0),
+            correlated("router-h-1", 12, "c-admitted", 2),
+            correlated("router-h-1", 30, "c-silent", 0),
+            correlated("router-h-1", 32, "c-silent", 2),
+            dropped("router-h-1", 11, 11),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+
+        assert_eq!(cert.gaps.len(), 2);
+        let admitted = cert
+            .gaps
+            .iter()
+            .find(|g| g.correlation_id == "c-admitted")
+            .expect("admitted gap");
+        assert_eq!(admitted.missing, vec![1]);
+        assert!(
+            admitted.explained_by_sink_drop,
+            "gseq 11 sits inside the correlation's span and the writer ledgered it"
+        );
+
+        let silent = cert
+            .gaps
+            .iter()
+            .find(|g| g.correlation_id == "c-silent")
+            .expect("silent gap");
+        assert!(
+            !silent.explained_by_sink_drop,
+            "the dropped range is nowhere near this correlation's span"
+        );
+        assert!(cert.describe().contains("1 admitted"));
+    }
+
+    #[test]
+    fn ambient_and_graph_records_do_not_invent_gaps() {
+        // Uncorrelated traffic numbers its `request_sequence` from a
+        // process-wide counter, and a graph node has neither field. Folding
+        // either into the continuity check would manufacture holes in a
+        // recording that lost nothing.
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n",
+            correlated("router-h-1", 0, "c-1", 0),
+            correlated("router-h-1", 1, "c-1", 1),
+            envelope("r1", 2, r#","request_sequence":97"#), // ambient: no correlation
+            graph_envelope("r1", 0),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+        assert_eq!(cert.correlations_checked, 1, "only the real correlation");
+        assert!(cert.continuous(), "{:?}", cert.gaps);
+    }
+
+    // -- defect 1: an unsealed recording cannot pass as complete -------------
+
+    #[test]
+    fn no_eof_marker_means_the_recording_may_still_be_landing() {
+        // The observed failure: a replay read a prefix of a tape still being
+        // written and reported 9/44 as though it were the whole recording. The
+        // writer's `eof` is what says a recording stopped growing; checkpoints
+        // alone say the opposite — it was still flushing when this was read.
+        let chunk = format!(
+            "{}\n{}\n",
+            correlated("router-h-1", 0, "c-1", 0),
+            checkpoint("router-h-1", 0),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let completeness = collated.markers.completeness();
+
+        assert!(
+            !completeness.is_complete(),
+            "a checkpoint is not a goodbye: {completeness:?}"
+        );
+        let reason = completeness.incomplete_reason().expect("a named reason");
+        assert!(reason.contains("router-h-1"), "names the silent instance");
+        assert!(reason.contains("eof"));
+        assert!(completeness.describe().contains("INCOMPLETE"));
+    }
+
+    #[test]
+    fn an_eof_from_every_instance_means_nothing_more_is_coming() {
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n",
+            correlated("router-h-1", 0, "c-1", 0),
+            correlated("router-h-2", 1, "c-2", 0),
+            eof("router-h-1", 0),
+            eof("router-h-2", 1),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let completeness = collated.markers.completeness();
+        assert_eq!(completeness, Completeness::EofObserved { instances: 2 });
+        assert!(completeness.is_complete());
+    }
+
+    #[test]
+    fn one_instance_still_writing_holds_the_whole_recording_incomplete() {
+        // A multi-producer recording is complete only when EVERY writer has
+        // said goodbye. One that hasn't is still appending to this session.
+        let chunk = format!(
+            "{}\n{}\n",
+            eof("router-h-1", 4),
+            checkpoint("router-h-2", 9),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let completeness = collated.markers.completeness();
+        assert!(!completeness.is_complete());
+        let reason = completeness.incomplete_reason().expect("a named reason");
+        assert!(reason.contains("router-h-2"));
+        assert!(
+            !reason.contains("router-h-1"),
+            "the instance that DID finish must not be blamed: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_with_no_markers_at_all_cannot_claim_completeness() {
+        // Absence of the audit trail is not evidence the recording finished.
+        // This is the case the real 9/44 run was in if its markers never
+        // reached the scanned prefix.
+        let chunk = format!("{}\n", correlated("router-h-1", 0, "c-1", 0)).into_bytes();
+        let collated = collate(&[chunk]);
+        let completeness = collated.markers.completeness();
+        assert!(!completeness.is_complete());
+        assert!(completeness
+            .incomplete_reason()
+            .expect("a named reason")
+            .contains("no readable sink marker"));
     }
 
     #[test]
     fn collate_keeps_distinct_runs_apart() {
         let chunks =
             vec![format!("{}\n{}\n", envelope("r2", 1, ""), envelope("r1", 1, "")).into_bytes()];
-        let (events, _, drops) = collate(&chunks);
+        let Collated { events, drops, .. } = collate(&chunks);
         assert_eq!(drops.duplicates, 0);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0.as_deref(), Some("r1")); // sorted by (rid, gseq, kind)
