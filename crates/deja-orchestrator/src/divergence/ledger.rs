@@ -39,9 +39,10 @@ use deja::{Address, BoundaryEvent, ObservedCall};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    args_free_effective_values, event_reply_canon_kind, is_nonblocking_boundary,
-    observed_value_diverged, omission_is_blocking, tier_for, values_diverge_under_event,
-    InconclusiveRaceEvidence, Tier, POSITIONAL_FALLBACK_RANK,
+    args_free_effective_values, correlation_column_provenance, event_reply_canon_kind,
+    is_nonblocking_boundary, observed_schema_default_divergence, observed_value_diverged,
+    omission_is_blocking, schema_default_divergence, tier_for, values_diverge_under_event,
+    InconclusiveRaceEvidence, SchemaDefaultVerdict, Tier, POSITIONAL_FALLBACK_RANK,
 };
 
 /// One side (recorded or observed) of a call, with everything a diff/graph UI
@@ -95,7 +96,7 @@ pub struct CallRecord {
     pub method_name: String,
     /// matched | recovered | novel | omitted | environmental | deterministic |
     /// value_diverged | order_nondeterministic | idempotent_delete |
-    /// inconclusive_race
+    /// inconclusive_race | schema_default | schema_default_inherited
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
@@ -111,6 +112,17 @@ pub struct CallRecord {
     pub recorded: Option<CallSide>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed: Option<CallSide>,
+}
+
+/// The ledger's snake_case name for a schema-derived row, keeping the
+/// scorecard's distinction between a provenance READ off the statement and one
+/// INFERRED from the correlation's history.
+fn schema_default_row_kind(scorecard_kind: &str) -> String {
+    match scorecard_kind {
+        "SchemaDefaultInherited" => "schema_default_inherited",
+        _ => "schema_default",
+    }
+    .to_owned()
 }
 
 fn recorded_side(ev: &BoundaryEvent) -> CallSide {
@@ -156,22 +168,24 @@ fn observed_side(obs: &ObservedCall) -> CallSide {
 }
 
 /// Build the per-call ledger from the recording's events (recorded side), the
-/// candidate's observed calls, the set of sequences the lookup table covers,
-/// and the recorded span path per sequence (rank-2 address, for graph
-/// alignment).
+/// candidate's observed calls, and the lookup table.
+///
+/// The table is passed whole rather than pre-digested into "the covered
+/// sequences" + "the span path per sequence" + "the pairing pool". Those three
+/// are one fact read three ways, and a caller that can hand over a mismatched
+/// set of them is a caller that can make the ledger disagree with the scorecard
+/// — which is the bug this signature was tightened to prevent.
 pub fn build(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
-    expected_seqs: &HashSet<u64>,
-    span_paths: &HashMap<u64, String>,
+    table: &deja::LookupTable,
     order_nondet_demote: &HashSet<u64>,
     idempotent_delete_demote: &HashSet<u64>,
 ) -> Vec<CallRecord> {
     build_with_inconclusive(
         events,
         observed,
-        expected_seqs,
-        span_paths,
+        table,
         order_nondet_demote,
         idempotent_delete_demote,
         &InconclusiveRaceEvidence::default(),
@@ -181,14 +195,18 @@ pub fn build(
 pub(crate) fn build_with_inconclusive(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
-    expected_seqs: &HashSet<u64>,
-    span_paths: &HashMap<u64, String>,
+    table: &deja::LookupTable,
     order_nondet_demote: &HashSet<u64>,
     idempotent_delete_demote: &HashSet<u64>,
     inconclusive_race: &InconclusiveRaceEvidence,
 ) -> Vec<CallRecord> {
+    let expected_seqs = &expected_sequences(table);
+    let span_paths = &recorded_span_paths(table);
     let by_seq: HashMap<u64, &BoundaryEvent> =
         events.iter().map(|e| (e.global_sequence, e)).collect();
+    // Same index the scorecard builds, from the same two streams, so a
+    // schema-derived row and a schema-derived count cannot come apart.
+    let column_provenance = correlation_column_provenance(events, observed);
     let recorded_for = |seq: u64| -> Option<CallSide> {
         by_seq.get(&seq).map(|ev| {
             let mut side = recorded_side(ev);
@@ -200,34 +218,18 @@ pub(crate) fn build_with_inconclusive(
     let mut rows: Vec<CallRecord> = Vec::new();
     let mut consumed: HashSet<u64> = HashSet::new();
 
-    // Args-free pairing of recorded twins for execute-mode write consequences,
-    // mirroring `detect()`: a re-keyed write misses its baseline by args, so it
-    // would otherwise split into a phantom novel (observed) + omitted (recorded
-    // twin). Pair them by call-site identity (correlation, boundary, method) in
-    // FIFO source order so the ledger shows ONE value_diverged consequence row
-    // carrying recorded 0.10 + observed 0.20 — parity with the scorecard.
-    type Identity = (Option<String>, String, String);
-    let mut recorded_pairing: HashMap<Identity, std::collections::VecDeque<u64>> = HashMap::new();
-    {
-        let mut by_identity: Vec<(Identity, u64)> = expected_seqs
-            .iter()
-            .filter_map(|s| by_seq.get(s).copied())
-            .map(|ev| {
-                (
-                    (
-                        ev.correlation_id.clone(),
-                        ev.boundary.clone(),
-                        ev.method_name.clone(),
-                    ),
-                    ev.global_sequence,
-                )
-            })
-            .collect();
-        by_identity.sort_by_key(|(_, seq)| *seq);
-        for (id, seq) in by_identity {
-            recorded_pairing.entry(id).or_default().push_back(seq);
-        }
-    }
+    // Args-free pairing of recorded twins for execute-mode write consequences:
+    // a re-keyed write misses its baseline by args, so it would otherwise split
+    // into a phantom novel (observed) + omitted (recorded twin). Pair them so
+    // the ledger shows ONE value_diverged consequence row carrying recorded 0.10
+    // + observed 0.20.
+    //
+    // The rule is `ArgsFreePairing` — THE one the scorecard uses, not a second
+    // copy of it. This used to key on (correlation, boundary, method) alone,
+    // which is the pool the scorecard had already narrowed twice; the two
+    // drifted, and a run whose scorecard correctly refused eight pairs shipped a
+    // ledger that made them anyway, each marrying two DIFFERENT SQL statements.
+    let mut recorded_pairing = super::ArgsFreePairing::build(table, events);
     // Recorded twins claimed by a value_diverged consequence, so the omitted pass
     // doesn't also flag them (collapses the would-be novel+omitted split).
     let mut paired_consumed: HashSet<u64> = HashSet::new();
@@ -250,7 +252,11 @@ pub(crate) fn build_with_inconclusive(
             // Rules A/B and narrow race recognition demote selected execute
             // divergences to non-blocking rows, mirroring the scorecard.
             let seq = obs.source_event_global_sequence;
-            let (kind, blocking) = if seq.is_some_and(|s| order_nondet_demote.contains(&s)) {
+            let schema_default =
+                observed_schema_default_divergence(obs, source_event, &column_provenance);
+            let (kind, blocking) = if let SchemaDefaultVerdict::Confirmed(d) = &schema_default {
+                (schema_default_row_kind(d.kind()), false)
+            } else if seq.is_some_and(|s| order_nondet_demote.contains(&s)) {
                 ("order_nondeterministic".to_owned(), false)
             } else if seq.is_some_and(|s| idempotent_delete_demote.contains(&s)) {
                 let kind = seq
@@ -288,22 +294,7 @@ pub(crate) fn build_with_inconclusive(
             && !is_nonblocking_boundary(&obs.boundary)
             && tier_for(&obs.boundary) != Tier::Environmental
         {
-            let id: Identity = (
-                obs.correlation_id.clone(),
-                obs.boundary.clone(),
-                obs.method_name.clone(),
-            );
-            let twin = recorded_pairing.get_mut(&id).and_then(|q| {
-                while let Some(seq) = q.front().copied() {
-                    if consumed.contains(&seq) {
-                        q.pop_front();
-                    } else {
-                        return q.pop_front();
-                    }
-                }
-                None
-            });
-            if let Some(twin_seq) = twin {
+            if let Some(twin_seq) = recorded_pairing.take_twin(obs, &consumed) {
                 paired_consumed.insert(twin_seq);
                 let mut recorded = recorded_for(twin_seq);
                 let mut observed = observed_side(obs);
@@ -342,21 +333,41 @@ pub(crate) fn build_with_inconclusive(
                 let race_downstream = value_diverged
                     && inconclusive_race
                         .attributable_downstream(obs.correlation_id.as_deref(), &obs.args);
+                // Rule C on the args-free arm, mirroring the scorecard: the two
+                // statements say the schema filled every differing column.
+                let schema_default = value_diverged
+                    .then(|| {
+                        schema_default_divergence(
+                            &obs.boundary,
+                            obs.correlation_id.as_deref(),
+                            twin_event
+                                .and_then(|ev| ev.args.get("sql"))
+                                .and_then(|s| s.as_str()),
+                            obs.args.get("sql").and_then(|s| s.as_str()),
+                            &recorded_val,
+                            &observed_val,
+                            &column_provenance,
+                        )
+                    })
+                    .and_then(|verdict| match verdict {
+                        SchemaDefaultVerdict::Confirmed(d) => {
+                            Some(schema_default_row_kind(d.kind()))
+                        }
+                        _ => None,
+                    });
                 rows.push(CallRecord {
                     correlation_id: obs.correlation_id.clone(),
                     source_event_global_sequence: Some(twin_seq),
                     boundary: obs.boundary.clone(),
                     trait_name: obs.trait_name.clone(),
                     method_name: obs.method_name.clone(),
-                    kind: if !value_diverged {
-                        "matched"
-                    } else if race_downstream {
-                        "inconclusive_race"
-                    } else {
-                        "value_diverged"
-                    }
-                    .to_owned(),
-                    blocking: value_diverged && !race_downstream,
+                    kind: match &schema_default {
+                        Some(kind) => kind.clone(),
+                        None if !value_diverged => "matched".to_owned(),
+                        None if race_downstream => "inconclusive_race".to_owned(),
+                        None => "value_diverged".to_owned(),
+                    },
+                    blocking: value_diverged && schema_default.is_none() && !race_downstream,
                     origin: false,
                     resolved_rank: obs.resolved_rank,
                     recorded,
@@ -543,11 +554,50 @@ mod tests {
         rows.iter().filter(|r| r.kind == kind).collect()
     }
 
+    /// A lookup table shaped like the one a real recording writes for `events`:
+    /// the rank-6 `Sequence` address every event emits, plus the rank-2
+    /// `SpanPath` address for each span the run harvested. The args-free pairing
+    /// pool is addressed off this table, so a fixture that omits it is a fixture
+    /// in which no observed call has a twin it is entitled to claim.
+    fn table_for(events: &[BoundaryEvent], spans: &HashMap<u64, String>) -> deja::LookupTable {
+        let mut entries = Vec::new();
+        for ev in events {
+            let key = |address| deja::LookupKey {
+                correlation_id: ev.correlation_id.clone(),
+                bucket_id: ev.bucket_id.clone(),
+                fork_seq: 0,
+                address,
+                args_hash: 0,
+                occurrence: 0,
+            };
+            entries.push(deja::LookupEntry {
+                key: key(Address::Sequence {
+                    boundary: ev.boundary.clone(),
+                    method: ev.method_name.clone(),
+                    request_sequence: 0,
+                }),
+                result: ev.result.clone(),
+                source_event_global_sequence: ev.global_sequence,
+            });
+            if let Some(path) = spans.get(&ev.global_sequence) {
+                entries.push(deja::LookupEntry {
+                    key: key(Address::SpanPath { path: path.clone() }),
+                    result: ev.result.clone(),
+                    source_event_global_sequence: ev.global_sequence,
+                });
+            }
+        }
+        deja::LookupTable {
+            recording_id: "rec".to_owned(),
+            policy_version: 1,
+            entries,
+        }
+    }
+
     #[test]
     fn ledger_classifies_and_carries_both_sides() {
         // recorded events: seq 1 (db, matched), seq 2 (redis, omitted)
         let events = vec![event(1, "db", Some("c1")), event(2, "redis", Some("c1"))];
-        let expected: HashSet<u64> = [1, 2].into_iter().collect();
         let spans: HashMap<u64, String> = [(1, "root>db".to_owned())].into_iter().collect();
         // observed: matched call to seq 1, plus a novel db call (unresolved)
         let observed = vec![
@@ -557,8 +607,7 @@ mod tests {
         let rows = build(
             &events,
             &observed,
-            &expected,
-            &spans,
+            &table_for(&events, &spans),
             &HashSet::new(),
             &HashSet::new(),
         );
@@ -597,12 +646,10 @@ mod tests {
     #[test]
     fn rank6_match_is_recovered_not_matched() {
         let events = vec![event(1, "db", Some("c1"))];
-        let expected: HashSet<u64> = [1].into_iter().collect();
         let rows = build(
             &events,
             &[obs("db", Some("c1"), true, Some(6), Some(1))],
-            &expected,
-            &HashMap::new(),
+            &table_for(&events, &HashMap::new()),
             &HashSet::new(),
             &HashSet::new(),
         );
@@ -618,8 +665,7 @@ mod tests {
                 obs("http_outgoing", Some("c1"), false, None, None),
                 obs("time", Some("c1"), false, None, None),
             ],
-            &HashSet::new(),
-            &HashMap::new(),
+            &table_for(&[], &HashMap::new()),
             &HashSet::new(),
             &HashSet::new(),
         );

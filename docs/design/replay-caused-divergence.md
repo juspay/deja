@@ -252,3 +252,35 @@ and pass if ANY type parses, while the runtime demands one exact type. `imc`
 values carry no `type_name` on the tape (db and km do), which is why the guess
 exists. Stamping the captured type at capture time would make the gate exact and
 delete the guess.
+
+## What a green gate does and does not say
+
+The conformance gate asserts that every recorded value reconstructs — that
+`Se(De(x))` equals `x` for each value the tape carries. That is worth asserting,
+because a type that serialises without deserialising fails at replay time and
+nowhere earlier, where no compiler and no write-only test can see it. But the
+property is narrower than it looks, and the natural misreading is expensive.
+
+The gate compares the tape against itself. It cannot compare the tape against
+the world. If a value was already wrong when it was written, both sides of the
+round trip agree on the wrong value and the check passes — not by accident, but
+because the question it asks does not reach that far.
+
+This is not hypothetical. `time` 0.3.41 renders an ISO 8601 subsecond by
+building `seconds + nanoseconds/1e9` as an `f64` and truncating, so a fraction
+that is not exactly representable renders one millisecond early: a true `.939`
+is written `.938`. Every tape recorded before that fix carries the error baked
+into its timestamps, and every one of them passes the gate on exactly those
+values, because `.938` reconstructs to `.938` faithfully. Replay was simply the
+first thing that ever rendered the same instant twice and compared the results,
+which is why the defect surfaced here rather than in the years of production
+responses that had been carrying it.
+
+So a green gate says the tape is SELF-CONSISTENT: replay will substitute what
+the recording holds. It does not say the recording holds what the system
+actually did. Two things follow. The first genuinely correct timestamps arrive
+only with the first recording made after the fix. And any comparison spanning
+that boundary sets a wrong-but-consistent tape against a right one, which will
+present as divergence and is not.
+
+Surfaced by the conformance gate on `rec-bb14832-08121241-ki`.

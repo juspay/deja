@@ -804,8 +804,188 @@ fn stage_resolve_recording(
             "recording {recording_id} not found in S3 or on disk"
         ));
     }
+    admit_against_recording(root, ctx, &recording_id)?;
     resolve_correlation_filter(root, run, ctx, &recording_id)?;
     Ok(recording_id)
+}
+
+/// What the tape's own ingest report says about the recording having stopped
+/// growing before it was read.
+///
+/// Three states, not two, because "the report says it was incomplete" and "there
+/// is no report" are different facts and refusing on both would be wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TapeCompleteness {
+    /// Sealed, or every producer instance emitted its `eof` marker.
+    Complete(String),
+    /// The recording was demonstrably still being written when this was read.
+    Incomplete(String),
+    /// No ingest report beside the tape — a tape materialized by an older
+    /// build. Absence of the audit trail is not evidence the recording was
+    /// short, so this is said out loud and not treated as a refusal.
+    Unproven(String),
+}
+
+impl TapeCompleteness {
+    /// The reason a verdict from this tape cannot be read as complete, if any.
+    fn provisional_reason(&self) -> Option<&str> {
+        match self {
+            TapeCompleteness::Incomplete(reason) => Some(reason),
+            TapeCompleteness::Complete(_) | TapeCompleteness::Unproven(_) => None,
+        }
+    }
+}
+
+/// Read the completeness the ingest already established, from beside the tape.
+///
+/// The report is the seam. A run that reuses an already-materialized tape never
+/// re-ingests it, so the fact cannot ride in memory from the pull to the
+/// verdict — it rides on disk with the thing it describes, and both the
+/// admission gate and the scoring stamp read it from there.
+fn tape_completeness(root: &HarnessRoot, recording_id: &str) -> TapeCompleteness {
+    let path = crate::scope::TapeSlot::ingest_report_path(root, recording_id);
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return TapeCompleteness::Unproven(format!(
+            "no ingest report beside the tape ({}) — this recording's completeness was never \
+             recorded",
+            path.display()
+        ));
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return TapeCompleteness::Unproven(format!(
+            "ingest report at {} is not readable JSON",
+            path.display()
+        ));
+    };
+    // Read defensively: a report written by an older build has no
+    // `completeness` at all, which is Unproven rather than a failure to parse.
+    let Some(state) = value
+        .pointer("/completeness/state")
+        .and_then(|v| v.as_str())
+    else {
+        return TapeCompleteness::Unproven(format!(
+            "ingest report at {} predates completeness accounting",
+            path.display()
+        ));
+    };
+    match state {
+        "still_landing" => TapeCompleteness::Incomplete(
+            value
+                .pointer("/completeness/reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("the recording had not stopped growing when it was read")
+                .to_owned(),
+        ),
+        "sealed" => TapeCompleteness::Complete("sealed session".to_owned()),
+        "eof_observed" => TapeCompleteness::Complete(format!(
+            "{} producer instance(s) emitted their `eof` marker",
+            value
+                .pointer("/completeness/instances")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+        )),
+        other => TapeCompleteness::Unproven(format!("unrecognized completeness state `{other}`")),
+    }
+}
+
+/// Refuse — or explicitly admit — a replay against a recording that cannot be
+/// shown to have finished.
+///
+/// The ingest has computed this fact for a while and nobody acted on it. Acting
+/// on it is the whole point: run
+/// `rp-sbx-1868bb92e9-1868bb9-08120623-rk-0812064511654` scored 9/44 against a
+/// prefix of `rec-1868bb9-08120623-rk`, a recording that later reported 87
+/// correlations, and the verdict was shaped exactly like a complete one. Three
+/// analyses were built on it.
+///
+/// Refusal is the default because the failure it prevents is silent and the
+/// failure it causes is not: a refused run says why, immediately, where a
+/// prefix-scored run says nothing and is believed. It is not unconditional
+/// because a caller may genuinely want a partial read — a recording still in
+/// flight, deliberately sampled early. That caller sets
+/// [`ALLOW_INCOMPLETE_RECORDING`], and the run then reports `inconclusive`
+/// instead of pass/fail, because a prefix cannot answer the question asked.
+fn admit_against_recording(
+    root: &HarnessRoot,
+    ctx: &StoreCtx,
+    recording_id: &str,
+) -> Result<(), String> {
+    admit_with_policy(
+        tape_completeness(root, recording_id),
+        ctx,
+        recording_id,
+        incomplete_recordings_allowed(),
+    )
+}
+
+/// The admission decision itself, with the opt-in passed in rather than read.
+/// Split out so the policy is testable without a process-wide env var — and so
+/// the rule is one expression a reader can check against the doc above it.
+fn admit_with_policy(
+    completeness: TapeCompleteness,
+    ctx: &StoreCtx,
+    recording_id: &str,
+    allow_incomplete: bool,
+) -> Result<(), String> {
+    match completeness {
+        TapeCompleteness::Complete(how) => {
+            ctx.log(
+                "ingest",
+                &format!("recording {recording_id} is complete ({how})"),
+            );
+            Ok(())
+        }
+        TapeCompleteness::Unproven(why) => {
+            // Loud, but not a refusal. Nothing here says the recording was
+            // short; refusing would strand every tape pulled by an older build.
+            let line = format!(
+                "recording {recording_id}: completeness UNPROVEN — {why}. Re-pull it to get a \
+                 delivery certificate; this run proceeds on an unverified tape."
+            );
+            eprintln!("lifecycle: {line}");
+            ctx.log("ingest", &line);
+            Ok(())
+        }
+        TapeCompleteness::Incomplete(reason) => {
+            if allow_incomplete {
+                let line = format!(
+                    "recording {recording_id} is INCOMPLETE — {reason}. Admitted by \
+                     {ALLOW_INCOMPLETE_RECORDING}: this run scores a PREFIX of the recording and \
+                     its verdict is reported inconclusive."
+                );
+                eprintln!("lifecycle: {line}");
+                ctx.log("ingest", &line);
+                return Ok(());
+            }
+            Err(format!(
+                "recording {recording_id} is not complete — {reason}. A replay scored against a \
+                 recording that is still being written scores a PREFIX of it, and the verdict is \
+                 indistinguishable from a complete one (a real run reported 9/44 on a recording \
+                 that later held 87 correlations). Wait for the recorder to finish and re-pull, \
+                 or set {ALLOW_INCOMPLETE_RECORDING}=1 to score the prefix deliberately — that \
+                 run reports inconclusive."
+            ))
+        }
+    }
+}
+
+/// Opt in to scoring a recording that cannot be shown to have finished.
+///
+/// This is a caller's intent and its natural home is the run request. It is an
+/// environment knob instead because `RunSpec` is constructed by struct literal
+/// in modules this change may not touch; moving it onto the request is a
+/// follow-up, and the only thing it changes is the granularity (process-wide
+/// here, per-run there). Either way the decision is recorded where it matters:
+/// the run's own log line, and the `recording_incomplete` stamp on its verdict.
+const ALLOW_INCOMPLETE_RECORDING: &str = "DEJA_ALLOW_INCOMPLETE_RECORDING";
+
+fn incomplete_recordings_allowed() -> bool {
+    matches!(
+        std::env::var(ALLOW_INCOMPLETE_RECORDING)
+            .unwrap_or_default()
+            .trim(),
+        "1" | "true" | "yes"
+    )
 }
 
 /// Settle the run's correlation filter into a CONCRETE list of ids, here, once,
@@ -1111,20 +1291,56 @@ fn score_and_register(
 
     let card = crate::divergence::detect_and_score(root, &run.run_id)
         .map_err(|e| format!("score: {e}"))?;
+
+    // The recording this verdict is ABOUT. A run admitted against a recording
+    // that was still being written scored a prefix of it, and the scorer has no
+    // way to know that — it sees a tape and scores the tape. So the stamp is
+    // applied here, where the run's own record is written, and it is applied to
+    // the verdict itself rather than to a note beside it: `inconclusive` is
+    // what a prefix score is, and it is the one value no reader mistakes for a
+    // clean result.
+    let provisional = tape_completeness(root, recording_id)
+        .provisional_reason()
+        .map(str::to_owned);
+
     let verdict_line = format!(
-        "run {} verdict pass={} ({})",
-        run.run_id, card.verdict.pass, card.verdict.reason
+        "run {} verdict pass={} ({}){}",
+        run.run_id,
+        card.verdict.pass,
+        card.verdict.reason,
+        match &provisional {
+            Some(reason) => format!(
+                " — REPORTED INCONCLUSIVE: scored against an incomplete recording ({reason})"
+            ),
+            None => String::new(),
+        }
     );
     eprintln!("lifecycle: {verdict_line}");
     ctx.log("scoring divergence (byte-exact)", &verdict_line);
-    let verdict = if card.verdict.inconclusive {
+    let verdict = if provisional.is_some() || card.verdict.inconclusive {
         "inconclusive"
     } else if card.verdict.pass {
         "pass"
     } else {
         "fail"
     };
-    ctx.result(Some(verdict), serde_json::to_value(&card).ok().as_ref());
+    // Stamp the stored scorecard payload too: the dashboard reads this value,
+    // and a verdict field alone leaves a reader to wonder which of the two
+    // kinds of inconclusive this was.
+    let mut result_value = serde_json::to_value(&card).ok();
+    if let (Some(serde_json::Value::Object(map)), Some(reason)) =
+        (result_value.as_mut(), provisional.as_ref())
+    {
+        map.insert(
+            "recording_incomplete".to_owned(),
+            serde_json::json!({
+                "recording_id": recording_id,
+                "reason": reason,
+                "effect": "this run scored a PREFIX of the recording; the verdict is inconclusive",
+            }),
+        );
+    }
+    ctx.result(Some(verdict), result_value.as_ref());
 
     // Publish the raw replay streams + computed cards through the sink. In-pod
     // these upload to S3 (durable past the ephemeral pod); compose registers
@@ -1208,6 +1424,9 @@ fn score_and_register(
         "candidate_image": run.candidate_image,
         "correlation_filter": run.spec.correlation_filter,
         "verdict": verdict,
+        // Travels with the verdict, in the one object that indexes the whole
+        // run: a reader who finds this key is looking at a prefix score.
+        "recording_incomplete": provisional,
         "artifacts": index,
     });
     let manifest_path = root
@@ -5607,6 +5826,196 @@ mod tests {
     /// cannot accidentally pass by sorting.
     fn descending_ids(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("c-{:04}", n - i)).collect()
+    }
+
+    // -- the recording-completeness gate ------------------------------------
+
+    /// Write an ingest report beside the tape, exactly where a pull puts it.
+    fn ingest_report_of(root: &HarnessRoot, recording_id: &str, completeness: serde_json::Value) {
+        let path = crate::scope::TapeSlot::ingest_report_path(root, recording_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "prefix": "s3://b/p",
+                "lines_in": 16258,
+                "events_out": 16175,
+                "correlations": 73,
+                "sealed": false,
+                "markers_dropped": 83,
+                "completeness": completeness,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_replay_against_a_still_landing_recording_is_refused() {
+        // THE defect. Run rp-sbx-1868bb92e9-…-0812064511654 scored 9/44 against
+        // a prefix of a recording that later held 87 correlations, and nothing
+        // in the verdict said so. The ingest already knew — it reported
+        // `sealed: false` with 83 markers it threw away — and nobody acted.
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        ingest_report_of(
+            &root,
+            "rec",
+            serde_json::json!({
+                "state": "still_landing",
+                "reason": "instance(s) router-h-1 emitted checkpoints but no `eof`",
+            }),
+        );
+
+        let err = admit_against_recording(&root, &StoreCtx::disabled("run-1"), "rec")
+            .expect_err("a run against a recording still being written must not be admitted");
+        assert!(err.contains("not complete"), "{err}");
+        assert!(err.contains("router-h-1"), "names the cause: {err}");
+        assert!(
+            err.contains("DEJA_ALLOW_INCOMPLETE_RECORDING"),
+            "a refusal has to say how to proceed on purpose: {err}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_opt_in_admits_the_prefix_run() {
+        // Refusing is safer but must not be a wall: a caller who KNOWS the
+        // recording is still in flight can ask for the partial read.
+        let ctx = StoreCtx::disabled("run-1");
+        admit_with_policy(
+            TapeCompleteness::Incomplete("no `eof` yet".to_owned()),
+            &ctx,
+            "rec",
+            true,
+        )
+        .expect("the opt-in admits the run");
+        admit_with_policy(
+            TapeCompleteness::Incomplete("no `eof` yet".to_owned()),
+            &ctx,
+            "rec",
+            false,
+        )
+        .expect_err("without it, the same recording is refused");
+    }
+
+    #[test]
+    fn a_prefix_run_reports_inconclusive_rather_than_a_clean_verdict() {
+        // The other half of the opt-in: admitted is not the same as believed.
+        // `provisional_reason` is what turns the verdict into `inconclusive`
+        // and stamps the run's stored result — a pass/fail here would be the
+        // original bug wearing a permission slip.
+        assert_eq!(
+            TapeCompleteness::Incomplete("no `eof` yet".to_owned()).provisional_reason(),
+            Some("no `eof` yet"),
+        );
+        assert_eq!(
+            TapeCompleteness::Complete("sealed session".to_owned()).provisional_reason(),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_complete_recording_is_admitted_without_a_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+
+        ingest_report_of(
+            &root,
+            "sealed-rec",
+            serde_json::json!({ "state": "sealed" }),
+        );
+        assert_eq!(
+            tape_completeness(&root, "sealed-rec"),
+            TapeCompleteness::Complete("sealed session".to_owned()),
+        );
+        admit_against_recording(&root, &StoreCtx::disabled("run-1"), "sealed-rec").unwrap();
+
+        ingest_report_of(
+            &root,
+            "eof-rec",
+            serde_json::json!({ "state": "eof_observed", "instances": 2 }),
+        );
+        let completeness = tape_completeness(&root, "eof-rec");
+        assert!(completeness.provisional_reason().is_none());
+        assert!(matches!(completeness, TapeCompleteness::Complete(ref how) if how.contains('2')));
+        admit_against_recording(&root, &StoreCtx::disabled("run-1"), "eof-rec").unwrap();
+    }
+
+    #[test]
+    fn a_tape_with_no_ingest_report_is_unproven_not_refused() {
+        // A tape pulled by an older build carries no completeness. That is the
+        // ABSENCE of evidence, not evidence the recording was short — refusing
+        // would strand every already-materialized tape on the box. It is said
+        // out loud and the run proceeds.
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let completeness = tape_completeness(&root, "rec");
+        assert!(matches!(completeness, TapeCompleteness::Unproven(_)));
+        assert!(
+            completeness.provisional_reason().is_none(),
+            "unproven must not masquerade as proven-incomplete"
+        );
+        admit_against_recording(&root, &StoreCtx::disabled("run-1"), "rec")
+            .expect("an unverified tape is not a refusal");
+
+        // A report from before completeness accounting lands in the same place.
+        let path = crate::scope::TapeSlot::ingest_report_path(&root, "old");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"lines_in":10,"sealed":false}"#).unwrap();
+        assert!(matches!(
+            tape_completeness(&root, "old"),
+            TapeCompleteness::Unproven(_)
+        ));
+    }
+
+    #[test]
+    fn the_gate_reads_the_completeness_the_ingest_actually_writes() {
+        // The two halves have to agree on the wire shape, or this whole gate is
+        // a producer/consumer split of its own. So the fixture here is the real
+        // `IngestReport`, serialized — not a hand-written JSON blob.
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        for (recording_id, completeness, expect_refusal) in [
+            ("sealed", crate::s3::Completeness::Sealed, false),
+            (
+                "eof",
+                crate::s3::Completeness::EofObserved { instances: 1 },
+                false,
+            ),
+            (
+                "landing",
+                crate::s3::Completeness::StillLanding {
+                    reason: "no `eof` from router-h-1".to_owned(),
+                },
+                true,
+            ),
+        ] {
+            let report = crate::s3::IngestReport {
+                prefix: "s3://b/p".into(),
+                landing_objects: 1,
+                lines_in: 1,
+                duplicates_dropped: 0,
+                events_out: 1,
+                correlations: 1,
+                sealed: false,
+                markers_dropped: 0,
+                non_envelope_dropped: 0,
+                unparseable_dropped: 0,
+                completeness,
+                delivery: crate::s3::DeliveryCertificate::default(),
+            };
+            let path = crate::scope::TapeSlot::ingest_report_path(&root, recording_id);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+
+            let admitted =
+                admit_against_recording(&root, &StoreCtx::disabled("run-1"), recording_id);
+            assert_eq!(
+                admitted.is_err(),
+                expect_refusal,
+                "recording {recording_id}: {admitted:?}"
+            );
+        }
     }
 
     #[test]
