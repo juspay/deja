@@ -675,6 +675,71 @@ fn is_unit_value(value: &serde_json::Value) -> bool {
     matches!(value, serde_json::Value::Null)
 }
 
+/// The part of a call's args that a VALUE divergence cannot change.
+///
+/// The args-free pairing exists so that a write whose operand diverged (a
+/// doubled amount) still pairs with its recorded twin instead of splitting into
+/// OmittedCall + NovelCall. Dropping args *entirely* to achieve that made the
+/// pairing pool too wide — every call through one kit function at one span
+/// shared one FIFO queue — so a call could pop a recorded event describing a
+/// completely different statement. Pairing on the statement instead of its
+/// operands keeps the recovery and removes the cross-claim.
+///
+/// A SQL boundary carries its operands in diesel's ` -- binds: [...]` tail, so
+/// the text before that tail is exactly "the statement without its values":
+/// identical for a re-keyed write, different for a different statement, and
+/// different across tables because the table name is in the statement. A
+/// boundary with no SQL falls back to the structural skeleton of its args — key
+/// paths with leaf values elided — which has the same property by construction.
+fn pairing_shape(args: &serde_json::Value) -> String {
+    // Fields deja's own args contract defines as WHAT KIND of call this is,
+    // rather than what it operates on. `key` is deliberately absent: a re-keyed
+    // write is precisely the divergence this pairing must still recover, so the
+    // key cannot be part of the identity that finds its twin.
+    const IDENTITY_FIELDS: [&str; 4] = ["operation", "table", "cache", "endpoint"];
+    let mut parts = Vec::new();
+    for field in IDENTITY_FIELDS {
+        if let Some(value) = args.get(field).and_then(serde_json::Value::as_str) {
+            parts.push(format!("{field}={value}"));
+        }
+    }
+    match args.get("sql").and_then(serde_json::Value::as_str) {
+        Some(sql) => {
+            let skeleton = match sql.rfind(" -- binds: ") {
+                Some(at) => &sql[..at],
+                None => sql,
+            };
+            parts.push(format!("sql={skeleton}"));
+        }
+        None => {
+            let mut paths = Vec::new();
+            collect_args_shape(args, String::new(), &mut paths);
+            paths.sort();
+            parts.push(paths.join(","));
+        }
+    }
+    parts.join("|")
+}
+
+/// Key paths of `value`, leaf values elided. An array contributes its length
+/// rather than its contents: the contents are operands.
+fn collect_args_shape(value: &serde_json::Value, prefix: String, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let next = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_args_shape(child, next, out);
+            }
+        }
+        serde_json::Value::Array(items) => out.push(format!("{prefix}[{}]", items.len())),
+        _ => out.push(prefix),
+    }
+}
+
 pub(crate) fn args_free_effective_values(
     recorded_result: &serde_json::Value,
     obs: &ObservedCall,
@@ -1704,16 +1769,37 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // An event with no rank-2 span address does not participate — it stays an
     // honest OmittedCall, and a span-less observed call stays a NovelCall.
     let recorded_span_paths = ledger::recorded_span_paths(&art.table);
-    type Identity = (Option<String>, String, String, String);
-    let identity_of =
-        |corr: &Option<String>, span: &str, boundary: &str, method: &str| -> Identity {
-            (
-                corr.clone(),
-                span.to_owned(),
-                boundary.to_owned(),
-                method.to_owned(),
-            )
-        };
+    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = art
+        .events
+        .iter()
+        .map(|ev| (ev.global_sequence, ev))
+        .collect();
+    // Identity carries the call's SHAPE as well as its address. Dropping args
+    // entirely made the pool too wide: every call through one kit function at
+    // one span shared a single FIFO queue, so on run-0812 a 12-column
+    // connector-response UPDATE popped a 20-column confirm UPDATE, and a
+    // `payment_attempt` event was claimed by a call whose result was a
+    // `payment_intent` row — ten fabricated value divergences. The shape is the
+    // part of the args a VALUE divergence cannot change, so GOTCHA #1's
+    // re-keyed write still pairs (see `pairing_shape`).
+    // `None` shape means "we cannot see this call's args" — a WILDCARD that
+    // still pairs the way it always did, not a claim that the call had no args.
+    // Only a KNOWN shape narrows the pool.
+    type Identity = (Option<String>, String, String, String, Option<String>);
+    let identity_of = |corr: &Option<String>,
+                       span: &str,
+                       boundary: &str,
+                       method: &str,
+                       shape: Option<&str>|
+     -> Identity {
+        (
+            corr.clone(),
+            span.to_owned(),
+            boundary.to_owned(),
+            method.to_owned(),
+            shape.map(str::to_owned),
+        )
+    };
     // (identity -> queue of (source_seq, recorded_result)); FIFO by source order.
     let mut recorded_pairing: BTreeMap<
         Identity,
@@ -1729,16 +1815,18 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         let Some(span) = recorded_span_paths.get(seq) else {
             continue;
         };
+        let shape = events_by_seq.get(seq).map(|ev| pairing_shape(&ev.args));
         recorded_pairing
-            .entry(identity_of(&exp.correlation, span, boundary, method))
+            .entry(identity_of(
+                &exp.correlation,
+                span,
+                boundary,
+                method,
+                shape.as_deref(),
+            ))
             .or_default()
             .push_back((*seq, exp.result.clone()));
     }
-    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = art
-        .events
-        .iter()
-        .map(|ev| (ev.global_sequence, ev))
-        .collect();
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
@@ -1915,22 +2003,12 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             // apart from the blocking `NovelCall` because it is a different
             // thing, not a different count of the same thing.
             stats.bump_kind("NovelCallTolerated");
-        } else if let Some((twin_seq, recorded)) = obs
-            .span_path
-            .as_deref()
-            .and_then(|span| {
-                recorded_pairing.get_mut(&identity_of(
-                    &obs.correlation_id,
-                    span,
-                    &obs.boundary,
-                    &obs.method_name,
-                ))
-            })
-            .and_then(|q| {
-                // Pop the next recorded twin for this identity, skipping any that a
-                // resolved (args-aligned) call already claimed — so a mixed run that
-                // resolves some calls normally and re-keys others never double-binds
-                // a single recorded event.
+        } else if let Some((twin_seq, recorded)) = obs.span_path.as_deref().and_then(|span| {
+            // Pop the next recorded twin for this identity, skipping any that a
+            // resolved (args-aligned) call already claimed — so a mixed run that
+            // resolves some calls normally and re-keys others never double-binds
+            // a single recorded event.
+            let take_twin = |q: &mut std::collections::VecDeque<(u64, serde_json::Value)>| {
                 while let Some((seq, _)) = q.front() {
                     if consumed.contains(seq) {
                         q.pop_front();
@@ -1939,8 +2017,24 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     }
                 }
                 None
-            })
-        {
+            };
+            // Same statement first; then the shape-unknown queue, whose
+            // events carry no args to compare and so pair as they always did.
+            let shape = pairing_shape(&obs.args);
+            for candidate in [Some(shape.as_str()), None] {
+                let key = identity_of(
+                    &obs.correlation_id,
+                    span,
+                    &obs.boundary,
+                    &obs.method_name,
+                    candidate,
+                );
+                if let Some(twin) = recorded_pairing.get_mut(&key).and_then(take_twin) {
+                    return Some(twin);
+                }
+            }
+            None
+        }) {
             // GOTCHA #1 resolution: this unresolved observed call pairs args-free
             // (correlation+boundary+method, FIFO occurrence) with a recorded twin
             // that the candidate "omitted" because its args were re-keyed. The
@@ -5490,6 +5584,53 @@ mod tests {
         assert_eq!(chain.side_effect_divergences, 0);
         assert!(chain.passed);
         assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    #[test]
+    fn pairing_shape_separates_statements_and_tables_but_not_rekeyed_operands() {
+        // A re-keyed write must keep its twin: same statement, different binds.
+        let confirm = serde_json::json!({
+            "operation": "generic_update_with_results", "table": "payment_attempt",
+            "sql": "UPDATE \"payment_attempt\" SET \"status\" = $1 WHERE \"attempt_id\" = $2 \
+                    -- binds: [Pending, \"a_1\"]"});
+        let confirm_rekeyed = serde_json::json!({
+            "operation": "generic_update_with_results", "table": "payment_attempt",
+            "sql": "UPDATE \"payment_attempt\" SET \"status\" = $1 WHERE \"attempt_id\" = $2 \
+                    -- binds: [Charged, \"a_9\"]"});
+        assert_eq!(
+            pairing_shape(&confirm),
+            pairing_shape(&confirm_rekeyed),
+            "operands live in the binds tail; a re-keyed write must still pair"
+        );
+
+        // A DIFFERENT statement at the same call site must not claim it. This is
+        // run-0812: a 10-column connector-response UPDATE popped an 18-column
+        // confirm UPDATE out of the same FIFO queue.
+        let connector_response = serde_json::json!({
+            "operation": "generic_update_with_results", "table": "payment_attempt",
+            "sql": "UPDATE \"payment_attempt\" SET \"connector_transaction_id\" = $1 \
+                    WHERE \"attempt_id\" = $2 -- binds: [TxnId(\"D4P\"), \"a_1\"]"});
+        assert_ne!(pairing_shape(&confirm), pairing_shape(&connector_response));
+
+        // And a different TABLE must not claim it, with or without SQL — the
+        // ledger showed a recorded payment_attempt row scored against an
+        // observed payment_intent row.
+        let intent = serde_json::json!({
+            "operation": "generic_update_with_results", "table": "payment_intent",
+            "sql": "UPDATE \"payment_intent\" SET \"status\" = $1 WHERE \"payment_id\" = $2 \
+                    -- binds: [Pending, \"p_1\"]"});
+        assert_ne!(pairing_shape(&confirm), pairing_shape(&intent));
+        assert_ne!(
+            pairing_shape(&serde_json::json!({"table": "payment_attempt"})),
+            pairing_shape(&serde_json::json!({"table": "payment_intent"})),
+            "table identity must survive the no-SQL fallback"
+        );
+
+        // A re-keyed cache write keeps its twin: `key` is an operand, not identity.
+        assert_eq!(
+            pairing_shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
+            pairing_shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "b"}))
+        );
     }
 
     #[test]

@@ -2972,10 +2972,19 @@ impl CrossingObservation {
 // explicitly, so their own `Location::caller()` is never consulted.
 ///
 /// Result of rebuilding a typed return value from a recorded replay payload.
+///
+/// `Failed` carries WHY. It used to be a unit variant, and the reason — the
+/// serde error and the concrete type it failed on — was discarded at the codec
+/// seam. Since an unreconstructable Substitute hit fail-stops, an operator saw
+/// only `server closed the connection without writing a response`: a codec
+/// incompatibility that looks exactly like a network fault. That anonymity cost
+/// three debugging cycles (`DirValue::Connector`'s `skip_deserializing`, twice,
+/// then `Encryptable`'s two-halves change). The reason is built only on the
+/// failure path, which is cold and terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconstructed<T> {
     Value(T),
-    Failed,
+    Failed(String),
 }
 
 /// Replay fail-stop on a Substitute-miss (the partial-function model).
@@ -2988,23 +2997,53 @@ pub enum Reconstructed<T> {
 /// shared store. So the only faithful continuation is to STOP. The blocking
 /// divergence (an unresolved `ObservedCall` → NovelCall) was already emitted by
 /// `replay_boundary` / `try_replay` before this point; this panics to unwind the
-/// one request, discarding its in-process downstream subtree by construction. Each
-/// request is an isolated test case, so the host's per-request panic isolation
-/// scopes the stop to the one correlation. Declare `replay_strategy = Execute` on
-/// the boundary to recompute the new value instead of stopping.
+/// one request, discarding its in-process downstream subtree by construction.
+/// Declare `replay_strategy = Execute` on the boundary to recompute the new value
+/// instead of stopping.
 ///
 /// The panic is type-erased: a true miss never constructs the boundary's return
 /// type `T`, so this works for any return type (no `Err` synthesis, no `Default`).
+///
+/// # The host does NOT isolate this panic for you
+///
+/// This doc comment used to claim that "each request is an isolated test case, so
+/// the host's per-request panic isolation scopes the stop to the one
+/// correlation". That was never true of actix, and believing it cost a sandbox
+/// run: there is no `catch_unwind` anywhere in actix-web 4.11 / actix-http 3.11 /
+/// actix-server 2.6, so the panic unwinds out of the connection task and the
+/// worker answers with NOTHING. The kernel then reports `server closed the
+/// connection without writing a response (0 bytes read)` — a deliberate replay
+/// stop, already diagnosed and already scored as a divergence, arriving dressed
+/// as a network fault. The host must wrap its request boundary in
+/// [`catch_fail_stop_async`] for the scope this comment once assumed.
 #[cold]
 #[inline(never)]
 pub fn fail_stop_substitute_miss(boundary: &str, method: &str) -> ! {
     panic!(
-        "deja replay fail-stop: Substitute boundary `{boundary}::{method}` missed \
+        "{FAIL_STOP_SENTINEL} Substitute boundary `{boundary}::{method}` missed \
          the recording (args diverged or novel call). No recorded value for these \
          args and re-running is unsafe; halting this request. Declare \
          `replay_strategy = Execute` to recompute instead of stopping."
     );
 }
+
+/// The stable prefix EVERY deja replay fail-stop panic message carries.
+///
+/// This is the in-band channel between a fail-stop and [`catch_fail_stop`]: the
+/// guard classifies a caught payload by this prefix and re-raises anything else,
+/// so a genuine bug panic is never laundered into a replay verdict. It is a
+/// `const` rather than three copies of a literal because the guard's correctness
+/// depends on the panic and the catcher agreeing on it — the exact
+/// producer/consumer split this repo keeps being bitten by. `fail_stop.rs`
+/// asserts the message carries it; [`catch_fail_stop`]'s own test asserts the
+/// round trip.
+///
+/// The payload stays a plain `String` deliberately. A structured payload
+/// (`panic_any(FailStop)`) would be tidier to match on, but the default panic
+/// hook renders a non-string payload as `Box<Any>` — it would delete the reason
+/// from the pod's stderr, which is the anonymity that already cost three
+/// debugging cycles (see [`Reconstructed`]).
+pub const FAIL_STOP_SENTINEL: &str = "deja replay fail-stop:";
 
 /// Replay fail-stop on a Substitute lookup hit whose recorded result cannot be reconstructed.
 ///
@@ -3015,12 +3054,15 @@ pub fn fail_stop_substitute_miss(boundary: &str, method: &str) -> ! {
 /// [`ReplayStrategy::Execute`].
 #[cold]
 #[inline(never)]
-pub fn fail_stop_substitute_unreconstructable(boundary: &str, method: &str) -> ! {
+pub fn fail_stop_substitute_unreconstructable(boundary: &str, method: &str, reason: &str) -> ! {
     panic!(
-        "deja replay fail-stop: Substitute boundary `{boundary}::{method}` hit \
+        "{FAIL_STOP_SENTINEL} Substitute boundary `{boundary}::{method}` hit \
          the recording, but the recorded result could not be reconstructed into \
-         the boundary return type. Re-running is unsafe; halting this request. \
-         Declare `replay_strategy = Execute` to recompute instead of substituting."
+         the boundary return type: {reason}. This is a capture/replay codec \
+         incompatibility, not a transport fault — the recording holds a shape \
+         this build cannot read, so re-record after any change to a captured \
+         type or its codec. Re-running is unsafe; halting this request. Declare \
+         `replay_strategy = Execute` to recompute instead of substituting."
     );
 }
 
@@ -3033,10 +3075,173 @@ pub fn fail_stop_substitute_unreconstructable(boundary: &str, method: &str) -> !
 #[inline(never)]
 pub fn fail_stop_execute_shadow_unavailable(boundary: &str, method: &str) -> ! {
     panic!(
-        "deja replay fail-stop: Execute boundary `{boundary}::{method}` could \
+        "{FAIL_STOP_SENTINEL} Execute boundary `{boundary}::{method}` could \
          not acquire an execute-shadow token before running the real boundary; \
          halting this request."
     );
+}
+
+/// A replay fail-stop caught at the request boundary by [`catch_fail_stop`] /
+/// [`catch_fail_stop_async`].
+///
+/// Carries the operator-facing message the fail-stop panicked with, so the host
+/// can put the REASON in the response it returns. That matters more than it
+/// sounds: replay pods drop their logs, so the response body is the only channel
+/// that reliably reaches the scorer and the human reading the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailStop {
+    message: String,
+}
+
+impl FailStop {
+    /// The fail-stop's full panic message, sentinel prefix included.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Consume the fail-stop for its message (response bodies take it by value).
+    pub fn into_message(self) -> String {
+        self.message
+    }
+}
+
+impl std::fmt::Display for FailStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FailStop {}
+
+/// Classify a caught panic payload: a deja fail-stop, or somebody else's panic.
+///
+/// `Err` hands the payload BACK so the caller can `resume_unwind` it unchanged.
+/// A guard that swallowed every panic would convert a genuine candidate bug into
+/// a deja verdict — the same laundering the fail-stop model exists to prevent.
+fn classify_fail_stop(
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<FailStop, Box<dyn std::any::Any + Send>> {
+    // A formatted `panic!` yields `String`; a literal one yields `&'static str`.
+    // Accept both so the classification cannot depend on how a message is built.
+    let message = payload.downcast_ref::<String>().cloned().or_else(|| {
+        payload
+            .downcast_ref::<&'static str>()
+            .map(|s| (*s).to_owned())
+    });
+    match message {
+        Some(message) if message.starts_with(FAIL_STOP_SENTINEL) => Ok(FailStop { message }),
+        _ => Err(payload),
+    }
+}
+
+/// Contain a replay fail-stop at the REQUEST boundary (sync bodies).
+///
+/// # Why this exists
+///
+/// The partial-function model fail-stops by panic-unwind precisely because a
+/// boundary's return type is an arbitrary `T`: a true miss never constructs `T`,
+/// so the panic is the only type-erased "stop" available (see
+/// [`fail_stop_substitute_miss`], and `docs/design/partial-function-replay.md`
+/// for why a synthesized `Err` or a `Default` is rejected). That reasoning is
+/// intact and unchanged — the panic still discards the request's entire
+/// in-process downstream subtree by construction, so nothing corrupt is
+/// computed, served, or written.
+///
+/// What was wrong was the SCOPE the model assumed: "the host's per-request panic
+/// isolation scopes the stop to the one correlation". actix has no such
+/// isolation — there is no `catch_unwind` anywhere in actix-web 4.11 /
+/// actix-http 3.11 / actix-server 2.6. The panic unwinds out of the connection
+/// task, the worker writes NO response, and the kernel records `server closed
+/// the connection without writing a response (0 bytes read)`. So a deliberate,
+/// well-diagnosed replay stop arrived at the scorer wearing the costume of a
+/// network fault, and its correlation scored as a transport failure instead of
+/// as the boundary divergence that was already emitted before the panic.
+/// Measured on `rp-sbx-bb148328f7-…-0812141147885`: 8 of 73 correlations, and
+/// 178 of that run's 182 omitted calls.
+///
+/// Wrapping the request in this guard converts that into a response the scorer
+/// can read. The blocking divergence (`ObservedCall` → `NovelCall`) was ALREADY
+/// emitted by `replay_boundary` / `try_replay` before the fail-stop, so the
+/// correlation keeps its real verdict and merely gains a named response instead
+/// of an anonymous hangup.
+///
+/// # What it deliberately does NOT do
+///
+/// It does not resume the request. The remaining boundaries of a fail-stopped
+/// request stay unexecuted and their calls stay omitted — that is the model's
+/// point, not a gap in this guard. Continuing past a miss would need a fabricated
+/// value, which is the rejected serve-stale/`Default` lie.
+///
+/// # Safety of the containment
+///
+/// - Only panics carrying [`FAIL_STOP_SENTINEL`] are contained; every other
+///   payload is `resume_unwind`-ed untouched, so a real candidate panic still
+///   behaves exactly as it does today.
+/// - Outside replay the guard is a PURE passthrough: no `catch_unwind` is
+///   installed at all, so record-mode and deja-off builds keep byte-identical
+///   panic behaviour. A fail-stop cannot occur outside replay anyway.
+/// - The arming predicate is [`replay_is_active`] — deliberately the SAME
+///   resolver `dispatch` consults to decide it may fail-stop, reading the same
+///   boot-installed `OnceLock`. A cheaper-looking peek could answer `Disabled`
+///   for a request whose boundaries then fail-stop, leaving the guard unarmed
+///   exactly when it is needed: the producer/consumer split that fails as a
+///   silent drop. Agreement here is structural, not coincidental.
+///
+/// # Host wiring
+///
+/// One call site, the ingress middleware's replay branch (hyperswitch:
+/// `crates/router_env/src/request_id.rs`, the `service.call(request)` arm taken
+/// when deja is active but not recording), which turns `Err(FailStop)` into a
+/// 5xx whose body is [`FailStop::message`]. Until that call site exists the
+/// fail-stop keeps escaping to actix — this crate cannot wrap a request it does
+/// not own.
+pub fn catch_fail_stop<T, F>(body: F) -> Result<T, FailStop>
+where
+    F: FnOnce() -> T,
+{
+    if !replay_is_active() {
+        return Ok(body());
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => Ok(value),
+        Err(payload) => match classify_fail_stop(payload) {
+            Ok(stop) => Err(stop),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+/// Contain a replay fail-stop at the REQUEST boundary (async bodies).
+///
+/// The async twin of [`catch_fail_stop`] — see it for the full rationale — and
+/// the one the HTTP ingress needs, since a request is a future. A panic escapes a
+/// future through `poll`, so the guard wraps each `poll` rather than the whole
+/// await: `catch_unwind` around an `.await` would not see it.
+///
+/// After a fail-stop is contained the inner future is dropped without being
+/// polled again (this returns `Ready`), which runs exactly the destructors an
+/// ordinary unwind would have run.
+pub async fn catch_fail_stop_async<Fut>(body: Fut) -> Result<Fut::Output, FailStop>
+where
+    Fut: std::future::Future,
+{
+    // Pure passthrough outside replay: no pinning dance, no `catch_unwind`, and
+    // no behaviour change for a recording or deja-off process.
+    if !replay_is_active() {
+        return Ok(body.await);
+    }
+    let mut body = std::pin::pin!(body);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Err(payload) => match classify_fail_stop(payload) {
+                Ok(stop) => std::task::Poll::Ready(Err(stop)),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        }
+    })
+    .await
 }
 
 #[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
@@ -3115,10 +3320,13 @@ where
                     ) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed => fail_stop_substitute_unreconstructable(
-                                obs.spec.boundary,
-                                obs.spec.method_name,
-                            ),
+                            Reconstructed::Failed(reason) => {
+                                fail_stop_substitute_unreconstructable(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    &reason,
+                                )
+                            }
                         },
                         None => {
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
@@ -3280,10 +3488,13 @@ where
                     ) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed => fail_stop_substitute_unreconstructable(
-                                obs.spec.boundary,
-                                obs.spec.method_name,
-                            ),
+                            Reconstructed::Failed(reason) => {
+                                fail_stop_substitute_unreconstructable(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    &reason,
+                                )
+                            }
                         },
                         None => on_miss(),
                     }
@@ -3398,10 +3609,13 @@ where
                     }) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed => fail_stop_substitute_unreconstructable(
-                                obs.spec.boundary,
-                                obs.spec.method_name,
-                            ),
+                            Reconstructed::Failed(reason) => {
+                                fail_stop_substitute_unreconstructable(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    &reason,
+                                )
+                            }
                         },
                         None => {
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
@@ -3478,10 +3692,13 @@ where
                     }) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed => fail_stop_substitute_unreconstructable(
-                                obs.spec.boundary,
-                                obs.spec.method_name,
-                            ),
+                            Reconstructed::Failed(reason) => {
+                                fail_stop_substitute_unreconstructable(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    &reason,
+                                )
+                            }
                         },
                         None => {
                             fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
@@ -4972,7 +5189,7 @@ mod tests {
             delegate_obs(&hook),
             serde_json::json!({"k": "v"}),
             || 7u64,
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
         );
         assert_eq!(out, 7);
@@ -4987,7 +5204,7 @@ mod tests {
             delegate_obs(&hook),
             serde_json::json!({"k": "v"}),
             || 42u64,
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
         );
         assert_eq!(out, 42);
@@ -5046,7 +5263,7 @@ mod tests {
                 "inputs": ["merch_ignored", "inferred_user"]
             }),
             || live_result.clone(),
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |_| {
                 RecordedOutput::new(live_result.clone(), false)
                     .with_read_set(vec![explicit_read.clone()])
@@ -5094,7 +5311,9 @@ mod tests {
             },
             |v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
-                Err(_) => Reconstructed::Failed,
+                Err(_) => {
+                    Reconstructed::Failed(String::from("test fixture: no replay representation"))
+                }
             },
             |r: &u64| (serde_json::json!(*r), false),
         );
@@ -5123,11 +5342,15 @@ mod tests {
                     if v.as_object()
                         .is_some_and(|map| map.contains_key("deja_err"))
                     {
-                        return Reconstructed::Failed;
+                        return Reconstructed::Failed(String::from(
+                            "test fixture: no replay representation",
+                        ));
                     }
                     match serde_json::from_value::<u64>(v) {
                         Ok(value) => Reconstructed::Value(value),
-                        Err(_) => Reconstructed::Failed,
+                        Err(_) => Reconstructed::Failed(String::from(
+                            "test fixture: no replay representation",
+                        )),
                     }
                 },
                 |r: &u64| (serde_json::json!(*r), false),
@@ -5162,7 +5385,7 @@ mod tests {
                     ran.set(true);
                     5u64
                 },
-                |_v| Reconstructed::Failed,
+                |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
                 |r: &u64| (serde_json::json!(*r), false),
             )
         }));
@@ -5208,7 +5431,9 @@ mod tests {
             },
             |v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
-                Err(_) => Reconstructed::Failed,
+                Err(_) => {
+                    Reconstructed::Failed(String::from("test fixture: no replay representation"))
+                }
             },
             |r: &u64| (serde_json::json!(*r), false),
         );
@@ -5250,7 +5475,7 @@ mod tests {
             delegate_obs(&record_hook),
             serde_json::json!({"key": "merchant_key_store_default"}),
             || Ok(RedisLikeValue::Null),
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             capture_redis_like,
         );
         assert_eq!(recorded_out, Ok(RedisLikeValue::Null));
@@ -5283,7 +5508,7 @@ mod tests {
             ),
             serde_json::json!({"key": "merchant_key_store_default"}),
             || Ok(RedisLikeValue::Null),
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             capture_redis_like,
         );
         assert_eq!(shadow_out, Ok(RedisLikeValue::Null));
@@ -5309,7 +5534,9 @@ mod tests {
             },
             |v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
-                Err(_) => Reconstructed::Failed,
+                Err(_) => {
+                    Reconstructed::Failed(String::from("test fixture: no replay representation"))
+                }
             },
             |r: &u64| (serde_json::json!(*r), false),
         );
@@ -5339,7 +5566,7 @@ mod tests {
             delegate_obs(&hook),
             serde_json::json!({"k": "v"}),
             || async { 21u64 },
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
         )
         .await;
@@ -5355,7 +5582,9 @@ mod tests {
             || async { 0u64 },
             |v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
-                Err(_) => Reconstructed::Failed,
+                Err(_) => {
+                    Reconstructed::Failed(String::from("test fixture: no replay representation"))
+                }
             },
             |r: &u64| (serde_json::json!(*r), false),
         )
@@ -5392,7 +5621,9 @@ mod tests {
             },
             |v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
-                Err(_) => Reconstructed::Failed,
+                Err(_) => {
+                    Reconstructed::Failed(String::from("test fixture: no replay representation"))
+                }
             },
             |r: &u64| (serde_json::json!(*r), false),
         )
@@ -5438,7 +5669,7 @@ mod tests {
                 serde_json::json!({"k": "v"})
             },
             || 55u64,
-            |_v| Reconstructed::Failed,
+            |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
         );
         assert_eq!(out, 55);
