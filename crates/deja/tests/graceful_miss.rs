@@ -73,7 +73,9 @@ async fn read_config(operation: &'static str, key: &str) -> Result<u64, String> 
         // reconstruct: rebuild the result from a recorded value (HIT path only).
         |v: serde_json::Value| match v.get("Ok").and_then(serde_json::Value::as_u64) {
             Some(n) => deja::__private::Reconstructed::Value(Ok(n)),
-            None => deja::__private::Reconstructed::Failed,
+            None => deja::__private::Reconstructed::Failed(String::from(
+                "test codec: recorded payload carried no value",
+            )),
         },
         // extract: (Value, is_error) image of a live result (record/execute path).
         |r: &Result<u64, String>| match r {

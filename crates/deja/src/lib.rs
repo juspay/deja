@@ -64,6 +64,14 @@ pub use deja_runtime::DejaCorrelationLayer;
 pub use deja_runtime::DejaHook;
 /// Re-export the execution graph tracing layer for framework logger setup.
 pub use deja_runtime::ExecutionGraphLayer;
+/// Re-export the request-boundary fail-stop guard. A `Substitute` miss stops the
+/// request by panic-unwind (the only type-erased stop available for an arbitrary
+/// return type); actix has no per-request panic isolation, so without this guard
+/// the connection closes with no response and the correlation scores as a
+/// transport fault instead of the boundary divergence it is. The host wraps its
+/// request future in [`catch_fail_stop_async`] and renders `Err(FailStop)` as a
+/// 5xx carrying [`FailStop::message`].
+pub use deja_runtime::{catch_fail_stop, catch_fail_stop_async, FailStop, FAIL_STOP_SENTINEL};
 /// Re-export semantic recording primitives so downstream crates only need
 /// one `deja` dependency.
 pub use deja_runtime::{

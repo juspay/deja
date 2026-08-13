@@ -286,7 +286,12 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                 match <#path as ::deja::codec::ReplayCodec>::reconstruct(__deja_recorded) {
                     ::std::option::Option::Some(__deja_replayed) =>
                         ::deja::__private::Reconstructed::Value(__deja_replayed),
-                    ::std::option::Option::None => ::deja::__private::Reconstructed::Failed,
+                    ::std::option::Option::None => ::deja::__private::Reconstructed::Failed(
+                        ::std::format!(
+                            "codec `{}` returned no value for `{}`",
+                            ::std::stringify!(#path), ::std::stringify!(#recon_ty)
+                        )
+                    ),
                 }
             }
         },
@@ -310,12 +315,21 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                         .as_object()
                         .is_some_and(|__deja_map| __deja_map.contains_key("deja_err"))
                     {
-                        return ::deja::__private::Reconstructed::Failed;
+                        return ::deja::__private::Reconstructed::Failed(
+                            ::std::string::String::from(
+                                "recorded payload is a captured error (`deja_err`), not an Ok value"
+                            )
+                        );
                     }
                     match ::serde_json::from_value::<#ok_ty>(__deja_recorded) {
                         ::std::result::Result::Ok(__deja_replayed) =>
                             ::deja::__private::Reconstructed::Value(::std::result::Result::Ok(__deja_replayed)),
-                        ::std::result::Result::Err(_) => ::deja::__private::Reconstructed::Failed,
+                        ::std::result::Result::Err(__deja_err) => ::deja::__private::Reconstructed::Failed(
+                            ::std::format!(
+                                "cannot deserialize the recorded value into `{}`: {}",
+                                ::std::stringify!(#ok_ty), __deja_err
+                            )
+                        ),
                     }
                 }
             }
@@ -325,13 +339,24 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                 match ::serde_json::from_value::<#recon_ty>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja::__private::Reconstructed::Value(__deja_replayed),
-                    ::std::result::Result::Err(_) => ::deja::__private::Reconstructed::Failed,
+                    ::std::result::Result::Err(__deja_err) => ::deja::__private::Reconstructed::Failed(
+                        ::std::format!(
+                            "cannot deserialize the recorded value into `{}`: {}",
+                            ::std::stringify!(#recon_ty), __deja_err
+                        )
+                    ),
                 }
             }
         },
         CaptureMode::Debug => quote! {
             |_: ::serde_json::Value| -> ::deja::__private::Reconstructed<#recon_ty> {
-                ::deja::__private::Reconstructed::Failed
+                ::deja::__private::Reconstructed::Failed(
+                    ::std::format!(
+                        "`{}` is captured for the record side only (Debug codec); it has no \
+                         replay representation, so a Substitute hit cannot be rebuilt",
+                        ::std::stringify!(#recon_ty)
+                    )
+                )
             }
         },
     };

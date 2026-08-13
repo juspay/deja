@@ -51,8 +51,31 @@ continuation never corrupts," and serve-stale corrupts three ways:
 Fail-stop (panic-unwind at the seam) discards the entire in-process downstream
 subtree **by construction** — descendants never execute, so nothing corrupt is
 computed, served, or written. That is exact transitive "subtree compromised" with
-zero graph-marking machinery, scoped to the one correlation (each request is an
-isolated test case).
+zero graph-marking machinery.
+
+### The scope is not free — the host must contain the unwind
+
+This section originally ended "…scoped to the one correlation (each request is an
+isolated test case)", treating per-request isolation as a property the host
+provides. **It is not.** There is no `catch_unwind` anywhere in actix-web 4.11 /
+actix-http 3.11 / actix-server 2.6: the panic unwinds out of the connection task
+and the worker writes no response at all. The kernel sees `server closed the
+connection without writing a response (0 bytes read)` and scores the correlation
+as a transport fault, so the divergence that was already emitted *before* the
+panic is buried, and every remaining call of that request is reported as an
+anonymous omission. Measured on `rp-sbx-bb148328f7-…-0812141147885`: 8 of 73
+correlations, and 178 of the run's 182 omitted calls.
+
+The containment is therefore explicit — `deja::catch_fail_stop_async` wraps the
+host's request future, classifies a caught payload by `deja::FAIL_STOP_SENTINEL`,
+re-raises everything else untouched, and hands the host a `FailStop` whose message
+becomes the 5xx body. Two properties are deliberate: the guard is inert outside
+replay (a fail-stop is replay-only, so record-mode and deja-off traffic keep
+byte-identical panic semantics), and it does **not** resume the request. The
+stopped request's remaining boundaries stay unexecuted — that is this model's
+point, and continuing past a miss would need exactly the fabricated value
+rejected above. What the guard buys is a correlation that scores as the boundary
+divergence it is, instead of as a hangup.
 
 ### Why no third mode (Skip/Noop)
 

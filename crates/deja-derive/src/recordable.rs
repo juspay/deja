@@ -380,14 +380,25 @@ fn generate_async_method(
                 match ::serde_json::from_value::<#return_type>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja_runtime::Reconstructed::Value(__deja_replayed),
-                    ::std::result::Result::Err(_) => ::deja_runtime::Reconstructed::Failed,
+                    ::std::result::Result::Err(__deja_err) => ::deja_runtime::Reconstructed::Failed(
+                        ::std::format!(
+                            "cannot deserialize the recorded value into `{}`: {}",
+                            ::std::stringify!(#return_type), __deja_err
+                        )
+                    ),
                 }
             }
         }
     } else {
         quote! {
             |_: ::serde_json::Value| -> ::deja_runtime::Reconstructed<#return_type> {
-                ::deja_runtime::Reconstructed::Failed
+                ::deja_runtime::Reconstructed::Failed(
+                    ::std::format!(
+                        "`{}` is captured for the record side only; it has no replay \
+                         representation, so a Substitute hit cannot be rebuilt",
+                        ::std::stringify!(#return_type)
+                    )
+                )
             }
         }
     };
@@ -546,7 +557,12 @@ fn generate_sync_method(
                 match ::serde_json::from_value::<#return_type_for_replay>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja_runtime::Reconstructed::Value(__deja_replayed),
-                    ::std::result::Result::Err(_) => ::deja_runtime::Reconstructed::Failed,
+                    ::std::result::Result::Err(__deja_err) => ::deja_runtime::Reconstructed::Failed(
+                        ::std::format!(
+                            "cannot deserialize the recorded value into `{}`: {}",
+                            ::std::stringify!(#return_type_for_replay), __deja_err
+                        )
+                    ),
                 }
             }
         }
@@ -554,7 +570,13 @@ fn generate_sync_method(
         let return_type_for_replay = output_type_tokens(return_type);
         quote! {
             |_: ::serde_json::Value| -> ::deja_runtime::Reconstructed<#return_type_for_replay> {
-                ::deja_runtime::Reconstructed::Failed
+                ::deja_runtime::Reconstructed::Failed(
+                    ::std::format!(
+                        "`{}` is captured for the record side only; it has no replay \
+                         representation, so a Substitute hit cannot be rebuilt",
+                        ::std::stringify!(#return_type_for_replay)
+                    )
+                )
             }
         }
     };
