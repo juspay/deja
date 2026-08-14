@@ -127,6 +127,14 @@ const POSITIONAL_FALLBACK_RANK: u8 = 6;
 
 const UNDECLARED_CONCURRENCY_WARNING: &str = "undeclared_concurrency";
 
+/// A declared `project` reply canon that resolved to nothing on both the
+/// recorded and the candidate body. The canon cannot absorb anything in that
+/// state (see [`Projection::agrees_with`]); this names the declaration so a
+/// broken one is visible rather than merely inert. It is a fact about the
+/// declaration, not about the candidate, so it is counted without being charged
+/// as a divergence.
+const INAPPLICABLE_REPLY_CANON_WARNING: &str = "inapplicable_reply_canon";
+
 // ---------------------------------------------------------------------------
 // Scorecard data model (`replay-scorecard/v1`)
 // ---------------------------------------------------------------------------
@@ -1187,10 +1195,8 @@ impl Canon for CanonPreset {
                         (Some("KeyDeleted"), Some("KeyNotDeleted"))
                     )
             }
-            Self::Project { include, exclude } => {
-                project_canon(recorded, include, exclude)
-                    == project_canon(observed, include, exclude)
-            }
+            Self::Project { include, exclude } => project_canon(recorded, include, exclude)
+                .agrees_with(&project_canon(observed, include, exclude)),
         }
     }
 }
@@ -1231,15 +1237,12 @@ fn declared_value_equivalent(
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
 ) -> bool {
-    if let CanonPreset::Project { include, .. } = canon {
-        if !include.is_empty()
-            && !include.iter().any(|field| {
-                json_path_get(recorded, field).is_some() || json_path_get(observed, field).is_some()
-            })
-        {
-            return false;
-        }
-    }
+    // A `project` canon whose paths resolve on neither side used to be caught
+    // here, by a guard local to this one call site. It is now a property of the
+    // projection itself ([`Projection::agrees_with`]), so every consumer of a
+    // `project` canon gets it — including the HTTP body diff, which had the same
+    // hole and no such guard.
+    //
     // `absent_after` is still surfaced as the existing idempotent-delete warning:
     // it is a non-blocking classification, not a silent value-match absorber.
     !matches!(canon, CanonPreset::AbsentAfter) && canon.equivalent(recorded, observed)
@@ -1559,23 +1562,71 @@ fn final_state_canon(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn project_canon(
-    value: &serde_json::Value,
-    include: &[String],
-    exclude: &[String],
-) -> serde_json::Value {
+/// One side of a `project` canon comparison: the projected value, together with
+/// whether the projection retained anything of the value it came from.
+///
+/// The two facts have to travel together, because the projected value alone
+/// cannot tell them apart. A projection that resolved no path at all and a
+/// projection whose resolved path happens to hold `{}` are both `{}`, and only
+/// the first means the canon had nothing to compare — the declaration named
+/// fields this value does not carry. Two such projections compare equal, and
+/// reading that as agreement absorbs *every* difference between the two values,
+/// including the ones the declaration's author most wanted compared.
+#[derive(Debug, Clone)]
+struct Projection {
+    value: serde_json::Value,
+    /// Whether the include/exclude lists left anything of the original value.
+    matched: bool,
+}
+
+impl Projection {
+    /// Whether two projections agree — which requires that the canon actually
+    /// applied to at least one of the two values. An inapplicable canon is
+    /// evidence that the declaration is wrong, never evidence that the values
+    /// are the same.
+    fn agrees_with(&self, other: &Self) -> bool {
+        (self.matched || other.matched) && self.value == other.value
+    }
+}
+
+fn project_canon(value: &serde_json::Value, include: &[String], exclude: &[String]) -> Projection {
     if !include.is_empty() {
-        return serde_json::Value::Object(
-            include
-                .iter()
-                .filter_map(|field| json_path_get(value, field).map(|v| (field.clone(), v.clone())))
-                .collect(),
-        );
+        // A non-empty include list is a declaration that only these paths
+        // matter. It applies when at least one of them resolves; a path that
+        // resolves to an empty value still counts, because the comparison did
+        // happen.
+        let projected: serde_json::Map<String, serde_json::Value> = include
+            .iter()
+            .filter_map(|field| json_path_get(value, field).map(|v| (field.clone(), v.clone())))
+            .collect();
+        return Projection {
+            matched: !projected.is_empty(),
+            value: serde_json::Value::Object(projected),
+        };
     }
     if exclude.is_empty() {
-        return value.clone();
+        // Neither list: `project` degenerates to identity, which always applies.
+        return Projection {
+            value: value.clone(),
+            matched: true,
+        };
     }
-    project_exclude_canon(value, exclude, "")
+    let projected = project_exclude_canon(value, exclude, "");
+    Projection {
+        matched: !projection_kept_nothing(&projected),
+        value: projected,
+    }
+}
+
+/// Whether an exclude list stripped a value down to nothing, leaving the
+/// comparison no field to act on.
+fn projection_kept_nothing(projected: &serde_json::Value) -> bool {
+    match projected {
+        serde_json::Value::Object(map) => map.is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        // A scalar survives any exclude list intact, so the canon applied to it.
+        _ => false,
+    }
 }
 
 fn project_exclude_canon(
@@ -2210,6 +2261,15 @@ fn http_incoming_events_by_correlation(
         .collect()
 }
 
+/// Whether the recorded response's declared reply canon says this body
+/// difference does not matter.
+///
+/// Two ways it can. Either the canon projects both bodies to the same value —
+/// a non-empty include list is a declaration that only those paths matter, so a
+/// difference outside them is absorbed by design — or the difference sits on a
+/// path the exclude list names. Neither can fire on a projection that resolved
+/// nothing on both sides: `Projection::agrees_with` refuses that comparison, so
+/// an inapplicable canon leaves every difference blocking.
 fn http_diff_absorbed_by_reply_canon(
     diff: &HttpDiff,
     recorded_http: Option<&deja::BoundaryEvent>,
@@ -2221,12 +2281,41 @@ fn http_diff_absorbed_by_reply_canon(
     };
     if let (Some(baseline), Some(candidate)) = (&diff.baseline_body, &diff.candidate_body) {
         if project_canon(baseline, &include, &exclude)
-            == project_canon(candidate, &include, &exclude)
+            .agrees_with(&project_canon(candidate, &include, &exclude))
         {
             return true;
         }
     }
     http_project_excludes_json_diff_path(&exclude, &body.json_path)
+}
+
+/// The id of a declared `project` reply canon that resolved to nothing on both
+/// bodies of this response pair, if that is what happened.
+///
+/// Absorption already refuses to act on such a canon, so nothing is hidden.
+/// What is left is to say so: a declaration naming paths that no body it governs
+/// carries is a defect in the declaration, and staying quiet about it is how it
+/// would remain one.
+fn http_reply_canon_inapplicable(
+    diff: &HttpDiff,
+    recorded_http: Option<&deja::BoundaryEvent>,
+) -> Option<String> {
+    let recorded_http = recorded_http?;
+    let canon_id = recorded_http
+        .declaration
+        .as_ref()?
+        .reply_canon
+        .as_ref()?
+        .id
+        .clone();
+    let CanonPreset::Project { include, exclude } = event_reply_canon(recorded_http)? else {
+        return None;
+    };
+    let baseline = diff.baseline_body.as_ref()?;
+    let candidate = diff.candidate_body.as_ref()?;
+    (!project_canon(baseline, &include, &exclude).matched
+        && !project_canon(candidate, &include, &exclude).matched)
+        .then_some(canon_id)
 }
 
 fn blocking_http_body_diff_count(
@@ -2870,16 +2959,29 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     let mut http_status_mismatches = 0u64;
     let mut http_body_mismatches = 0u64;
     let mut corr_http: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    // Declarations, not responses: one broken reply canon governing forty
+    // responses is one fact about the declaration, and it is the fact that says
+    // where to look. Keyed by canon id, counting the responses it governed
+    // vacuously.
+    let mut inapplicable_reply_canons: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
-            let blocking_body_diffs = blocking_http_body_diff_count(
-                diff,
-                http_incoming_by_correlation
-                    .get(&diff.correlation_id)
-                    .copied(),
-                &inconclusive_race,
-            );
+            let recorded_http = http_incoming_by_correlation
+                .get(&diff.correlation_id)
+                .copied();
+            if let Some(canon) = http_reply_canon_inapplicable(diff, recorded_http) {
+                // Counted in `kinds` without touching `diverged`, the way
+                // `undeclared_concurrency` is: the candidate did not cause this,
+                // so it must be visible without being charged to it.
+                *stats
+                    .kinds
+                    .entry(INAPPLICABLE_REPLY_CANON_WARNING.to_owned())
+                    .or_insert(0) += 1;
+                *inapplicable_reply_canons.entry(canon).or_insert(0) += 1;
+            }
+            let blocking_body_diffs =
+                blocking_http_body_diff_count(diff, recorded_http, &inconclusive_race);
             if diff.status_match && blocking_body_diffs == 0 {
                 stats.matched += 1;
             }
@@ -3046,6 +3148,19 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
              the correlation having created the row with that column left to the schema. \
              Correlation stands in for the row here because the payment tables record no typed \
              row keys; a write to the same row from another correlation would not be seen"
+        ));
+    }
+    // A declaration that governs nothing is reported as the defect it is. The
+    // bodies were still compared in full — an inapplicable canon absorbs
+    // nothing — so this costs no coverage; what it costs is a declaration
+    // someone believed was in force.
+    for (canon, responses) in &inapplicable_reply_canons {
+        warnings.push(format!(
+            "{INAPPLICABLE_REPLY_CANON_WARNING}: {responses} response(s) declare the reply canon \
+             {canon}, which resolves to nothing on either the recorded or the candidate body. It \
+             cannot say the two agree, so every body difference on those responses stays \
+             blocking; the declaration names fields these bodies do not carry and is itself what \
+             needs fixing"
         ));
     }
     // An empty class has two causes and they need opposite fixes; say which.
@@ -4457,6 +4572,216 @@ mod tests {
             card.verdict.reason.contains("http body mismatch"),
             "{}",
             card.verdict.reason
+        );
+    }
+
+    /// One response pair carrying the given reply canon and one body difference
+    /// on `json_path`, scored. The shape every reply-canon absorption test needs.
+    fn http_reply_canon_card(
+        corr: &str,
+        seq: u64,
+        canon: &str,
+        json_path: &str,
+        baseline_body: serde_json::Value,
+        candidate_body: serde_json::Value,
+    ) -> Scorecard {
+        let leaf = json_path.trim_start_matches("$.");
+        let baseline_leaf = baseline_body.get(leaf).cloned().unwrap_or_default();
+        let candidate_leaf = candidate_body.get(leaf).cloned().unwrap_or_default();
+        detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                vec![JsonFieldDiff {
+                    json_path: json_path.to_owned(),
+                    baseline: baseline_leaf,
+                    candidate: candidate_leaf,
+                }],
+                baseline_body.clone(),
+                candidate_body,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                seq,
+                Some(canon),
+                baseline_body,
+            )],
+        ))
+    }
+
+    /// The absorber's failure mode: an include list naming paths that neither
+    /// body carries projects both sides to `{}`, and two empty projections used
+    /// to compare equal — which absorbed every difference between the bodies,
+    /// including a payment's terminal status.
+    #[test]
+    fn http_reply_canon_include_matching_neither_body_absorbs_nothing() {
+        let card = http_reply_canon_card(
+            "vacuous-http-reply-canon",
+            503,
+            "project:settlement.state,settlement.reference",
+            "$.status",
+            serde_json::json!({"id": "resp_1", "status": "succeeded", "amount": 100}),
+            serde_json::json!({"id": "resp_1", "status": "failed", "amount": 100}),
+        );
+
+        assert_eq!(
+            card.summary.http_body_mismatches, 1,
+            "an empty projection is evidence the canon did not apply, never evidence \
+             that the bodies agree"
+        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert_eq!(
+            kind_count(&card, "http_incoming", INAPPLICABLE_REPLY_CANON_WARNING),
+            1,
+            "the declaration that governs nothing is counted, not silently ignored"
+        );
+        assert!(
+            card.warnings.iter().any(|warning| warning
+                .starts_with(INAPPLICABLE_REPLY_CANON_WARNING)
+                && warning.contains("project:settlement.state,settlement.reference")),
+            "the warning must name the declaration to fix: {:?}",
+            card.warnings
+        );
+    }
+
+    /// The other half of the same rule: a non-empty include list is a
+    /// declaration that only those paths matter, so a difference outside it is
+    /// absorbed by design. Refusing empty projections must not cost this.
+    #[test]
+    fn http_reply_canon_include_absorbs_a_difference_outside_the_declared_paths() {
+        let card = http_reply_canon_card(
+            "http-reply-canon-outside-include",
+            504,
+            "project:id,status",
+            "$.created",
+            serde_json::json!({"id": "resp_1", "status": "succeeded", "created": "10:00:00"}),
+            serde_json::json!({"id": "resp_1", "status": "succeeded", "created": "10:00:01"}),
+        );
+
+        assert_eq!(
+            card.summary.http_body_mismatches, 0,
+            "the include list resolves on both bodies and agrees; a difference outside \
+             it is what the declaration asked to ignore"
+        );
+        assert_eq!(
+            kind_count(&card, "http_incoming", INAPPLICABLE_REPLY_CANON_WARNING),
+            0,
+            "a canon that applied is not an inapplicable canon"
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// An include list that resolves still guards the paths it names.
+    #[test]
+    fn http_reply_canon_include_present_in_both_bodies_absorbs_only_when_it_agrees() {
+        let agreeing = http_reply_canon_card(
+            "http-reply-canon-include-agrees",
+            505,
+            "project:id",
+            "$.amount",
+            serde_json::json!({"id": "resp_1", "amount": 100}),
+            serde_json::json!({"id": "resp_1", "amount": 101}),
+        );
+        assert_eq!(
+            agreeing.summary.http_body_mismatches, 0,
+            "the declared path is present in both bodies and equal"
+        );
+        assert!(agreeing.verdict.pass, "{}", agreeing.verdict.reason);
+
+        let disagreeing = http_reply_canon_card(
+            "http-reply-canon-include-disagrees",
+            506,
+            "project:id",
+            "$.id",
+            serde_json::json!({"id": "resp_1", "amount": 100}),
+            serde_json::json!({"id": "resp_2", "amount": 100}),
+        );
+        assert_eq!(
+            disagreeing.summary.http_body_mismatches, 1,
+            "a project canon must not hide a change to a path it declared"
+        );
+        assert_eq!(
+            kind_count(
+                &disagreeing,
+                "http_incoming",
+                INAPPLICABLE_REPLY_CANON_WARNING
+            ),
+            0,
+            "the canon applied and disagreed; the declaration is fine, the bodies are not"
+        );
+        assert!(!disagreeing.verdict.pass);
+    }
+
+    /// Exclude semantics, including the case where the exclude list strips the
+    /// whole body: the difference is absorbed because it sits on an excluded
+    /// path, never because two stripped bodies both projected to `{}`.
+    #[test]
+    fn http_reply_canon_exclude_absorbs_the_path_it_names() {
+        let partial = http_reply_canon_card(
+            "http-reply-canon-exclude",
+            507,
+            "project:!trace_id",
+            "$.trace_id",
+            serde_json::json!({"id": "resp_1", "trace_id": "trace-a"}),
+            serde_json::json!({"id": "resp_1", "trace_id": "trace-b"}),
+        );
+        assert_eq!(
+            partial.summary.http_body_mismatches, 0,
+            "a difference on an excluded path is what the declaration asked to ignore"
+        );
+        assert!(partial.verdict.pass, "{}", partial.verdict.reason);
+
+        let whole_body = http_reply_canon_card(
+            "http-reply-canon-exclude-everything",
+            508,
+            "project:!trace_id",
+            "$.trace_id",
+            serde_json::json!({"trace_id": "trace-a"}),
+            serde_json::json!({"trace_id": "trace-b"}),
+        );
+        assert_eq!(
+            whole_body.summary.http_body_mismatches, 0,
+            "the excluded path still absorbs when it is the body's only field"
+        );
+        assert!(whole_body.verdict.pass, "{}", whole_body.verdict.reason);
+    }
+
+    /// The same rule at the value level, where a `project` canon governs a
+    /// recorded result rather than an HTTP body.
+    #[test]
+    fn project_canon_with_no_resolving_path_is_not_a_value_match() {
+        let canon = resolve_canon(Some(&deja::CanonRef::new("project:settlement.state")))
+            .expect("project preset resolves");
+        assert!(
+            !canon.equivalent(
+                &serde_json::json!({"status": "charged"}),
+                &serde_json::json!({"status": "failed"})
+            ),
+            "neither value carries the declared path, so the canon has nothing to say"
+        );
+        assert!(
+            !canon.equivalent(&serde_json::json!("charged"), &serde_json::json!("failed")),
+            "a non-object projects to nothing under an include list, which is not agreement"
+        );
+
+        let resolving = resolve_canon(Some(&deja::CanonRef::new("project:status")))
+            .expect("project preset resolves");
+        assert!(
+            resolving.equivalent(
+                &serde_json::json!({"status": "charged", "updated_at": 1}),
+                &serde_json::json!({"status": "charged", "updated_at": 2})
+            ),
+            "a resolving include list still absorbs differences outside itself"
+        );
+        assert!(
+            resolving.equivalent(
+                &serde_json::json!({"status": {}}),
+                &serde_json::json!({"status": {}, "updated_at": 2})
+            ),
+            "a declared path whose value is empty MATCHED; only a path that resolves \
+             nowhere is inapplicability"
         );
     }
 
