@@ -59,17 +59,10 @@ pub struct IngestReport {
     pub markers_dropped: usize,
     pub non_envelope_dropped: usize,
     pub unparseable_dropped: usize,
-    /// Whether the recording had stopped growing when this pull read it.
+    /// Which correlations this recording holds WHOLE, which it does not, and
+    /// why — plus the sink's own account of what it dropped.
     ///
-    /// A replay is scored against the tape it was handed. Reading a recording
-    /// that is still landing scores a PREFIX of it, and the verdict looks
-    /// exactly like a complete one — run
-    /// `rp-sbx-1868bb92e9-1868bb9-08120623-rk-0812064511654` scored 9/44 on a
-    /// recording that later reported 87 correlations. This is the fact that
-    /// says which happened; acting on it is the lifecycle's job.
-    pub completeness: Completeness,
-    /// What the sink's own markers, plus the event stream's per-correlation
-    /// ordering, establish about delivery.
+    /// This is the fact a replay acts on; acting on it is the lifecycle's job.
     pub delivery: DeliveryCertificate,
 }
 
@@ -112,6 +105,20 @@ impl IngestReport {
             }
         )
     }
+
+    /// Print everything this ingest established, exclusions BY NAME.
+    ///
+    /// Both pull paths call this, so a reader of either gets the same account.
+    /// The exclusion list is printed rather than summarized because "6
+    /// correlations excluded" without ids is the shape of a silent drop wearing
+    /// a counter.
+    pub fn report(&self) {
+        eprintln!("{}", self.accounting());
+        eprintln!("{}", self.delivery.describe());
+        for line in self.delivery.describe_exclusions() {
+            eprintln!("ingest: EXCLUDED {line}");
+        }
+    }
 }
 
 /// Why a line did not become an event. Returned alongside the events so the
@@ -126,58 +133,75 @@ pub struct DropCounts {
 
 // -- delivery accounting -----------------------------------------------------
 
-/// Whether more of this recording could still arrive.
+/// The unit of completeness is the CORRELATION, not the recording.
 ///
-/// `sealed` alone cannot answer this. A replay holds `s3:PutObject` on
-/// `replay-runs/*` and nothing else, so it may not seal what it reads: every
-/// prefix-scan pull reports `sealed: false`, including pulls of recordings that
-/// finished hours ago. Gating on it would refuse the normal path.
+/// An earlier gate here asked whether the whole recording had stopped growing
+/// and refused the run when it could not tell. That is the wrong unit. A
+/// recording still being written is not a problem: the next pull simply holds
+/// more correlations, and both pulls are equally valid. The hazard is a
+/// correlation whose event stream was cut mid-flight — a request whose db
+/// writes landed and whose response did not, scored as though it were whole.
+/// Run `rp-sbx-1868bb92e9-1868bb9-08120623-rk-0812064511654` scored 9/44
+/// against a recording that later held 87 correlations, and what made that
+/// verdict a lie was not the recording's size but that the correlations it did
+/// hold were half-there.
 ///
-/// The recorder answers it instead. The writer's `eof` marker is emitted on
-/// shutdown after a real producer drain — "everything before this landed" — so
-/// a recording that has stopped growing has one per producer instance, and a
-/// recording still being written has none. The record lifecycle stops the
-/// router before it waits for the landing precisely so the `eof` is in the
-/// prefix before anything reads it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum Completeness {
-    /// A compaction job promoted this into a sealed session. The seal is
-    /// terminal, and it is taken on trust here for the same reason the manifest
-    /// is: the compactor is the component allowed to make it.
-    Sealed,
-    /// Not sealed, but every producer instance that spoke also said goodbye.
-    EofObserved { instances: usize },
-    /// Nothing here proves the recording stopped growing. Scoring a replay
-    /// against it scores a prefix.
-    StillLanding { reason: String },
+/// (The old gate could not have worked either. It required the writer's `eof`
+/// marker, which is emitted from `impl Drop for AsyncRecordWriter` — and the
+/// recorder is installed as a process-global runtime hook, Rust runs no
+/// destructor for a value in a static, and a pod termination is a signal rather
+/// than an unwind. No deployed router emits one.)
+///
+/// So a correlation is ADMISSIBLE when both of these hold, and is excluded by
+/// name and counted when either does not:
+///
+/// 1. its `request_sequence` run is dense from zero, and
+/// 2. it carries its `http_incoming` event.
+///
+/// Test 2 is a Tier-1 INFERENCE, and worth being precise about what it infers.
+/// The `http_incoming` event is one event carrying both the request and the
+/// response, and `EventBuilder::start` allocates its sequence numbers on
+/// boundary ENTRY while the event itself is written on EXIT. So it holds the
+/// LOWEST `request_sequence` of its correlation (0) and is written LAST in
+/// wall-clock time — which is exactly why its absence means the request→
+/// response path did not finish landing. A producer-side `correlation_close`
+/// marker would turn this inference into an assertion; it is a vendor change
+/// and rides the next router build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionTest {
+    /// The `request_sequence` run is dense from zero. `request_sequence` is a
+    /// dense per-correlation counter allocated in `next_request_sequence`, and
+    /// a sampled-out or sink-down boundary no-ops BEFORE any sequence is
+    /// allocated, so a hole is loss.
+    DenseSequence,
+    /// The correlation carries its `http_incoming` event — the request→response
+    /// path completed and reached the tape.
+    TerminalResponse,
 }
 
-impl Completeness {
-    /// Whether the recording can be shown to have stopped growing.
-    pub fn is_complete(&self) -> bool {
-        !matches!(self, Completeness::StillLanding { .. })
-    }
-
-    /// Why not, when not.
-    pub fn incomplete_reason(&self) -> Option<&str> {
+impl AdmissionTest {
+    fn describe(self) -> &'static str {
         match self {
-            Completeness::StillLanding { reason } => Some(reason),
-            _ => None,
+            AdmissionTest::DenseSequence => "request_sequence run is not dense from zero",
+            AdmissionTest::TerminalResponse => "no `http_incoming` event",
         }
     }
+}
 
-    /// One line naming the state and how it was established.
-    pub fn describe(&self) -> String {
-        match self {
-            Completeness::Sealed => "sealed session — the recording is final".to_owned(),
-            Completeness::EofObserved { instances } => format!(
-                "complete — {instances} producer instance(s) emitted their `eof` marker, so \
-                 nothing more is coming"
-            ),
-            Completeness::StillLanding { reason } => format!("INCOMPLETE — {reason}"),
-        }
-    }
+/// A correlation this recording cannot be shown to hold whole, and why.
+///
+/// Named and counted, never silently dropped: a run whose denominator quietly
+/// shrank is the exact class of lie this accounting exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CorrelationExclusion {
+    pub correlation_id: String,
+    /// EVERY test it failed, not just the first. The two failures have
+    /// different causes and a correlation can carry both.
+    pub failed: Vec<AdmissionTest>,
+    /// One line a human reads, carrying the specifics (which sequences are
+    /// missing, whether the producer admits the loss).
+    pub detail: String,
 }
 
 /// What delivery can be established for this recording.
@@ -212,13 +236,36 @@ pub struct DeliveryCertificate {
     pub correlations_checked: usize,
     /// Correlations whose run had a hole, and which sequence numbers are gone.
     pub gaps: Vec<DeliveryGap>,
+    /// How many of the checked correlations passed BOTH admission tests. The
+    /// count rather than the ids: a session holds tens of thousands of them and
+    /// the ids are already on the tape, in tape order, behind
+    /// `TapeSlot::correlations_in_tape_order`. The exclusions are the short
+    /// list, and they are the one a reader needs by name.
+    pub correlations_admitted: usize,
+    /// Every correlation that failed, by id and reason.
+    pub correlations_excluded: Vec<CorrelationExclusion>,
 }
 
 impl DeliveryCertificate {
     /// Whether every checked correlation's `request_sequence` run is contiguous
-    /// from zero — the property the certificate exists to assert.
+    /// from zero — one half of admission, and the half the markers can speak to.
     pub fn continuous(&self) -> bool {
         self.gaps.is_empty()
+    }
+
+    /// Every checked correlation became an admission or a named exclusion, and
+    /// nothing else. Accounting that must balance, asserted rather than logged:
+    /// a false here means a correlation left the check without a verdict.
+    pub fn balances(&self) -> bool {
+        self.correlations_admitted + self.correlations_excluded.len() == self.correlations_checked
+    }
+
+    /// Whether this correlation can be replayed as a whole request.
+    pub fn admits(&self, correlation_id: &str) -> bool {
+        !self
+            .correlations_excluded
+            .iter()
+            .any(|e| e.correlation_id == correlation_id)
     }
 
     /// One line naming what the markers and the event stream established.
@@ -231,17 +278,39 @@ impl DeliveryCertificate {
         let unexplained = self.gaps.len() - admitted;
         format!(
             "delivery: {} marker(s) consumed ({} checkpoint(s), {} instance(s), {} unreadable); \
-             {} correlation(s) checked for request_sequence continuity, {} gap(s) ({} admitted by \
-             a `dropped` marker, {} unexplained)",
+             {} correlation(s) checked, {} admissible, {} excluded; {} gap(s) ({} admitted by \
+             a `dropped` marker, {} unexplained){}",
             self.markers_seen,
             self.checkpoints,
             self.instances.len(),
             self.markers_unreadable,
             self.correlations_checked,
+            self.correlations_admitted,
+            self.correlations_excluded.len(),
             self.gaps.len(),
             admitted,
             unexplained,
+            if self.balances() {
+                String::new()
+            } else {
+                format!(
+                    " — UNACCOUNTED: {} correlation(s) were checked and neither admitted nor \
+                     excluded",
+                    self.correlations_checked as i64
+                        - (self.correlations_admitted + self.correlations_excluded.len()) as i64
+                )
+            },
         )
+    }
+
+    /// The excluded correlations, by id and reason, one per line. Empty when
+    /// nothing was excluded — the caller decides whether silence is worth
+    /// printing.
+    pub fn describe_exclusions(&self) -> Vec<String> {
+        self.correlations_excluded
+            .iter()
+            .map(|e| format!("{}: {}", e.correlation_id, e.detail))
+            .collect()
     }
 }
 
@@ -323,38 +392,6 @@ impl MarkerLedger {
         }
     }
 
-    /// What the markers say about the recording having stopped growing.
-    fn completeness(&self) -> Completeness {
-        if self.by_instance.is_empty() {
-            return Completeness::StillLanding {
-                reason: format!(
-                    "no readable sink marker under this prefix ({} marker line(s), {} unreadable) \
-                     — the recorder's `eof` stamp is what says a recording stopped growing, and \
-                     none arrived",
-                    self.seen, self.unreadable
-                ),
-            };
-        }
-        let silent: Vec<&str> = self
-            .by_instance
-            .values()
-            .filter(|i| !i.eof)
-            .map(|i| i.instance_id.as_str())
-            .collect();
-        if silent.is_empty() {
-            return Completeness::EofObserved {
-                instances: self.by_instance.len(),
-            };
-        }
-        Completeness::StillLanding {
-            reason: format!(
-                "instance(s) {} emitted checkpoints but no `eof` — that writer has not shut down \
-                 and drained, so this prefix is a snapshot of a recording still being written",
-                silent.join(", ")
-            ),
-        }
-    }
-
     fn into_instances(self) -> Vec<InstanceDelivery> {
         self.by_instance.into_values().collect()
     }
@@ -368,9 +405,16 @@ fn fold_totals(entry: &mut InstanceDelivery, body: &MarkerBody) {
     entry.records_dropped = entry.records_dropped.max(body.records_dropped);
 }
 
-/// Build the certificate: continuity from the events, cause from the markers.
+/// Build the certificate: admission from the events, cause from the markers.
+///
+/// ONE pass over the same map, deliberately. The continuity check and the
+/// terminal-response check are two halves of one question — is this correlation
+/// whole — and splitting them across two traversals is the producer/consumer
+/// shape that keeps failing in this repo. Every checked correlation leaves here
+/// as an admission or a named exclusion; [`DeliveryCertificate::balances`]
+/// asserts the two add up.
 fn certify(
-    per_correlation: std::collections::BTreeMap<String, Vec<(u64, u64)>>,
+    per_correlation: std::collections::BTreeMap<String, CorrelationTrace>,
     markers: MarkerLedger,
 ) -> DeliveryCertificate {
     let dropped_ranges: Vec<[u64; 2]> = markers
@@ -381,28 +425,76 @@ fn certify(
 
     let correlations_checked = per_correlation.len();
     let mut gaps = Vec::new();
-    for (correlation_id, mut seen) in per_correlation {
-        seen.sort_unstable();
-        let highest = seen.last().map(|(rseq, _)| *rseq).unwrap_or_default();
-        let present: std::collections::BTreeSet<u64> = seen.iter().map(|(rseq, _)| *rseq).collect();
+    let mut correlations_admitted = 0usize;
+    let mut correlations_excluded = Vec::new();
+    for (correlation_id, trace) in per_correlation {
+        let CorrelationTrace {
+            mut seq,
+            has_ingress,
+        } = trace;
+        seq.sort_unstable();
+        let highest = seq.last().map(|(rseq, _)| *rseq).unwrap_or_default();
+        let present: std::collections::BTreeSet<u64> = seq.iter().map(|(rseq, _)| *rseq).collect();
         // The recorder starts every correlation at 0 and increments by one, so
         // the run it emitted is exactly `0..=highest`. Anything in that range
         // that did not arrive was allocated and then lost.
         let missing: Vec<u64> = (0..=highest).filter(|r| !present.contains(r)).collect();
-        if missing.is_empty() {
-            continue;
+
+        let mut failed = Vec::new();
+        let mut detail = String::new();
+        if !missing.is_empty() {
+            let gseq_lo = seq.iter().map(|(_, g)| *g).min().unwrap_or_default();
+            let gseq_hi = seq.iter().map(|(_, g)| *g).max().unwrap_or_default();
+            let explained_by_sink_drop = dropped_ranges
+                .iter()
+                .any(|[from, to]| *from <= gseq_hi && *to >= gseq_lo);
+            failed.push(AdmissionTest::DenseSequence);
+            detail.push_str(&format!(
+                "{} — request_sequence {} never arrived out of the run 0..={highest} \
+                 (global_sequence span {gseq_lo}..={gseq_hi}); {}",
+                AdmissionTest::DenseSequence.describe(),
+                describe_missing(&missing),
+                if explained_by_sink_drop {
+                    "a `dropped` marker covers that span, so the producer admits this loss"
+                } else {
+                    "no `dropped` marker covers that span, so the records left the writer and \
+                     went missing in transport"
+                },
+            ));
+            gaps.push(DeliveryGap {
+                correlation_id: correlation_id.clone(),
+                missing,
+                gseq_span: [gseq_lo, gseq_hi],
+                explained_by_sink_drop,
+            });
         }
-        let gseq_lo = seen.iter().map(|(_, g)| *g).min().unwrap_or_default();
-        let gseq_hi = seen.iter().map(|(_, g)| *g).max().unwrap_or_default();
-        let explained_by_sink_drop = dropped_ranges
-            .iter()
-            .any(|[from, to]| *from <= gseq_hi && *to >= gseq_lo);
-        gaps.push(DeliveryGap {
-            correlation_id,
-            missing,
-            gseq_span: [gseq_lo, gseq_hi],
-            explained_by_sink_drop,
-        });
+        if !has_ingress {
+            failed.push(AdmissionTest::TerminalResponse);
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            // Absence has two causes and they are not the same defect, so the
+            // line says both rather than picking one. A request whose response
+            // never landed is truncation; a correlation that was never an
+            // inbound request at all (background work that engaged a
+            // correlation of its own) has no request to re-drive. Either way
+            // the replay cannot drive it, which is why both are excluded.
+            detail.push_str(AdmissionTest::TerminalResponse.describe());
+            detail.push_str(
+                " — either the request→response path did not finish landing, or this correlation \
+                 was never an inbound request; the replay has nothing to re-drive",
+            );
+        }
+
+        if failed.is_empty() {
+            correlations_admitted += 1;
+        } else {
+            correlations_excluded.push(CorrelationExclusion {
+                correlation_id,
+                failed,
+                detail,
+            });
+        }
     }
 
     DeliveryCertificate {
@@ -411,7 +503,22 @@ fn certify(
         checkpoints: markers.checkpoints,
         correlations_checked,
         gaps,
+        correlations_admitted,
+        correlations_excluded,
         instances: markers.into_instances(),
+    }
+}
+
+/// The missing sequence numbers, abbreviated once the list stops being
+/// readable. A correlation that lost 4,000 events must still be namable in a
+/// log line.
+fn describe_missing(missing: &[u64]) -> String {
+    const SHOWN: usize = 8;
+    let head: Vec<String> = missing.iter().take(SHOWN).map(u64::to_string).collect();
+    if missing.len() > SHOWN {
+        format!("{} (+{} more)", head.join(", "), missing.len() - SHOWN)
+    } else {
+        head.join(", ")
     }
 }
 
@@ -432,6 +539,12 @@ struct EventProbe {
     correlation_id: Option<String>,
     #[serde(default)]
     request_sequence: u64,
+    /// Which boundary produced the event. `http_incoming` is the correlation's
+    /// own request→response span, and its presence is the terminal half of
+    /// admission — see [`AdmissionTest`]. Defaulted so a graph node (which has
+    /// no boundary) still parses.
+    #[serde(default)]
+    boundary: String,
 }
 
 /// A sink marker, as the record sink puts it on the wire: the payload the
@@ -489,6 +602,12 @@ struct EnvelopeProbe<'a> {
 /// An unset type is the legacy boundary-event envelope.
 const ARTIFACT_TYPE_MARKER: &str = "deja_sink_marker";
 const ARTIFACT_TYPE_GRAPH_NODE: &str = "deja_graph_node";
+
+/// The boundary name of a correlation's own inbound request span. It is not a
+/// row in the `call_ledger` — it is the request the kernel re-drives — so its
+/// presence cannot be inferred from any downstream artifact and has to be read
+/// off the event stream here.
+const BOUNDARY_HTTP_INCOMING: &str = "http_incoming";
 
 impl<'a> EnvelopeProbe<'a> {
     /// The record kind this envelope declares, and the raw payload under
@@ -570,15 +689,13 @@ pub fn pull_recording(
         markers_dropped: collated.drops.markers,
         non_envelope_dropped: collated.drops.non_envelope,
         unparseable_dropped: collated.drops.unparseable,
-        // The seal is terminal, so this recording has stopped growing whatever
-        // the markers say. They will say nothing: the compactor skips marker
-        // lines when it builds a session, so a sealed session carries no audit
-        // trail and the certificate below rests on the event stream alone.
-        completeness: Completeness::Sealed,
+        // The compactor skips marker lines when it builds a session, so a
+        // sealed session carries no producer audit trail and the certificate
+        // below rests on the event stream alone. Admission does not need the
+        // markers — they only tell an admitted gap from an admitted loss.
         delivery: certify(collated.per_correlation, collated.markers),
     };
-    eprintln!("{}", report.accounting());
-    eprintln!("{}", report.delivery.describe());
+    report.report();
     Ok((report, manifest))
 }
 
@@ -732,10 +849,6 @@ pub fn pull_recording_from_prefix(
         .copied()
         .unwrap_or_default();
 
-    // The markers answer "has this recording stopped growing" BEFORE they are
-    // folded into the certificate, because that question decides whether the
-    // run may report a verdict at all.
-    let completeness = collated.markers.completeness();
     let report = IngestReport {
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
         landing_objects: session_objects,
@@ -744,18 +857,17 @@ pub fn pull_recording_from_prefix(
         events_out: collated.events.len(),
         correlations: collated.per_correlation.len(),
         // This pull read a landing prefix. It is sealed only if a compaction job
-        // has already promoted it, which a replay neither does nor may do — so
-        // this is NOT the completeness signal; `completeness` is.
+        // has already promoted it, which a replay neither does nor may do — and
+        // a live recorder is not a reason to refuse anything: a recording still
+        // being written yields the correlations it has finished, and the ones
+        // it has not are excluded by name below.
         sealed: false,
         markers_dropped: collated.drops.markers,
         non_envelope_dropped: collated.drops.non_envelope,
         unparseable_dropped: collated.drops.unparseable,
-        completeness,
         delivery: certify(collated.per_correlation, collated.markers),
     };
-    eprintln!("{}", report.accounting());
-    eprintln!("{}", report.delivery.describe());
-    eprintln!("ingest: {}", report.completeness.describe());
+    report.report();
     Ok((report, resolved, seen))
 }
 
@@ -802,7 +914,7 @@ fn stamp_record_kind(event_json: &str, record_kind: &str) -> String {
 fn collate(raw_chunks: &[Vec<u8>]) -> Collated {
     let mut seen = std::collections::HashSet::new();
     let mut events: Vec<(Option<String>, &'static str, u64, String)> = Vec::new();
-    let mut per_correlation: std::collections::BTreeMap<String, Vec<(u64, u64)>> =
+    let mut per_correlation: std::collections::BTreeMap<String, CorrelationTrace> =
         Default::default();
     let mut markers = MarkerLedger::default();
     let mut lines_in = 0usize;
@@ -863,10 +975,11 @@ fn collate(raw_chunks: &[Vec<u8>]) -> Collated {
             // them. Boundary events only — see `EventProbe::correlation_id`.
             if record_kind == "boundary_event" {
                 if let Some(correlation_id) = &probe.correlation_id {
-                    per_correlation
-                        .entry(correlation_id.clone())
-                        .or_default()
+                    let trace = per_correlation.entry(correlation_id.clone()).or_default();
+                    trace
+                        .seq
                         .push((probe.request_sequence, probe.global_sequence));
+                    trace.has_ingress |= probe.boundary == BOUNDARY_HTTP_INCOMING;
                 }
             }
             events.push((
@@ -896,12 +1009,27 @@ fn collate(raw_chunks: &[Vec<u8>]) -> Collated {
 /// same input is exactly the producer/consumer split that keeps failing here.
 struct Collated {
     events: Vec<(Option<String>, &'static str, u64, String)>,
-    /// `correlation_id -> [(request_sequence, global_sequence)]` for the
-    /// boundary events that survived dedup.
-    per_correlation: std::collections::BTreeMap<String, Vec<(u64, u64)>>,
+    /// What each correlation's boundary events establish about it — the input
+    /// to admission.
+    per_correlation: std::collections::BTreeMap<String, CorrelationTrace>,
     lines_in: usize,
     drops: DropCounts,
     markers: MarkerLedger,
+}
+
+/// One correlation's boundary events as the ingest saw them: the sequence pairs
+/// continuity is computed from, and whether its `http_incoming` arrived.
+///
+/// Both facts are collected in the SAME pass that builds the event stream. A
+/// second pass over the same lines to answer the second half of one question is
+/// exactly the split this repo keeps paying for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CorrelationTrace {
+    /// `(request_sequence, global_sequence)` per boundary event that survived
+    /// dedup.
+    seq: Vec<(u64, u64)>,
+    /// The correlation carries its `http_incoming` event.
+    has_ingress: bool,
 }
 
 #[cfg(test)]
@@ -914,11 +1042,33 @@ mod tests {
         )
     }
 
-    /// A boundary event carrying the two fields continuity is computed from.
-    fn correlated(instance: &str, gseq: u64, correlation: &str, rseq: u64) -> String {
+    /// A boundary event carrying the fields admission is computed from.
+    fn at_boundary(
+        instance: &str,
+        gseq: u64,
+        correlation: &str,
+        rseq: u64,
+        boundary: &str,
+    ) -> String {
         format!(
-            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"{instance}","event":{{"recording_run_id":"r1","global_sequence":{gseq},"correlation_id":"{correlation}","request_sequence":{rseq}}}}}"#
+            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"{instance}","event":{{"recording_run_id":"r1","global_sequence":{gseq},"correlation_id":"{correlation}","request_sequence":{rseq},"boundary":"{boundary}"}}}}"#
         )
+    }
+
+    /// An inner crossing — a db read, a redis get. Never the request itself.
+    fn correlated(instance: &str, gseq: u64, correlation: &str, rseq: u64) -> String {
+        at_boundary(instance, gseq, correlation, rseq, "db")
+    }
+
+    /// The correlation's own request→response span.
+    ///
+    /// `request_sequence` 0 on purpose, and this is the producer's shape rather
+    /// than a convenience: `EventBuilder::start` allocates the sequence on
+    /// boundary ENTRY, and the inbound request is the first crossing under its
+    /// own correlation. The EVENT is written on exit, which is why it can be
+    /// the one that goes missing when a recording is cut mid-request.
+    fn ingress(instance: &str, gseq: u64, correlation: &str) -> String {
+        at_boundary(instance, gseq, correlation, 0, "http_incoming")
     }
 
     /// A sink marker EXACTLY as the record sink emits it.
@@ -1071,7 +1221,6 @@ mod tests {
             markers_dropped: drops.markers,
             non_envelope_dropped: drops.non_envelope,
             unparseable_dropped: drops.unparseable,
-            completeness: Completeness::Sealed,
             delivery: DeliveryCertificate::default(),
         };
         assert!(report.balances(), "{}", report.accounting());
@@ -1092,7 +1241,6 @@ mod tests {
             markers_dropped: 0,
             non_envelope_dropped: 0,
             unparseable_dropped: 0,
-            completeness: Completeness::Sealed,
             delivery: DeliveryCertificate::default(),
         };
         assert!(!report.balances());
@@ -1164,7 +1312,7 @@ mod tests {
         // needs it — but the CLAIM each marker carries now lands somewhere.
         let chunk = format!(
             "{}\n{}\n{}\n{}\n",
-            correlated("router-h-1", 0, "c-1", 0),
+            ingress("router-h-1", 0, "c-1"),
             checkpoint("router-h-1", 0),
             dropped("router-h-1", 40, 41),
             eof("router-h-1", 7),
@@ -1217,7 +1365,7 @@ mod tests {
         // so 0,1,3 means the event numbered 2 was allocated and then lost.
         let chunk = format!(
             "{}\n{}\n{}\n",
-            correlated("router-h-1", 10, "c-1", 0),
+            ingress("router-h-1", 10, "c-1"),
             correlated("router-h-1", 11, "c-1", 1),
             correlated("router-h-1", 13, "c-1", 3),
         )
@@ -1236,6 +1384,12 @@ mod tests {
             "no `dropped` marker covers it — the producer does not admit this loss"
         );
         assert!(cert.describe().contains("1 unexplained"));
+        // The response DID land, so only the continuity test fails. The two
+        // halves of admission stay separable.
+        assert_eq!(
+            cert.correlations_excluded[0].failed,
+            vec![AdmissionTest::DenseSequence]
+        );
     }
 
     #[test]
@@ -1248,9 +1402,9 @@ mod tests {
         // in transport, which is the worse of the two.
         let chunk = format!(
             "{}\n{}\n{}\n{}\n{}\n",
-            correlated("router-h-1", 10, "c-admitted", 0),
+            ingress("router-h-1", 10, "c-admitted"),
             correlated("router-h-1", 12, "c-admitted", 2),
-            correlated("router-h-1", 30, "c-silent", 0),
+            ingress("router-h-1", 30, "c-silent"),
             correlated("router-h-1", 32, "c-silent", 2),
             dropped("router-h-1", 11, 11),
         )
@@ -1290,7 +1444,7 @@ mod tests {
         // recording that lost nothing.
         let chunk = format!(
             "{}\n{}\n{}\n{}\n",
-            correlated("router-h-1", 0, "c-1", 0),
+            ingress("router-h-1", 0, "c-1"),
             correlated("router-h-1", 1, "c-1", 1),
             envelope("r1", 2, r#","request_sequence":97"#), // ambient: no correlation
             graph_envelope("r1", 0),
@@ -1300,85 +1454,221 @@ mod tests {
         let cert = certify(collated.per_correlation, collated.markers);
         assert_eq!(cert.correlations_checked, 1, "only the real correlation");
         assert!(cert.continuous(), "{:?}", cert.gaps);
+        assert_eq!(
+            cert.correlations_admitted, 1,
+            "ambient traffic and graph nodes are not correlations to admit or refuse"
+        );
+        assert!(cert.correlations_excluded.is_empty());
     }
 
-    // -- defect 1: an unsealed recording cannot pass as complete -------------
+    // -- admission is per correlation, not per recording ---------------------
+    //
+    // The gate this replaces asked whether the RECORDING had stopped growing
+    // and refused the run when it could not tell. It could never answer: it
+    // required the writer's `eof`, which is emitted from `impl Drop for
+    // AsyncRecordWriter` while the recorder is installed as a process-global
+    // hook — Rust runs no destructor for a static, so no deployed router emits
+    // one and every real tape was refused. It was also asking the wrong
+    // question. A recording still being written is fine; a correlation cut
+    // mid-flight is not.
+
+    fn exclusion<'a>(cert: &'a DeliveryCertificate, id: &str) -> &'a CorrelationExclusion {
+        cert.correlations_excluded
+            .iter()
+            .find(|e| e.correlation_id == id)
+            .unwrap_or_else(|| panic!("{id} should have been excluded: {cert:?}"))
+    }
 
     #[test]
-    fn no_eof_marker_means_the_recording_may_still_be_landing() {
-        // The observed failure: a replay read a prefix of a tape still being
-        // written and reported 9/44 as though it were the whole recording. The
-        // writer's `eof` is what says a recording stopped growing; checkpoints
-        // alone say the opposite — it was still flushing when this was read.
+    fn a_whole_correlation_is_admitted() {
+        // Dense from zero, and its `http_incoming` landed. Nothing else is
+        // required — no `eof`, no seal, no marker at all.
+        let chunk = format!(
+            "{}\n{}\n{}\n",
+            ingress("router-h-1", 10, "c-1"),
+            correlated("router-h-1", 11, "c-1", 1),
+            correlated("router-h-1", 12, "c-1", 2),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+
+        assert_eq!(cert.correlations_checked, 1);
+        assert_eq!(cert.correlations_admitted, 1);
+        assert!(cert.correlations_excluded.is_empty());
+        assert!(cert.admits("c-1"));
+        assert!(cert.balances(), "{}", cert.describe());
+        assert_eq!(cert.markers_seen, 0, "no marker was needed to admit it");
+    }
+
+    #[test]
+    fn a_correlation_whose_sequence_has_a_hole_is_excluded_by_name() {
+        let chunk = format!(
+            "{}\n{}\n{}\n",
+            ingress("router-h-1", 10, "c-holed"),
+            correlated("router-h-1", 11, "c-holed", 1),
+            correlated("router-h-1", 13, "c-holed", 3),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+
+        assert_eq!(cert.correlations_admitted, 0);
+        assert!(!cert.admits("c-holed"));
+        let excluded = exclusion(&cert, "c-holed");
+        assert_eq!(excluded.failed, vec![AdmissionTest::DenseSequence]);
+        assert!(
+            excluded.detail.contains("request_sequence 2"),
+            "the reason names WHICH event is gone: {}",
+            excluded.detail
+        );
+        assert!(
+            excluded.detail.contains("went missing in transport"),
+            "and whether the producer admits the loss: {}",
+            excluded.detail
+        );
+        assert!(cert.balances());
+        assert!(cert
+            .describe_exclusions()
+            .iter()
+            .any(|l| l.starts_with("c-holed:")));
+    }
+
+    #[test]
+    fn a_correlation_with_no_response_event_is_excluded_by_name() {
+        // The hazard the phase exists for: db writes landed, the response did
+        // not. The `http_incoming` event is written when the request boundary
+        // EXITS, so a request cut mid-flight leaves its inner crossings on the
+        // tape and no request→response span at all.
         let chunk = format!(
             "{}\n{}\n",
-            correlated("router-h-1", 0, "c-1", 0),
-            checkpoint("router-h-1", 0),
+            correlated("router-h-1", 20, "c-cut", 1),
+            correlated("router-h-1", 21, "c-cut", 2),
         )
         .into_bytes();
         let collated = collate(&[chunk]);
-        let completeness = collated.markers.completeness();
+        let cert = certify(collated.per_correlation, collated.markers);
 
+        assert_eq!(cert.correlations_admitted, 0);
+        let excluded = exclusion(&cert, "c-cut");
         assert!(
-            !completeness.is_complete(),
-            "a checkpoint is not a goodbye: {completeness:?}"
+            excluded.failed.contains(&AdmissionTest::TerminalResponse),
+            "{excluded:?}"
         );
-        let reason = completeness.incomplete_reason().expect("a named reason");
-        assert!(reason.contains("router-h-1"), "names the silent instance");
-        assert!(reason.contains("eof"));
-        assert!(completeness.describe().contains("INCOMPLETE"));
-    }
-
-    #[test]
-    fn an_eof_from_every_instance_means_nothing_more_is_coming() {
-        let chunk = format!(
-            "{}\n{}\n{}\n{}\n",
-            correlated("router-h-1", 0, "c-1", 0),
-            correlated("router-h-2", 1, "c-2", 0),
-            eof("router-h-1", 0),
-            eof("router-h-2", 1),
-        )
-        .into_bytes();
-        let collated = collate(&[chunk]);
-        let completeness = collated.markers.completeness();
-        assert_eq!(completeness, Completeness::EofObserved { instances: 2 });
-        assert!(completeness.is_complete());
-    }
-
-    #[test]
-    fn one_instance_still_writing_holds_the_whole_recording_incomplete() {
-        // A multi-producer recording is complete only when EVERY writer has
-        // said goodbye. One that hasn't is still appending to this session.
-        let chunk = format!(
-            "{}\n{}\n",
-            eof("router-h-1", 4),
-            checkpoint("router-h-2", 9),
-        )
-        .into_bytes();
-        let collated = collate(&[chunk]);
-        let completeness = collated.markers.completeness();
-        assert!(!completeness.is_complete());
-        let reason = completeness.incomplete_reason().expect("a named reason");
-        assert!(reason.contains("router-h-2"));
         assert!(
-            !reason.contains("router-h-1"),
-            "the instance that DID finish must not be blamed: {reason}"
+            excluded.detail.contains("http_incoming"),
+            "the reason names the missing event: {}",
+            excluded.detail
+        );
+        // Both tests failed and both are named: the response is missing AND the
+        // hole it left at sequence 0 is real loss. Reporting only the first
+        // would hide half of what the tape says.
+        assert!(excluded.failed.contains(&AdmissionTest::DenseSequence));
+        assert_eq!(excluded.failed.len(), 2);
+        assert!(cert.balances());
+    }
+
+    #[test]
+    fn a_recording_still_being_written_admits_its_whole_correlations() {
+        // THE property this phase establishes, and the case the old gate got
+        // wrong. This prefix has no `eof` and never will — the recorder is a
+        // live process-global hook — and it was read mid-request: `c-live` is
+        // still in flight, so its inner crossings landed and its response has
+        // not. The two correlations that finished are perfectly good, and a run
+        // against this tape scores them rather than being refused.
+        let chunk = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            ingress("router-h-1", 0, "c-done-1"),
+            correlated("router-h-1", 1, "c-done-1", 1),
+            ingress("router-h-1", 2, "c-done-2"),
+            correlated("router-h-1", 3, "c-done-2", 1),
+            // In flight: rseq 0 is allocated but its event is not written yet.
+            correlated("router-h-1", 4, "c-live", 1),
+            checkpoint("router-h-1", 4),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+
+        assert_eq!(cert.correlations_checked, 3);
+        assert_eq!(
+            cert.correlations_admitted, 2,
+            "a live recorder must not block the correlations it HAS finished"
+        );
+        assert!(cert.admits("c-done-1") && cert.admits("c-done-2"));
+        assert_eq!(cert.correlations_excluded.len(), 1);
+        assert_eq!(cert.correlations_excluded[0].correlation_id, "c-live");
+        assert!(cert.balances(), "{}", cert.describe());
+        assert!(cert.describe().contains("3 correlation(s) checked"));
+        assert!(cert.describe().contains("2 admissible, 1 excluded"));
+
+        // The same prefix read again later holds MORE correlations, and the one
+        // that was in flight is now whole. Both reads are valid; neither is a
+        // prefix score, because neither scored a half-landed request.
+        let later = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            ingress("router-h-1", 0, "c-done-1"),
+            correlated("router-h-1", 1, "c-done-1", 1),
+            ingress("router-h-1", 2, "c-done-2"),
+            correlated("router-h-1", 3, "c-done-2", 1),
+            correlated("router-h-1", 4, "c-live", 1),
+            ingress("router-h-1", 5, "c-live"),
+            ingress("router-h-1", 6, "c-new"),
+        )
+        .into_bytes();
+        let collated = collate(&[later]);
+        let cert = certify(collated.per_correlation, collated.markers);
+        assert_eq!(cert.correlations_admitted, 4);
+        assert!(cert.correlations_excluded.is_empty());
+    }
+
+    #[test]
+    fn a_gap_the_producer_admits_is_still_not_a_whole_correlation() {
+        // A `dropped` marker changes the DIAGNOSIS, not the verdict: the writer
+        // owning up to the loss does not put the events back. The certificate
+        // says both — excluded, and excluded for a loss the producer admits.
+        let chunk = format!(
+            "{}\n{}\n{}\n",
+            ingress("router-h-1", 10, "c-1"),
+            correlated("router-h-1", 12, "c-1", 2),
+            dropped("router-h-1", 11, 11),
+        )
+        .into_bytes();
+        let collated = collate(&[chunk]);
+        let cert = certify(collated.per_correlation, collated.markers);
+
+        assert_eq!(cert.correlations_admitted, 0);
+        let excluded = exclusion(&cert, "c-1");
+        assert!(
+            excluded.detail.contains("the producer admits this loss"),
+            "{}",
+            excluded.detail
         );
     }
 
     #[test]
-    fn a_prefix_with_no_markers_at_all_cannot_claim_completeness() {
-        // Absence of the audit trail is not evidence the recording finished.
-        // This is the case the real 9/44 run was in if its markers never
-        // reached the scanned prefix.
-        let chunk = format!("{}\n", correlated("router-h-1", 0, "c-1", 0)).into_bytes();
+    fn the_correlation_check_is_not_a_recording_check() {
+        // No marker of any kind, no seal, nothing that says the recorder has
+        // stopped — and the tape's one finished correlation is still admitted.
+        // Absence of an audit trail is not evidence about any request.
+        let chunk = format!("{}\n", ingress("router-h-1", 0, "c-1")).into_bytes();
         let collated = collate(&[chunk]);
-        let completeness = collated.markers.completeness();
-        assert!(!completeness.is_complete());
-        assert!(completeness
-            .incomplete_reason()
-            .expect("a named reason")
-            .contains("no readable sink marker"));
+        let cert = certify(collated.per_correlation, collated.markers);
+        assert_eq!(cert.markers_seen, 0);
+        assert_eq!(cert.correlations_admitted, 1);
+        assert!(cert.correlations_excluded.is_empty());
+    }
+
+    #[test]
+    fn an_unbalanced_certificate_says_so() {
+        // The balance has to be able to fail, or it is decoration.
+        let cert = DeliveryCertificate {
+            correlations_checked: 53,
+            correlations_admitted: 24,
+            ..Default::default()
+        };
+        assert!(!cert.balances());
+        assert!(cert.describe().contains("UNACCOUNTED: 29"));
     }
 
     #[test]
