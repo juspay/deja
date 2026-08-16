@@ -3,6 +3,7 @@ members = [
     "crates/deja",
     "crates/deja-context",
     "crates/deja-core",
+    "crates/deja-forest",
     "crates/deja-derive",
     "crates/deja-compactor",
     "crates/deja-diesel",

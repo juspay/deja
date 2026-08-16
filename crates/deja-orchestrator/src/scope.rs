@@ -27,6 +27,7 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 use deja_core::ExecutionGraphNode;
+use deja_forest::{root_for, RootResolution};
 
 use crate::{HarnessRoot, Run, RunSpec};
 
@@ -407,7 +408,7 @@ impl ScopedRecording {
     /// scoped read with no anchors, or an in-scope correlation whose events
     /// reach no graph root, is a hard error naming the tape.
     fn resolve(&self, index: &TapeIndex) -> io::Result<Resolved> {
-        let mut root_of: HashMap<u64, u64> = HashMap::new();
+        let mut root_of: HashMap<u64, RootResolution> = HashMap::new();
 
         // `EntireSession` keeps the whole graph WITHOUT consulting anchors at
         // all: record mode has no filter, and "no filter = everything" is what
@@ -416,7 +417,9 @@ impl ScopedRecording {
         if self.scope.is_entire_session() {
             let mut roots: BTreeSet<u64> = BTreeSet::new();
             for node_id in index.parent_of.keys() {
-                if let Some(root) = root_for(*node_id, &index.parent_of, &mut root_of) {
+                if let RootResolution::Root(root) | RootResolution::Cycle { root, .. } =
+                    root_for(*node_id, &index.parent_of, &mut root_of)
+                {
                     roots.insert(root);
                 }
             }
@@ -453,7 +456,9 @@ impl ScopedRecording {
         let mut unreachable: Vec<String> = Vec::new();
 
         for anchor in &index.ambient_anchors {
-            if let Some(root) = root_for(*anchor, &index.parent_of, &mut root_of) {
+            if let RootResolution::Root(root) | RootResolution::Cycle { root, .. } =
+                root_for(*anchor, &index.parent_of, &mut root_of)
+            {
                 roots.insert(root);
             }
         }
@@ -466,7 +471,9 @@ impl ScopedRecording {
         for (correlation, ids) in &index.anchors_by_correlation {
             let mut reached = false;
             for anchor in ids {
-                if let Some(root) = root_for(*anchor, &index.parent_of, &mut root_of) {
+                if let RootResolution::Root(root) | RootResolution::Cycle { root, .. } =
+                    root_for(*anchor, &index.parent_of, &mut root_of)
+                {
                     roots.insert(root);
                     reached = true;
                 }
@@ -533,7 +540,9 @@ impl ScopedRecording {
         // Keep every node under a reached root — the request's own span tree.
         let mut keep: HashSet<u64> = HashSet::new();
         for node_id in index.parent_of.keys() {
-            if let Some(root) = root_for(*node_id, &index.parent_of, &mut root_of) {
+            if let RootResolution::Root(root) | RootResolution::Cycle { root, .. } =
+                root_for(*node_id, &index.parent_of, &mut root_of)
+            {
                 if roots.contains(&root) {
                     keep.insert(*node_id);
                 }
@@ -590,43 +599,6 @@ struct Resolved {
     keep: HashSet<u64>,
     anchors: u64,
     roots_reached: u64,
-}
-
-/// Walk to the root, memoizing every node on the way. Cycle-guarded: a tape is
-/// untrusted input and a parent cycle would otherwise hang the extractor.
-fn root_for(
-    node: u64,
-    parent_of: &HashMap<u64, Option<u64>>,
-    memo: &mut HashMap<u64, u64>,
-) -> Option<u64> {
-    if let Some(root) = memo.get(&node) {
-        return Some(*root);
-    }
-    let mut chain: Vec<u64> = Vec::new();
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut current = node;
-    let root = loop {
-        if let Some(root) = memo.get(&current) {
-            break *root;
-        }
-        if !seen.insert(current) {
-            // Cycle: treat the entry point as its own root rather than looping.
-            break node;
-        }
-        chain.push(current);
-        match parent_of.get(&current) {
-            // A parent the payload does not carry: promote to root.
-            Some(Some(parent)) if !parent_of.contains_key(parent) => break current,
-            Some(Some(parent)) => current = *parent,
-            Some(None) => break current,
-            // The anchor names a node absent from the graph entirely.
-            None => return None,
-        }
-    };
-    for n in chain {
-        memo.insert(n, root);
-    }
-    Some(root)
 }
 
 /// Minimal projection of a tape line: the tag plus the two or three fields
