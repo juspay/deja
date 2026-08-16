@@ -229,7 +229,7 @@ pub(crate) fn build_with_inconclusive(
     // which is the pool the scorecard had already narrowed twice; the two
     // drifted, and a run whose scorecard correctly refused eight pairs shipped a
     // ledger that made them anyway, each marrying two DIFFERENT SQL statements.
-    let mut recorded_pairing = super::ArgsFreePairing::build(table, events);
+    let mut recorded_pairing = super::ArgsFreePairing::build(table, events, &column_provenance);
     // Recorded twins claimed by a value_diverged consequence, so the omitted pass
     // doesn't also flag them (collapses the would-be novel+omitted split).
     let mut paired_consumed: HashSet<u64> = HashSet::new();

@@ -40,6 +40,7 @@
 //! scaffold for that work and are always false here.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 
 use deja::{Address, LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
@@ -894,6 +895,10 @@ pub(crate) struct CorrelationColumnProvenance {
     inserted_schema_filled: HashMap<(String, String), BTreeSet<String>>,
     /// (correlation, table) -> columns some statement supplied a value for.
     bound: HashMap<(String, String), BTreeSet<String>>,
+    /// (correlation, table) -> columns a resolved value divergence proved were
+    /// schema-derived. This is the pairing-shape authority: it is populated only
+    /// from [`observed_schema_default_divergence`], never from a parallel rule.
+    established_schema_derived: HashMap<(String, String), BTreeSet<String>>,
 }
 
 impl CorrelationColumnProvenance {
@@ -932,10 +937,41 @@ impl CorrelationColumnProvenance {
                 .get(&key)
                 .is_some_and(|columns| columns.contains(column))
     }
+
+    fn establish_schema_default(
+        &mut self,
+        correlation: Option<&str>,
+        divergence: &SchemaDefaultDivergence,
+    ) {
+        let Some(correlation) = correlation else {
+            return;
+        };
+        self.established_schema_derived
+            .entry((correlation.to_owned(), divergence.table.clone()))
+            .or_default()
+            .extend(divergence.columns.iter().cloned());
+    }
+
+    fn is_established_schema_derived(
+        &self,
+        correlation: Option<&str>,
+        table: &str,
+        column: &str,
+    ) -> bool {
+        let Some(correlation) = correlation else {
+            return false;
+        };
+        self.established_schema_derived
+            .get(&(correlation.to_owned(), table.to_owned()))
+            .is_some_and(|columns| columns.contains(column))
+    }
 }
 
 /// Build the index from both sides of the run: the recorded tape and the
-/// candidate's own calls. A column either side supplied is disqualified.
+/// candidate's own calls. A column either side supplied is disqualified from
+/// inherited classification. Resolved value divergences then establish the
+/// narrower set that pairing-shape normalization may ignore, using the same
+/// schema-default verdict the scorecard and ledger report.
 pub(crate) fn correlation_column_provenance(
     events: &[deja::BoundaryEvent],
     observed: &[ObservedCall],
@@ -952,6 +988,24 @@ pub(crate) fn correlation_column_provenance(
             obs.correlation_id.as_deref(),
             obs.args.get("sql").and_then(|s| s.as_str()),
         );
+    }
+
+    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = events
+        .iter()
+        .map(|event| (event.global_sequence, event))
+        .collect();
+    for obs in observed {
+        let event = obs
+            .source_event_global_sequence
+            .and_then(|seq| events_by_seq.get(&seq).copied());
+        if !observed_value_diverged(obs, event) {
+            continue;
+        }
+        if let SchemaDefaultVerdict::Confirmed(divergence) =
+            observed_schema_default_divergence(obs, event, &provenance)
+        {
+            provenance.establish_schema_default(obs.correlation_id.as_deref(), &divergence);
+        }
     }
     provenance
 }
@@ -1283,6 +1337,128 @@ fn is_unit_value(value: &serde_json::Value) -> bool {
     matches!(value, serde_json::Value::Null)
 }
 
+/// Remove UPDATE assignments whose column was already proven schema-derived in
+/// this correlation. Every other byte of the statement remains identity.
+///
+/// Diesel renumbers later binds when an `AsChangeset` field appears or
+/// disappears, so the remaining `$N` ordinals are canonicalized by first
+/// occurrence. Unsupported SQL returns `None`; callers then retain the original
+/// statement and pairing fails closed.
+fn schema_normalized_update_shape(
+    sql: &str,
+    correlation: Option<&str>,
+    provenance: &CorrelationColumnProvenance,
+) -> Option<String> {
+    let statement = sql_statement(sql).trim_start();
+    let parsed = parse_write_statement(statement)?;
+    if parsed.kind != WriteKind::Update {
+        return None;
+    }
+
+    let (verb, rest) = split_leading_word(statement);
+    if !verb.eq_ignore_ascii_case("UPDATE") {
+        return None;
+    }
+    let (_, rest) = quoted_identifier(rest.trim_start())?;
+    let (set, assignments_and_suffix) = split_leading_word(rest.trim_start());
+    if !set.eq_ignore_ascii_case("SET") {
+        return None;
+    }
+    let suffix_at = top_level_keyword(assignments_and_suffix, &["WHERE", "RETURNING"])
+        .unwrap_or(assignments_and_suffix.len());
+    let assignments = &assignments_and_suffix[..suffix_at];
+    let suffix = &assignments_and_suffix[suffix_at..];
+    let assignments_at = statement.len() - assignments_and_suffix.len();
+
+    let mut removed = false;
+    let mut kept = Vec::new();
+    for assignment in split_top_level(assignments) {
+        let (column, value) = split_assignment(assignment)?;
+        let column = unquote_identifier(column)?;
+        if value.trim().is_empty() {
+            return None;
+        }
+        if provenance.is_established_schema_derived(correlation, &parsed.table, &column) {
+            removed = true;
+        } else {
+            kept.push(assignment.trim());
+        }
+    }
+    if !removed || kept.is_empty() {
+        return None;
+    }
+
+    let leading_len = assignments.len() - assignments.trim_start().len();
+    let trailing_at = assignments.trim_end().len();
+    let mut normalized = String::with_capacity(statement.len());
+    normalized.push_str(&statement[..assignments_at]);
+    normalized.push_str(&assignments[..leading_len]);
+    for (index, assignment) in kept.into_iter().enumerate() {
+        if index != 0 {
+            normalized.push_str(", ");
+        }
+        normalized.push_str(assignment);
+    }
+    normalized.push_str(&assignments[trailing_at..]);
+    normalized.push_str(suffix);
+    canonicalize_bind_ordinals(&normalized)
+}
+
+fn canonicalize_bind_ordinals(statement: &str) -> Option<String> {
+    let bytes = statement.as_bytes();
+    let mut ordinals = BTreeMap::<u32, usize>::new();
+    let mut next = 1usize;
+    let mut normalized = String::with_capacity(statement.len());
+    let mut copied_through = 0usize;
+    let mut at = 0usize;
+
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                loop {
+                    match bytes.get(at).copied() {
+                        Some(b'"') if bytes.get(at + 1) == Some(&b'"') => at += 2,
+                        Some(b'"') => {
+                            at += 1;
+                            break;
+                        }
+                        Some(_) => at += 1,
+                        None => return None,
+                    }
+                }
+            }
+            b'\'' => return None,
+            b'$' => {
+                let start = at;
+                at += 1;
+                let first = *bytes.get(at)?;
+                if !first.is_ascii_digit() || first == b'0' {
+                    return None;
+                }
+                let mut ordinal = 0u32;
+                while let Some(digit) = bytes.get(at).filter(|digit| digit.is_ascii_digit()) {
+                    ordinal = ordinal
+                        .checked_mul(10)?
+                        .checked_add(u32::from(*digit - b'0'))?;
+                    at += 1;
+                }
+                let canonical = *ordinals.entry(ordinal).or_insert_with(|| {
+                    let current = next;
+                    next += 1;
+                    current
+                });
+                normalized.push_str(&statement[copied_through..start]);
+                write!(&mut normalized, "${canonical}").ok()?;
+                copied_through = at;
+            }
+            _ => at += 1,
+        }
+    }
+    normalized.push_str(&statement[copied_through..]);
+    Some(normalized)
+}
+
 /// The part of a call's args that a VALUE divergence cannot change.
 ///
 /// The args-free pairing exists so that a write whose operand diverged (a
@@ -1294,12 +1470,17 @@ fn is_unit_value(value: &serde_json::Value) -> bool {
 /// operands keeps the recovery and removes the cross-claim.
 ///
 /// A SQL boundary carries its operands in diesel's ` -- binds: [...]` tail, so
-/// the text before that tail is exactly "the statement without its values":
-/// identical for a re-keyed write, different for a different statement, and
-/// different across tables because the table name is in the statement. A
-/// boundary with no SQL falls back to the structural skeleton of its args — key
-/// paths with leaf values elided — which has the same property by construction.
-fn pairing_shape(args: &serde_json::Value) -> String {
+/// the text before that tail is exactly "the statement without its values".
+/// The only exception is an UPDATE assignment for a column whose earlier value
+/// divergence the existing schema-default classifier already confirmed was
+/// environment-derived. That assignment is removed by
+/// [`schema_normalized_update_shape`]; every unproven column remains identity.
+/// A boundary with no SQL falls back to the structural skeleton of its args.
+fn pairing_shape(
+    args: &serde_json::Value,
+    correlation: Option<&str>,
+    provenance: &CorrelationColumnProvenance,
+) -> String {
     // Fields deja's own args contract defines as WHAT KIND of call this is,
     // rather than what it operates on. `key` is deliberately absent: a re-keyed
     // write is precisely the divergence this pairing must still recover, so the
@@ -1312,7 +1493,11 @@ fn pairing_shape(args: &serde_json::Value) -> String {
         }
     }
     match args.get("sql").and_then(serde_json::Value::as_str) {
-        Some(sql) => parts.push(format!("sql={}", sql_statement(sql))),
+        Some(sql) => {
+            let statement = schema_normalized_update_shape(sql, correlation, provenance)
+                .unwrap_or_else(|| sql_statement(sql).to_owned());
+            parts.push(format!("sql={statement}"));
+        }
         None => {
             let mut paths = Vec::new();
             collect_args_shape(args, String::new(), &mut paths);
@@ -1376,17 +1561,22 @@ type PairingIdentity = (Option<String>, String, String, String, Option<String>);
 /// KNOWN shape narrows the pool. In a real run every table-covered sequence has
 /// its event, so the wildcard queue is empty and only the shape-matched arm
 /// fires; it is reachable when the tape is missing an event the table covers.
-pub(crate) struct ArgsFreePairing {
+pub(crate) struct ArgsFreePairing<'a> {
     /// Recorded source sequences per identity, FIFO by source order.
     queues: BTreeMap<PairingIdentity, std::collections::VecDeque<u64>>,
+    provenance: &'a CorrelationColumnProvenance,
 }
 
-impl ArgsFreePairing {
+impl<'a> ArgsFreePairing<'a> {
     /// Build the pool from the run's own two streams: the lookup table (which
     /// says which sequences are expected, and at which address) and the tape
     /// (which says what each call's args looked like). Both callers pass the
     /// SAME two, so neither can see a pool the other does not.
-    pub(crate) fn build(table: &LookupTable, events: &[deja::BoundaryEvent]) -> Self {
+    pub(crate) fn build(
+        table: &LookupTable,
+        events: &[deja::BoundaryEvent],
+        provenance: &'a CorrelationColumnProvenance,
+    ) -> Self {
         let events_by_seq: HashMap<u64, &deja::BoundaryEvent> =
             events.iter().map(|ev| (ev.global_sequence, ev)).collect();
         let span_paths = ledger::recorded_span_paths(table);
@@ -1428,7 +1618,9 @@ impl ArgsFreePairing {
             let Some(span) = span_paths.get(seq) else {
                 continue;
             };
-            let shape = events_by_seq.get(seq).map(|ev| pairing_shape(&ev.args));
+            let shape = events_by_seq
+                .get(seq)
+                .map(|ev| pairing_shape(&ev.args, entry.correlation.as_deref(), provenance));
             queues
                 .entry((
                     entry.correlation.clone(),
@@ -1440,7 +1632,7 @@ impl ArgsFreePairing {
                 .or_default()
                 .push_back(*seq);
         }
-        Self { queues }
+        Self { queues, provenance }
     }
 
     /// Pop the next unclaimed recorded twin for `obs`, or `None` if this call
@@ -1451,7 +1643,7 @@ impl ArgsFreePairing {
         let span = obs.span_path.as_deref()?;
         // Same statement first; then the shape-unknown queue, whose events carry
         // no args to compare and so pair as they always did.
-        let shape = pairing_shape(&obs.args);
+        let shape = pairing_shape(&obs.args, obs.correlation_id.as_deref(), self.provenance);
         for candidate in [Some(shape.clone()), None] {
             let key = (
                 obs.correlation_id.clone(),
@@ -2586,7 +2778,10 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         .iter()
         .map(|ev| (ev.global_sequence, ev))
         .collect();
-    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events);
+    // Who supplied each column, per correlation — the stand-in for the row
+    // provenance deja cannot yet name on the payment tables.
+    let column_provenance = correlation_column_provenance(&art.events, &art.observed);
+    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events, &column_provenance);
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
@@ -2600,9 +2795,6 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     let mut schema_default_inherited = 0u64;
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
-    // Who supplied each column, per correlation — the stand-in for the row
-    // provenance deja cannot yet name on the payment tables.
-    let column_provenance = correlation_column_provenance(&art.events, &art.observed);
     // Race evidence needs to be discovered before HTTP body classification:
     // a race can flow into the response body itself. Status mismatches still
     // block evidence up front; body mismatches are neutralized only when their
@@ -6679,6 +6871,8 @@ mod tests {
 
     #[test]
     fn pairing_shape_separates_statements_and_tables_but_not_rekeyed_operands() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
         // A re-keyed write must keep its twin: same statement, different binds.
         let confirm = serde_json::json!({
             "operation": "generic_update_with_results", "table": "payment_attempt",
@@ -6689,8 +6883,8 @@ mod tests {
             "sql": "UPDATE \"payment_attempt\" SET \"status\" = $1 WHERE \"attempt_id\" = $2 \
                     -- binds: [Charged, \"a_9\"]"});
         assert_eq!(
-            pairing_shape(&confirm),
-            pairing_shape(&confirm_rekeyed),
+            shape(&confirm),
+            shape(&confirm_rekeyed),
             "operands live in the binds tail; a re-keyed write must still pair"
         );
 
@@ -6701,7 +6895,7 @@ mod tests {
             "operation": "generic_update_with_results", "table": "payment_attempt",
             "sql": "UPDATE \"payment_attempt\" SET \"connector_transaction_id\" = $1 \
                     WHERE \"attempt_id\" = $2 -- binds: [TxnId(\"D4P\"), \"a_1\"]"});
-        assert_ne!(pairing_shape(&confirm), pairing_shape(&connector_response));
+        assert_ne!(shape(&confirm), shape(&connector_response));
 
         // And a different TABLE must not claim it, with or without SQL — the
         // ledger showed a recorded payment_attempt row scored against an
@@ -6710,17 +6904,17 @@ mod tests {
             "operation": "generic_update_with_results", "table": "payment_intent",
             "sql": "UPDATE \"payment_intent\" SET \"status\" = $1 WHERE \"payment_id\" = $2 \
                     -- binds: [Pending, \"p_1\"]"});
-        assert_ne!(pairing_shape(&confirm), pairing_shape(&intent));
+        assert_ne!(shape(&confirm), shape(&intent));
         assert_ne!(
-            pairing_shape(&serde_json::json!({"table": "payment_attempt"})),
-            pairing_shape(&serde_json::json!({"table": "payment_intent"})),
+            shape(&serde_json::json!({"table": "payment_attempt"})),
+            shape(&serde_json::json!({"table": "payment_intent"})),
             "table identity must survive the no-SQL fallback"
         );
 
         // A re-keyed cache write keeps its twin: `key` is an operand, not identity.
         assert_eq!(
-            pairing_shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
-            pairing_shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "b"}))
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "b"}))
         );
     }
 
@@ -7353,6 +7547,16 @@ mod tests {
         "UPDATE \"payment_intent\" SET \"currency\" = $1, \"business_label\" = $2 WHERE \
         (\"payment_intent\".\"payment_id\" = $3) RETURNING * -- binds: [USD, \"retail\", \"pay_1\"]";
 
+    const PAYMENT_INTENT_UPDATE_BINDING_DESCRIPTION: &str =
+        "UPDATE \"payment_intent\" SET \"currency\" = $1, \"description\" = $2 WHERE \
+        (\"payment_intent\".\"payment_id\" = $3) RETURNING * -- binds: [USD, \"changed\", \
+        \"pay_1\"]";
+
+    const PAYMENT_INTENT_UPDATE_BINDING_LABEL_AND_DESCRIPTION: &str =
+        "UPDATE \"payment_intent\" SET \"currency\" = $1, \"business_label\" = $2, \
+        \"description\" = $3 WHERE (\"payment_intent\".\"payment_id\" = $4) RETURNING * -- binds: \
+        [USD, \"default\", \"changed\", \"pay_1\"]";
+
     /// A correlation whose INSERT created the row and whose UPDATE then returns
     /// it with `business_label` diverging. `also_ran` are extra statements in
     /// the same correlation, which is what the inference is scoped to.
@@ -7529,6 +7733,106 @@ mod tests {
             rows.iter().all(|r| r.kind != "value_diverged"),
             "the ledger must not call blocking what the scorecard called schema-derived"
         );
+    }
+
+    /// The resolved INSERT proves `business_label` schema-derived. The later
+    /// UPDATE misses strict args lookup, so only pairing shape can recover it.
+    fn schema_rekeyed_update_card(observed_update_sql: &str) -> Scorecard {
+        let corr = "c1";
+        let recorded = payment_intent_row(serde_json::Value::Null);
+        let observed = payment_intent_row(serde_json::json!("default"));
+        let insert_event = db_insert_ev(corr, 7, PAYMENT_INTENT_INSERT, recorded.clone());
+        let mut update_event = db_insert_ev(corr, 8, PAYMENT_INTENT_UPDATE, recorded.clone());
+        update_event.method_name = "generic_update_with_results".to_owned();
+
+        let insert_observed = db_exec_obs_with_sql(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            recorded.clone(),
+            observed.clone(),
+        );
+        let mut update_observed = exec_obs_method(
+            "db",
+            Some(corr),
+            "generic_update_with_results",
+            false,
+            None,
+            None,
+            envelope(observed),
+        );
+        update_observed.seed_gap = false;
+        update_observed.args =
+            serde_json::json!({"table": "payment_intent", "sql": observed_update_sql});
+        let update_observed = with_span(update_observed, "root>update_payment_intent");
+
+        detect(&art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_insert",
+                    7,
+                    envelope(recorded.clone()),
+                ),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update_with_results",
+                    8,
+                    envelope(recorded),
+                ),
+                span_entry(Some(corr), 8, "root>update_payment_intent"),
+            ],
+            vec![insert_observed, update_observed],
+            vec![http(corr, true, vec![])],
+            vec![insert_event, update_event],
+        ))
+    }
+
+    #[test]
+    fn schema_derived_set_column_does_not_rekey_args_free_pairing() {
+        let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_LABEL);
+
+        assert_eq!(
+            card.summary.schema_default_divergences, 1,
+            "the resolved INSERT establishes the environment-derived column"
+        );
+        assert_eq!(
+            card.summary.value_divergences, 1,
+            "the UPDATE is one paired call with a value difference"
+        );
+        assert_eq!(card.summary.novel_calls, 0, "not a novel UPDATE");
+        assert_eq!(card.summary.omitted_calls, 0, "not an omitted UPDATE");
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 1);
+    }
+
+    #[test]
+    fn non_schema_derived_set_column_still_separates_pairing() {
+        let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_DESCRIPTION);
+
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.omitted_calls, 1);
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+    }
+
+    #[test]
+    fn mixed_schema_and_non_schema_set_columns_still_separate_pairing() {
+        let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_LABEL_AND_DESCRIPTION);
+
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the non-schema column keeps the observed UPDATE novel"
+        );
+        assert_eq!(
+            card.summary.omitted_calls, 1,
+            "the non-schema column keeps the recorded UPDATE omitted"
+        );
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
     }
 
     /// One `payment_attempt` UPDATE per side at one span, running DIFFERENT
