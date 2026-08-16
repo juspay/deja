@@ -33,7 +33,7 @@
 //! sides for context; the genuine value divergence lives in the HTTP diff stream
 //! and in the novel/omitted set-deltas.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use deja::{Address, BoundaryEvent, ObservedCall};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,8 @@ use super::{
     args_free_effective_values, correlation_column_provenance, event_reply_canon_kind,
     is_nonblocking_boundary, observed_schema_default_divergence, observed_value_diverged,
     omission_is_blocking, schema_default_divergence, tier_for, values_diverge_under_event,
-    InconclusiveRaceEvidence, SchemaDefaultVerdict, Tier, POSITIONAL_FALLBACK_RANK,
+    GraphScoringPlan, InconclusiveRaceEvidence, SchemaDefaultVerdict, Tier,
+    POSITIONAL_FALLBACK_RANK,
 };
 
 /// One side (recorded or observed) of a call, with everything a diff/graph UI
@@ -91,12 +92,17 @@ pub struct CallRecord {
     pub correlation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_event_global_sequence: Option<u64>,
+    /// The recorded event actually served by the replay lookup ladder. Present
+    /// when graph alignment found that serving and structural identity differ;
+    /// `source_event_global_sequence` remains the structurally aligned event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_event_global_sequence: Option<u64>,
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
     /// matched | recovered | novel | omitted | environmental | deterministic |
-    /// value_diverged | order_nondeterministic | idempotent_delete |
-    /// inconclusive_race | schema_default | schema_default_inherited
+    /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
+    /// identity_skew | pruned_subtree | novel_subtree
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
@@ -114,15 +120,9 @@ pub struct CallRecord {
     pub observed: Option<CallSide>,
 }
 
-/// The ledger's snake_case name for a schema-derived row, keeping the
-/// scorecard's distinction between a provenance READ off the statement and one
-/// INFERRED from the correlation's history.
-fn schema_default_row_kind(scorecard_kind: &str) -> String {
-    match scorecard_kind {
-        "SchemaDefaultInherited" => "schema_default_inherited",
-        _ => "schema_default",
-    }
-    .to_owned()
+/// The ledger's snake_case name for a schema-derived INSERT row.
+fn schema_default_row_kind(_scorecard_kind: &str) -> String {
+    "schema_default".to_owned()
 }
 
 fn recorded_side(ev: &BoundaryEvent) -> CallSide {
@@ -179,14 +179,12 @@ pub fn build(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
     table: &deja::LookupTable,
-    order_nondet_demote: &HashSet<u64>,
     idempotent_delete_demote: &HashSet<u64>,
 ) -> Vec<CallRecord> {
     build_with_inconclusive(
         events,
         observed,
         table,
-        order_nondet_demote,
         idempotent_delete_demote,
         &InconclusiveRaceEvidence::default(),
     )
@@ -196,7 +194,6 @@ pub(crate) fn build_with_inconclusive(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
     table: &deja::LookupTable,
-    order_nondet_demote: &HashSet<u64>,
     idempotent_delete_demote: &HashSet<u64>,
     inconclusive_race: &InconclusiveRaceEvidence,
 ) -> Vec<CallRecord> {
@@ -229,7 +226,7 @@ pub(crate) fn build_with_inconclusive(
     // which is the pool the scorecard had already narrowed twice; the two
     // drifted, and a run whose scorecard correctly refused eight pairs shipped a
     // ledger that made them anyway, each marrying two DIFFERENT SQL statements.
-    let mut recorded_pairing = super::ArgsFreePairing::build(table, events);
+    let mut recorded_pairing = super::ArgsFreePairing::build(table, events, &column_provenance);
     // Recorded twins claimed by a value_diverged consequence, so the omitted pass
     // doesn't also flag them (collapses the would-be novel+omitted split).
     let mut paired_consumed: HashSet<u64> = HashSet::new();
@@ -249,15 +246,12 @@ pub(crate) fn build_with_inconclusive(
                 .source_event_global_sequence
                 .and_then(recorded_for)
                 .and_then(CallSide::or_none);
-            // Rules A/B and narrow race recognition demote selected execute
+            // Rule B and narrow race recognition demote selected execute
             // divergences to non-blocking rows, mirroring the scorecard.
             let seq = obs.source_event_global_sequence;
-            let schema_default =
-                observed_schema_default_divergence(obs, source_event, &column_provenance);
+            let schema_default = observed_schema_default_divergence(obs, source_event);
             let (kind, blocking) = if let SchemaDefaultVerdict::Confirmed(d) = &schema_default {
                 (schema_default_row_kind(d.kind()), false)
-            } else if seq.is_some_and(|s| order_nondet_demote.contains(&s)) {
-                ("order_nondeterministic".to_owned(), false)
             } else if seq.is_some_and(|s| idempotent_delete_demote.contains(&s)) {
                 let kind = seq
                     .and_then(|s| by_seq.get(&s).and_then(|ev| event_reply_canon_kind(ev)))
@@ -271,6 +265,7 @@ pub(crate) fn build_with_inconclusive(
             rows.push(CallRecord {
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: obs.source_event_global_sequence,
+                served_event_global_sequence: None,
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -294,7 +289,8 @@ pub(crate) fn build_with_inconclusive(
             && !is_nonblocking_boundary(&obs.boundary)
             && tier_for(&obs.boundary) != Tier::Environmental
         {
-            if let Some(twin_seq) = recorded_pairing.take_twin(obs, &consumed) {
+            if let Some(twin) = recorded_pairing.take_twin(obs, &consumed) {
+                let twin_seq = twin.sequence;
                 paired_consumed.insert(twin_seq);
                 let mut recorded = recorded_for(twin_seq);
                 let mut observed = observed_side(obs);
@@ -324,29 +320,32 @@ pub(crate) fn build_with_inconclusive(
                 let twin_event = by_seq.get(&twin_seq).copied();
                 let (recorded_val, observed_val) =
                     args_free_effective_values(&recorded_result, obs, twin_event);
-                let value_diverged = values_diverge_under_event(
-                    &obs.boundary,
-                    &recorded_val,
-                    &observed_val,
-                    twin_event,
-                );
-                let race_downstream = value_diverged
+                let value_diverged = twin.order_mismatch
+                    || values_diverge_under_event(
+                        &obs.boundary,
+                        &recorded_val,
+                        &observed_val,
+                        twin_event,
+                        obs.args.get("sql").and_then(serde_json::Value::as_str),
+                    );
+                let race_downstream = !twin.order_mismatch
+                    && value_diverged
                     && inconclusive_race
                         .attributable_downstream(obs.correlation_id.as_deref(), &obs.args);
                 // Rule C on the args-free arm, mirroring the scorecard: the two
                 // statements say the schema filled every differing column.
-                let schema_default = value_diverged
+                // Exact later-args evidence is instead always value-diverged and
+                // blocking; equivalent result envelopes cannot absorb the swap.
+                let schema_default = (value_diverged && !twin.order_mismatch)
                     .then(|| {
                         schema_default_divergence(
                             &obs.boundary,
-                            obs.correlation_id.as_deref(),
                             twin_event
                                 .and_then(|ev| ev.args.get("sql"))
                                 .and_then(|s| s.as_str()),
                             obs.args.get("sql").and_then(|s| s.as_str()),
                             &recorded_val,
                             &observed_val,
-                            &column_provenance,
                         )
                     })
                     .and_then(|verdict| match verdict {
@@ -358,6 +357,7 @@ pub(crate) fn build_with_inconclusive(
                 rows.push(CallRecord {
                     correlation_id: obs.correlation_id.clone(),
                     source_event_global_sequence: Some(twin_seq),
+                    served_event_global_sequence: None,
                     boundary: obs.boundary.clone(),
                     trait_name: obs.trait_name.clone(),
                     method_name: obs.method_name.clone(),
@@ -398,6 +398,7 @@ pub(crate) fn build_with_inconclusive(
         rows.push(CallRecord {
             correlation_id: obs.correlation_id.clone(),
             source_event_global_sequence: obs.source_event_global_sequence,
+            served_event_global_sequence: None,
             boundary: obs.boundary.clone(),
             trait_name: obs.trait_name.clone(),
             method_name: obs.method_name.clone(),
@@ -422,6 +423,7 @@ pub(crate) fn build_with_inconclusive(
         rows.push(CallRecord {
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
+            served_event_global_sequence: None,
             boundary: ev.boundary.clone(),
             trait_name: ev.trait_name.clone(),
             method_name: ev.method_name.clone(),
@@ -432,6 +434,327 @@ pub(crate) fn build_with_inconclusive(
             recorded: recorded_for(ev.global_sequence),
             observed: None,
         });
+    }
+
+    rows
+}
+
+/// Build a ledger through the same per-correlation graph/flat seam as the
+/// scorecard. The all-flat arm delegates directly to the legacy builder; mixed
+/// runs remove graph correlations before doing so, so args-free pairing cannot
+/// claim an event owned by graph alignment.
+pub(crate) fn build_with_plan(
+    events: &[BoundaryEvent],
+    observed: &[ObservedCall],
+    table: &deja::LookupTable,
+    idempotent_delete_demote: &HashSet<u64>,
+    inconclusive_race: &InconclusiveRaceEvidence,
+    plan: &GraphScoringPlan,
+) -> Vec<CallRecord> {
+    let graph_correlations: BTreeSet<&str> = events
+        .iter()
+        .filter_map(|event| event.correlation_id.as_deref())
+        .chain(
+            observed
+                .iter()
+                .filter_map(|call| call.correlation_id.as_deref()),
+        )
+        .filter(|correlation_id| plan.is_graph(Some(correlation_id)))
+        .collect();
+
+    if graph_correlations.is_empty() {
+        return build_with_inconclusive(
+            events,
+            observed,
+            table,
+            idempotent_delete_demote,
+            inconclusive_race,
+        );
+    }
+    let by_seq: HashMap<u64, &BoundaryEvent> = events
+        .iter()
+        .map(|event| (event.global_sequence, event))
+        .collect();
+
+    let mut graph_sequence = HashSet::new();
+    let mut graph_observed_indices = HashSet::new();
+    for correlation_id in &graph_correlations {
+        let alignment = plan
+            .alignment(correlation_id)
+            .expect("graph scoring mode owns a reconciled alignment");
+        for row in &alignment.nodes {
+            if plan.alignment_row_uses_flat_tier(correlation_id, row) {
+                continue;
+            }
+            match &row.outcome {
+                deja_forest::NodeOutcome::PrunedSubtree { .. } => {
+                    graph_sequence.extend(plan.alignment_recorded_sequences(correlation_id, row));
+                }
+                deja_forest::NodeOutcome::NovelSubtree { .. } => {
+                    graph_observed_indices
+                        .extend(plan.alignment_replay_indices(correlation_id, row));
+                }
+                deja_forest::NodeOutcome::IdentitySkew {
+                    aligned_event,
+                    served_event,
+                } => {
+                    let sequences = plan.alignment_recorded_sequences(correlation_id, row);
+                    let indices = plan.alignment_replay_indices(correlation_id, row);
+                    if sequences.len() == 1 && indices.len() == 1 {
+                        graph_sequence.extend(aligned_event.iter().copied());
+                        graph_sequence.extend(served_event.iter().copied());
+                        graph_observed_indices.insert(indices[0]);
+                    }
+                }
+                _ => {
+                    let sequences = plan.alignment_recorded_sequences(correlation_id, row);
+                    let indices = plan.alignment_replay_indices(correlation_id, row);
+                    if sequences.len() == 1 && indices.len() == 1 {
+                        graph_sequence.insert(sequences[0]);
+                        graph_observed_indices.insert(indices[0]);
+                    }
+                }
+            }
+        }
+    }
+    graph_sequence.retain(|sequence| {
+        let correlation_id = by_seq
+            .get(sequence)
+            .and_then(|event| event.correlation_id.as_deref());
+        !correlation_id.is_some_and(|id| plan.record_event_uses_flat_tier(id, *sequence))
+    });
+    graph_observed_indices.retain(|index| {
+        let correlation_id = observed[*index].correlation_id.as_deref();
+        !correlation_id.is_some_and(|id| plan.replay_event_uses_flat_tier(id, *index))
+    });
+    let flat_events: Vec<BoundaryEvent> = events
+        .iter()
+        .filter(|event| !graph_sequence.contains(&event.global_sequence))
+        .cloned()
+        .collect();
+    let flat_observed: Vec<ObservedCall> = observed
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !graph_observed_indices.contains(index))
+        .map(|(_, call)| call.clone())
+        .collect();
+    let mut flat_table = table.clone();
+    flat_table
+        .entries
+        .retain(|entry| !graph_sequence.contains(&entry.source_event_global_sequence));
+
+    let mut rows = build_with_inconclusive(
+        &flat_events,
+        &flat_observed,
+        &flat_table,
+        idempotent_delete_demote,
+        inconclusive_race,
+    );
+    let span_paths = recorded_span_paths(table);
+
+    for correlation_id in graph_correlations {
+        let alignment = plan
+            .alignment(correlation_id)
+            .expect("graph scoring mode owns a reconciled alignment");
+        for alignment_row in &alignment.nodes {
+            use deja_forest::NodeOutcome;
+
+            match &alignment_row.outcome {
+                NodeOutcome::PrunedSubtree { events_below } => {
+                    let sequences =
+                        plan.alignment_recorded_sequences(correlation_id, alignment_row);
+                    assert_eq!(sequences.len() as u64, *events_below);
+                    for sequence in sequences {
+                        let event = by_seq[&sequence];
+                        let mut side = recorded_side(event);
+                        side.span_path = span_paths.get(&sequence).cloned();
+                        rows.push(CallRecord {
+                            correlation_id: event.correlation_id.clone(),
+                            source_event_global_sequence: Some(sequence),
+                            served_event_global_sequence: None,
+                            boundary: event.boundary.clone(),
+                            trait_name: event.trait_name.clone(),
+                            method_name: event.method_name.clone(),
+                            kind: "pruned_subtree".to_owned(),
+                            blocking: omission_is_blocking(
+                                event.correlation_id.as_deref(),
+                                &event.boundary,
+                            ),
+                            origin: false,
+                            resolved_rank: None,
+                            recorded: side.or_none(),
+                            observed: None,
+                        });
+                    }
+                }
+                NodeOutcome::NovelSubtree { events_below } => {
+                    let indices = plan.alignment_replay_indices(correlation_id, alignment_row);
+                    assert_eq!(indices.len() as u64, *events_below);
+                    for index in indices {
+                        let call = &observed[index];
+                        rows.push(CallRecord {
+                            correlation_id: call.correlation_id.clone(),
+                            source_event_global_sequence: None,
+                            served_event_global_sequence: None,
+                            boundary: call.boundary.clone(),
+                            trait_name: call.trait_name.clone(),
+                            method_name: call.method_name.clone(),
+                            kind: "novel_subtree".to_owned(),
+                            blocking: tier_for(&call.boundary) != Tier::Environmental
+                                && !is_nonblocking_boundary(&call.boundary),
+                            origin: false,
+                            resolved_rank: call.resolved_rank,
+                            recorded: None,
+                            observed: observed_side(call).or_none(),
+                        });
+                    }
+                }
+                outcome => {
+                    let replay_node = alignment_row
+                        .replay_node
+                        .expect("paired graph outcome has a replay node");
+                    let indices = plan.alignment_replay_indices(correlation_id, alignment_row);
+                    if indices.len() != 1 || !graph_observed_indices.contains(&indices[0]) {
+                        // Multiple events attached to one span have no
+                        // unambiguous event-level graph pairing. The plan marks
+                        // them flat-tier and the legacy builder above owns them.
+                        continue;
+                    }
+                    let call = &observed[indices[0]];
+                    let (aligned_sequence, served_sequence) = match outcome {
+                        NodeOutcome::IdentitySkew {
+                            aligned_event,
+                            served_event,
+                        } => (*aligned_event, *served_event),
+                        _ => (
+                            plan.recorded_sequence_for_replay_node(correlation_id, replay_node),
+                            None,
+                        ),
+                    };
+                    let aligned_event = aligned_sequence.and_then(|seq| by_seq.get(&seq).copied());
+                    let mut recorded = aligned_event.map(recorded_side);
+                    if let (Some(sequence), Some(side)) = (aligned_sequence, recorded.as_mut()) {
+                        side.span_path = span_paths.get(&sequence).cloned();
+                    }
+
+                    let computed_divergence = match outcome {
+                        NodeOutcome::ValueDiverged { origin } => Some(*origin),
+                        NodeOutcome::Matched if observed_value_diverged(call, aligned_event) => {
+                            Some(true)
+                        }
+                        NodeOutcome::Matched if !call.resolved => aligned_event.and_then(|event| {
+                            let (recorded_value, observed_value) =
+                                args_free_effective_values(&event.result, call, Some(event));
+                            values_diverge_under_event(
+                                &call.boundary,
+                                &recorded_value,
+                                &observed_value,
+                                Some(event),
+                                call.args.get("sql").and_then(serde_json::Value::as_str),
+                            )
+                            .then_some(false)
+                        }),
+                        _ => None,
+                    };
+                    let mut observed = observed_side(call);
+                    let (kind, blocking, origin) =
+                        if matches!(outcome, NodeOutcome::IdentitySkew { .. }) {
+                            ("identity_skew".to_owned(), true, false)
+                        } else if computed_divergence == Some(true) {
+                            let schema_default =
+                                observed_schema_default_divergence(call, aligned_event);
+                            let (kind, blocking) =
+                                if let SchemaDefaultVerdict::Confirmed(divergence) = schema_default
+                                {
+                                    (schema_default_row_kind(divergence.kind()), false)
+                                } else if aligned_sequence
+                                    .is_some_and(|seq| idempotent_delete_demote.contains(&seq))
+                                {
+                                    let kind = aligned_event
+                                        .and_then(event_reply_canon_kind)
+                                        .unwrap_or_else(|| "idempotent_delete".to_owned());
+                                    (kind, false)
+                                } else if aligned_sequence
+                                    .is_some_and(|seq| inconclusive_race.contains(&seq))
+                                {
+                                    ("inconclusive_race".to_owned(), false)
+                                } else {
+                                    ("value_diverged".to_owned(), true)
+                                };
+                            (kind, blocking, true)
+                        } else if computed_divergence == Some(false) {
+                            let event =
+                                aligned_event.expect("aligned divergence owns a recorded event");
+                            let (recorded_value, observed_value) =
+                                args_free_effective_values(&event.result, call, Some(event));
+                            if matches!(
+                                recorded.as_ref().and_then(|side| side.result.as_ref()),
+                                None | Some(serde_json::Value::Null)
+                            ) && matches!(
+                                observed.result.as_ref(),
+                                None | Some(serde_json::Value::Null)
+                            ) {
+                                observed.result = call.args.get("value").cloned();
+                                if let Some(side) = recorded.as_mut() {
+                                    side.result = side
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("value"))
+                                        .cloned();
+                                }
+                            }
+                            let schema_default = schema_default_divergence(
+                                &call.boundary,
+                                event.args.get("sql").and_then(|sql| sql.as_str()),
+                                call.args.get("sql").and_then(|sql| sql.as_str()),
+                                &recorded_value,
+                                &observed_value,
+                            );
+                            let schema_kind = match schema_default {
+                                SchemaDefaultVerdict::Confirmed(divergence) => {
+                                    Some(schema_default_row_kind(divergence.kind()))
+                                }
+                                _ => None,
+                            };
+                            let race_downstream = inconclusive_race.attributable_downstream(
+                                call.correlation_id.as_deref(),
+                                &call.args,
+                            );
+                            let blocking = schema_kind.is_none() && !race_downstream;
+                            let kind = schema_kind.unwrap_or_else(|| {
+                                if race_downstream {
+                                    "inconclusive_race".to_owned()
+                                } else {
+                                    "value_diverged".to_owned()
+                                }
+                            });
+                            (kind, blocking, false)
+                        } else {
+                            let recovered = call.resolved_rank == Some(POSITIONAL_FALLBACK_RANK);
+                            (
+                                if recovered { "recovered" } else { "matched" }.to_owned(),
+                                false,
+                                false,
+                            )
+                        };
+
+                    rows.push(CallRecord {
+                        correlation_id: call.correlation_id.clone(),
+                        source_event_global_sequence: aligned_sequence,
+                        served_event_global_sequence: served_sequence,
+                        boundary: call.boundary.clone(),
+                        trait_name: call.trait_name.clone(),
+                        method_name: call.method_name.clone(),
+                        kind,
+                        blocking,
+                        origin,
+                        resolved_rank: call.resolved_rank,
+                        recorded: recorded.and_then(CallSide::or_none),
+                        observed: observed.or_none(),
+                    });
+                }
+            }
+        }
     }
 
     rows
@@ -609,7 +932,6 @@ mod tests {
             &observed,
             &table_for(&events, &spans),
             &HashSet::new(),
-            &HashSet::new(),
         );
 
         let matched = find(&rows, "matched");
@@ -651,7 +973,6 @@ mod tests {
             &[obs("db", Some("c1"), true, Some(6), Some(1))],
             &table_for(&events, &HashMap::new()),
             &HashSet::new(),
-            &HashSet::new(),
         );
         assert_eq!(find(&rows, "recovered").len(), 1);
         assert!(find(&rows, "matched").is_empty());
@@ -666,7 +987,6 @@ mod tests {
                 obs("time", Some("c1"), false, None, None),
             ],
             &table_for(&[], &HashMap::new()),
-            &HashSet::new(),
             &HashSet::new(),
         );
         assert_eq!(find(&rows, "environmental").len(), 1);

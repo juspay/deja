@@ -585,6 +585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "deja-forest"
+version = "0.1.0"
+dependencies = [
+ "deja-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "deja-kernel"
 version = "0.1.0"
 dependencies = [
@@ -604,6 +613,7 @@ dependencies = [
  "deja-compactor",
  "deja-context",
  "deja-core",
+ "deja-forest",
  "deja-kernel",
  "deja-store",
  "flate2",

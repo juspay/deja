@@ -1,14 +1,11 @@
 //! Post-hoc divergence detector + scorecard renderer (V1 full mock).
 //!
-//! Consumes three artifacts produced during a replay run and reconciles the
-//! orchestrator's model of what SHOULD have happened (the lookup table, itself
-//! rendered from the recording) with what the candidate ACTUALLY did (its
-//! `ObservedCall` stream) and how its HTTP responses compared (the kernel's
-//! `HttpDiff` stream):
-//!
-//!   - lookup table   → `HarnessRoot::lookup_table_path(run_id)`
-//!   - observed calls → `HarnessRoot::observed_path(run_id)`
-//!   - http diffs     → `HarnessRoot::http_diff_path(run_id)`
+//! Consumes the replay artifacts and reconciles the orchestrator's model of
+//! what SHOULD have happened (the lookup table, itself rendered from the
+//! recording) with what the candidate ACTUALLY did (its `ObservedCall` stream)
+//! and how its HTTP responses compared (the kernel's `HttpDiff` stream).
+//! Raw record/replay execution-graph nodes are carried alongside those inputs
+//! for downstream reporting but do not participate in classification.
 //!
 //! Classification (V1):
 //!   - resolved hit                         → matched (recorded per address rank)
@@ -18,12 +15,8 @@
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!   - table entry the candidate never hit  → OmittedCall (blocking)
 //!     …uncorrelated, or non-blocking       → OmittedCallTolerated
-//!   - db value diff confined to columns
-//!     both statements fill with `DEFAULT`  → SchemaDefaultDivergence (tolerated)
-//!     …the statement wrote none of them, and
-//!     the correlation's history says the
-//!     schema did                           → SchemaDefaultInherited (tolerated)
-//!   - http status / body diffs             → StatusMismatch / BodyMismatch
+//!   - schema-derived DB/response occurrences → SchemaDefaultDivergence (tolerated)
+//!   - http status / unabsorbed body diffs    → StatusMismatch / BodyMismatch
 //!
 //! Every classification lands in `per_boundary`, and the summary's counters are
 //! FOLDS of that table (see [`Scorecard::counter_disagreements`]) rather than
@@ -40,7 +33,8 @@
 //! scaffold for that work and are always false here.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io;
+use std::fmt::Write as _;
+use std::io::{self, BufRead};
 
 use deja::{Address, LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
 use deja_kernel::{HttpDiff, JsonFieldDiff};
@@ -167,7 +161,7 @@ pub struct Summary {
     /// several — so the two are deliberately not the same number.
     pub http_body_mismatches: u64,
     /// Every blocking side-effect divergence:
-    /// `omitted_calls + novel_calls + value_divergences`.
+    /// `omitted_calls + novel_calls + value_divergences + identity_skews`.
     pub side_effect_divergences: u64,
     pub matched_side_effect_calls: u64,
     /// BLOCKING omissions: recorded calls the candidate never made, on a
@@ -205,23 +199,24 @@ pub struct Summary {
     /// here. Calls resolved by lookup/substitution keep observed == recorded.
     #[serde(default)]
     pub value_divergences: u64,
-    /// Execute-mode value differences DEMOTED to a non-blocking warning because
-    /// they are order-nondeterminism artifacts: two concurrent writes to the SAME
-    /// correlation+table+primary-key row (overlapping wall-clock windows) whose
-    /// final row state (a matched write) reproduces the recorded final state, so an
-    /// earlier write's `RETURNING` row differs only by interleaving. NOT counted in
-    /// `value_divergences`/`side_effect_divergences`; does NOT fail the verdict.
+    /// Graph alignments whose serving identity disagreed with their structural
+    /// counterpart. Projection of `per_boundary[*].kinds["IdentitySkew"]`.
+    #[serde(default)]
+    pub identity_skews: u64,
+    /// Legacy persisted-scorecard field. UPDATE results now compare only columns
+    /// assigned by the statement, so inherited-row ordering noise is equivalent
+    /// directly and every remaining UPDATE value mismatch is blocking. New
+    /// scorecards always write zero.
     #[serde(default)]
     pub order_nondeterminism_warnings: u64,
-    /// Db value divergences classified as SCHEMA-DERIVED: every column that
-    /// differed was one the statement filled with the literal SQL keyword
-    /// `DEFAULT`, on both the recorded and the observed side, so the value came
-    /// from the schema and not from the application. These are evidence that the
-    /// two databases disagree about a column default — a fact about the
-    /// environment — so they are counted and named here rather than counted in
-    /// `value_divergences`/`side_effect_divergences`, and they do NOT fail the
-    /// verdict. A divergence touching one bound (`$n`) column as well stays
-    /// blocking; see `schema_default_divergence`.
+    /// Schema-derived DB and response occurrences. DB INSERT evidence is
+    /// confirmed only when every differing column was filled with literal SQL
+    /// `DEFAULT` by both statements. That same established provenance may
+    /// absorb a response leaf with the same column name only in the same
+    /// correlation. These occurrences describe an environment/schema
+    /// difference, not an application divergence, so they are named here
+    /// instead of `value_divergences` or `side_effect_divergences` and do not
+    /// fail the verdict. UPDATE assigned-column mismatches remain strict.
     #[serde(default)]
     pub schema_default_divergences: u64,
     /// Redis idempotent-delete divergences DEMOTED to a non-blocking warning: a
@@ -305,6 +300,9 @@ pub struct CorrelationOutcome {
     pub http_status_match: bool,
     pub http_body_match: bool,
     pub side_effect_divergences: u64,
+    pub scoring_mode: deja_forest::ScoringMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<deja_forest::Alignment>,
     pub passed: bool,
 }
 
@@ -367,13 +365,17 @@ impl Scorecard {
             }
         };
         let s = &self.summary;
-        folds("omitted_calls", s.omitted_calls, &["OmittedCall"]);
+        folds(
+            "omitted_calls",
+            s.omitted_calls,
+            &["OmittedCall", "PrunedSubtree"],
+        );
         folds(
             "omitted_calls_tolerated",
             s.omitted_calls_tolerated,
             &["OmittedCallTolerated"],
         );
-        folds("novel_calls", s.novel_calls, &["NovelCall"]);
+        folds("novel_calls", s.novel_calls, &["NovelCall", "NovelSubtree"]);
         folds(
             "novel_calls_tolerated",
             s.novel_calls_tolerated,
@@ -389,6 +391,7 @@ impl Scorecard {
             s.value_divergences,
             &["ValueDivergedOrigin", "ValueDiverged"],
         );
+        folds("identity_skews", s.identity_skews, &["IdentitySkew"]);
         folds(
             "inconclusive_seed_gaps",
             s.inconclusive_seed_gaps,
@@ -407,7 +410,7 @@ impl Scorecard {
         folds(
             "schema_default_divergences",
             s.schema_default_divergences,
-            &["SchemaDefaultDivergence", "SchemaDefaultInherited"],
+            &["SchemaDefaultDivergence"],
         );
         folds(
             "undeclared_concurrency_warnings",
@@ -428,10 +431,10 @@ impl Scorecard {
         // The headline number: every blocking side-effect divergence, and
         // nothing else. A demotion that stopped excluding itself here would show
         // up as a verdict nobody could account for from the breakdown.
-        let blocking = s.omitted_calls + s.novel_calls + s.value_divergences;
+        let blocking = s.omitted_calls + s.novel_calls + s.value_divergences + s.identity_skews;
         if s.side_effect_divergences != blocking {
             out.push(format!(
-                "summary.side_effect_divergences = {}, but omitted + novel + value = {blocking}",
+                "summary.side_effect_divergences = {}, but omitted + novel + value + identity = {blocking}",
                 s.side_effect_divergences
             ));
         }
@@ -479,13 +482,18 @@ impl Scorecard {
 // Detection
 // ---------------------------------------------------------------------------
 
-/// The three artifact streams a run produces, loaded into memory.
+/// The artifact streams a run produces, loaded into memory.
 pub struct RunArtifacts {
     pub run_id: String,
     pub recording_id: Option<String>,
     pub table: LookupTable,
     pub observed: Vec<ObservedCall>,
     pub http_diffs: Vec<HttpDiff>,
+    /// Raw record-side execution graph. `None` means unavailable or refused;
+    /// `Some(Vec::new())` means the artifact was present but empty.
+    pub record_graph: Option<Vec<deja_core::ExecutionGraphNode>>,
+    /// Raw replay-side execution graph, in observed-stream order.
+    pub replay_graph: Vec<deja_core::ExecutionGraphNode>,
     /// The recording's semantic events (recorded side). Carried so the classifier
     /// can reason about wall-clock windows + row identity for the concurrent
     /// same-row write (order-nondeterminism) demotion. Empty when unavailable.
@@ -498,6 +506,524 @@ pub struct RunArtifacts {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct GraphCorrelationPlan {
+    pruned_record_events: HashSet<u64>,
+    novel_replay_events: HashSet<usize>,
+    scoring_mode: deja_forest::ScoringMode,
+    alignment: Option<deja_forest::Alignment>,
+    record: Option<deja_forest::ActivationForest>,
+    replay: Option<deja_forest::ActivationForest>,
+    flat_replay_nodes: HashSet<u64>,
+    flat_record_nodes: HashSet<u64>,
+    flat_record_events: HashSet<u64>,
+    flat_replay_events: HashSet<usize>,
+}
+
+/// The single record/replay graph seam shared by scorecard and call-ledger
+/// classification. Replay forest event sequences are stable indices into
+/// `RunArtifacts::observed`; record forest event sequences are tape-global
+/// boundary-event sequences.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GraphScoringPlan {
+    correlations: BTreeMap<String, GraphCorrelationPlan>,
+}
+
+impl GraphScoringPlan {
+    pub(crate) fn build(art: &RunArtifacts) -> Self {
+        let mut correlation_ids = BTreeSet::new();
+        correlation_ids.extend(
+            art.http_diffs
+                .iter()
+                .map(|diff| diff.correlation_id.clone()),
+        );
+        correlation_ids.extend(
+            art.events
+                .iter()
+                .filter_map(|event| event.correlation_id.clone()),
+        );
+        correlation_ids.extend(
+            art.observed
+                .iter()
+                .filter_map(|observed| observed.correlation_id.clone()),
+        );
+        correlation_ids.extend(
+            art.record_graph
+                .iter()
+                .flatten()
+                .filter_map(|node| node.correlation_id.clone()),
+        );
+        correlation_ids.extend(
+            art.replay_graph
+                .iter()
+                .filter_map(|node| node.correlation_id.clone()),
+        );
+
+        let mut correlations = BTreeMap::new();
+        for correlation_id in correlation_ids {
+            let record_build = art.record_graph.as_ref().map(|nodes| {
+                let nodes: Vec<_> = nodes
+                    .iter()
+                    .filter(|node| node.correlation_id.as_deref() == Some(correlation_id.as_str()))
+                    .cloned()
+                    .collect();
+                let events: Vec<_> = art
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.correlation_id.as_deref() == Some(correlation_id.as_str())
+                    })
+                    .map(|event| deja_forest::EventRef {
+                        global_sequence: event.global_sequence,
+                        graph_node_id: event.graph_node_id,
+                        correlation_id_present: true,
+                    })
+                    .collect();
+                deja_forest::build(&nodes, &events).inspect(|set| {
+                    set.balance(events.len() as u64)
+                        .expect("record forest balance changed after construction");
+                })
+            });
+            let replay_nodes: Vec<_> = art
+                .replay_graph
+                .iter()
+                .filter(|node| node.correlation_id.as_deref() == Some(correlation_id.as_str()))
+                .cloned()
+                .collect();
+            let replay_events: Vec<_> = art
+                .observed
+                .iter()
+                .enumerate()
+                .filter(|(_, observed)| {
+                    observed.correlation_id.as_deref() == Some(correlation_id.as_str())
+                })
+                .map(|(index, observed)| deja_forest::EventRef {
+                    global_sequence: index as u64,
+                    graph_node_id: observed.graph_node_id,
+                    correlation_id_present: true,
+                })
+                .collect();
+            let replay_build = deja_forest::build(&replay_nodes, &replay_events).inspect(|set| {
+                set.balance(replay_events.len() as u64)
+                    .expect("replay forest balance changed after construction");
+            });
+            let record = record_build
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|set| set.by_correlation.get(&correlation_id))
+                .cloned();
+            let replay = replay_build
+                .as_ref()
+                .ok()
+                .and_then(|set| set.by_correlation.get(&correlation_id))
+                .cloned();
+            let cycle = record_build
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .is_some_and(|set| set.unusable.contains_key(&correlation_id))
+                || replay_build
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|set| set.unusable.contains_key(&correlation_id));
+            let reason = if cycle {
+                Some(deja_forest::FlatReason::CycleDetected)
+            } else if record.is_none() || replay.is_none() {
+                Some(deja_forest::FlatReason::MissingForest)
+            } else if event_bearing_ingress_root(
+                record
+                    .as_ref()
+                    .expect("missing record forest handled above"),
+            ) != event_bearing_ingress_root(
+                replay
+                    .as_ref()
+                    .expect("missing replay forest handled above"),
+            ) {
+                Some(deja_forest::FlatReason::IngressRootAsymmetry)
+            } else {
+                None
+            };
+            let flat_record_events: HashSet<u64> = record_build
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(|set| {
+                    set.annex
+                        .names_no_node
+                        .iter()
+                        .chain(&set.annex.names_absent_node)
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let flat_replay_events: HashSet<usize> = replay_build
+                .as_ref()
+                .ok()
+                .map(|set| {
+                    set.annex
+                        .names_no_node
+                        .iter()
+                        .chain(&set.annex.names_absent_node)
+                        .map(|index| *index as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let (scoring_mode, alignment, flat_replay_nodes, flat_record_nodes) =
+                if let Some(reason) = reason {
+                    (
+                        deja_forest::ScoringMode::Flat { reason },
+                        None,
+                        HashSet::new(),
+                        HashSet::new(),
+                    )
+                } else {
+                    let record_forest = record.as_ref().expect("graph mode has a record forest");
+                    let replay_forest = replay.as_ref().expect("graph mode has a replay forest");
+                    let mut alignment = deja_forest::align(record_forest, replay_forest);
+                    alignment
+                        .flat_tier_events
+                        .extend(flat_record_events.iter().copied());
+                    alignment
+                        .flat_tier_events
+                        .extend(flat_replay_events.iter().map(|index| *index as u64));
+                    alignment.flat_tier_events.sort_unstable();
+                    alignment.flat_tier_events.dedup();
+                    let mut flat_replay_nodes = HashSet::new();
+                    let mut flat_record_nodes = HashSet::new();
+                    let mut paired_fallback_metadata = Vec::new();
+                    for row in &alignment.nodes {
+                        let (Some(record_node), Some(replay_node)) =
+                            (row.record_node, row.replay_node)
+                        else {
+                            continue;
+                        };
+                        if record_forest.nodes[&record_node].events.len() != 1
+                            || replay_forest.nodes[&replay_node].events.len() != 1
+                        {
+                            flat_record_nodes.insert(record_node);
+                            flat_replay_nodes.insert(replay_node);
+                            paired_fallback_metadata
+                                .extend(record_forest.nodes[&record_node].events.iter().copied());
+                            paired_fallback_metadata
+                                .extend(replay_forest.nodes[&replay_node].events.iter().copied());
+                        }
+                    }
+                    alignment.flat_tier_events.extend(paired_fallback_metadata);
+                    alignment.flat_tier_events.sort_unstable();
+                    alignment.flat_tier_events.dedup();
+                    let served: BTreeMap<u64, u64> = replay_forest
+                        .nodes
+                        .values()
+                        .filter(|node| !flat_replay_nodes.contains(&node.node_id))
+                        .filter_map(|node| match node.events.as_slice() {
+                            [index] => art
+                                .observed
+                                .get(*index as usize)
+                                .and_then(|observed| observed.source_event_global_sequence)
+                                .map(|sequence| (node.node_id, sequence)),
+                            _ => None,
+                        })
+                        .collect();
+                    deja_forest::reconcile_serving(&mut alignment, &served, record_forest);
+                    let record_skeleton_nodes = record_forest
+                        .nodes
+                        .values()
+                        .filter(|node| node.subtree_events > 0)
+                        .count() as u64;
+                    let replay_skeleton_nodes = replay_forest
+                        .nodes
+                        .values()
+                        .filter(|node| node.subtree_events > 0)
+                        .count() as u64;
+                    alignment
+                        .balance(record_skeleton_nodes, replay_skeleton_nodes)
+                        .expect("graph alignment must account for both event-bearing skeletons");
+                    (
+                        deja_forest::ScoringMode::Graph,
+                        Some(alignment),
+                        flat_replay_nodes,
+                        flat_record_nodes,
+                    )
+                };
+            let mut pruned_record_events = HashSet::new();
+            let mut novel_replay_events = HashSet::new();
+            if let Some(alignment) = &alignment {
+                for row in &alignment.nodes {
+                    match &row.outcome {
+                        deja_forest::NodeOutcome::PrunedSubtree { .. } => {
+                            if let (Some(forest), Some(node)) = (&record, row.record_node) {
+                                pruned_record_events
+                                    .extend(forest_event_sequences(forest, node, true));
+                            }
+                        }
+                        deja_forest::NodeOutcome::NovelSubtree { .. } => {
+                            if let (Some(forest), Some(node)) = (&replay, row.replay_node) {
+                                novel_replay_events.extend(
+                                    forest_event_sequences(forest, node, true)
+                                        .into_iter()
+                                        .map(|index| index as usize),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            correlations.insert(
+                correlation_id,
+                GraphCorrelationPlan {
+                    scoring_mode,
+                    alignment,
+                    record,
+                    replay,
+                    flat_replay_nodes,
+                    flat_record_nodes,
+                    flat_record_events,
+                    flat_replay_events,
+                    pruned_record_events,
+                    novel_replay_events,
+                },
+            );
+        }
+        Self { correlations }
+    }
+
+    pub(crate) fn mode(&self, correlation_id: &str) -> Option<&deja_forest::ScoringMode> {
+        self.correlations
+            .get(correlation_id)
+            .map(|entry| &entry.scoring_mode)
+    }
+
+    pub(crate) fn alignment(&self, correlation_id: &str) -> Option<&deja_forest::Alignment> {
+        self.correlations
+            .get(correlation_id)
+            .and_then(|entry| entry.alignment.as_ref())
+    }
+
+    pub(crate) fn is_graph(&self, correlation_id: Option<&str>) -> bool {
+        correlation_id
+            .and_then(|id| self.mode(id))
+            .is_some_and(|mode| matches!(mode, deja_forest::ScoringMode::Graph))
+    }
+
+    pub(crate) fn alignment_row_for_replay_node(
+        &self,
+        correlation_id: &str,
+        replay_node: u64,
+    ) -> Option<&deja_forest::AlignedNode> {
+        self.alignment(correlation_id)?
+            .nodes
+            .iter()
+            .find(|row| row.replay_node == Some(replay_node))
+    }
+
+    pub(crate) fn recorded_sequence_for_replay_node(
+        &self,
+        correlation_id: &str,
+        replay_node: u64,
+    ) -> Option<u64> {
+        let entry = self.correlations.get(correlation_id)?;
+        let record_node = self
+            .alignment_row_for_replay_node(correlation_id, replay_node)?
+            .record_node?;
+        let events = &entry.record.as_ref()?.nodes.get(&record_node)?.events;
+        (events.len() == 1).then(|| events[0])
+    }
+
+    pub(crate) fn replay_node_uses_flat_tier(
+        &self,
+        correlation_id: &str,
+        replay_node: u64,
+    ) -> bool {
+        self.correlations
+            .get(correlation_id)
+            .is_some_and(|entry| entry.flat_replay_nodes.contains(&replay_node))
+    }
+
+    pub(crate) fn alignment_row_uses_flat_tier(
+        &self,
+        correlation_id: &str,
+        row: &deja_forest::AlignedNode,
+    ) -> bool {
+        self.correlations.get(correlation_id).is_some_and(|entry| {
+            row.record_node
+                .is_some_and(|node| entry.flat_record_nodes.contains(&node))
+                || row
+                    .replay_node
+                    .is_some_and(|node| entry.flat_replay_nodes.contains(&node))
+        })
+    }
+
+    pub(crate) fn record_event_uses_flat_tier(&self, correlation_id: &str, sequence: u64) -> bool {
+        self.correlations
+            .get(correlation_id)
+            .is_some_and(|entry| entry.flat_record_events.contains(&sequence))
+    }
+
+    fn recorded_event_is_pruned(&self, correlation_id: &str, sequence: u64) -> bool {
+        self.correlations
+            .get(correlation_id)
+            .is_some_and(|entry| entry.pruned_record_events.contains(&sequence))
+    }
+
+    fn replay_event_is_novel(&self, correlation_id: &str, index: usize) -> bool {
+        self.correlations
+            .get(correlation_id)
+            .is_some_and(|entry| entry.novel_replay_events.contains(&index))
+    }
+
+    pub(crate) fn replay_event_uses_flat_tier(&self, correlation_id: &str, index: usize) -> bool {
+        self.correlations
+            .get(correlation_id)
+            .is_some_and(|entry| entry.flat_replay_events.contains(&index))
+    }
+
+    pub(crate) fn recorded_event_sequences(
+        &self,
+        correlation_id: &str,
+        record_node: u64,
+        include_subtree: bool,
+    ) -> Vec<u64> {
+        let Some(forest) = self
+            .correlations
+            .get(correlation_id)
+            .and_then(|entry| entry.record.as_ref())
+        else {
+            return Vec::new();
+        };
+        forest_event_sequences(forest, record_node, include_subtree)
+    }
+
+    pub(crate) fn replay_event_indices(
+        &self,
+        correlation_id: &str,
+        replay_node: u64,
+        include_subtree: bool,
+    ) -> Vec<usize> {
+        let Some(forest) = self
+            .correlations
+            .get(correlation_id)
+            .and_then(|entry| entry.replay.as_ref())
+        else {
+            return Vec::new();
+        };
+        forest_event_sequences(forest, replay_node, include_subtree)
+            .into_iter()
+            .map(|index| index as usize)
+            .collect()
+    }
+
+    pub(crate) fn alignment_recorded_sequences(
+        &self,
+        correlation_id: &str,
+        row: &deja_forest::AlignedNode,
+    ) -> Vec<u64> {
+        row.record_node
+            .map(|node| {
+                self.recorded_event_sequences(
+                    correlation_id,
+                    node,
+                    matches!(&row.outcome, deja_forest::NodeOutcome::PrunedSubtree { .. }),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn alignment_replay_indices(
+        &self,
+        correlation_id: &str,
+        row: &deja_forest::AlignedNode,
+    ) -> Vec<usize> {
+        row.replay_node
+            .map(|node| {
+                self.replay_event_indices(
+                    correlation_id,
+                    node,
+                    matches!(&row.outcome, deja_forest::NodeOutcome::NovelSubtree { .. }),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn scored_alignment(
+        &self,
+        correlation_id: &str,
+        divergent_nodes: Option<&HashSet<u64>>,
+    ) -> Option<deja_forest::Alignment> {
+        let entry = self.correlations.get(correlation_id)?;
+        let mut alignment = entry.alignment.clone()?;
+        let Some(divergent_nodes) = divergent_nodes else {
+            return Some(alignment);
+        };
+        let replay = entry.replay.as_ref()?;
+        for row in &mut alignment.nodes {
+            let Some(replay_node) = row.replay_node else {
+                continue;
+            };
+            if !divergent_nodes.contains(&replay_node)
+                || matches!(&row.outcome, deja_forest::NodeOutcome::IdentitySkew { .. })
+            {
+                continue;
+            }
+            let mut parent = replay.nodes[&replay_node].parent_id;
+            let mut origin = true;
+            while let Some(parent_id) = parent {
+                if divergent_nodes.contains(&parent_id) {
+                    origin = false;
+                    break;
+                }
+                parent = replay.nodes.get(&parent_id).and_then(|node| node.parent_id);
+            }
+            row.outcome = deja_forest::NodeOutcome::ValueDiverged { origin };
+        }
+        Some(alignment)
+    }
+}
+
+fn event_bearing_ingress_root(forest: &deja_forest::ActivationForest) -> bool {
+    forest.roots.iter().any(|root| {
+        let node = &forest.nodes[root];
+        node.span_name == "deja::http_incoming" && node.subtree_events > 0
+    })
+}
+
+fn forest_event_sequences(
+    forest: &deja_forest::ActivationForest,
+    root: u64,
+    include_subtree: bool,
+) -> Vec<u64> {
+    let mut events = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node_id) = pending.pop() {
+        let node = forest
+            .nodes
+            .get(&node_id)
+            .expect("alignment names a node in its forest");
+        events.extend(node.events.iter().copied());
+        if include_subtree {
+            pending.extend(node.children.iter().rev().copied());
+        }
+    }
+    events.sort_unstable();
+    events
+}
+fn graph_identity_skew(
+    plan: &GraphScoringPlan,
+    observed: &ObservedCall,
+) -> Option<(Option<u64>, Option<u64>)> {
+    let correlation_id = observed.correlation_id.as_deref()?;
+    if !plan.is_graph(Some(correlation_id)) {
+        return None;
+    }
+    let row = plan.alignment_row_for_replay_node(correlation_id, observed.graph_node_id?)?;
+    match &row.outcome {
+        deja_forest::NodeOutcome::IdentitySkew {
+            aligned_event,
+            served_event,
+        } => Some((*aligned_event, *served_event)),
+        _ => None,
+    }
+}
+
 /// Get-or-create a boundary's stats, stamping its tier (and an egress note) the
 /// first time it is seen.
 /// Whether a boundary tag is the database channel (which assigns serial PKs).
@@ -505,9 +1031,15 @@ fn is_db_boundary(boundary: &str) -> bool {
     matches!(boundary, "db" | "storage")
 }
 
+fn graph_recorded_event_is_pruned(
+    plan: &GraphScoringPlan,
+    correlation_id: &str,
+    sequence: u64,
+) -> bool {
+    plan.recorded_event_is_pruned(correlation_id, sequence)
+}
+
 /// Two db results are equivalent modulo replay-local DB infrastructure.
-///
-/// Normalizations are deliberately narrow:
 /// - integer `id` fields are postgres SERIAL values assigned by the replay DB's
 ///   fresh sequence;
 /// - structured DB `Err` payloads compare by stable `kind`; their `message` is
@@ -685,11 +1217,23 @@ fn parse_write_statement(sql: &str) -> Option<WriteStatement> {
             Some(at) => &rest[..at],
             None => rest,
         };
-        let (schema_filled, application_filled) = split_provenance(
-            split_top_level(assignments)
-                .into_iter()
-                .filter_map(split_assignment),
-        );
+        let assignments = split_top_level(assignments);
+        if assignments.is_empty() {
+            return None;
+        }
+        let (mut schema_filled, mut application_filled) = (BTreeSet::new(), BTreeSet::new());
+        for assignment in assignments {
+            let (column, value) = split_assignment(assignment)?;
+            let column = unquote_identifier(column)?;
+            if value.trim().is_empty() {
+                return None;
+            }
+            if is_default_keyword(value) {
+                schema_filled.insert(column);
+            } else {
+                application_filled.insert(column);
+            }
+        }
         Some(WriteStatement {
             kind: WriteKind::Update,
             table,
@@ -867,115 +1411,83 @@ fn db_row_column_diff(
     )
 }
 
-/// Who supplied each column, per correlation and table, across every statement
-/// the run ran on either side.
-///
-/// This exists because a returned row is not only what its own statement wrote.
-/// An `UPDATE … RETURNING` hands back the whole row, so a column the statement
-/// never mentions comes back carrying INHERITED state — whatever put it there
-/// earlier. Attributing that value needs the row's history, and deja cannot
-/// currently name a `payment_intent` row (RC4: the payment tables record no
-/// typed row keys, because `binds_read_keys` looks for `"merchant_id" = $` and
-/// their predicate is `"processor_merchant_id" = $n`). The CORRELATION is the
-/// available approximation of the row: one request's statements.
-///
-/// So this index is a stand-in for a row-provenance index deja should have
-/// anyway, and it is deliberately built to fail closed:
-///   - `bound` is the union across BOTH sides — one statement anywhere in the
-///     correlation supplying a value disqualifies the column for the whole
-///     correlation, in either direction and regardless of order.
-///   - `inserted_schema_filled` requires the row's CREATION to be in scope. A
-///     correlation that only updates a pre-existing row proves nothing about
-///     where that row's untouched columns came from — they may have come from
-///     the seed — so it yields no claim at all.
+/// Schema-derived columns proven by resolved INSERT divergences, keyed by
+/// correlation and table. This is the pairing-shape authority: later UPDATE
+/// shapes may omit only columns established by the direct INSERT evidence.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CorrelationColumnProvenance {
-    /// (correlation, table) -> columns some INSERT left to the schema.
-    inserted_schema_filled: HashMap<(String, String), BTreeSet<String>>,
-    /// (correlation, table) -> columns some statement supplied a value for.
-    bound: HashMap<(String, String), BTreeSet<String>>,
+    established_schema_derived: HashMap<(String, String), BTreeSet<String>>,
 }
 
 impl CorrelationColumnProvenance {
-    fn observe(&mut self, correlation: Option<&str>, sql: Option<&str>) {
-        let (Some(correlation), Some(statement)) =
-            (correlation, sql.and_then(parse_write_statement))
-        else {
+    fn establish_schema_default(
+        &mut self,
+        correlation: Option<&str>,
+        divergence: &SchemaDefaultDivergence,
+    ) {
+        let Some(correlation) = correlation else {
             return;
         };
-        let key = (correlation.to_owned(), statement.table.clone());
-        if statement.kind == WriteKind::Insert {
-            self.inserted_schema_filled
-                .entry(key.clone())
-                .or_default()
-                .extend(statement.schema_filled.iter().cloned());
-        }
-        self.bound
-            .entry(key)
+        self.established_schema_derived
+            .entry((correlation.to_owned(), divergence.table.clone()))
             .or_default()
-            .extend(statement.application_filled);
+            .extend(divergence.columns.iter().cloned());
     }
 
-    /// Whether `column` of `table` was created by the schema inside this
-    /// correlation and never supplied a value by anything in it.
-    fn inherited_from_schema(&self, correlation: Option<&str>, table: &str, column: &str) -> bool {
+    fn is_established_schema_derived(
+        &self,
+        correlation: Option<&str>,
+        table: &str,
+        column: &str,
+    ) -> bool {
         let Some(correlation) = correlation else {
-            // Background work has no request scope to reason within.
             return false;
         };
-        let key = (correlation.to_owned(), table.to_owned());
-        self.inserted_schema_filled
-            .get(&key)
+        self.established_schema_derived
+            .get(&(correlation.to_owned(), table.to_owned()))
             .is_some_and(|columns| columns.contains(column))
-            && !self
-                .bound
-                .get(&key)
-                .is_some_and(|columns| columns.contains(column))
+    }
+
+    /// Whether direct, confirmed schema-default evidence established `column`
+    /// on any table in this correlation. Response bodies do not carry a table,
+    /// so this deliberately performs only a same-correlation, established-only
+    /// lookup: it neither reclassifies SQL nor infers provenance from a name.
+    fn is_established_in_correlation(&self, correlation: Option<&str>, column: &str) -> bool {
+        let Some(correlation) = correlation else {
+            return false;
+        };
+        self.established_schema_derived
+            .iter()
+            .any(|((established_correlation, _), columns)| {
+                established_correlation == correlation && columns.contains(column)
+            })
     }
 }
 
-/// Build the index from both sides of the run: the recorded tape and the
-/// candidate's own calls. A column either side supplied is disqualified.
+/// Build the direct schema-default evidence used by pairing-shape normalization.
 pub(crate) fn correlation_column_provenance(
     events: &[deja::BoundaryEvent],
     observed: &[ObservedCall],
 ) -> CorrelationColumnProvenance {
     let mut provenance = CorrelationColumnProvenance::default();
-    for ev in events {
-        provenance.observe(
-            ev.correlation_id.as_deref(),
-            ev.args.get("sql").and_then(|s| s.as_str()),
-        );
-    }
+    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> = events
+        .iter()
+        .map(|event| (event.global_sequence, event))
+        .collect();
     for obs in observed {
-        provenance.observe(
-            obs.correlation_id.as_deref(),
-            obs.args.get("sql").and_then(|s| s.as_str()),
-        );
-    }
-    provenance
-}
-
-/// How strong the evidence for a schema-derived divergence is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SchemaDefaultProvenance {
-    /// Read straight off this statement: it fills the column with `DEFAULT`.
-    Statement,
-    /// INFERRED: this statement does not write the column at all, and within
-    /// this correlation the row was created with the column left to the schema
-    /// and nothing ever supplied a value for it.
-    InheritedInCorrelation,
-}
-
-impl SchemaDefaultProvenance {
-    /// Named apart in the ledger so a reader can see how much of a clean run
-    /// rests on a direct reading and how much on an inference.
-    fn kind(self) -> &'static str {
-        match self {
-            Self::Statement => "SchemaDefaultDivergence",
-            Self::InheritedInCorrelation => "SchemaDefaultInherited",
+        let event = obs
+            .source_event_global_sequence
+            .and_then(|seq| events_by_seq.get(&seq).copied());
+        if !observed_value_diverged(obs, event) {
+            continue;
+        }
+        if let SchemaDefaultVerdict::Confirmed(divergence) =
+            observed_schema_default_divergence(obs, event)
+        {
+            provenance.establish_schema_default(obs.correlation_id.as_deref(), &divergence);
         }
     }
+    provenance
 }
 
 /// A db divergence whose every differing column was filled by the schema.
@@ -983,7 +1495,6 @@ impl SchemaDefaultProvenance {
 pub(crate) struct SchemaDefaultDivergence {
     table: String,
     columns: Vec<String>,
-    provenance: SchemaDefaultProvenance,
 }
 
 impl SchemaDefaultDivergence {
@@ -998,11 +1509,7 @@ impl SchemaDefaultDivergence {
     }
 
     pub(crate) fn kind(&self) -> &'static str {
-        self.provenance.kind()
-    }
-
-    fn is_inherited(&self) -> bool {
-        self.provenance == SchemaDefaultProvenance::InheritedInCorrelation
+        "SchemaDefaultDivergence"
     }
 }
 
@@ -1029,35 +1536,15 @@ pub(crate) enum SchemaDefaultVerdict {
 /// fact about the environment and not about the candidate — so it is counted and
 /// named rather than blocking.
 ///
-/// Two arms, and they are not equally strong:
-///   - STATEMENT: this statement fills every differing column with `DEFAULT`.
-///     Read directly off the artifact, no inference.
-///   - INHERITED: this statement writes none of the differing columns, so their
-///     values came back out of stored state. The claim is then about the ROW's
-///     history, and it is granted only where
-///     [`CorrelationColumnProvenance`] can stand in for it. Strictly weaker, and
-///     named apart for that reason.
-///
-/// What keeps a real divergence out, in both arms:
-///   - EVERY differing column must qualify. One column the application supplied
-///     and the whole divergence stays blocking, because a statement that supplies
-///     a value is the candidate speaking.
-///   - BOTH statements must agree. A recorded statement that BOUND the column
-///     against a candidate one that left it to the schema is a candidate that
-///     stopped supplying a value — the most interesting divergence of all, and it
-///     stays blocking.
-///   - Neither arm is gated on an otherwise-clean run, unlike the interleaving
-///     demotions, because the evidence is the statements themselves rather than
-///     some other call's outcome. Nothing about the rest of the run changes what
-///     `DEFAULT` means.
+/// This classification applies only to INSERT. UPDATE returned fields assigned
+/// by `SET` remain strict even when the right-hand side is `DEFAULT`; unassigned
+/// returned fields were already projected out by [`update_returning_equivalent`].
 pub(crate) fn schema_default_divergence(
     boundary: &str,
-    correlation: Option<&str>,
     recorded_sql: Option<&str>,
     observed_sql: Option<&str>,
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
-    provenance: &CorrelationColumnProvenance,
 ) -> SchemaDefaultVerdict {
     if !is_db_boundary(boundary) {
         return SchemaDefaultVerdict::No;
@@ -1065,57 +1552,32 @@ pub(crate) fn schema_default_divergence(
     let Some(observed_statement) = observed_sql.and_then(parse_write_statement) else {
         return SchemaDefaultVerdict::No;
     };
+    if observed_statement.kind != WriteKind::Insert {
+        return SchemaDefaultVerdict::No;
+    }
     let Some(differing) = db_row_column_diff(recorded, observed) else {
         return SchemaDefaultVerdict::No;
     };
-    if differing.is_empty() {
+    if differing.is_empty()
+        || !differing
+            .iter()
+            .all(|column| observed_statement.schema_filled.contains(column))
+    {
         return SchemaDefaultVerdict::No;
     }
-    let table = observed_statement.table.as_str();
-    // A column is schema-filled for THIS statement either because the statement
-    // says so, or because the statement did not write it and the correlation's
-    // history says the schema did. The two are tracked apart: a divergence that
-    // needs the inference anywhere is reported as inferred, not as read.
-    let qualifies = |statement: &WriteStatement, column: &String| -> Option<bool> {
-        if statement.schema_filled.contains(column) {
-            Some(false)
-        } else if !statement.writes(column)
-            && provenance.inherited_from_schema(correlation, &statement.table, column)
-        {
-            Some(true)
-        } else {
-            None
-        }
-    };
-    let Some(observed_inference) = differing
-        .iter()
-        .map(|column| qualifies(&observed_statement, column))
-        .try_fold(false, |acc, inferred| Some(acc | inferred?))
-    else {
-        return SchemaDefaultVerdict::No;
-    };
     match recorded_sql.and_then(parse_write_statement) {
-        Some(recorded_statement) if recorded_statement.table == observed_statement.table => {
-            let Some(recorded_inference) = differing
-                .iter()
-                .map(|column| qualifies(&recorded_statement, column))
-                .try_fold(false, |acc, inferred| Some(acc | inferred?))
-            else {
-                // The recorded statement supplied one of these columns: the
-                // candidate stopped supplying a value it used to supply.
-                return SchemaDefaultVerdict::No;
-            };
+        Some(recorded_statement)
+            if recorded_statement.kind == WriteKind::Insert
+                && recorded_statement.table == observed_statement.table
+                && differing
+                    .iter()
+                    .all(|column| recorded_statement.schema_filled.contains(column)) =>
+        {
             SchemaDefaultVerdict::Confirmed(SchemaDefaultDivergence {
-                table: table.to_owned(),
+                table: observed_statement.table,
                 columns: differing.into_iter().collect(),
-                provenance: if observed_inference || recorded_inference {
-                    SchemaDefaultProvenance::InheritedInCorrelation
-                } else {
-                    SchemaDefaultProvenance::Statement
-                },
             })
         }
-        // The recorded statement parsed and addressed another table.
         Some(_) => SchemaDefaultVerdict::No,
         None => SchemaDefaultVerdict::RecordedStatementUnavailable,
     }
@@ -1128,21 +1590,18 @@ pub(crate) fn schema_default_divergence(
 pub(crate) fn observed_schema_default_divergence(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
-    provenance: &CorrelationColumnProvenance,
 ) -> SchemaDefaultVerdict {
     let (Some(recorded), Some(observed)) = (&obs.recorded_result, &obs.observed_result) else {
         return SchemaDefaultVerdict::No;
     };
     schema_default_divergence(
         &obs.boundary,
-        obs.correlation_id.as_deref(),
         event
             .and_then(|ev| ev.args.get("sql"))
             .and_then(|s| s.as_str()),
         obs.args.get("sql").and_then(|s| s.as_str()),
         recorded,
         observed,
-        provenance,
     )
 }
 
@@ -1247,19 +1706,127 @@ fn declared_value_equivalent(
     // it is a non-blocking classification, not a silent value-match absorber.
     !matches!(canon, CanonPreset::AbsentAfter) && canon.equivalent(recorded, observed)
 }
+/// Compare an UPDATE's single returned row on exactly the columns named in its
+/// SET list. The statement pair must describe the same table and assigned-column
+/// set; unsupported SQL and non-row result shapes fail closed.
+///
+/// The result envelope remains strict. Only fields of the returned row that the
+/// UPDATE did not assign are projected away, because those fields carry inherited
+/// state and can reflect the order of concurrent writes to the same row.
+fn update_returning_equivalent(
+    recorded_sql: Option<&str>,
+    observed_sql: Option<&str>,
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    let (Some(recorded_statement), Some(observed_statement)) = (
+        recorded_sql.and_then(parse_write_statement),
+        observed_sql.and_then(parse_write_statement),
+    ) else {
+        return false;
+    };
+    if recorded_statement.kind != WriteKind::Update
+        || observed_statement.kind != WriteKind::Update
+        || recorded_statement.table != observed_statement.table
+    {
+        return false;
+    }
+
+    let recorded_column_count =
+        recorded_statement.schema_filled.len() + recorded_statement.application_filled.len();
+    let observed_column_count =
+        observed_statement.schema_filled.len() + observed_statement.application_filled.len();
+    if recorded_column_count != observed_column_count
+        || !recorded_statement
+            .schema_filled
+            .iter()
+            .chain(&recorded_statement.application_filled)
+            .all(|column| observed_statement.writes(column))
+    {
+        return false;
+    }
+
+    let recorded = db_normalize_infra(recorded);
+    let observed = db_normalize_infra(observed);
+    let row_container_is_array =
+        |result: &serde_json::Value| match result.get("value").unwrap_or(result) {
+            serde_json::Value::Object(_) => Some(false),
+            serde_json::Value::Array(rows) if rows.len() == 1 && rows[0].is_object() => Some(true),
+            _ => None,
+        };
+    let (Some(recorded_is_array), Some(observed_is_array)) = (
+        row_container_is_array(&recorded),
+        row_container_is_array(&observed),
+    ) else {
+        return false;
+    };
+    if recorded_is_array != observed_is_array {
+        return false;
+    }
+    let (Some(recorded_row), Some(observed_row)) =
+        (db_returning_row(&recorded), db_returning_row(&observed))
+    else {
+        return false;
+    };
+
+    // A structured result envelope is not row state. Keep all of its metadata
+    // strict while projecting only the nested `value` row.
+    let envelope_equivalent = |left: &serde_json::Value, right: &serde_json::Value| match (
+        left.as_object(),
+        right.as_object(),
+    ) {
+        (Some(left), Some(right)) if left.contains_key("value") && right.contains_key("value") => {
+            left.keys()
+                .chain(right.keys())
+                .filter(|key| key.as_str() != "value")
+                .all(|key| left.get(key) == right.get(key))
+        }
+        (Some(left), Some(right))
+            if !left.contains_key("result")
+                && !right.contains_key("result")
+                && !left.contains_key("value")
+                && !right.contains_key("value") =>
+        {
+            true
+        }
+        _ => false,
+    };
+    envelope_equivalent(&recorded, &observed)
+        && recorded_statement
+            .schema_filled
+            .iter()
+            .chain(&recorded_statement.application_filled)
+            .all(
+                |column| match (recorded_row.get(column), observed_row.get(column)) {
+                    (Some(recorded), Some(observed)) => recorded == observed,
+                    _ => false,
+                },
+            )
+}
 
 pub(crate) fn values_diverge_under_event(
     boundary: &str,
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
     event: Option<&deja::BoundaryEvent>,
+    observed_sql: Option<&str>,
 ) -> bool {
     if let Some(canon) = event.and_then(event_value_canon) {
         if declared_value_equivalent(&canon, recorded, observed) {
             return false;
         }
     }
-    if is_db_boundary(boundary) && db_equiv_modulo_infra(recorded, observed) {
+    if is_db_boundary(boundary)
+        && (db_equiv_modulo_infra(recorded, observed)
+            || update_returning_equivalent(
+                event
+                    .and_then(|event| event.args.get("sql"))
+                    .and_then(serde_json::Value::as_str),
+                observed_sql,
+                recorded,
+                observed,
+            ))
+    {
         return false;
     }
     recorded != observed
@@ -1272,15 +1839,141 @@ pub(crate) fn observed_value_diverged(
     obs.resolved
         && obs.provenance == deja::Provenance::Shadow
         && match (&obs.recorded_result, &obs.observed_result) {
-            (Some(recorded), Some(observed)) => {
-                values_diverge_under_event(&obs.boundary, recorded, observed, event)
-            }
+            (Some(recorded), Some(observed)) => values_diverge_under_event(
+                &obs.boundary,
+                recorded,
+                observed,
+                event,
+                obs.args.get("sql").and_then(serde_json::Value::as_str),
+            ),
             _ => false,
         }
 }
 
 fn is_unit_value(value: &serde_json::Value) -> bool {
     matches!(value, serde_json::Value::Null)
+}
+
+/// Remove UPDATE assignments whose column was already proven schema-derived in
+/// this correlation. Every other byte of the statement remains identity.
+///
+/// Diesel renumbers later binds when an `AsChangeset` field appears or
+/// disappears, so the remaining `$N` ordinals are canonicalized by first
+/// occurrence. Unsupported SQL returns `None`; callers then retain the original
+/// statement and pairing fails closed.
+fn schema_normalized_update_shape(
+    sql: &str,
+    correlation: Option<&str>,
+    provenance: &CorrelationColumnProvenance,
+) -> Option<String> {
+    let statement = sql_statement(sql).trim_start();
+    let parsed = parse_write_statement(statement)?;
+    if parsed.kind != WriteKind::Update {
+        return None;
+    }
+
+    let (verb, rest) = split_leading_word(statement);
+    if !verb.eq_ignore_ascii_case("UPDATE") {
+        return None;
+    }
+    let (_, rest) = quoted_identifier(rest.trim_start())?;
+    let (set, assignments_and_suffix) = split_leading_word(rest.trim_start());
+    if !set.eq_ignore_ascii_case("SET") {
+        return None;
+    }
+    let suffix_at = top_level_keyword(assignments_and_suffix, &["WHERE", "RETURNING"])
+        .unwrap_or(assignments_and_suffix.len());
+    let assignments = &assignments_and_suffix[..suffix_at];
+    let suffix = &assignments_and_suffix[suffix_at..];
+    let assignments_at = statement.len() - assignments_and_suffix.len();
+
+    let mut removed = false;
+    let mut kept = Vec::new();
+    for assignment in split_top_level(assignments) {
+        let (column, value) = split_assignment(assignment)?;
+        let column = unquote_identifier(column)?;
+        if value.trim().is_empty() {
+            return None;
+        }
+        if provenance.is_established_schema_derived(correlation, &parsed.table, &column) {
+            removed = true;
+        } else {
+            kept.push(assignment.trim());
+        }
+    }
+    if !removed || kept.is_empty() {
+        return None;
+    }
+
+    let leading_len = assignments.len() - assignments.trim_start().len();
+    let trailing_at = assignments.trim_end().len();
+    let mut normalized = String::with_capacity(statement.len());
+    normalized.push_str(&statement[..assignments_at]);
+    normalized.push_str(&assignments[..leading_len]);
+    for (index, assignment) in kept.into_iter().enumerate() {
+        if index != 0 {
+            normalized.push_str(", ");
+        }
+        normalized.push_str(assignment);
+    }
+    normalized.push_str(&assignments[trailing_at..]);
+    normalized.push_str(suffix);
+    canonicalize_bind_ordinals(&normalized)
+}
+
+fn canonicalize_bind_ordinals(statement: &str) -> Option<String> {
+    let bytes = statement.as_bytes();
+    let mut ordinals = BTreeMap::<u32, usize>::new();
+    let mut next = 1usize;
+    let mut normalized = String::with_capacity(statement.len());
+    let mut copied_through = 0usize;
+    let mut at = 0usize;
+
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                loop {
+                    match bytes.get(at).copied() {
+                        Some(b'"') if bytes.get(at + 1) == Some(&b'"') => at += 2,
+                        Some(b'"') => {
+                            at += 1;
+                            break;
+                        }
+                        Some(_) => at += 1,
+                        None => return None,
+                    }
+                }
+            }
+            b'\'' => return None,
+            b'$' => {
+                let start = at;
+                at += 1;
+                let first = *bytes.get(at)?;
+                if !first.is_ascii_digit() || first == b'0' {
+                    return None;
+                }
+                let mut ordinal = 0u32;
+                while let Some(digit) = bytes.get(at).filter(|digit| digit.is_ascii_digit()) {
+                    ordinal = ordinal
+                        .checked_mul(10)?
+                        .checked_add(u32::from(*digit - b'0'))?;
+                    at += 1;
+                }
+                let canonical = *ordinals.entry(ordinal).or_insert_with(|| {
+                    let current = next;
+                    next += 1;
+                    current
+                });
+                normalized.push_str(&statement[copied_through..start]);
+                write!(&mut normalized, "${canonical}").ok()?;
+                copied_through = at;
+            }
+            _ => at += 1,
+        }
+    }
+    normalized.push_str(&statement[copied_through..]);
+    Some(normalized)
 }
 
 /// The part of a call's args that a VALUE divergence cannot change.
@@ -1294,12 +1987,17 @@ fn is_unit_value(value: &serde_json::Value) -> bool {
 /// operands keeps the recovery and removes the cross-claim.
 ///
 /// A SQL boundary carries its operands in diesel's ` -- binds: [...]` tail, so
-/// the text before that tail is exactly "the statement without its values":
-/// identical for a re-keyed write, different for a different statement, and
-/// different across tables because the table name is in the statement. A
-/// boundary with no SQL falls back to the structural skeleton of its args — key
-/// paths with leaf values elided — which has the same property by construction.
-fn pairing_shape(args: &serde_json::Value) -> String {
+/// the text before that tail is exactly "the statement without its values".
+/// The only exception is an UPDATE assignment for a column whose earlier value
+/// divergence the existing schema-default classifier already confirmed was
+/// environment-derived. That assignment is removed by
+/// [`schema_normalized_update_shape`]; every unproven column remains identity.
+/// A boundary with no SQL falls back to the structural skeleton of its args.
+fn pairing_shape(
+    args: &serde_json::Value,
+    correlation: Option<&str>,
+    provenance: &CorrelationColumnProvenance,
+) -> String {
     // Fields deja's own args contract defines as WHAT KIND of call this is,
     // rather than what it operates on. `key` is deliberately absent: a re-keyed
     // write is precisely the divergence this pairing must still recover, so the
@@ -1312,7 +2010,11 @@ fn pairing_shape(args: &serde_json::Value) -> String {
         }
     }
     match args.get("sql").and_then(serde_json::Value::as_str) {
-        Some(sql) => parts.push(format!("sql={}", sql_statement(sql))),
+        Some(sql) => {
+            let statement = schema_normalized_update_shape(sql, correlation, provenance)
+                .unwrap_or_else(|| sql_statement(sql).to_owned());
+            parts.push(format!("sql={statement}"));
+        }
         None => {
             let mut paths = Vec::new();
             collect_args_shape(args, String::new(), &mut paths);
@@ -1376,17 +2078,33 @@ type PairingIdentity = (Option<String>, String, String, String, Option<String>);
 /// KNOWN shape narrows the pool. In a real run every table-covered sequence has
 /// its event, so the wildcard queue is empty and only the shape-matched arm
 /// fires; it is reachable when the tape is missing an event the table covers.
-pub(crate) struct ArgsFreePairing {
-    /// Recorded source sequences per identity, FIFO by source order.
-    queues: BTreeMap<PairingIdentity, std::collections::VecDeque<u64>>,
+pub(crate) struct ArgsFreePairing<'a> {
+    /// Recorded twins per identity, FIFO by source order. Known entries borrow
+    /// full args solely to detect an observed occurrence arriving out of order.
+    queues: BTreeMap<PairingIdentity, std::collections::VecDeque<ArgsFreeTwin<'a>>>,
+    provenance: &'a CorrelationColumnProvenance,
 }
 
-impl ArgsFreePairing {
+struct ArgsFreeTwin<'a> {
+    sequence: u64,
+    args: Option<&'a serde_json::Value>,
+}
+
+pub(crate) struct ArgsFreePairingResult {
+    pub(crate) sequence: u64,
+    pub(crate) order_mismatch: bool,
+}
+
+impl<'a> ArgsFreePairing<'a> {
     /// Build the pool from the run's own two streams: the lookup table (which
     /// says which sequences are expected, and at which address) and the tape
     /// (which says what each call's args looked like). Both callers pass the
     /// SAME two, so neither can see a pool the other does not.
-    pub(crate) fn build(table: &LookupTable, events: &[deja::BoundaryEvent]) -> Self {
+    pub(crate) fn build(
+        table: &LookupTable,
+        events: &'a [deja::BoundaryEvent],
+        provenance: &'a CorrelationColumnProvenance,
+    ) -> Self {
         let events_by_seq: HashMap<u64, &deja::BoundaryEvent> =
             events.iter().map(|ev| (ev.global_sequence, ev)).collect();
         let span_paths = ledger::recorded_span_paths(table);
@@ -1419,8 +2137,10 @@ impl ArgsFreePairing {
         }
 
         // `addressed` is ordered by sequence, so each queue comes out in source
-        // order and `take_twin`'s pop_front is FIFO occurrence.
-        let mut queues: BTreeMap<_, std::collections::VecDeque<u64>> = BTreeMap::new();
+        // order and `take_twin` always pops the FIFO occurrence. Full args only
+        // reveal when the observed args belong to a later live occurrence; they
+        // never select that later occurrence.
+        let mut queues: BTreeMap<_, std::collections::VecDeque<ArgsFreeTwin<'a>>> = BTreeMap::new();
         for (seq, entry) in &addressed {
             let (Some(boundary), Some(method)) = (&entry.boundary, &entry.method) else {
                 continue;
@@ -1428,7 +2148,9 @@ impl ArgsFreePairing {
             let Some(span) = span_paths.get(seq) else {
                 continue;
             };
-            let shape = events_by_seq.get(seq).map(|ev| pairing_shape(&ev.args));
+            let event = events_by_seq.get(seq).copied();
+            let shape =
+                event.map(|ev| pairing_shape(&ev.args, entry.correlation.as_deref(), provenance));
             queues
                 .entry((
                     entry.correlation.clone(),
@@ -1438,21 +2160,34 @@ impl ArgsFreePairing {
                     shape,
                 ))
                 .or_default()
-                .push_back(*seq);
+                .push_back(ArgsFreeTwin {
+                    sequence: *seq,
+                    args: event.map(|ev| &ev.args),
+                });
         }
-        Self { queues }
+        Self { queues, provenance }
     }
 
     /// Pop the next unclaimed recorded twin for `obs`, or `None` if this call
     /// has no twin it is entitled to. Skips any sequence a resolved
     /// (args-aligned) call already claimed, so a mixed run that resolves some
     /// calls normally and re-keys others never double-binds one recorded event.
-    pub(crate) fn take_twin(&mut self, obs: &ObservedCall, consumed: &HashSet<u64>) -> Option<u64> {
+    ///
+    /// The FIFO head remains the twin even when the observed full args exactly
+    /// match a later live entry. That condition is reported as an order mismatch
+    /// rather than used to rematch, preserving occurrence pairing while making a
+    /// same-shape swap visible. Unknown-args queues cannot report this signal.
+    pub(crate) fn take_twin(
+        &mut self,
+        obs: &ObservedCall,
+        consumed: &HashSet<u64>,
+    ) -> Option<ArgsFreePairingResult> {
         let span = obs.span_path.as_deref()?;
         // Same statement first; then the shape-unknown queue, whose events carry
         // no args to compare and so pair as they always did.
-        let shape = pairing_shape(&obs.args);
+        let shape = pairing_shape(&obs.args, obs.correlation_id.as_deref(), self.provenance);
         for candidate in [Some(shape.clone()), None] {
+            let args_known = candidate.is_some();
             let key = (
                 obs.correlation_id.clone(),
                 span.to_owned(),
@@ -1463,12 +2198,24 @@ impl ArgsFreePairing {
             let Some(queue) = self.queues.get_mut(&key) else {
                 continue;
             };
-            while let Some(seq) = queue.front().copied() {
-                if consumed.contains(&seq) {
-                    queue.pop_front();
-                } else {
-                    return queue.pop_front();
-                }
+            while queue
+                .front()
+                .is_some_and(|twin| consumed.contains(&twin.sequence))
+            {
+                queue.pop_front();
+            }
+            let order_mismatch = args_known
+                && queue.front().is_some_and(|head| {
+                    head.args != Some(&obs.args)
+                        && queue.iter().skip(1).any(|later| {
+                            !consumed.contains(&later.sequence) && later.args == Some(&obs.args)
+                        })
+                });
+            if let Some(twin) = queue.pop_front() {
+                return Some(ArgsFreePairingResult {
+                    sequence: twin.sequence,
+                    order_mismatch,
+                });
             }
         }
         None
@@ -1494,22 +2241,6 @@ pub(crate) fn args_free_effective_values(
         }
     }
     (recorded, observed)
-}
-
-fn event_canon_labels(ev: &deja::BoundaryEvent) -> Vec<String> {
-    let Some(declaration) = ev.declaration.as_ref() else {
-        return Vec::new();
-    };
-    [
-        ("state", declaration.state_canon.as_ref()),
-        ("reply", declaration.reply_canon.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(slot, canon)| {
-        let canon = canon?;
-        resolve_canon(Some(canon)).map(|preset| format!("{slot}:{}", preset.preset_name()))
-    })
-    .collect()
 }
 
 fn parse_project_canon(id: &str) -> Option<CanonPreset> {
@@ -1743,28 +2474,6 @@ fn projected_db_error_equiv(a: &serde_json::Value, b: &serde_json::Value) -> boo
     project_kind.equivalent(a, b)
 }
 
-fn rows_equal_for_order_evidence(
-    ev: &deja::BoundaryEvent,
-    a: &serde_json::Map<String, serde_json::Value>,
-    b: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    let a = serde_json::Value::Object(a.clone());
-    let b = serde_json::Value::Object(b.clone());
-    match event_reply_canon(ev).or_else(|| event_state_canon(ev)) {
-        Some(CanonPreset::Project { include, exclude }) => {
-            CanonPreset::Project { include, exclude }.equivalent(&a, &b)
-        }
-        Some(CanonPreset::Bag) => CanonPreset::Bag.equivalent(&a, &b),
-        Some(CanonPreset::FinalState)
-        | Some(CanonPreset::Sequence)
-        | Some(CanonPreset::AbsentAfter)
-        | None => rows_equal_modulo_volatile(
-            a.as_object().expect("row object"),
-            b.as_object().expect("row object"),
-        ),
-    }
-}
-
 fn boundary_entry<'a>(
     map: &'a mut BTreeMap<String, BoundaryStats>,
     boundary: &str,
@@ -1849,32 +2558,6 @@ fn undeclared_concurrency_warnings(observed: &[ObservedCall]) -> Vec<UndeclaredC
         .collect()
 }
 
-fn returns_row(result: &serde_json::Value) -> bool {
-    match result.get("value") {
-        Some(serde_json::Value::Array(a)) => !a.is_empty(),
-        Some(serde_json::Value::Object(_)) => true,
-        _ => false,
-    }
-}
-
-fn declared_update_returning(ev: &deja::BoundaryEvent) -> Option<bool> {
-    let declaration = ev.declaration.as_ref()?;
-    let effect = declaration.effect?;
-    let op = declaration.op?;
-    let returns = declaration.returns?;
-    Some(
-        effect == deja::EffectKind::Db
-            && matches!(op, deja::OperationKind::Update | deja::OperationKind::Touch)
-            && returns == deja::ReturnSemantics::UpdateReturning,
-    )
-}
-
-fn is_update_returning_event(ev: &deja::BoundaryEvent) -> bool {
-    declared_update_returning(ev).unwrap_or_else(|| {
-        ev.boundary == "db" && ev.method_name.contains("update") && returns_row(&ev.result)
-    })
-}
-
 fn declared_idempotent_delete(ev: &deja::BoundaryEvent) -> Option<bool> {
     let declaration = ev.declaration.as_ref()?;
     let effect = declaration.effect?;
@@ -1903,36 +2586,6 @@ impl DbRowKey {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct OrderNondeterministicDemotions {
-    sequences: HashSet<u64>,
-    row_labels: BTreeMap<u64, String>,
-    canon_labels: BTreeMap<u64, String>,
-}
-
-impl OrderNondeterministicDemotions {
-    fn insert(&mut self, seq: u64, row_key: &DbRowKey, ev: &deja::BoundaryEvent) {
-        self.sequences.insert(seq);
-        self.row_labels
-            .entry(seq)
-            .or_insert_with(|| row_key.label());
-        let labels = event_canon_labels(ev);
-        if !labels.is_empty() {
-            self.canon_labels
-                .entry(seq)
-                .or_insert_with(|| labels.join(","));
-        }
-    }
-
-    fn contains(&self, seq: &u64) -> bool {
-        self.sequences.contains(seq)
-    }
-
-    fn canon_label(&self, seq: &u64) -> Option<&str> {
-        self.canon_labels.get(seq).map(String::as_str)
-    }
-}
-
 fn db_row_key_from_state_key(raw: &str) -> Option<DbRowKey> {
     let parsed = deja::StateKey::parse(raw).ok()?;
     let wire = parsed.to_wire();
@@ -1943,201 +2596,6 @@ fn db_row_key_from_state_key(raw: &str) -> Option<DbRowKey> {
     }
 }
 
-fn event_db_row_key(ev: &deja::BoundaryEvent) -> Option<DbRowKey> {
-    let mut row_key: Option<DbRowKey> = None;
-    for raw in ev.write_set.iter().chain(ev.read_set.iter()) {
-        let Some(next) = db_row_key_from_state_key(raw) else {
-            continue;
-        };
-        if row_key
-            .as_ref()
-            .is_some_and(|seen| seen.table != next.table || seen.key != next.key)
-        {
-            return None;
-        }
-        row_key.get_or_insert(next);
-    }
-    row_key
-}
-
-/// Reconcile the artifact streams into a `replay-scorecard/v1`.
-/// Rule A — order-nondeterminism demotion (concurrent same-row UPDATE RETURNING).
-///
-/// Returns the recorded event sequences whose execute-mode value divergence is a
-/// benign INTERLEAVING artifact and must be DEMOTED to a non-blocking warning
-/// (not a gate failure), plus row labels for diagnostics. STRICTLY guarded so a
-/// real lost-update can never hide:
-///   0. `http_clean` — the run's HTTP layer is 9/9 (no status/body mismatch). If
-///      any HTTP diverged, NOTHING is demoted (the response itself is wrong).
-///   1. Declared `Db` + `Update`/`Touch` + `UpdateReturning`; old/incomplete tapes
-///      may still identify the operation by `db` boundary + update-ish method +
-///      RETURNING row shape, but they MUST carry a typed `StateKey::DbRow` in
-///      the event state sets. Without a typed row key, Rule A stays conservative.
-///   2. Two+ writes to the SAME correlation + typed table + typed primary key.
-///      Row values still have to line up modulo the explicit volatile-column
-///      allowlist; the allowlist is only a row-value comparison guard, never a
-///      grouping key.
-///   3. The demoted earlier write's wall-clock window OVERLAPS the FINAL write's
-///      (genuinely concurrent, not sequential).
-///   4. The FINAL/LAST write of that same-row set (max `global_sequence`) is
-///      MATCHED on replay — it reproduces the recorded final row. If the final
-///      write diverges (final state lost), NOTHING in the set is demoted, so a real
-///      lost-update stays a blocking divergence.
-pub(crate) fn order_nondeterministic_demotions(
-    events: &[deja::BoundaryEvent],
-    observed: &[ObservedCall],
-    http_clean: bool,
-) -> OrderNondeterministicDemotions {
-    // Guard 0: demotion is only ever considered on an otherwise HTTP-clean run.
-    if !http_clean {
-        return OrderNondeterministicDemotions::default();
-    }
-
-    // matched-on-replay: an observed call for a recorded seq that resolved and did
-    // NOT value-diverge after applying the event-scoped declaration.
-    let events_by_seq: HashMap<u64, &deja::BoundaryEvent> =
-        events.iter().map(|ev| (ev.global_sequence, ev)).collect();
-    let mut matched_seq: HashSet<u64> = HashSet::new();
-    for obs in observed {
-        let Some(seq) = obs.source_event_global_sequence else {
-            continue;
-        };
-        if obs.resolved && !observed_value_diverged(obs, events_by_seq.get(&seq).copied()) {
-            matched_seq.insert(seq);
-        }
-    }
-
-    // Guard 1: an UPDATE whose recorded result carries a RETURNING row and whose
-    // event state sets contain exactly one typed DB-row identity. Typed row keys
-    // are the only grouping input; legacy table strings and row JSON never form
-    // identity. If a PK row key is absent or ambiguous, Rule A refuses demotion.
-    // Grouped by correlation and the row's canonical wire key — which already
-    // encodes the table and every key column, so it identifies the row whether
-    // its primary key has one column or several.
-    type Key = (Option<String>, String);
-    let mut groups: HashMap<Key, Vec<(&deja::BoundaryEvent, DbRowKey)>> = HashMap::new();
-    for ev in events {
-        if !is_update_returning_event(ev) {
-            continue;
-        }
-        let Some(row_key) = event_db_row_key(ev) else {
-            continue;
-        };
-        groups
-            .entry((ev.correlation_id.clone(), row_key.wire.clone()))
-            .or_default()
-            .push((ev, row_key));
-    }
-
-    let overlaps = |a: &deja::BoundaryEvent, b: &deja::BoundaryEvent| -> bool {
-        let a_e = a.end_timestamp_ns.unwrap_or(a.timestamp_ns);
-        let b_e = b.end_timestamp_ns.unwrap_or(b.timestamp_ns);
-        a.timestamp_ns.max(b.timestamp_ns) < a_e.min(b_e)
-    };
-
-    let mut demote = OrderNondeterministicDemotions::default();
-    for members in groups.values() {
-        if members.len() < 2 {
-            continue;
-        }
-        // Guard 4: the FINAL/LAST write (max global_sequence) must be matched — it
-        // reproduces the recorded final row. Otherwise the final state is lost.
-        let Some((final_write, final_key)) = members.iter().max_by_key(|(e, _)| e.global_sequence)
-        else {
-            continue;
-        };
-        if !matched_seq.contains(&final_write.global_sequence) {
-            continue;
-        }
-        let Some(final_row) = db_returning_row(&final_write.result) else {
-            continue;
-        };
-        // Demote each NON-matched (diverged) earlier write whose window OVERLAPS
-        // the final write's (guard 3) and whose recorded row is the same final row
-        // modulo the narrow volatile-column allowlist. The group already proved
-        // exact typed row identity; row comparison only proves the interleaving
-        // evidence, never the identity.
-        for (m, row_key) in members {
-            if m.global_sequence == final_write.global_sequence
-                || matched_seq.contains(&m.global_sequence)
-            {
-                continue;
-            }
-            let Some(row) = db_returning_row(&m.result) else {
-                continue;
-            };
-            if overlaps(m, final_write) && rows_equal_for_order_evidence(m, row, final_row) {
-                demote.insert(m.global_sequence, row_key, m);
-            }
-        }
-        if demote.contains(&final_write.global_sequence) {
-            demote
-                .row_labels
-                .insert(final_write.global_sequence, final_key.label());
-        }
-    }
-
-    // ORDER-SWAP arm: when the RECORDING captured the opposite interleaving, the
-    // diverged earlier write's recorded row is the PRE-final state, so the
-    // same-recorded-row evidence above cannot pair it. Evidence here is the
-    // inverse: the earlier write's OBSERVED row equals the RECORDED row of an
-    // overlapping, MATCHED, same-correlation+typed-row final write — i.e. on replay
-    // the earlier write simply saw the final state early. Rows are compared
-    // MODULO VOLATILE_COLUMNS; general row comparison everywhere else stays strict.
-    let update_events: Vec<(&deja::BoundaryEvent, DbRowKey)> = events
-        .iter()
-        .filter(|ev| is_update_returning_event(ev))
-        .filter_map(|ev| event_db_row_key(ev).map(|row_key| (ev, row_key)))
-        .collect();
-    let by_seq: HashMap<u64, &(&deja::BoundaryEvent, DbRowKey)> = update_events
-        .iter()
-        .map(|p| (p.0.global_sequence, p))
-        .collect();
-    for obs in observed {
-        let Some(seq) = obs.source_event_global_sequence else {
-            continue;
-        };
-        if demote.contains(&seq) || matched_seq.contains(&seq) {
-            continue;
-        }
-        let diverged = observed_value_diverged(obs, events_by_seq.get(&seq).copied());
-        if !diverged {
-            continue;
-        }
-        let Some((ev, row_key)) = by_seq.get(&seq).map(|p| (p.0, &p.1)) else {
-            continue;
-        };
-        let Some(observed_row) = obs.observed_result.as_ref().and_then(db_returning_row) else {
-            continue;
-        };
-        // The evidence write must be strictly LATER than the diverged one (the
-        // swap story is "the earlier write saw the final state early"; an EARLIER
-        // matched row equal to the observed value is NOT final-state evidence),
-        // plus matched, overlapping, exact same typed row key, with its RECORDED
-        // row equal to the diverged OBSERVED row modulo volatile columns.
-        let swap_evidenced = update_events.iter().any(|(other, other_key)| {
-            other.global_sequence > seq
-                && other.correlation_id == ev.correlation_id
-                && other_key.table == row_key.table
-                && other_key.key == row_key.key
-                && matched_seq.contains(&other.global_sequence)
-                && overlaps(ev, other)
-                && db_returning_row(&other.result).is_some_and(|final_row| {
-                    rows_equal_for_order_evidence(ev, observed_row, final_row)
-                })
-        });
-        if swap_evidenced {
-            demote.insert(seq, row_key, ev);
-        }
-    }
-    demote
-}
-
-/// Columns the racing writes themselves stamp (their own `now()`), so the twin
-/// rows of a concurrent same-row UPDATE pair differ there by construction. Used
-/// ONLY inside the order-swap evidence comparison — never in general row scoring.
-const VOLATILE_COLUMNS: &[&str] = &["modified_at", "last_synced"];
-
 /// Unwrap a structured db result envelope (`{result:"Ok", value: [row] | row}`)
 /// to its single RETURNING row, if that is its shape.
 fn db_returning_row(v: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -2147,20 +2605,6 @@ fn db_returning_row(v: &serde_json::Value) -> Option<&serde_json::Map<String, se
         serde_json::Value::Array(a) if a.len() == 1 => a[0].as_object(),
         _ => None,
     }
-}
-
-/// Row equality modulo [`VOLATILE_COLUMNS`] (order-swap evidence check only).
-fn rows_equal_modulo_volatile(
-    a: &serde_json::Map<String, serde_json::Value>,
-    b: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    let keys: std::collections::BTreeSet<&str> = a
-        .keys()
-        .chain(b.keys())
-        .map(String::as_str)
-        .filter(|k| !VOLATILE_COLUMNS.contains(k))
-        .collect();
-    keys.into_iter().all(|k| a.get(k) == b.get(k))
 }
 
 /// Read a redis delete reply (`KeyDeleted` / `KeyNotDeleted`) from a result value.
@@ -2318,18 +2762,252 @@ fn http_reply_canon_inapplicable(
         .then_some(canon_id)
 }
 
-fn blocking_http_body_diff_count(
+#[derive(PartialEq, Eq)]
+struct HiddenFormProjection {
+    body_without_hidden_inputs: String,
+    hidden_inputs_by_form: Vec<Vec<String>>,
+}
+
+/// Canonicalize only hidden-input ordering inside redirect forms. The
+/// surrounding document and every byte of every input tag remain significant;
+/// sorting the tag strings preserves duplicate name/value pairs.
+fn hidden_form_projection(html: &str) -> Option<HiddenFormProjection> {
+    let bytes = html.as_bytes();
+    let mut body_without_hidden_inputs = String::with_capacity(html.len());
+    let mut hidden_inputs_by_form = Vec::new();
+    let mut current_form: Option<Vec<String>> = None;
+    let mut found_hidden_input = false;
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        let Some(relative_start) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
+            body_without_hidden_inputs.push_str(&html[cursor..]);
+            break;
+        };
+        let tag_start = cursor + relative_start;
+        body_without_hidden_inputs.push_str(&html[cursor..tag_start]);
+        let tag_end = html_tag_end(bytes, tag_start)?;
+        let tag = &html[tag_start..=tag_end];
+
+        match html_tag_name(tag) {
+            Some((false, name)) if name.eq_ignore_ascii_case("form") => {
+                if current_form.is_some() {
+                    return None;
+                }
+                current_form = Some(Vec::new());
+                body_without_hidden_inputs.push_str(tag);
+            }
+            Some((true, name)) if name.eq_ignore_ascii_case("form") => {
+                let mut inputs = current_form.take()?;
+                inputs.sort();
+                hidden_inputs_by_form.push(inputs);
+                body_without_hidden_inputs.push_str(tag);
+            }
+            Some((false, name))
+                if current_form.is_some()
+                    && (name.eq_ignore_ascii_case("script")
+                        || name.eq_ignore_ascii_case("style")) =>
+            {
+                return None;
+            }
+            Some((false, name))
+                if name.eq_ignore_ascii_case("input")
+                    && current_form.is_some()
+                    && html_attribute_equals(tag, "type", "hidden") =>
+            {
+                current_form
+                    .as_mut()
+                    .expect("form presence checked above")
+                    .push(tag.to_owned());
+                found_hidden_input = true;
+            }
+            _ => body_without_hidden_inputs.push_str(tag),
+        }
+        cursor = tag_end + 1;
+    }
+
+    if current_form.is_some() || !found_hidden_input {
+        return None;
+    }
+    Some(HiddenFormProjection {
+        body_without_hidden_inputs,
+        hidden_inputs_by_form,
+    })
+}
+
+fn html_tag_end(bytes: &[u8], tag_start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, byte) in bytes[tag_start + 1..].iter().copied().enumerate() {
+        match (quote, byte) {
+            (Some(active), current) if current == active => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => return Some(tag_start + offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn html_tag_name(tag: &str) -> Option<(bool, &str)> {
+    let bytes = tag.as_bytes();
+    let mut cursor = 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if matches!(bytes.get(cursor), Some(b'!' | b'?')) {
+        return None;
+    }
+    let closing = bytes.get(cursor) == Some(&b'/');
+    if closing {
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+    }
+    let start = cursor;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'_'))
+    {
+        cursor += 1;
+    }
+    (cursor > start).then_some((closing, &tag[start..cursor]))
+}
+
+fn html_attribute_equals(tag: &str, wanted_name: &str, wanted_value: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let Some((_, tag_name)) = html_tag_name(tag) else {
+        return false;
+    };
+    let mut cursor = 1 + tag[1..].find(tag_name).unwrap_or(0) + tag_name.len();
+
+    while cursor < bytes.len() {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'/')
+        {
+            cursor += 1;
+        }
+        if bytes.get(cursor).is_none_or(|byte| *byte == b'>') {
+            break;
+        }
+        let name_start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'>'))
+        {
+            cursor += 1;
+        }
+        let name = &tag[name_start..cursor];
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let (value_start, value_end) = match bytes.get(cursor).copied() {
+            Some(quote @ (b'\'' | b'"')) => {
+                cursor += 1;
+                let start = cursor;
+                while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+                    cursor += 1;
+                }
+                let end = cursor;
+                cursor += usize::from(bytes.get(cursor) == Some(&quote));
+                (start, end)
+            }
+            Some(_) => {
+                let start = cursor;
+                while bytes
+                    .get(cursor)
+                    .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>'))
+                {
+                    cursor += 1;
+                }
+                (start, cursor)
+            }
+            None => return false,
+        };
+        if name.eq_ignore_ascii_case(wanted_name)
+            && tag[value_start..value_end].eq_ignore_ascii_case(wanted_value)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn hidden_form_bodies_equivalent(diff: &HttpDiff) -> bool {
+    let (Some(baseline), Some(candidate)) = (
+        diff.baseline_body
+            .as_ref()
+            .and_then(serde_json::Value::as_str),
+        diff.candidate_body
+            .as_ref()
+            .and_then(serde_json::Value::as_str),
+    ) else {
+        return false;
+    };
+    match (
+        hidden_form_projection(baseline),
+        hidden_form_projection(candidate),
+    ) {
+        (Some(baseline), Some(candidate)) => baseline == candidate,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HttpBodyClassification {
+    blocking_leaf_count: usize,
+    schema_derived_paths: Vec<String>,
+}
+
+fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
+    let mut path = json_path.trim();
+    while path.ends_with(']') {
+        let index = path.rfind('[')?;
+        path = &path[..index];
+    }
+    path.rsplit('.')
+        .next()
+        .map(str::trim)
+        .filter(|leaf| !leaf.is_empty() && *leaf != "$")
+}
+
+fn classify_http_body_diff(
     diff: &HttpDiff,
     recorded_http: Option<&deja::BoundaryEvent>,
     race: &InconclusiveRaceEvidence,
-) -> usize {
-    diff.body_diff
-        .iter()
-        .filter(|body| {
-            !http_diff_absorbed_by_reply_canon(diff, recorded_http, body)
-                && !race.http_body_diff_attributable(&diff.correlation_id, body)
-        })
-        .count()
+    provenance: &CorrelationColumnProvenance,
+) -> HttpBodyClassification {
+    if hidden_form_bodies_equivalent(diff) {
+        return HttpBodyClassification::default();
+    }
+    let mut classification = HttpBodyClassification::default();
+    for body in &diff.body_diff {
+        // Existing explicit absorptions retain precedence over schema
+        // provenance; one leaf is classified exactly once.
+        if http_diff_absorbed_by_reply_canon(diff, recorded_http, body)
+            || race.http_body_diff_attributable(&diff.correlation_id, body)
+        {
+            continue;
+        }
+        if json_diff_leaf_field(&body.json_path).is_some_and(|column| {
+            provenance.is_established_in_correlation(Some(&diff.correlation_id), column)
+        }) {
+            classification
+                .schema_derived_paths
+                .push(body.json_path.clone());
+        } else {
+            classification.blocking_leaf_count += 1;
+        }
+    }
+    classification
 }
 
 fn json_contains_value(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
@@ -2520,6 +3198,11 @@ pub(crate) fn idempotent_delete_demotions(
 }
 
 pub fn detect(art: &RunArtifacts) -> Scorecard {
+    let graph_plan = GraphScoringPlan::build(art);
+    detect_with_plan(art, &graph_plan)
+}
+
+pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan) -> Scorecard {
     // V1: uncorrelated (background-task) events are tolerated; the deja-tokio
     // correlation-propagation fix is a separate plan.
     let uncorrelated_tolerated = true;
@@ -2586,23 +3269,25 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         .iter()
         .map(|ev| (ev.global_sequence, ev))
         .collect();
-    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events);
+    // Direct, confirmed INSERT schema-default evidence normalizes later UPDATE
+    // pairing shapes and can absorb same-correlation response leaves. It never
+    // classifies inherited returned-row state or infers provenance.
+    let column_provenance = correlation_column_provenance(&art.events, &art.observed);
+    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events, &column_provenance);
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
-    let mut order_nondeterminism_warnings = 0u64;
+    let mut graph_value_nodes: BTreeMap<String, HashSet<u64>> = BTreeMap::new();
+    let mut identity_skews = 0u64;
+    let order_nondeterminism_warnings = 0u64;
     let mut idempotent_delete_warnings = 0u64;
     // Schema-derived divergences, counted by the column they name so that
     // fifteen inserts disagreeing about one column default read as one fact —
     // and, beside them, the ones we could not confirm because the recorded
     // statement was missing, so an empty class says which cause applies.
     let mut schema_default_divergences = 0u64;
-    let mut schema_default_inherited = 0u64;
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
-    // Who supplied each column, per correlation — the stand-in for the row
-    // provenance deja cannot yet name on the payment tables.
-    let column_provenance = correlation_column_provenance(&art.events, &art.observed);
     // Race evidence needs to be discovered before HTTP body classification:
     // a race can flow into the response body itself. Status mismatches still
     // block evidence up front; body mismatches are neutralized only when their
@@ -2619,19 +3304,19 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         .http_diffs
         .iter()
         .filter(|diff| {
-            blocking_http_body_diff_count(
+            classify_http_body_diff(
                 diff,
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
                 &inconclusive_race,
-            ) > 0
+                &column_provenance,
+            )
+            .blocking_leaf_count
+                > 0
         })
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
-    // Rule A: concurrent same-row UPDATE-RETURNING interleaving artifacts.
-    let order_nondet_demote =
-        order_nondeterministic_demotions(&art.events, &art.observed, http_clean);
     // Rule B: idempotent redis DELETE (recorded KeyDeleted vs observed KeyNotDeleted).
     let idempotent_delete_demote =
         idempotent_delete_demotions(&art.events, &art.observed, http_clean);
@@ -2660,21 +3345,49 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // steal a recorded event that a later resolved call owned — one event
     // classified twice (ValueDiverged AND matched), which is how the run-0810
     // phantom entered the scorecard.
-    let mut deferred: Vec<&ObservedCall> = Vec::new();
-    for obs in &art.observed {
+    let mut deferred: Vec<(usize, &ObservedCall)> = Vec::new();
+    for (observed_index, obs) in art.observed.iter().enumerate() {
         if obs.boundary == "http_incoming" {
             continue;
         }
+        if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
+            graph_plan.replay_event_is_novel(correlation_id, observed_index)
+        }) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            if tier_for(&obs.boundary) == Tier::Environmental {
+                stats.bump_kind("EnvironmentalMiss");
+                environmental_misses += 1;
+            } else if is_nonblocking_boundary(&obs.boundary) {
+                stats.bump_kind("DeterministicMiss");
+            } else {
+                stats.bump_kind("NovelSubtree");
+                blocking_side_effect += 1;
+                if let Some(correlation_id) = &obs.correlation_id {
+                    *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
+                }
+            }
+            continue;
+        }
+        if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            stats.bump_kind("IdentitySkew");
+            identity_skews += 1;
+            blocking_side_effect += 1;
+            if let Some(correlation_id) = &obs.correlation_id {
+                *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
+            }
+            consumed.extend(aligned_event);
+            consumed.extend(served_event);
+            continue;
+        }
         if !obs.resolved {
-            deferred.push(obs);
+            deferred.push((observed_index, obs));
             continue;
         }
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
         {
             // The recorded baseline was found (args still aligned). Under lookup
             // mode observed_result == recorded_result (substituted) so this is a
-            // plain match. Under execute mode the recorded baseline was located by
-            // args-aligned occurrence but the REAL boundary ran: if its
             // observed_result differs from the recorded baseline this is a
             // ValueDiverged (the args-aligned flavor — a READ, or a WRITE whose
             // operand did not change). The re-keyed WRITE whose operand DID change
@@ -2685,6 +3398,18 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
             if diverged {
+                if let (Some(correlation_id), Some(node_id)) =
+                    (obs.correlation_id.as_ref(), obs.graph_node_id)
+                {
+                    if graph_plan.is_graph(Some(correlation_id))
+                        && !graph_plan.replay_node_uses_flat_tier(correlation_id, node_id)
+                    {
+                        graph_value_nodes
+                            .entry(correlation_id.clone())
+                            .or_default()
+                            .insert(node_id);
+                    }
+                }
                 // Rule C: every column that differs is one the statement filled
                 // with the SQL keyword DEFAULT, on both sides — the schema
                 // supplied the value, so this describes the two databases and
@@ -2695,12 +3420,10 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     obs,
                     obs.source_event_global_sequence
                         .and_then(|seq| events_by_seq.get(&seq).copied()),
-                    &column_provenance,
                 ) {
                     SchemaDefaultVerdict::Confirmed(schema_default) => {
                         stats.bump_kind(schema_default.kind());
                         schema_default_divergences += 1;
-                        schema_default_inherited += u64::from(schema_default.is_inherited());
                         *schema_default_columns_seen
                             .entry(schema_default.label())
                             .or_insert(0) += 1;
@@ -2714,17 +3437,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     }
                     SchemaDefaultVerdict::No => {}
                 }
-                // Rule A: a concurrent same-row UPDATE-RETURNING interleaving
-                // artifact is NOT a blocking divergence — the final row state is
-                // reproduced by a matched write; only this earlier write's RETURNING
-                // row differs by ordering. Demote to a non-blocking warning.
                 if let Some(seq) = obs.source_event_global_sequence {
-                    if order_nondet_demote.contains(&seq) {
-                        stats.bump_kind("OrderNondeterministicWarning");
-                        order_nondeterminism_warnings += 1;
-                        consumed.insert(seq);
-                        continue;
-                    }
                     // Rule B: benign idempotent redis DELETE (recorded KeyDeleted vs
                     // observed KeyNotDeleted — key absent afterward either way).
                     if idempotent_delete_demote.contains(&seq) {
@@ -2789,7 +3502,47 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // PASS 2 — unresolved calls, in stream order (which keeps args-free FIFO
     // occurrence stable). `consumed` is complete: no pairing decision below
     // can bind a recorded event that a resolved call owns.
-    for obs in deferred {
+    for (observed_index, obs) in deferred {
+        if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            stats.bump_kind("IdentitySkew");
+            identity_skews += 1;
+            blocking_side_effect += 1;
+            if let Some(correlation_id) = &obs.correlation_id {
+                *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
+            }
+            paired_consumed.extend(aligned_event);
+            paired_consumed.extend(served_event);
+            continue;
+        }
+        let graph_mode = graph_plan.is_graph(obs.correlation_id.as_deref())
+            && obs.correlation_id.as_deref().is_some_and(|correlation_id| {
+                !graph_plan.replay_event_uses_flat_tier(correlation_id, observed_index)
+                    && obs.graph_node_id.is_some_and(|node_id| {
+                        !graph_plan.replay_node_uses_flat_tier(correlation_id, node_id)
+                    })
+            });
+        let paired_twin = if graph_mode {
+            obs.correlation_id
+                .as_deref()
+                .zip(obs.graph_node_id)
+                .and_then(|(correlation_id, node_id)| {
+                    graph_plan.recorded_sequence_for_replay_node(correlation_id, node_id)
+                })
+                .map(|sequence| ArgsFreePairingResult {
+                    sequence,
+                    order_mismatch: false,
+                })
+        } else {
+            recorded_pairing.take_twin(obs, &consumed)
+        }
+        .map(|twin| {
+            let result = expected
+                .get(&twin.sequence)
+                .map(|exp| exp.result.clone())
+                .unwrap_or(serde_json::Value::Null);
+            (twin.sequence, twin.order_mismatch, result)
+        });
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
         if tier_for(&obs.boundary) == Tier::Environmental {
             stats.bump_kind("EnvironmentalMiss");
@@ -2803,18 +3556,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             // apart from the blocking `NovelCall` because it is a different
             // thing, not a different count of the same thing.
             stats.bump_kind("NovelCallTolerated");
-        } else if let Some((twin_seq, recorded)) =
-            recorded_pairing.take_twin(obs, &consumed).map(|seq| {
-                // The recorded operand this twin compares against is the lookup
-                // entry's own result, the same one the strict-args path would
-                // have substituted.
-                let result = expected
-                    .get(&seq)
-                    .map(|exp| exp.result.clone())
-                    .unwrap_or(serde_json::Value::Null);
-                (seq, result)
-            })
-        {
+        } else if let Some((twin_seq, order_mismatch, recorded)) = paired_twin {
             // GOTCHA #1 resolution: this unresolved observed call pairs args-free
             // (correlation+boundary+method, FIFO occurrence) with a recorded twin
             // that the candidate "omitted" because its args were re-keyed. The
@@ -2823,19 +3565,39 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let value_diverged =
-                values_diverge_under_event(&obs.boundary, &recorded_val, &observed_val, twin_event);
-            let schema_default = if value_diverged {
+            let value_diverged = order_mismatch
+                || values_diverge_under_event(
+                    &obs.boundary,
+                    &recorded_val,
+                    &observed_val,
+                    twin_event,
+                    obs.args.get("sql").and_then(serde_json::Value::as_str),
+                );
+            if value_diverged {
+                if let (Some(correlation_id), Some(node_id)) =
+                    (obs.correlation_id.as_ref(), obs.graph_node_id)
+                {
+                    if graph_plan.is_graph(Some(correlation_id))
+                        && !graph_plan.replay_node_uses_flat_tier(correlation_id, node_id)
+                    {
+                        graph_value_nodes
+                            .entry(correlation_id.clone())
+                            .or_default()
+                            .insert(node_id);
+                    }
+                }
+            }
+            // An exact later-args match is direct order evidence. Result/schema
+            // equivalence and race demotion must not absorb that blocking signal.
+            let schema_default = if value_diverged && !order_mismatch {
                 schema_default_divergence(
                     &obs.boundary,
-                    obs.correlation_id.as_deref(),
                     twin_event
                         .and_then(|ev| ev.args.get("sql"))
                         .and_then(|s| s.as_str()),
                     obs.args.get("sql").and_then(|s| s.as_str()),
                     &recorded_val,
                     &observed_val,
-                    &column_provenance,
                 )
             } else {
                 SchemaDefaultVerdict::No
@@ -2847,17 +3609,16 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                 schema_default_unconfirmed += 1;
             }
             if let SchemaDefaultVerdict::Confirmed(schema_default) = schema_default {
-                // Rule C, on the args-free arm: same statement-borne evidence,
                 // same non-blocking class.
                 stats.bump_kind(schema_default.kind());
                 schema_default_divergences += 1;
-                schema_default_inherited += u64::from(schema_default.is_inherited());
                 *schema_default_columns_seen
                     .entry(schema_default.label())
                     .or_insert(0) += 1;
             } else if value_diverged {
-                if inconclusive_race
-                    .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
+                if !order_mismatch
+                    && inconclusive_race
+                        .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
                 {
                     stats.bump_kind("InconclusiveRace");
                     inconclusive_races += 1;
@@ -2899,7 +3660,10 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // here is what collapses a re-keyed write's Omitted+Novel split into ONE
     // ValueDiverged instead of double-counting.
     for (seq, exp) in &expected {
-        if consumed.contains(seq) || paired_consumed.contains(seq) {
+        let pruned = exp.correlation.as_deref().is_some_and(|correlation_id| {
+            graph_recorded_event_is_pruned(graph_plan, correlation_id, *seq)
+        });
+        if !pruned && (consumed.contains(seq) || paired_consumed.contains(seq)) {
             continue;
         }
         let boundary = exp.boundary.clone().unwrap_or_else(|| "unknown".to_owned());
@@ -2909,7 +3673,9 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         // the summary give a report two answers for one set of calls.
         let blocking = omission_is_blocking(exp.correlation.as_deref(), &boundary);
         let stats = boundary_entry(&mut per_boundary, &boundary);
-        stats.bump_kind(if blocking {
+        stats.bump_kind(if blocking && pruned {
+            "PrunedSubtree"
+        } else if blocking {
             "OmittedCall"
         } else {
             "OmittedCallTolerated"
@@ -2941,9 +3707,11 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // The summary's call counters are PROJECTIONS of the per-boundary ledger
     // above, folded out of it once every call has been classified — never a
     // second tally kept alongside it, which is what let them disagree.
-    let omitted_calls = kind_total(&per_boundary, "OmittedCall");
+    let omitted_calls =
+        kind_total(&per_boundary, "OmittedCall") + kind_total(&per_boundary, "PrunedSubtree");
     let omitted_calls_tolerated = kind_total(&per_boundary, "OmittedCallTolerated");
-    let novel_calls = kind_total(&per_boundary, "NovelCall");
+    let novel_calls =
+        kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
 
     // --- post-finalization correlated work warnings --------------------------
@@ -2964,6 +3732,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     // where to look. Keyed by canon id, counting the responses it governed
     // vacuously.
     let mut inapplicable_reply_canons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut schema_default_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -2980,8 +3749,13 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                     .or_insert(0) += 1;
                 *inapplicable_reply_canons.entry(canon).or_insert(0) += 1;
             }
-            let blocking_body_diffs =
-                blocking_http_body_diff_count(diff, recorded_http, &inconclusive_race);
+            let body_classification = classify_http_body_diff(
+                diff,
+                recorded_http,
+                &inconclusive_race,
+                &column_provenance,
+            );
+            let blocking_body_diffs = body_classification.blocking_leaf_count;
             if diff.status_match && blocking_body_diffs == 0 {
                 stats.matched += 1;
             }
@@ -2994,6 +3768,11 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
                 for _ in 0..blocking_body_diffs {
                     stats.bump_kind("BodyMismatch");
                 }
+            }
+            for path in body_classification.schema_derived_paths {
+                stats.bump_kind("SchemaDefaultDivergence");
+                schema_default_divergences += 1;
+                *schema_default_response_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -3017,6 +3796,12 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             http_status_match: *status_match,
             http_body_match: *body_match,
             side_effect_divergences,
+            scoring_mode: graph_plan.mode(corr).cloned().unwrap_or(
+                deja_forest::ScoringMode::Flat {
+                    reason: deja_forest::FlatReason::MissingForest,
+                },
+            ),
+            alignment: graph_plan.scored_alignment(corr, graph_value_nodes.get(corr)),
             passed,
         });
     }
@@ -3044,6 +3829,9 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
         // `corr_side_effect`).
         reasons.push(format!("{value_divergences} value divergence(s)"));
     }
+    if identity_skews > 0 {
+        reasons.push(format!("{identity_skews} graph identity skew(s)"));
+    }
     // Seed gaps are reported but do NOT by themselves fail the verdict — a
     // missing baseline is inconclusive, not a divergence.
     if inconclusive_seed_gaps > 0 {
@@ -3056,30 +3844,16 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             "{inconclusive_races} inconclusive_race row(s) recognized; auto-rerun recommended"
         ));
     }
-    // Order-nondeterminism demotions (Rule A) are reported but non-blocking: a
-    // concurrent same-row UPDATE-RETURNING interleaving whose final state matches
-    // the recording is not a divergence.
-    if order_nondeterminism_warnings > 0 {
-        reasons.push(format!(
-            "{order_nondeterminism_warnings} order-nondeterminism warning(s) (non-blocking)"
-        ));
-    }
     if idempotent_delete_warnings > 0 {
         reasons.push(format!(
             "{idempotent_delete_warnings} idempotent-delete warning(s) (non-blocking)"
         ));
     }
-    // Rule C: a divergence the statements themselves attribute to the schema
-    // describes the two databases, not the candidate. Reported, non-blocking.
+    // Rule C: confirmed schema provenance describes the databases and response
+    // values derived from them, not the candidate. Reported, non-blocking.
     if schema_default_divergences > 0 {
-        // The split is in the headline, not buried: a reader has to be able to
-        // see how much of this rests on a statement and how much on an
-        // inference, without opening the breakdown.
         reasons.push(format!(
-            "{schema_default_divergences} schema-derived divergence(s) (non-blocking; \
-             {} read off the statement, {schema_default_inherited} inherited within a \
-             correlation)",
-            schema_default_divergences - schema_default_inherited
+            "{schema_default_divergences} schema-derived DB/response occurrence(s) (non-blocking)"
         ));
     }
     if undeclared_concurrency_warnings > 0 {
@@ -3087,15 +3861,14 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             "{undeclared_concurrency_warnings} undeclared_concurrency warning(s) (non-blocking)"
         ));
     }
-    // Seed-gap + race + order-nondeterminism + idempotent-delete +
-    // schema-derived + undeclared_concurrency lines are informational, not
-    // divergences the candidate caused; exclude
-    // them from the blocking count so a run whose only "reasons" are those still
-    // avoids a blocking failure (race becomes an explicit inconclusive verdict).
+    // Seed-gap + race + idempotent-delete + schema-derived +
+    // undeclared_concurrency lines are informational, not divergences the
+    // candidate caused; exclude them from the blocking count so a run whose
+    // only "reasons" are those still avoids a blocking failure (race becomes an
+    // explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
         - usize::from(inconclusive_seed_gaps > 0)
         - usize::from(inconclusive_races > 0)
-        - usize::from(order_nondeterminism_warnings > 0)
         - usize::from(idempotent_delete_warnings > 0)
         - usize::from(schema_default_divergences > 0)
         - usize::from(undeclared_concurrency_warnings > 0);
@@ -3113,15 +3886,6 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
     };
 
     let mut warnings = art.warnings.clone();
-    for (seq, row) in &order_nondet_demote.row_labels {
-        let canon = order_nondet_demote
-            .canon_label(seq)
-            .map(|label| format!(" canon={label}"))
-            .unwrap_or_default();
-        warnings.push(format!(
-            "Rule A order-nondeterminism demoted event {seq} on db row {row}{canon}"
-        ));
-    }
     for (seq, row) in &inconclusive_race.row_labels {
         warnings.push(format!(
             "inconclusive_race event {seq} on db row {row}: auto-rerun recommended"
@@ -3138,16 +3902,12 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
              cause this"
         ));
     }
-    // The inference names itself and its limit. It stands in for a row
-    // provenance deja cannot yet express on these tables, and a reader who does
-    // not know that cannot judge how far to trust the green.
-    if schema_default_inherited > 0 {
+    // Response evidence is grouped by its original JSON path so absorption
+    // remains visible without mutating the kernel's raw HttpDiff evidence.
+    for (path, n) in &schema_default_response_paths_seen {
         warnings.push(format!(
-            "{schema_default_inherited} of those were INFERRED, not read: the statement did not \
-             write the column, so its value came out of stored state, and the claim rests on \
-             the correlation having created the row with that column left to the schema. \
-             Correlation stands in for the row here because the payment tables record no typed \
-             row keys; a write to the same row from another correlation would not be seen"
+            "{n} response body leaf occurrence(s) at {path} classified as schema-derived from \
+             confirmed same-correlation column provenance — the candidate did not cause this"
         ));
     }
     // A declaration that governs nothing is reported as the defect it is. The
@@ -3205,6 +3965,7 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
             novel_calls,
             novel_calls_tolerated,
             value_divergences,
+            identity_skews,
             order_nondeterminism_warnings,
             schema_default_divergences,
             idempotent_delete_warnings,
@@ -3236,9 +3997,10 @@ pub fn detect(art: &RunArtifacts) -> Scorecard {
 // Loading + scoring
 // ---------------------------------------------------------------------------
 
-/// Load a run's three artifact streams off disk. Missing files are treated as
-/// empty (a run mid-flight); parse failures are surfaced as `warnings` rather
-/// than silently dropped, so a corrupt stream can't masquerade as a clean run.
+/// Load a run's artifact streams off disk. Missing files are treated as empty
+/// (or unavailable for the optional record graph); parse failures are surfaced
+/// as `warnings` rather than silently dropped, so corruption cannot masquerade
+/// as a clean run.
 pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifacts> {
     let run = crate::read_json::<crate::Run>(&root.run_path(run_id)).ok();
     let recording_id = run.as_ref().and_then(|run| {
@@ -3256,7 +4018,9 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 
     let mut warnings = Vec::new();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
-    let observed = load_observed_calls(&root.observed_path(run_id), &mut warnings);
+    let (observed, mut replay_graph) =
+        load_replay_stream(&root.observed_path(run_id), &mut warnings);
+    let mut record_graph = load_record_graph(&root.record_graph_path(run_id), &mut warnings);
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
 
     // The record graph could not be built for this run: the extract left the
@@ -3392,6 +4156,10 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         table
             .entries
             .retain(|e| scope.contains(e.key.correlation_id.as_deref()));
+        replay_graph.retain(|node| scope.contains(node.correlation_id.as_deref()));
+        if let Some(nodes) = &mut record_graph {
+            nodes.retain(|node| scope.contains(node.correlation_id.as_deref()));
+        }
         warnings.push(format!(
             "correlation scope: {} id(s) driven; excluded {} lookup entries outside the subset; \
              {} recorded event(s) in scope",
@@ -3407,6 +4175,8 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         table,
         observed,
         http_diffs,
+        record_graph,
+        replay_graph,
         events,
         correlation_scope,
         warnings,
@@ -3424,7 +4194,8 @@ pub fn scorecard(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecard> {
 /// ledger sidecar (best-effort — a ledger failure never fails scoring).
 pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecard> {
     let art = load_artifacts(root, run_id)?;
-    let card = detect(&art);
+    let graph_plan = GraphScoringPlan::build(&art);
+    let card = detect_with_plan(&art, &graph_plan);
     let path = root
         .root
         .join("runs")
@@ -3432,7 +4203,7 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     crate::write_json(&path, &card)?;
 
     // Ledger: the per-call detail the scorecard summary drops. Best-effort.
-    match build_ledger(&art) {
+    match build_ledger_with_plan(&art, &graph_plan) {
         Ok(rows) => {
             if let Err(e) = write_ledger(&root.call_ledger_path(run_id), &rows) {
                 eprintln!("divergence: ledger write failed for {run_id}: {e}");
@@ -3453,6 +4224,14 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 /// data, two answers, and recorded payloads from correlations the run never
 /// drove attached to its ledger rows.
 pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
+    let graph_plan = GraphScoringPlan::build(art);
+    build_ledger_with_plan(art, &graph_plan)
+}
+
+pub(crate) fn build_ledger_with_plan(
+    art: &RunArtifacts,
+    graph_plan: &GraphScoringPlan,
+) -> io::Result<Vec<CallRecord>> {
     let events = &art.events;
     let span_paths = ledger::recorded_span_paths(&art.table);
     // Mirror scorecard classification: discover race evidence under status-clean
@@ -3462,29 +4241,32 @@ pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     let http_incoming_by_correlation = http_incoming_events_by_correlation(events);
     let inconclusive_race =
         inconclusive_race_evidence(events, &art.observed, http_status_clean, &span_paths);
+    let column_provenance = correlation_column_provenance(events, &art.observed);
     let blocking_http_body_mismatches = art
         .http_diffs
         .iter()
         .filter(|diff| {
-            blocking_http_body_diff_count(
+            classify_http_body_diff(
                 diff,
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
                 &inconclusive_race,
-            ) > 0
+                &column_provenance,
+            )
+            .blocking_leaf_count
+                > 0
         })
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
-    let demote = order_nondeterministic_demotions(events, &art.observed, http_clean);
     let idempotent_delete = idempotent_delete_demotions(events, &art.observed, http_clean);
-    Ok(ledger::build_with_inconclusive(
+    Ok(ledger::build_with_plan(
         events,
         &art.observed,
         &art.table,
-        &demote.sequences,
         &idempotent_delete,
         &inconclusive_race,
+        graph_plan,
     ))
 }
 
@@ -3556,45 +4338,73 @@ fn load_jsonl<T: for<'de> Deserialize<'de>>(
     out
 }
 
-/// Load the shared graph-as-events wire stream from JSONL. The stream is
-/// internally tagged as [`deja::DejaRecord`], so callers match variants instead
-/// of routing by raw `record_kind` strings.
-fn load_deja_records(path: &std::path::Path, warnings: &mut Vec<String>) -> Vec<deja::DejaRecord> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+/// Stream a tagged JSONL file, routing each parsed record before reading the
+/// next line. Returns whether the file was present and completely readable.
+fn stream_deja_records(
+    path: &std::path::Path,
+    warnings: &mut Vec<String>,
+    mut route: impl FnMut(deja::DejaRecord),
+) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
         Err(e) => {
             warnings.push(format!("read {} failed: {e}", path.display()));
-            return Vec::new();
+            return false;
         }
     };
-    let mut out = Vec::new();
-    for (i, line) in content.lines().enumerate() {
+    for (i, line) in io::BufReader::new(file).lines().enumerate() {
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                warnings.push(format!("read {} failed: {e}", path.display()));
+                return false;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<deja::DejaRecord>(line) {
-            Ok(record) => out.push(record),
+        match serde_json::from_str::<deja::DejaRecord>(&line) {
+            Ok(record) => route(record),
             Err(e) => warnings.push(format!("{}:{}: parse error: {e}", path.display(), i + 1)),
         }
     }
-    out
+    true
 }
 
-// NOTE: there is deliberately no `load_boundary_events(path)` here any more.
-// It read a recording tape from a raw `&Path` with no notion of the run's
-// scope, which is how `build_ledger` came to classify a different, wider event
-// set than the scorecard it was supposed to mirror. Recordings are read through
-// `scope::ScopedRecording`.
+/// Split the replay's shared tagged stream in one pass.
+fn load_replay_stream(
+    path: &std::path::Path,
+    warnings: &mut Vec<String>,
+) -> (Vec<ObservedCall>, Vec<deja_core::ExecutionGraphNode>) {
+    let mut observed = Vec::new();
+    let mut graph = Vec::new();
+    if !stream_deja_records(path, warnings, |record| match record {
+        deja::DejaRecord::Observed(call) => observed.push(*call),
+        deja::DejaRecord::GraphNode(node) => graph.push(*node),
+        deja::DejaRecord::BoundaryEvent(_) => {}
+    }) {
+        // Match the previous all-or-nothing read: a truncated stream cannot
+        // masquerade as a complete, smaller replay.
+        observed.clear();
+        graph.clear();
+    }
+    (observed, graph)
+}
 
-fn load_observed_calls(path: &std::path::Path, warnings: &mut Vec<String>) -> Vec<ObservedCall> {
-    load_deja_records(path, warnings)
-        .into_iter()
-        .filter_map(|record| match record {
-            deja::DejaRecord::Observed(call) => Some(*call),
-            deja::DejaRecord::BoundaryEvent(_) | deja::DejaRecord::GraphNode(_) => None,
-        })
-        .collect()
+/// Load the optional record-side tagged graph stream. Missing or unreadable is
+/// unavailable (`None`); a readable empty artifact remains `Some(empty)`.
+fn load_record_graph(
+    path: &std::path::Path,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<deja_core::ExecutionGraphNode>> {
+    let mut graph = Vec::new();
+    stream_deja_records(path, warnings, |record| {
+        if let deja::DejaRecord::GraphNode(node) = record {
+            graph.push(*node);
+        }
+    })
+    .then_some(graph)
 }
 
 #[cfg(test)]
@@ -3764,6 +4574,166 @@ mod tests {
 
         // Identical rows are trivially equivalent; redis (non-db) is unaffected here.
         assert!(db_equiv_modulo_infra(&rec, &rec));
+    }
+
+    #[test]
+    fn update_returning_ignores_only_unassigned_row_columns() {
+        let sql = "update \"payment_attempt\" set \"status\" = $1, \
+                   \"modified_at\" = now() where \"attempt_id\" = $2 returning * \
+                   -- binds: [Charged, \"a_1\"]";
+        let recorded = serde_json::json!({
+            "result": "Ok",
+            "type_name": "PaymentAttempt",
+            "value": [{
+                "attempt_id": "a_1",
+                "status": "Charged",
+                "modified_at": "2026-08-16T10:00:00Z",
+                "connector_transaction_id": "txn_recorded"
+            }]
+        });
+        let observed = serde_json::json!({
+            "result": "Ok",
+            "type_name": "PaymentAttempt",
+            "value": [{
+                "attempt_id": "a_1",
+                "status": "Charged",
+                "modified_at": "2026-08-16T10:00:00Z",
+                "connector_transaction_id": "txn_from_racing_update"
+            }]
+        });
+        let mut event = db_update_ev(
+            "corr",
+            "payment_attempt",
+            1,
+            serde_json::json!({"attempt_id": "a_1"}),
+            0,
+            1,
+        );
+        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+
+        assert!(
+            !values_diverge_under_event("db", &recorded, &observed, Some(&event), Some(sql)),
+            "the scorer must tolerate a whole-row mismatch inherited from an unassigned column"
+        );
+        assert!(
+            !update_returning_equivalent(
+                Some("UPDATE payment_attempt SET status = $1 RETURNING *"),
+                Some("UPDATE payment_attempt SET status = $1 RETURNING *"),
+                &recorded,
+                &observed,
+            ),
+            "unsupported unquoted identifiers must fail closed"
+        );
+        assert!(
+            !update_returning_equivalent(
+                Some(
+                    "UPDATE \"payment_attempt\" SET \"status\" = $1, malformed \
+                     WHERE \"attempt_id\" = $2 RETURNING *",
+                ),
+                Some(
+                    "UPDATE \"payment_attempt\" SET \"status\" = $1, malformed \
+                     WHERE \"attempt_id\" = $2 RETURNING *",
+                ),
+                &recorded,
+                &observed,
+            ),
+            "a partially parsed SET list must fail closed instead of projecting on a subset"
+        );
+    }
+
+    #[test]
+    fn update_returning_keeps_assigned_columns_strict() {
+        let sql = "UPDATE \"payment_attempt\" SET \"status\" = $1, \
+                   \"modified_at\" = now() WHERE \"attempt_id\" = $2 RETURNING * \
+                   -- binds: [Charged, \"a_1\"]";
+        let recorded = serde_json::json!({
+            "result": "Ok",
+            "type_name": "PaymentAttempt",
+            "value": {
+                "attempt_id": "a_1",
+                "status": "Charged",
+                "modified_at": "2026-08-16T10:00:00Z"
+            }
+        });
+        let observed = serde_json::json!({
+            "result": "Ok",
+            "type_name": "PaymentAttempt",
+            "value": {
+                "attempt_id": "a_1",
+                "status": "Pending",
+                "modified_at": "2026-08-16T10:00:00Z"
+            }
+        });
+        let mut event = db_update_ev(
+            "corr",
+            "payment_attempt",
+            1,
+            serde_json::json!({"attempt_id": "a_1"}),
+            0,
+            1,
+        );
+        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+
+        assert!(
+            values_diverge_under_event("db", &recorded, &observed, Some(&event), Some(sql)),
+            "the scorer must keep a mismatch in quoted SET column status divergent"
+        );
+        let default_sql = "UPDATE \"payment_attempt\" SET \"status\" = DEFAULT, \
+                           \"modified_at\" = now() WHERE \"attempt_id\" = $1 RETURNING * \
+                           -- binds: [\"a_1\"]";
+        assert_eq!(
+            schema_default_divergence(
+                "db",
+                Some(default_sql),
+                Some(default_sql),
+                &recorded,
+                &observed,
+            ),
+            SchemaDefaultVerdict::No,
+            "SET column mismatches stay strict even when the assignment uses DEFAULT"
+        );
+        let missing_assigned = serde_json::json!({
+            "result": "Ok",
+            "type_name": "PaymentAttempt",
+            "value": {
+                "attempt_id": "a_1",
+                "status": "Charged"
+            }
+        });
+        assert!(
+            !update_returning_equivalent(
+                Some(sql),
+                Some(sql),
+                &missing_assigned,
+                &missing_assigned,
+            ),
+            "projection requires every assigned column on both returned rows"
+        );
+        assert!(
+            !update_returning_equivalent(
+                Some(sql),
+                Some(
+                    "UPDATE \"payment_attempt\" SET \"connector_transaction_id\" = $1 \
+                     WHERE \"attempt_id\" = $2 RETURNING * -- binds: [\"txn\", \"a_1\"]",
+                ),
+                &recorded,
+                &recorded,
+            ),
+            "different assigned-column sets are not result-equivalent"
+        );
+        let array_container = serde_json::json!({
+            "result": "Ok",
+            "type_name": "PaymentAttempt",
+            "value": [{
+                "attempt_id": "a_1",
+                "status": "Charged",
+                "modified_at": "2026-08-16T10:00:00Z"
+            }]
+        });
+        assert!(
+            !update_returning_equivalent(Some(sql), Some(sql), &recorded, &array_container,),
+            "object and single-element-array row containers are not equivalent"
+        );
     }
 
     fn obs(
@@ -4115,6 +5085,191 @@ mod tests {
         o
     }
 
+    fn graph_node(node_id: u64, correlation_id: Option<&str>) -> deja_core::ExecutionGraphNode {
+        deja_core::ExecutionGraphNode {
+            node_id,
+            global_sequence: node_id,
+            parent_id: None,
+            causal_parent_ids: Vec::new(),
+            sequence: node_id,
+            correlation_id: correlation_id.map(str::to_owned),
+            recording_run_id: Some("rec-graph".to_owned()),
+            span_name: format!("span-{node_id}"),
+            target: "test".to_owned(),
+            level: "INFO".to_owned(),
+            fields: BTreeMap::new(),
+            started_ns: node_id * 10,
+            closed_ns: Some(node_id * 10 + 1),
+        }
+    }
+
+    fn write_graph_test_run(root: &HarnessRoot, run_id: &str, filter: Option<Vec<String>>) {
+        crate::write_json(
+            &root.run_path(run_id),
+            &crate::Run {
+                run_id: run_id.to_owned(),
+                spec: crate::RunSpec {
+                    mode: crate::RunMode::Replay,
+                    candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                        image: "deja-demo".to_owned(),
+                    },
+                    candidate_repo: None,
+                    recording_id: None,
+                    s3_source: None,
+                    correlation_filter: filter,
+                    workload: serde_json::Value::Null,
+                },
+                status: crate::RunStatus::Completed,
+                recording_id: None,
+                candidate_image: None,
+                failure_reason: None,
+                stage: None,
+                step: 0,
+                steps_total: 0,
+                stage_updated_ms: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_artifacts_carries_both_execution_graph_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-both-graphs";
+        let replay_rows = vec![
+            deja::DejaRecord::GraphNode(Box::new(graph_node(11, Some("c1")))),
+            deja::DejaRecord::Observed(Box::new(obs("db", Some("c1"), true, Some(3), Some(1)))),
+            deja::DejaRecord::GraphNode(Box::new(graph_node(12, Some("c1")))),
+        ];
+        let record_rows = vec![
+            deja::DejaRecord::GraphNode(Box::new(graph_node(1, Some("c1")))),
+            deja::DejaRecord::GraphNode(Box::new(graph_node(2, Some("c1")))),
+            deja::DejaRecord::GraphNode(Box::new(graph_node(3, Some("c1")))),
+        ];
+        write_jsonl_rows(&root.observed_path(run_id), &replay_rows);
+        write_jsonl_rows(&root.record_graph_path(run_id), &record_rows);
+
+        let art = load_artifacts(&root, run_id).unwrap();
+        assert_eq!(art.observed.len(), 1);
+        assert_eq!(art.replay_graph.len(), 2);
+        assert_eq!(art.record_graph.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn unavailable_record_graph_preserves_detection_and_distinguishes_present_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-record-graph-absent";
+        write_graph_test_run(&root, run_id, None);
+        write_jsonl_rows::<deja::DejaRecord>(&root.record_graph_path(run_id), &[]);
+
+        let present = load_artifacts(&root, run_id).unwrap();
+        assert_eq!(present.record_graph, Some(Vec::new()));
+        let present_card = detect(&present);
+
+        std::fs::remove_file(root.record_graph_path(run_id)).unwrap();
+        let absent = load_artifacts(&root, run_id).unwrap();
+        assert!(absent.record_graph.is_none());
+        assert!(!absent
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("record graph refused")));
+        let absent_card = detect(&absent);
+        assert_eq!(
+            serde_json::to_value(&absent_card.summary).unwrap(),
+            serde_json::to_value(&present_card.summary).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&absent_card.verdict).unwrap(),
+            serde_json::to_value(&present_card.verdict).unwrap()
+        );
+
+        std::fs::write(
+            root.record_graph_note_path(run_id),
+            "record graph refused: incomplete correlation coverage\n",
+        )
+        .unwrap();
+        let refused = load_artifacts(&root, run_id).unwrap();
+        assert!(refused.record_graph.is_none());
+        assert!(refused
+            .warnings
+            .iter()
+            .any(|warning| warning == "record graph refused: incomplete correlation coverage"));
+
+        std::fs::create_dir(root.record_graph_path(run_id)).unwrap();
+        let unreadable = load_artifacts(&root, run_id).unwrap();
+        assert!(unreadable.record_graph.is_none());
+        assert!(unreadable
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("read") && warning.contains("record-graph.jsonl") }));
+    }
+
+    #[test]
+    fn graph_streams_follow_filtered_run_scope_and_keep_ambient_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-graph-scope";
+        write_graph_test_run(&root, run_id, Some(vec!["c-keep".to_owned()]));
+        let rows = |offset| {
+            vec![
+                deja::DejaRecord::GraphNode(Box::new(graph_node(offset, Some("c-keep")))),
+                deja::DejaRecord::GraphNode(Box::new(graph_node(offset + 1, Some("c-drop")))),
+                deja::DejaRecord::GraphNode(Box::new(graph_node(offset + 2, None))),
+            ]
+        };
+        write_jsonl_rows(&root.record_graph_path(run_id), &rows(1));
+        write_jsonl_rows(&root.observed_path(run_id), &rows(11));
+
+        let art = load_artifacts(&root, run_id).unwrap();
+        let record = art.record_graph.unwrap();
+        assert_eq!(
+            record.iter().map(|node| node.node_id).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(
+            art.replay_graph
+                .iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>(),
+            [11, 13]
+        );
+        assert!(record.iter().any(|node| node.correlation_id.is_none()));
+        assert!(art
+            .replay_graph
+            .iter()
+            .any(|node| node.correlation_id.is_none()));
+    }
+
+    #[test]
+    fn interleaved_replay_records_split_in_source_order_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let rows = vec![
+            deja::DejaRecord::Observed(Box::new(obs("first", Some("c1"), true, None, Some(1)))),
+            deja::DejaRecord::GraphNode(Box::new(graph_node(21, Some("c1")))),
+            deja::DejaRecord::Observed(Box::new(obs("second", Some("c1"), true, None, Some(2)))),
+            deja::DejaRecord::GraphNode(Box::new(graph_node(22, Some("c1")))),
+        ];
+        write_jsonl_rows(&path, &rows);
+        let mut warnings = Vec::new();
+
+        let (observed, graph) = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            observed
+                .iter()
+                .map(|call| call.boundary.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            graph.iter().map(|node| node.node_id).collect::<Vec<_>>(),
+            [21, 22]
+        );
+    }
+
     fn seq_entry_method_res(
         corr: Option<&str>,
         boundary: &str,
@@ -4195,6 +5350,8 @@ mod tests {
             },
             observed,
             http_diffs: http,
+            record_graph: None,
+            replay_graph: Vec::new(),
             events: Vec::new(),
             correlation_scope: None,
             warnings: Vec::new(),
@@ -4224,6 +5381,127 @@ mod tests {
         diff.baseline_body = Some(baseline_body);
         diff.candidate_body = Some(candidate_body);
         diff
+    }
+
+    fn scorer_html_diff(baseline: &str, candidate: &str) -> HttpDiff {
+        let baseline = serde_json::Value::String(baseline.to_owned());
+        let candidate = serde_json::Value::String(candidate.to_owned());
+        http_with_bodies(
+            "redirect-form",
+            true,
+            vec![JsonFieldDiff {
+                json_path: "$".to_owned(),
+                baseline: baseline.clone(),
+                candidate: candidate.clone(),
+            }],
+            baseline,
+            candidate,
+        )
+    }
+
+    const REDIRECT_FORM: &str = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="amount" value="100"><input type="hidden" name="currency" value="USD"><input type="hidden" name="merchant" value="shop"></form></body></html>"#;
+
+    #[test]
+    fn scorer_forgives_reordered_hidden_form_inputs() {
+        let candidate = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="merchant" value="shop"><input type="hidden" name="amount" value="100"><input type="hidden" name="currency" value="USD"></form></body></html>"#;
+        let diff = scorer_html_diff(REDIRECT_FORM, candidate);
+        assert_eq!(
+            diff.body_diff.len(),
+            1,
+            "raw HttpDiff evidence must remain intact"
+        );
+        assert_eq!(
+            classify_http_body_diff(
+                &diff,
+                None,
+                &InconclusiveRaceEvidence::default(),
+                &CorrelationColumnProvenance::default(),
+            )
+            .blocking_leaf_count,
+            0
+        );
+    }
+
+    #[test]
+    fn scorer_keeps_changed_hidden_form_value_blocking() {
+        let candidate = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="currency" value="EUR"><input type="hidden" name="merchant" value="shop"><input type="hidden" name="amount" value="100"></form></body></html>"#;
+        let diff = scorer_html_diff(REDIRECT_FORM, candidate);
+        assert_eq!(
+            classify_http_body_diff(
+                &diff,
+                None,
+                &InconclusiveRaceEvidence::default(),
+                &CorrelationColumnProvenance::default(),
+            )
+            .blocking_leaf_count,
+            1
+        );
+    }
+
+    #[test]
+    fn scorer_keeps_missing_hidden_form_input_blocking() {
+        let candidate = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="merchant" value="shop"><input type="hidden" name="amount" value="100"></form></body></html>"#;
+        let diff = scorer_html_diff(REDIRECT_FORM, candidate);
+        assert_eq!(
+            classify_http_body_diff(
+                &diff,
+                None,
+                &InconclusiveRaceEvidence::default(),
+                &CorrelationColumnProvenance::default(),
+            )
+            .blocking_leaf_count,
+            1
+        );
+    }
+
+    #[test]
+    fn scorer_keeps_extra_hidden_form_input_blocking() {
+        let candidate = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="merchant" value="shop"><input type="hidden" name="signature" value="abc"><input type="hidden" name="amount" value="100"><input type="hidden" name="currency" value="USD"></form></body></html>"#;
+        let diff = scorer_html_diff(REDIRECT_FORM, candidate);
+        assert_eq!(
+            classify_http_body_diff(
+                &diff,
+                None,
+                &InconclusiveRaceEvidence::default(),
+                &CorrelationColumnProvenance::default(),
+            )
+            .blocking_leaf_count,
+            1
+        );
+    }
+
+    #[test]
+    fn scorer_does_not_collapse_duplicate_hidden_form_inputs() {
+        let baseline = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="item" value="book"><input type="hidden" name="item" value="book"></form></body></html>"#;
+        let candidate = r#"<!DOCTYPE html><html><body><form method="post" action="https://psp/pay"><input type="hidden" name="item" value="book"></form></body></html>"#;
+        let diff = scorer_html_diff(baseline, candidate);
+        assert_eq!(
+            classify_http_body_diff(
+                &diff,
+                None,
+                &InconclusiveRaceEvidence::default(),
+                &CorrelationColumnProvenance::default(),
+            )
+            .blocking_leaf_count,
+            1
+        );
+    }
+
+    #[test]
+    fn scorer_does_not_treat_script_text_as_form_inputs() {
+        let baseline = r#"<!DOCTYPE html><html><body><form><script>const fields = ['<input type="hidden" name="a" value="1">', '<input type="hidden" name="b" value="2">'];</script><input type="hidden" name="token" value="abc"></form></body></html>"#;
+        let candidate = r#"<!DOCTYPE html><html><body><form><script>const fields = ['<input type="hidden" name="b" value="2">', '<input type="hidden" name="a" value="1">'];</script><input type="hidden" name="token" value="abc"></form></body></html>"#;
+        let diff = scorer_html_diff(baseline, candidate);
+        assert_eq!(
+            classify_http_body_diff(
+                &diff,
+                None,
+                &InconclusiveRaceEvidence::default(),
+                &CorrelationColumnProvenance::default(),
+            )
+            .blocking_leaf_count,
+            1
+        );
     }
 
     fn db_read_ev_with_state_canon(
@@ -4396,6 +5674,8 @@ mod tests {
             },
             observed,
             http_diffs: vec![http(corr, true, vec![])],
+            record_graph: None,
+            replay_graph: Vec::new(),
             events: events.clone(),
             correlation_scope: None,
             warnings: Vec::new(),
@@ -4879,8 +6159,6 @@ mod tests {
             .any(|warning| warning.starts_with("undeclared_concurrency:")));
     }
 
-    // ---- Rule A: order-nondeterminism demotion (cycle-25 payment_attempt case) --
-
     fn envelope(row: serde_json::Value) -> serde_json::Value {
         serde_json::json!({"result": "Ok", "value": [row]})
     }
@@ -4941,25 +6219,6 @@ mod tests {
                 .operation(deja::OperationKind::Update)
                 .returns(deja::ReturnSemantics::UpdateReturning),
         );
-        ev
-    }
-
-    fn declared_db_update_ev_with_state_canon(
-        corr: &str,
-        table: &str,
-        seq: u64,
-        row: serde_json::Value,
-        start_ns: u64,
-        end_ns: u64,
-        canon: &str,
-    ) -> deja::BoundaryEvent {
-        let mut ev = declared_db_update_ev(corr, table, seq, row, start_ns, end_ns);
-        let declaration = ev
-            .declaration
-            .take()
-            .expect("declared_db_update_ev stamps a declaration")
-            .state_canon(deja::CanonRef::new(canon));
-        ev.declaration = Some(declaration);
         ev
     }
 
@@ -5033,445 +6292,6 @@ mod tests {
         wire["bucket_id"] = serde_json::json!(bucket_id);
         wire["fork_seq"] = serde_json::json!(fork_seq);
         serde_json::from_value(wire).expect("event with lineage")
-    }
-
-    #[test]
-    fn rule_a_demotes_declared_renamed_update_returning() {
-        register_test_schema_identity();
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(charged.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                declared_db_update_ev("c1", "payment_attempt", 202, charged.clone(), 100, 300),
-                declared_db_update_ev("c1", "payment_attempt", 204, charged.clone(), 150, 250),
-            ],
-        ));
-        assert_eq!(card.summary.order_nondeterminism_warnings, 1);
-        assert_eq!(card.summary.value_divergences, 0);
-        assert_eq!(card.summary.side_effect_divergences, 0);
-        assert!(card.verdict.pass, "{}", card.verdict.reason);
-    }
-
-    #[test]
-    fn canon_final_state_preserves_rule_a_demotion_and_lost_update_guard() {
-        register_test_schema_identity();
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-
-        let demoted = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending.clone()),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(charged.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                declared_db_update_ev_with_state_canon(
-                    "c1",
-                    "payment_attempt",
-                    202,
-                    charged.clone(),
-                    100,
-                    300,
-                    "final_state",
-                ),
-                declared_db_update_ev_with_state_canon(
-                    "c1",
-                    "payment_attempt",
-                    204,
-                    charged.clone(),
-                    150,
-                    250,
-                    "final_state",
-                ),
-            ],
-        ));
-        assert_eq!(demoted.summary.order_nondeterminism_warnings, 1);
-        assert_eq!(demoted.summary.value_divergences, 0);
-        assert_eq!(demoted.summary.side_effect_divergences, 0);
-        assert!(demoted.verdict.pass, "{}", demoted.verdict.reason);
-
-        let lost_update = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending.clone()),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(pending),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                declared_db_update_ev_with_state_canon(
-                    "c1",
-                    "payment_attempt",
-                    202,
-                    charged.clone(),
-                    100,
-                    300,
-                    "final_state",
-                ),
-                declared_db_update_ev_with_state_canon(
-                    "c1",
-                    "payment_attempt",
-                    204,
-                    charged,
-                    150,
-                    250,
-                    "final_state",
-                ),
-            ],
-        ));
-        assert_eq!(lost_update.summary.order_nondeterminism_warnings, 0);
-        assert!(
-            lost_update.summary.value_divergences >= 1,
-            "final_state canon must not mask a lost update"
-        );
-        assert!(!lost_update.verdict.pass);
-    }
-
-    // Mirrors cycle 25: seq 204 (final, sets Charged) matches; seq 202 (earlier,
-    // net_amount only) runs concurrently on the SAME row and its RETURNING diverges
-    // by interleaving (observed pending vs recorded charged). Demoted → pass.
-    #[test]
-    fn rule_a_legacy_fallback_demotes_concurrent_same_row_update_when_final_matches_and_http_clean()
-    {
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                // seq 202: earlier concurrent write, RETURNING diverges (pending).
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending),
-                ),
-                // seq 204: final write, matches recorded charged row.
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(charged.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                db_update_ev("c1", "payment_attempt", 202, charged.clone(), 100, 300),
-                db_update_ev("c1", "payment_attempt", 204, charged.clone(), 150, 250),
-            ],
-        ));
-        assert_eq!(
-            card.summary.order_nondeterminism_warnings, 1,
-            "seq 202 demoted"
-        );
-        assert_eq!(
-            card.summary.value_divergences, 0,
-            "no blocking value divergence"
-        );
-        assert_eq!(card.summary.side_effect_divergences, 0);
-        assert!(card.verdict.pass, "{}", card.verdict.reason);
-    }
-
-    // Guard: the FINAL write also diverges (a real lost update) → NOT demoted.
-    #[test]
-    fn rule_a_keeps_blocking_when_final_write_diverges() {
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending.clone()),
-                ),
-                // final write diverges too → final state lost, must stay blocking.
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(pending),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                db_update_ev("c1", "payment_attempt", 202, charged.clone(), 100, 300),
-                db_update_ev("c1", "payment_attempt", 204, charged.clone(), 150, 250),
-            ],
-        ));
-        assert_eq!(card.summary.order_nondeterminism_warnings, 0);
-        assert!(
-            card.summary.value_divergences >= 1,
-            "lost update stays blocking"
-        );
-        assert!(!card.verdict.pass);
-    }
-
-    // Guard: sequential (non-overlapping) writes are NOT concurrent → NOT demoted.
-    #[test]
-    fn rule_a_keeps_blocking_when_windows_do_not_overlap() {
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(charged.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                db_update_ev("c1", "payment_attempt", 202, charged.clone(), 100, 140), // ends before 204 starts
-                db_update_ev("c1", "payment_attempt", 204, charged.clone(), 150, 250),
-            ],
-        ));
-        assert_eq!(card.summary.order_nondeterminism_warnings, 0);
-        assert!(
-            card.summary.value_divergences >= 1,
-            "sequential divergence stays blocking"
-        );
-        assert!(!card.verdict.pass);
-    }
-
-    // Guard: HTTP not 9/9 → no demotion at all (the response itself is wrong).
-    #[test]
-    fn rule_a_never_demotes_when_http_diverges() {
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let pending = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(charged.clone())),
-                    envelope(pending),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(204),
-                    Some(envelope(charged.clone())),
-                    envelope(charged.clone()),
-                ),
-            ],
-            vec![http("c1", false, vec![])], // HTTP status mismatch → not 9/9
-            vec![
-                db_update_ev("c1", "payment_attempt", 202, charged.clone(), 100, 300),
-                db_update_ev("c1", "payment_attempt", 204, charged.clone(), 150, 250),
-            ],
-        ));
-        assert_eq!(card.summary.order_nondeterminism_warnings, 0);
-        assert!(!card.verdict.pass);
-    }
-
-    // ORDER-SWAP arm (cycle-34c fixture): the RECORDING captured the opposite
-    // interleaving — the earlier write (seq 200) recorded the PRE-charge row, and
-    // on replay observed the post-charge row that the matched final write (202)
-    // recorded, differing only in `modified_at` by 1ms (each write's own clock).
-    // Identical-recorded-row grouping cannot pair these; the observed==final
-    // evidence (modulo volatile columns) must demote it.
-    #[test]
-    fn rule_a_demotes_order_swap_when_observed_equals_recorded_final() {
-        register_test_schema_identity();
-        let pre = serde_json::json!({"attempt_id": "pay_1", "status": "pending",
-            "connector_transaction_id": null, "modified_at": "2026-07-02T18:43:47.101Z"});
-        let final_rec = serde_json::json!({"attempt_id": "pay_1", "status": "charged",
-            "connector_transaction_id": {"TxnId": "pi_x"}, "modified_at": "2026-07-02T18:43:47.959Z"});
-        let observed_early = serde_json::json!({"attempt_id": "pay_1", "status": "charged",
-            "connector_transaction_id": {"TxnId": "pi_x"}, "modified_at": "2026-07-02T18:43:47.958Z"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(200),
-                    Some(envelope(pre.clone())),
-                    envelope(observed_early),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(final_rec.clone())),
-                    envelope(final_rec.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                db_update_ev("c1", "payment_attempt", 200, pre, 100, 300),
-                db_update_ev("c1", "payment_attempt", 202, final_rec, 150, 250),
-            ],
-        ));
-        assert_eq!(
-            card.summary.order_nondeterminism_warnings, 1,
-            "order-swap demoted"
-        );
-        assert_eq!(card.summary.value_divergences, 0);
-        assert!(card.verdict.pass, "{}", card.verdict.reason);
-    }
-
-    // Guard: a REAL column difference (not just volatile clock stamps) between the
-    // observed row and the recorded final row stays BLOCKING.
-    #[test]
-    fn rule_a_order_swap_keeps_blocking_on_real_column_difference() {
-        let pre = serde_json::json!({"attempt_id": "pay_1", "status": "pending", "amount": 100});
-        let final_rec =
-            serde_json::json!({"attempt_id": "pay_1", "status": "charged", "amount": 100});
-        let observed_early =
-            serde_json::json!({"attempt_id": "pay_1", "status": "charged", "amount": 200});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(200),
-                    Some(envelope(pre.clone())),
-                    envelope(observed_early),
-                ),
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(final_rec.clone())),
-                    envelope(final_rec.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                db_update_ev("c1", "payment_attempt", 200, pre, 100, 300),
-                db_update_ev("c1", "payment_attempt", 202, final_rec, 150, 250),
-            ],
-        ));
-        assert_eq!(card.summary.order_nondeterminism_warnings, 0);
-        assert!(
-            card.summary.value_divergences >= 1,
-            "real amount drift stays blocking"
-        );
-        assert!(!card.verdict.pass);
-    }
-
-    // Guard: the order-swap evidence write must be LATER and FINAL. Here the
-    // observed row equals an EARLIER matched write's recorded row, and the
-    // diverged write IS the latest — no later final-state evidence exists, so it
-    // stays BLOCKING (demoting would mask a real later divergence).
-    #[test]
-    fn rule_a_order_swap_requires_later_final_evidence_write() {
-        let charged = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
-        let drifted = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
-        let card = detect(&art_with_events(
-            vec![],
-            vec![
-                // seq 198: earlier write, matched (recorded == observed == charged).
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(198),
-                    Some(envelope(charged.clone())),
-                    envelope(charged.clone()),
-                ),
-                // seq 202: LATEST write diverges — recorded `drifted`, observed equals
-                // the EARLIER row. No later evidence write exists.
-                exec_obs(
-                    "db",
-                    Some("c1"),
-                    true,
-                    Some(202),
-                    Some(envelope(drifted.clone())),
-                    envelope(charged.clone()),
-                ),
-            ],
-            vec![http("c1", true, vec![])],
-            vec![
-                db_update_ev("c1", "payment_attempt", 198, charged, 100, 300),
-                db_update_ev("c1", "payment_attempt", 202, drifted, 150, 250),
-            ],
-        ));
-        assert_eq!(card.summary.order_nondeterminism_warnings, 0);
-        assert!(
-            card.summary.value_divergences >= 1,
-            "latest-write divergence stays blocking"
-        );
-        assert!(!card.verdict.pass);
     }
 
     // ---- Rule B: idempotent redis delete demotion (cycle-25 delete_key case) ----
@@ -5848,13 +6668,7 @@ mod tests {
 
         // The `/calls` ledger classifies the same four events, and its split is
         // the summary's two numbers — not a third answer.
-        let rows = ledger::build(
-            &a.events,
-            &a.observed,
-            &a.table,
-            &HashSet::new(),
-            &HashSet::new(),
-        );
+        let rows = ledger::build(&a.events, &a.observed, &a.table, &HashSet::new());
         let omitted: Vec<&CallRecord> = rows.iter().filter(|r| r.kind == "omitted").collect();
         assert_eq!(
             omitted.len() as u64,
@@ -6450,6 +7264,8 @@ mod tests {
             table,
             observed,
             http_diffs,
+            record_graph: None,
+            replay_graph: Vec::new(),
             events: recorded_events,
             correlation_scope: None,
             warnings: Vec::new(),
@@ -6679,6 +7495,8 @@ mod tests {
 
     #[test]
     fn pairing_shape_separates_statements_and_tables_but_not_rekeyed_operands() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
         // A re-keyed write must keep its twin: same statement, different binds.
         let confirm = serde_json::json!({
             "operation": "generic_update_with_results", "table": "payment_attempt",
@@ -6689,8 +7507,8 @@ mod tests {
             "sql": "UPDATE \"payment_attempt\" SET \"status\" = $1 WHERE \"attempt_id\" = $2 \
                     -- binds: [Charged, \"a_9\"]"});
         assert_eq!(
-            pairing_shape(&confirm),
-            pairing_shape(&confirm_rekeyed),
+            shape(&confirm),
+            shape(&confirm_rekeyed),
             "operands live in the binds tail; a re-keyed write must still pair"
         );
 
@@ -6701,7 +7519,7 @@ mod tests {
             "operation": "generic_update_with_results", "table": "payment_attempt",
             "sql": "UPDATE \"payment_attempt\" SET \"connector_transaction_id\" = $1 \
                     WHERE \"attempt_id\" = $2 -- binds: [TxnId(\"D4P\"), \"a_1\"]"});
-        assert_ne!(pairing_shape(&confirm), pairing_shape(&connector_response));
+        assert_ne!(shape(&confirm), shape(&connector_response));
 
         // And a different TABLE must not claim it, with or without SQL — the
         // ledger showed a recorded payment_attempt row scored against an
@@ -6710,17 +7528,17 @@ mod tests {
             "operation": "generic_update_with_results", "table": "payment_intent",
             "sql": "UPDATE \"payment_intent\" SET \"status\" = $1 WHERE \"payment_id\" = $2 \
                     -- binds: [Pending, \"p_1\"]"});
-        assert_ne!(pairing_shape(&confirm), pairing_shape(&intent));
+        assert_ne!(shape(&confirm), shape(&intent));
         assert_ne!(
-            pairing_shape(&serde_json::json!({"table": "payment_attempt"})),
-            pairing_shape(&serde_json::json!({"table": "payment_intent"})),
+            shape(&serde_json::json!({"table": "payment_attempt"})),
+            shape(&serde_json::json!({"table": "payment_intent"})),
             "table identity must survive the no-SQL fallback"
         );
 
         // A re-keyed cache write keeps its twin: `key` is an operand, not identity.
         assert_eq!(
-            pairing_shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
-            pairing_shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "b"}))
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "b"}))
         );
     }
 
@@ -7225,12 +8043,10 @@ mod tests {
         assert_eq!(card.summary.side_effect_divergences, 0);
         assert!(card.verdict.pass, "reason: {}", card.verdict.reason);
         assert!(
-            card.verdict.reason.contains(
-                "1 schema-derived divergence(s) (non-blocking; 1 read off the statement, 0 \
-                 inherited within a correlation)"
-            ),
-            "counted and named in the verdict, never silently dropped, and the strength of the \
-             evidence is in the headline: {}",
+            card.verdict
+                .reason
+                .contains("1 schema-derived DB/response occurrence(s) (non-blocking)"),
+            "counted and named in the verdict, never silently dropped: {}",
             card.verdict.reason
         );
         assert!(
@@ -7353,149 +8169,48 @@ mod tests {
         "UPDATE \"payment_intent\" SET \"currency\" = $1, \"business_label\" = $2 WHERE \
         (\"payment_intent\".\"payment_id\" = $3) RETURNING * -- binds: [USD, \"retail\", \"pay_1\"]";
 
-    /// A correlation whose INSERT created the row and whose UPDATE then returns
-    /// it with `business_label` diverging. `also_ran` are extra statements in
-    /// the same correlation, which is what the inference is scoped to.
-    fn inherited_card(also_ran: &[&str], insert_sql: Option<&str>) -> Scorecard {
+    const PAYMENT_INTENT_UPDATE_BINDING_DESCRIPTION: &str =
+        "UPDATE \"payment_intent\" SET \"currency\" = $1, \"description\" = $2 WHERE \
+        (\"payment_intent\".\"payment_id\" = $3) RETURNING * -- binds: [USD, \"changed\", \
+        \"pay_1\"]";
+
+    const PAYMENT_INTENT_UPDATE_BINDING_LABEL_AND_DESCRIPTION: &str =
+        "UPDATE \"payment_intent\" SET \"currency\" = $1, \"business_label\" = $2, \
+        \"description\" = $3 WHERE (\"payment_intent\".\"payment_id\" = $4) RETURNING * -- binds: \
+        [USD, \"default\", \"changed\", \"pay_1\"]";
+
+    #[test]
+    fn update_unassigned_returned_difference_matches_without_correlation_history() {
         let corr = "c1";
         let recorded = payment_intent_row(serde_json::Value::Null);
         let mut update = db_insert_ev(corr, 8, PAYMENT_INTENT_UPDATE, recorded.clone());
         update.method_name = "generic_update_with_results".to_owned();
-        let mut events = vec![update];
-        if let Some(insert_sql) = insert_sql {
-            events.push(db_insert_ev(corr, 7, insert_sql, recorded.clone()));
-        }
-        let mut observed = vec![{
-            let mut o = db_exec_obs_with_sql(
-                corr,
-                8,
-                PAYMENT_INTENT_UPDATE,
-                recorded.clone(),
-                payment_intent_row(serde_json::json!("default")),
-            );
-            o.method_name = "generic_update_with_results".to_owned();
-            o
-        }];
-        // The INSERT itself matched on replay; only the later UPDATE diverges,
-        // so the inference is doing the work rather than the statement rule.
-        if insert_sql.is_some() {
-            observed.push(substituted_obs_method(
-                "db",
+        let mut observed = db_exec_obs_with_sql(
+            corr,
+            8,
+            PAYMENT_INTENT_UPDATE,
+            recorded.clone(),
+            payment_intent_row(serde_json::json!("different inherited value")),
+        );
+        observed.method_name = "generic_update_with_results".to_owned();
+
+        let card = detect(&art_with_events(
+            vec![seq_entry_method_res(
                 Some(corr),
-                "generic_insert",
-                7,
-                envelope(recorded.clone()),
-            ));
-        }
-        for (n, sql) in also_ran.iter().enumerate() {
-            let seq = 20 + n as u64;
-            let mut ev = db_insert_ev(corr, seq, sql, recorded.clone());
-            ev.method_name = "generic_update_with_results".to_owned();
-            events.push(ev);
-            observed.push(substituted_obs_method(
                 "db",
-                Some(corr),
                 "generic_update_with_results",
-                seq,
-                envelope(recorded.clone()),
-            ));
-        }
-        let entries = events
-            .iter()
-            .map(|ev| {
-                seq_entry_method_res(
-                    Some(corr),
-                    "db",
-                    &ev.method_name,
-                    ev.global_sequence,
-                    envelope(recorded.clone()),
-                )
-            })
-            .collect();
-        detect(&art_with_events(
-            entries,
-            observed,
+                8,
+                envelope(recorded),
+            )],
+            vec![observed],
             vec![http(corr, true, vec![])],
-            events,
-        ))
-    }
+            vec![update],
+        ));
 
-    #[test]
-    fn a_column_the_statement_never_wrote_is_inherited_from_the_correlations_insert() {
-        let card = inherited_card(&[], Some(PAYMENT_INTENT_INSERT));
-        assert_eq!(
-            kind_count(&card, "db", "SchemaDefaultInherited"),
-            1,
-            "the UPDATE writes only `currency`; `business_label` came back out of the row the \
-             correlation's INSERT left to the schema"
-        );
-        assert_eq!(
-            kind_count(&card, "db", "SchemaDefaultDivergence"),
-            0,
-            "and it is NOT reported as read off the statement — the two are named apart"
-        );
-        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(card.summary.schema_default_divergences, 0);
         assert_eq!(card.summary.value_divergences, 0);
-        assert!(card.verdict.pass, "reason: {}", card.verdict.reason);
-        assert!(
-            card.verdict
-                .reason
-                .contains("0 read off the statement, 1 inherited within a correlation"),
-            "the headline says how much rests on the inference: {}",
-            card.verdict.reason
-        );
-        assert!(
-            card.warnings
-                .iter()
-                .any(|w| w.contains("INFERRED, not read")),
-            "the inference names itself and its limit: {:?}",
-            card.warnings
-        );
-        assert!(card.counter_disagreements().is_empty());
-    }
-
-    #[test]
-    fn a_correlation_that_ever_supplied_the_column_gets_no_inference() {
-        // One statement elsewhere in the same correlation binds
-        // `business_label`. The application wrote that column in this request,
-        // so nothing in the request can claim the schema owns it — regardless of
-        // whether that statement ran before or after the diverging one.
-        let card = inherited_card(
-            &[PAYMENT_INTENT_UPDATE_BINDING_LABEL],
-            Some(PAYMENT_INTENT_INSERT),
-        );
-        assert_eq!(card.summary.schema_default_divergences, 0);
-        assert_eq!(card.summary.value_divergences, 1);
-        assert!(!card.verdict.pass);
-    }
-
-    #[test]
-    fn an_inherited_claim_needs_a_schema_filled_insert_in_the_same_correlation() {
-        // The correlation's INSERT supplies `business_label` rather than leaving
-        // it to the schema, so the row's stored value is the application's and
-        // the later UPDATE's divergence in it is blocking.
-        let card = inherited_card(&[], Some(PAYMENT_INTENT_INSERT_BINDING_LABEL));
-        assert_eq!(card.summary.schema_default_divergences, 0);
-        assert_eq!(card.summary.value_divergences, 1);
-        assert!(!card.verdict.pass);
-    }
-
-    #[test]
-    fn an_update_on_a_row_this_correlation_did_not_create_gets_no_inference() {
-        // THE limit of the approximation, pinned. Nothing in this correlation
-        // binds `business_label` and nothing contradicts the inference — but the
-        // correlation never created the row either, so the row is a SEEDED one
-        // whose stored value came from outside the request. Where that value came
-        // from is exactly what the inference cannot see, so it must not be made:
-        // a seed carrying a real value would otherwise be laundered into "the
-        // schema did it".
-        let card = inherited_card(&[], None);
-        assert_eq!(
-            card.summary.schema_default_divergences, 0,
-            "no INSERT in scope means no claim about where the row's columns came from"
-        );
-        assert_eq!(card.summary.value_divergences, 1);
-        assert!(!card.verdict.pass);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
     #[test]
@@ -7529,6 +8244,106 @@ mod tests {
             rows.iter().all(|r| r.kind != "value_diverged"),
             "the ledger must not call blocking what the scorecard called schema-derived"
         );
+    }
+
+    /// The resolved INSERT proves `business_label` schema-derived. The later
+    /// UPDATE misses strict args lookup, so only pairing shape can recover it.
+    fn schema_rekeyed_update_card(observed_update_sql: &str) -> Scorecard {
+        let corr = "c1";
+        let recorded = payment_intent_row(serde_json::Value::Null);
+        let observed = payment_intent_row(serde_json::json!("default"));
+        let insert_event = db_insert_ev(corr, 7, PAYMENT_INTENT_INSERT, recorded.clone());
+        let mut update_event = db_insert_ev(corr, 8, PAYMENT_INTENT_UPDATE, recorded.clone());
+        update_event.method_name = "generic_update_with_results".to_owned();
+
+        let insert_observed = db_exec_obs_with_sql(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            recorded.clone(),
+            observed.clone(),
+        );
+        let mut update_observed = exec_obs_method(
+            "db",
+            Some(corr),
+            "generic_update_with_results",
+            false,
+            None,
+            None,
+            envelope(observed),
+        );
+        update_observed.seed_gap = false;
+        update_observed.args =
+            serde_json::json!({"table": "payment_intent", "sql": observed_update_sql});
+        let update_observed = with_span(update_observed, "root>update_payment_intent");
+
+        detect(&art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_insert",
+                    7,
+                    envelope(recorded.clone()),
+                ),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update_with_results",
+                    8,
+                    envelope(recorded),
+                ),
+                span_entry(Some(corr), 8, "root>update_payment_intent"),
+            ],
+            vec![insert_observed, update_observed],
+            vec![http(corr, true, vec![])],
+            vec![insert_event, update_event],
+        ))
+    }
+
+    #[test]
+    fn schema_derived_set_column_does_not_rekey_args_free_pairing() {
+        let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_LABEL);
+
+        assert_eq!(
+            card.summary.schema_default_divergences, 1,
+            "the resolved INSERT establishes the environment-derived column"
+        );
+        assert_eq!(
+            card.summary.value_divergences, 1,
+            "the UPDATE is one paired call with a value difference"
+        );
+        assert_eq!(card.summary.novel_calls, 0, "not a novel UPDATE");
+        assert_eq!(card.summary.omitted_calls, 0, "not an omitted UPDATE");
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 1);
+    }
+
+    #[test]
+    fn non_schema_derived_set_column_still_separates_pairing() {
+        let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_DESCRIPTION);
+
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.omitted_calls, 1);
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+    }
+
+    #[test]
+    fn mixed_schema_and_non_schema_set_columns_still_separate_pairing() {
+        let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_LABEL_AND_DESCRIPTION);
+
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the non-schema column keeps the observed UPDATE novel"
+        );
+        assert_eq!(
+            card.summary.omitted_calls, 1,
+            "the non-schema column keeps the recorded UPDATE omitted"
+        );
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
     }
 
     /// One `payment_attempt` UPDATE per side at one span, running DIFFERENT
@@ -7665,5 +8480,1277 @@ mod tests {
             rows.iter().all(|r| r.kind != "omitted"),
             "the twin is accounted for by the pair, not omitted as well"
         );
+    }
+    fn graph_span(
+        node_id: u64,
+        correlation_id: &str,
+        parent_id: Option<u64>,
+        sequence: u64,
+        span_name: &str,
+    ) -> deja_core::ExecutionGraphNode {
+        let mut node = graph_node(node_id, Some(correlation_id));
+        node.parent_id = parent_id;
+        node.sequence = sequence;
+        node.span_name = span_name.to_owned();
+        node
+    }
+
+    fn graph_event(
+        correlation_id: &str,
+        global_sequence: u64,
+        graph_node_id: u64,
+        method: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut event = omitted_ev(global_sequence, "db", Some(correlation_id));
+        event.method_name = method.to_owned();
+        event.args = args;
+        event.result = result;
+        event.graph_node_id = Some(graph_node_id);
+        event
+    }
+
+    fn graph_observed(
+        correlation_id: &str,
+        graph_node_id: u64,
+        served_event: u64,
+        method: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> ObservedCall {
+        let mut observed =
+            substituted_obs_method("db", Some(correlation_id), method, served_event, result);
+        observed.args = args;
+        observed.graph_node_id = Some(graph_node_id);
+        observed
+    }
+
+    fn with_graphs(
+        mut artifacts: RunArtifacts,
+        record: Vec<deja_core::ExecutionGraphNode>,
+        replay: Vec<deja_core::ExecutionGraphNode>,
+    ) -> RunArtifacts {
+        artifacts.record_graph = Some(record);
+        artifacts.replay_graph = replay;
+        artifacts
+    }
+
+    fn strip_scoring_mode(mut value: serde_json::Value) -> serde_json::Value {
+        for outcome in value["per_correlation"]
+            .as_array_mut()
+            .expect("serialized per_correlation array")
+        {
+            outcome
+                .as_object_mut()
+                .expect("serialized correlation outcome")
+                .remove("scoring_mode")
+                .expect("every correlation declares its scoring mode");
+        }
+        value
+    }
+    #[test]
+    fn both_forests_choose_and_serialize_graph_mode() {
+        let corr = "graph-both";
+        let result = serde_json::json!({"result": "Ok", "value": 7});
+        let event = graph_event(
+            corr,
+            101,
+            1,
+            "load",
+            serde_json::json!({"id": 7}),
+            result.clone(),
+        );
+        let observed = graph_observed(
+            corr,
+            11,
+            101,
+            "load",
+            serde_json::json!({"id": 7}),
+            result.clone(),
+        );
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(Some(corr), "db", "load", 101, result)],
+                vec![observed],
+                vec![http(corr, true, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(1, corr, None, 0, "request")],
+            vec![graph_span(11, corr, None, 0, "request")],
+        );
+        let card = detect(&artifacts);
+        let outcome = card
+            .per_correlation
+            .iter()
+            .find(|outcome| outcome.correlation_id == corr)
+            .expect("graph correlation is reported");
+        assert_eq!(outcome.scoring_mode, deja_forest::ScoringMode::Graph);
+        assert!(outcome
+            .alignment
+            .as_ref()
+            .is_some_and(|a| !a.nodes.is_empty()));
+        let wire = serde_json::to_value(outcome).unwrap();
+        assert_eq!(wire["scoring_mode"], serde_json::json!({"mode": "graph"}));
+        assert!(wire["alignment"]["nodes"].is_array());
+    }
+
+    #[test]
+    fn missing_forest_is_declared_flat_without_changing_flat_scorecard_bytes() {
+        let corr = "flat-missing";
+        let fixture = || {
+            let result = serde_json::json!({"result": "Ok", "value": "same"});
+            let mut observed = graph_observed(
+                corr,
+                12,
+                201,
+                "load",
+                serde_json::json!({"id": 1}),
+                result.clone(),
+            );
+            observed.graph_node_id = None;
+            art_with_events(
+                vec![seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "load",
+                    201,
+                    result.clone(),
+                )],
+                vec![observed],
+                vec![http(corr, true, vec![])],
+                vec![graph_event(
+                    corr,
+                    201,
+                    2,
+                    "load",
+                    serde_json::json!({"id": 1}),
+                    result,
+                )],
+            )
+        };
+        let flat_fixture = fixture();
+        let one_missing = with_graphs(
+            fixture(),
+            vec![graph_span(2, corr, None, 0, "request")],
+            Vec::new(),
+        );
+        let card = detect(&one_missing);
+        let outcome = &card.per_correlation[0];
+        assert_eq!(
+            outcome.scoring_mode,
+            deja_forest::ScoringMode::Flat {
+                reason: deja_forest::FlatReason::MissingForest
+            }
+        );
+        assert!(outcome.alignment.is_none());
+        assert_eq!(
+            serde_json::to_value(outcome).unwrap()["scoring_mode"],
+            serde_json::json!({"mode": "flat", "reason": "missing_forest"})
+        );
+        let graph_bytes =
+            serde_json::to_vec(&strip_scoring_mode(serde_json::to_value(&card).unwrap())).unwrap();
+        let explicit_flat_bytes = serde_json::to_vec(&strip_scoring_mode(
+            serde_json::to_value(detect(&flat_fixture)).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            graph_bytes, explicit_flat_bytes,
+            "apart from the isolated mode declaration, demotion must be byte-identical \
+             to the established flat scorer"
+        );
+    }
+
+    #[test]
+    fn one_sided_event_bearing_http_ingress_root_demotes_instead_of_misaligning() {
+        let corr = "ingress-asymmetry";
+        let result = serde_json::json!({"result": "Ok"});
+        let event = graph_event(corr, 301, 3, "load", serde_json::json!({}), result.clone());
+        let observed = graph_observed(corr, 13, 301, "load", serde_json::json!({}), result.clone());
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(Some(corr), "db", "load", 301, result)],
+                vec![observed],
+                vec![http(corr, true, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(3, corr, None, 0, "deja::http_incoming")],
+            vec![graph_span(13, corr, None, 0, "request")],
+        );
+        let outcome = &detect(&artifacts).per_correlation[0];
+        assert_eq!(
+            outcome.scoring_mode,
+            deja_forest::ScoringMode::Flat {
+                reason: deja_forest::FlatReason::IngressRootAsymmetry
+            }
+        );
+        assert!(outcome.alignment.is_none());
+    }
+    #[test]
+    fn mixed_graph_and_flat_correlations_keep_weighted_accounting_independent() {
+        let graph_corr = "mixed-graph";
+        let flat_corr = "mixed-flat";
+        let result = serde_json::json!({"result": "Ok"});
+        let mut flat_event = omitted_ev(404, "db", Some(flat_corr));
+        flat_event.method_name = "flat".to_owned();
+        let mut flat_observed =
+            substituted_obs_method("db", Some(flat_corr), "flat", 404, result.clone());
+        flat_observed.graph_node_id = None;
+        let mut graph_novel = obs("db", Some(graph_corr), false, None, None);
+        graph_novel.method_name = "novel".to_owned();
+        graph_novel.graph_node_id = Some(15);
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(graph_corr), "db", "root", 401, result.clone()),
+                    seq_entry_method_res(Some(graph_corr), "db", "old_a", 402, result.clone()),
+                    seq_entry_method_res(Some(graph_corr), "db", "old_b", 403, result.clone()),
+                    seq_entry_method_res(Some(flat_corr), "db", "flat", 404, result.clone()),
+                ],
+                vec![
+                    graph_observed(
+                        graph_corr,
+                        14,
+                        401,
+                        "root",
+                        serde_json::json!({}),
+                        result.clone(),
+                    ),
+                    graph_novel,
+                    flat_observed,
+                ],
+                vec![
+                    http(graph_corr, true, vec![]),
+                    http(flat_corr, true, vec![]),
+                ],
+                vec![
+                    graph_event(
+                        graph_corr,
+                        401,
+                        4,
+                        "root",
+                        serde_json::json!({}),
+                        result.clone(),
+                    ),
+                    graph_event(
+                        graph_corr,
+                        402,
+                        5,
+                        "old_a",
+                        serde_json::json!({}),
+                        result.clone(),
+                    ),
+                    graph_event(graph_corr, 403, 5, "old_b", serde_json::json!({}), result),
+                    flat_event,
+                ],
+            ),
+            vec![
+                graph_span(4, graph_corr, None, 0, "request"),
+                graph_span(5, graph_corr, Some(4), 1, "old-subtree"),
+            ],
+            vec![
+                graph_span(14, graph_corr, None, 0, "request"),
+                graph_span(15, graph_corr, Some(14), 1, "new-subtree"),
+            ],
+        );
+        let card = detect(&artifacts);
+        let graph_outcome = card
+            .per_correlation
+            .iter()
+            .find(|outcome| outcome.correlation_id == graph_corr)
+            .unwrap();
+        let flat_outcome = card
+            .per_correlation
+            .iter()
+            .find(|outcome| outcome.correlation_id == flat_corr)
+            .unwrap();
+        assert_eq!(graph_outcome.scoring_mode, deja_forest::ScoringMode::Graph);
+        assert_eq!(
+            flat_outcome.scoring_mode,
+            deja_forest::ScoringMode::Flat {
+                reason: deja_forest::FlatReason::MissingForest
+            }
+        );
+        let alignment = graph_outcome.alignment.as_ref().unwrap();
+        assert_eq!(
+            alignment
+                .nodes
+                .iter()
+                .filter(|row| matches!(
+                    &row.outcome,
+                    deja_forest::NodeOutcome::PrunedSubtree { events_below: 2 }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            alignment
+                .nodes
+                .iter()
+                .filter(|row| matches!(
+                    &row.outcome,
+                    deja_forest::NodeOutcome::NovelSubtree { events_below: 1 }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(kind_count(&card, "db", "PrunedSubtree"), 2);
+        assert_eq!(kind_count(&card, "db", "NovelSubtree"), 1);
+        assert_eq!(kind_count(&card, "db", "OmittedCall"), 0);
+        assert_eq!(kind_count(&card, "db", "NovelCall"), 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 2);
+        assert_eq!(card.summary.omitted_calls, 2);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.side_effect_divergences, 3);
+        assert!(card.counter_disagreements().is_empty());
+        let rows = build_ledger(&artifacts).expect("mixed-tier ledger builds");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == "pruned_subtree")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == "novel_subtree")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn same_statement_bind_order_swap_is_blocking_identity_skew() {
+        let corr = "identity-swap";
+        let result = serde_json::json!({"result": "Ok", "value": []});
+        let events = vec![
+            graph_event(
+                corr,
+                501,
+                51,
+                "same_statement",
+                serde_json::json!({"bind": "a"}),
+                result.clone(),
+            ),
+            graph_event(
+                corr,
+                502,
+                52,
+                "same_statement",
+                serde_json::json!({"bind": "b"}),
+                result.clone(),
+            ),
+        ];
+        let observed = vec![
+            graph_observed(
+                corr,
+                61,
+                502,
+                "same_statement",
+                serde_json::json!({"bind": "b"}),
+                result.clone(),
+            ),
+            graph_observed(
+                corr,
+                62,
+                501,
+                "same_statement",
+                serde_json::json!({"bind": "a"}),
+                result.clone(),
+            ),
+        ];
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(corr), "db", "same_statement", 501, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "same_statement", 502, result),
+                ],
+                observed,
+                vec![http(corr, true, vec![])],
+                events,
+            ),
+            vec![
+                graph_span(50, corr, None, 0, "request"),
+                graph_span(51, corr, Some(50), 1, "same-span"),
+                graph_span(52, corr, Some(50), 2, "same-span"),
+            ],
+            vec![
+                graph_span(60, corr, None, 0, "request"),
+                graph_span(61, corr, Some(60), 1, "same-span"),
+                graph_span(62, corr, Some(60), 2, "same-span"),
+            ],
+        );
+        let card = detect(&artifacts);
+        let outcome = &card.per_correlation[0];
+        assert_eq!(outcome.scoring_mode, deja_forest::ScoringMode::Graph);
+        let bindings: BTreeSet<_> = outcome
+            .alignment
+            .as_ref()
+            .expect("graph alignment is serialized")
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.outcome {
+                deja_forest::NodeOutcome::IdentitySkew {
+                    aligned_event,
+                    served_event,
+                } => Some((*aligned_event, *served_event)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bindings,
+            BTreeSet::from([(Some(501), Some(502)), (Some(502), Some(501))])
+        );
+        assert_eq!(card.summary.identity_skews, 2);
+        assert_eq!(card.summary.side_effect_divergences, 2);
+        assert_eq!(kind_count(&card, "db", "IdentitySkew"), 2);
+        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+        assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 0);
+        assert!(!outcome.passed);
+        assert!(!card.verdict.pass);
+        assert!(card.counter_disagreements().is_empty());
+    }
+    #[test]
+    fn scorecard_and_ledger_classifications_agree_in_graph_and_flat_tiers() {
+        let graph_corr = "agreement-graph";
+        let flat_corr = "agreement-flat";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let graph_event = graph_event(
+            graph_corr,
+            601,
+            71,
+            "load",
+            serde_json::json!({"id": 9}),
+            result.clone(),
+        );
+        let mut flat_event = omitted_ev(602, "db", Some(flat_corr));
+        flat_event.method_name = "load".to_owned();
+        flat_event.result = result.clone();
+        let graph_observed = graph_observed(
+            graph_corr,
+            81,
+            601,
+            "load",
+            serde_json::json!({"id": 9}),
+            result.clone(),
+        );
+        let mut flat_observed =
+            substituted_obs_method("db", Some(flat_corr), "load", 602, result.clone());
+        flat_observed.args = serde_json::json!({"id": 9});
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(graph_corr), "db", "load", 601, result.clone()),
+                    seq_entry_method_res(Some(flat_corr), "db", "load", 602, result),
+                ],
+                vec![graph_observed, flat_observed],
+                vec![
+                    http(graph_corr, true, vec![]),
+                    http(flat_corr, true, vec![]),
+                ],
+                vec![graph_event, flat_event],
+            ),
+            vec![graph_span(71, graph_corr, None, 0, "request")],
+            vec![graph_span(81, graph_corr, None, 0, "request")],
+        );
+        let card = detect(&artifacts);
+        let rows = build_ledger(&artifacts).expect("shared graph plan builds a ledger");
+        assert_eq!(card.summary.matched_side_effect_calls, 2);
+        assert_eq!(card.per_boundary["db"].matched, 2);
+        assert_eq!(rows.iter().filter(|row| row.kind == "matched").count(), 2);
+        for corr in [graph_corr, flat_corr] {
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| {
+                        row.correlation_id.as_deref() == Some(corr) && row.kind == "matched"
+                    })
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            card.per_correlation
+                .iter()
+                .find(|outcome| outcome.correlation_id == graph_corr)
+                .unwrap()
+                .scoring_mode,
+            deja_forest::ScoringMode::Graph
+        );
+        assert_eq!(
+            card.per_correlation
+                .iter()
+                .find(|outcome| outcome.correlation_id == flat_corr)
+                .unwrap()
+                .scoring_mode,
+            deja_forest::ScoringMode::Flat {
+                reason: deja_forest::FlatReason::MissingForest
+            }
+        );
+        assert!(card.counter_disagreements().is_empty());
+    }
+    #[test]
+    fn multiple_events_on_one_aligned_span_fall_back_without_panicking_or_double_counting() {
+        let corr = "multi-event-span";
+        let result = serde_json::json!({"result": "Ok"});
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(corr), "db", "first", 701, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "second", 702, result.clone()),
+                ],
+                vec![
+                    graph_observed(
+                        corr,
+                        101,
+                        701,
+                        "first",
+                        serde_json::json!({"n": 1}),
+                        result.clone(),
+                    ),
+                    graph_observed(
+                        corr,
+                        101,
+                        702,
+                        "second",
+                        serde_json::json!({"n": 2}),
+                        result.clone(),
+                    ),
+                ],
+                vec![http(corr, true, vec![])],
+                vec![
+                    graph_event(
+                        corr,
+                        701,
+                        91,
+                        "first",
+                        serde_json::json!({"n": 1}),
+                        result.clone(),
+                    ),
+                    graph_event(corr, 702, 91, "second", serde_json::json!({"n": 2}), result),
+                ],
+            ),
+            vec![graph_span(91, corr, None, 0, "request")],
+            vec![graph_span(101, corr, None, 0, "request")],
+        );
+
+        let card = detect(&artifacts);
+        let outcome = &card.per_correlation[0];
+        assert_eq!(outcome.scoring_mode, deja_forest::ScoringMode::Graph);
+        assert!(
+            !outcome
+                .alignment
+                .as_ref()
+                .expect("graph mode publishes alignment")
+                .flat_tier_events
+                .is_empty(),
+            "a many-event node is explicitly routed through the flat tier"
+        );
+        assert_eq!(card.summary.matched_side_effect_calls, 2);
+        assert_eq!(card.summary.side_effect_divergences, 0);
+        assert!(card.counter_disagreements().is_empty());
+        let rows = build_ledger(&artifacts).expect("multi-event span is valid ledger input");
+        assert_eq!(rows.iter().filter(|row| row.kind == "matched").count(), 2);
+        assert_eq!(rows.len(), 2, "neither side is counted a second time");
+    }
+
+    #[test]
+    fn graph_alignment_records_value_difference_before_schema_demotion() {
+        let corr = "graph-schema-demotion";
+        let sequence = 801;
+        let recorded = payment_intent_row(serde_json::Value::Null);
+        let observed = payment_intent_row(serde_json::json!("default"));
+        let mut event = db_insert_ev(corr, sequence, PAYMENT_INTENT_INSERT, recorded.clone());
+        event.graph_node_id = Some(111);
+        let mut call = db_exec_obs_with_sql(
+            corr,
+            sequence,
+            PAYMENT_INTENT_INSERT,
+            recorded.clone(),
+            observed,
+        );
+        call.graph_node_id = Some(211);
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_insert",
+                    sequence,
+                    envelope(recorded),
+                )],
+                vec![call],
+                vec![http(corr, true, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(111, corr, None, 0, "db-call")],
+            vec![graph_span(211, corr, None, 0, "db-call")],
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.schema_default_divergences, 1);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.side_effect_divergences, 0);
+        assert!(card.verdict.pass);
+        let aligned = card.per_correlation[0]
+            .alignment
+            .as_ref()
+            .expect("graph mode publishes its scored alignment")
+            .nodes
+            .iter()
+            .find(|node| node.replay_node == Some(211))
+            .expect("the divergent graph node is aligned");
+        assert_eq!(
+            aligned.outcome,
+            deja_forest::NodeOutcome::ValueDiverged { origin: true },
+            "blocking policy demotes the verdict, not the fact that the values differ"
+        );
+        let rows = build_ledger(&artifacts).expect("graph schema-demotion ledger builds");
+        let row = rows
+            .iter()
+            .find(|row| row.correlation_id.as_deref() == Some(corr))
+            .expect("the graph call has one ledger row");
+        assert_eq!(row.kind, "schema_default");
+        assert!(!row.blocking);
+    }
+
+    #[test]
+    fn same_span_order_swap_is_one_blocking_ledger_value_divergence() {
+        let corr = "order-ledger";
+        let first_seq = 808;
+        let second_seq = 809;
+        let result = serde_json::json!({"rows_affected": 1});
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    first_seq,
+                    envelope(result.clone()),
+                ),
+                span_entry(Some(corr), first_seq, "root>update_attempt"),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    second_seq,
+                    envelope(result.clone()),
+                ),
+                span_entry(Some(corr), second_seq, "root>update_attempt"),
+            ],
+            vec![
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, result.clone()),
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS, result.clone()),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                attempt_update_ev(corr, first_seq, ATTEMPT_UPDATE_STATUS, result.clone()),
+                attempt_update_ev(corr, second_seq, ATTEMPT_UPDATE_STATUS_REKEYED, result),
+            ],
+        );
+
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.novel_calls, 0);
+        assert_eq!(card.summary.omitted_calls, 0);
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let blocking_value_diverged: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == "value_diverged" && row.blocking)
+            .collect();
+        assert_eq!(blocking_value_diverged.len(), 1, "rows: {rows:?}");
+        assert_eq!(
+            blocking_value_diverged[0].source_event_global_sequence,
+            Some(first_seq),
+            "FIFO pairing remains intact even though the observed args match the later twin"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.kind != "novel" && row.kind != "omitted"),
+            "the two paired calls must not also split into novel/omitted rows: {rows:?}"
+        );
+    }
+    // A same-image replay is the zero calibration; these tests are the other
+    // half of the instrument check. Each case changes exactly one observable
+    // and pins both the blocking count and the class that explains it.
+    mod sensitivity {
+        use super::*;
+
+        fn blocking_divergences(card: &Scorecard) -> u64 {
+            card.summary.http_status_mismatches
+                + card.summary.http_body_mismatches
+                + card.summary.side_effect_divergences
+        }
+
+        fn assert_one_blocking(
+            card: &Scorecard,
+            boundary: &str,
+            kind: &str,
+            protected_signal: &str,
+        ) {
+            assert_eq!(
+                blocking_divergences(card),
+                1,
+                "{protected_signal}: one injection must produce exactly one blocking divergence"
+            );
+            assert_eq!(
+                kind_count(card, boundary, kind),
+                1,
+                "{protected_signal}: the scorer must name the expected {kind} class"
+            );
+            assert!(
+                !card.verdict.pass,
+                "{protected_signal}: the injected difference must fail the verdict"
+            );
+        }
+
+        fn schema_default_body_card(
+            provenance_corr: Option<&str>,
+            response_corr: &str,
+            recorded_label: serde_json::Value,
+            candidate_label: serde_json::Value,
+            body_diff: Vec<JsonFieldDiff>,
+        ) -> Scorecard {
+            let (entries, observed, events) = match provenance_corr {
+                Some(corr) => {
+                    let sequence = 808;
+                    let recorded = payment_intent_row(recorded_label);
+                    let candidate = payment_intent_row(candidate_label);
+                    (
+                        vec![seq_entry_method_res(
+                            Some(corr),
+                            "db",
+                            "generic_insert",
+                            sequence,
+                            envelope(recorded.clone()),
+                        )],
+                        vec![db_exec_obs_with_sql(
+                            corr,
+                            sequence,
+                            PAYMENT_INTENT_INSERT,
+                            recorded.clone(),
+                            candidate,
+                        )],
+                        vec![db_insert_ev(
+                            corr,
+                            sequence,
+                            PAYMENT_INTENT_INSERT,
+                            recorded,
+                        )],
+                    )
+                }
+                None => (vec![], vec![], vec![]),
+            };
+            detect(&art_with_events(
+                entries,
+                observed,
+                vec![http(response_corr, true, body_diff)],
+                events,
+            ))
+        }
+
+        fn body_diff(
+            json_path: &str,
+            baseline: serde_json::Value,
+            candidate: serde_json::Value,
+        ) -> JsonFieldDiff {
+            JsonFieldDiff {
+                json_path: json_path.to_owned(),
+                baseline,
+                candidate,
+            }
+        }
+
+        #[test]
+        fn bound_database_column_value_change_deflects_once() {
+            let card = schema_default_card(
+                Some(PAYMENT_INTENT_INSERT_BINDING_LABEL),
+                PAYMENT_INTENT_INSERT_BINDING_LABEL,
+                payment_intent_row(serde_json::json!("retail")),
+                payment_intent_row(serde_json::json!("wholesale")),
+            );
+
+            assert_one_blocking(
+                &card,
+                "db",
+                "ValueDivergedOrigin",
+                "bound column `business_label` sensitivity",
+            );
+            assert_eq!(card.summary.value_divergences, 1);
+            assert_eq!(
+                card.summary.schema_default_divergences, 0,
+                "a bound column is application-owned, never schema-filled"
+            );
+            assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+            assert_eq!(kind_count(&card, "db", "OmittedCall"), 0);
+            assert_eq!(kind_count(&card, "db", "NovelCall"), 0);
+        }
+
+        #[test]
+        fn http_response_status_change_deflects_once() {
+            let card = detect(&art(
+                vec![],
+                vec![],
+                vec![http("status-sensitivity", false, vec![])],
+            ));
+
+            assert_one_blocking(
+                &card,
+                "http_incoming",
+                "StatusMismatch",
+                "HTTP status sensitivity",
+            );
+            assert_eq!(card.summary.http_status_mismatches, 1);
+            assert_eq!(card.summary.http_body_mismatches, 0);
+            assert_eq!(card.summary.side_effect_divergences, 0);
+            assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        }
+
+        #[test]
+        fn body_field_outside_declared_reply_canon_deflects_once() {
+            let corr = "uncovered-body-sensitivity";
+            let baseline = serde_json::json!({
+                "id": "resp_1",
+                "amount": 100,
+                "trace_id": "stable",
+            });
+            let candidate = serde_json::json!({
+                "id": "resp_1",
+                "amount": 101,
+                "trace_id": "stable",
+            });
+            let card = detect(&art_with_events(
+                vec![],
+                vec![],
+                vec![http_with_bodies(
+                    corr,
+                    true,
+                    vec![JsonFieldDiff {
+                        json_path: "$.amount".to_owned(),
+                        baseline: serde_json::json!(100),
+                        candidate: serde_json::json!(101),
+                    }],
+                    baseline.clone(),
+                    candidate,
+                )],
+                vec![http_incoming_ev_with_reply_canon(
+                    corr,
+                    802,
+                    Some("project:!trace_id"),
+                    baseline,
+                )],
+            ));
+
+            assert_one_blocking(
+                &card,
+                "http_incoming",
+                "BodyMismatch",
+                "HTTP body path `$.amount` outside the declared `trace_id` exclusion",
+            );
+            assert_eq!(card.summary.http_body_mismatches, 1);
+            assert_eq!(card.summary.http_status_mismatches, 0);
+            assert_eq!(card.summary.side_effect_divergences, 0);
+            assert_eq!(kind_count(&card, "http_incoming", "StatusMismatch"), 0);
+        }
+
+        #[test]
+        fn recorded_call_absent_from_observed_side_deflects_once() {
+            let corr = "omission-sensitivity";
+            let card = detect(&art(
+                vec![seq_entry(Some(corr), "db", 803)],
+                vec![],
+                vec![http(corr, true, vec![])],
+            ));
+
+            assert_one_blocking(
+                &card,
+                "db",
+                "OmittedCall",
+                "recorded DB call omission sensitivity",
+            );
+            assert_eq!(card.summary.omitted_calls, 1);
+            assert_eq!(card.summary.novel_calls, 0);
+            assert_eq!(card.summary.value_divergences, 0);
+            assert_eq!(kind_count(&card, "db", "NovelCall"), 0);
+            assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+            assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
+        }
+
+        #[test]
+        fn observed_call_without_recorded_counterpart_deflects_once() {
+            let corr = "novel-sensitivity";
+            let card = detect(&art(
+                vec![],
+                vec![obs("redis", Some(corr), false, None, None)],
+                vec![http(corr, true, vec![])],
+            ));
+
+            assert_one_blocking(
+                &card,
+                "redis",
+                "NovelCall",
+                "observed Redis call novelty sensitivity",
+            );
+            assert_eq!(card.summary.novel_calls, 1);
+            assert_eq!(card.summary.omitted_calls, 0);
+            assert_eq!(card.summary.value_divergences, 0);
+            assert_eq!(kind_count(&card, "redis", "OmittedCall"), 0);
+            assert_eq!(kind_count(&card, "redis", "ValueDiverged"), 0);
+            assert_eq!(kind_count(&card, "redis", "ValueDivergedOrigin"), 0);
+        }
+
+        #[test]
+        fn same_span_same_statement_order_swap_deflects_once() {
+            let corr = "order-sensitivity";
+            let first_seq = 804;
+            let second_seq = 805;
+            let result = serde_json::json!({"rows_affected": 1});
+            let art = art_with_events(
+                vec![
+                    seq_entry_method_res(
+                        Some(corr),
+                        "db",
+                        "generic_update",
+                        first_seq,
+                        envelope(result.clone()),
+                    ),
+                    span_entry(Some(corr), first_seq, "root>update_attempt"),
+                    seq_entry_method_res(
+                        Some(corr),
+                        "db",
+                        "generic_update",
+                        second_seq,
+                        envelope(result.clone()),
+                    ),
+                    span_entry(Some(corr), second_seq, "root>update_attempt"),
+                ],
+                vec![
+                    attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, result.clone()),
+                    attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS, result.clone()),
+                ],
+                vec![http(corr, true, vec![])],
+                vec![
+                    attempt_update_ev(corr, first_seq, ATTEMPT_UPDATE_STATUS, result.clone()),
+                    attempt_update_ev(corr, second_seq, ATTEMPT_UPDATE_STATUS_REKEYED, result),
+                ],
+            );
+            let card = detect(&art);
+
+            assert_one_blocking(
+                &card,
+                "db",
+                "ValueDiverged",
+                "same-span same-statement call-order sensitivity",
+            );
+            assert_eq!(card.summary.value_divergences, 1);
+            assert_eq!(card.summary.omitted_calls, 0);
+            assert_eq!(card.summary.novel_calls, 0);
+            assert_eq!(kind_count(&card, "db", "OmittedCall"), 0);
+            assert_eq!(kind_count(&card, "db", "NovelCall"), 0);
+        }
+
+        #[test]
+        fn seeded_database_row_readback_change_deflects_once() {
+            let corr = "seed-readback-sensitivity";
+            let seq = 806;
+            let recorded = serde_json::json!({
+                "attempt_id": "pay_seeded",
+                "status": "charged",
+                "amount": 100,
+            });
+            let observed = serde_json::json!({
+                "attempt_id": "pay_seeded",
+                "status": "charged",
+                "amount": 101,
+            });
+            let recorded_result = envelope(recorded.clone());
+            let card = detect(&art_with_events(
+                vec![seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    seq,
+                    recorded_result.clone(),
+                )],
+                vec![exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(seq),
+                    Some(recorded_result),
+                    envelope(observed),
+                )],
+                vec![http(corr, true, vec![])],
+                vec![db_read_ev(
+                    corr,
+                    "payment_attempt",
+                    seq,
+                    recorded,
+                    100,
+                    110,
+                    "root",
+                    0,
+                )],
+            ));
+
+            assert_one_blocking(
+                &card,
+                "db",
+                "ValueDivergedOrigin",
+                "seeded row column `amount` readback sensitivity",
+            );
+            assert_eq!(card.summary.value_divergences, 1);
+            assert_eq!(card.summary.schema_default_divergences, 0);
+            assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+            assert_eq!(kind_count(&card, "db", "OmittedCall"), 0);
+            assert_eq!(kind_count(&card, "db", "NovelCall"), 0);
+        }
+
+        #[test]
+        fn established_same_correlation_body_path_absorbs_and_is_named_counted() {
+            let corr = "same-correlation-body-provenance";
+            for (direction, recorded, candidate) in [
+                (
+                    "NULL to default",
+                    serde_json::Value::Null,
+                    serde_json::json!("default"),
+                ),
+                (
+                    "default to NULL",
+                    serde_json::json!("default"),
+                    serde_json::Value::Null,
+                ),
+            ] {
+                let card = schema_default_body_card(
+                    Some(corr),
+                    corr,
+                    recorded.clone(),
+                    candidate.clone(),
+                    vec![body_diff("$.business_label", recorded, candidate)],
+                );
+
+                assert_eq!(
+                    blocking_divergences(&card),
+                    0,
+                    "{direction}: the provenanced response leaf is non-blocking"
+                );
+                assert_eq!(
+                    kind_count(&card, "db", "SchemaDefaultDivergence"),
+                    1,
+                    "{direction}: the establishing DB occurrence remains counted"
+                );
+                assert_eq!(
+                    kind_count(&card, "http_incoming", "SchemaDefaultDivergence"),
+                    1,
+                    "{direction}: the absorbed response leaf is counted separately"
+                );
+                assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+                assert_eq!(card.summary.schema_default_divergences, 2);
+                assert_eq!(card.summary.http_body_mismatches, 0);
+                assert_eq!(card.summary.http_status_mismatches, 0);
+                assert_eq!(card.summary.side_effect_divergences, 0);
+                assert_eq!(card.summary.value_divergences, 0);
+                assert!(
+                    card.warnings.iter().any(|warning| {
+                        warning.contains("$.business_label") && warning.contains("schema-derived")
+                    }),
+                    "{direction}: absorbed response evidence must name its JSON path: {:?}",
+                    card.warnings
+                );
+                assert!(card.verdict.pass, "{direction}: {}", card.verdict.reason);
+                assert!(card.counter_disagreements().is_empty());
+            }
+        }
+
+        #[test]
+        fn same_field_proven_only_in_another_correlation_blocks() {
+            for (direction, recorded, candidate) in [
+                (
+                    "NULL to default",
+                    serde_json::Value::Null,
+                    serde_json::json!("default"),
+                ),
+                (
+                    "default to NULL",
+                    serde_json::json!("default"),
+                    serde_json::Value::Null,
+                ),
+            ] {
+                let card = schema_default_body_card(
+                    Some("database-provenance-correlation"),
+                    "response-correlation",
+                    recorded.clone(),
+                    candidate.clone(),
+                    vec![body_diff("$.business_label", recorded, candidate)],
+                );
+
+                assert_one_blocking(&card, "http_incoming", "BodyMismatch", direction);
+                assert_eq!(
+                    kind_count(&card, "db", "SchemaDefaultDivergence"),
+                    1,
+                    "{direction}: the unrelated DB occurrence is still counted"
+                );
+                assert_eq!(
+                    kind_count(&card, "http_incoming", "SchemaDefaultDivergence"),
+                    0,
+                    "{direction}: provenance must not cross correlations"
+                );
+                assert_eq!(card.summary.schema_default_divergences, 1);
+                assert_eq!(card.summary.http_body_mismatches, 1);
+                assert_eq!(card.summary.http_status_mismatches, 0);
+                assert_eq!(card.summary.side_effect_divergences, 0);
+                assert_eq!(card.summary.value_divergences, 0);
+                assert!(card.counter_disagreements().is_empty());
+            }
+        }
+
+        #[test]
+        fn body_path_without_schema_default_provenance_blocks() {
+            for (direction, recorded, candidate) in [
+                (
+                    "NULL to default",
+                    serde_json::Value::Null,
+                    serde_json::json!("default"),
+                ),
+                (
+                    "default to NULL",
+                    serde_json::json!("default"),
+                    serde_json::Value::Null,
+                ),
+            ] {
+                let card = schema_default_body_card(
+                    None,
+                    "no-body-provenance",
+                    recorded.clone(),
+                    candidate.clone(),
+                    vec![body_diff("$.business_label", recorded, candidate)],
+                );
+
+                assert_one_blocking(&card, "http_incoming", "BodyMismatch", direction);
+                assert_eq!(kind_count(&card, "db", "SchemaDefaultDivergence"), 0);
+                assert_eq!(
+                    kind_count(&card, "http_incoming", "SchemaDefaultDivergence"),
+                    0
+                );
+                assert_eq!(card.summary.schema_default_divergences, 0);
+                assert_eq!(card.summary.http_body_mismatches, 1);
+                assert_eq!(card.summary.http_status_mismatches, 0);
+                assert_eq!(card.summary.side_effect_divergences, 0);
+                assert_eq!(card.summary.value_divergences, 0);
+                assert!(card.counter_disagreements().is_empty());
+            }
+        }
+
+        #[test]
+        fn mixed_provenanced_and_unprovenanced_body_paths_blocks() {
+            let corr = "mixed-body-provenance";
+            for (direction, recorded, candidate) in [
+                (
+                    "NULL to default",
+                    serde_json::Value::Null,
+                    serde_json::json!("default"),
+                ),
+                (
+                    "default to NULL",
+                    serde_json::json!("default"),
+                    serde_json::Value::Null,
+                ),
+            ] {
+                let card = schema_default_body_card(
+                    Some(corr),
+                    corr,
+                    recorded.clone(),
+                    candidate.clone(),
+                    vec![
+                        body_diff("$.business_label", recorded.clone(), candidate.clone()),
+                        body_diff("$.currency", recorded, candidate),
+                    ],
+                );
+
+                assert_one_blocking(&card, "http_incoming", "BodyMismatch", direction);
+                assert_eq!(
+                    kind_count(&card, "db", "SchemaDefaultDivergence"),
+                    1,
+                    "{direction}: the establishing DB occurrence remains counted"
+                );
+                assert_eq!(
+                    kind_count(&card, "http_incoming", "SchemaDefaultDivergence"),
+                    1,
+                    "{direction}: the provenanced response leaf remains counted while its sibling blocks"
+                );
+                assert_eq!(card.summary.schema_default_divergences, 2);
+                assert_eq!(card.summary.http_body_mismatches, 1);
+                assert_eq!(card.summary.http_status_mismatches, 0);
+                assert_eq!(card.summary.side_effect_divergences, 0);
+                assert_eq!(card.summary.value_divergences, 0);
+                assert!(
+                    card.warnings.iter().any(|warning| {
+                        warning.contains("$.business_label") && warning.contains("schema-derived")
+                    }),
+                    "{direction}: absorbed response evidence must survive a blocking sibling: {:?}",
+                    card.warnings
+                );
+                assert!(!card.verdict.pass, "{direction}: mixed body must block");
+                assert!(card.counter_disagreements().is_empty());
+            }
+        }
+
+        #[test]
+        fn literal_default_column_difference_absorbs_without_blocking() {
+            let card = schema_default_card(
+                None,
+                PAYMENT_INTENT_INSERT,
+                payment_intent_row(serde_json::Value::Null),
+                payment_intent_row(serde_json::json!("default")),
+            );
+
+            assert_eq!(
+                blocking_divergences(&card),
+                0,
+                "literal DEFAULT provenance rule: schema-filled `business_label` must not block"
+            );
+            assert_eq!(
+                kind_count(&card, "db", "SchemaDefaultDivergence"),
+                1,
+                "literal DEFAULT provenance rule must remain explicitly named"
+            );
+            assert_eq!(card.summary.schema_default_divergences, 1);
+            assert_eq!(card.summary.value_divergences, 0);
+            assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
+            assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+            assert!(card.verdict.pass, "{}", card.verdict.reason);
+        }
+
+        #[test]
+        fn reply_canon_excluded_body_path_absorbs_without_blocking() {
+            let card = http_reply_canon_card(
+                "reply-canon-absorption-sensitivity",
+                807,
+                "project:!trace_id",
+                "$.trace_id",
+                serde_json::json!({
+                    "id": "resp_1",
+                    "amount": 100,
+                    "trace_id": "recorded",
+                }),
+                serde_json::json!({
+                    "id": "resp_1",
+                    "amount": 100,
+                    "trace_id": "observed",
+                }),
+            );
+
+            assert_eq!(
+                blocking_divergences(&card),
+                0,
+                "declared reply-canon exclusion rule: `$.trace_id` must be absorbed"
+            );
+            assert_eq!(card.summary.http_body_mismatches, 0);
+            assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+            assert_eq!(card.summary.http_status_mismatches, 0);
+            assert_eq!(card.summary.side_effect_divergences, 0);
+            assert!(card.verdict.pass, "{}", card.verdict.reason);
+        }
     }
 }
