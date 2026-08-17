@@ -361,3 +361,165 @@ fn a_later_request_does_not_inherit_the_earlier_one() {
         "a closed request must not bleed into the next one",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The real ingress order.
+//
+// Every test above establishes a correlation-carrying context BEFORE creating a
+// span, so the thread already has an ambient correlation when `on_new_span`
+// runs. A router does the opposite, and the difference is not cosmetic:
+//
+//   1. the sampler decides and `set_recording_decision` writes the
+//      correlation-keyed REGISTRY — no correlation is live on the thread
+//   2. the ingress root span is CREATED (`on_new_span` fires here)
+//   3. the future is polled and the span is ENTERED — only now does
+//      `DejaCorrelationLayer` make the correlation ambient
+//
+// So at step 2 the ambient gate answers `false` on every recorded request. A
+// layer that consults only the ambient gate allocates no state for the root,
+// its children find no parent state, and the record side loses its forest root
+// while the replay side keeps one (`observation_active` is unconditionally true
+// for `RuntimeMode::Replay`). Two forests differing at the root cannot align.
+//
+// These drive the registry, not a thread-local snapshot, because that is what
+// the ingress writes and it is the only store that can answer for a request the
+// thread is not yet serving.
+// ---------------------------------------------------------------------------
+
+/// Collect nodes for `f` with no ambient correlation, under both layer
+/// registration orders, asserting the two agree.
+///
+/// The order matters to the mechanism: `.with(a).with(b)` runs `a`'s
+/// `on_new_span` first (`Layered` delegates inner-first), and the host installs
+/// `.with(deja_layer()).with(deja_correlation_layer())`, so the graph layer
+/// runs BEFORE the correlation layer and cannot read its span extension. That
+/// is why the fix reads the registry rather than that extension — and why this
+/// helper pins the property in both directions, so a host that reorders its
+/// `.with` calls cannot silently change what gets recorded.
+fn collect_graph_at_ingress_order<T>(f: impl Fn() -> T) -> Vec<ExecutionGraphNode> {
+    install_process_record_hook();
+    assert_eq!(
+        deja_context::current_correlation_id(),
+        None,
+        "these tests must run with no ambient correlation — that is the condition \
+         under test",
+    );
+
+    let graph_first = Arc::new(CollectingSink::default());
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(ExecutionGraphLayer::new(
+                Arc::clone(&graph_first) as Arc<dyn GraphNodeSink>
+            ))
+            .with(deja_runtime::DejaCorrelationLayer::new()),
+        || {
+            f();
+        },
+    );
+
+    let correlation_first = Arc::new(CollectingSink::default());
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(deja_runtime::DejaCorrelationLayer::new())
+            .with(ExecutionGraphLayer::new(
+                Arc::clone(&correlation_first) as Arc<dyn GraphNodeSink>
+            )),
+        || {
+            f();
+        },
+    );
+
+    let a = graph_first.drain();
+    let b = correlation_first.drain();
+    let shape = |nodes: &[ExecutionGraphNode]| -> Vec<(String, Option<String>)> {
+        nodes
+            .iter()
+            .map(|n| (n.span_name.clone(), n.correlation_id.clone()))
+            .collect()
+    };
+    assert_eq!(
+        shape(&a),
+        shape(&b),
+        "graph allocation must not depend on which layer was registered first; \
+         `Layered` runs the inner layer's `on_new_span` first, so a rule that \
+         reads the other layer's span extension would pass one order and fail \
+         the other",
+    );
+    a
+}
+
+/// The ingress root span, created before the correlation it carries is engaged.
+fn drive_one_ingress_request(correlation_id: &str) {
+    let root = span!(Level::INFO, "deja::http_incoming", request_id = %correlation_id);
+    let _entered = root.enter();
+    // `TracingLogger`'s root span sits inside the deja span and names the same
+    // correlation; application spans below inherit it.
+    let actix_root = span!(Level::INFO, "HTTP request", request_id = %correlation_id);
+    let _actix = actix_root.enter();
+    let work = span!(Level::INFO, "payments.core");
+    drop(work);
+}
+
+#[test]
+fn ingress_root_span_gets_a_node_though_its_correlation_is_not_yet_ambient() {
+    let correlation_id = "ingress-root-allocates";
+    deja_context::set_recording_decision(correlation_id, true);
+    let nodes = collect_graph_at_ingress_order(|| drive_one_ingress_request(correlation_id));
+    deja_context::clear_recording_decision(correlation_id);
+
+    let root = node_named(&nodes, "deja::http_incoming");
+    assert_eq!(
+        root.correlation_id.as_deref(),
+        Some(correlation_id),
+        "the ingress root establishes the correlation and must state it",
+    );
+    assert_eq!(
+        root.parent_id, None,
+        "the ingress root is the forest root — nothing is above it",
+    );
+
+    // The point of allocating the root is that everything below can reach it.
+    // Without it these two hang off nothing and the record-side forest has a
+    // different root than the replay-side one built from the same spans.
+    let http = node_named(&nodes, "HTTP request");
+    assert_eq!(
+        http.parent_id,
+        Some(root.node_id),
+        "the next span in must hang off the ingress root, not off nothing",
+    );
+    assert_eq!(
+        node_named(&nodes, "payments.core").parent_id,
+        Some(http.node_id),
+        "application spans keep their place in the tree",
+    );
+}
+
+#[test]
+fn a_span_naming_a_sampled_out_correlation_allocates_nothing() {
+    let correlation_id = "ingress-root-sampled-out";
+    deja_context::set_recording_decision(correlation_id, false);
+    let nodes = collect_graph_at_ingress_order(|| drive_one_ingress_request(correlation_id));
+    deja_context::clear_recording_decision(correlation_id);
+
+    assert!(
+        nodes.is_empty(),
+        "an explicit Skip must stay as inert as before — answering for a named \
+         correlation changes WHICH decision is consulted, never whether one is \
+         required: {nodes:#?}",
+    );
+}
+
+#[test]
+fn a_span_naming_an_undecided_correlation_allocates_nothing() {
+    // No `set_recording_decision` at all: recording is opt-in, so a span that
+    // names a correlation nobody decided on records nothing. This is the guard
+    // against the named path becoming a way to capture what `capture_verdict`
+    // refuses — note the polarity differs from `DejaCorrelationLayer`, which
+    // engages a correlation unless an explicit Skip says otherwise because
+    // engaging one records nothing.
+    let nodes = collect_graph_at_ingress_order(|| drive_one_ingress_request("ingress-undecided"));
+    assert!(
+        nodes.is_empty(),
+        "an undecided correlation must not capture — recording is opt-in: {nodes:#?}",
+    );
+}

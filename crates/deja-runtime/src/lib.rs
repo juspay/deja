@@ -856,6 +856,36 @@ pub trait DejaHook: Send + Sync {
         }
     }
 
+    /// [`observation_active`](Self::observation_active) asked about a NAMED
+    /// correlation instead of the one this thread is currently serving.
+    ///
+    /// For callers that know which request a piece of work belongs to before the
+    /// correlation becomes ambient. The only such caller today is
+    /// [`crate::ExecutionGraphLayer::on_new_span`]: a request's root span is
+    /// created one instruction before `DejaCorrelationLayer::on_enter` engages
+    /// the correlation it carries, so the ambient answer is `None` for every
+    /// recorded request and the root would allocate no state.
+    ///
+    /// Same three arms as the ambient form, and the Record arm resolves through
+    /// [`capture_verdict_for`](Self::capture_verdict_for) so sink-liveness and
+    /// the opt-in rule are stated once, not twice.
+    fn observation_active_for(&self, correlation_id: &str) -> bool {
+        match self.process_mode() {
+            RuntimeMode::Replay => true,
+            RuntimeMode::Record => self.capture_verdict_for(correlation_id).should_capture(),
+            RuntimeMode::Disabled => false,
+        }
+    }
+
+    /// [`capture_verdict`](Self::capture_verdict) for a NAMED correlation.
+    ///
+    /// Defaults to the ambient verdict, which is the right answer for every hook
+    /// that holds no per-correlation state. [`RecordingHook`] overrides it to ask
+    /// the correlation-keyed registry.
+    fn capture_verdict_for(&self, _correlation_id: &str) -> CaptureVerdict {
+        self.capture_verdict()
+    }
+
     /// Attempt to replay a previously recorded result without calling the
     /// real implementation.
     ///
@@ -1052,6 +1082,24 @@ pub(crate) type CallsiteOccurrenceMap = HashMap<
 >;
 
 impl RecordingHook {
+    /// Turn a resolved recording decision into a capture verdict.
+    ///
+    /// The one place the record-side gate's two rules live: a dead sink degrades
+    /// to a no-op rather than failing the application, and recording is opt-in,
+    /// so an absent decision skips. `capture_verdict` and `capture_verdict_for`
+    /// differ ONLY in which store answered — the thread's own correlation or a
+    /// named one — never in what the answer means.
+    fn verdict_from(&self, decision: Option<deja_context::RecordDecision>) -> CaptureVerdict {
+        if !self.writer.is_active() {
+            return CaptureVerdict::SkipSinkDown;
+        }
+        match decision {
+            Some(deja_context::RecordDecision::Record) => CaptureVerdict::Capture,
+            Some(deja_context::RecordDecision::Skip) => CaptureVerdict::SkipSampledOut,
+            None => CaptureVerdict::SkipNoDecision,
+        }
+    }
+
     /// Resolve `recording_run_id` from the environment, falling back to a
     /// time-based id when neither `DEJA_RECORDING_RUN_ID` nor
     /// `DEJA_RUN_ID_ENV_VAR` is set.
@@ -1185,14 +1233,17 @@ impl DejaHook for RecordingHook {
         // failing the application. Every boundary — db, instrument
         // id/time/crypto/http, redis, and the `RuntimeHook::Recording` delegation
         // — funnels through here.
-        if !self.writer.is_active() {
-            return CaptureVerdict::SkipSinkDown;
-        }
-        match deja_context::recording_decision_for_current() {
-            Some(deja_context::RecordDecision::Record) => CaptureVerdict::Capture,
-            Some(deja_context::RecordDecision::Skip) => CaptureVerdict::SkipSampledOut,
-            None => CaptureVerdict::SkipNoDecision,
-        }
+        self.verdict_from(deja_context::recording_decision_for_current())
+    }
+
+    /// The same gate for a correlation named by the caller rather than by the
+    /// thread. The decision comes from the correlation-keyed registry, which is
+    /// the only store that can answer for a request this thread is not yet
+    /// serving — the ingress writes it before the root span exists. Resolving
+    /// through the same [`RecordingHook::verdict_from`] keeps sink-liveness and
+    /// the opt-in rule single-sourced with [`Self::capture_verdict`].
+    fn capture_verdict_for(&self, correlation_id: &str) -> CaptureVerdict {
+        self.verdict_from(deja_context::recording_decision(correlation_id))
     }
 
     fn record(&self, event: BoundaryEvent) {
@@ -1354,6 +1405,22 @@ impl RuntimeHook {
         }
     }
 
+    /// The capture verdict for a NAMED correlation — see
+    /// [`DejaHook::capture_verdict_for`].
+    ///
+    /// This arm-by-arm delegation is not optional. `DejaHook::capture_verdict_for`
+    /// carries a default body, and this enum is a hand-written wrapper, so
+    /// omitting it compiles cleanly and silently answers with the wrapper's own
+    /// AMBIENT verdict — the exact question the named form exists to avoid asking.
+    pub fn capture_verdict_for(&self, correlation_id: &str) -> CaptureVerdict {
+        match self {
+            RuntimeHook::Recording(h) => DejaHook::capture_verdict_for(h.as_ref(), correlation_id),
+            RuntimeHook::Replay(h) => DejaHook::capture_verdict_for(h, correlation_id),
+            RuntimeHook::LookupReplay(h) => DejaHook::capture_verdict_for(h, correlation_id),
+            RuntimeHook::Disabled(h) => DejaHook::capture_verdict_for(h, correlation_id),
+        }
+    }
+
     /// Whether this hook is replaying recorded results (either the standalone
     /// `Replay` hook or the harness-driven `LookupReplay` hook).
     pub fn is_replay(&self) -> bool {
@@ -1368,6 +1435,10 @@ impl DejaHook for RuntimeHook {
 
     fn capture_verdict(&self) -> CaptureVerdict {
         RuntimeHook::capture_verdict(self)
+    }
+
+    fn capture_verdict_for(&self, correlation_id: &str) -> CaptureVerdict {
+        RuntimeHook::capture_verdict_for(self, correlation_id)
     }
 
     fn try_replay(
@@ -2208,6 +2279,22 @@ pub fn observation_is_active() -> bool {
         .unwrap_or(false)
 }
 
+/// [`observation_is_active`] for a boundary or span that NAMES the correlation
+/// it belongs to, rather than inheriting the thread's.
+///
+/// Use this only where the caller genuinely knows the correlation and the
+/// ambient one may not be engaged yet. A request's root span is the motivating
+/// case: it carries the `request_id` that establishes the correlation, but it is
+/// created before `DejaCorrelationLayer::on_enter` makes that correlation
+/// ambient, so [`observation_is_active`] answers `false` for it on every
+/// recorded request. Resolves the SAME installed hook, so the two predicates
+/// cannot disagree about the process mode or the sink.
+pub fn observation_is_active_for(correlation_id: &str) -> bool {
+    global_runtime_hook_from_env()
+        .map(|hook| hook.observation_active_for(correlation_id))
+        .unwrap_or(false)
+}
+
 /// The explicit process-wide runtime mode.
 ///
 /// Returns the installed global runtime hook mode, or [`RuntimeMode::Disabled`] when
@@ -2343,20 +2430,62 @@ pub(crate) fn current_task_metadata(_correlation_id: Option<&str>) -> TaskMetada
 /// a `deja.fork`-marked span, opens a fresh lineage bucket for the child, and
 /// derives its `task_id`/`bucket_id`/`fork_seq` from the span tree — no captured
 /// task-locals. Boundary events inside the child inherit the request correlation
-/// via the same layer. Provided so callers keep one obvious spelling; a bare
-/// `tokio::spawn(fut.instrument(deja::fork_span()))` is equivalent.
+/// via the same layer.
+///
+/// **This is where a detached task stops belonging to nobody.** A bare
+/// `tokio::spawn` hands the child neither the span nor the deja context, so every
+/// boundary it crosses resolves no correlation and the opt-in capture gate
+/// answers `SkipNoDecision` — the work is simply absent from the tape, while a
+/// replayed candidate still makes the same calls and has them written off as
+/// environmental. That is not a race: the correlation is lost at spawn,
+/// unconditionally.
+///
+/// Two things must travel for the child to stay attributable, and the span alone
+/// carries only the first:
+///
+/// * the **correlation and lineage**, which ride the instrumented span — the
+///   child inherits its parent's correlation and opens its own bucket; and
+/// * the **recording decision**, which does not. Ingress clears the
+///   correlation-keyed registry entry when the response returns, and a detached
+///   child routinely outlives that. `DejaCorrelationLayer::on_enter` would then
+///   re-resolve the decision from an entry that no longer exists, and a child
+///   with a correlation but no decision still fails the gate.
+///
+/// So the context is captured HERE, at spawn, while the request is still live,
+/// and re-entered on every poll. Capturing goes through
+/// [`deja_context::capture_current`], which resolves the decision by the one
+/// ownership rule, so the pair frozen into the child can never name one request
+/// and carry another's verdict. An explicit `Skip` travels exactly as faithfully
+/// as a `Record`.
+///
+/// Ordering is deliberate: the context is entered OUTSIDE the span, so when the
+/// layer engages the correlation on enter it re-derives the decision from a
+/// thread-local that already agrees with it, instead of from a registry entry
+/// that may be gone. Reversing the two would leave the decision transiently
+/// absent for exactly the window the layer runs in.
+///
+/// This does not make anything wait. Nothing here awaits or joins; the handle is
+/// still dropped, child errors still do not reach the response, and response
+/// completion is still uncoupled from the child's. The cost is capture-only: one
+/// context clone per poll on top of the span the fork already carried.
+///
+/// A bare `tokio::spawn(fut.instrument(deja::fork_span()))` is therefore NO
+/// LONGER equivalent — it is the version that loses the decision. Fork through
+/// this function.
 pub fn spawn_fork<F, T>(future: F)
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    let context = deja_context::capture_current();
     // Dropping the JoinHandle is deliberate — fire-and-forget by contract.
-    drop(tokio::spawn(
+    drop(tokio::spawn(deja_context::scope_snapshot(
+        context,
         async move {
             let _ = future.await;
         }
         .instrument(fork_span()),
-    ));
+    )));
 }
 
 /// The span that marks a spawned-task fork boundary for the correlation/graph

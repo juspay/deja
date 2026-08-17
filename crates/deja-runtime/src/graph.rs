@@ -82,10 +82,50 @@ where
     S: for<'lookup> LookupSpan<'lookup>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        // Which correlation does this span NAME? Resolved before the gate,
+        // because the gate needs the answer — see below — and reused for the
+        // node's own correlation further down, so it is visited once.
+        let mut correlation_visitor = crate::correlation_layer::CorrelationVisitor(None);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            attrs.record(&mut correlation_visitor);
+        }));
+        let own_correlation = correlation_visitor.0;
+
         // Allocate nothing — no node id, no `graph_node_map` lock, no span
         // extension — unless this call will be recorded or replayed. A recorder
-        // with the request sampled out is as inert as a disabled process.
-        if !crate::observation_is_active() {
+        // with the request sampled out allocates nothing beyond the visit above.
+        //
+        // TWO questions, in cost order, and the second one is load-bearing.
+        //
+        // The ambient question answers every span created *inside* a request
+        // scope, which is nearly all of them. It cannot answer the one span that
+        // matters most. A request's ROOT span is CREATED one instruction before
+        // `DejaCorrelationLayer::on_enter` engages the correlation it
+        // establishes (`router_env`'s ingress builds the span, then instruments
+        // the future with it), so at this point the thread has no correlation and
+        // the ambient gate says "no" for EVERY recorded request. The root then
+        // owns no `GraphSpanState`, its children find no parent state, and the
+        // record side silently loses its forest root — while the replay side
+        // keeps one, because `observation_active` is unconditionally true for
+        // `RuntimeMode::Replay`. Two forests that differ at the root cannot be
+        // aligned.
+        //
+        // So a span that NAMES its own correlation is answered on its own terms,
+        // against the correlation-keyed registry the ingress writes BEFORE
+        // creating the span, and which `DejaCorrelationLayer::on_new_span` already
+        // consults for the same decision. Same store, same owner, so the two
+        // layers cannot disagree about which spans belong to a sampled-in request.
+        //
+        // The POLARITY differs from that layer deliberately: it observes unless
+        // an explicit `Skip` says otherwise, because engaging a correlation
+        // records nothing. Allocating graph state does record, so this stays
+        // opt-in — an undecided correlation allocates nothing, exactly as
+        // `capture_verdict` treats it.
+        if !crate::observation_is_active()
+            && !own_correlation
+                .as_deref()
+                .is_some_and(crate::observation_is_active_for)
+        {
             return;
         }
 
@@ -107,8 +147,8 @@ where
         }
 
         if let Some(span) = ctx.span(id) {
-            // The span's correlation, resolved HERE rather than read from
-            // anywhere else. Two nearer-looking sources are both wrong:
+            // The span's correlation, resolved from the visit above rather than
+            // read from anywhere else. Two nearer-looking sources are both wrong:
             //
             //  * `DejaCorrelationLayer`'s `SpanContext` extension does not exist
             //    yet. `Layered::on_new_span` runs the inner layer first, and the
@@ -121,18 +161,16 @@ where
             //    not on new-span. At this point the ambient value is still the
             //    parent's, so a request's ROOT span — the one that establishes
             //    the correlation, and the one a scoped graph needs most — would
-            //    be attributed to whatever ran before it.
+            //    be attributed to whatever ran before it. (That is the same fact
+            //    the gate above turns on: it is why the ambient gate cannot
+            //    answer for a root, not merely why the ambient value cannot name
+            //    one.)
             //
             // A span's own `request_id` field is the source of truth; a span
             // without one belongs to whatever its parent belongs to. That is the
             // same rule `DejaCorrelationLayer` applies, over the same field
             // constant and visitor, so the two layers cannot drift.
-            let mut correlation_visitor = crate::correlation_layer::CorrelationVisitor(None);
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                attrs.record(&mut correlation_visitor);
-            }));
-            let correlation = correlation_visitor
-                .0
+            let correlation = own_correlation
                 .map(Arc::<str>::from)
                 .or_else(|| parent_correlation(attrs, &ctx));
 
