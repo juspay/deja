@@ -136,12 +136,14 @@ pub struct ActivationForest {
     pub roots: Vec<u64>,
 }
 
-/// Events that named no node, or named a node this payload does not carry.
+/// Events held out of the forest, each under the cause that put it there.
 ///
-/// Two distinguishable causes, kept apart because they are fixed in different
-/// halves of the system: an event with no `graph_node_id` is a CAPTURE gap —
-/// nothing on the tape ties the call to a span; an event naming an absent node
-/// is a DELIVERY gap — the tie exists and the node went missing. One blanket
+/// The causes are kept apart because they are fixed in different halves of the
+/// system, and because two of them are faults while the third is not. An event
+/// with no `graph_node_id` is a CAPTURE gap — nothing on the tape ties the call
+/// to a span; an event naming an absent node is a DELIVERY gap — the tie exists
+/// and the node went missing; an event with no possible counterpart is neither
+/// — it is healthy, its tie exists, and it is withheld on purpose. One blanket
 /// message sends the reader looking in the wrong place.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Annex {
@@ -149,6 +151,48 @@ pub struct Annex {
     pub names_no_node: Vec<u64>,
     /// Global sequences of events naming a node absent from the payload.
     pub names_absent_node: Vec<u64>,
+    /// Global sequences of events the other side cannot produce a counterpart
+    /// for however faithfully it behaves, because the harness drives that
+    /// boundary rather than the code under test.
+    ///
+    /// **This is not a fault, and nothing here needs fixing.** Attaching such an
+    /// event would make one side's subtree event-bearing while the other's stays
+    /// empty, and that asymmetry is structural — no candidate can close it. The
+    /// tie between this event and its span exists; it is withheld so the two
+    /// sides stay comparable. See [`EventRef::counterpart_possible`].
+    pub no_counterpart_by_construction: Vec<u64>,
+}
+
+impl Annex {
+    /// Every annexed sequence, whatever its cause.
+    ///
+    /// THE list of buckets, and the only one. [`ForestSet::balance`] sums and
+    /// de-duplicates over this, [`build`] cross-checks its sequence set over it,
+    /// and the orchestrator's `flat_record_events` / `flat_replay_events` are
+    /// built from it — before this existed those carried four separate
+    /// hand-written chains, so a new bucket had to be remembered in four places
+    /// and the balance passed while `build` still called the event dropped.
+    ///
+    /// Two consequences a reader adding a bucket needs, because they pull in
+    /// opposite directions. Omitting it here fails `build` and `balance` at once,
+    /// loudly — that is intended. But the flat-tier sets have no such assertion
+    /// behind them, and an event annexed without reaching them is scored by no
+    /// tier at all, which the accounting cannot see: it balances, because being
+    /// annexed is what balancing asks of it.
+    ///
+    /// So adding a bucket here also enrols its events in **flat scoring**, and
+    /// that is the deliberate default: an annexed event has no node, so the graph
+    /// tier has nothing to say about it, and being scored by the wrong tier is a
+    /// visible finding while being scored by none is a silent drop. A bucket that
+    /// genuinely must not be scored at all needs to say so at the two flat-tier
+    /// call sites, and to explain itself there.
+    pub fn annexed_sequences(&self) -> impl Iterator<Item = u64> + '_ {
+        self.names_no_node
+            .iter()
+            .chain(&self.names_absent_node)
+            .chain(&self.no_counterpart_by_construction)
+            .copied()
+    }
 }
 
 /// The whole of one side: per-correlation forests, the ambient forest, and the
@@ -211,14 +255,9 @@ impl ForestSet {
             return Err(BuildError::NodePartition { node_id, forests });
         }
 
-        let annexed = (self.annex.names_no_node.len() + self.annex.names_absent_node.len()) as u64;
-        for sequence in self
-            .annex
-            .names_no_node
-            .iter()
-            .chain(&self.annex.names_absent_node)
-        {
-            sequences_are_unique &= accounted_sequences.insert(*sequence);
+        let annexed = self.annex.annexed_sequences().count() as u64;
+        for sequence in self.annex.annexed_sequences() {
+            sequences_are_unique &= accounted_sequences.insert(sequence);
         }
 
         if attached + annexed != events_in
@@ -424,6 +463,18 @@ pub fn build(nodes: &[ExecutionGraphNode], events: &[EventRef]) -> Result<Forest
     let _ = ambient_cycles;
 
     for event in events {
+        // Checked before `graph_node_id`, and deliberately so: such an event
+        // usually HAS a node, and routing it by that node would attach it. The
+        // question "can the other side ever match this?" outranks "where did it
+        // happen?", because a node the other side cannot reach is not a
+        // comparison, it is a guaranteed divergence.
+        if !event.counterpart_possible {
+            result
+                .annex
+                .no_counterpart_by_construction
+                .push(event.global_sequence);
+            continue;
+        }
         match event.graph_node_id {
             None => result.annex.names_no_node.push(event.global_sequence),
             Some(node_id) => match node_partition.get(&node_id) {
@@ -450,6 +501,7 @@ pub fn build(nodes: &[ExecutionGraphNode], events: &[EventRef]) -> Result<Forest
 
     result.annex.names_no_node.sort_unstable();
     result.annex.names_absent_node.sort_unstable();
+    result.annex.no_counterpart_by_construction.sort_unstable();
     for forest in std::iter::once(&mut result.ambient).chain(result.by_correlation.values_mut()) {
         for node in forest.nodes.values_mut() {
             node.events.sort_unstable();
@@ -497,8 +549,7 @@ pub fn build(nodes: &[ExecutionGraphNode], events: &[EventRef]) -> Result<Forest
         .chain(std::iter::once(&result.ambient))
         .flat_map(|forest| forest.nodes.values())
         .flat_map(|node| node.events.iter().copied())
-        .chain(result.annex.names_no_node.iter().copied())
-        .chain(result.annex.names_absent_node.iter().copied())
+        .chain(result.annex.annexed_sequences())
         .collect();
     accounted_sequences.sort_unstable();
     if accounted_sequences != expected_sequences {
@@ -509,8 +560,7 @@ pub fn build(nodes: &[ExecutionGraphNode], events: &[EventRef]) -> Result<Forest
             .flat_map(|forest| forest.nodes.values())
             .map(|node| node.events.len() as u64)
             .sum();
-        let annexed =
-            (result.annex.names_no_node.len() + result.annex.names_absent_node.len()) as u64;
+        let annexed = result.annex.annexed_sequences().count() as u64;
         return Err(BuildError::Imbalanced {
             events_in: events.len() as u64,
             attached,
@@ -531,6 +581,21 @@ pub struct EventRef {
     /// Stated by the event, used only to cross-check the node's own answer.
     /// A disagreement is reported, never used to re-home the event.
     pub correlation_id_present: bool,
+    /// Whether the other side is capable of producing a counterpart for this
+    /// event at all.
+    ///
+    /// `false` for a boundary the harness drives rather than the code under
+    /// test: the candidate can behave perfectly and still never emit it, so
+    /// comparing its presence measures the harness, not the candidate. Such an
+    /// event is annexed to [`Annex::no_counterpart_by_construction`] rather than
+    /// attached to its node, which keeps it from making one side's subtree
+    /// event-bearing while the other's is empty.
+    ///
+    /// The caller decides this, because it is a property of the boundary and
+    /// this crate deliberately knows nothing about boundaries. `true` is the
+    /// answer for every ordinary event, including entropy seams — a substituted
+    /// seam still emits an observation on replay, hit or miss.
+    pub counterpart_possible: bool,
 }
 
 // ---------------------------------------------------------------------------
