@@ -30,7 +30,34 @@ use crate::scope::{ScopedRecording, TapeItem};
 ///
 /// Scoping is safe for key identity: `KeyStamper`'s occurrence counter and the
 /// per-request sequence are both keyed BY correlation, so omitting other
-/// correlations' events does not shift the keys of the ones kept.
+/// correlations' events does not shift the keys of the ones kept. That covers
+/// the uncorrelated bucket too, for a second reason rather than the same one:
+/// `RunScope::contains(None)` is deliberately `true`, so NO scope ever omits an
+/// uncorrelated event and the `None` bucket is numbered over one population
+/// whatever the filter says. Both halves are pinned by tests below, because the
+/// second is the kind of property a later change to `contains` would silently
+/// take away.
+///
+/// What that guarantee does NOT cover — and must not be read as covering — is
+/// that this renderer numbers the `None` bucket over the whole recorded SESSION
+/// while a candidate re-derives it over its own RUN. Every uncorrelated event
+/// shares one key, so a candidate's first ambient call at a given
+/// `(address, args_hash)` would resolve against the session's first, whoever
+/// made it: benign when the results agree, a silently substituted wrong value
+/// when they do not. That asymmetry is NOT scope-dependent — it is identical at
+/// whole-session scope — and it belongs to the record/replay pair, not to
+/// scoping.
+///
+/// It also has no material to bite on. `RecordingHook` captures only under a
+/// live recording decision, and a decision is only ever set alongside the
+/// correlation it was made for, so a boundary firing with no correlation reaches
+/// `CaptureVerdict::SkipNoDecision` and writes nothing: the record side cannot
+/// emit an uncorrelated event at all. Two production tapes agree — 27,790 and
+/// 14,595 rendered entries, not one of them uncorrelated. The replay side has no
+/// such gate, so a candidate does still make ambient calls the tape cannot hold;
+/// the scorer classifies those as environmental misses instead of resolving
+/// them. The day the record side starts emitting uncorrelated events, this
+/// paragraph is what stops being true — not the scoping guarantee above.
 pub fn render_lookup_table(
     recording: &ScopedRecording,
     recording_id: &str,
@@ -232,6 +259,103 @@ mod tests {
             "an out-of-scope recorded value reached the lookup table"
         );
         assert!(!table.entries.is_empty(), "the driven case still renders");
+    }
+
+    /// Same event, rendered with a correlation in scope and with it plus a
+    /// second one. `KeyStamper` is keyed by correlation, so the kept
+    /// correlation's occurrence numbering must not notice the other's presence
+    /// — that is the whole reason a scoped render is allowed to omit events.
+    /// Pinned on two calls to the SAME callsite with the SAME args, because a
+    /// counter that was NOT correlation-scoped would number them 0,2 with the
+    /// foreign event in between and 0,1 without it.
+    #[test]
+    fn renderer_keys_of_a_named_correlation_do_not_depend_on_scope() {
+        let same_args = serde_json::json!({"payment_id": "pay_same"});
+        let build = || {
+            let mut first = event("redis", 0, serde_json::Value::Null);
+            first["correlation_id"] = serde_json::json!("c-driven");
+            first["args"] = same_args.clone();
+            let mut foreign = event("redis", 1, serde_json::Value::Null);
+            foreign["correlation_id"] = serde_json::json!("c-foreign");
+            foreign["args"] = same_args.clone();
+            let mut second = event("redis", 2, serde_json::Value::Null);
+            second["correlation_id"] = serde_json::json!("c-driven");
+            second["args"] = same_args.clone();
+            vec![first, foreign, second]
+        };
+
+        let keys_of_driven = |scope: crate::scope::RunScope| {
+            let (_dir, recording) = write_events_scoped(&build(), scope);
+            let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+            table
+                .entries
+                .iter()
+                .filter(|e| e.key.correlation_id.as_deref() == Some("c-driven"))
+                .map(|e| serde_json::to_value(&e.key).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let scoped = keys_of_driven(crate::scope::RunScope::from_filter(Some(&[
+            "c-driven".to_owned()
+        ])));
+        let whole = keys_of_driven(crate::scope::RunScope::entire_session());
+
+        assert!(!scoped.is_empty(), "the driven correlation renders keys");
+        assert_eq!(
+            scoped, whole,
+            "a kept correlation's keys must be byte-identical whether or not \
+             another correlation was scoped in"
+        );
+    }
+
+    /// The uncorrelated half of the same guarantee, which holds for a different
+    /// reason and is therefore worth its own pin. A `None`-keyed occurrence
+    /// counter has no correlation to scope it by, so the only thing keeping it
+    /// scope-stable is that `RunScope::contains(None)` is `true` for every
+    /// scope — no filter ever omits an ambient event, so every render numbers
+    /// the same population. Change `contains` to drop uncorrelated records under
+    /// a filter and this property goes away silently: the renderer would number
+    /// ambient traffic differently per run while claiming, three lines above the
+    /// loop, that scoping cannot shift a key. Two ambient calls to the SAME
+    /// callsite with the SAME args, split by a foreign correlation, so a
+    /// renumbering would show up as a changed `occurrence`.
+    #[test]
+    fn renderer_keys_of_uncorrelated_events_do_not_depend_on_scope() {
+        let same_args = serde_json::json!({"key": "ambient"});
+        let build = || {
+            let mut driven = event("redis", 0, serde_json::Value::Null);
+            driven["correlation_id"] = serde_json::json!("c-driven");
+            let mut amb1 = event("redis", 1, serde_json::Value::Null);
+            amb1["correlation_id"] = serde_json::Value::Null;
+            amb1["args"] = same_args.clone();
+            let mut foreign = event("redis", 2, serde_json::Value::Null);
+            foreign["correlation_id"] = serde_json::json!("c-foreign");
+            let mut amb2 = event("redis", 3, serde_json::Value::Null);
+            amb2["correlation_id"] = serde_json::Value::Null;
+            amb2["args"] = same_args.clone();
+            vec![driven, amb1, foreign, amb2]
+        };
+        let ambient_keys = |scope: crate::scope::RunScope| {
+            let (_dir, recording) = write_events_scoped(&build(), scope);
+            let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+            table
+                .entries
+                .iter()
+                .filter(|e| e.key.correlation_id.is_none())
+                .map(|e| serde_json::to_value(&e.key).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let scoped = ambient_keys(crate::scope::RunScope::from_filter(Some(&[
+            "c-driven".to_owned()
+        ])));
+        let whole = ambient_keys(crate::scope::RunScope::entire_session());
+
+        assert!(!scoped.is_empty(), "ambient traffic renders under a filter");
+        assert_eq!(
+            scoped, whole,
+            "an uncorrelated event's keys must not depend on which correlations \
+             were scoped in — no scope may omit ambient traffic"
+        );
     }
 
     #[test]
