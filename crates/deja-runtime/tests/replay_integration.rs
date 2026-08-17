@@ -12,11 +12,15 @@ use deja_runtime::replay::{
 };
 use deja_runtime::{read_events, Provenance, RecordingHook, ReplayHook};
 
-/// Recording is opt-in: enter a decision-only context so the record phase's
-/// `RecordingHook` actually records. Only the record phase consults this; the
-/// replay phase uses `ReplayHook`, which ignores the recording decision.
+/// Recording is opt-in and a decision only counts for the request it belongs to,
+/// so enter a correlation carrying an explicit `Record` — the pair ingress
+/// installs — and the record phase's `RecordingHook` captures. Only the record
+/// phase consults this; the replay phase uses `ReplayHook`, which ignores the
+/// recording decision.
 fn recording_enabled() -> deja_context::ContextGuard {
-    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+    deja_context::enter(
+        deja_context::ContextSnapshot::new("req-replay-integration").with_recording_decision(true),
+    )
 }
 
 // --- Define a trait ---

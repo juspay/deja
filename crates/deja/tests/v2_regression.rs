@@ -47,12 +47,15 @@ use std::collections::{HashMap, HashSet};
 use deja::{addresses_for, canonical_args_hash, BoundaryEvent, KeyStamper, LookupKey};
 use serde_json::json;
 
-/// Recording is opt-in: enter a decision-only context so the `#[deja::boundary]`
-/// record calls below are actually recorded. Each site's explicit correlation is
-/// carried on its event but not entered into the ambient context, so the record
-/// gate relies on this decision-only context (checked first).
+/// Recording is opt-in and a decision only counts for the request it belongs to,
+/// so enter a correlation carrying an explicit `Record` and the
+/// `#[deja::boundary]` record calls below are captured. Each site's explicit
+/// correlation is still carried on its own event; this ambient pair only opens
+/// the gate.
 fn recording_enabled() -> deja_context::ContextGuard {
-    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+    deja_context::enter(
+        deja_context::ContextSnapshot::new("req-v2-regression").with_recording_decision(true),
+    )
 }
 
 // ---------------------------------------------------------------------------
