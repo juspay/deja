@@ -2398,8 +2398,18 @@ fn clear_fork_counter(correlation_id: Option<&str>, parent_bucket_id: &str) {
 /// The task lineage active on this thread, derived from the entered `tracing`
 /// span tree by [`crate::correlation_layer`] — the span-based replacement for the
 /// former `CURRENT_TASK_LINEAGE` task-local and its `spawn_detached` writer.
+///
+/// A boundary that fires with NO span entered owns no bucket, and this is the one
+/// place that decides what to call it. The root region is the right answer and the
+/// only safe one: it says the call belongs to no fork, so the scorer orders it
+/// against other root traffic instead of excusing it. The unsafe answer is some
+/// other span's bucket, which is what the cursors used to hand out between polls —
+/// `divergence::unordered_distinct_lineage` treats two differing buckets as an
+/// unordered race, so a borrowed bucket turned a real regression into an excused
+/// one. Naming the fallback here rather than inside the accessor keeps the
+/// substitution visible to the next reader.
 pub(crate) fn current_task_lineage() -> TaskLineage {
-    crate::correlation_layer::current_span_lineage()
+    crate::correlation_layer::current_span_lineage().unwrap_or_else(TaskLineage::root)
 }
 
 /// Lineage facts stamped on every event, named so call sites cannot swap the

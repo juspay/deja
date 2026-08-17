@@ -19,15 +19,17 @@
 //! task lineage, and Skip-gate verdict ONCE into a single `SpanContext`
 //! extension. That is the only extension *write*, once per span.
 //!
-//! The per-poll hot path is a brief extension *read* plus thread-local cursor
-//! writes: `on_enter` sets the path and lineage cursors to this span's values;
-//! `on_exit` restores them from the span PARENT via `ctx`. The payloads are
-//! `Arc`, so a poll bracket moves no heap. Correlation is entered into
-//! deja-context only when it CHANGES from the thread's current value (≈once per
-//! request), saving the previous value so a spawned task polled on a fresh worker
-//! reverts to nothing rather than to its parent. Because an `Instrumented` future
-//! enters/exits its span on every poll, the cursors are re-established per-poll on
-//! whichever worker thread polls the task — correct under work-stealing.
+//! The per-poll hot path is a brief extension *read* plus a push/pop on a
+//! thread-local stack of ENTERED spans: `on_enter` pushes this span's path and
+//! lineage tagged with its span id, `on_exit` removes the frame that span's own
+//! enter pushed. The payloads are `Arc`, so a poll bracket moves no heap.
+//! Correlation follows the same discipline through `CORRELATION_RESTORE`,
+//! differing only in that it is entered into deja-context on a CHANGE (≈once per
+//! request) rather than once per span. Every cursor therefore reverts to the value
+//! the thread held BEFORE the enter — which for a spawned task polled on a fresh
+//! worker is nothing at all. Because an `Instrumented` future enters/exits its
+//! span on every poll, the cursors are re-established per-poll on whichever worker
+//! thread polls the task — correct under work-stealing.
 
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -71,18 +73,40 @@ struct SpanContext {
 /// purely from the span tree instead of `spawn_detached`.
 const FORK_FIELD: &str = "deja.fork";
 
-thread_local! {
-    /// The full logical span-path active on this thread. `on_enter` sets it to the
-    /// entered span's path; `on_exit` restores it from the span parent. This is the
-    /// SOURCE for the `SpanPath` address: same-callsite calls in DISTINCT spans get
-    /// distinct paths → distinct occurrence buckets, fixing the positional
-    /// `occurrence` swap async interleaving otherwise causes.
-    static CURRENT_PATH: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
+/// One entered span's cursor values, tagged with the span that owns them.
+///
+/// The tag is the whole point. These were two bare cells that `on_exit` reset from
+/// the span TREE PARENT — which answers "who encloses this span", not "what did
+/// this thread hold before entering it". Those differ exactly when a span is
+/// entered without its parent entered, the spawned-task case this layer exists to
+/// serve: the parent is not on this thread at all, so the reset left the previous
+/// request's path and bucket standing for every boundary that fired on that worker
+/// until the next enter. Owning each frame by span id makes the pop exact, and
+/// makes absence observable — an empty stack means no span is entered, which is
+/// what [`current_span_path`]'s documented `None` always claimed to mean and
+/// nothing enforced.
+struct SpanCursor {
+    /// The span whose `on_enter` pushed this frame; only that span's `on_exit`
+    /// removes it.
+    span_id: u64,
+    /// Full logical span-path root→leaf, from the owning span's `SpanContext`.
+    path: Arc<str>,
+    /// Task lineage of the owning span.
+    lineage: Arc<crate::TaskLineage>,
+}
 
-    /// The task lineage active on this thread, same set/restore-from-parent shape
-    /// as `CURRENT_PATH`. `None` means the root region.
-    static CURRENT_LINEAGE: RefCell<Option<Arc<crate::TaskLineage>>> =
-        const { RefCell::new(None) };
+thread_local! {
+    /// The spans ENTERED on this thread, innermost last. This is the SOURCE for the
+    /// `SpanPath` address and the task lineage: same-callsite calls in DISTINCT
+    /// spans get distinct paths → distinct occurrence buckets, fixing the positional
+    /// `occurrence` swap async interleaving otherwise causes.
+    ///
+    /// One door in each direction, and nothing else may touch this cell: written
+    /// only by `push_span_cursor` / `pop_span_cursor`, read only by
+    /// `with_current_cursor`. An unchecked read is what the previous shape made
+    /// writable, so the rule is enforced at the source level by
+    /// `tests/span_cursor_invariant.rs` rather than left to review.
+    static ENTERED_SPANS: RefCell<Vec<SpanCursor>> = const { RefCell::new(Vec::new()) };
 
     /// The correlation this layer has entered into deja-context on this thread,
     /// compared against each span's engaged correlation so the scope is entered
@@ -96,6 +120,41 @@ thread_local! {
     /// Depth ≈ correlation nesting (≈1 per request).
     static CORRELATION_RESTORE: RefCell<Vec<(u64, Option<Arc<str>>)>> =
         const { RefCell::new(Vec::new()) };
+}
+
+/// Push `span_id`'s path and lineage as the innermost entered span. The only
+/// writer that grows the stack.
+fn push_span_cursor(span_id: u64, cx: &SpanContext) {
+    ENTERED_SPANS.with(|stack| {
+        stack.borrow_mut().push(SpanCursor {
+            span_id,
+            path: Arc::clone(&cx.path),
+            lineage: Arc::clone(&cx.lineage),
+        });
+    });
+}
+
+/// Remove the frame `span_id`'s enter pushed, leaving this thread's cursors at
+/// their exact pre-enter value.
+///
+/// Innermost-first, and a no-op when this span has no frame — the same shape as
+/// [`restore_correlation`], and the same shape the registry's own entered-span
+/// stack uses, so a guard dropped out of order removes its own frame rather than a
+/// bystander's.
+fn pop_span_cursor(span_id: u64) {
+    ENTERED_SPANS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(index) = stack.iter().rposition(|frame| frame.span_id == span_id) {
+            stack.remove(index);
+        }
+    });
+}
+
+/// Read the innermost entered span's cursor. The only read path, and it hands out
+/// no value when no span is entered — a caller cannot take a path or a bucket
+/// without that question having been answered.
+fn with_current_cursor<T>(read: impl FnOnce(&SpanCursor) -> T) -> Option<T> {
+    ENTERED_SPANS.with(|stack| stack.borrow().last().map(read))
 }
 
 /// Enter `target` into deja-context only when it differs from what this layer last
@@ -131,7 +190,8 @@ fn restore_correlation(span_id: u64) {
 
 /// The logical span-path currently active on this thread — the entered span NAMES
 /// joined root→leaf with `>` (e.g. `"payments_core>update_trackers"`). `None` when
-/// no span is entered.
+/// no span is entered, and that is now a fact rather than an aspiration: the cursor
+/// lives on a stack of entered spans, so between polls there is nothing to read.
 ///
 /// Read once per boundary call at `CallsiteIdentity` build time, on BOTH record and
 /// replay (the layer is registered in both modes). The path is a rank-2 address that
@@ -161,16 +221,23 @@ fn restore_correlation(span_id: u64) {
 ///    and IS disambiguated.
 #[must_use]
 pub fn current_span_path() -> Option<String> {
-    CURRENT_PATH.with(|cell| cell.borrow().as_ref().map(|path| path.to_string()))
+    with_current_cursor(|cursor| cursor.path.to_string())
 }
 
-/// The task lineage active on this thread, derived from the entered span tree —
-/// the span-based replacement for the `CURRENT_TASK_LINEAGE` task-local. Returns
-/// the root region's lineage when no lineage-bearing span is entered.
-pub(crate) fn current_span_lineage() -> crate::TaskLineage {
-    CURRENT_LINEAGE
-        .with(|cell| cell.borrow().as_ref().map(|lineage| (**lineage).clone()))
-        .unwrap_or_else(crate::TaskLineage::root)
+/// The task lineage of the innermost span entered on this thread, derived from the
+/// entered span tree — the span-based replacement for the `CURRENT_TASK_LINEAGE`
+/// task-local.
+///
+/// `None` when NO span is entered, which is deliberately not the same answer as the
+/// root region. The root region is a lineage a span actually carries; `None` means
+/// this boundary is outside every instrumented scope and owns no bucket at all. The
+/// distinction has to survive to the caller, because a bucket is not an inert label
+/// — the scorer excuses a value divergence as an unordered race when two events'
+/// buckets differ (`divergence::unordered_distinct_lineage`), so a borrowed bucket
+/// writes a real regression off. A caller that must name a bucket anyway chooses
+/// its fallback in the open; see [`crate::current_task_lineage`].
+pub(crate) fn current_span_lineage() -> Option<crate::TaskLineage> {
+    with_current_cursor(|cursor| (*cursor.lineage).clone())
 }
 
 /// Tracing layer mirroring the ingress `request_id` span field into deja-context.
@@ -301,27 +368,22 @@ where
             return;
         };
 
-        CURRENT_PATH.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&cx.path)));
-        CURRENT_LINEAGE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&cx.lineage)));
+        push_span_cursor(id.into_u64(), &cx);
 
         // Engage the correlation scope unless the ingress sampled this request out.
         let engaged = cx.observe.then(|| cx.correlation.clone()).flatten();
         engage_correlation(id.into_u64(), engaged);
     }
 
-    fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
-        // Restore the path and lineage cursors from the span PARENT (clear at root).
-        let parent = ctx
-            .span(id)
-            .and_then(|span| span.parent())
-            .and_then(|parent| parent.extensions().get::<SpanContext>().cloned());
-        CURRENT_PATH.with(|cell| {
-            *cell.borrow_mut() = parent.as_ref().map(|c| Arc::clone(&c.path));
-        });
-        CURRENT_LINEAGE.with(|cell| {
-            *cell.borrow_mut() = parent.as_ref().map(|c| Arc::clone(&c.lineage));
-        });
-
+    /// Revert everything this span's enter established, addressed by span id.
+    ///
+    /// No span-tree lookup: `ctx` can name this span's PARENT, but the parent is
+    /// not what the thread held before the enter, and the two differ precisely in
+    /// the case this layer exists for — a task span polled on a worker that never
+    /// entered its parent. Popping the frame this span pushed is the only question
+    /// with a correct answer in both cases.
+    fn on_exit(&self, id: &Id, _ctx: Context<'_, S>) {
+        pop_span_cursor(id.into_u64());
         restore_correlation(id.into_u64());
     }
 }
@@ -458,15 +520,23 @@ mod tests {
     }
 
     #[test]
-    fn spawned_child_entered_without_parent_engages_then_reverts_correlation() {
+    fn spawned_child_entered_without_parent_reverts_every_cursor() {
         // A task span polled on a fresh worker: its parent (the request root) is in
         // the span tree but NOT entered on this thread. Entering the child engages
-        // its inherited correlation and exposes the full-ancestry path. On exit the
-        // two cursors deliberately differ: CORRELATION reverts faithfully to nothing
-        // (a stale correlation would attribute a later boundary to the wrong
-        // request), while PATH/LINEAGE restore from the tree parent (a cheap cursor
-        // whose between-poll value is never read — boundaries read only within a
-        // span, and the next poll's enter overwrites it).
+        // its inherited correlation and exposes the full-ancestry path — the path is
+        // resolved from the span TREE at creation, so having never entered the parent
+        // costs nothing while the child is entered. On exit all three cursors revert
+        // to what this thread held before, which is nothing: the worker is now free
+        // for unrelated work, and that work must not be stamped with this request's
+        // address or bucket.
+        //
+        // The path assertion used to run the other way — `Some("deja::http_incoming")`
+        // — justified as a cheap cursor whose between-poll value is never read.
+        // Nothing enforced that. Four readers took it with no check that a span was
+        // entered (`CallsiteIdentity.span_path` on both record and replay, and
+        // `current_task_metadata` on the lineage side), so the leaked value became a
+        // rank-2 `SpanPath` address the caller did not own and a lineage bucket the
+        // scorer read as evidence of an unordered race.
         let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
         tracing::subscriber::with_default(subscriber, || {
             let root = tracing::info_span!("deja::http_incoming", request_id = "req-spawn");
@@ -477,6 +547,7 @@ mod tests {
             // Root has been exited; nothing is entered on this thread.
             assert_eq!(current_correlation_id(), None);
             assert_eq!(current_span_path(), None);
+            assert!(current_span_lineage().is_none());
             {
                 let _child = child.enter();
                 assert_eq!(current_correlation_id().as_deref(), Some("req-spawn"));
@@ -484,11 +555,22 @@ mod tests {
                     current_span_path().as_deref(),
                     Some("deja::http_incoming>spawned_work")
                 );
+                assert!(
+                    current_span_lineage().is_some(),
+                    "an entered span always resolves a lineage"
+                );
             }
             // Correlation reverts faithfully to None (not the parent's "req-spawn").
             assert_eq!(current_correlation_id(), None);
-            // Path is a parent-restored cursor, so it holds the tree parent here.
-            assert_eq!(current_span_path().as_deref(), Some("deja::http_incoming"));
+            assert_eq!(
+                current_span_path(),
+                None,
+                "the tree parent is not entered on this thread, so no path is active"
+            );
+            assert!(
+                current_span_lineage().is_none(),
+                "and no bucket either — the next boundary here owns neither"
+            );
         });
     }
 
@@ -503,14 +585,14 @@ mod tests {
             let root = tracing::info_span!("deja::http_incoming", request_id = "req-fork");
             let _root = root.enter();
             // The synchronous request path stays in the root bucket.
-            let base = current_span_lineage();
+            let base = entered_lineage();
             assert_eq!(base.bucket_id, crate::ROOT_TASK_ID);
             assert_eq!(base.fork_seq, 0);
 
             {
                 let fork = crate::fork_span();
                 let _fork = fork.enter();
-                let forked = current_span_lineage();
+                let forked = entered_lineage();
                 assert!(
                     forked.bucket_id.contains("::fork-"),
                     "fork bucket must carry the marker, got {:?}",
@@ -523,11 +605,249 @@ mod tests {
                 // unordered region propagates down the span tree.
                 let child = tracing::info_span!("inside_fork");
                 let _child = child.enter();
-                assert_eq!(current_span_lineage().bucket_id, forked.bucket_id);
+                assert_eq!(entered_lineage().bucket_id, forked.bucket_id);
             }
 
             // Fork popped LIFO → back to the synchronous root bucket.
-            assert_eq!(current_span_lineage().bucket_id, crate::ROOT_TASK_ID);
+            assert_eq!(entered_lineage().bucket_id, crate::ROOT_TASK_ID);
+        });
+    }
+
+    /// The lineage of the span entered right now. Every call site below is inside
+    /// an entered span, so `None` there is a failure of the test's own premise and
+    /// says so rather than silently degrading to the root region.
+    fn entered_lineage() -> crate::TaskLineage {
+        current_span_lineage().expect("a span is entered")
+    }
+
+    /// The pair of cursors as a boundary would observe them, in the two forms that
+    /// actually reach a tape: the rank-2 span-path address and the lineage bucket.
+    fn observed_cursors() -> (Option<String>, Option<String>) {
+        (
+            current_span_path(),
+            current_span_lineage().map(|lineage| lineage.bucket_id),
+        )
+    }
+
+    #[test]
+    fn an_entered_span_still_resolves_its_own_path_and_lineage() {
+        // The counterweight, and the more dangerous direction to get wrong. Making
+        // the cursors revert honestly must not make a NORMAL boundary stop resolving
+        // a span path: `addresses_for` simply omits rank-2 when the path is `None`
+        // (replay.rs), so an over-tightened cursor demotes every lookup to a weaker
+        // address with no error at any layer, surfacing much later as unexplained
+        // divergences. Both shapes must keep FULL ancestry — the synchronous nesting
+        // the request middleware produces, and the spawned task polled on a worker
+        // that never entered the parent.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-live");
+            let detached = {
+                let _root = root.enter();
+                // Minted under the root, as `.in_current_span()` does at a spawn site.
+                let detached = tracing::info_span!("spawned_work");
+
+                let inner = tracing::info_span!("update_trackers");
+                let _inner = inner.enter();
+
+                // Synchronous nesting: root→leaf, and a lineage is resolved.
+                let (path, bucket) = observed_cursors();
+                assert_eq!(
+                    path.as_deref(),
+                    Some("deja::http_incoming>update_trackers"),
+                    "an in-span boundary keeps its rank-2 address"
+                );
+                assert_eq!(bucket.as_deref(), Some(crate::ROOT_TASK_ID));
+
+                detached
+            };
+
+            // Same question for the case the layer exists to serve: entered alone,
+            // on a thread holding nothing, the path is still the full ancestry.
+            let _detached = detached.enter();
+            let (path, bucket) = observed_cursors();
+            assert_eq!(
+                path.as_deref(),
+                Some("deja::http_incoming>spawned_work"),
+                "a task polled without its parent entered still addresses at rank 2"
+            );
+            assert_eq!(bucket.as_deref(), Some(crate::ROOT_TASK_ID));
+        });
+    }
+
+    #[test]
+    fn a_thread_that_served_a_request_resolves_neither_afterwards() {
+        // The defect, stated as the worker lifecycle that produces it: one thread
+        // serves a request, the request finishes, and the thread goes on to serve a
+        // boundary belonging to nobody. Under restore-from-parent it kept the first
+        // request's path and bucket, so that unrelated boundary registered a rank-2
+        // `SpanPath` address it did not own.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            // The last thing this worker does for the earlier request is poll a
+            // spawned task, whose parent is in the span tree but was never entered
+            // here. Restore-from-parent has a tree parent to reach for at that exit
+            // and leaves its path standing, which is the defect; a bare nested span
+            // under an entered root would not exercise it.
+            let spawned = {
+                let first = tracing::info_span!("deja::http_incoming", request_id = "req-earlier");
+                let _first = first.enter();
+                tracing::info_span!("payments_core")
+            };
+            {
+                let _poll = spawned.enter();
+                assert_eq!(
+                    current_span_path().as_deref(),
+                    Some("deja::http_incoming>payments_core"),
+                    "premise: the poll resolves the full ancestry"
+                );
+            }
+
+            assert_eq!(
+                observed_cursors(),
+                (None, None),
+                "the poll is over; a boundary firing here owns no address and no bucket"
+            );
+        });
+    }
+
+    #[test]
+    fn a_finished_fork_leaves_no_bucket_for_the_next_boundary_to_borrow() {
+        // The consumer this protects. `divergence::unordered_distinct_lineage` calls
+        // a value divergence an excusable unordered race when the two events' lineage
+        // buckets merely DIFFER — a mismatch alone returns true, before any span-path
+        // check. So a worker that had just polled a forked task and then stamped an
+        // unrelated boundary with `root::fork-N`, while its replay counterpart stamped
+        // `root`, handed the scorer a manufactured mismatch and wrote a real
+        // regression off.
+        //
+        // Asserted at the producer, on the exact value that reaches that comparison:
+        // `current_task_metadata`'s bucket, once the fork region has been left.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            // `spawn_fork` mints the fork span at the spawn site, under the request
+            // root; tokio polls the task on whatever worker is free, which has not
+            // entered the root. The boundary that matters is one span deeper — work
+            // inside the forked task — because THAT is the exit whose tree parent
+            // carries a fork bucket for restore-from-parent to leave behind.
+            let (inside_fork, forked_bucket) = {
+                let root = tracing::info_span!("deja::http_incoming", request_id = "req-borrow");
+                let _root = root.enter();
+                let fork = crate::fork_span();
+                let _fork = fork.enter();
+                let bucket = entered_lineage().bucket_id;
+                assert!(bucket.contains("::fork-"), "premise: a real fork bucket");
+                (tracing::info_span!("inside_fork"), bucket)
+            };
+
+            // The poll, on a worker holding nothing else.
+            {
+                let _poll = inside_fork.enter();
+                assert_eq!(
+                    entered_lineage().bucket_id,
+                    forked_bucket,
+                    "premise: the poll is genuinely in the fork's unordered region"
+                );
+            }
+
+            // The poll is over and the worker is free.
+            let stamped = crate::current_task_metadata(None);
+            assert_ne!(
+                stamped.bucket_id.as_deref(),
+                Some(forked_bucket.as_str()),
+                "an orphan boundary must not inherit the finished fork's bucket"
+            );
+            assert_eq!(
+                stamped.bucket_id.as_deref(),
+                Some(crate::ROOT_TASK_ID),
+                "it belongs to no fork, so it is ordered against root traffic, not \
+                 excused against it"
+            );
+            assert_eq!(stamped.task_bucket, stamped.bucket_id, "the two agree");
+        });
+    }
+
+    #[test]
+    fn a_balanced_enter_and_exit_leaves_the_cursors_as_it_found_them() {
+        // The invariant the defect violated, stated generically rather than per
+        // shape, so the next author of `on_exit` cannot satisfy it by restoring from
+        // somewhere that merely looks right in the common case. Restore-from-parent
+        // passes this for a span whose parent is entered and fails it for one whose
+        // parent is not — which is the whole finding.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-balance");
+
+            // Shape 1: a root span entered on a bare thread.
+            let before = observed_cursors();
+            let detached = {
+                let _root = root.enter();
+                tracing::info_span!("spawned_work")
+            };
+            assert_eq!(observed_cursors(), before, "root span");
+
+            // Shape 2: a child whose parent is NOT entered — the spawned-task poll.
+            let before = observed_cursors();
+            {
+                let _detached = detached.enter();
+            }
+            assert_eq!(
+                observed_cursors(),
+                before,
+                "child entered without its parent"
+            );
+
+            // Shapes 3 and 4: a nested child and a fork, both under an entered root,
+            // where the pre-enter value is a real value rather than absence.
+            let _root = root.enter();
+            let before = observed_cursors();
+            assert!(before.0.is_some(), "premise: the root is entered");
+            {
+                let inner = tracing::info_span!("payments_core");
+                let _inner = inner.enter();
+            }
+            assert_eq!(observed_cursors(), before, "nested child");
+            {
+                let fork = crate::fork_span();
+                let _fork = fork.enter();
+            }
+            assert_eq!(observed_cursors(), before, "fork boundary");
+        });
+    }
+
+    #[test]
+    fn a_guard_dropped_out_of_order_removes_its_own_frame() {
+        // `Span::enter` guards are RAII but nothing forces them to drop LIFO — a
+        // `Vec<EnteredSpan>` drops in declaration order. The registry's own entered
+        // -span stack removes the matching id from wherever it sits, and the cursor
+        // stack has to agree, or an out-of-order exit would evict a bystander's frame
+        // and leave the thread addressing under a span it had already left.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-order");
+            let _root = root.enter();
+            let outer = tracing::info_span!("outer").entered();
+            let inner = tracing::info_span!("inner").entered();
+            assert_eq!(
+                current_span_path().as_deref(),
+                Some("deja::http_incoming>outer>inner")
+            );
+
+            // Drop the OUTER guard first; `inner` is still entered and still the
+            // innermost frame, so it remains the active address.
+            drop(outer);
+            assert_eq!(
+                current_span_path().as_deref(),
+                Some("deja::http_incoming>outer>inner"),
+                "the innermost entered span is unaffected by a sibling frame leaving"
+            );
+
+            drop(inner);
+            assert_eq!(
+                current_span_path().as_deref(),
+                Some("deja::http_incoming"),
+                "and the root, still entered, is what remains"
+            );
         });
     }
 }
