@@ -894,6 +894,35 @@ mod tests {
         clear_recording_decision(payment);
     }
 
+    /// The same probe that fails against the shipped gate, run against this one.
+    /// A stale decision is physically on the thread, owned by another request.
+    #[test]
+    fn probe_foreign_decision_on_thread_does_not_answer_the_gate() {
+        let payment = "corr-payment";
+        let health = "corr-health";
+
+        set_recording_decision(payment, true);
+        let serving = enter_correlation_id(payment);
+        assert_eq!(
+            recording_decision_for_current(),
+            Some(RecordDecision::Record)
+        );
+        drop(serving);
+        clear_recording_decision(payment);
+
+        // Exactly the state a worker thread is left in: the payment's decision
+        // still present, the thread now serving a health check.
+        CURRENT_RECORDING_DECISION
+            .with(|c| *c.borrow_mut() = Some((payment.to_owned(), RecordDecision::Record)));
+        CURRENT_CONTEXT.with(|c| *c.borrow_mut() = Some(health.to_owned()));
+
+        assert_eq!(
+            recording_decision_for_current(),
+            None,
+            "a decision owned by another correlation must not answer for this one"
+        );
+    }
+
     #[test]
     fn the_samplers_own_read_self_excludes() {
         let correlation_id = "req-sampler-self-exclude";
