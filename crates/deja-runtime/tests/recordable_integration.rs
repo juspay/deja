@@ -8,12 +8,16 @@ use std::sync::Arc;
 use deja_runtime::{read_events, RecordingHook};
 use serde::Serialize;
 
-/// Recording is opt-in: a boundary records only when an explicit `Record`
-/// decision is present for the current context. Enter a decision-only context
-/// (no correlation) so `RecordingHook::mode()` records on this thread; hold the
-/// returned guard until after the recording + `read_events` section.
+/// Recording is opt-in, and a decision only counts for the request it belongs
+/// to: the gate requires a live correlation and reads the decision installed
+/// alongside it. Enter that pair — a correlation carrying `Record` — so
+/// `RecordingHook::capture_verdict()` captures on this thread; hold the returned
+/// guard until after the recording + `read_events` section.
 fn recording_enabled() -> deja_context::ContextGuard {
-    deja_context::enter(deja_context::ContextSnapshot::empty().with_recording_decision(true))
+    deja_context::enter(
+        deja_context::ContextSnapshot::new("req-recordable-integration")
+            .with_recording_decision(true),
+    )
 }
 
 // --- Define a trait using #[deja::recordable] ---
