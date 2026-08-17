@@ -100,10 +100,27 @@ thread_local! {
     /// Thread-visible context read by syscall/preload hooks.
     static CURRENT_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
 
-    /// Per-correlation recording decision captured with the current context.
-    /// `Some(RecordDecision::Skip)` must survive registry cleanup while spawned
-    /// work is still running, so it lives independently of the global decision map.
-    static CURRENT_RECORDING_DECISION: RefCell<Option<RecordDecision>> = const { RefCell::new(None) };
+    /// The recording decision on this thread, **and the correlation it belongs
+    /// to**. `Some(RecordDecision::Skip)` must survive registry cleanup while
+    /// spawned work is still running, so it lives independently of the global
+    /// decision map.
+    ///
+    /// The owner is stored rather than implied, and that is load-bearing. This
+    /// cell was once a bare `Option<RecordDecision>` documented as
+    /// per-correlation while carrying no correlation, so a reader wanting to
+    /// know whether the decision was its own had nothing to compare against and
+    /// had to reconstruct the owner from thread state — the same thread state
+    /// that had already moved on. A guard written that way compared a value
+    /// derived from `current_correlation_id()` against `current_correlation_id()`
+    /// and was unconditionally true; a build carrying it recorded every health
+    /// check the pod served, because a worker thread applied one request's
+    /// decision to whatever it polled next.
+    ///
+    /// With the owner in the cell there is nothing to reconstruct and nothing to
+    /// get wrong: a reader supplies the correlation it is asking about, and a
+    /// decision belonging to another one is simply not returned.
+    static CURRENT_RECORDING_DECISION: RefCell<Option<(String, RecordDecision)>> =
+        const { RefCell::new(None) };
 
     /// Tokio task currently being polled on this OS thread, if Tokio has called
     /// the runtime task-hook entry point.
@@ -130,8 +147,14 @@ fn set_current_context(snapshot: &ContextSnapshot) {
     CURRENT_CONTEXT.with(|cell| {
         *cell.borrow_mut() = snapshot.correlation_id.clone();
     });
+    // A decision is installed only together with the correlation it speaks for.
+    // A snapshot carrying a decision and no correlation names nobody, so it
+    // installs nothing rather than installing something unattributable.
     CURRENT_RECORDING_DECISION.with(|cell| {
-        *cell.borrow_mut() = snapshot.recording_decision;
+        *cell.borrow_mut() = snapshot
+            .correlation_id
+            .clone()
+            .zip(snapshot.recording_decision);
     });
 }
 
@@ -149,14 +172,33 @@ pub fn current_correlation_id() -> Option<String> {
     CURRENT_CONTEXT.with(|cell| cell.borrow().clone())
 }
 
-fn current_recording_decision() -> Option<RecordDecision> {
-    CURRENT_RECORDING_DECISION.with(|cell| *cell.borrow())
+/// What is physically in the cell, owner and all. Tests only: production code
+/// must name the correlation it is asking about, which is the whole point of
+/// the shape.
+#[cfg(test)]
+fn installed_decision() -> Option<(String, RecordDecision)> {
+    CURRENT_RECORDING_DECISION.with(|cell| cell.borrow().clone())
+}
+
+/// The decision on this thread **if it belongs to `correlation_id`**.
+///
+/// There is no way to ask this question without naming a correlation, which is
+/// the point: the previous shape allowed a caller to take the decision and
+/// decide for itself whether it was entitled to it, and two callers decided
+/// differently.
+fn current_recording_decision_for(correlation_id: &str) -> Option<RecordDecision> {
+    CURRENT_RECORDING_DECISION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(owner, _)| owner == correlation_id)
+            .map(|(_, decision)| *decision)
+    })
 }
 
 /// The recording decision that belongs to `correlation_id`.
 ///
 /// This is the ONE ownership rule. It is the **sole reader** of
-/// [`current_recording_decision`] outside this crate's tests — the capture gate
+/// [`current_recording_decision_for`] outside this crate's tests — the capture gate
 /// ([`recording_decision_for_current`]) and the snapshot constructors
 /// ([`capture_current`], [`ContextSnapshot::new`]) all resolve through here, so
 /// they cannot drift apart. Keep it that way: a second direct read of the
@@ -172,11 +214,13 @@ fn current_recording_decision() -> Option<RecordDecision> {
 /// For any other correlation the answer comes from the correlation-keyed
 /// registry, which cannot be attributed to the wrong request.
 fn snapshot_recording_decision_for(correlation_id: &str) -> Option<RecordDecision> {
-    let current_id_matches = current_correlation_id().as_deref() == Some(correlation_id);
-    if current_id_matches {
-        if let Some(record) = current_recording_decision() {
-            return Some(record);
-        }
+    // Ownership is established by the cell, not by comparing thread state
+    // against itself. The comparison this replaced took the correlation from
+    // `current_correlation_id()` and then asked whether it equalled
+    // `current_correlation_id()`, which is a tautology — so the thread-local was
+    // returned to whoever asked, regardless of whose it was.
+    if let Some(record) = current_recording_decision_for(correlation_id) {
+        return Some(record);
     }
     recording_decision(correlation_id)
 }
@@ -253,7 +297,7 @@ pub fn set_recording_decision(
     }
     if current_correlation_id().as_deref() == Some(correlation_id.as_str()) {
         CURRENT_RECORDING_DECISION.with(|cell| {
-            *cell.borrow_mut() = Some(decision);
+            *cell.borrow_mut() = Some((correlation_id.clone(), decision));
         });
     }
 }
@@ -560,9 +604,10 @@ mod tests {
         {
             let _guard = enter(ContextSnapshot::empty().with_recording_decision(false));
             assert_eq!(current_correlation_id(), None);
-            // Installed on the thread, exactly as before...
-            assert_eq!(current_recording_decision(), Some(RecordDecision::Skip));
-            // ...but with no correlation to own it, no reader will use it.
+            // Not installed at all: a decision naming no correlation owns
+            // nothing, so the cell has nowhere to put it. Stronger than
+            // installing it and relying on every reader to decline it.
+            assert_eq!(installed_decision(), None);
             assert_eq!(capture_current().recording_decision(), None);
             assert_eq!(recording_decision_for_current(), None);
             assert!(!gate(), "an orphan boundary must not capture");
@@ -572,7 +617,7 @@ mod tests {
         // Nothing was frozen, so the task inherits no decision either.
         tokio_task_poll_start(task_id);
         assert_eq!(current_correlation_id(), None);
-        assert_eq!(current_recording_decision(), None);
+        assert_eq!(installed_decision(), None);
         assert_eq!(recording_decision_for_current(), None);
         assert!(!gate());
         tokio_task_poll_stop(task_id);
@@ -599,7 +644,11 @@ mod tests {
         // recordings against 4 bucketing decisions.
         let _leaked = enter(ContextSnapshot::empty().with_recording_decision(true));
         assert_eq!(current_correlation_id(), None);
-        assert_eq!(current_recording_decision(), Some(RecordDecision::Record));
+        assert_eq!(
+            installed_decision(),
+            None,
+            "an unowned decision is not installed"
+        );
 
         assert_eq!(
             recording_decision_for_current(),
@@ -621,7 +670,10 @@ mod tests {
         set_recording_decision(owner, true);
 
         let _owner_guard = enter_correlation_id(owner);
-        assert_eq!(current_recording_decision(), Some(RecordDecision::Record));
+        assert_eq!(
+            current_recording_decision_for(owner),
+            Some(RecordDecision::Record)
+        );
         assert!(gate(), "the owner itself still captures");
 
         // Resolving for a different correlation does not borrow the owner's
@@ -709,7 +761,7 @@ mod tests {
         // A `Record` left on the thread with no correlation to own it.
         let _leaked = enter(ContextSnapshot::empty().with_recording_decision(true));
         assert_eq!(current_correlation_id(), None);
-        assert_eq!(current_recording_decision(), Some(RecordDecision::Record));
+        assert_eq!(installed_decision(), None);
 
         let snapshot = capture_current();
         assert_eq!(snapshot.correlation_id(), None);
@@ -804,6 +856,44 @@ mod tests {
     /// self-excludes. Recording being opt-in is what makes that work; this pins
     /// it, because a fix that defaulted an unknown correlation to `Record` would
     /// make the sampler record itself.
+    /// The measured production failure, reduced to the invariant it violated.
+    ///
+    /// A worker thread that had served a sampled request applied that request's
+    /// `Record` to whatever it polled next, so 298 health calls became 298
+    /// recordings behind 4 bucketing decisions. The guard added to stop it
+    /// compared `current_correlation_id()` against a value taken from
+    /// `current_correlation_id()` — a tautology — so a second build did the same.
+    ///
+    /// The invariant underneath both: a decision installed for one correlation
+    /// must not answer for another. It is checkable now only because the cell
+    /// carries its owner; with a bare decision there was nothing to compare.
+    #[test]
+    fn a_decision_installed_for_one_correlation_does_not_answer_for_another() {
+        let payment = "corr-payment";
+        let health = "corr-health";
+
+        set_recording_decision(payment, true);
+        let _serving = enter_correlation_id(payment);
+
+        assert_eq!(
+            installed_decision(),
+            Some((payment.to_owned(), RecordDecision::Record)),
+            "the decision is on the thread, owner and all"
+        );
+        assert_eq!(
+            current_recording_decision_for(payment),
+            Some(RecordDecision::Record),
+            "the request that was selected still records"
+        );
+        assert_eq!(
+            current_recording_decision_for(health),
+            None,
+            "another correlation must not be answered by this one's decision"
+        );
+
+        clear_recording_decision(payment);
+    }
+
     #[test]
     fn the_samplers_own_read_self_excludes() {
         let correlation_id = "req-sampler-self-exclude";
