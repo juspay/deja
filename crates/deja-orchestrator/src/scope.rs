@@ -172,6 +172,16 @@ impl RunScope {
     /// ambient/background traffic is shared across cases and is tolerated by
     /// the scorer rather than attributed to any one of them. Dropping it would
     /// turn shared setup into a per-case omission.
+    ///
+    /// This `true` is also load-bearing for key identity, which is easy to miss
+    /// when weighing a change to it. An uncorrelated event's occurrence counter
+    /// has no correlation to be scoped by, so the ONLY thing keeping its
+    /// numbering stable across runs is that no filter ever omits one: every
+    /// render numbers the same ambient population. Returning `false` here under
+    /// a filter would not merely hide ambient traffic — it would renumber it per
+    /// run, quietly falsifying the key-identity guarantee
+    /// `lookup::render_lookup_table` documents. That is pinned by
+    /// `renderer_keys_of_uncorrelated_events_do_not_depend_on_scope`.
     pub fn contains(&self, correlation_id: Option<&str>) -> bool {
         match (&self.correlations, correlation_id) {
             (Correlations::EntireSession, _) => true,
