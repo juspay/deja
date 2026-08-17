@@ -33,6 +33,16 @@ fn event(global_sequence: u64, graph_node_id: Option<u64>) -> EventRef {
         global_sequence,
         graph_node_id,
         correlation_id_present: graph_node_id.is_some(),
+        counterpart_possible: true,
+    }
+}
+
+/// An event whose boundary the harness drives, so the other side can never
+/// produce a counterpart. It names a node — that is the point of the case.
+fn event_without_counterpart(global_sequence: u64, graph_node_id: Option<u64>) -> EventRef {
+    EventRef {
+        counterpart_possible: false,
+        ..event(global_sequence, graph_node_id)
     }
 }
 
@@ -204,4 +214,116 @@ fn ambient_nodes_form_a_separate_forest_from_named_correlation() {
     assert_eq!(named.nodes[&2].parent_id, None);
     assert!(named.nodes[&2].promoted);
     assert_eq!(named.nodes[&2].events, vec![20]);
+}
+
+// ---------------------------------------------------------------------------
+// Events with no possible counterpart on the other side
+// ---------------------------------------------------------------------------
+
+/// The ingress shape, both sides, as a recording actually carries it: a
+/// `deja::http_incoming` root beside the request tree, holding one event on the
+/// record side that replay structurally cannot have.
+fn ingress_shaped_nodes() -> Vec<ExecutionGraphNode> {
+    vec![
+        node(1, 1, None, Some("request-a"), "deja::http_incoming"),
+        node(2, 2, None, Some("request-a"), "HTTP request"),
+        node(3, 3, Some(2), Some("request-a"), "payments_operation_core"),
+    ]
+}
+
+#[test]
+fn an_event_with_no_possible_counterpart_is_annexed_under_its_own_cause_not_attached() {
+    let events = vec![event_without_counterpart(100, Some(1)), event(200, Some(3))];
+
+    let built = build(&ingress_shaped_nodes(), &events).expect("forest builds");
+    let forest = &built.by_correlation["request-a"];
+
+    assert_eq!(
+        built.annex.no_counterpart_by_construction,
+        vec![100],
+        "the ingress event belongs in its own bucket"
+    );
+    assert!(
+        built.annex.names_no_node.is_empty(),
+        "it named a node, so calling it a capture gap would send a reader \
+         hunting for an instrumentation bug that does not exist"
+    );
+    assert!(built.annex.names_absent_node.is_empty());
+
+    assert!(
+        forest.nodes[&1].events.is_empty(),
+        "annexed means not attached"
+    );
+    assert_eq!(
+        forest.nodes[&1].subtree_events, 0,
+        "the ingress root must roll up to zero, or it stays event-bearing on \
+         the record side alone and the tier demotes on the asymmetry"
+    );
+    assert_eq!(forest.nodes[&2].subtree_events, 1);
+}
+
+#[test]
+fn balance_counts_the_no_counterpart_bucket_and_rejects_a_sequence_duplicated_into_it() {
+    let events = vec![event_without_counterpart(100, Some(1)), event(200, Some(3))];
+    let built = build(&ingress_shaped_nodes(), &events).expect("forest builds");
+
+    // The bucket is counted, so the set balances rather than reading as a drop.
+    assert_eq!(built.balance(2), Ok(()));
+
+    // And it is in the uniqueness chain. A sequence that is both attached and
+    // annexed must fail, or a double-counted event balances by arithmetic while
+    // being scored twice.
+    let mut duplicated = built.clone();
+    duplicated.annex.no_counterpart_by_construction.push(200);
+    assert_eq!(
+        duplicated.balance(3),
+        Err(BuildError::Imbalanced {
+            events_in: 3,
+            attached: 1,
+            annexed: 2,
+        }),
+        "a sequence in two places at once must be refused, not silently tolerated"
+    );
+}
+
+#[test]
+fn a_zero_event_ingress_root_is_absent_from_the_alignment_on_both_sides() {
+    // Record carries the ingress event; replay cannot. This is exactly the
+    // asymmetry that demoted all 78 correlations on run
+    // rp-sbx-1ed5b454b7-1ed5b45-08171332-8j-0817194832193.
+    let record = build(
+        &ingress_shaped_nodes(),
+        &[event_without_counterpart(100, Some(1)), event(200, Some(3))],
+    )
+    .expect("record forest builds");
+    let replay =
+        build(&ingress_shaped_nodes(), &[event(200, Some(3))]).expect("replay forest builds");
+
+    let record_forest = &record.by_correlation["request-a"];
+    let replay_forest = &replay.by_correlation["request-a"];
+
+    // Both ingress roots roll up to zero, so neither survives skeleton pruning.
+    assert_eq!(record_forest.nodes[&1].subtree_events, 0);
+    assert_eq!(replay_forest.nodes[&1].subtree_events, 0);
+
+    let alignment = deja_forest::align(record_forest, replay_forest);
+
+    assert!(
+        !alignment
+            .nodes
+            .iter()
+            .any(|row| row.span_name == "deja::http_incoming"),
+        "a zero-event ingress root must not reach the alignment at all — not as \
+         a match, and above all not as a PrunedSubtree, which is the finding \
+         that relaxing the gate alone would have produced: {:#?}",
+        alignment.nodes
+    );
+    assert!(
+        alignment
+            .nodes
+            .iter()
+            .any(|row| row.span_name == "HTTP request"
+                && matches!(row.outcome, deja_forest::NodeOutcome::Matched)),
+        "the request tree still pairs 1:1"
+    );
 }

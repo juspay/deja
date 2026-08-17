@@ -74,6 +74,26 @@ fn is_nonblocking_boundary(boundary: &str) -> bool {
     tier_for(boundary) == Tier::Pure || boundary == "http_incoming"
 }
 
+/// Whether replay is *incapable* of producing a counterpart for this boundary,
+/// however faithfully the candidate behaves.
+///
+/// Only `http_incoming` qualifies. The kernel re-drives the request itself, so
+/// the replay hook is never asked to resolve that boundary and no `ObservedCall`
+/// is ever emitted for it — see the skip in `lookup::render`. Every other
+/// boundary produces an observation on replay, hit or miss.
+///
+/// **Do not reach for [`is_nonblocking_boundary`] here**, however close it
+/// looks. That predicate answers a scoring question — may an unconsumed recorded
+/// call block the verdict — and its `Tier::Pure` half covers entropy seams,
+/// which are *substituted* on replay and therefore very much do have
+/// counterparts. The two predicates agree on `http_incoming` and nowhere else.
+/// Merging them would route every `time` / `id` / `uuid` / `rng` event into the
+/// annex and strip the highest-volume events we capture out of both graphs, with
+/// the accounting balancing perfectly the whole way.
+fn lacks_replay_counterpart_by_construction(boundary: &str) -> bool {
+    boundary == "http_incoming"
+}
+
 /// Whether an unconsumed recorded call is a BLOCKING omission — the candidate
 /// failing to do something the recording says it did.
 ///
@@ -577,6 +597,9 @@ impl GraphScoringPlan {
                         global_sequence: event.global_sequence,
                         graph_node_id: event.graph_node_id,
                         correlation_id_present: true,
+                        counterpart_possible: !lacks_replay_counterpart_by_construction(
+                            &event.boundary,
+                        ),
                     })
                     .collect();
                 deja_forest::build(&nodes, &events).inspect(|set| {
@@ -597,10 +620,19 @@ impl GraphScoringPlan {
                 .filter(|(_, observed)| {
                     observed.correlation_id.as_deref() == Some(correlation_id.as_str())
                 })
+                // Symmetrical with the record side on purpose. Replay never
+                // emits an `http_incoming` observation at all, so this filter
+                // is expected to match nothing here — but the two sides must
+                // classify by the same rule, or a future boundary that does
+                // reach both would be annexed on one side and attached on the
+                // other, which is the asymmetry this whole change removes.
                 .map(|(index, observed)| deja_forest::EventRef {
                     global_sequence: index as u64,
                     graph_node_id: observed.graph_node_id,
                     correlation_id_present: true,
+                    counterpart_possible: !lacks_replay_counterpart_by_construction(
+                        &observed.boundary,
+                    ),
                 })
                 .collect();
             let replay_build = deja_forest::build(&replay_nodes, &replay_events).inspect(|set| {
@@ -646,12 +678,18 @@ impl GraphScoringPlan {
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
                 .map(|set| {
-                    set.annex
-                        .names_no_node
-                        .iter()
-                        .chain(&set.annex.names_absent_node)
-                        .copied()
-                        .collect()
+                    // Every annexed event is scored by the flat tier — it has no
+                    // node, so the graph tier has nothing to say about it. That
+                    // includes the by-construction bucket: `http_incoming` is
+                    // already `is_nonblocking_boundary`, so it is a tolerated
+                    // omission there rather than a finding.
+                    //
+                    // Through `annexed_sequences` rather than a chain of its
+                    // own, and this is the reason the method exists: a bucket
+                    // left out here is annexed, balances, and is then scored by
+                    // nobody. `build` and `balance` shout about a bucket they do
+                    // not know; this path would say nothing at all.
+                    set.annex.annexed_sequences().collect()
                 })
                 .unwrap_or_default();
             let flat_replay_events: HashSet<usize> = replay_build
@@ -659,10 +697,8 @@ impl GraphScoringPlan {
                 .ok()
                 .map(|set| {
                     set.annex
-                        .names_no_node
-                        .iter()
-                        .chain(&set.annex.names_absent_node)
-                        .map(|index| *index as usize)
+                        .annexed_sequences()
+                        .map(|index| index as usize)
                         .collect()
                 })
                 .unwrap_or_default();
