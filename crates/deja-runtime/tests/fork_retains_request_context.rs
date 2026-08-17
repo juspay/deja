@@ -119,13 +119,24 @@ fn a_detached_tail_of_a_sampled_out_request_still_does_not_capture() {
     assert_eq!(
         saw,
         TailSaw {
-            correlation_id: Some("fork-retains-skip".to_owned()),
+            correlation_id: None,
             captures: false,
         },
-        "carrying the decision must carry an explicit Skip just as faithfully as \
-         a Record — this is the guard against the fix becoming a way to record \
-         what the sampler excluded",
+        "a sampled-out request must not start capturing because its tail now \
+         carries context — this is the guard against the fix becoming a way to \
+         record what the sampler excluded",
     );
+
+    // Worth stating, because the absent correlation looks like a second defect
+    // and is not one. A sampled-out request never engages its correlation at
+    // all: `DejaCorrelationLayer::on_enter` engages only when the span's
+    // `observe` is true, and an explicit `Skip` makes it false. So inside the
+    // request there is no ambient correlation for `capture_current` to freeze,
+    // and the tail inherits nothing rather than inheriting a `Skip`.
+    //
+    // That is a STRONGER guarantee than carrying the Skip would be: the tail
+    // cannot resolve the correlation, so no boundary it crosses can key against
+    // that request even if a decision appeared from somewhere else.
 }
 
 #[test]
