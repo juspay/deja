@@ -915,6 +915,16 @@ fn has_event_bearing_cycle(forest: &ActivationForest) -> bool {
         .map(|id| (id, 0_usize))
         .collect();
     for (&id, node) in &forest.nodes {
+        // Both ends must be event-bearing, exactly as the child pass above
+        // requires. `parent_indegrees` is keyed by `event_nodes` alone, so
+        // counting an edge whose child is eventless looks up a key that was
+        // never inserted. That is not a rare shape: `subtree_events` rolls up,
+        // so an eventless leaf under an event-bearing parent is the ordinary
+        // case, and this pass is only ever asked whether the event-bearing
+        // subgraph contains a cycle.
+        if !event_nodes.contains(&id) {
+            continue;
+        }
         let Some(parent) = node.parent_id.filter(|parent| event_nodes.contains(parent)) else {
             continue;
         };
@@ -1407,6 +1417,36 @@ mod structural_alignment_tests {
 
         assert!(alignment.nodes.is_empty());
         assert_eq!(alignment.flat_tier_events, vec![10, 11]);
+    }
+
+    #[test]
+    fn an_eventless_child_of_an_event_bearing_parent_is_not_a_cycle() {
+        // The ordinary shape of every real tree, and it used to abort the run.
+        // `subtree_events` rolls up, so a leaf holding no events of its own
+        // under a parent that holds some is unremarkable — 12,032 nodes of a
+        // real recording are mostly this. Cycle detection keyed its parent-pass
+        // indegree map by event-bearing nodes alone but counted an edge for
+        // any child of an event-bearing parent, so the first such pair panicked
+        // with "event-bearing node has an indegree".
+        //
+        // Unreachable until now: `align` runs only when the tier is not
+        // demoted, and every correlation was demoting at the ingress gate.
+        let record = forest(
+            &[1],
+            vec![
+                node(1, None, "request", &[2], &[10], 1),
+                node(2, Some(1), "eventless_leaf", &[], &[], 0),
+            ],
+        );
+
+        let alignment = align(&record, &ActivationForest::default());
+
+        assert_eq!(alignment.nodes.len(), 1);
+        assert_eq!(alignment.nodes[0].record_node, Some(1));
+        assert!(matches!(
+            alignment.nodes[0].outcome,
+            NodeOutcome::PrunedSubtree { events_below: 1 }
+        ));
     }
 }
 
