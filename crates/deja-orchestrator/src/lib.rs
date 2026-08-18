@@ -171,6 +171,14 @@ pub struct RunSpec {
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,
+    /// Span-name prefixes (e.g. `["ucs::", "connector::"]`) whose spans are the
+    /// candidate's DECLARED instrumentation contract: on replay, every recorded
+    /// span under one of these prefixes must be executed again (and with the
+    /// same field values), event-bearing or not. Empty = no shape check — the
+    /// scorecard stays byte-identical, so systems that never declare a
+    /// namespace (hyperswitch) are untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_span_namespaces: Vec<String>,
 }
 
 impl RunSpec {
@@ -255,6 +263,8 @@ pub struct RunParams {
     pub correlation_filter: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub workload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_span_namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expectation: Option<String>,
 }
@@ -273,6 +283,7 @@ impl RunParams {
                 .ids()
                 .map(|ids| ids.iter().cloned().collect()),
             workload: spec.resolved_workload(),
+            scored_span_namespaces: spec.scored_span_namespaces.clone(),
             expectation: expectation.map(str::to_owned),
         }
     }
@@ -904,6 +915,7 @@ mod run_params_tests {
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,
             candidate_spec: CandidateSpec::PrebuiltImage {

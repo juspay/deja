@@ -658,6 +658,7 @@ mod tests {
         let run = Run {
             run_id: "run-42".into(),
             spec: crate::RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: crate::CandidateSpec::PrebuiltImage {

@@ -191,7 +191,31 @@ export type Scorecard = {
     http_status_match?: boolean;
     http_body_match?: boolean;
     side_effect_divergences?: number;
+    // The scored-span shape section: present only when the run declared
+    // `scored_span_namespaces` and this correlation carries namespaced spans.
+    span_shape?: CorrelationSpanShape;
   }[];
+};
+
+/** One scored span occurrence from the span-shape check (see the scorer's
+ * `span_shape` module): the run's declared instrumentation contract, compared
+ * recorded-vs-replayed outside the event-bearing skeleton. */
+export type SpanShapeOutcome = {
+  path: string;
+  span_name: string;
+  k: number;
+  status: "matched" | "missing" | "novel" | "field_diverged";
+  record_node_id?: number;
+  replay_node_id?: number;
+  field_diffs?: { key: string; recorded?: unknown; replayed?: unknown }[];
+};
+
+export type CorrelationSpanShape = {
+  matched: number;
+  missing: number;
+  novel: number;
+  field_diverged: number;
+  outcomes: SpanShapeOutcome[];
 };
 
 // One side (recorded or observed) of a reconciled boundary call.

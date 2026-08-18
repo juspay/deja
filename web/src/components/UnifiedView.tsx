@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api, CallRecord, HttpDiff, Scorecard } from "../lib/api";
+import { api, CallRecord, HttpDiff, Scorecard, SpanShapeOutcome } from "../lib/api";
 import {
   ancestorKeys,
   buildSpine,
@@ -34,9 +34,12 @@ import { ConfidenceBadge, levelForRank } from "./Confidence";
 const MARK_LABEL: Record<Mark, string> = {
   origin: "origin",
   consequence: "consequence",
+  "field-diff": "field diff",
   response: "response",
   omitted: "omitted",
+  "missing-span": "missing span",
   novel: "novel",
+  "novel-span": "novel span",
   environmental: "environmental",
   matched: "matched",
 };
@@ -568,9 +571,17 @@ export default function UnifiedView({
   const https = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId) });
   const graph = useQuery({ queryKey: ["graph", runId], queryFn: () => api.graph(runId) });
 
+  // The scored-span contract sections, keyed by correlation, for the graft.
+  const spanShapes = React.useMemo(() => {
+    const m = new Map<string, SpanShapeOutcome[]>();
+    for (const c of scorecard?.per_correlation ?? [])
+      if (c.span_shape?.outcomes?.length) m.set(c.correlation_id, c.span_shape.outcomes);
+    return m;
+  }, [scorecard]);
+
   const model = React.useMemo(
-    () => buildSpine(calls.data ?? [], graph.data, https.data ?? []),
-    [calls.data, graph.data, https.data],
+    () => buildSpine(calls.data ?? [], graph.data, https.data ?? [], spanShapes),
+    [calls.data, graph.data, https.data, spanShapes],
   );
 
   const boundaryNotes = React.useMemo(() => {

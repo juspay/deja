@@ -1283,7 +1283,12 @@ fn write_record_graph_nodes(
 /// publish a partial graph as if it were whole — is kept: nothing is
 /// published, and the absence explains itself in the run's own record instead
 /// of on a dead stderr.
-fn extract_record_graph(
+///
+/// `pub` for the out-of-tree dev bridge (prism's `replay-dev.sh`), which
+/// prepares a run root by hand and needs the record graph laid down the same
+/// way the in-pod runner does — without it, every dev run scores flat
+/// (`missing_forest`) and the graph tier never engages locally.
+pub fn extract_record_graph(
     root: &HarnessRoot,
     run: &Run,
     recording_id: &str,
@@ -5787,6 +5792,7 @@ mod tests {
         Run {
             run_id: "r1".into(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: RunMode::Record,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
@@ -5857,6 +5863,7 @@ mod tests {
         Run {
             run_id: "run-backstop".into(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
@@ -6584,6 +6591,7 @@ mod tests {
         let run = Run {
             run_id: run_id.to_owned(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage {

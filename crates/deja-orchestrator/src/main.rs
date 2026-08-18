@@ -1531,6 +1531,7 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: deja_orchestrator::CandidateSpec::PrebuiltImage {
