@@ -286,7 +286,7 @@ pub(crate) fn build_with_inconclusive(
         if !obs.resolved
             && obs.provenance == deja::Provenance::Shadow
             && obs.correlation_id.is_some()
-            && !is_nonblocking_boundary(&obs.boundary)
+            && !is_nonblocking_boundary(&obs.boundary, obs.role.as_deref())
             && tier_for(&obs.boundary) != Tier::Environmental
         {
             if let Some(twin) = recorded_pairing.take_twin(obs, &consumed) {
@@ -383,7 +383,7 @@ pub(crate) fn build_with_inconclusive(
             (if recovered { "recovered" } else { "matched" }, false)
         } else if tier_for(&obs.boundary) == Tier::Environmental {
             ("environmental", false)
-        } else if is_nonblocking_boundary(&obs.boundary) {
+        } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
             ("deterministic", false)
         } else if obs.correlation_id.is_none() {
             // uncorrelated background-task novel call — tolerated in V1
@@ -419,7 +419,11 @@ pub(crate) fn build_with_inconclusive(
         .collect();
     omitted.sort_by_key(|e| e.global_sequence);
     for ev in omitted {
-        let blocking = omission_is_blocking(ev.correlation_id.as_deref(), &ev.boundary);
+        let blocking = omission_is_blocking(
+            ev.correlation_id.as_deref(),
+            &ev.boundary,
+            ev.role.as_deref(),
+        );
         rows.push(CallRecord {
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
@@ -579,6 +583,7 @@ pub(crate) fn build_with_plan(
                             blocking: omission_is_blocking(
                                 event.correlation_id.as_deref(),
                                 &event.boundary,
+                                event.role.as_deref(),
                             ),
                             origin: false,
                             resolved_rank: None,
@@ -601,7 +606,7 @@ pub(crate) fn build_with_plan(
                             method_name: call.method_name.clone(),
                             kind: "novel_subtree".to_owned(),
                             blocking: tier_for(&call.boundary) != Tier::Environmental
-                                && !is_nonblocking_boundary(&call.boundary),
+                                && !is_nonblocking_boundary(&call.boundary, call.role.as_deref()),
                             origin: false,
                             resolved_rank: call.resolved_rank,
                             recorded: None,
@@ -830,6 +835,7 @@ mod tests {
             entropy_source: None,
             replay_strategy: deja::ReplayStrategy::default(),
             kind: None,
+            role: None,
             declaration: None,
             raw_draw: None,
             end_timestamp_ns: None,
@@ -846,6 +852,7 @@ mod tests {
         ObservedCall {
             correlation_id: corr.map(str::to_owned),
             boundary: boundary.to_owned(),
+            role: None,
             trait_name: "T".to_owned(),
             method_name: "m".to_owned(),
             args: serde_json::json!({"obs": true}),
