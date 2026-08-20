@@ -671,17 +671,13 @@ fn drive_replay(
     // build cache. The parallel runner builds the replay image ONCE up front and
     // sets DEMO_REPLAY_NO_BUILD=1, so isolated runs reuse it instead of rebuilding.
     let build = run.candidate_image.is_none() && std::env::var("DEMO_REPLAY_NO_BUILD").is_err();
-    // The replay service is named after the system under test: the default
-    // system keeps the existing `hyperswitch-replay` service; another system
-    // (e.g. prism) is `<system>-replay` in its own compose overlay.
-    let replay_service = format!("{}-replay", run.spec.system());
     compose_up(
         demo,
         ctx,
         "starting replay router (DEJA_MODE=replay)",
         &recording_id,
         &run.run_id,
-        &[replay_service.as_str()],
+        &["hyperswitch-replay"],
         build,
         &[],
     )?;
@@ -709,34 +705,27 @@ fn drive_replay(
     // run wrote → short-circuits → "merchant already exists" / UR_15). The
     // in-memory moka cache is already fresh per replay process; only redis carries
     // record's writes over.
-    // Store preparation (redis flush + seed materialization) belongs to the
-    // DEFAULT system's stateful demo overlay. A stateless system under test
-    // (prism: no pg/redis of its own — every store crossing is a recorded
-    // boundary) has nothing to flush or seed, and its overlay has no store
-    // services to exec into.
-    if run.spec.system() == crate::DEFAULT_SYSTEM_UNDER_TEST {
-        // Store transport for this run (S1 seam): compose here; the in-pod k8s
-        // runner builds a StoreExec::direct against its sidecars instead.
-        let store = StoreExec::compose(
-            demo.compose_base_args(),
-            demo.compose_env(&recording_id, &run.run_id),
-        );
-        flush_redis(&store)?;
-        // GENERAL SEEDING (replay precondition materialization).
-        // Replay routing is driven by the candidate's explicit per-boundary
-        // declarations plus DEJA_MODE=replay. Seed materialization restores the
-        // recorded preconditions into concrete stores before the replay workload
-        // runs; materialization remains best-effort because scoring can still report
-        // the replay outcome when store seeding is unavailable.
-        let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
-        let seed_certificate_path = root.seed_certificate_path(&run.run_id);
-        // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
-        // publish loop like every other stream artifact. Registering here as well
-        // stored the runner pod's local path verbatim — a row that answered every
-        // read with ENOENT once the pod died — and would now duplicate the row.
-        if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
-            eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
-        }
+    // Store transport for this run (S1 seam): compose here; the in-pod k8s
+    // runner builds a StoreExec::direct against its sidecars instead.
+    let store = StoreExec::compose(
+        demo.compose_base_args(),
+        demo.compose_env(&recording_id, &run.run_id),
+    );
+    flush_redis(&store)?;
+    // GENERAL SEEDING (replay precondition materialization).
+    // Replay routing is driven by the candidate's explicit per-boundary
+    // declarations plus DEJA_MODE=replay. Seed materialization restores the
+    // recorded preconditions into concrete stores before the replay workload
+    // runs; materialization remains best-effort because scoring can still report
+    // the replay outcome when store seeding is unavailable.
+    let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
+    let seed_certificate_path = root.seed_certificate_path(&run.run_id);
+    // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
+    // publish loop like every other stream artifact. Registering here as well
+    // stored the runner pod's local path verbatim — a row that answered every
+    // read with ENOENT once the pod died — and would now duplicate the row.
+    if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
+        eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
     }
     run_kernel(
         &demo.kernel_bin,
@@ -1589,19 +1578,7 @@ pub fn drive_replay_in_pod(
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
     set_stage(root, run, ctx, 3, total, "migrating sidecar pg");
-    // Harness-managed stores belong to the DEFAULT system's profile. A
-    // stateless system under test (prism) has no sidecar pg/redis: every store
-    // crossing is a recorded boundary, so there is nothing to migrate, gate,
-    // flush, or seed — and no sidecar to exec against.
-    let manages_stores = run.spec.system() == crate::DEFAULT_SYSTEM_UNDER_TEST;
     match &opts.migrate_cmd {
-        _ if !manages_stores => ctx.log(
-            "migrating sidecar pg",
-            &format!(
-                "system under test `{}` has no harness-managed stores — skipping migration",
-                run.spec.system()
-            ),
-        ),
         Some(argv) if !argv.is_empty() => {
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).env("DATABASE_URL", &opts.database_url);
@@ -1619,69 +1596,59 @@ pub fn drive_replay_in_pod(
     set_status(root, run, RunStatus::Running, None);
     ctx.run_state("running");
     set_stage(root, run, ctx, 4, total, "seeding sidecar stores");
-    if !manages_stores {
-        ctx.log(
-            "seeding sidecar stores",
-            &format!(
-                "system under test `{}` has no harness-managed stores — skipping schema gate and seeding",
-                run.spec.system()
-            ),
-        );
-    } else {
-        let store = StoreExec::direct(
-            opts.redis_host.clone(),
-            opts.redis_port,
-            opts.database_url.clone(),
-        );
+    let store = StoreExec::direct(
+        opts.redis_host.clone(),
+        opts.redis_port,
+        opts.database_url.clone(),
+    );
 
-        // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
-        // into it. The live fingerprint is read back from the store; the expected set
-        // is the candidate's own migration versions (supplied by the executor, a
-        // function of the candidate ref — never a harness constant). A mismatch is a
-        // fail-closed refusal that names the drift, not a silent seed-into-wrong-
-        // schema that resurfaces later as a phantom candidate regression.
-        let live_schema = read_schema_fingerprint(&store)?;
-        ctx.log(
-            "seeding sidecar stores",
-            &format!(
-                "live schema: {} migrations applied (head {})",
-                live_schema.count(),
-                live_schema.head().unwrap_or("none"),
-            ),
-        );
-        if let Some(expected) = &opts.expected_schema {
-            if !live_schema.matches(expected) {
-                let (missing, extra) = live_schema.diff(expected);
-                return Err(format!(
-                    "schema fingerprint mismatch (P1): candidate expects {} migrations (head {}), \
+    // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
+    // into it. The live fingerprint is read back from the store; the expected set
+    // is the candidate's own migration versions (supplied by the executor, a
+    // function of the candidate ref — never a harness constant). A mismatch is a
+    // fail-closed refusal that names the drift, not a silent seed-into-wrong-
+    // schema that resurfaces later as a phantom candidate regression.
+    let live_schema = read_schema_fingerprint(&store)?;
+    ctx.log(
+        "seeding sidecar stores",
+        &format!(
+            "live schema: {} migrations applied (head {})",
+            live_schema.count(),
+            live_schema.head().unwrap_or("none"),
+        ),
+    );
+    if let Some(expected) = &opts.expected_schema {
+        if !live_schema.matches(expected) {
+            let (missing, extra) = live_schema.diff(expected);
+            return Err(format!(
+                "schema fingerprint mismatch (P1): candidate expects {} migrations (head {}), \
                  store has {} (head {}); missing {} [{}], extra {} [{}]. The applied migration set \
                  is not the candidate's — refusing rather than emit a false verdict.",
-                    expected.count(),
-                    expected.head().unwrap_or("none"),
-                    live_schema.count(),
-                    live_schema.head().unwrap_or("none"),
-                    missing.len(),
-                    sample_versions(&missing),
-                    extra.len(),
-                    sample_versions(&extra),
-                ));
-            }
-            ctx.log(
-                "seeding sidecar stores",
-                "schema fingerprint matches the candidate (P1 pass)",
-            );
+                expected.count(),
+                expected.head().unwrap_or("none"),
+                live_schema.count(),
+                live_schema.head().unwrap_or("none"),
+                missing.len(),
+                sample_versions(&missing),
+                extra.len(),
+                sample_versions(&extra),
+            ));
         }
+        ctx.log(
+            "seeding sidecar stores",
+            "schema fingerprint matches the candidate (P1 pass)",
+        );
+    }
 
-        flush_redis(&store)?;
-        let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
-        let seed_certificate_path = root.seed_certificate_path(&run.run_id);
-        // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
-        // publish loop like every other stream artifact. Registering here as well
-        // stored the runner pod's local path verbatim — a row that answered every
-        // read with ENOENT once the pod died — and would now duplicate the row.
-        if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
-            eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
-        }
+    flush_redis(&store)?;
+    let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
+    let seed_certificate_path = root.seed_certificate_path(&run.run_id);
+    // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
+    // publish loop like every other stream artifact. Registering here as well
+    // stored the runner pod's local path verbatim — a row that answered every
+    // read with ENOENT once the pod died — and would now duplicate the row.
+    if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
+        eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
     }
 
     // A2: the candidate boots as a pod sibling with no ordering guarantee vs
@@ -5788,7 +5755,6 @@ mod tests {
             run_id: "r1".into(),
             spec: RunSpec {
                 mode: RunMode::Record,
-                system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: None,
@@ -5858,7 +5824,6 @@ mod tests {
             run_id: "run-backstop".into(),
             spec: RunSpec {
                 mode: RunMode::Replay,
-                system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: Some(recording_id.to_owned()),
@@ -6175,10 +6140,7 @@ mod tests {
         );
 
         let mut excluded = std::collections::BTreeMap::new();
-        excluded.insert(
-            "c-cut".to_owned(),
-            "no ingress (`http_incoming`-role) event".to_owned(),
-        );
+        excluded.insert("c-cut".to_owned(), "no `http_incoming` event".to_owned());
         let stamp = admission_stamp(
             &TapeAdmission::Computed {
                 checked: 53,
@@ -6200,7 +6162,7 @@ mod tests {
         assert_eq!(stamp.value["correlations_driven"], 2);
         assert_eq!(
             stamp.value["correlations_excluded"]["c-cut"],
-            "no ingress (`http_incoming`-role) event"
+            "no `http_incoming` event"
         );
 
         // An unchecked tape says so in the verdict too, rather than looking
@@ -6585,7 +6547,6 @@ mod tests {
             run_id: run_id.to_owned(),
             spec: RunSpec {
                 mode: crate::RunMode::Replay,
-                system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage {
                     image: "deja-demo".to_owned(),
                 },

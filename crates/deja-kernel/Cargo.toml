@@ -11,17 +11,6 @@ description = "Workload player for the Deja replay test harness: loads a recordi
 deja = { path = "../deja", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# gRPC drive path (src/grpc.rs). Chosen to keep the graph MSRV-safe: none of
-# these pull url/idna (the icu >= rustc-1.86 hazard the HTTP driver avoids by
-# hand-rolling HTTP/1.1). HTTP/2 cannot reasonably be hand-rolled, so h2 + a
-# current-thread tokio runtime per drive is the floor.
-base64 = "0.22"
-bytes = "1"
-h2 = "0.4"
-http = "1"
-prost = "0.13"
-prost-reflect = { version = "0.14", features = ["serde"] }
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,7 +6,6 @@ import { useDebug, withDebug } from "../lib/debug";
 import {
   attemptOrdinals,
   candidateRef,
-  systemUnderTest,
   RESULT_STATES,
   ResultState,
   resultOf,
@@ -33,7 +32,6 @@ function haystack(r: RunRow): string {
     r.run_id,
     r.recording_id ?? "",
     candidateRef(r).full,
-    systemUnderTest(r),
     r.created_by,
     r.failure?.message ?? "",
     r.scorecard?.verdict?.reason ?? "",
@@ -141,14 +139,7 @@ export default function RunsPage() {
               >
                 <span className="rl-when">{t.short}</span>
                 <span className="rl-result"><ResultChip result={res} /></span>
-                <span className="rl-cand mono" title={cand.full}>
-                  {cand.label}
-                  {/* Only a non-default system is worth a badge — every legacy
-                      row is hyperswitch and would just repeat itself. */}
-                  {systemUnderTest(r) !== "hyperswitch" && (
-                    <> · {systemUnderTest(r)}</>
-                  )}
-                </span>
+                <span className="rl-cand mono" title={cand.full}>{cand.label}</span>
                 <span className="rl-rec mono">{r.recording_id ?? "—"}</span>
                 <span className="rl-said" title={said ?? undefined}>{said ?? "—"}</span>
                 <span

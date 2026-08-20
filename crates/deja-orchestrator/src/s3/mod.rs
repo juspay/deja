@@ -184,7 +184,7 @@ impl AdmissionTest {
     fn describe(self) -> &'static str {
         match self {
             AdmissionTest::DenseSequence => "request_sequence run is not dense from zero",
-            AdmissionTest::TerminalResponse => "no ingress (`http_incoming`-role) event",
+            AdmissionTest::TerminalResponse => "no `http_incoming` event",
         }
     }
 }
@@ -539,17 +539,12 @@ struct EventProbe {
     correlation_id: Option<String>,
     #[serde(default)]
     request_sequence: u64,
-    /// Which boundary produced the event. An ingress event is the correlation's
+    /// Which boundary produced the event. `http_incoming` is the correlation's
     /// own request→response span, and its presence is the terminal half of
     /// admission — see [`AdmissionTest`]. Defaulted so a graph node (which has
     /// no boundary) still parses.
     #[serde(default)]
     boundary: String,
-    /// Self-described structural role (`"ingress"` on the request event);
-    /// absent on egress events and on tapes recorded before the field existed,
-    /// where the legacy `http_incoming` boundary name identifies ingress.
-    #[serde(default)]
-    role: Option<String>,
 }
 
 /// A sink marker, as the record sink puts it on the wire: the payload the
@@ -984,8 +979,7 @@ fn collate(raw_chunks: &[Vec<u8>]) -> Collated {
                     trace
                         .seq
                         .push((probe.request_sequence, probe.global_sequence));
-                    trace.has_ingress |= probe.role.as_deref() == Some(deja::ROLE_INGRESS)
-                        || probe.boundary == BOUNDARY_HTTP_INCOMING;
+                    trace.has_ingress |= probe.boundary == BOUNDARY_HTTP_INCOMING;
                 }
             }
             events.push((
