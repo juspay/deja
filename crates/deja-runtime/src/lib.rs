@@ -209,15 +209,6 @@ pub struct BoundaryEvent {
     /// provenance. NOT routing. `None` when the site declared no label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// The event's structural role within its correlation. `Some("ingress")`
-    /// ([`ROLE_INGRESS`]) marks the correlation's root request — the one a replay
-    /// driver re-drives and the lookup renderer skips — so tapes self-describe
-    /// their ingress instead of every consumer hardcoding boundary names.
-    /// `None` on egress/side-effect events and on all tapes recorded before this
-    /// field existed; consumers go through [`BoundaryEvent::is_ingress`], which
-    /// keeps the legacy `http_incoming` name working.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
     /// Typed declarative boundary metadata for seed planning/reporting. Metadata
     /// only; replay routing still uses `replay_strategy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,22 +283,7 @@ impl DejaRecord {
 /// not comparable to pre-v6 tapes at fallback-affected sites. v7 adds Phase F
 /// task-lineage/canonicalization scaffolding. v8 switches detached spawning to a
 /// stamp-only model and adds canonical `bucket_id` plus `fork_seq` lineage.
-/// (The optional `role` field is additive within v8: absent on old tapes,
-/// defaulted on read, and never required by any consumer.)
 pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 8;
-
-/// The [`BoundaryEvent::role`] value marking a correlation's ingress root.
-pub const ROLE_INGRESS: &str = "ingress";
-
-impl BoundaryEvent {
-    /// Whether this event is its correlation's ingress root: the recorded request
-    /// a replay driver re-drives, which the lookup renderer must therefore skip.
-    /// Self-described via [`Self::role`]; falls back to the legacy boundary name
-    /// so every tape recorded before `role` existed keeps working unchanged.
-    pub fn is_ingress(&self) -> bool {
-        self.role.as_deref() == Some(ROLE_INGRESS) || self.boundary == "http_incoming"
-    }
-}
 
 /// How a [`BoundaryEvent`] entered the artifact.
 ///
@@ -1751,9 +1727,6 @@ pub struct EventBuilder {
     /// [`BoundarySpec`] in `start_boundary_event_lazy` and written into the
     /// emitted [`BoundaryEvent`] by [`Self::finish`].
     pub semantics: BoundarySemantics,
-    /// Structural role stamped onto the emitted event (see [`BoundaryEvent::role`]).
-    /// `None` by default; ingress recorders opt in via [`Self::with_role`].
-    role: Option<&'static str>,
 }
 
 /// Stable content digest over `(args, result)`, reusing the same canonical
@@ -1869,7 +1842,6 @@ impl EventBuilder {
             explicit_pre_image: None,
             callsite_identity: None,
             semantics: BoundarySemantics::undeclared(),
-            role: None,
         }
     }
 
@@ -1884,14 +1856,6 @@ impl EventBuilder {
     /// every declared field `None`, stamping the same event as before.
     pub fn with_semantics(mut self, semantics: BoundarySemantics) -> Self {
         self.semantics = semantics;
-        self
-    }
-
-    /// Stamp a structural role onto the emitted event. Ingress recorders pass
-    /// [`ROLE_INGRESS`] so their tapes self-describe the correlation root
-    /// (see [`BoundaryEvent::role`]); everything else leaves this unset.
-    pub fn with_role(mut self, role: &'static str) -> Self {
-        self.role = Some(role);
         self
     }
 
@@ -2022,7 +1986,6 @@ impl EventBuilder {
             explicit_pre_image,
             callsite_identity,
             semantics,
-            role,
             ..
         } = self;
 
@@ -2096,7 +2059,6 @@ impl EventBuilder {
             // is the non-routing descriptive label.
             replay_strategy: semantics.replay_strategy,
             kind: semantics.kind,
-            role: role.map(str::to_owned),
             declaration: semantics
                 .declaration
                 .filter(|declaration| !declaration.is_empty()),
@@ -4596,44 +4558,6 @@ mod tests {
         assert_eq!(events[0].boundary, "storage");
         assert!(!events[0].is_error);
         assert!(events[0].call_file.contains("lib.rs"));
-        // No role declared → none stamped, and a non-ingress boundary is not
-        // an ingress root.
-        assert_eq!(events[0].role, None);
-        assert!(!events[0].is_ingress());
-    }
-
-    #[test]
-    fn with_role_stamps_ingress_and_is_ingress_keeps_the_legacy_name() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let hook = RecordingHook::new(dir.path()).expect("hook");
-        let caller = Location::caller();
-        EventBuilder::start(
-            &hook,
-            "grpc_incoming",
-            "GrpcServer",
-            "call",
-            caller,
-            serde_json::json!({"rpc": "/types.PaymentService/Authorize"}),
-        )
-        .with_role(ROLE_INGRESS)
-        .finish(&hook, serde_json::json!({}), false);
-        drop(hook);
-        let events = read_events(dir.path()).expect("read");
-        assert_eq!(events[0].role.as_deref(), Some("ingress"));
-        assert!(events[0].is_ingress(), "self-described role marks ingress");
-
-        // The legacy name keeps working with NO role — every pre-`role` tape.
-        let legacy: BoundaryEvent = serde_json::from_str(
-            r#"{"global_sequence":0,"request_sequence":0,"correlation_id":"c","timestamp_ns":1,
-                "boundary":"http_incoming","trait_name":"RequestIdMiddleware","method_name":"call",
-                "call_file":"request_id.rs","call_line":1,"call_column":1,"request":{},"args":{},
-                "response":{},"result":{},"is_error":false,"duration_us":1,
-                "event_schema_version":8,"provenance":"recorded","recon":"lossless",
-                "replay_strategy":"substitute"}"#,
-        )
-        .expect("legacy event parses");
-        assert_eq!(legacy.role, None);
-        assert!(legacy.is_ingress(), "legacy http_incoming stays ingress");
     }
 
     #[test]
@@ -4933,7 +4857,6 @@ mod tests {
             entropy_source: Some("id".to_string()),
             replay_strategy: ReplayStrategy::Execute,
             kind: Some("redis".to_string()),
-            role: None,
             declaration: Some(
                 BoundaryDeclaration::default()
                     .effect(EffectKind::Redis)
@@ -5053,7 +4976,6 @@ mod tests {
                 entropy_source: None,
                 replay_strategy: ReplayStrategy::default(),
                 kind: None,
-                role: None,
                 declaration: None,
                 raw_draw: None,
                 end_timestamp_ns: None,
@@ -5096,7 +5018,6 @@ mod tests {
                 entropy_source: None,
                 replay_strategy: ReplayStrategy::default(),
                 kind: None,
-                role: None,
                 declaration: None,
                 raw_draw: None,
                 end_timestamp_ns: None,
@@ -5155,7 +5076,6 @@ mod tests {
                 entropy_source: None,
                 replay_strategy: ReplayStrategy::default(),
                 kind: None,
-                role: None,
                 declaration: None,
                 raw_draw: None,
                 end_timestamp_ns: None,
@@ -5198,7 +5118,6 @@ mod tests {
                 entropy_source: None,
                 replay_strategy: ReplayStrategy::default(),
                 kind: None,
-                role: None,
                 declaration: None,
                 raw_draw: None,
                 end_timestamp_ns: None,
@@ -5328,7 +5247,6 @@ mod tests {
             Some(ExecuteShadowToken::new(crate::replay::ObservedCall {
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
-                role: None,
                 trait_name: query.trait_name.to_string(),
                 method_name: query.method_name.to_string(),
                 args: query.args.clone(),

@@ -45,10 +45,6 @@ pub struct LoadedArtifacts {
 pub struct ObservedCall {
     #[serde(default)]
     pub boundary: String,
-    /// Structural role from the observed artifact (`"ingress"` on the response
-    /// finalizer marker); absent on egress rows and pre-`role` artifacts.
-    #[serde(default)]
-    pub role: Option<String>,
     #[serde(default)]
     pub method_name: String,
     #[serde(default)]
@@ -516,26 +512,21 @@ pub fn request_outcomes(artifacts: &LoadedArtifacts) -> Vec<RequestOutcome> {
         }
     }
 
-    // Method/path live on the correlation's ingress event — which is emitted
-    // at request COMPLETION, so it is usually the correlation's LAST event,
-    // not its first. A gRPC ingress has no method/path; its `rpc` fills the
-    // path slot so the outcome row still names the request.
+    // Method/path live on the correlation's http_incoming event — which is
+    // emitted at request COMPLETION, so it is usually the correlation's LAST
+    // event, not its first.
     let mut ingress: HashMap<&str, (&str, &str)> = HashMap::new();
     for event in &artifacts.semantic_events {
-        if !event.is_ingress() {
+        if event.boundary != "http_incoming" {
             continue;
         }
         let Some(id) = event.correlation_id.as_deref() else {
             continue;
         };
         let method = event.request.get("method").and_then(Value::as_str);
-        let path = event
-            .request
-            .get("path")
-            .or_else(|| event.args.get("rpc"))
-            .and_then(Value::as_str);
-        if let Some(path) = path {
-            ingress.entry(id).or_insert((method.unwrap_or("rpc"), path));
+        let path = event.request.get("path").and_then(Value::as_str);
+        if let (Some(method), Some(path)) = (method, path) {
+            ingress.entry(id).or_insert((method, path));
         }
     }
 
@@ -954,22 +945,13 @@ fn sorted_counts(counts: BTreeMap<String, usize>) -> Vec<(String, usize)> {
 // ---------------------------------------------------------------------------
 
 /// A real side-effect seam (db/redis/http/grpc...) — excludes the request
-/// boundary (self-described `role: "ingress"`, legacy `http_incoming` name)
-/// and the deterministic/tolerated seams (time/id/crypto) so the diff shows
-/// the calls that actually matter.
-pub fn is_side_effect_boundary(boundary: &str, role: Option<&str>) -> bool {
-    role != Some("ingress")
-        && !matches!(
-            boundary,
-            "http_incoming"
-                | "time"
-                | "id"
-                | "id_generation"
-                | "uuid"
-                | "rng"
-                | "crypto"
-                | "function"
-        )
+/// boundary and the deterministic/tolerated seams (time/id/crypto) so the diff
+/// shows the calls that actually matter.
+pub fn is_side_effect_boundary(boundary: &str) -> bool {
+    !matches!(
+        boundary,
+        "http_incoming" | "time" | "id" | "id_generation" | "uuid" | "rng" | "crypto" | "function"
+    )
 }
 
 /// One field-level difference between two JSON values (also the shape of an
@@ -1109,7 +1091,7 @@ pub fn build_diff_rows(
     let rec: Vec<&BoundaryEvent> = events
         .iter()
         .filter(|e| e.correlation_id.as_deref() == Some(corr))
-        .filter(|e| is_side_effect_boundary(&e.boundary, e.role.as_deref()))
+        .filter(|e| is_side_effect_boundary(&e.boundary))
         .collect();
     let obs: &[ObservedCall] = replay.map(|r| r.observed.as_slice()).unwrap_or(&[]);
 
@@ -1126,7 +1108,7 @@ pub fn build_diff_rows(
         .iter()
         .filter(|c| c.correlation_id.as_deref() == Some(corr))
         .filter(|c| !c.resolved)
-        .filter(|c| is_side_effect_boundary(&c.boundary, c.role.as_deref()))
+        .filter(|c| is_side_effect_boundary(&c.boundary))
         .collect();
 
     // Pairing pass: fuse an omitted recorded event with a novel candidate call

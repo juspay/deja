@@ -2,18 +2,14 @@
 //!
 //! Pure-logic surface for the workload player: load a recording of
 //! `BoundaryEvent`s, group by `correlation_id`, reconstruct each
-//! correlation's ingress event into a drivable request, and compare the
-//! candidate's response against the baseline recorded response. The
-//! orchestration shell in `main.rs` dispatches per correlation on the
-//! recorded ingress shape: HTTP ingress (`method`/`path`) drives over the
-//! hand-rolled HTTP/1.1 client, gRPC ingress (`rpc`) over the [`grpc`]
-//! module's HTTP/2 client — one kernel binary, one `KERNEL_*` contract.
+//! correlation's first `http_incoming` event into a drivable HTTP request,
+//! and compare the candidate's response against the baseline recorded
+//! response. The orchestration shell in `main.rs` wires this to a
+//! `reqwest::blocking::Client` and an HTTP diff sink.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-
-pub mod grpc;
 
 pub use deja::BoundaryEvent;
 
@@ -135,14 +131,11 @@ pub fn group_by_correlation(
     (by_corr, uncorrelated)
 }
 
-/// Extract the FIRST ingress event (self-described `role: "ingress"`, legacy
-/// `http_incoming` name) from a correlation group and reconstruct a driveable
-/// HTTP request. Returns None when the correlation has no ingress event
-/// (background-only correlation) — or when its ingress is not HTTP-shaped
-/// (no `method`/`path`; a gRPC ingress), which the caller hands to
-/// [`grpc::reconstruct_grpc_request`] instead.
+/// Extract the FIRST `boundary == "http_incoming"` event from a correlation
+/// group and reconstruct a driveable request. Returns None when the
+/// correlation has no incoming-HTTP event (background-only correlation).
 pub fn reconstruct_driver_request(events: &[BoundaryEvent]) -> Option<DriverRequest> {
-    let event = events.iter().find(|e| e.is_ingress())?;
+    let event = events.iter().find(|e| e.boundary == "http_incoming")?;
     let req = &event.request;
     let method = req.get("method")?.as_str()?.to_string();
     let path = req.get("path")?.as_str()?.to_string();
@@ -200,7 +193,7 @@ fn baseline_from_event(event: &BoundaryEvent) -> BaselineResponse {
 /// response diff against the candidate's empty body forever.
 ///
 /// `None` only when the tape says nothing about a body at all.
-pub(crate) fn captured_body_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
+fn captured_body_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
     if let Some(arr) = body.get("raw_bytes").and_then(|v| v.as_array()) {
         return Some(
             arr.iter()
@@ -413,38 +406,10 @@ mod tests {
             entropy_source: None,
             replay_strategy: deja::ReplayStrategy::default(),
             kind: None,
-            role: None,
             declaration: None,
             raw_draw: None,
             end_timestamp_ns: None,
         }
-    }
-
-    #[test]
-    fn reconstruct_finds_ingress_by_role_not_only_by_legacy_name() {
-        // A role-described HTTP ingress under a NEW boundary name reconstructs;
-        // the legacy-name path is covered by every other test in this module.
-        let req = serde_json::json!({ "method": "GET", "path": "/x" });
-        let mut event = json_event(req, serde_json::json!({"status": 200}), 0);
-        event.boundary = "axum_incoming".to_owned();
-        assert!(
-            reconstruct_driver_request(std::slice::from_ref(&event)).is_none(),
-            "an unknown boundary without a role is NOT ingress"
-        );
-        event.role = Some("ingress".to_owned());
-        let drv = reconstruct_driver_request(&[event]).expect("role marks ingress");
-        assert_eq!(drv.path, "/x");
-    }
-
-    #[test]
-    fn grpc_shaped_ingress_yields_none_from_the_http_reconstruct() {
-        // A gRPC ingress (rpc, no method/path) is ingress but not HTTP-drivable;
-        // the drive loop hands it to grpc::reconstruct_grpc_request instead.
-        let req = serde_json::json!({ "rpc": "/types.PaymentService/Authorize" });
-        let mut event = json_event(req, serde_json::json!({}), 0);
-        event.boundary = "grpc_incoming".to_owned();
-        event.role = Some("ingress".to_owned());
-        assert!(reconstruct_driver_request(&[event]).is_none());
     }
 
     #[test]

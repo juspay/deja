@@ -1532,7 +1532,6 @@ mod tests {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
                 mode: deja_orchestrator::RunMode::Replay,
-                system_under_test: None,
                 candidate_spec: deja_orchestrator::CandidateSpec::PrebuiltImage {
                     image: "deja-demo".to_owned(),
                 },

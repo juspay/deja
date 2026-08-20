@@ -339,8 +339,6 @@ struct EventProbe {
     #[serde(default)]
     boundary: String,
     #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
     event_schema_version: Option<u32>,
 }
 
@@ -462,7 +460,6 @@ struct Accepted {
     gseq: u64,
     correlation_id: Option<String>,
     boundary: String,
-    role: Option<String>,
     raw_line: String,
 }
 
@@ -1017,7 +1014,6 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
             gseq: probe.global_sequence,
             correlation_id: probe.correlation_id,
             boundary: probe.boundary,
-            role: probe.role,
             raw_line: line_str.into_owned(),
         });
     }
@@ -1085,8 +1081,7 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
         row.events += 1;
         row.gseq_min = row.gseq_min.min(acc.gseq);
         row.gseq_max = row.gseq_max.max(acc.gseq);
-        row.has_ingress |=
-            acc.role.as_deref() == Some("ingress") || acc.boundary == "http_incoming";
+        row.has_ingress |= acc.boundary == "http_incoming";
     }
     let correlations: Vec<CorrelationSummary> = order
         .into_iter()

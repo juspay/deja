@@ -195,11 +195,6 @@ export function whatHappened(run: RunRow): string | null {
   return run.scorecard?.verdict?.reason?.trim() || failureText(run);
 }
 
-/** The run's system under test, with the wire default applied. */
-export function systemUnderTest(run: RunRow): string {
-  return runParams(run)?.system_under_test || "hyperswitch";
-}
-
 /** A candidate ref rendered for a table cell, for every CandidateSpec kind. */
 export function candidateRef(run: RunRow): { label: string; full: string } {
   const c = (run.candidate ?? {}) as Record<string, unknown>;
@@ -245,9 +240,7 @@ export function attemptOrdinals(runs: RunRow[]): Map<string, { attempt: number; 
   const subject = (r: RunRow) => {
     const scope = runParams(r)?.correlation_filter;
     const scopeKey = scope ? [...scope].sort().join(",") : "*";
-    // The system under test is part of the subject: the same recording driven
-    // against hyperswitch and against prism is two different experiments.
-    return `${r.mode}|${systemUnderTest(r)}|${(r.recording_id ?? "").trim()}|${candidateRef(r).full}|${scopeKey}`;
+    return `${r.mode}|${(r.recording_id ?? "").trim()}|${candidateRef(r).full}|${scopeKey}`;
   };
   const groups = new Map<string, RunRow[]>();
   for (const r of runs) {
