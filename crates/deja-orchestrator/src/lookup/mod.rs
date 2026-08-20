@@ -95,8 +95,9 @@ pub fn render_lookup_table(
             }
         };
 
-        // http_incoming is driven by the kernel, not resolved by the hook.
-        if event.boundary == "http_incoming" {
+        // Ingress events (self-described `role: "ingress"`, legacy name
+        // `http_incoming`) are driven by the kernel, not resolved by the hook.
+        if event.is_ingress() {
             continue;
         }
 
@@ -385,6 +386,45 @@ mod tests {
                 deja::Address::Sequence { boundary, .. } if boundary == "redis"
             )),
             "rank-6 sequence address names the boundary"
+        );
+    }
+
+    #[test]
+    fn renderer_skips_role_described_grpc_ingress_without_relabeling() {
+        // A prism-style gRPC ingress self-describes with `role: "ingress"`
+        // under its own boundary name. The renderer must skip it exactly as it
+        // skips `http_incoming` — kernel-driven, never hook-resolved — with NO
+        // relabel shim, and the egress event must keep rank-6 alignment
+        // (request_sequence renumbered over the non-ingress subset).
+        let mut ingress = event("grpc_incoming", 0, serde_json::Value::Null);
+        ingress["role"] = serde_json::json!("ingress");
+        let (_dir, recording) =
+            write_events(&[ingress, event("redis", 1, serde_json::Value::Null)]);
+
+        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        assert_eq!(table.entries.len(), 2, "only the redis event renders");
+        assert!(table
+            .entries
+            .iter()
+            .all(|e| e.source_event_global_sequence == 1));
+        assert!(
+            table.entries.iter().any(|e| matches!(
+                &e.key.address,
+                deja::Address::Sequence {
+                    request_sequence: 0,
+                    ..
+                }
+            )),
+            "the egress event is sequence 0 of the hook-visible subset"
+        );
+        // Without the role, an unrecognized boundary is NOT skipped — the
+        // legacy behavior for every non-ingress event.
+        let (_dir2, recording2) =
+            write_events(&[event("grpc_incoming", 0, serde_json::Value::Null)]);
+        let table2 = render_lookup_table(&recording2, "rec-1", 1).unwrap();
+        assert!(
+            !table2.entries.is_empty(),
+            "role-less unknown boundary renders like any egress event"
         );
     }
 

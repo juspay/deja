@@ -131,6 +131,7 @@ fn write_run(root: &HarnessRoot, run_id: &str, recording_id: &str, filter: Optio
         run_id: run_id.to_owned(),
         spec: RunSpec {
             mode: RunMode::Replay,
+            system_under_test: None,
             candidate_spec: CandidateSpec::PrebuiltImage {
                 image: "deja-demo".to_owned(),
             },
