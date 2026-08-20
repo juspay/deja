@@ -42,10 +42,9 @@ fn main() {
         // The migrations initContainer runs this to pull + unpack the candidate's
         // CodeBundle (its migrations/ tree at sha_C) before the runner migrates.
         Some("stage-codebundle") => stage_codebundle(&args[1..]),
-        // The config initContainer runs this to layer the candidate's own
-        // router config for THIS environment UNDER the recorded one, and write
-        // the single file the candidate boots from (the router reads exactly
-        // one config file).
+        // The config initContainer runs this to merge the candidate's own
+        // config UNDER the recorded one and write the single file the candidate
+        // boots from. Paths come from the caller; see `layer_config`.
         Some("layer-config") => layer_config(&args[1..]),
         // No subcommand: drive one replay run (the runner container's job).
         _ => run(),
@@ -72,28 +71,30 @@ fn stage_codebundle(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `deja-runner layer-config --bundle <dir> --recorded <toml> --out <toml>` —
-/// produce the ONE config file the candidate router boots from, by layering the
-/// candidate's own config for THIS replay's environment (from the staged
-/// CodeBundle) UNDER the recorded baseline (the mounted ConfigMap).
+/// `deja-runner layer-config --base <toml> --over <toml> --out <toml>` —
+/// merge two TOML config files into the one file the candidate boots from.
 ///
-/// The environment is not an argument. It comes from `--out`: the path the
-/// router boots from already names it (`/…/sandbox.toml` is the sandbox
-/// environment), and the candidate's `config/deployments/sandbox.toml` is what
-/// goes underneath. `RUN_ENV`, when set, is a CHECK on that, not the source —
-/// a disagreement between the two is refused rather than resolved. This is why
-/// the flag is `--bundle <dir>` and not `--candidate <file>`: a Job template
-/// that never names a candidate config file cannot name the wrong one.
+/// `--over` wins at every key it sets; `--base` supplies only what `--over` is
+/// silent about. In a replay that means `--base` is the candidate's own config
+/// at its ref (staged in the CodeBundle) and `--over` is the recorded one, so
+/// the recording stays authoritative and the candidate fills only the keys the
+/// recording could not have known about — a key the candidate added after the
+/// tape was taken, without which it may refuse to boot.
 ///
-/// The recording wins at every key it defines; the candidate supplies only what
-/// the recording is silent about — a connector or a required section added
-/// after the recording was taken. See `config_layer` for the merge and the
-/// three balances it asserts.
+/// All three paths come from the CALLER. This command does not know which file
+/// the system under test boots, where that system keeps its own copy, or what
+/// selects between several: the Job template mounts one and stages the other,
+/// so it already holds both ends and simply says them. A different system
+/// passes different paths and this code is unchanged.
+///
+/// See `config_layer` for the merge, the provenance and the three balances it
+/// asserts.
 fn layer_config(args: &[String]) -> Result<(), String> {
-    let mut bundle: Option<String> = None;
-    let mut recorded: Option<String> = None;
+    let mut base: Option<String> = None;
+    let mut over: Option<String> = None;
     let mut out: Option<String> = None;
 
+    let usage = "expected --base <toml> --over <toml> --out <toml>";
     let mut i = 1;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -103,50 +104,37 @@ fn layer_config(args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| format!("layer-config: {flag} needs a value"))
         };
         match flag {
-            "--bundle" => bundle = Some(value()?),
-            "--recorded" => recorded = Some(value()?),
+            "--base" => base = Some(value()?),
+            "--over" => over = Some(value()?),
             "--out" => out = Some(value()?),
-            other => {
-                return Err(format!(
-                    "layer-config: unknown argument {other:?}; expected --bundle <dir> \
-                     --recorded <toml> --out <toml>"
-                ))
-            }
+            other => return Err(format!("layer-config: unknown argument {other:?}; {usage}")),
         }
         i += 2;
     }
 
-    let bundle = bundle.ok_or("layer-config: --bundle <dir> is required")?;
-    let recorded = recorded.ok_or("layer-config: --recorded <toml> is required")?;
-    let out = out.ok_or("layer-config: --out <toml> is required")?;
+    let base = base.ok_or_else(|| format!("layer-config: --base is required; {usage}"))?;
+    let over = over.ok_or_else(|| format!("layer-config: --over is required; {usage}"))?;
+    let out = out.ok_or_else(|| format!("layer-config: --out is required; {usage}"))?;
 
-    let nonempty = |v: String| (!v.trim().is_empty()).then_some(v);
-    let run_env = std::env::var("RUN_ENV").ok().and_then(nonempty);
-    let bundle_uri = std::env::var("DEJA_CODE_BUNDLE_URI")
+    // Whatever named the delivery of `--base` in this deployment, so a missing
+    // base layer points at the thing that failed to deliver it.
+    let source = std::env::var("DEJA_CODE_BUNDLE_URI")
         .ok()
-        .and_then(nonempty);
+        .filter(|v| !v.trim().is_empty());
 
-    let (env, report) = deja_orchestrator::config_layer::layer_config_files(
-        std::path::Path::new(&bundle),
-        std::path::Path::new(&recorded),
+    let report = deja_orchestrator::config_layer::layer_config_files(
+        std::path::Path::new(&base),
+        std::path::Path::new(&over),
         std::path::Path::new(&out),
-        run_env.as_deref(),
-        bundle_uri.as_deref(),
+        source.as_deref(),
     )?;
 
-    // Which environment's config was resolved, and every key the merge took
-    // from the candidate rather than the recording — by name, at boot, so the
-    // next config surprise is a five-minute diagnosis.
-    eprintln!(
-        "config layering: environment {} -> candidate {} layered under the recorded {}",
-        env.run_env, env.repo_path, recorded,
-    );
-    eprint!(
-        "{}",
-        report.render(&format!("{bundle}/{}", env.repo_path), &recorded)
-    );
+    // Every key the merge took from the base rather than the overriding layer,
+    // by name, at boot — so the next config surprise is a five-minute
+    // diagnosis instead of an archaeology session.
+    eprint!("{}", report.render(&base, &over));
     for (section, n) in deja_orchestrator::config_layer::carried_by_section(&report) {
-        eprintln!("config layering: from candidate, by section: [{section}] x{n}");
+        eprintln!("config layering: from the base layer, by section: [{section}] x{n}");
     }
     eprintln!("deja-runner: layered config written to {out}");
     Ok(())

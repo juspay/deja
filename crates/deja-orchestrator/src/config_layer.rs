@@ -1,20 +1,15 @@
-//! Layering the candidate's own router config UNDER the recorded one.
+//! Layering the candidate's own config UNDER the recorded one.
 //!
-//! The replay Job boots the candidate router from a single config file. The
-//! router reads exactly one (`Settings::with_config_path` adds one
-//! `config::File` source, selected by `RUN_ENV`), so "just pass both" is not
-//! available: two independent sources have to become one file before the
-//! container starts.
+//! A replay boots the candidate from a single config file, so two independent
+//! sources have to become one file before it starts:
 //!
-//! The two sources are:
-//!
-//!   * the RECORDED config — the sandbox baseline the recorded session's router
-//!     actually booted from, rendered by the recording-era chart into a
-//!     ConfigMap. This is the environment being reproduced.
-//!   * the CANDIDATE's config — `config/deployments/<run_env>.toml` at the
-//!     candidate's own ref, carried in the CodeBundle. This is the only thing
-//!     that knows about keys the candidate ADDED after the recording was taken
-//!     (a new connector's `base_url`, a new required section).
+//!   * the RECORDED config — what the recorded session's process actually
+//!     booted from. This is the environment being reproduced.
+//!   * the CANDIDATE's config — the same-shaped file at the candidate's own
+//!     ref, carried in the CodeBundle. It is the only thing that knows about
+//!     keys the candidate ADDED after the recording was taken, which the
+//!     recording cannot possibly carry and without which the candidate may
+//!     refuse to boot at all.
 //!
 //! Precedence is fixed and one-directional: **the recording wins wherever it
 //! has an opinion**. The candidate's file supplies only what the recording is
@@ -32,10 +27,19 @@
 //!      recorded leaf at the same path, or named in `shadowed`.
 //!
 //! Nothing is dropped without a name.
+//!
+//! # What this module deliberately does not know
+//!
+//! Which file the system under test boots, where that system keeps its own
+//! copy of it, and what selects between several — all of that belongs to the
+//! deployment, which knows both ends already because it mounts one and stages
+//! the other. Every path arrives as an argument. The merge, the precedence
+//! direction, the accounting and the refusal are generic; a table of somebody
+//! else's filenames would not be, and would have to be edited every time that
+//! system rearranged its own directory.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use toml::Value;
@@ -48,54 +52,56 @@ use toml::Value;
 /// exactly what the recording did not specify.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LayerReport {
-    /// Dotted paths present only in the candidate's config, carried into the
-    /// merged output. Sorted.
+    /// Dotted paths present only in the BASE layer, carried into the merged
+    /// output. Sorted. In a replay these are exactly the keys the recording
+    /// could not have known about.
     pub carried: Vec<String>,
-    /// Leaf count taken from the recording (every recorded leaf, by invariant).
-    pub from_recording: usize,
-    /// Candidate leaves displaced by a recorded leaf at the SAME path. The
-    /// ordinary case, and the reason the replay stays faithful.
+    /// Leaf count taken from the OVER layer (every one of its leaves, by
+    /// invariant — the whole point of the direction).
+    pub from_over: usize,
+    /// Base leaves displaced by an over leaf at the SAME path. The ordinary
+    /// case, and the reason a replay stays faithful.
     pub overridden: usize,
-    /// Candidate leaves dropped because the recording put a value of a
-    /// different SHAPE at or above that path (a scalar where the candidate has
-    /// a table, or a table where it has a scalar). Rare and worth reading:
-    /// these are candidate defaults the recording structurally displaced.
-    /// Named, never merely counted.
+    /// Base leaves dropped because the over layer put a value of a different
+    /// SHAPE at or above that path (a scalar where the base has a table, or a
+    /// table where it has a scalar). Rare and worth reading. Named, never
+    /// merely counted.
     pub shadowed: Vec<String>,
 }
 
 impl LayerReport {
     /// Total leaves in the merged output.
     pub fn total(&self) -> usize {
-        self.from_recording + self.carried.len()
+        self.from_over + self.carried.len()
     }
 
     /// A human summary for the Job's init log: the counts, then every key the
-    /// merge took from the candidate rather than the recording.
-    pub fn render(&self, candidate_label: &str, recorded_label: &str) -> String {
+    /// merge took from the base layer rather than the overriding one. Both
+    /// paths are printed, so which file played which role is never in doubt.
+    pub fn render(&self, base_label: &str, over_label: &str) -> String {
         let mut s = String::new();
         let _ = writeln!(
             s,
-            "config layering: {} keys in the merged config = {} from the recording ({}) \
-             + {} from the candidate ({})",
+            "config layering: {} keys in the merged config = {} from the overriding layer ({}) \
+             + {} from the base layer ({})",
             self.total(),
-            self.from_recording,
-            recorded_label,
+            self.from_over,
+            over_label,
             self.carried.len(),
-            candidate_label,
+            base_label,
         );
         let _ = writeln!(
             s,
-            "config layering: {} candidate keys were overridden by the recording",
+            "config layering: {} base keys were overridden by the overriding layer",
             self.overridden,
         );
         for k in &self.carried {
-            let _ = writeln!(s, "config layering: from candidate: {k}");
+            let _ = writeln!(s, "config layering: from the base layer: {k}");
         }
         for k in &self.shadowed {
             let _ = writeln!(
                 s,
-                "config layering: candidate key structurally shadowed by the recording: {k}",
+                "config layering: base key structurally shadowed by the overriding layer: {k}",
             );
         }
         s
@@ -109,11 +115,11 @@ impl LayerReport {
 /// recursively; every non-table value (including arrays and arrays-of-tables)
 /// is a leaf and is taken wholesale from the recording when the recording has
 /// one at that path.
-pub fn layer_toml(candidate: &str, recorded: &str) -> Result<(String, LayerReport), String> {
-    let base: toml::Table = toml::from_str(candidate)
-        .map_err(|e| format!("candidate config is not valid TOML: {e}"))?;
-    let over: toml::Table =
-        toml::from_str(recorded).map_err(|e| format!("recorded config is not valid TOML: {e}"))?;
+pub fn layer_toml(base_text: &str, over_text: &str) -> Result<(String, LayerReport), String> {
+    let base: toml::Table = toml::from_str(base_text)
+        .map_err(|e| format!("the --base config is not valid TOML: {e}"))?;
+    let over: toml::Table = toml::from_str(over_text)
+        .map_err(|e| format!("the --over config is not valid TOML: {e}"))?;
 
     let base_leaves = count_leaves_table(&base);
     let over_leaves = count_leaves_table(&over);
@@ -133,23 +139,24 @@ pub fn layer_toml(candidate: &str, recorded: &str) -> Result<(String, LayerRepor
     if merged_leaves != report.total() {
         return Err(format!(
             "config layering accounting failed: merged output has {merged_leaves} leaves but \
-             provenance accounts for {} ({} recorded + {} carried)",
+             provenance accounts for {} ({} from --over + {} carried from --base)",
             report.total(),
-            report.from_recording,
+            report.from_over,
             report.carried.len(),
         ));
     }
-    if report.from_recording != over_leaves {
+    if report.from_over != over_leaves {
         return Err(format!(
-            "config layering accounting failed: the recorded config has {over_leaves} leaves but \
-             only {} survived into the merged output — the recording must never lose a key",
-            report.from_recording,
+            "config layering accounting failed: the --over config has {over_leaves} leaves but \
+             only {} survived into the merged output — the authoritative layer must never lose \
+             a key",
+            report.from_over,
         ));
     }
     let accounted_base = report.carried.len() + report.overridden + report.shadowed.len();
     if accounted_base != base_leaves {
         return Err(format!(
-            "config layering accounting failed: the candidate config has {base_leaves} leaves but \
+            "config layering accounting failed: the --base config has {base_leaves} leaves but \
              {accounted_base} were accounted for ({} carried + {} overridden + {} shadowed)",
             report.carried.len(),
             report.overridden,
@@ -204,7 +211,7 @@ fn merge_table(
                 } else {
                     report.overridden += 1;
                 }
-                report.from_recording += count_leaves(over_value);
+                report.from_over += count_leaves(over_value);
                 out.insert(key, over_value.clone());
             }
         }
@@ -216,7 +223,7 @@ fn merge_table(
         if out.contains_key(key) {
             continue;
         }
-        report.from_recording += count_leaves(over_value);
+        report.from_over += count_leaves(over_value);
         out.insert(key.clone(), over_value.clone());
     }
 
@@ -262,240 +269,134 @@ pub fn carried_by_section(report: &LayerReport) -> BTreeMap<String, usize> {
     out
 }
 
-/// One replay environment: the router's `RUN_ENV` value, the config FILE NAME
-/// the router resolves for it, and where that file lives in the candidate's
-/// repo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReplayEnvConfig {
-    /// The `RUN_ENV` value.
-    pub run_env: &'static str,
-    /// The file name `router_env::Config::config_path` resolves under
-    /// `CONFIG_DIR` for that `RUN_ENV`.
-    pub config_file_name: &'static str,
-    /// The candidate repo path holding that environment's config.
-    pub repo_path: &'static str,
-}
-
-/// The router's environment→config-file mapping, plus the candidate repo path
-/// for each. ONE table, read by BOTH halves: the CodeBundle producer decides
-/// what to carry from it (`codebundle::CANDIDATE_CONFIG_FILES`) and the layering
-/// step decides what applies from it. An environment cannot be carried without
-/// being resolvable, or resolvable without being carried.
-///
-/// The environments are the router's own three config files (`router_env`'s
-/// `config_path`: `production` → `production.toml`, `sandbox` → `sandbox.toml`,
-/// anything else → `development.toml`). `RUN_ENV=integ` therefore boots from
-/// `development.toml` and layers the candidate's `config/development.toml` under
-/// it — the router's mapping, mirrored, not a choice made here.
-pub const REPLAY_ENV_CONFIGS: [ReplayEnvConfig; 3] = [
-    ReplayEnvConfig {
-        run_env: "sandbox",
-        config_file_name: "sandbox.toml",
-        repo_path: "config/deployments/sandbox.toml",
-    },
-    ReplayEnvConfig {
-        run_env: "production",
-        config_file_name: "production.toml",
-        repo_path: "config/deployments/production.toml",
-    },
-    ReplayEnvConfig {
-        run_env: "development",
-        config_file_name: "development.toml",
-        repo_path: "config/development.toml",
-    },
-];
-
-/// The config file name the ROUTER resolves for a `RUN_ENV`, mirroring
-/// `router_env::Config::config_path`: an unrecognised `RUN_ENV` falls to
-/// `development.toml`, exactly as the router does.
-pub fn router_config_file_name(run_env: &str) -> &'static str {
-    match run_env {
-        "production" => "production.toml",
-        "sandbox" => "sandbox.toml",
-        _ => "development.toml",
-    }
-}
-
-/// The replay environment a config FILE NAME denotes — the inverse of the
-/// router's own mapping.
-///
-/// This is where the environment comes from: not a new parameter, but the name
-/// of the file the router boots from. `/local/config/sandbox.toml` says
-/// `sandbox`, and the candidate's `config/deployments/sandbox.toml` is what goes
-/// underneath it. Nothing else in the Job has to be told.
-pub fn env_config_for_file_name(file_name: &str) -> Option<&'static ReplayEnvConfig> {
-    REPLAY_ENV_CONFIGS
-        .iter()
-        .find(|e| e.config_file_name == file_name)
-}
-
-/// Resolve which of the candidate's configs layers under a config file the
-/// router will boot from at `out`, and where that file sits inside a staged
-/// CodeBundle at `bundle_dir`.
-///
-/// `run_env_hint` is the `RUN_ENV` the Job also gives the candidate container,
-/// when it is set. It is not the source of the answer — it is a CHECK on it. If
-/// the environment the boot path names and the environment `RUN_ENV` names
-/// disagree, the two halves of the Job would boot different environments, so
-/// this refuses rather than picking one.
-pub fn resolve_candidate_config(
-    bundle_dir: &Path,
-    out: &Path,
-    run_env_hint: Option<&str>,
-) -> Result<(&'static ReplayEnvConfig, PathBuf), String> {
-    let file_name = out
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("--out has no file name: {}", out.display()))?;
-    let env = env_config_for_file_name(file_name).ok_or_else(|| {
-        let known: Vec<&str> = REPLAY_ENV_CONFIGS
-            .iter()
-            .map(|e| e.config_file_name)
-            .collect();
-        format!(
-            "the router boots from {file_name}, which names no replay environment. The config \
-             file name IS the environment (the router resolves RUN_ENV to one of {known:?}); \
-             refusing rather than guessing which of the candidate's configs to layer under it."
-        )
-    })?;
-    if let Some(hint) = run_env_hint {
-        let expected = router_config_file_name(hint);
-        if expected != file_name {
-            return Err(format!(
-                "environment mismatch: the router boots from {file_name} (environment \
-                 {env_named}) but RUN_ENV={hint} resolves to {expected}. The candidate container \
-                 and this layering step would use different environments; refusing. Make the \
-                 Job's RUN_ENV and the config mount path name the same environment.",
-                env_named = env.run_env,
-            ));
-        }
-    }
-    Ok((env, bundle_dir.join(env.repo_path)))
-}
-
 /// The sidecar file written next to the merged config, naming every key the
 /// merge took from the candidate. The Job's init log carries the same content;
-/// the file is there so a post-mortem on a finished run can read it without
-/// the logs.
+/// the file is there so a post-mortem on a finished run can read it without the
+/// logs.
 pub fn provenance_path(out: &Path) -> PathBuf {
     let mut p = out.as_os_str().to_owned();
     p.push(".provenance");
     PathBuf::from(p)
 }
 
-/// The bundle entry that CodeBundles staged BEFORE the candidate config became
-/// per-environment carry instead of it. Bundles are cached in S3 forever, keyed
-/// by candidate sha, so a ref replayed before this change still has one; its
-/// presence next to a missing environment config is that bundle's signature.
+/// The nearest existing ancestor directory of a path that is missing, and what
+/// it actually contains (sorted, capped).
 ///
-/// Detecting it is all this does. There is no migration, no backfill and no
-/// sweep: a stale bundle is diagnosed by name and refused, which costs whoever
-/// hits it one re-run after the stale object is dropped. A re-staging path for
-/// something this rare would be code nobody exercises.
-const LEGACY_BUNDLE_CONFIG: &str = "config/docker_compose.toml";
+/// This is how a missing candidate config explains itself without this module
+/// knowing what any file is FOR. "Expected X, and here is what the delivery
+/// actually produced" is the whole diagnosis, and it reads the same whether the
+/// system under test keeps its config in one layout or another.
+fn nearest_existing_listing(missing: &Path) -> Option<(PathBuf, Vec<String>)> {
+    const MAX: usize = 24;
+    let mut dir = missing.parent()?;
+    loop {
+        if dir.is_dir() {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if e.path().is_dir() {
+                        format!("{name}/")
+                    } else {
+                        name
+                    }
+                })
+                .collect();
+            names.sort();
+            if names.len() > MAX {
+                let extra = names.len() - MAX;
+                names.truncate(MAX);
+                names.push(format!("… and {extra} more"));
+            }
+            return Some((dir.to_path_buf(), names));
+        }
+        dir = dir.parent()?;
+    }
+}
 
-/// Read the candidate's config for this replay's environment and the recorded
-/// config, layer them, and write the single merged file the candidate boots
-/// from.
+/// Read the candidate's config and the recorded config, layer them, and write
+/// the single merged file the candidate boots from.
 ///
-/// Which candidate config applies is derived from `out` — the path the router
-/// boots from already names the environment — and cross-checked against
-/// `run_env_hint`. See [`resolve_candidate_config`].
+/// All three paths come from the CALLER. This module does not know which file
+/// the system under test boots, where that system keeps its own copy, or what
+/// selects between them — the deployment that mounts one and stages the other
+/// knows both ends already, and telling it to a merge tool is cheaper and more
+/// honest than a table in here that has to be right about somebody else's
+/// layout.
 ///
-/// `bundle_hint` is whatever names the CodeBundle in this deployment (its S3
-/// URI). It appears in the error when the candidate config is absent, so the
-/// message points at the thing that failed to deliver it rather than at the
-/// file that is merely missing.
+/// `source_label` is whatever names the delivery mechanism for `candidate` in
+/// this deployment (deja's CodeBundle URI). It appears in the error so the
+/// message points at the thing that failed to deliver the file rather than at
+/// the file that is merely missing.
 ///
-/// There is deliberately NO fallback — not to another environment's config, not
-/// to the recorded config alone. Filling a production replay's gaps with
-/// sandbox endpoints would score as a clean run while calling test endpoints,
-/// which is worse than the boot panic it would be papering over; and proceeding
-/// with the recorded config alone is precisely the silent behaviour that
-/// produced `base_url must not be empty for <connector>` at boot, with a
-/// message that named a connector instead of the mechanism.
+/// There is deliberately NO fallback. If the candidate's config is not there,
+/// this fails and the Job fails with it. Substituting some other file — or
+/// proceeding with the recorded config alone — fills a config gap from
+/// somewhere the recorded system never used, and that scores as a clean run
+/// against the wrong endpoints, which is worse than the boot failure it would
+/// be papering over.
 pub fn layer_config_files(
-    bundle_dir: &Path,
-    recorded: &Path,
+    base: &Path,
+    over: &Path,
     out: &Path,
-    run_env_hint: Option<&str>,
-    bundle_hint: Option<&str>,
-) -> Result<(&'static ReplayEnvConfig, LayerReport), String> {
-    let (env, candidate) = resolve_candidate_config(bundle_dir, out, run_env_hint)?;
-
-    let candidate_text = fs::read_to_string(&candidate).map_err(|e| {
-        // Name the ref (the bundle URI is `…/codebundles/<sha>/…`), the exact
-        // file this environment expected, and the one thing to do about it.
-        let source = match bundle_hint {
-            Some(uri) => format!("the CodeBundle staged for this candidate ref, {uri}"),
-            None => "no CodeBundle URI was supplied to this Job at all".to_owned(),
+    source_label: Option<&str>,
+) -> Result<LayerReport, String> {
+    let base_text = std::fs::read_to_string(base).map_err(|e| {
+        let delivered_by = match source_label {
+            Some(s) => format!(" It is delivered by {s}."),
+            None => String::new(),
         };
-        let remedy = if bundle_dir.join(LEGACY_BUNDLE_CONFIG).is_file() {
-            let drop_it = match bundle_hint {
-                Some(uri) => format!("Drop that stale object ({uri}) and re-run"),
-                None => "Drop the stale bundle object for this ref and re-run".to_owned(),
-            };
-            format!(
-                " That bundle carries {LEGACY_BUNDLE_CONFIG} instead, so it was staged before \
-                 the candidate config became per-environment. {LEGACY_BUNDLE_CONFIG} is the \
-                 local docker-compose config, not this environment's, so it is not used as a \
-                 substitute. {drop_it}: the bundle is a pure function of the candidate ref, so \
-                 the next run stages it again with this file."
-            )
-        } else {
-            String::new()
+        let found = match nearest_existing_listing(base) {
+            Some((dir, names)) => format!(
+                " The nearest directory that does exist is {}, and it contains {names:?} — if \
+                 that is not what you expected to be staged, the delivery is the thing to look \
+                 at, not this step.",
+                dir.display()
+            ),
+            None => String::new(),
         };
         format!(
-            "this replay boots the {run_env} environment (the router resolves RUN_ENV={run_env} \
-             to {file}), but the candidate's own {repo_path} is not in {source} — looked for it \
-             at {looked} ({e}).{remedy} Refusing: without it the recorded config has nothing to \
-             layer over, and no other environment's config is an acceptable substitute — \
-             filling a sandbox replay's gaps from a dev config, or a production replay's from a \
-             sandbox one, scores as a clean run against the wrong endpoints.",
-            run_env = env.run_env,
-            file = env.config_file_name,
-            repo_path = env.repo_path,
-            looked = candidate.display(),
+            "--base: expected a config file at {} but it is not there ({e}).{delivered_by}\
+             {found} Refusing: without it the --over layer has nothing to layer over, and this \
+             step will not substitute another file.",
+            base.display(),
         )
     })?;
 
-    let recorded_text = fs::read_to_string(recorded).map_err(|e| {
+    let over_text = std::fs::read_to_string(over).map_err(|e| {
         format!(
-            "the recorded router config is not at {} ({e}). It is mounted from the ConfigMap the \
-             recording-era chart rendered; a Job whose config mount is missing would boot the \
-             candidate under its own defaults, which is not a replay.",
-            recorded.display(),
+            "--over: expected a config file at {} but it is not there ({e}). That layer is the \
+             authoritative one — in a replay it IS the environment being reproduced, so a run \
+             that booted without it would not be a replay.",
+            over.display(),
         )
     })?;
 
-    let (merged, report) = layer_toml(&candidate_text, &recorded_text)?;
+    let (merged, report) = layer_toml(&base_text, &over_text)?;
 
     if let Some(parent) = out.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    fs::write(out, merged.as_bytes()).map_err(|e| format!("write {}: {e}", out.display()))?;
-    // The hyperswitch runtime image runs as the unprivileged `app` user while
-    // this step runs as the init container's user; an owner-only file would be
-    // unreadable at boot. Make it world-readable explicitly rather than relying
-    // on whatever umask the image happens to set.
+    std::fs::write(out, merged.as_bytes()).map_err(|e| format!("write {}: {e}", out.display()))?;
+    // The candidate may run as a different, unprivileged user than this step
+    // (they are different images). An owner-only file would be unreadable at
+    // boot, so set the mode explicitly rather than inheriting a umask.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(out, fs::Permissions::from_mode(0o644))
+        std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o644))
             .map_err(|e| format!("chmod {}: {e}", out.display()))?;
     }
 
     let prov = provenance_path(out);
-    fs::write(
+    std::fs::write(
         &prov,
-        report.render(
-            &candidate.display().to_string(),
-            &recorded.display().to_string(),
-        ),
+        report.render(&base.display().to_string(), &over.display().to_string()),
     )
     .map_err(|e| format!("write {}: {e}", prov.display()))?;
 
-    Ok((env, report))
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -579,7 +480,7 @@ mod tests {
         // And the provenance says which was which, by name.
         assert_eq!(r.carried, vec!["connectors.ilixium.base_url".to_owned()]);
         assert_eq!(r.overridden, 1);
-        assert_eq!(r.from_recording, 1);
+        assert_eq!(r.from_over, 1);
         assert!(r.shadowed.is_empty());
     }
 
@@ -605,7 +506,7 @@ mod tests {
             t["network_tokenization_service"]["generate_token_url"].as_str(),
             Some("u")
         );
-        assert_eq!(r.from_recording, 2);
+        assert_eq!(r.from_over, 2);
         assert!(r.carried.is_empty());
     }
 
@@ -624,7 +525,7 @@ mod tests {
             "an array is one opinion: the recording's replaces the candidate's, never appends"
         );
         assert_eq!(r.overridden, 1);
-        assert_eq!(r.from_recording, 1);
+        assert_eq!(r.from_over, 1);
     }
 
     #[test]
@@ -670,7 +571,7 @@ z = 1
         // Candidate leaves: top, only_candidate, t.a, t.b, t.deep.c, cs.x, cs.y = 7
         assert_eq!(r.carried.len() + r.overridden + r.shadowed.len(), 7);
         // Recorded leaves: top, t.a, t.deep.c, t.deep.d, rs.z = 5
-        assert_eq!(r.from_recording, 5);
+        assert_eq!(r.from_over, 5);
         assert_eq!(
             r.carried,
             vec![
@@ -699,19 +600,19 @@ z = 1
     }
 
     #[test]
-    fn invalid_candidate_toml_is_named_as_such() {
+    fn invalid_base_toml_is_named_as_such() {
         let err = layer_toml("this is not toml", "a = 1").expect_err("must fail");
         assert!(
-            err.contains("candidate config is not valid TOML"),
+            err.contains("--base config is not valid TOML"),
             "error must name WHICH side failed to parse, got: {err}"
         );
     }
 
     #[test]
-    fn invalid_recorded_toml_is_named_as_such() {
+    fn invalid_over_toml_is_named_as_such() {
         let err = layer_toml("a = 1", "this is not toml").expect_err("must fail");
         assert!(
-            err.contains("recorded config is not valid TOML"),
+            err.contains("--over config is not valid TOML"),
             "error must name WHICH side failed to parse, got: {err}"
         );
     }
@@ -722,96 +623,13 @@ z = 1
             "[connectors]\nilixium.base_url = \"u\"\nadyen.base_url = \"d\"\n",
             "[connectors]\nadyen.base_url = \"s\"\n",
         );
-        let text = r.render("candidate.toml", "recorded.toml");
-        assert!(text.contains("from candidate: connectors.ilixium.base_url"));
-        assert!(text.contains("1 from the candidate (candidate.toml)"));
+        let text = r.render("base.toml", "over.toml");
+        assert!(text.contains("from the base layer: connectors.ilixium.base_url"));
+        assert!(text.contains("1 from the base layer (base.toml)"));
+        assert!(text.contains("from the overriding layer (over.toml)"));
     }
 
-    // ── which candidate config applies: derived, never enumerated ──────────
-
-    #[test]
-    fn the_boot_path_names_the_environment() {
-        let dir = std::path::Path::new("/workspace/state/codebundle");
-        let (env, candidate) = resolve_candidate_config(
-            dir,
-            std::path::Path::new("/local/config/sandbox.toml"),
-            None,
-        )
-        .expect("sandbox resolves");
-        assert_eq!(env.run_env, "sandbox");
-        assert_eq!(
-            candidate,
-            dir.join("config/deployments/sandbox.toml"),
-            "the sandbox boot path must pull the candidate's sandbox config, not a dev one"
-        );
-
-        let (env, candidate) = resolve_candidate_config(
-            dir,
-            std::path::Path::new("/local/config/production.toml"),
-            None,
-        )
-        .expect("production resolves");
-        assert_eq!(env.run_env, "production");
-        assert_eq!(candidate, dir.join("config/deployments/production.toml"));
-    }
-
-    #[test]
-    fn an_unknown_boot_file_name_is_refused_not_guessed() {
-        let err = resolve_candidate_config(
-            std::path::Path::new("/b"),
-            std::path::Path::new("/local/config/router.toml"),
-            None,
-        )
-        .expect_err("must refuse");
-        assert!(err.contains("router.toml"), "{err}");
-        assert!(err.contains("names no replay environment"), "{err}");
-    }
-
-    #[test]
-    fn run_env_disagreeing_with_the_boot_path_is_refused() {
-        // The Job would boot the candidate under production while this step
-        // layered sandbox defaults. Refuse rather than pick one.
-        let err = resolve_candidate_config(
-            std::path::Path::new("/b"),
-            std::path::Path::new("/local/config/sandbox.toml"),
-            Some("production"),
-        )
-        .expect_err("must refuse a mismatch");
-        assert!(err.contains("environment mismatch"), "{err}");
-        assert!(
-            err.contains("sandbox.toml") && err.contains("production.toml"),
-            "{err}"
-        );
-
-        // Agreement passes.
-        resolve_candidate_config(
-            std::path::Path::new("/b"),
-            std::path::Path::new("/local/config/sandbox.toml"),
-            Some("sandbox"),
-        )
-        .expect("agreement resolves");
-    }
-
-    #[test]
-    fn the_mapping_mirrors_the_routers_own() {
-        // router_env::Config::config_path: production/sandbox by name, anything
-        // else falls to development.toml.
-        assert_eq!(router_config_file_name("production"), "production.toml");
-        assert_eq!(router_config_file_name("sandbox"), "sandbox.toml");
-        assert_eq!(router_config_file_name("development"), "development.toml");
-        assert_eq!(router_config_file_name("integ"), "development.toml");
-        // Every environment the bundle carries is resolvable from its file name,
-        // and back — the producer and the consumer read one table.
-        for env in REPLAY_ENV_CONFIGS {
-            assert_eq!(
-                env_config_for_file_name(env.config_file_name).map(|e| e.run_env),
-                Some(env.run_env)
-            );
-            assert_eq!(router_config_file_name(env.run_env), env.config_file_name);
-        }
-    }
-
-    // ── fail closed ────────────────────────────────────────────────────────
+    // ── the file layer: paths in, no layout knowledge ──────────────────────
 
     fn write(dir: &std::path::Path, rel: &str, body: &str) {
         let p = dir.join(rel);
@@ -820,150 +638,134 @@ z = 1
     }
 
     #[test]
-    fn a_bundle_without_this_environments_config_is_refused_by_name() {
+    fn a_missing_candidate_config_is_refused_and_nothing_is_written() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let bundle = tmp.path().join("codebundle");
-        std::fs::create_dir_all(&bundle).expect("mkdir bundle");
-        // Only production is present; this replay is sandbox.
-        write(&bundle, "config/deployments/production.toml", "a = 1\n");
         write(tmp.path(), "recorded.toml", "b = 2\n");
+        let out = tmp.path().join("out/boot.toml");
 
         let err = layer_config_files(
-            &bundle,
+            &tmp.path().join("bundle/some/where/base.toml"),
             &tmp.path().join("recorded.toml"),
-            &tmp.path().join("out/sandbox.toml"),
-            Some("sandbox"),
-            Some("s3://bucket/codebundles/deadbeef/bundle-v2.tar"),
+            &out,
+            Some("s3://bucket/codebundles/deadbeef/migrations.tar"),
         )
         .expect_err("must refuse");
-        assert!(err.contains("sandbox"), "must name the environment: {err}");
         assert!(
-            err.contains("config/deployments/sandbox.toml"),
-            "must name the file it looked for: {err}"
+            err.contains("bundle/some/where/base.toml"),
+            "must name the file it expected: {err}"
         );
         assert!(
-            err.contains("s3://bucket/codebundles/deadbeef/bundle-v2.tar"),
-            "must name the bundle that failed to deliver it: {err}"
+            err.contains("s3://bucket/codebundles/deadbeef/migrations.tar"),
+            "must name what was supposed to deliver it: {err}"
         );
         assert!(
-            !tmp.path().join("out/sandbox.toml").exists(),
+            !out.exists() && !provenance_path(&out).exists(),
             "nothing may be written when the base layer is missing"
         );
     }
 
+    /// The stale-bundle diagnosis, without knowing what any file MEANS: say
+    /// what was expected and show what the delivery actually produced. A reader
+    /// who knows the system recognises an old bundle instantly; this module
+    /// never has to.
     #[test]
-    fn a_pre_change_bundle_with_a_uri_names_the_object_to_drop() {
+    fn a_missing_candidate_config_shows_what_was_delivered_instead() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let bundle = tmp.path().join("codebundle");
-        write(&bundle, "config/docker_compose.toml", "a = 1\n");
         write(tmp.path(), "recorded.toml", "b = 2\n");
-        let uri = "s3://bucket/codebundles/65e1ccbb85/migrations.tar";
+        write(tmp.path(), "bundle/cfg/older-thing.toml", "a = 1\n");
+        write(tmp.path(), "bundle/cfg/another.toml", "a = 1\n");
+
         let err = layer_config_files(
-            &bundle,
+            &tmp.path().join("bundle/cfg/wanted.toml"),
             &tmp.path().join("recorded.toml"),
-            &tmp.path().join("out/sandbox.toml"),
-            Some("sandbox"),
-            Some(uri),
+            &tmp.path().join("out/boot.toml"),
+            None,
         )
         .expect_err("must refuse");
+        assert!(err.contains("wanted.toml"), "{err}");
         assert!(
-            err.contains(&format!("Drop that stale object ({uri})")),
-            "the remedy must name the exact object, which also names the ref: {err}"
+            err.contains("another.toml") && err.contains("older-thing.toml"),
+            "must list what the delivery actually produced: {err}"
         );
     }
 
+    /// The expected file's own directory may not exist at all — that is the
+    /// shape a bundle takes when a whole subtree is missing. Walk up to
+    /// something real rather than reporting nothing.
     #[test]
-    fn a_pre_change_bundle_is_named_as_such() {
+    fn the_listing_walks_up_to_a_directory_that_exists() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let bundle = tmp.path().join("codebundle");
-        std::fs::create_dir_all(&bundle).expect("mkdir bundle");
-        // The v1 bundle shape: docker_compose.toml and no per-environment config.
-        write(&bundle, "config/docker_compose.toml", "a = 1\n");
         write(tmp.path(), "recorded.toml", "b = 2\n");
+        write(tmp.path(), "bundle/cfg/present.toml", "a = 1\n");
 
         let err = layer_config_files(
-            &bundle,
+            &tmp.path().join("bundle/cfg/deeper/still/wanted.toml"),
             &tmp.path().join("recorded.toml"),
-            &tmp.path().join("out/sandbox.toml"),
-            Some("sandbox"),
+            &tmp.path().join("out/boot.toml"),
             None,
         )
         .expect_err("must refuse");
         assert!(
-            err.contains("config/docker_compose.toml") && err.contains("staged before"),
-            "a bundle that predates the change must say so, not report a bare missing file: {err}"
-        );
-        assert!(
-            err.contains("config/deployments/sandbox.toml"),
-            "must name the environment's config file it expected: {err}"
-        );
-        assert!(
-            err.contains("Drop the stale bundle object") && err.contains("re-run"),
-            "must say what to do about it — detection without a remedy is just a bare error: \
-             {err}"
+            err.contains("present.toml"),
+            "must climb to the nearest existing directory and list it: {err}"
         );
     }
 
     #[test]
-    fn a_missing_recorded_config_is_refused_too() {
+    fn a_missing_over_config_is_refused_too() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let bundle = tmp.path().join("codebundle");
-        write(&bundle, "config/deployments/sandbox.toml", "a = 1\n");
+        write(tmp.path(), "base.toml", "a = 1\n");
         let err = layer_config_files(
-            &bundle,
+            &tmp.path().join("base.toml"),
             &tmp.path().join("nope.toml"),
-            &tmp.path().join("out/sandbox.toml"),
-            Some("sandbox"),
+            &tmp.path().join("out/boot.toml"),
             None,
         )
         .expect_err("must refuse");
-        assert!(err.contains("recorded router config"), "{err}");
+        assert!(err.contains("--over"), "{err}");
     }
 
     #[test]
     fn the_written_file_is_the_merge_and_carries_its_provenance() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let bundle = tmp.path().join("codebundle");
         write(
-            &bundle,
-            "config/deployments/sandbox.toml",
-            "[connectors]\nadyen.base_url = \"https://cand.adyen\"\nilixium.base_url = \"https://ili\"\n",
+            tmp.path(),
+            "base.toml",
+            "[connectors]\nwise.base_url = \"https://cand.wise\"\nnewthing.base_url = \"https://new\"\n",
         );
         write(
             tmp.path(),
             "recorded.toml",
-            "[connectors]\nadyen.base_url = \"https://rec.adyen\"\n",
+            "[connectors]\nwise.base_url = \"https://rec.wise\"\n",
         );
-        let out = tmp.path().join("out/sandbox.toml");
-        let (env, report) = layer_config_files(
-            &bundle,
+        let out = tmp.path().join("out/boot.toml");
+        let report = layer_config_files(
+            &tmp.path().join("base.toml"),
             &tmp.path().join("recorded.toml"),
             &out,
-            Some("sandbox"),
             None,
         )
         .expect("layering succeeds");
-        assert_eq!(env.run_env, "sandbox");
 
         let merged: toml::Table =
             toml::from_str(&std::fs::read_to_string(&out).expect("read out")).expect("valid toml");
         assert_eq!(
-            merged["connectors"]["adyen"]["base_url"].as_str(),
-            Some("https://rec.adyen"),
+            merged["connectors"]["wise"]["base_url"].as_str(),
+            Some("https://rec.wise"),
             "the recording stays authoritative for a key it sets"
         );
         assert_eq!(
-            merged["connectors"]["ilixium"]["base_url"].as_str(),
-            Some("https://ili"),
+            merged["connectors"]["newthing"]["base_url"].as_str(),
+            Some("https://new"),
             "the candidate fills a key the recording never knew about"
         );
         assert_eq!(
             report.carried,
-            vec!["connectors.ilixium.base_url".to_owned()]
+            vec!["connectors.newthing.base_url".to_owned()]
         );
 
         let prov = std::fs::read_to_string(provenance_path(&out)).expect("provenance written");
-        assert!(prov.contains("connectors.ilixium.base_url"));
+        assert!(prov.contains("connectors.newthing.base_url"));
 
         #[cfg(unix)]
         {
@@ -972,7 +774,8 @@ z = 1
             assert_eq!(
                 mode & 0o777,
                 0o644,
-                "the router runs as an unprivileged user and must be able to read this"
+                "the candidate may run as a different, unprivileged user and must be able to \
+                 read this"
             );
         }
     }
