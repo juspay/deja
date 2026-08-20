@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use deja_kernel::{
-    compare_response, group_by_correlation, project_body, reconstruct_driver_request,
+    compare_response, group_by_correlation, grpc, project_body, reconstruct_driver_request,
     BoundaryEvent, DriverRequest, HttpDiff,
 };
 
@@ -140,6 +140,12 @@ fn run() -> Result<(), String> {
     let sink = std::sync::Mutex::new(&mut sink_file);
     let write_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+    // Optional: a compiled FileDescriptorSet for gRPC-ingress correlations.
+    // With it, decoded-only recorded requests can be re-encoded and response
+    // diffs are field-level proto3-JSON; without it, gRPC drives run on raw
+    // recorded bytes and compare byte-exact.
+    let descriptor_pool = grpc::descriptor_pool_from_env();
+
     // Drive ONE correlation: reconstruct its request, stamp the recorded
     // correlation as `x-request-id` (the replay router runs IdReuse::UseIncoming,
     // so its time/id/db replay lookups key off the SAME correlation that was
@@ -182,9 +188,51 @@ fn run() -> Result<(), String> {
                         .unwrap_or_default(),
                 );
             }
-            None => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            }
+            // Not HTTP-shaped: a gRPC ingress (drivable over HTTP/2) or no
+            // ingress at all (background-only correlation — the existing skip).
+            None => match grpc::reconstruct_grpc_request(events, descriptor_pool.as_ref()) {
+                Some(grpc_driver) => {
+                    let outcome = grpc::drive_grpc(&target_host, target_port, &grpc_driver);
+                    let diff = grpc::compare_grpc_response(
+                        &grpc_driver,
+                        &outcome,
+                        descriptor_pool.as_ref(),
+                        &allowlist,
+                    );
+                    {
+                        let mut file = sink.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Err(e) = write_diff(&mut file, &diff) {
+                            let mut slot = write_err.lock().unwrap_or_else(|p| p.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(format!("write diff: {e}"));
+                            }
+                        }
+                    }
+                    driven.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "deja-kernel: drove {cid} → grpc {} (status {} vs {}, body diffs {}{})",
+                        grpc_driver.rpc,
+                        diff.status_candidate,
+                        diff.status_baseline,
+                        diff.body_diff.len(),
+                        diff.transport_error
+                            .as_deref()
+                            .map(|e| format!("; NO RESPONSE: {e}"))
+                            .unwrap_or_default(),
+                    );
+                }
+                None => {
+                    if grpc::has_grpc_ingress(events) {
+                        // A gRPC ingress we could not reconstruct: recorded
+                        // decoded-only and no KERNEL_DESCRIPTOR_SET to re-encode
+                        // it. Named loudly — this skip shrinks coverage.
+                        eprintln!(
+                            "deja-kernel: SKIP {cid} — gRPC ingress recorded without raw bytes and no KERNEL_DESCRIPTOR_SET to re-encode it"
+                        );
+                    }
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                }
+            },
         }
     };
 
