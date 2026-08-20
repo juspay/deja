@@ -27,6 +27,11 @@ rust-embed = "8"
 # migrations initContainer unpacks the candidate's CodeBundle tar). Self-
 # contained so the runner does not depend on a `tar` binary being in the image.
 tar = "0.4"
+# TOML with a value DOM (`toml::Table`), for layering the candidate's own router
+# config under the recorded one (`config_layer`). A table-aware merge is the
+# whole point: two `[connectors]` tables concatenated is a duplicate-key parse
+# error, so text splicing cannot do this job.
+toml = "0.8"
 # gunzip the source repo tarball (git-host codeload) when the control plane
 # produces a candidate's migration bundle straight from its ref — streamed, so
 # only the migrations/ subtree is held, not the whole repo.

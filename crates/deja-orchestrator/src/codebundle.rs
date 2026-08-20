@@ -178,35 +178,74 @@ pub fn manifest_from_repo(repo_dir: &Path, sha: &str) -> Result<SchemaFingerprin
     Ok(fp)
 }
 
-/// The candidate config files the replay Job boots the router against, carried in
-/// the bundle alongside `migrations/` (config structure = f(candidate)):
-///   - `config/docker_compose.toml`     — the router's self-sufficient base config
-///     (passed as `-f`); the delta-complete key set a newer candidate may need.
-///   - `config/superposition_seed.toml` — the offline Superposition fallback the
-///     router reads when the live service is unreachable (always, in the sealed
-///     replay pod).
+/// The env var naming the candidate-ref files the bundle carries ALONGSIDE
+/// `migrations/`, as repo-relative paths separated by commas or whitespace.
+pub const CANDIDATE_CONFIG_FILES_ENV: &str = "DEJA_CANDIDATE_CONFIG_FILES";
+
+/// The candidate-ref files the bundle carries alongside `migrations/` — the
+/// system under test's own config at `sha_C`, whatever that system calls it and
+/// wherever it keeps it.
 ///
-/// The frozen image bakes neither at a usable path (only
-/// `payment_required_fields_v2.toml`), so both ride the bundle rather than
-/// being copied into infra.
-const CANDIDATE_CONFIG_FILES: [&str; 2] = [
-    "config/docker_compose.toml",
-    "config/superposition_seed.toml",
-];
+/// This is DEPLOYMENT DATA, not a constant. Which files a candidate needs, and
+/// where in its repo they live, is a fact about the system being replayed, and
+/// baking it here would mean this crate had to be edited every time that system
+/// rearranged its own directory — and would silently mean the wrong thing the
+/// first time a second system was replayed. The deployment that mounts these
+/// files into the Job already knows their names; it says them once, here.
+///
+/// Empty (the default) means the bundle carries migrations only. That is not
+/// silent: the layering step in the Job then refuses by name, saying which path
+/// it expected and listing what the bundle actually delivered.
+///
+/// Per-system extension, when `system_under_test` lands: read
+/// `DEJA_<SYSTEM>_CANDIDATE_CONFIG_FILES` for a non-default system and fall
+/// back to *nothing* rather than to this list — borrowing another system's
+/// paths is the failure mode `config_source_for` already refuses to have. That
+/// needs `RunSpec::system()` threaded to [`produce_tar`]; until then there is
+/// one list, which is exactly as many systems as the bundle producer is
+/// reached for today.
+fn candidate_config_files() -> Vec<String> {
+    candidate_config_files_from(std::env::var(CANDIDATE_CONFIG_FILES_ENV).ok().as_deref())
+}
+
+/// Parse the setting: comma- or whitespace-separated repo-relative paths.
+/// Separated from the environment so it is testable, and so a malformed entry
+/// (absolute, or climbing out of the repo) is dropped HERE rather than becoming
+/// a `git archive` pathspec that means something unintended.
+fn candidate_config_files_from(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter(|p| !p.starts_with('/') && !p.split('/').any(|seg| seg == ".."))
+        .map(str::to_owned)
+        .collect()
+}
 
 /// The candidate's `migrations/` tree at `sha` as a tar (git archive reads the
 /// tree object directly — no working-tree checkout). This is the bundle the
 /// Job initContainer pulls and extracts so the runner APPLIES the candidate's
 /// migrations, not the harness's.
 pub fn produce_tar(repo_dir: &Path, sha: &str) -> Result<Vec<u8>, String> {
-    // The candidate's self-sufficient config rides alongside migrations, so the
-    // Job boots the router `-f` it and gets the candidate's FULL (delta-complete)
-    // key set — config structure is a function of the candidate, exactly like
-    // migrations; sbx-specific VALUES layer on as ROUTER__* env at run time.
-    // `git archive` fails on a pathspec that matches nothing, so each config file
-    // in CANDIDATE_CONFIG_FILES is included only when the ref actually has it.
+    // The candidate's own per-environment configs ride alongside migrations, so
+    // the Job's layering step can put this environment's one UNDER the recorded
+    // config and reach the candidate's FULL (delta-complete) key set — config
+    // structure is a function of the candidate, exactly like migrations. The
+    // recorded VALUES stay authoritative for every key they set.
+    // `git archive` fails on a pathspec that matches nothing, so each configured
+    // file is included only when the ref actually has it.
+    let configured = candidate_config_files();
+    if configured.is_empty() {
+        // Not a silent omission: the layering step in the Job refuses by name
+        // when the file it was told to expect is not in the bundle, but that is
+        // one pod away and this is where the decision was made.
+        eprintln!(
+            "codebundle: {CANDIDATE_CONFIG_FILES_ENV} is unset, so the bundle for {sha} carries \
+             migrations only and no candidate config"
+        );
+    }
     let mut pathspecs: Vec<&str> = vec!["migrations"];
-    for cfg_file in CANDIDATE_CONFIG_FILES {
+    for cfg_file in &configured {
         let blob = format!("{sha}:{cfg_file}");
         let present = Command::new("git")
             .arg("-C")
@@ -274,13 +313,16 @@ fn strip_to_root_migrations(path: &str) -> Option<String> {
     Some(path[idx + 1..].to_owned())
 }
 
-/// `<top>/config/<f>` → `config/<f>` for each candidate config file in
-/// [`CANDIDATE_CONFIG_FILES`] (the base router config and the offline Superposition
-/// fallback), carried alongside `migrations/` (config structure = f(candidate);
-/// see [`produce_tar`]). `<top>` must be a single repo-root segment (so
+/// `<top>/<repo-path>` → `<repo-path>` for each repo-relative path the
+/// deployment configured (see [`candidate_config_files`]), carried alongside
+/// `migrations/`. `<top>` must be a single repo-root segment (so
 /// `crates/x/config/…` is ignored). `None` for anything else.
-fn strip_to_root_config(path: &str) -> Option<String> {
-    for cfg_file in CANDIDATE_CONFIG_FILES {
+///
+/// The list is a parameter rather than read from the environment here: the
+/// entry points read the setting once, which keeps this pure and lets a test
+/// state the list instead of mutating process-global env.
+fn strip_to_root_config(path: &str, configured: &[String]) -> Option<String> {
+    for cfg_file in configured {
         let needle = format!("/{cfg_file}");
         if let Some(idx) = path.find(&needle) {
             // Must sit at the repo root: the top segment before it has no '/'.
@@ -295,15 +337,16 @@ fn strip_to_root_config(path: &str) -> Option<String> {
 
 /// Build the canonical migration bundle from a gzipped repo tarball (the shape
 /// a git host's codeload serves: every path wrapped in a single `{repo}-{sha}/`
-/// top dir). Keeps root-level `migrations/` files plus `config/docker_compose.toml`
-/// (the candidate's base config), rewrites their paths to the canonical form, and
-/// returns `(bundle_tar, fingerprint)` (the fingerprint is migrations-only).
+/// top dir). Keeps root-level `migrations/` files plus each repo-relative path
+/// in `configured`, rewrites their paths to the canonical form, and returns
+/// `(bundle_tar, fingerprint)` (the fingerprint is migrations-only).
 ///
 /// Streamed: the gzip is decoded on the fly and non-migration entries are
 /// skipped without buffering, so only the (small) `migrations/` content is held
 /// — not the whole repo. Separated from the network for testing.
 pub fn bundle_migrations_from_targz<R: Read>(
     src: R,
+    configured: &[String],
 ) -> Result<(Vec<u8>, SchemaFingerprint), String> {
     let gz = flate2::read::GzDecoder::new(src);
     let mut archive = tar::Archive::new(gz);
@@ -330,7 +373,7 @@ pub fn bundle_migrations_from_targz<R: Read>(
                     versions.push(version_of(dir).to_owned());
                 }
                 m
-            } else if let Some(c) = strip_to_root_config(&path) {
+            } else if let Some(c) = strip_to_root_config(&path, configured) {
                 // The candidate's base config rides alongside migrations; it does
                 // NOT contribute to the migration fingerprint.
                 c
@@ -400,7 +443,7 @@ pub fn bundle_from_tarball_url(url: &str) -> Result<(Vec<u8>, SchemaFingerprint)
         .get(url)
         .call()
         .map_err(|e| format!("fetch repo tarball {url}: {e}"))?;
-    bundle_migrations_from_targz(resp.into_reader())
+    bundle_migrations_from_targz(resp.into_reader(), &candidate_config_files())
 }
 
 /// The candidate's expected migration set read back from an ALREADY-STAGED
@@ -613,24 +656,28 @@ mod tests {
                     "migrations/00000000000000_diesel_initial_setup/up.sql",
                     b"-- up",
                 ),
-                // The candidate's self-sufficient config — both files kept alongside migrations.
+                // Whatever the deployment configured — these paths are DATA
+                // here, deliberately not names this crate knows.
+                ("cfg/wanted-a.toml", b"[server]\nhost = \"0.0.0.0\"\n"),
                 (
-                    "config/docker_compose.toml",
+                    "cfg/nested/wanted-b.toml",
                     b"[server]\nhost = \"0.0.0.0\"\n",
                 ),
-                (
-                    "config/superposition_seed.toml",
-                    b"[superposition]\nenabled = false\n",
-                ),
+                // Present in the repo but NOT configured: must not ride along.
+                ("cfg/not-configured.toml", b"[server]\nhost = \"0.0.0.0\"\n"),
                 // NOT under root migrations/ — must be ignored.
                 ("crates/diesel_models/migrations/x/up.sql", b"-- nope"),
                 // NOT root-level config — must be ignored.
-                ("crates/x/config/docker_compose.toml", b"-- nope"),
-                ("crates/x/config/superposition_seed.toml", b"-- nope"),
+                ("crates/x/cfg/wanted-a.toml", b"-- nope"),
+                ("crates/x/cfg/nested/wanted-b.toml", b"-- nope"),
                 ("README.md", b"readme"),
             ],
         );
-        let (bundle, fp) = bundle_migrations_from_targz(&targz[..]).expect("produce");
+        let configured = [
+            "cfg/wanted-a.toml".to_owned(),
+            "cfg/nested/wanted-b.toml".to_owned(),
+        ];
+        let (bundle, fp) = bundle_migrations_from_targz(&targz[..], &configured).expect("produce");
         // Two distinct versions, root-level only (the crates/ ones dropped). The
         // config file does NOT contribute to the migration fingerprint.
         assert_eq!(
@@ -644,21 +691,67 @@ mod tests {
         let extracted =
             fingerprint_from_migrations_dir(&dest.path().join("migrations")).expect("fingerprint");
         assert_eq!(extracted.applied, fp.applied);
-        // The candidate's config rode along at the canonical root paths (so the Job
-        // boots the router `-f config/docker_compose.toml` and points its offline
-        // Superposition fallback at config/superposition_seed.toml), and only the
-        // root-level ones — the crates/ decoys were dropped.
+        // Each CONFIGURED path rode along at its canonical root path, and only
+        // the root-level ones — the crates/ decoys were dropped.
+        for want in &configured {
+            assert!(
+                dest.path().join(want).is_file(),
+                "{want} was configured and must be carried in the bundle"
+            );
+        }
+        // A config file the deployment did NOT name is not carried. Which files
+        // matter is the deployment's call, not this crate's.
         assert!(
-            dest.path().join("config/docker_compose.toml").is_file(),
-            "config/docker_compose.toml must be carried in the bundle"
-        );
-        assert!(
-            dest.path().join("config/superposition_seed.toml").is_file(),
-            "config/superposition_seed.toml must be carried in the bundle"
+            !dest.path().join("cfg/not-configured.toml").exists(),
+            "an unconfigured file must not ride along"
         );
         // And reading the bundle back directly (the S3-cache path) agrees.
         let cached = fingerprint_from_bundle_tar_bytes(&bundle).expect("cache fp");
         assert_eq!(cached.applied, fp.applied);
+    }
+
+    /// Which files matter in the candidate's repo is the DEPLOYMENT's call, so
+    /// the setting is parsed as data — and a path that could mean something
+    /// unintended as a `git archive` pathspec is dropped here rather than
+    /// handed to git.
+    #[test]
+    fn the_configured_file_list_is_parsed_as_data_and_sanitised() {
+        assert!(candidate_config_files_from(None).is_empty());
+        assert!(candidate_config_files_from(Some("   ")).is_empty());
+        assert_eq!(
+            candidate_config_files_from(Some("a/one.toml, b/two.toml")),
+            vec!["a/one.toml".to_owned(), "b/two.toml".to_owned()]
+        );
+        // Whitespace and newlines separate too, so the value can be written as a
+        // YAML block in a chart without becoming one long path.
+        assert_eq!(
+            candidate_config_files_from(Some("a/one.toml\n  b/two.toml\t c/three.toml")),
+            vec![
+                "a/one.toml".to_owned(),
+                "b/two.toml".to_owned(),
+                "c/three.toml".to_owned()
+            ]
+        );
+        // Escaping the repo is not expressible: an absolute path or a `..`
+        // segment is dropped, not passed to git.
+        assert_eq!(
+            candidate_config_files_from(Some("/etc/passwd, ../../secrets.toml, ok/keep.toml")),
+            vec!["ok/keep.toml".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_exact_rendered_chart_value_parses() {
+        let rendered = "config/deployments/sandbox.toml, config/deployments/production.toml, config/development.toml, config/superposition_seed.toml";
+        assert_eq!(
+            candidate_config_files_from(Some(rendered)),
+            vec![
+                "config/deployments/sandbox.toml".to_owned(),
+                "config/deployments/production.toml".to_owned(),
+                "config/development.toml".to_owned(),
+                "config/superposition_seed.toml".to_owned(),
+            ]
+        );
     }
 
     #[test]
