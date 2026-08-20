@@ -58,7 +58,6 @@ export default function NewRunPage() {
   const [params] = useSearchParams();
   const debug = useDebug();
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
-  const [systemUnderTest, setSystemUnderTest] = React.useState("hyperswitch");
   const [imageRef, setImageRef] = React.useState("");
   const [candidateRepo, setCandidateRepo] = React.useState("");
   const [s3Path, setS3Path] = React.useState("");
@@ -125,9 +124,6 @@ export default function NewRunPage() {
       // (auto-resolved when the prefix holds exactly one session).
       recording_id: recordingId.trim() || (s3Path ? null : "<recording_id>"),
     };
-    // hyperswitch is the wire default; only a non-default system is sent, so
-    // existing curl recipes and stored rows keep meaning what they meant.
-    if (systemUnderTest !== "hyperswitch") spec.system_under_test = systemUnderTest;
     if (s3Path) spec.s3_source = { path: s3Path };
     if (candidateRepo.trim()) spec.candidate_repo = candidateRepo.trim();
     // The DEFAULT IS SENT, not left implicit, whenever the ids are knowable:
@@ -138,7 +134,7 @@ export default function NewRunPage() {
     if (scope.length) spec.correlation_filter = scope;
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [candidateRepo, expectation, imageRef, recordingId, s3Path, scope, systemUnderTest]);
+  }, [candidateRepo, expectation, imageRef, recordingId, s3Path, scope]);
 
   const curlCommand = React.useMemo(
     () =>
@@ -276,22 +272,6 @@ export default function NewRunPage() {
             />
           </label>
         )}
-
-        <label>
-          system under test{" "}
-          <span className="hint">
-            (which recorded system this run replays — selects the candidate's
-            env-binding profile; recordings from either system replay under the
-            same harness)
-          </span>
-          <select
-            value={systemUnderTest}
-            onChange={(e) => setSystemUnderTest(e.target.value)}
-          >
-            <option value="hyperswitch">hyperswitch</option>
-            <option value="prism">prism (UCS)</option>
-          </select>
-        </label>
 
         <label>
           candidate image{" "}
