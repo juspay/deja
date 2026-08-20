@@ -178,35 +178,61 @@ pub fn manifest_from_repo(repo_dir: &Path, sha: &str) -> Result<SchemaFingerprin
     Ok(fp)
 }
 
-/// The candidate config files the replay Job boots the router against, carried in
-/// the bundle alongside `migrations/` (config structure = f(candidate)):
-///   - `config/docker_compose.toml`     — the router's self-sufficient base config
-///     (passed as `-f`); the delta-complete key set a newer candidate may need.
-///   - `config/superposition_seed.toml` — the offline Superposition fallback the
-///     router reads when the live service is unreachable (always, in the sealed
-///     replay pod).
+/// The offline Superposition fallback the router reads when the live service is
+/// unreachable — always, in the sealed replay pod. Not environment-specific.
+const CANDIDATE_SUPERPOSITION_SEED: &str = "config/superposition_seed.toml";
+
+/// The candidate config files carried in the bundle alongside `migrations/`
+/// (config structure = f(candidate)):
+///   - one router config PER REPLAY ENVIRONMENT, from
+///     [`crate::config_layer::REPLAY_ENV_CONFIGS`] — the file the candidate's own
+///     deployment would boot for that `RUN_ENV`. The layering step picks the one
+///     this replay's environment names and puts it UNDER the recorded config, so
+///     it supplies only the keys the recording never specified (a connector added
+///     after the recording was taken).
+///   - [`CANDIDATE_SUPERPOSITION_SEED`].
 ///
-/// The frozen image bakes neither at a usable path (only
-/// `payment_required_fields_v2.toml`), so both ride the bundle rather than
-/// being copied into infra.
-const CANDIDATE_CONFIG_FILES: [&str; 2] = [
-    "config/docker_compose.toml",
-    "config/superposition_seed.toml",
-];
+/// The bundle carries every environment because it is keyed by sha alone, not by
+/// (sha, environment); which one applies is decided per run, in the pod.
+///
+/// Each rides at its REPO path, so the bundle entry's own name says which
+/// environment it is. It deliberately does NOT carry `config/docker_compose.toml`:
+/// that is the local docker-compose config, and nothing keeps it tracking any
+/// deployed environment. Using it as the base layer fills a gap with an address
+/// the recorded environment never used — and an outgoing call's URL is part of
+/// its boundary identity, so that is a divergence per call rather than an honest
+/// boot failure. Measured at one real candidate ref against the recorded sandbox
+/// config, it would supply 288 keys the recording never specified, against 9 for
+/// the environment-matched file — including `key_manager.url` and
+/// `internal_services.payments_base_url` on localhost. For a production tape it
+/// would fill gaps with TEST endpoints.
+///
+/// The frozen image bakes none of these at a usable path (its Dockerfile copies
+/// only `payment_required_fields_v2.toml` into `CONFIG_DIR`), so they ride the
+/// bundle rather than being copied into infra.
+fn candidate_config_files() -> Vec<&'static str> {
+    let mut files: Vec<&'static str> = crate::config_layer::REPLAY_ENV_CONFIGS
+        .iter()
+        .map(|e| e.repo_path)
+        .collect();
+    files.push(CANDIDATE_SUPERPOSITION_SEED);
+    files
+}
 
 /// The candidate's `migrations/` tree at `sha` as a tar (git archive reads the
 /// tree object directly — no working-tree checkout). This is the bundle the
 /// Job initContainer pulls and extracts so the runner APPLIES the candidate's
 /// migrations, not the harness's.
 pub fn produce_tar(repo_dir: &Path, sha: &str) -> Result<Vec<u8>, String> {
-    // The candidate's self-sufficient config rides alongside migrations, so the
-    // Job boots the router `-f` it and gets the candidate's FULL (delta-complete)
-    // key set — config structure is a function of the candidate, exactly like
-    // migrations; sbx-specific VALUES layer on as ROUTER__* env at run time.
+    // The candidate's own per-environment configs ride alongside migrations, so
+    // the Job's layering step can put this environment's one UNDER the recorded
+    // config and reach the candidate's FULL (delta-complete) key set — config
+    // structure is a function of the candidate, exactly like migrations. The
+    // recorded VALUES stay authoritative for every key they set.
     // `git archive` fails on a pathspec that matches nothing, so each config file
-    // in CANDIDATE_CONFIG_FILES is included only when the ref actually has it.
+    // in `candidate_config_files()` is included only when the ref actually has it.
     let mut pathspecs: Vec<&str> = vec!["migrations"];
-    for cfg_file in CANDIDATE_CONFIG_FILES {
+    for cfg_file in candidate_config_files() {
         let blob = format!("{sha}:{cfg_file}");
         let present = Command::new("git")
             .arg("-C")
@@ -274,13 +300,14 @@ fn strip_to_root_migrations(path: &str) -> Option<String> {
     Some(path[idx + 1..].to_owned())
 }
 
-/// `<top>/config/<f>` → `config/<f>` for each candidate config file in
-/// [`CANDIDATE_CONFIG_FILES`] (the base router config and the offline Superposition
-/// fallback), carried alongside `migrations/` (config structure = f(candidate);
-/// see [`produce_tar`]). `<top>` must be a single repo-root segment (so
-/// `crates/x/config/…` is ignored). `None` for anything else.
+/// `<top>/<repo-path>` → `<repo-path>` for each candidate config file in
+/// [`candidate_config_files`] (one router config per replay environment, plus the
+/// offline Superposition fallback), carried alongside `migrations/` (config
+/// structure = f(candidate); see [`produce_tar`]). `<top>` must be a single
+/// repo-root segment (so `crates/x/config/…` is ignored). `None` for anything
+/// else.
 fn strip_to_root_config(path: &str) -> Option<String> {
-    for cfg_file in CANDIDATE_CONFIG_FILES {
+    for cfg_file in candidate_config_files() {
         let needle = format!("/{cfg_file}");
         if let Some(idx) = path.find(&needle) {
             // Must sit at the repo root: the top segment before it has no '/'.
@@ -295,9 +322,9 @@ fn strip_to_root_config(path: &str) -> Option<String> {
 
 /// Build the canonical migration bundle from a gzipped repo tarball (the shape
 /// a git host's codeload serves: every path wrapped in a single `{repo}-{sha}/`
-/// top dir). Keeps root-level `migrations/` files plus `config/docker_compose.toml`
-/// (the candidate's base config), rewrites their paths to the canonical form, and
-/// returns `(bundle_tar, fingerprint)` (the fingerprint is migrations-only).
+/// top dir). Keeps root-level `migrations/` files plus the candidate config files
+/// (see [`candidate_config_files`]), rewrites their paths to the canonical form,
+/// and returns `(bundle_tar, fingerprint)` (the fingerprint is migrations-only).
 ///
 /// Streamed: the gzip is decoded on the fly and non-migration entries are
 /// skipped without buffering, so only the (small) `migrations/` content is held
@@ -613,19 +640,30 @@ mod tests {
                     "migrations/00000000000000_diesel_initial_setup/up.sql",
                     b"-- up",
                 ),
-                // The candidate's self-sufficient config — both files kept alongside migrations.
+                // The candidate's own config, one per replay environment, kept
+                // alongside migrations.
                 (
-                    "config/docker_compose.toml",
+                    "config/deployments/sandbox.toml",
                     b"[server]\nhost = \"0.0.0.0\"\n",
                 ),
+                (
+                    "config/deployments/production.toml",
+                    b"[server]\nhost = \"0.0.0.0\"\n",
+                ),
+                ("config/development.toml", b"[server]\nhost = \"0.0.0.0\"\n"),
                 (
                     "config/superposition_seed.toml",
                     b"[superposition]\nenabled = false\n",
                 ),
+                // The local docker-compose config: deliberately NOT carried.
+                (
+                    "config/docker_compose.toml",
+                    b"[server]\nhost = \"0.0.0.0\"\n",
+                ),
                 // NOT under root migrations/ — must be ignored.
                 ("crates/diesel_models/migrations/x/up.sql", b"-- nope"),
                 // NOT root-level config — must be ignored.
-                ("crates/x/config/docker_compose.toml", b"-- nope"),
+                ("crates/x/config/deployments/sandbox.toml", b"-- nope"),
                 ("crates/x/config/superposition_seed.toml", b"-- nope"),
                 ("README.md", b"readme"),
             ],
@@ -644,17 +682,30 @@ mod tests {
         let extracted =
             fingerprint_from_migrations_dir(&dest.path().join("migrations")).expect("fingerprint");
         assert_eq!(extracted.applied, fp.applied);
-        // The candidate's config rode along at the canonical root paths (so the Job
-        // boots the router `-f config/docker_compose.toml` and points its offline
-        // Superposition fallback at config/superposition_seed.toml), and only the
-        // root-level ones — the crates/ decoys were dropped.
-        assert!(
-            dest.path().join("config/docker_compose.toml").is_file(),
-            "config/docker_compose.toml must be carried in the bundle"
-        );
+        // The candidate's config rode along at the canonical root paths — one per
+        // replay environment, under the name that says WHICH environment it is,
+        // so the layering step cannot pick up the wrong one; plus the offline
+        // Superposition fallback. Only the root-level ones: the crates/ decoys
+        // were dropped.
+        for env in crate::config_layer::REPLAY_ENV_CONFIGS {
+            assert!(
+                dest.path().join(env.repo_path).is_file(),
+                "{} must be carried in the bundle for environment {}",
+                env.repo_path,
+                env.run_env
+            );
+        }
         assert!(
             dest.path().join("config/superposition_seed.toml").is_file(),
             "config/superposition_seed.toml must be carried in the bundle"
+        );
+        // And the local docker-compose config is NOT carried. It tracks no
+        // deployed environment, so as a base layer it fills gaps with addresses
+        // the recorded environment never used — a divergence per call, which
+        // scores as a regression, rather than an honest boot failure.
+        assert!(
+            !dest.path().join("config/docker_compose.toml").exists(),
+            "config/docker_compose.toml must NOT be carried — it is not an environment's config"
         );
         // And reading the bundle back directly (the S3-cache path) agrees.
         let cached = fingerprint_from_bundle_tar_bytes(&bundle).expect("cache fp");

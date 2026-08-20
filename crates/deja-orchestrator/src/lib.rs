@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod api;
 pub mod codebundle;
+pub mod config_layer;
 pub mod divergence;
 pub mod executor;
 pub mod lifecycle;

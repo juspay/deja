@@ -42,6 +42,11 @@ fn main() {
         // The migrations initContainer runs this to pull + unpack the candidate's
         // CodeBundle (its migrations/ tree at sha_C) before the runner migrates.
         Some("stage-codebundle") => stage_codebundle(&args[1..]),
+        // The config initContainer runs this to layer the candidate's own
+        // router config for THIS environment UNDER the recorded one, and write
+        // the single file the candidate boots from (the router reads exactly
+        // one config file).
+        Some("layer-config") => layer_config(&args[1..]),
         // No subcommand: drive one replay run (the runner container's job).
         _ => run(),
     };
@@ -64,6 +69,86 @@ fn stage_codebundle(args: &[String]) -> Result<(), String> {
         .ok_or("stage-codebundle: missing <dest-dir> argument")?;
     let n = deja_orchestrator::codebundle::stage_bundle(uri, std::path::Path::new(dest))?;
     eprintln!("deja-runner: staged CodeBundle {uri} -> {dest} ({n} entries)");
+    Ok(())
+}
+
+/// `deja-runner layer-config --bundle <dir> --recorded <toml> --out <toml>` —
+/// produce the ONE config file the candidate router boots from, by layering the
+/// candidate's own config for THIS replay's environment (from the staged
+/// CodeBundle) UNDER the recorded baseline (the mounted ConfigMap).
+///
+/// The environment is not an argument. It comes from `--out`: the path the
+/// router boots from already names it (`/…/sandbox.toml` is the sandbox
+/// environment), and the candidate's `config/deployments/sandbox.toml` is what
+/// goes underneath. `RUN_ENV`, when set, is a CHECK on that, not the source —
+/// a disagreement between the two is refused rather than resolved. This is why
+/// the flag is `--bundle <dir>` and not `--candidate <file>`: a Job template
+/// that never names a candidate config file cannot name the wrong one.
+///
+/// The recording wins at every key it defines; the candidate supplies only what
+/// the recording is silent about — a connector or a required section added
+/// after the recording was taken. See `config_layer` for the merge and the
+/// three balances it asserts.
+fn layer_config(args: &[String]) -> Result<(), String> {
+    let mut bundle: Option<String> = None;
+    let mut recorded: Option<String> = None;
+    let mut out: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let value = || -> Result<String, String> {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("layer-config: {flag} needs a value"))
+        };
+        match flag {
+            "--bundle" => bundle = Some(value()?),
+            "--recorded" => recorded = Some(value()?),
+            "--out" => out = Some(value()?),
+            other => {
+                return Err(format!(
+                    "layer-config: unknown argument {other:?}; expected --bundle <dir> \
+                     --recorded <toml> --out <toml>"
+                ))
+            }
+        }
+        i += 2;
+    }
+
+    let bundle = bundle.ok_or("layer-config: --bundle <dir> is required")?;
+    let recorded = recorded.ok_or("layer-config: --recorded <toml> is required")?;
+    let out = out.ok_or("layer-config: --out <toml> is required")?;
+
+    let nonempty = |v: String| (!v.trim().is_empty()).then_some(v);
+    let run_env = std::env::var("RUN_ENV").ok().and_then(nonempty);
+    let bundle_uri = std::env::var("DEJA_CODE_BUNDLE_URI")
+        .ok()
+        .and_then(nonempty);
+
+    let (env, report) = deja_orchestrator::config_layer::layer_config_files(
+        std::path::Path::new(&bundle),
+        std::path::Path::new(&recorded),
+        std::path::Path::new(&out),
+        run_env.as_deref(),
+        bundle_uri.as_deref(),
+    )?;
+
+    // Which environment's config was resolved, and every key the merge took
+    // from the candidate rather than the recording — by name, at boot, so the
+    // next config surprise is a five-minute diagnosis.
+    eprintln!(
+        "config layering: environment {} -> candidate {} layered under the recorded {}",
+        env.run_env, env.repo_path, recorded,
+    );
+    eprint!(
+        "{}",
+        report.render(&format!("{bundle}/{}", env.repo_path), &recorded)
+    );
+    for (section, n) in deja_orchestrator::config_layer::carried_by_section(&report) {
+        eprintln!("config layering: from candidate, by section: [{section}] x{n}");
+    }
+    eprintln!("deja-runner: layered config written to {out}");
     Ok(())
 }
 
