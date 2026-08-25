@@ -160,10 +160,15 @@ fn resolve_expected_schema(run: &Run) -> Option<(crate::SchemaFingerprint, Strin
         .and_then(|tmpl| resolve_tarball_url(&tmpl, run.spec.candidate_repo.as_deref(), &sha))
     {
         match crate::codebundle::ensure_bundle_staged_from_url(&s3, &url, &sha) {
-            Ok(fp) => {
+            Ok((fp, source)) => {
+                // `source` is the whole point of this line: "staged" used to be
+                // printed whether the object was fetched or found and returned
+                // untouched, which reads as work that did not happen and sends
+                // the next reader looking in the wrong place.
                 eprintln!(
-                    "codebundle: candidate {sha} staged from {url} at {uri}; expects {} \
+                    "codebundle: candidate {sha} from {url} at {uri}; {}; expects {} \
                      migrations (P1 armed)",
+                    source.render(),
                     fp.count()
                 );
                 return Some((fp, uri));
@@ -181,10 +186,11 @@ fn resolve_expected_schema(run: &Run) -> Option<(crate::SchemaFingerprint, Strin
     {
         let repo = std::path::Path::new(&repo);
         match crate::codebundle::ensure_bundle_staged(&s3, repo, &sha) {
-            Ok(fp) => {
+            Ok((fp, source)) => {
                 eprintln!(
-                    "codebundle: candidate {sha} staged from local checkout at {uri}; expects \
+                    "codebundle: candidate {sha} from local checkout at {uri}; {}; expects \
                      {} migrations (P1 armed)",
+                    source.render(),
                     fp.count()
                 );
                 return Some((fp, uri));

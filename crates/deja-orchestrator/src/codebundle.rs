@@ -278,6 +278,111 @@ pub fn produce_tar(repo_dir: &Path, sha: &str) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// Which of `configured` a bundle tar does NOT carry, in the order asked for.
+///
+/// Answered from bytes already in hand: the reuse path downloads the object
+/// anyway to fingerprint its migrations, so this is one more pass over the same
+/// buffer and no extra request.
+pub fn configs_missing_from_bundle_tar(
+    bytes: &[u8],
+    configured: &[String],
+) -> Result<Vec<String>, String> {
+    let mut present = std::collections::BTreeSet::new();
+    let mut archive = tar::Archive::new(io::Cursor::new(bytes));
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("read bundle tar: {e}"))?
+    {
+        let entry = entry.map_err(|e| format!("bundle tar entry: {e}"))?;
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            continue;
+        }
+        present.insert(
+            entry
+                .path()
+                .map_err(|e| format!("entry path: {e}"))?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    Ok(configured
+        .iter()
+        .filter(|want| !present.contains(*want))
+        .cloned()
+        .collect())
+}
+
+/// Where a run's bundle came from. The two cases are indistinguishable from the
+/// outside and cost wildly different things to debug, so the caller says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleSource {
+    /// An object already staged for this sha carried the migrations AND every
+    /// file the deployment asked for, so it was reused untouched.
+    Reused,
+    /// Produced from the candidate ref and uploaded. `replaced_missing` names
+    /// the configured files a previously staged object lacked; empty when there
+    /// was no previous object at all.
+    Staged { replaced_missing: Vec<String> },
+}
+
+impl BundleSource {
+    /// The clause the run log appends, so "I fetched this" and "I found this
+    /// and did nothing" stop reading identically.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Reused => "REUSED the bundle already staged for this sha (not re-fetched)".into(),
+            Self::Staged { replaced_missing } if replaced_missing.is_empty() => {
+                "STAGED a new bundle (none was present for this sha)".into()
+            }
+            Self::Staged { replaced_missing } => format!(
+                "RE-STAGED: the bundle already present for this sha did not carry {replaced_missing:?}, \
+                 which this deployment asks for via {CANDIDATE_CONFIG_FILES_ENV}"
+            ),
+        }
+    }
+}
+
+/// Say so when a freshly produced bundle STILL lacks something the deployment
+/// asked for.
+///
+/// This is reachable and worth a line: a configured path that does not exist at
+/// the candidate ref makes every run re-stage (the reuse check keeps rejecting
+/// the object, the producer keeps rebuilding it without the file) and then fail
+/// at the layering step. That is correct — it fails loudly rather than booting
+/// wrong — but without this line the repeated re-staging looks like a bug in
+/// the cache rather than a path that is simply not in the repo.
+fn warn_if_still_missing(tar: &[u8], configured: &[String], sha: &str) {
+    match configs_missing_from_bundle_tar(tar, configured) {
+        Ok(missing) if !missing.is_empty() => eprintln!(
+            "codebundle: the bundle just produced for {sha} still does not carry {missing:?} — \
+             those paths do not exist at that ref, so every run will re-stage and then refuse at \
+             the config layering step. Fix {CANDIDATE_CONFIG_FILES_ENV} or the ref."
+        ),
+        _ => {}
+    }
+}
+
+/// Can an object already staged for this sha be reused as-is?
+///
+/// `Reused` means exactly "do not fetch, do not put" — the caller returns it
+/// untouched. Anything else is the list of files the deployment asked for that
+/// the object does not carry, which is both the reason to re-stage and the text
+/// the run log prints.
+///
+/// Separated from the S3 plumbing so the decision is testable on bytes: the
+/// question that was being got wrong is not "does the object exist" but "does
+/// it contain what was asked for", and that question is pure.
+pub fn reuse_decision(bytes: &[u8], configured: &[String]) -> Result<BundleSource, String> {
+    let missing = configs_missing_from_bundle_tar(bytes, configured)?;
+    Ok(if missing.is_empty() {
+        BundleSource::Reused
+    } else {
+        BundleSource::Staged {
+            replaced_missing: missing,
+        }
+    })
+}
+
 /// Ensure the candidate's migration bundle is staged in S3 (idempotent by sha)
 /// and return its manifest (the P1 gate's expected set). A bundle already
 /// present for the sha is NOT re-uploaded — the fetch-once-per-sha cache the
@@ -287,15 +392,29 @@ pub fn ensure_bundle_staged(
     cfg: &S3Config,
     repo_dir: &Path,
     sha: &str,
-) -> Result<SchemaFingerprint, String> {
+) -> Result<(SchemaFingerprint, BundleSource), String> {
     let manifest = manifest_from_repo(repo_dir, sha)?;
     let key = bundle_s3_key(sha);
+    let mut replaced_missing = Vec::new();
     if deja_compactor::object_exists(cfg, &key)? {
-        return Ok(manifest);
+        // Reusing an object means asserting it is usable, and "it exists" is a
+        // weaker claim than "it carries what this deployment asked for". A
+        // bundle staged before a file was added to the configured set has the
+        // right migrations and the wrong contents; reusing it strands the run
+        // on a missing base layer that nobody with S3 write access may be
+        // around to clear.
+        let bytes = deja_compactor::get_object_decoded(cfg, &key)?;
+        match reuse_decision(&bytes, &candidate_config_files())? {
+            BundleSource::Reused => return Ok((manifest, BundleSource::Reused)),
+            BundleSource::Staged {
+                replaced_missing: m,
+            } => replaced_missing = m,
+        }
     }
     let tar = produce_tar(repo_dir, sha)?;
+    warn_if_still_missing(&tar, &candidate_config_files(), sha);
     deja_compactor::put_object(cfg, &key, tar)?;
-    Ok(manifest)
+    Ok((manifest, BundleSource::Staged { replaced_missing }))
 }
 
 // ── git-host producer (fetch the repo tarball at a ref, keep migrations/) ────
@@ -477,19 +596,30 @@ pub fn ensure_bundle_staged_from_url(
     cfg: &S3Config,
     url: &str,
     sha: &str,
-) -> Result<SchemaFingerprint, String> {
+) -> Result<(SchemaFingerprint, BundleSource), String> {
     let key = bundle_s3_key(sha);
+    let mut replaced_missing = Vec::new();
     if deja_compactor::object_exists(cfg, &key)? {
         let bytes = deja_compactor::get_object_decoded(cfg, &key)?;
         let fp = fingerprint_from_bundle_tar_bytes(&bytes)?;
         if fp.count() == 0 {
             return Err(format!("staged bundle for {sha} has no migrations"));
         }
-        return Ok(fp);
+        // The object is already downloaded and already being inspected; ask it
+        // the second question too. A bundle that does not carry the files this
+        // deployment asked for is not one this deployment can use, so fall
+        // through to the produce-and-put below rather than returning it.
+        match reuse_decision(&bytes, &candidate_config_files())? {
+            BundleSource::Reused => return Ok((fp, BundleSource::Reused)),
+            BundleSource::Staged {
+                replaced_missing: m,
+            } => replaced_missing = m,
+        }
     }
     let (tar, fp) = bundle_from_tarball_url(url)?;
+    warn_if_still_missing(&tar, &candidate_config_files(), sha);
     deja_compactor::put_object(cfg, &key, tar)?;
-    Ok(fp)
+    Ok((fp, BundleSource::Staged { replaced_missing }))
 }
 
 #[cfg(test)]
@@ -752,6 +882,125 @@ mod tests {
                 "config/superposition_seed.toml".to_owned(),
             ]
         );
+    }
+
+    /// A real bundle, produced the way the producer produces one, carrying the
+    /// files `configured` asks for.
+    fn bundle_carrying(configured: &[String], extra: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut files: Vec<(&str, &[u8])> = vec![(
+            "migrations/2022-09-29-084920_create_initial_tables/up.sql",
+            b"-- up",
+        )];
+        let owned: Vec<String> = configured.to_vec();
+        for c in &owned {
+            files.push((c.as_str(), b"[server]\nhost = \"0.0.0.0\"\n"));
+        }
+        files.extend_from_slice(extra);
+        let targz = fake_codeload_targz("repo-ff191d7f", &files);
+        let (bundle, _) = bundle_migrations_from_targz(&targz[..], configured).expect("produce");
+        bundle
+    }
+
+    /// An object that carries everything asked for is REUSED — the whole point
+    /// of caching by sha. If this ever returns `Staged`, every run re-fetches
+    /// and re-uploads a bundle that was already correct.
+    #[test]
+    fn a_bundle_carrying_everything_asked_for_is_reused() {
+        let configured = vec!["cfg/a.toml".to_owned(), "cfg/nested/b.toml".to_owned()];
+        let bundle = bundle_carrying(&configured, &[]);
+        assert_eq!(
+            reuse_decision(&bundle, &configured).expect("decide"),
+            BundleSource::Reused
+        );
+        // And with nothing configured, any bundle is reusable — the check asks
+        // only about what was actually asked for.
+        assert_eq!(
+            reuse_decision(&bundle, &[]).expect("decide"),
+            BundleSource::Reused
+        );
+    }
+
+    /// An object staged before a file joined the configured set has the right
+    /// migrations and the wrong contents. "It exists" is the weaker claim;
+    /// reusing it strands the run on a missing base layer that nobody without
+    /// S3 write access can clear.
+    #[test]
+    fn a_bundle_missing_a_requested_config_re_stages_and_names_what_was_missing() {
+        let had = vec!["cfg/a.toml".to_owned()];
+        let bundle = bundle_carrying(&had, &[]);
+        let now_wants = vec![
+            "cfg/a.toml".to_owned(),
+            "cfg/added-later.toml".to_owned(),
+            "cfg/also-added.toml".to_owned(),
+        ];
+        assert_eq!(
+            reuse_decision(&bundle, &now_wants).expect("decide"),
+            BundleSource::Staged {
+                replaced_missing: vec![
+                    "cfg/added-later.toml".to_owned(),
+                    "cfg/also-added.toml".to_owned()
+                ]
+            },
+            "a bundle lacking a requested file must re-stage, naming exactly what it lacked"
+        );
+    }
+
+    /// The migrations are present either way, so a check that only asked about
+    /// migrations would call this bundle fine. That is the bug this closes.
+    #[test]
+    fn migrations_alone_do_not_make_a_bundle_reusable() {
+        let bundle = bundle_carrying(&[], &[]);
+        assert!(
+            fingerprint_from_bundle_tar_bytes(&bundle)
+                .expect("fp")
+                .count()
+                > 0,
+            "fixture must have migrations, so only the config check can reject it"
+        );
+        assert_eq!(
+            reuse_decision(&bundle, &["cfg/wanted.toml".to_owned()]).expect("decide"),
+            BundleSource::Staged {
+                replaced_missing: vec!["cfg/wanted.toml".to_owned()]
+            }
+        );
+    }
+
+    /// The run log has to distinguish work that happened from work that did
+    /// not. All three cases previously printed the word "staged".
+    #[test]
+    fn the_run_log_says_which_it_did() {
+        let reused = BundleSource::Reused.render();
+        assert!(
+            reused.contains("REUSED") && reused.contains("not re-fetched"),
+            "{reused}"
+        );
+
+        let fresh = BundleSource::Staged {
+            replaced_missing: Vec::new(),
+        }
+        .render();
+        assert!(
+            fresh.contains("STAGED") && !fresh.contains("RE-STAGED"),
+            "{fresh}"
+        );
+
+        let restaged = BundleSource::Staged {
+            replaced_missing: vec!["cfg/added-later.toml".to_owned()],
+        }
+        .render();
+        assert!(restaged.contains("RE-STAGED"), "{restaged}");
+        assert!(
+            restaged.contains("cfg/added-later.toml"),
+            "a re-stage must name what was missing: {restaged}"
+        );
+        assert!(
+            restaged.contains(CANDIDATE_CONFIG_FILES_ENV),
+            "and point at the setting that asked for it: {restaged}"
+        );
+        // The three are mutually distinguishable, which is the property that
+        // failed before: they must not read the same.
+        assert_ne!(reused, fresh);
+        assert_ne!(fresh, restaged);
     }
 
     #[test]
