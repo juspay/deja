@@ -130,6 +130,41 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
             Err(err) => return err,
         };
 
+    // GRACEFUL SUBSTITUTE-MISS (`on_miss = <expr>`). A PR under review adds novel
+    // boundary calls — that is what a PR is — and the fail-stop default answers
+    // the first one by unwinding the request, which censors every other signal in
+    // the run. A boundary whose caller has an honest degraded path declares the
+    // value that path expects; the miss is STILL scored (the blocking NovelCall
+    // divergence is emitted by the lookup, before `on_miss` is ever reached), so
+    // the subtree that depended on the missing value diverges and the graph tier
+    // localises it, instead of the whole correlation dying as a 500.
+    //
+    // This is legal ONLY where the value asserts nothing untrue. `None` from a
+    // cache read means "not in cache", which IS true on replay, and the caller's
+    // fallback is separately instrumented. `Default::default()` on an egress
+    // response is a different thing entirely — it fabricates an answer nobody
+    // gave and launders the divergence into a false pass. Egress stays fail-stop;
+    // the declaration site, which knows its own return type, decides.
+    let on_miss_expr = args.on_miss;
+    // `on_miss` under Execute would be dead code: the Execute branch either runs
+    // live behind a shadow token or fail-stops on an unavailable one, and never
+    // reaches the Substitute-miss arm. A declaration that does nothing is a
+    // silent skip, so reject it here rather than let it read as protection.
+    if on_miss_expr.is_some() {
+        let execute_declared = match args.replay.as_ref() {
+            Some(id) => id == "Execute",
+            None => matches!(preset, Preset::Redis),
+        };
+        if execute_declared {
+            return syn::Error::new_spanned(
+                &sig.ident,
+                "`on_miss` applies to the Substitute-miss branch, which an `Execute` \
+                 site never reaches; declare `replay = Substitute` or drop `on_miss`",
+            )
+            .to_compile_error();
+        }
+    }
+
     let state_read = args.state_read;
     let state_write = args.state_write;
     let state_touch = args.state_touch;
@@ -383,6 +418,51 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         }))
     };
 
+    // Which dispatch seam the shape below names, and the extra argument it takes.
+    // With no `on_miss` this is `dispatch` / `dispatch_async` and an EMPTY extra
+    // argument — byte-identical tokens to before, so no existing boundary changes
+    // behaviour. With `on_miss` it is the `_or_miss` twin plus the miss thunk.
+    //
+    // The marker is built INSIDE the thunk (cold path) but its args image has to
+    // be cloned outside it, because the args value is moved into the lazy args
+    // thunk the seam consumes. That clone is paid per active-path call, so it is
+    // emitted ONLY when the miss expression actually names `__deja_miss`: a miss
+    // value that needs no attribution (`on_miss = None`) costs nothing.
+    let (sync_seam, async_seam, miss_prelude, miss_arg) = match &on_miss_expr {
+        None => (
+            quote!(dispatch),
+            quote!(dispatch_async),
+            TokenStream::new(),
+            TokenStream::new(),
+        ),
+        Some(expr) => {
+            let (prelude, thunk_body) = if mentions_miss_marker(expr) {
+                (
+                    quote! {
+                        let __deja_miss_args = ::std::clone::Clone::clone(&__deja_boundary_args);
+                    },
+                    quote! {
+                        let __deja_miss = ::deja::SubstituteMiss::new(
+                            #boundary,
+                            #component,
+                            #operation,
+                            __deja_miss_args,
+                        );
+                        #expr
+                    },
+                )
+            } else {
+                (TokenStream::new(), quote!(#expr))
+            };
+            (
+                quote!(dispatch_or_miss),
+                quote!(dispatch_async_or_miss),
+                prelude,
+                quote!(move || { #thunk_body },),
+            )
+        }
+    };
+
     if sig.asyncness.is_some() {
         if args.future.is_some() {
             return syn::Error::new_spanned(
@@ -414,12 +494,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     let __deja_caller = ::std::panic::Location::caller();
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
-                            ::deja::__private::dispatch_async(
+                            #miss_prelude
+                            ::deja::__private::#async_seam(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
+                                #miss_arg
                             ).await
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -446,12 +528,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     let __deja_caller = ::std::panic::Location::caller();
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
-                            ::std::boxed::Box::pin(::deja::__private::dispatch_async(
+                            #miss_prelude
+                            ::std::boxed::Box::pin(::deja::__private::#async_seam(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move { #block.await },
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
+                                #miss_arg
                             ))
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -475,12 +559,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     let __deja_caller = ::std::panic::Location::caller();
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
-                            ::deja::__private::dispatch(
+                            #miss_prelude
+                            ::deja::__private::#sync_seam(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 || #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
+                                #miss_arg
                             )
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -691,6 +777,25 @@ fn build_boundary_spec_expr(
             },
         )
     })
+}
+
+/// Does an `on_miss` expression name the `__deja_miss` marker binding?
+///
+/// The marker costs a clone of the structured args image (the seam moves the
+/// original into its lazy args thunk), so it is built only when the expression
+/// asks for it. A purely syntactic check is the honest one here: the binding is
+/// visible to the expression exactly when the expression writes that identifier,
+/// the same call-site-hygiene arrangement `result = ...` already uses for
+/// `__deja_result`.
+fn mentions_miss_marker(expr: &Expr) -> bool {
+    fn walk(tokens: TokenStream) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            proc_macro2::TokenTree::Ident(ident) => ident == "__deja_miss",
+            proc_macro2::TokenTree::Group(group) => walk(group.stream()),
+            _ => false,
+        })
+    }
+    walk(quote!(#expr))
 }
 
 /// Validate + map a `replay = <Ident>` to `ReplayStrategy::<Variant>` tokens.
@@ -1047,6 +1152,14 @@ pub struct InstrumentArgs {
     pub effect: Option<Ident>,
     pub op: Option<Ident>,
     pub returns: Option<Ident>,
+    /// GRACEFUL SUBSTITUTE-MISS. `on_miss = <expr>`: the value this boundary
+    /// returns when a `Substitute` lookup MISSES in replay, instead of the
+    /// default fail-stop panic. The expression is evaluated only on a genuine
+    /// miss and must have the boundary's return type. It may name
+    /// `__deja_miss` (a `deja::SubstituteMiss`) exactly as `result = ...` names
+    /// `__deja_result`; the marker is built only when the expression mentions
+    /// it, so a miss value that needs no attribution costs no args clone.
+    pub on_miss: Option<Expr>,
     pub state_read: Option<Expr>,
     pub state_write: Option<Expr>,
     pub state_touch: Option<Expr>,
@@ -1117,6 +1230,7 @@ impl Parse for InstrumentArgs {
                         "args" => args.args = Some(input.parse()?),
                         "result" => args.result = Some(input.parse()?),
                         "codec" => args.codec = Some(input.parse()?),
+                        "on_miss" => args.on_miss = Some(input.parse()?),
                         "state_read" => args.state_read = Some(input.parse()?),
                         "state_write" => args.state_write = Some(input.parse()?),
                         "state_touch" => args.state_touch = Some(input.parse()?),
@@ -1303,6 +1417,104 @@ mod tests {
 
     fn parse_fn(src: proc_macro2::TokenStream) -> ItemFn {
         syn::parse2(src).expect("parse fn")
+    }
+
+    /// `on_miss` routes to the `_or_miss` seam; its absence must leave the
+    /// emitted seam name exactly as it was, so no existing boundary's
+    /// continuation changes.
+    #[test]
+    fn on_miss_routes_to_the_or_miss_seam_and_its_absence_does_not() {
+        let declared = generate(
+            parse_args(quote!(
+                boundary = "imc",
+                replay = Substitute,
+                on_miss = None
+            )),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            declared.contains("dispatch_async_or_miss"),
+            "a declared `on_miss` must reach the graceful seam: {declared}"
+        );
+
+        let undeclared = generate(
+            parse_args(quote!(boundary = "imc", replay = Substitute)),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            !undeclared.contains("or_miss"),
+            "an undeclared site must keep the fail-stop seam: {undeclared}"
+        );
+    }
+
+    /// The marker costs an args clone, so it is built ONLY when the miss
+    /// expression asks for it.
+    #[test]
+    fn the_miss_marker_is_built_only_when_the_expression_names_it() {
+        let plain = generate(
+            parse_args(quote!(
+                boundary = "imc",
+                replay = Substitute,
+                on_miss = None
+            )),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            !plain.contains("SubstituteMiss"),
+            "a miss value that needs no attribution must not pay for the marker: {plain}"
+        );
+
+        let attributed = generate(
+            parse_args(quote!(
+                boundary = "imc",
+                replay = Substitute,
+                on_miss = Err(__deja_miss.into())
+            )),
+            parse_fn(quote!(
+                async fn get(key: String) -> Result<u64, HostError> {
+                    Ok(0)
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            attributed.contains("SubstituteMiss"),
+            "an expression naming `__deja_miss` must get the marker: {attributed}"
+        );
+    }
+
+    /// `on_miss` under Execute would never fire. A declaration that does nothing
+    /// reads as protection, so it is rejected instead of silently ignored.
+    #[test]
+    fn on_miss_on_an_execute_site_is_a_build_error() {
+        let expanded = generate(
+            parse_args(quote!(boundary = "redis", replay = Execute, on_miss = None)),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            expanded.contains("compile_error"),
+            "`on_miss` + `replay = Execute` must not compile: {expanded}"
+        );
     }
 
     /// The per-site knob (#28) parses and expands into a `with_semantics`
