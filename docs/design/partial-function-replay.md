@@ -96,6 +96,43 @@ Fail-stop = **panic-unwind at the dispatch seam**, not a synthesized error:
   `Result`, streams alike. No `Default` bound; `Default::default()` is rejected
   (fabricating a value launders the divergence into a false pass).
 
+### `on_miss` — a declared miss value, where one is honest
+
+The type-erasure argument above says deja cannot build an `Err` for an `E` a
+`replay_ok` site never names. That is true of *deja*; it is not true of the
+site. `on_miss = <expr>` on `#[deja::boundary]` inverts the construction: the
+declaration, which knows its own return type, supplies the value; the seam
+(`dispatch_or_miss` / `dispatch_async_or_miss`) just returns it instead of
+panicking. Deja contributes `deja::SubstituteMiss` — boundary, component,
+method, args image — which the expression may name as `__deja_miss` so a host
+error enum takes it with `#[from]` and the degraded path stays attributable. No
+host error type appears in deja.
+
+Why the fail-stop default is wrong for *some* boundaries: a candidate under
+review adds boundary calls the recording never made — that is what a change is.
+Answering the first one with an unwind means actix writes nothing, the kernel
+reads a 500, and one added cache read censors every other signal in the run (a
+measured sandbox run: 45 of 52 correlations at `500 vs 200`, 1/52 matched). The
+miss is still scored either way — the blocking NovelCall divergence is emitted
+by the lookup *before* `on_miss` runs — so the choice is only about the
+continuation, and a returned miss lets the divergence localise to the subtree
+that actually needed the value.
+
+The distinction that keeps this from being the rejected `Default::default()`:
+
+- **Honest.** `Cache::get_val` returns `Option<T>`; `None` means *not in cache*,
+  which is TRUE under replay, and the caller's fallback is separately
+  instrumented, so the fallback's own boundary calls are scored. Nothing untrue
+  is asserted.
+- **Fabrication.** A synthesized egress response claims a third party answered
+  when none did, and every downstream boundary consumes the lie as an argument.
+  That is the false pass `Default::default()` was rejected for. Egress
+  (http/grpc) keeps the fail-stop default, per Legality below.
+
+`on_miss` on a site that resolves to `replay = Execute` is a build error: the
+Execute branch never reaches the Substitute-miss arm, so the declaration would
+be dead code reading as protection.
+
 ## Legality — `Execute` is not valid everywhere
 
 `Execute` re-runs the real boundary, so it is illegal where re-running is unsafe:
