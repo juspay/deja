@@ -39,12 +39,17 @@ function Span({ dates }: { dates: string[] }) {
 }
 
 function Identity({ rec }: { rec: AvailableRecording }) {
+  const parts: string[] = [];
   const text = identityText(rec.identity);
+  if (text) parts.push(text);
+  // The `inst=` discriminators — for a UCS session, the recorder's pod name,
+  // which the id itself does not carry.
+  if (rec.instances?.length) parts.push(`pod ${rec.instances.join(", ")}`);
   // No identity means the id predates ids naming a revision. That is the
   // ordinary past — the facts still live in the recording's envelopes — so it
   // reads as a plain dash, not as a missing-data warning.
-  if (!text) return <span className="recdash">—</span>;
-  return <span className="recident">{text}</span>;
+  if (!parts.length) return <span className="recdash">—</span>;
+  return <span className="recident">{parts.join(" · ")}</span>;
 }
 
 /**
@@ -161,7 +166,14 @@ export default function RecordingsPage() {
               const cat = byId.get(r.recording_id);
               return (
                 <tr key={r.recording_id}>
-                  <td className="mono">{r.recording_id}</td>
+                  <td className="mono">
+                    {r.recording_id}
+                    {/* Only a non-default system is worth a badge — same rule
+                        as the runs list. */}
+                    {r.system === "prism" && (
+                      <span className="chip muted" style={{ marginLeft: 6 }}>prism</span>
+                    )}
+                  </td>
                   <td className="recspan">
                     <Span dates={r.dates} />
                   </td>

@@ -185,7 +185,9 @@ pub fn launch_spec_for_run(
         jobs_namespace: cfg.jobs_namespace.clone(),
         template_namespace: cfg.template_namespace.clone(),
         template_configmap: cfg.template_configmap.clone(),
-        template_key: cfg.template_key.clone(),
+        // Per-system: a prism run resolves `job.prism.json`; the default system
+        // keeps `job.json`. See `template_key_for` for why there is no fallback.
+        template_key: cfg.template_key_for(run.spec.system()),
         candidate_container: candidate_binding.container.clone(),
         candidate_image,
         env,
@@ -701,6 +703,52 @@ mod tests {
             val(&cfg.candidate_binding.observed_env),
             "/workspace/state/observed/run-42.jsonl"
         );
+    }
+
+    /// A prism run must fetch ITS template key and bind the CS__DEJA__* names —
+    /// the first prism launch in sandbox booted the router template (postgres,
+    /// redis, router-config) and died with "DEJA_RUN_ID unset". The template
+    /// key and the binding both follow the run's system, in the same spec.
+    #[test]
+    fn a_prism_run_resolves_its_own_template_key_and_binding() {
+        let cfg = K8sExecutorConfig::from_env();
+        let run = Run {
+            run_id: "run-43".into(),
+            spec: crate::RunSpec {
+                scored_span_namespaces: Vec::new(),
+                mode: crate::RunMode::Replay,
+                system_under_test: Some("prism".into()),
+                candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                    image: "img:abc123".into(),
+                },
+                candidate_repo: None,
+                recording_id: None,
+                s3_source: None,
+                correlation_filter: None,
+                workload: serde_json::Value::Null,
+            },
+            status: crate::RunStatus::Pending,
+            recording_id: None,
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
+        assert_eq!(spec.template_key, "job.prism.json");
+        assert!(
+            spec.env
+                .iter()
+                .any(|e| e.name == "CS__DEJA__RUN_ID" && e.value == "run-43"),
+            "the prism binding names carry the replay contract"
+        );
+        // And a default-system run keeps the base key untouched.
+        let mut base = run;
+        base.spec.system_under_test = None;
+        let spec = launch_spec_for_run(&base, &cfg, None, None).expect("spec builds");
+        assert_eq!(spec.template_key, cfg.template_key);
     }
 
     /// Killing must take the pod with the Job, and sweep one the cascade missed —

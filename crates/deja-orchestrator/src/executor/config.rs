@@ -173,6 +173,25 @@ impl K8sExecutorConfig {
         }
     }
 
+    /// The job-template ConfigMap KEY for a run's `system_under_test`. The
+    /// default system keeps the base key (`DEJA_JOB_TEMPLATE_KEY`, `job.json`).
+    /// Any other system resolves `job.<system>.json` by convention,
+    /// overridable via `DEJA_<SYSTEM>_JOB_TEMPLATE_KEY` — and if the ConfigMap
+    /// lacks that key the launch FAILS naming it. It must never fall back to
+    /// the default system's template: a prism run booted off the router
+    /// template dies in `router-config` with "DEJA_RUN_ID unset" after
+    /// spinning up postgres/redis/migrations the system does not have — a
+    /// diagnosis that cost a day. A missing key that says
+    /// "job.prism.json not found" costs a minute.
+    pub fn template_key_for(&self, system: &str) -> String {
+        if system == crate::DEFAULT_SYSTEM_UNDER_TEST {
+            return self.template_key.clone();
+        }
+        let sys = system.to_uppercase().replace('-', "_");
+        std::env::var(format!("DEJA_{sys}_JOB_TEMPLATE_KEY"))
+            .unwrap_or_else(|_| format!("job.{system}.json"))
+    }
+
     /// The config-copy source for a run's `system_under_test`. Non-default
     /// systems read `DEJA_<SYSTEM>_CONFIG_SOURCE_{DEPLOYMENT,CONTAINER}`; unset
     /// means NO config copy (empty deployment) — booting a prism candidate off
@@ -360,6 +379,35 @@ mod tests {
             binary_or_source: "/x".into(),
         })
         .is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod per_system_template_tests {
+    use super::*;
+
+    /// One test, one lock: `DEJA_PRISM_JOB_TEMPLATE_KEY` is process-global.
+    #[test]
+    fn the_template_key_follows_the_system_and_never_falls_back_to_the_router_template() {
+        std::env::remove_var("DEJA_PRISM_JOB_TEMPLATE_KEY");
+        let cfg = K8sExecutorConfig::from_env();
+
+        // The default system keeps the base key — zero change for every
+        // existing deployment.
+        assert_eq!(cfg.template_key_for(crate::DEFAULT_SYSTEM_UNDER_TEST), cfg.template_key);
+
+        // A non-default system resolves its own key BY CONVENTION. It must
+        // not inherit `job.json`: a prism run booted off the router template
+        // spins up postgres/redis and dies in `router-config` with
+        // "DEJA_RUN_ID unset" — the silent-fallback failure this exists to end.
+        assert_eq!(cfg.template_key_for("prism"), "job.prism.json");
+        assert_eq!(cfg.template_key_for("some-new-system"), "job.some-new-system.json");
+
+        // The env override wins, same pattern as the candidate binding.
+        std::env::set_var("DEJA_PRISM_JOB_TEMPLATE_KEY", "job.prism-v2.json");
+        assert_eq!(cfg.template_key_for("prism"), "job.prism-v2.json");
+        std::env::remove_var("DEJA_PRISM_JOB_TEMPLATE_KEY");
     }
 }
 

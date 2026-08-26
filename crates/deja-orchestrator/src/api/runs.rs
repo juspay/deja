@@ -146,6 +146,21 @@ fn resolve_tarball_url(template: &str, run_repo: Option<&str>, sha: &str) -> Opt
 ///
 /// Neither configured / both fail → None (P1 record-only).
 fn resolve_expected_schema(run: &Run) -> Option<(crate::SchemaFingerprint, String)> {
+    // The CodeBundle is a hyperswitch contract: the candidate repo's
+    // migrations/ (the P1 schema gate) plus its config seed. A non-default
+    // system has neither — resolving one anyway would fetch the DEFAULT repo's
+    // migrations for a foreign image sha, and worse, arm the patch to inject
+    // DEJA_CODE_BUNDLE_URI into a `migrations` initContainer that system's job
+    // template deliberately does not have, failing the launch on
+    // ContainerNotFound. No bundle: the lifecycle already skips every store
+    // stage for such systems (`manages_stores`).
+    if run.spec.system() != crate::DEFAULT_SYSTEM_UNDER_TEST {
+        eprintln!(
+            "codebundle: system '{}' has no CodeBundle contract; skipping (P1 not applicable)",
+            run.spec.system()
+        );
+        return None;
+    }
     let (_, sha) = crate::executor::resolve_candidate_image(&run.spec.candidate_spec).ok()?;
     let s3 = crate::s3::S3Config::from_env();
     let uri = crate::codebundle::bundle_s3_uri(&s3, &sha);

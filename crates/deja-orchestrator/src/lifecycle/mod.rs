@@ -689,7 +689,10 @@ fn drive_replay(
     set_status(root, run, RunStatus::Running, None);
     ctx.run_state("running");
     set_stage(root, run, ctx, 4, total, "waiting for replay router");
-    wait_health(demo.replay_port, Duration::from_secs(240))?;
+    wait_health(
+        &format!("http://127.0.0.1:{}/health", demo.replay_port),
+        Duration::from_secs(240),
+    )?;
 
     set_stage(
         root,
@@ -1545,6 +1548,10 @@ pub struct InPodOptions {
     pub database_url: String,
     /// The router container's health/traffic port (pod-shared netns).
     pub router_port: u16,
+    /// Readiness URL override (`RUNNER_HEALTH_URL`). None = HTTP `/health` on
+    /// `router_port`, the router's shape. A prism candidate serves gRPC on its
+    /// traffic port, so its template points this at the metrics endpoint.
+    pub health_url: Option<String>,
     /// deja-kernel binary path inside the runner container.
     pub kernel_bin: String,
     /// Migration command (argv) run at stage 3 with DATABASE_URL set; None
@@ -1716,7 +1723,10 @@ pub fn drive_replay_in_pod(
         total,
         "driving recorded requests (kernel)",
     );
-    wait_health(opts.router_port, Duration::from_secs(240))?;
+    let health_url = opts.health_url.clone().unwrap_or_else(|| {
+        format!("http://127.0.0.1:{}/health", opts.router_port)
+    });
+    wait_health(&health_url, Duration::from_secs(240))?;
     run_kernel(
         &opts.kernel_bin,
         opts.router_port,
@@ -4848,13 +4858,16 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
-/// Poll the candidate's `/health` on a host-published port until 200 or timeout.
-fn wait_health(port: u16, timeout: Duration) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/health");
+/// Poll a candidate readiness URL until 200 or timeout. The URL is the
+/// caller's: HTTP `/health` on the traffic port for the router; a prism
+/// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
+/// curl — so its Job template names a probeable URL (`RUNNER_HEALTH_URL`,
+/// e.g. the metrics endpoint) instead of teaching this function systems.
+fn wait_health(url: &str, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         let ok = Command::new("curl")
-            .args(["-fsS", "-o", "/dev/null", "--max-time", "3", &url])
+            .args(["-fsS", "-o", "/dev/null", "--max-time", "3", url])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);

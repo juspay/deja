@@ -128,6 +128,11 @@ export default function NewRunPage() {
     // hyperswitch is the wire default; only a non-default system is sent, so
     // existing curl recipes and stored rows keep meaning what they meant.
     if (systemUnderTest !== "hyperswitch") spec.system_under_test = systemUnderTest;
+    // Prism declares its instrumentation contract: every recorded ucs::* /
+    // connector::* span must replay, with equal field values (the span-shape
+    // check). Sent by default because a prism run without it silently skips
+    // that verification tier.
+    if (systemUnderTest === "prism") spec.scored_span_namespaces = ["ucs::", "connector::"];
     if (s3Path) spec.s3_source = { path: s3Path };
     if (candidateRepo.trim()) spec.candidate_repo = candidateRepo.trim();
     // The DEFAULT IS SENT, not left implicit, whenever the ids are knowable:

@@ -411,12 +411,14 @@ export const api = {
  * recording's envelopes (`code.sha`, `instance_id`).
  */
 export type RecordingIdentity = {
-  /** Short git sha of the recorded system. */
-  revision: string;
+  /** Short git sha of the recorded system. (hyperswitch `rec-…` shape) */
+  revision?: string;
   /** `MMDDhhmm` UTC — when recording began. No year. */
-  recorded_at: string;
+  recorded_at?: string;
   /** Discriminator, so two pods starting in the same minute stay distinct. */
-  instance: string;
+  instance?: string;
+  /** Nanoseconds since epoch at recorder boot (the UCS `run-<nanos>` shape). */
+  booted_at_nanos?: string;
 };
 
 /** One session found in the bucket. */
@@ -433,6 +435,13 @@ export type AvailableRecording = {
    *  when the catalog itself cannot be read, so the bucket stays visible. */
   pulled: boolean;
   identity: RecordingIdentity | null;
+  /** Which recorded system minted the session, from the id shape — the
+   *  hyperswitch recorder mints `rec-<sha>-<time>-<inst>`, the UCS recorder
+   *  `run-<nanos>`. Null when the shape names neither. */
+  system?: "hyperswitch" | "prism" | null;
+  /** `inst=` discriminators under the session — for a UCS session this is the
+   *  recorder's pod name, the only identity its id does not carry. */
+  instances?: string[];
   /** The prefix the orchestrator would ingest from — reported so a run can be
    *  reproduced by hand, NOT so a caller has to supply it. Bucket-relative: a
    *  `s3_source.path` needs `bucket/` in front of it. */

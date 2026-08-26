@@ -89,6 +89,9 @@ fn run() -> Result<(), String> {
         router_port: env("RUNNER_ROUTER_PORT", "8080")
             .parse()
             .map_err(|e| format!("RUNNER_ROUTER_PORT: {e}"))?,
+        health_url: std::env::var("RUNNER_HEALTH_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
         kernel_bin: env("RUNNER_KERNEL_BIN", "target/release/deja-kernel"),
         migrate_cmd: std::env::var("RUNNER_MIGRATE_CMD")
             .ok()

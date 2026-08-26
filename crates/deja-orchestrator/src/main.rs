@@ -727,17 +727,29 @@ async fn v1_available_recordings(
             // that difference should be one field rather than every reader
             // reimplementing the same two shapes.
             let identity = deja_orchestrator::parse_recording_id(&r.session_id);
-            let described = match &identity {
+            let (described, system) = match &identity {
                 deja_orchestrator::RecordingIdentity::Described {
                     revision,
                     recorded_at,
                     instance,
-                } => serde_json::json!({
-                    "revision": revision,
-                    "recorded_at": recorded_at,
-                    "instance": instance,
-                }),
-                deja_orchestrator::RecordingIdentity::Opaque => serde_json::Value::Null,
+                } => (
+                    serde_json::json!({
+                        "revision": revision,
+                        "recorded_at": recorded_at,
+                        "instance": instance,
+                    }),
+                    // The rec-<sha>-<time>-<inst> shape is the hyperswitch
+                    // recorder's; the boot-derived run-<nanos> shape is the
+                    // UCS recorder's. The id shape is the cheapest honest
+                    // signal the LISTING has — object content would say more,
+                    // but a bucket scan must not read objects.
+                    Some("hyperswitch"),
+                ),
+                deja_orchestrator::RecordingIdentity::BootDerived { booted_at_nanos } => (
+                    serde_json::json!({ "booted_at_nanos": booted_at_nanos }),
+                    Some("prism"),
+                ),
+                deja_orchestrator::RecordingIdentity::Opaque => (serde_json::Value::Null, None),
             };
             serde_json::json!({
                 "recording_id": r.session_id,
@@ -748,6 +760,13 @@ async fn v1_available_recordings(
                 // Null for a recording whose id names no revision; its envelopes
                 // still carry `code.sha` and `instance_id`.
                 "identity": described,
+                // Which recorded system minted the session, from the id shape;
+                // null when the shape names neither.
+                "system": system,
+                // The `inst=` discriminators under the session — for a UCS
+                // session this is the recorder's pod name, the only identity
+                // its id does not carry.
+                "instances": r.instances,
                 // The prefix the orchestrator would ingest from. Reported so a
                 // run can be reproduced by hand, not so a caller has to supply it.
                 "prefix": r.prefix,

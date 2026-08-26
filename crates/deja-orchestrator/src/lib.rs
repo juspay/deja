@@ -430,6 +430,14 @@ pub enum RecordingIdentity {
         /// minute stay distinct.
         instance: String,
     },
+    /// A prism/UCS recorder default: `run-<nanos-since-epoch>`, minted at
+    /// process boot (prism's `configured_run_id`). The shape names the SYSTEM
+    /// as a side effect — only the UCS recorder mints these — which is what
+    /// lets the recordings page say "prism" without reading an object.
+    BootDerived {
+        /// Nanoseconds since the epoch at recorder boot, as recorded.
+        booted_at_nanos: String,
+    },
     /// The id carries no provenance. Its parts live in the recording's
     /// envelopes (`code.sha`, `instance_id`) rather than in its name.
     Opaque,
@@ -453,6 +461,16 @@ pub fn recording_id_body(recording_id: &str) -> &str {
 ///
 /// [`Opaque`]: RecordingIdentity::Opaque
 pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
+    // The UCS recorder's boot-derived default: `run-` + a nanosecond epoch.
+    // Digit count pins the era (18-19 digits ≈ 1971-2262), so `run-1` or a
+    // hand-named `run-foo` stays Opaque instead of masquerading as a boot id.
+    if let Some(nanos) = recording_id.strip_prefix("run-") {
+        if (18..=19).contains(&nanos.len()) && nanos.chars().all(|c| c.is_ascii_digit()) {
+            return RecordingIdentity::BootDerived {
+                booted_at_nanos: nanos.to_owned(),
+            };
+        }
+    }
     let Some(body) = recording_id.strip_prefix("rec-") else {
         return RecordingIdentity::Opaque;
     };
@@ -1058,14 +1076,24 @@ mod run_identity_tests {
             }
         );
 
-        // A recorder that does NOT know its revision keeps the older form
-        // rather than minting `rec-unknown-…`, which would claim a provenance
-        // it does not have. Every recording made before ids carried one reads
-        // this way, and stays replayable.
+        // The boot-derived form is the UCS recorder's default run id — the
+        // shape itself names the system, which is what lets a bucket listing
+        // say "prism" without reading an object.
         assert_eq!(
             parse_recording_id("run-1785331134782268537"),
-            RecordingIdentity::Opaque
+            RecordingIdentity::BootDerived {
+                booted_at_nanos: "1785331134782268537".into()
+            }
         );
+        // But only a plausible nanosecond epoch: a hand-minted run id must not
+        // masquerade as a boot instant (or as a system).
+        for not_boot in ["run-1", "run-ucs-capture-aug", "run-178533113478226853700"] {
+            assert_eq!(
+                parse_recording_id(not_boot),
+                RecordingIdentity::Opaque,
+                "{not_boot} should not have parsed"
+            );
+        }
 
         // Anything that does not match the shape is opaque, never half-read:
         // the envelopes carry these facts authoritatively, so a guess here
