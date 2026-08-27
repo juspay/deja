@@ -63,16 +63,22 @@ fn tier_for(boundary: &str) -> Tier {
 ///     substituted on replay, after which everything downstream is pure. These are
 ///     fully substituted in practice (they never miss), so the non-blocking status
 ///     is a safety net, not a load-bearing exclusion.
-///   - `http_incoming`: the request boundary the kernel re-drives by construction,
-///     not a side effect at all.
+///   - ingress: the request boundary the kernel re-drives by construction,
+///     not a side effect at all. Self-described by `role: "ingress"`; the
+///     legacy `http_incoming` name keeps pre-`role` tapes working.
 ///
 /// NB there is deliberately no `crypto` tier. Crypto is pure computation, not a
 /// seam: its only entropy is the AEAD nonce, recorded at its own seam
 /// (`common_utils::crypto::NonceSequence::new`), so AES reproduces byte-identically
 /// when run live. It carries no boundary and therefore needs no exclusion — see the
 /// note on `crypto_operation` in `hyperswitch_domain_models::type_encryption`.
-fn is_nonblocking_boundary(boundary: &str) -> bool {
-    tier_for(boundary) == Tier::Pure || boundary == "http_incoming"
+/// Callers pass the row's `role` when they have one (events, observed calls);
+/// lookup-table entries never carry ingress (the renderer skips it), so `None`
+/// is correct there.
+fn is_nonblocking_boundary(boundary: &str, role: Option<&str>) -> bool {
+    tier_for(boundary) == Tier::Pure
+        || role == Some(deja::ROLE_INGRESS)
+        || boundary == "http_incoming"
 }
 
 /// Whether replay is *incapable* of producing a counterpart for this boundary,
@@ -106,8 +112,15 @@ fn lacks_replay_counterpart_by_construction(boundary: &str) -> bool {
 ///
 /// THE definition, shared with [`ledger::build`], so a ledger row's `blocking`
 /// flag and the scorecard's count cannot come to mean two different things.
-fn omission_is_blocking(correlation: Option<&str>, boundary: &str) -> bool {
-    correlation.is_some() && !is_nonblocking_boundary(boundary)
+fn omission_is_blocking(correlation: Option<&str>, boundary: &str, role: Option<&str>) -> bool {
+    correlation.is_some() && !is_nonblocking_boundary(boundary, role)
+}
+
+/// Whether an observed replay row is the ingress response-finalizer marker.
+/// Mirrors [`deja::BoundaryEvent::is_ingress`]: the self-described `role` first,
+/// the legacy `http_incoming` name for artifacts that predate it.
+fn observed_is_ingress(obs: &ObservedCall) -> bool {
+    obs.role.as_deref() == Some(deja::ROLE_INGRESS) || obs.boundary == "http_incoming"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,7 +1061,14 @@ impl GraphScoringPlan {
 fn event_bearing_ingress_root(forest: &deja_forest::ActivationForest) -> bool {
     forest.roots.iter().any(|root| {
         let node = &forest.nodes[root];
-        node.span_name == "deja::http_incoming" && node.subtree_events > 0
+        // Ingress recorders open their correlated span as `deja::<boundary>`
+        // (`deja::http_incoming`, `deja::grpc_incoming`, ...). The span carries
+        // no role field, so the naming convention is the recognizer here.
+        let is_ingress_span = node
+            .span_name
+            .strip_prefix("deja::")
+            .is_some_and(|name| name.ends_with("_incoming"));
+        is_ingress_span && node.subtree_events > 0
     })
 }
 
@@ -2585,7 +2605,7 @@ fn is_fork_region(obs: &ObservedCall) -> bool {
 fn undeclared_concurrency_warnings(observed: &[ObservedCall]) -> Vec<UndeclaredConcurrencyWarning> {
     let mut finalization_by_correlation: HashMap<String, u64> = HashMap::new();
     for obs in observed {
-        if obs.boundary != "http_incoming" {
+        if !observed_is_ingress(obs) {
             continue;
         }
         let Some(correlation_id) = &obs.correlation_id else {
@@ -2604,7 +2624,7 @@ fn undeclared_concurrency_warnings(observed: &[ObservedCall]) -> Vec<UndeclaredC
             // Fork work (a non-root lineage bucket) is an unordered region —
             // expected to run past the HTTP response finalization — so it is
             // excluded here, exactly the role the removed `detached` flag played.
-            if is_fork_region(obs) || obs.boundary == "http_incoming" || obs.timestamp_ns == 0 {
+            if is_fork_region(obs) || observed_is_ingress(obs) || obs.timestamp_ns == 0 {
                 return None;
             }
             let correlation_id = obs.correlation_id.as_ref()?;
@@ -2766,7 +2786,7 @@ fn http_incoming_events_by_correlation(
 ) -> HashMap<String, &deja::BoundaryEvent> {
     events
         .iter()
-        .filter(|ev| ev.boundary == "http_incoming")
+        .filter(|ev| ev.is_ingress())
         .filter_map(|ev| ev.correlation_id.as_ref().map(|corr| (corr.clone(), ev)))
         .collect()
 }
@@ -3613,7 +3633,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // phantom entered the scorecard.
     let mut deferred: Vec<(usize, &ObservedCall)> = Vec::new();
     for (observed_index, obs) in art.observed.iter().enumerate() {
-        if obs.boundary == "http_incoming" {
+        if observed_is_ingress(obs) {
             continue;
         }
         if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
@@ -3623,7 +3643,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             if tier_for(&obs.boundary) == Tier::Environmental {
                 stats.bump_kind("EnvironmentalMiss");
                 environmental_misses += 1;
-            } else if is_nonblocking_boundary(&obs.boundary) {
+            } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
                 stats.bump_kind("DeterministicMiss");
             } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
                 // The recording for this correlation stopped at request teardown
@@ -3821,9 +3841,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if tier_for(&obs.boundary) == Tier::Environmental {
             stats.bump_kind("EnvironmentalMiss");
             environmental_misses += 1;
-        } else if is_nonblocking_boundary(&obs.boundary) {
+        } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
             // Deterministic-live (crypto/time/id/rng) or the request boundary
-            // (http_incoming) — not a real divergence. See is_nonblocking_boundary.
+            // (ingress) — not a real divergence. See is_nonblocking_boundary.
             stats.bump_kind("DeterministicMiss");
         } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
             // Background-task call with no correlation — tolerated in V1. Named
@@ -3955,7 +3975,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // omissions — uncorrelated background work, and non-blocking boundaries
         // — under the same name as the blocking ones is what let this table and
         // the summary give a report two answers for one set of calls.
-        let blocking = omission_is_blocking(exp.correlation.as_deref(), &boundary);
+        let blocking = omission_is_blocking(exp.correlation.as_deref(), &boundary, None);
         let stats = boundary_entry(&mut per_boundary, &boundary);
         stats.bump_kind(if blocking && pruned {
             "PrunedSubtree"
@@ -5068,6 +5088,7 @@ mod tests {
         ObservedCall {
             correlation_id: corr.map(str::to_owned),
             boundary: boundary.to_owned(),
+            role: None,
             trait_name: "T".to_owned(),
             method_name: "m".to_owned(),
             args: serde_json::json!({}),
@@ -5133,6 +5154,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
                     mode: crate::RunMode::Replay,
+                    system_under_test: None,
                     candidate_spec: crate::CandidateSpec::PrebuiltImage {
                         image: "deja-demo".to_owned(),
                     },
@@ -5250,6 +5272,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
                     mode: crate::RunMode::Replay,
+                    system_under_test: None,
                     candidate_spec: crate::CandidateSpec::PrebuiltImage {
                         image: "deja-demo".to_owned(),
                     },
@@ -5432,6 +5455,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
                     mode: crate::RunMode::Replay,
+                    system_under_test: None,
                     candidate_spec: crate::CandidateSpec::PrebuiltImage {
                         image: "deja-demo".to_owned(),
                     },

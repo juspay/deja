@@ -21,6 +21,8 @@ export type CandidateSpecRow =
 export type RunParams = {
   mode: "record" | "replay";
   candidate_spec: CandidateSpecRow;
+  /** Which system the run drives ("hyperswitch" | "prism" | ...); absent = hyperswitch. */
+  system_under_test?: string;
   candidate_repo?: string;
   recording_id: string | null;
   s3_source?: { path: string; region?: string; endpoint?: string };
