@@ -1545,12 +1545,17 @@ pub struct InPodOptions {
     pub redis_host: String,
     pub redis_port: u16,
     /// Sidecar pg conninfo URL (also what seeding's psql uses via `-d`).
-    pub database_url: String,
-    /// The router container's health/traffic port (pod-shared netns).
-    pub router_port: u16,
+    /// None for a system with no harness-managed stores (prism) — every store
+    /// stage self-skips, so requiring a value would force templates to carry a
+    /// dummy. Required (by name, at use) when the run manages stores.
+    pub database_url: Option<String>,
+    /// The CANDIDATE container's traffic port (pod-shared netns) — the
+    /// kernel's drive target. `RUNNER_CANDIDATE_PORT`; the pre-multi-system
+    /// name `RUNNER_ROUTER_PORT` is read as a legacy alias.
+    pub candidate_port: u16,
     /// Readiness URL override (`RUNNER_HEALTH_URL`). None = HTTP `/health` on
-    /// `router_port`, the router's shape. A prism candidate serves gRPC on its
-    /// traffic port, so its template points this at the metrics endpoint.
+    /// `candidate_port`, the router's shape. A prism candidate serves gRPC on
+    /// its traffic port, so its template points this at the metrics endpoint.
     pub health_url: Option<String>,
     /// deja-kernel binary path inside the runner container.
     pub kernel_bin: String,
@@ -1616,7 +1621,10 @@ pub fn drive_replay_in_pod(
         ),
         Some(argv) if !argv.is_empty() => {
             let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]).env("DATABASE_URL", &opts.database_url);
+            let database_url = opts.database_url.as_deref().ok_or(
+                "RUNNER_DATABASE_URL is required when the run manages harness stores",
+            )?;
+            cmd.args(&argv[1..]).env("DATABASE_URL", database_url);
             let status = run_streamed(cmd, ctx, "migrating sidecar pg", "migrate")?;
             if !status.success() {
                 return Err(format!("migration command failed (status {status})"));
@@ -1643,7 +1651,9 @@ pub fn drive_replay_in_pod(
         let store = StoreExec::direct(
             opts.redis_host.clone(),
             opts.redis_port,
-            opts.database_url.clone(),
+            opts.database_url
+                .clone()
+                .ok_or("RUNNER_DATABASE_URL is required when the run manages harness stores")?,
         );
 
         // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
@@ -1724,12 +1734,12 @@ pub fn drive_replay_in_pod(
         "driving recorded requests (kernel)",
     );
     let health_url = opts.health_url.clone().unwrap_or_else(|| {
-        format!("http://127.0.0.1:{}/health", opts.router_port)
+        format!("http://127.0.0.1:{}/health", opts.candidate_port)
     });
     wait_health(&health_url, Duration::from_secs(240))?;
     run_kernel(
         &opts.kernel_bin,
-        opts.router_port,
+        opts.candidate_port,
         root,
         ctx,
         &recording_id,

@@ -85,10 +85,21 @@ fn run() -> Result<(), String> {
         redis_port: env("RUNNER_REDIS_PORT", "6379")
             .parse()
             .map_err(|e| format!("RUNNER_REDIS_PORT: {e}"))?,
-        database_url: required("RUNNER_DATABASE_URL")?,
-        router_port: env("RUNNER_ROUTER_PORT", "8080")
-            .parse()
-            .map_err(|e| format!("RUNNER_ROUTER_PORT: {e}"))?,
+        // Optional: a system with no harness-managed stores (prism) has no
+        // sidecar pg, and every stage that would dial one self-skips. The
+        // store stages re-require it by name if a run that manages stores
+        // arrives without it.
+        database_url: std::env::var("RUNNER_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        // `RUNNER_ROUTER_PORT` is the pre-multi-system name, kept as a legacy
+        // alias so deployed hyperswitch templates keep working unchanged.
+        candidate_port: env(
+            "RUNNER_CANDIDATE_PORT",
+            &env("RUNNER_ROUTER_PORT", "8080"),
+        )
+        .parse()
+        .map_err(|e| format!("RUNNER_CANDIDATE_PORT: {e}"))?,
         health_url: std::env::var("RUNNER_HEALTH_URL")
             .ok()
             .filter(|v| !v.trim().is_empty()),
