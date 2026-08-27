@@ -1690,7 +1690,7 @@ fn render_replay_summary(frame: &mut Frame<'_>, area: Rect, scorecard: Option<&S
     let text = match scorecard.map(|card| &card.summary) {
         Some(summary) => format!(
             "requests {}/{} matched · http status {} / body {} mismatches\n\
-             side-effects: {} substituted · {} diverged ({} omitted, {} novel, {} environmental, {} inconclusive_race)",
+             side-effects: {} substituted · {} diverged ({} omitted, {} novel, {} environmental, {} inconclusive_race, {} inconclusive_tail_gap)",
             summary.matched_correlations,
             summary.total_correlations,
             summary.http_status_mismatches,
@@ -1701,6 +1701,7 @@ fn render_replay_summary(frame: &mut Frame<'_>, area: Rect, scorecard: Option<&S
             summary.novel_calls,
             summary.environmental_misses,
             summary.inconclusive_races,
+            summary.inconclusive_tail_gaps,
         ),
         None => "scorecard summary unavailable".to_owned(),
     };
@@ -2606,7 +2607,7 @@ fn print_replay_summary(artifacts: &LoadedArtifacts) {
             card.verdict.pass, card.verdict.inconclusive, card.verdict.reason
         );
         println!(
-            "replay_summary matched={}/{} side_effect_divergences={} omitted={} novel={} environmental={} inconclusive_races={} http_status_mismatches={} http_body_mismatches={}",
+            "replay_summary matched={}/{} side_effect_divergences={} omitted={} novel={} environmental={} inconclusive_races={} inconclusive_tail_gaps={} http_status_mismatches={} http_body_mismatches={}",
             card.summary.matched_correlations,
             card.summary.total_correlations,
             card.summary.side_effect_divergences,
@@ -2614,6 +2615,7 @@ fn print_replay_summary(artifacts: &LoadedArtifacts) {
             card.summary.novel_calls,
             card.summary.environmental_misses,
             card.summary.inconclusive_races,
+            card.summary.inconclusive_tail_gaps,
             card.summary.http_status_mismatches,
             card.summary.http_body_mismatches,
         );

@@ -19,6 +19,7 @@
 //!   unresolved, egress    → environmental (tolerated)
 //!   unresolved, pure/req  → deterministic (tolerated)
 //!   unresolved, blocking  → novel
+//!     …after a truncated recording tail → inconclusive_tail_gap (tolerated)
 //!   recorded ∧ unconsumed → omitted
 //!
 //! Each row carries `blocking` so the UI can show the same pass/fail split the
@@ -42,7 +43,7 @@ use super::{
     args_free_effective_values, correlation_column_provenance, event_reply_canon_kind,
     is_nonblocking_boundary, observed_schema_default_divergence, observed_value_diverged,
     omission_is_blocking, schema_default_divergence, tier_for, values_diverge_under_event,
-    GraphScoringPlan, InconclusiveRaceEvidence, SchemaDefaultVerdict, Tier,
+    GraphScoringPlan, InconclusiveRaceEvidence, SchemaDefaultVerdict, TailGapEvidence, Tier,
     POSITIONAL_FALLBACK_RANK,
 };
 
@@ -100,7 +101,8 @@ pub struct CallRecord {
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | novel | omitted | environmental | deterministic |
+    /// matched | recovered | novel | inconclusive_tail_gap | omitted |
+    /// environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
     /// identity_skew | pruned_subtree | novel_subtree
     pub kind: String,
@@ -187,6 +189,7 @@ pub fn build(
         table,
         idempotent_delete_demote,
         &InconclusiveRaceEvidence::default(),
+        &TailGapEvidence::default(),
     )
 }
 
@@ -196,6 +199,7 @@ pub(crate) fn build_with_inconclusive(
     table: &deja::LookupTable,
     idempotent_delete_demote: &HashSet<u64>,
     inconclusive_race: &InconclusiveRaceEvidence,
+    tail_gap: &TailGapEvidence,
 ) -> Vec<CallRecord> {
     let expected_seqs = &expected_sequences(table);
     let span_paths = &recorded_span_paths(table);
@@ -232,7 +236,9 @@ pub(crate) fn build_with_inconclusive(
     let mut paired_consumed: HashSet<u64> = HashSet::new();
 
     // --- observed calls (candidate side) ------------------------------------
-    for obs in observed {
+    // Enumerated because a truncated-recording tail is a POSITIONAL fact: the
+    // call must come after the correlation's last recorded event was reproduced.
+    for (observed_index, obs) in observed.iter().enumerate() {
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
         // result differs from the recorded baseline — the cause of a cascade.
         let source_event = obs
@@ -388,6 +394,11 @@ pub(crate) fn build_with_inconclusive(
         } else if obs.correlation_id.is_none() {
             // uncorrelated background-task novel call — tolerated in V1
             ("novel", false)
+        } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+            // The recording for this correlation stops at request teardown and
+            // this call comes after it: no baseline, so neither matched nor
+            // novel. Mirrors the scorecard's `InconclusiveTailGap`.
+            ("inconclusive_tail_gap", false)
         } else {
             ("novel", true)
         };
@@ -449,6 +460,7 @@ pub(crate) fn build_with_plan(
     table: &deja::LookupTable,
     idempotent_delete_demote: &HashSet<u64>,
     inconclusive_race: &InconclusiveRaceEvidence,
+    tail_gap: &TailGapEvidence,
     plan: &GraphScoringPlan,
 ) -> Vec<CallRecord> {
     let graph_correlations: BTreeSet<&str> = events
@@ -469,6 +481,7 @@ pub(crate) fn build_with_plan(
             table,
             idempotent_delete_demote,
             inconclusive_race,
+            tail_gap,
         );
     }
     let by_seq: HashMap<u64, &BoundaryEvent> = events
@@ -532,12 +545,16 @@ pub(crate) fn build_with_plan(
         .filter(|event| !graph_sequence.contains(&event.global_sequence))
         .cloned()
         .collect();
-    let flat_observed: Vec<ObservedCall> = observed
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !graph_observed_indices.contains(index))
-        .map(|(_, call)| call.clone())
+    // Retained ORIGINAL indices, ascending — the map from this sub-stream back
+    // to the stream the tail-gap evidence was measured against.
+    let flat_retained: Vec<usize> = (0..observed.len())
+        .filter(|index| !graph_observed_indices.contains(index))
         .collect();
+    let flat_observed: Vec<ObservedCall> = flat_retained
+        .iter()
+        .map(|index| observed[*index].clone())
+        .collect();
+    let flat_tail_gap = tail_gap.remap_to(&flat_retained);
     let mut flat_table = table.clone();
     flat_table
         .entries
@@ -549,6 +566,7 @@ pub(crate) fn build_with_plan(
         &flat_table,
         idempotent_delete_demote,
         inconclusive_race,
+        &flat_tail_gap,
     );
     let span_paths = recorded_span_paths(table);
 
@@ -592,6 +610,10 @@ pub(crate) fn build_with_plan(
                     assert_eq!(indices.len() as u64, *events_below);
                     for index in indices {
                         let call = &observed[index];
+                        // `indices` are ORIGINAL stream positions, which is the
+                        // space the evidence was measured in — no remap here.
+                        let unrecorded_tail =
+                            tail_gap.covers(call.correlation_id.as_deref(), index);
                         rows.push(CallRecord {
                             correlation_id: call.correlation_id.clone(),
                             source_event_global_sequence: None,
@@ -599,8 +621,13 @@ pub(crate) fn build_with_plan(
                             boundary: call.boundary.clone(),
                             trait_name: call.trait_name.clone(),
                             method_name: call.method_name.clone(),
-                            kind: "novel_subtree".to_owned(),
-                            blocking: tier_for(&call.boundary) != Tier::Environmental
+                            kind: if unrecorded_tail {
+                                "inconclusive_tail_gap".to_owned()
+                            } else {
+                                "novel_subtree".to_owned()
+                            },
+                            blocking: !unrecorded_tail
+                                && tier_for(&call.boundary) != Tier::Environmental
                                 && !is_nonblocking_boundary(&call.boundary),
                             origin: false,
                             resolved_rank: call.resolved_rank,
