@@ -97,6 +97,11 @@ pub struct ScoreSummary {
     pub matched_side_effect_calls: u64,
     #[serde(default)]
     pub inconclusive_races: u64,
+    /// Calls left unjudged because the recording for their correlation stops at
+    /// request teardown. Mirrored here so a run whose novel count fell to zero
+    /// says WHY on the same line it says so.
+    #[serde(default)]
+    pub inconclusive_tail_gaps: u64,
     #[serde(default)]
     pub environmental_misses: u64,
     #[serde(default)]
