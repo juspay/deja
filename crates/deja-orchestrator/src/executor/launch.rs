@@ -163,12 +163,15 @@ pub fn launch_spec_for_run(
     // The migrations initContainer pulls the candidate's bundle from this URI
     // (Option B). Only injected when the bundle resolved — else the template's
     // placeholder stays and the init no-ops / fails loudly on a bad URI.
+    //
+    // The config-layering init reads the SAME bundle and gets the SAME URI: both
+    // steps depend on that one object, so neither should be able to name a
+    // different one. It uses the URI only to name the object when the bundle
+    // does not carry this environment's candidate config.
     if let Some(uri) = code_bundle_uri {
-        env.push(EnvUpsert::new(
-            &cfg.migrations_init_container,
-            &cfg.code_bundle_uri_env,
-            uri,
-        ));
+        for container in [&cfg.migrations_init_container, &cfg.config_init_container] {
+            env.push(EnvUpsert::new(container, &cfg.code_bundle_uri_env, uri));
+        }
     }
 
     // One fixed render supplies the config env for every run. An empty name in
@@ -653,12 +656,9 @@ mod tests {
     /// from the wrong one is something the candidate cannot open. It failed
     /// exactly that way once the candidate first booted: `failed to open replay
     /// observed sink '/var/lib/deja/state/observed/<run>.jsonl': Permission denied`.
-    #[test]
-    fn candidate_artifact_paths_are_on_the_job_mount() {
-        let mut cfg = K8sExecutorConfig::from_env();
-        cfg.job_state_dir = "/workspace/state".into();
-        let run = Run {
-            run_id: "run-42".into(),
+    fn pending_replay_run(run_id: &str) -> Run {
+        Run {
+            run_id: run_id.into(),
             spec: crate::RunSpec {
                 scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
@@ -680,7 +680,14 @@ mod tests {
             step: 0,
             steps_total: 0,
             stage_updated_ms: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn candidate_artifact_paths_are_on_the_job_mount() {
+        let mut cfg = K8sExecutorConfig::from_env();
+        cfg.job_state_dir = "/workspace/state".into();
+        let run = pending_replay_run("run-42");
         let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
         let candidate: Vec<_> = spec
             .env
@@ -749,6 +756,31 @@ mod tests {
         base.spec.system_under_test = None;
         let spec = launch_spec_for_run(&base, &cfg, None, None).expect("spec builds");
         assert_eq!(spec.template_key, cfg.template_key);
+    }
+
+    /// Both steps that consume the CodeBundle must be pointed at the SAME
+    /// object. The migrations init applies the candidate's migrations from it;
+    /// the config init layers the candidate's own router config from it. A URI
+    /// delivered to only one of them is how the pod migrates one ref's schema
+    /// while failing to explain which bundle its config came from.
+    #[test]
+    fn the_bundle_uri_reaches_every_step_that_reads_the_bundle() {
+        let cfg = K8sExecutorConfig::from_env();
+        let run = pending_replay_run("run-42");
+        let uri = "s3://bundles/codebundles/abc123/bundle-v2.tar";
+        let spec = launch_spec_for_run(&run, &cfg, None, Some(uri)).expect("spec builds");
+        for container in [&cfg.migrations_init_container, &cfg.config_init_container] {
+            let got = spec
+                .env
+                .iter()
+                .find(|e| &e.container == container && e.name == cfg.code_bundle_uri_env)
+                .unwrap_or_else(|| panic!("{container} must be given the bundle URI"));
+            assert_eq!(&got.value, uri);
+        }
+        assert_ne!(
+            cfg.migrations_init_container, cfg.config_init_container,
+            "the two bundle consumers are separate containers, so a failure names which step"
+        );
     }
 
     /// Killing must take the pod with the Job, and sweep one the cascade missed —

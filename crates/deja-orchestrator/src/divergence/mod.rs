@@ -13,6 +13,7 @@
 //!   - candidate call with no table hit     → NovelCall (blocking)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
+//!     …after a truncated recording tail    → InconclusiveTailGap (inconclusive)
 //!   - table entry the candidate never hit  → OmittedCall (blocking)
 //!     …uncorrelated, or non-blocking       → OmittedCallTolerated
 //!   - schema-derived DB/response occurrences → SchemaDefaultDivergence (tolerated)
@@ -272,6 +273,22 @@ pub struct Summary {
     /// divergence. Substitute hits do not contribute seed gaps.
     #[serde(default)]
     pub inconclusive_seed_gaps: u64,
+    /// Calls that could not be conclusively classified because the RECORDING for
+    /// their correlation stops at request teardown — the recorder releases the
+    /// correlation at the API-lock release, so the post-response work the request
+    /// path goes on to do was never captured. The candidate performs that work on
+    /// replay and it necessarily misses the lookup table. Counted here rather
+    /// than as `novel_calls` so a recording limit is not reported as a candidate
+    /// bug, and never as a pass: the correlation's verdict becomes INCONCLUSIVE.
+    ///
+    /// Guarded on the correlation's HTTP response matching in BOTH status and
+    /// body — a tail gap that changed the response is a divergence, not a tail
+    /// gap — and on the call sitting after the reproduced teardown marker. See
+    /// [`tail_gap_evidence`].
+    ///
+    /// Projection of `per_boundary[*].kinds["InconclusiveTailGap"]`.
+    #[serde(default)]
+    pub inconclusive_tail_gaps: u64,
     /// Value-divergence rows that were recognized as a narrow read/write race:
     /// HTTP-clean, same typed DB row, distinct overlapping task buckets. These are
     /// not counted as blocking side-effect divergences; the verdict is explicitly
@@ -362,6 +379,14 @@ pub struct CorrelationOutcome {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_shape: Option<span_shape::CorrelationSpanShape>,
+    /// This correlation carried at least one `InconclusiveTailGap`: its
+    /// recording stops at request teardown, so the candidate's post-response
+    /// work has no baseline and the correlation CANNOT be judged clean. Held
+    /// apart from `passed` rather than folded into it — an unjudgeable
+    /// correlation is not a failing one, and it is emphatically not a passing
+    /// one. `passed` is false whenever this is true.
+    #[serde(default)]
+    pub inconclusive: bool,
     pub passed: bool,
 }
 
@@ -455,6 +480,11 @@ impl Scorecard {
             "inconclusive_seed_gaps",
             s.inconclusive_seed_gaps,
             &["InconclusiveSeedGap"],
+        );
+        folds(
+            "inconclusive_tail_gaps",
+            s.inconclusive_tail_gaps,
+            &["InconclusiveTailGap"],
         );
         folds(
             "inconclusive_races",
@@ -3297,6 +3327,191 @@ pub(crate) fn idempotent_delete_demotions(
         .collect()
 }
 
+/// Key prefix of the router's per-request API lock. The lock is taken at request
+/// entry and RELEASED as the last thing the request path does before the response
+/// is finalized, so a `delete_key` on it is the request-teardown marker.
+const API_LOCK_KEY_PREFIX: &str = "API_LOCK_";
+
+/// Whether this recorded event is the request-teardown marker — the API-lock
+/// release the router performs at response finalization.
+fn is_request_teardown_marker(ev: &deja::BoundaryEvent) -> bool {
+    ev.boundary == "redis"
+        && ev.method_name == "delete_key"
+        && ev
+            .args
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| key.starts_with(API_LOCK_KEY_PREFIX))
+}
+
+/// Correlations whose RECORDING was truncated at request teardown, and the point
+/// in the candidate's observed stream after which its calls therefore have no
+/// recorded baseline to be judged against.
+///
+/// The recorder stops capturing a correlation at the API-lock release, so the
+/// post-response work the request path goes on to do — persisting and notifying
+/// an outgoing webhook, roughly a second later — never reaches the tape. On
+/// replay the candidate does that work for real and every call in it misses the
+/// lookup table. Charging those to the candidate as blocking novel calls reports
+/// a RECORDING limit as a candidate bug; tolerating them silently launders a real
+/// capture gap into a clean pass. Neither is true, so they are their own class:
+/// INCONCLUSIVE, and never passing.
+///
+/// This is [`Summary::inconclusive_seed_gaps`] on a different axis — a missing
+/// baseline that is neither a false match nor a false divergence — and it is
+/// deliberately built the same way: named, counted, folded out of `per_boundary`,
+/// and excluded from the blocking total without being excluded from the verdict.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TailGapEvidence {
+    /// correlation -> index of the FIRST observed call past the one that
+    /// reproduced that correlation's last recorded event. From here on the
+    /// recording has nothing left to say about the correlation.
+    tail_begins_at: HashMap<String, usize>,
+}
+
+impl TailGapEvidence {
+    /// Whether an otherwise-BLOCKING novel call sits in the unrecorded tail.
+    ///
+    /// This positional test is the load-bearing half of the class — see the
+    /// measurement on [`tail_gap_evidence`]. Callers must consult it only after
+    /// every other classification has declined the call, so it can demote
+    /// nothing but a would-be `NovelCall` / `NovelSubtree`.
+    pub(crate) fn covers(&self, correlation: Option<&str>, observed_index: usize) -> bool {
+        correlation
+            .and_then(|correlation| self.tail_begins_at.get(correlation))
+            .is_some_and(|tail_begins_at| observed_index >= *tail_begins_at)
+    }
+
+    /// Re-express these indices against a FILTERED observed stream, where
+    /// `retained` lists — ascending — the original indices that survived.
+    ///
+    /// The graph-mode ledger scores flat-tier correlations through a rebuilt
+    /// sub-stream, and an index means nothing outside the stream it was taken
+    /// from. Handing the original indices to that sub-stream would demote
+    /// whichever calls happened to land on those positions, which is the
+    /// divergence-hiding failure this class exists to avoid.
+    pub(crate) fn remap_to(&self, retained: &[usize]) -> TailGapEvidence {
+        TailGapEvidence {
+            tail_begins_at: self
+                .tail_begins_at
+                .iter()
+                .map(|(correlation, original)| {
+                    (
+                        correlation.clone(),
+                        retained.partition_point(|index| index < original),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Build [`TailGapEvidence`]. A correlation qualifies only when ALL of these
+/// hold; each is doing work, and dropping any one of them widens this from a
+/// truncation class into a divergence-hiding machine.
+///
+///   1. Its recording ENDS at the request-teardown marker. If the tape carries
+///      post-teardown events for the correlation then the recorder did NOT stop
+///      there, and a novel call is a novel call.
+///   2. That last event is not the tape's last event. Per-correlation truncation
+///      is the measured shape; a correlation running to the end of the tape is
+///      left BLOCKING, which is the safe direction to be wrong in.
+///   3. The candidate actually reproduced the teardown marker. Without an
+///      observed counterpart there is no point in the stream to call the tail
+///      start, and the recorded prefix was not reproduced anyway.
+///   4. THE GUARD — the correlation's HTTP status AND body both matched. A tail
+///      gap that changed the response is not a tail gap, it is a divergence. A
+///      correlation with no HTTP diff at all fails this too: absent evidence
+///      that the response matched, the calls stay blocking.
+///
+/// Condition (1) is near-vacuous ALONE and must never be used alone: in a
+/// measured main-app run 71 of 77 correlations ended at the API-lock release, so
+/// it establishes only that the recorder behaves this way generally. What
+/// discriminates is the POSITIONAL test in [`TailGapEvidence::covers`] — the call
+/// must come after the teardown marker was reproduced. That same run carried 16
+/// BLOCKING novel `update_payment_intent` calls inside `payments_operation_core`,
+/// mid-request and HTTP-clean: conditions (1)–(4) all hold for their
+/// correlations, and only their POSITION keeps them blocking, which is correct.
+fn tail_gap_evidence(
+    events: &[deja::BoundaryEvent],
+    observed: &[ObservedCall],
+    http_clean_by_correlation: &HashMap<String, bool>,
+) -> TailGapEvidence {
+    let Some(tape_last_sequence) = events.iter().map(|ev| ev.global_sequence).max() else {
+        return TailGapEvidence::default();
+    };
+    let mut last_recorded: HashMap<&str, &deja::BoundaryEvent> = HashMap::new();
+    for ev in events {
+        let Some(correlation) = ev.correlation_id.as_deref() else {
+            continue;
+        };
+        last_recorded
+            .entry(correlation)
+            .and_modify(|existing| {
+                if ev.global_sequence > existing.global_sequence {
+                    *existing = ev;
+                }
+            })
+            .or_insert(ev);
+    }
+    let mut tail_begins_at = HashMap::new();
+    for (correlation, last) in last_recorded {
+        if !is_request_teardown_marker(last) || last.global_sequence >= tape_last_sequence {
+            continue;
+        }
+        if http_clean_by_correlation.get(correlation) != Some(&true) {
+            continue;
+        }
+        // The observed call that reproduced the teardown marker. Take the LAST
+        // such index: a duplicate resolution must not drag the tail start
+        // earlier and widen the class.
+        let Some(index) = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, obs)| {
+                obs.correlation_id.as_deref() == Some(correlation)
+                    && obs.source_event_global_sequence == Some(last.global_sequence)
+            })
+            .map(|(index, _)| index)
+            .max()
+        else {
+            continue;
+        };
+        tail_begins_at.insert(correlation.to_owned(), index + 1);
+    }
+    TailGapEvidence { tail_begins_at }
+}
+
+/// Per-correlation HTTP cleanliness: status matched AND no blocking body leaf.
+/// A correlation carrying several responses is clean only if every one of them
+/// is, mirroring the `corr_http` fold the per-correlation outcomes use.
+fn http_clean_by_correlation(
+    http_diffs: &[HttpDiff],
+    http_incoming_by_correlation: &HashMap<String, &deja::BoundaryEvent>,
+    inconclusive_race: &InconclusiveRaceEvidence,
+    column_provenance: &CorrelationColumnProvenance,
+) -> HashMap<String, bool> {
+    let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
+    for diff in http_diffs {
+        let clean = diff.status_match
+            && classify_http_body_diff(
+                diff,
+                http_incoming_by_correlation
+                    .get(&diff.correlation_id)
+                    .copied(),
+                inconclusive_race,
+                column_provenance,
+            )
+            .blocking_leaf_count
+                == 0;
+        clean_by_correlation
+            .entry(diff.correlation_id.clone())
+            .and_modify(|existing| *existing &= clean)
+            .or_insert(clean);
+    }
+    clean_by_correlation
+}
+
 pub fn detect(art: &RunArtifacts) -> Scorecard {
     let graph_plan = GraphScoringPlan::build(art);
     detect_with_plan(art, &graph_plan)
@@ -3422,6 +3637,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         idempotent_delete_demotions(&art.events, &art.observed, http_clean);
     let undeclared_concurrency = undeclared_concurrency_warnings(&art.observed);
     let undeclared_concurrency_warnings = undeclared_concurrency.len() as u64;
+    // Truncated-recording tails. Built BEFORE classification because its guard is
+    // a per-correlation HTTP verdict and the novel arms below need it in hand;
+    // the per-correlation outcomes recompute the same cleanliness downstream from
+    // the same two predicates, so the guard and the reported outcome agree.
+    let tail_gap = tail_gap_evidence(
+        &art.events,
+        &art.observed,
+        &http_clean_by_correlation(
+            &art.http_diffs,
+            &http_incoming_by_correlation,
+            &inconclusive_race,
+            &column_provenance,
+        ),
+    );
+    let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_seed_gaps = 0u64;
     let mut inconclusive_races = 0u64;
     // Expected events claimed by a ValueDiverged pairing: counted as the
@@ -3459,6 +3689,14 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 environmental_misses += 1;
             } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
                 stats.bump_kind("DeterministicMiss");
+            } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+                // The recording for this correlation stopped at request teardown
+                // and this call comes after it. There is no baseline to judge it
+                // against, so it is neither novel nor matched — see TailGapEvidence.
+                stats.bump_kind("InconclusiveTailGap");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    tail_gap_correlations.insert(correlation_id.clone());
+                }
             } else {
                 stats.bump_kind("NovelSubtree");
                 blocking_side_effect += 1;
@@ -3745,6 +3983,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // inconclusive rather than a false Novel — see InconclusiveSeedGap.
             stats.bump_kind("InconclusiveSeedGap");
             inconclusive_seed_gaps += 1;
+        } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+            // Last resort before charging the candidate: the recording for this
+            // correlation stopped at request teardown and this call comes after
+            // it, so there is no baseline to judge it against. Reached only once
+            // every other arm has declined the call, which is what keeps the
+            // demotion to would-be NovelCalls alone — see TailGapEvidence.
+            stats.bump_kind("InconclusiveTailGap");
+            if let Some(corr) = &obs.correlation_id {
+                tail_gap_correlations.insert(corr.clone());
+            }
         } else {
             stats.bump_kind("NovelCall");
             blocking_side_effect += 1;
@@ -3813,6 +4061,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let novel_calls =
         kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
+    let inconclusive_tail_gaps = kind_total(&per_boundary, "InconclusiveTailGap");
 
     // --- post-finalization correlated work warnings --------------------------
     for warning in &undeclared_concurrency {
@@ -3954,8 +4203,17 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     for (corr, (status_match, body_match)) in &corr_http {
         let side_effect_divergences = corr_side_effect.get(corr).copied().unwrap_or(0);
         let span_shape_clean = span_shapes.get(corr).is_none_or(|shape| shape.clean());
-        let passed =
-            *status_match && *body_match && side_effect_divergences == 0 && span_shape_clean;
+        // A tail gap costs the correlation its pass without charging it a
+        // divergence. Demoting those calls out of `corr_side_effect` and stopping
+        // there would have handed this correlation a clean `passed` — the
+        // silent-absorption failure — so the unjudgeable state is carried
+        // explicitly instead.
+        let inconclusive = tail_gap_correlations.contains(corr);
+        let passed = *status_match
+            && *body_match
+            && side_effect_divergences == 0
+            && span_shape_clean
+            && !inconclusive;
         if passed {
             matched_correlations += 1;
         }
@@ -3971,6 +4229,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             ),
             alignment: graph_plan.scored_alignment(corr, graph_value_nodes.get(corr)),
             span_shape: span_shapes.remove(corr),
+            inconclusive,
             passed,
         });
     }
@@ -4024,6 +4283,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "{inconclusive_seed_gaps} inconclusive seed gap(s) (non-blocking)"
         ));
     }
+    // A truncated recording tail is reported and does NOT fail the verdict — but
+    // it does not pass either, so unlike a seed gap it forces `inconclusive`.
+    if inconclusive_tail_gaps > 0 {
+        reasons.push(format!(
+            "{inconclusive_tail_gaps} inconclusive tail-gap call(s) across \
+             {} correlation(s): recording truncated at request teardown",
+            tail_gap_correlations.len()
+        ));
+    }
     if inconclusive_races > 0 {
         reasons.push(format!(
             "{inconclusive_races} inconclusive_race row(s) recognized; auto-rerun recommended"
@@ -4053,11 +4321,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
         - usize::from(inconclusive_seed_gaps > 0)
+        - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
         - usize::from(idempotent_delete_warnings > 0)
         - usize::from(schema_default_divergences > 0)
         - usize::from(undeclared_concurrency_warnings > 0);
-    let inconclusive = nothing || (inconclusive_races > 0 && blocking_reasons == 0);
+    // A tail gap joins a race in forcing INCONCLUSIVE rather than merely
+    // declining to block: the candidate's post-response work went unrecorded, so
+    // a run carrying one has not been shown to be clean and must never report a
+    // pass. A seed gap deliberately does not do this — its missing baseline is a
+    // single call's, not a whole correlation's unjudged tail.
+    let inconclusive = nothing
+        || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0) && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
         "no artifacts ingested for this run yet".to_owned()
@@ -4157,6 +4432,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             idempotent_delete_warnings,
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
+            inconclusive_tail_gaps,
             inconclusive_races,
             missing_scored_spans,
             novel_scored_spans,
@@ -4454,12 +4730,25 @@ pub(crate) fn build_ledger_with_plan(
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
     let idempotent_delete = idempotent_delete_demotions(events, &art.observed, http_clean);
+    // The SAME evidence the scorecard classifies with, from the same streams, so
+    // a tail-gap row and a tail-gap count cannot come apart.
+    let tail_gap = tail_gap_evidence(
+        events,
+        &art.observed,
+        &http_clean_by_correlation(
+            &art.http_diffs,
+            &http_incoming_by_correlation,
+            &inconclusive_race,
+            &column_provenance,
+        ),
+    );
     Ok(ledger::build_with_plan(
         events,
         &art.observed,
         &art.table,
         &idempotent_delete,
         &inconclusive_race,
+        &tail_gap,
         graph_plan,
     ))
 }
@@ -7873,6 +8162,306 @@ mod tests {
             card.verdict.reason
         );
         assert!(card.verdict.reason.contains("seed gap"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Truncated recording tails
+    // -----------------------------------------------------------------------
+
+    /// A recorded event at `seq` on `boundary`/`method`, carrying `args`.
+    fn tail_ev(
+        seq: u64,
+        corr: &str,
+        boundary: &str,
+        method: &str,
+        args: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut ev = omitted_ev(seq, boundary, Some(corr));
+        ev.method_name = method.to_owned();
+        ev.args = args;
+        ev
+    }
+
+    /// The router's API-lock release — the request-teardown marker a truncated
+    /// recording ends at.
+    fn teardown_ev(seq: u64, corr: &str) -> deja::BoundaryEvent {
+        tail_ev(
+            seq,
+            corr,
+            "redis",
+            "delete_key",
+            serde_json::json!({"command": "DEL", "key": "API_LOCK_merchant_1_payments_pay_x"}),
+        )
+    }
+
+    fn resolved_obs(boundary: &str, corr: &str, seq: u64) -> ObservedCall {
+        obs(boundary, Some(corr), true, Some(1), Some(seq))
+    }
+
+    /// The measured shape. `c1`'s recording ends at its API-lock release while
+    /// the tape runs on for `c2`, so the truncation is per-correlation. The
+    /// candidate reproduces every recorded `c1` call and then makes one more —
+    /// the post-response webhook work the recorder never captured.
+    ///
+    /// The parameters are exactly what the class must stay sensitive to:
+    /// `status_match` and `body` are THE GUARD's inputs, and `extra_at_tail`
+    /// puts the candidate's unrecorded call after the teardown marker (a tail
+    /// gap) or before it (mid-request work, which is a real novel call).
+    fn tail_gap_art(
+        status_match: bool,
+        body: Vec<JsonFieldDiff>,
+        extra_at_tail: bool,
+    ) -> RunArtifacts {
+        let extra = obs("db", Some("c1"), false, None, None);
+        let mut observed = vec![resolved_obs("db", "c1", 1)];
+        if !extra_at_tail {
+            observed.push(extra.clone());
+        }
+        observed.push(resolved_obs("redis", "c1", 2));
+        if extra_at_tail {
+            observed.push(extra);
+        }
+        observed.push(resolved_obs("db", "c2", 3));
+        art_with_events(
+            vec![
+                seq_entry(Some("c1"), "db", 1),
+                seq_entry(Some("c1"), "redis", 2),
+                seq_entry(Some("c2"), "db", 3),
+            ],
+            observed,
+            vec![http("c1", status_match, body), http("c2", true, vec![])],
+            vec![
+                tail_ev(1, "c1", "db", "m", serde_json::json!({})),
+                teardown_ev(2, "c1"),
+                tail_ev(3, "c2", "db", "m", serde_json::json!({})),
+            ],
+        )
+    }
+
+    /// The measured defect. The recorder stops capturing a correlation at the
+    /// API-lock release, so the post-response webhook work the request path goes
+    /// on to do never reaches the tape. The candidate does it for real on replay
+    /// and every call in it misses the table. That is a RECORDING limit, so it
+    /// is neither a blocking novel call nor a pass.
+    #[test]
+    fn truncated_recording_tail_is_inconclusive_not_a_novel_call() {
+        let card = detect(&tail_gap_art(true, vec![], true));
+        assert_eq!(card.summary.inconclusive_tail_gaps, 1);
+        assert_eq!(card.summary.novel_calls, 0, "a tail gap is not a Novel");
+        assert_eq!(card.summary.side_effect_divergences, 0);
+        // Laundering check: the demotion must not have been bought by matching
+        // FEWER calls.
+        assert_eq!(card.summary.matched_side_effect_calls, 3);
+        assert!(
+            !card.verdict.pass,
+            "an unrecorded tail is not a pass: {}",
+            card.verdict.reason
+        );
+        assert!(card.verdict.inconclusive, "{}", card.verdict.reason);
+        assert!(
+            card.verdict.reason.contains("tail-gap"),
+            "{}",
+            card.verdict.reason
+        );
+
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 scored");
+        assert!(c1.inconclusive, "the correlation cannot be judged");
+        assert!(!c1.passed, "and must never read as passing");
+        assert_eq!(c1.side_effect_divergences, 0);
+
+        // A correlation the recorder captured whole is untouched.
+        let c2 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c2")
+            .expect("c2 scored");
+        assert!(!c2.inconclusive);
+        assert!(c2.passed);
+        assert_eq!(card.summary.matched_correlations, 1, "c1 does not count");
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// THE GUARD. Every correlation this class was built from answered with a
+    /// byte-identical response, which is the only thing that makes calling their
+    /// unrecorded tails inconclusive honest. A tail gap that CHANGED the
+    /// response is not a tail gap, it is a divergence — so a status mismatch
+    /// keeps the very same call BLOCKING.
+    #[test]
+    fn a_status_mismatch_keeps_the_unrecorded_tail_call_blocking() {
+        let card = detect(&tail_gap_art(false, vec![], true));
+        assert_eq!(
+            card.summary.inconclusive_tail_gaps, 0,
+            "a diverged response is not an inconclusive tail"
+        );
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the tail call stays a BLOCKING novel call"
+        );
+        assert_eq!(card.summary.side_effect_divergences, 1);
+        assert!(!card.verdict.pass);
+        assert!(
+            !card.verdict.inconclusive,
+            "a diverged response is a real fail, not an unjudged run"
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// THE GUARD, other half: the status agreed but the BODY did not. Same
+    /// answer — the response differed, so the tail is a divergence.
+    #[test]
+    fn a_body_mismatch_keeps_the_unrecorded_tail_call_blocking() {
+        let card = detect(&tail_gap_art(
+            true,
+            vec![JsonFieldDiff {
+                json_path: "$.amount".to_owned(),
+                baseline: serde_json::json!(100),
+                candidate: serde_json::json!(200),
+            }],
+            true,
+        ));
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.http_body_mismatches, 1);
+        assert!(!card.verdict.pass);
+        assert!(!card.verdict.inconclusive);
+    }
+
+    /// The condition that does the real work. "The recording ends at a teardown
+    /// marker" is very nearly universal — in the measured main-app run it held
+    /// for 71 of 77 correlations — so it cannot be what selects a tail gap. That
+    /// same run carried 16 BLOCKING novel `update_payment_intent` calls inside
+    /// HTTP-clean, teardown-ending correlations, mid-request. Only their
+    /// POSITION keeps them blocking, and it must.
+    #[test]
+    fn a_novel_call_before_the_teardown_marker_stays_blocking() {
+        let card = detect(&tail_gap_art(true, vec![], false));
+        assert_eq!(
+            card.summary.inconclusive_tail_gaps, 0,
+            "mid-request work has a recorded baseline region; it is not a tail"
+        );
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.side_effect_divergences, 1);
+        assert!(!card.verdict.pass);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// Truncation is the claim, so it has to be evidenced. When the tape carries
+    /// recorded work PAST the correlation's lock release the recorder plainly
+    /// did not stop there, and an extra candidate call is a genuine novel call.
+    #[test]
+    fn a_recording_that_continues_past_teardown_is_not_truncated() {
+        // c1 records work AFTER its lock release, so the recorder plainly did
+        // not stop there. The candidate reproduces all of it and THEN makes an
+        // extra call, in the same trailing position a genuine tail gap would
+        // occupy and with the tape still running on for c2 — so the marker test
+        // is the only thing left that can tell the two apart. (An earlier
+        // version of this fixture put the extra call mid-stream and ended the
+        // tape at c1, and passed under a deleted marker test: the position and
+        // tape-end conditions were catching it instead.)
+        let a = art_with_events(
+            vec![
+                seq_entry(Some("c1"), "db", 1),
+                seq_entry(Some("c1"), "redis", 2),
+                seq_entry(Some("c1"), "db", 3),
+                seq_entry(Some("c2"), "db", 4),
+            ],
+            vec![
+                resolved_obs("db", "c1", 1),
+                resolved_obs("redis", "c1", 2),
+                resolved_obs("db", "c1", 3),
+                obs("db", Some("c1"), false, None, None),
+                resolved_obs("db", "c2", 4),
+            ],
+            vec![http("c1", true, vec![]), http("c2", true, vec![])],
+            vec![
+                tail_ev(1, "c1", "db", "m", serde_json::json!({})),
+                teardown_ev(2, "c1"),
+                tail_ev(3, "c1", "db", "m", serde_json::json!({})),
+                tail_ev(4, "c2", "db", "m", serde_json::json!({})),
+            ],
+        );
+        let card = detect(&a);
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    /// A correlation running to the very end of the tape is left BLOCKING. The
+    /// evidence for truncation is that the recorder kept capturing OTHER work
+    /// after this correlation's lock release; when the tape simply stops there
+    /// that evidence is absent, and the safe reading is the strict one.
+    #[test]
+    fn a_teardown_at_the_end_of_the_tape_is_not_evidence_of_truncation() {
+        let mut a = tail_gap_art(true, vec![], true);
+        // Drop c2, so c1's lock release IS the tape's last recorded event.
+        a.events
+            .retain(|ev| ev.correlation_id.as_deref() != Some("c2"));
+        a.table
+            .entries
+            .retain(|entry| entry.key.correlation_id.as_deref() != Some("c2"));
+        a.observed
+            .retain(|call| call.correlation_id.as_deref() != Some("c2"));
+        a.http_diffs.retain(|diff| diff.correlation_id != "c2");
+        let card = detect(&a);
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    /// The tail begins where the recording ended, so the candidate has to have
+    /// GOT there. One that never reproduced the lock release has an omission on
+    /// its hands, not an unrecorded tail to be excused.
+    #[test]
+    fn a_candidate_that_never_reached_teardown_has_no_tail_to_excuse() {
+        let mut a = tail_gap_art(true, vec![], true);
+        a.observed
+            .retain(|call| call.source_event_global_sequence != Some(2));
+        let card = detect(&a);
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(
+            card.summary.omitted_calls, 1,
+            "the unreproduced lock release is a real omission"
+        );
+        assert_eq!(card.summary.novel_calls, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    /// The ledger and the scorecard must tell ONE story: a demoted tail call
+    /// carries a non-blocking row naming the same class the summary counts.
+    #[test]
+    fn the_ledger_names_a_tail_gap_the_same_way_the_scorecard_counts_it() {
+        let a = tail_gap_art(true, vec![], true);
+        let card = detect(&a);
+        let rows = build_ledger(&a).expect("ledger builds");
+        let tail: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == "inconclusive_tail_gap")
+            .collect();
+        assert_eq!(tail.len() as u64, card.summary.inconclusive_tail_gaps);
+        assert!(
+            tail.iter().all(|row| !row.blocking),
+            "an unjudgeable call is not charged to the candidate"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "novel" && row.blocking),
+            "no blocking novel row may survive alongside the demotion"
+        );
     }
 
     /// REGRESSION (#28 extra-call): an execute-shadow call with NO recorded
