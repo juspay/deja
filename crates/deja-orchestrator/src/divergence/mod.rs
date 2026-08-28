@@ -2331,15 +2331,19 @@ fn parse_project_canon(id: &str) -> Option<CanonPreset> {
     Some(CanonPreset::Project { include, exclude })
 }
 
+/// The canonical order for a multiset of JSON values: by serialized form. A
+/// SORT, never a dedup, so two collections agree only when their members agree
+/// WITH MULTIPLICITY — losing one of two identical members is still a
+/// difference.
+fn sort_as_bag(items: &mut [serde_json::Value]) {
+    items.sort_by_cached_key(|item| serde_json::to_string(item).unwrap_or_default());
+}
+
 fn bag_canon(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
             let mut items: Vec<_> = items.iter().map(bag_canon).collect();
-            items.sort_by(|a, b| {
-                serde_json::to_string(a)
-                    .unwrap_or_default()
-                    .cmp(&serde_json::to_string(b).unwrap_or_default())
-            });
+            sort_as_bag(&mut items);
             serde_json::Value::Array(items)
         }
         serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -2785,8 +2789,21 @@ fn http_diff_absorbed_by_reply_canon(
     recorded_http: Option<&deja::BoundaryEvent>,
     body: &JsonFieldDiff,
 ) -> bool {
-    let Some(CanonPreset::Project { include, exclude }) = recorded_http.and_then(event_reply_canon)
-    else {
+    let Some(canon) = recorded_http.and_then(event_reply_canon) else {
+        return false;
+    };
+    // `bag` is the generic declaration that a boundary's collections carry no
+    // order, and it is the one place knowledge of a particular payload belongs:
+    // stated by whoever owns the semantics, against the boundary it describes,
+    // rather than compiled into the comparison. Without a declaration an
+    // ordering difference is reported like any other.
+    if matches!(canon, CanonPreset::Bag) {
+        return match (&diff.baseline_body, &diff.candidate_body) {
+            (Some(baseline), Some(candidate)) => canon.equivalent(baseline, candidate),
+            _ => false,
+        };
+    }
+    let CanonPreset::Project { include, exclude } = canon else {
         return false;
     };
     if let (Some(baseline), Some(candidate)) = (&diff.baseline_body, &diff.candidate_body) {
@@ -3027,10 +3044,156 @@ fn hidden_form_bodies_equivalent(diff: &HttpDiff) -> bool {
     }
 }
 
+/// Compare two JSON values with array order treated STRUCTURALLY rather than
+/// positionally. Knows nothing about any particular schema, service or field
+/// name: it is a property of comparing JSON, not of what the JSON describes.
+///
+/// Two rules, and both of them report rather than forgive:
+///
+/// - Two arrays holding the SAME members in a different order are one
+///   difference, at the array's own path, instead of a difference at every
+///   position the two orders happen to disagree on. Nine values in a shuffled
+///   order are one fact about ordering, not seven facts about values.
+/// - Two arrays whose members genuinely differ are aligned by canonical order
+///   before being compared, so what surfaces is the membership difference
+///   rather than the positional shift it caused downstream of it.
+///
+/// The point is FAITHFULNESS, not tolerance. An ordering difference is still a
+/// difference and still blocks; it is merely reported once, at the level where
+/// it is true, so the report says the same thing every run. A boundary whose
+/// order genuinely carries no meaning says so with a `bag` reply canon, which
+/// is the generic declaration for exactly that and is honoured below — schema
+/// knowledge belongs in a declaration made by whoever owns the semantics, never
+/// in this file.
+fn order_canonical_diff(
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<JsonFieldDiff>,
+) {
+    if baseline == candidate {
+        return;
+    }
+    match (baseline, candidate) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(c)) => {
+            let mut keys: Vec<&String> = b.keys().chain(c.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                let next = format!("{path}.{key}");
+                order_canonical_diff(
+                    b.get(key).unwrap_or(&serde_json::Value::Null),
+                    c.get(key).unwrap_or(&serde_json::Value::Null),
+                    &next,
+                    out,
+                );
+            }
+        }
+        (serde_json::Value::Array(b), serde_json::Value::Array(c)) => {
+            // Same members, different order. Report it HERE and do not descend:
+            // the ordering is the whole of the difference, and descending would
+            // re-describe it as however many positions this run's two orders
+            // happened to disagree on — which is the count that will not sit
+            // still between runs.
+            if bag_canon(baseline) == bag_canon(candidate) {
+                out.push(JsonFieldDiff {
+                    json_path: path.to_owned(),
+                    baseline: baseline.clone(),
+                    candidate: candidate.clone(),
+                });
+                return;
+            }
+            // Members genuinely differ. Report the MULTISET DIFFERENCE — the
+            // members one side has and the other does not — rather than walking
+            // the two sequences in step. Members present on both sides cancel
+            // however far apart they sit, so substituting one element of nine
+            // is one difference and not the run of positional disagreements
+            // that the substitution shifted everything else into.
+            let key = |value: &serde_json::Value| {
+                serde_json::to_string(&bag_canon(value)).unwrap_or_default()
+            };
+            let mut unmatched_candidates: BTreeMap<String, Vec<&serde_json::Value>> =
+                BTreeMap::new();
+            for item in c {
+                unmatched_candidates
+                    .entry(key(item))
+                    .or_default()
+                    .push(item);
+            }
+            let mut only_baseline: Vec<&serde_json::Value> = Vec::new();
+            for item in b {
+                // Cancel against an equal member wherever it sits. Popping one
+                // occurrence rather than all of them is what keeps this a
+                // multiset difference: a lost duplicate still surfaces.
+                match unmatched_candidates.get_mut(&key(item)) {
+                    Some(pool) if !pool.is_empty() => {
+                        pool.pop();
+                    }
+                    _ => only_baseline.push(item),
+                }
+            }
+            let mut only_candidate: Vec<&serde_json::Value> =
+                unmatched_candidates.into_values().flatten().collect();
+            // Both residues in canonical order, so the pairing below — and
+            // every path it names — is the same on every run.
+            only_baseline.sort_by_cached_key(|item| key(item));
+            only_candidate.sort_by_cached_key(|item| key(item));
+            for index in 0..only_baseline.len().max(only_candidate.len()) {
+                // The index is into the residue, not into the original array:
+                // once order carries no information, a position cannot be
+                // reported as though it did.
+                let next = format!("{path}[{index}]");
+                order_canonical_diff(
+                    only_baseline
+                        .get(index)
+                        .copied()
+                        .unwrap_or(&serde_json::Value::Null),
+                    only_candidate
+                        .get(index)
+                        .copied()
+                        .unwrap_or(&serde_json::Value::Null),
+                    &next,
+                    out,
+                );
+            }
+        }
+        (b, c) => out.push(JsonFieldDiff {
+            json_path: path.to_owned(),
+            baseline: b.clone(),
+            candidate: c.clone(),
+        }),
+    }
+}
+
+/// Is this row an ordering difference — two arrays with identical members in a
+/// different order? Derived from the row itself, so it needs no flag threaded
+/// alongside it and cannot disagree with the values it describes.
+fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
+    matches!(
+        (&row.baseline, &row.candidate),
+        (serde_json::Value::Array(_), serde_json::Value::Array(_))
+    ) && row.baseline != row.candidate
+        && bag_canon(&row.baseline) == bag_canon(&row.candidate)
+}
+
+/// The response's body difference, recomputed with array order handled
+/// structurally. `None` when the run predates full bodies being recorded
+/// alongside the diff, in which case the kernel's own rows are used unchanged.
+fn order_canonical_body_diff(diff: &HttpDiff) -> Option<Vec<JsonFieldDiff>> {
+    let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
+    let mut rows = Vec::new();
+    order_canonical_diff(baseline, candidate, "$", &mut rows);
+    Some(rows)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HttpBodyClassification {
     blocking_leaf_count: usize,
     schema_derived_paths: Vec<String>,
+    /// Paths whose difference is a permutation and nothing else. Still counted
+    /// as blocking — they are named here so the report can SAY that a
+    /// difference was ordering, not so it can stop reporting it.
+    order_only_paths: Vec<String>,
 }
 
 fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
@@ -3055,7 +3218,12 @@ fn classify_http_body_diff(
         return HttpBodyClassification::default();
     }
     let mut classification = HttpBodyClassification::default();
-    for body in &diff.body_diff {
+    // Ordering is resolved BEFORE anything is classified, so every absorber
+    // below sees the path a difference will be reported at rather than
+    // whichever positions this run's ordering scattered it across.
+    let canonical = order_canonical_body_diff(diff);
+    let rows = canonical.as_deref().unwrap_or(&diff.body_diff);
+    for body in rows {
         // Existing explicit absorptions retain precedence over schema
         // provenance; one leaf is classified exactly once.
         if http_diff_absorbed_by_reply_canon(diff, recorded_http, body)
@@ -3070,6 +3238,9 @@ fn classify_http_body_diff(
                 .schema_derived_paths
                 .push(body.json_path.clone());
         } else {
+            if is_order_only_difference(body) {
+                classification.order_only_paths.push(body.json_path.clone());
+            }
             classification.blocking_leaf_count += 1;
         }
     }
@@ -4018,6 +4189,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // vacuously.
     let mut inapplicable_reply_canons: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    // Response paths whose difference was a permutation and nothing else.
+    // Counted as divergences like any other body difference; named separately
+    // so the report can say WHAT KIND of difference it was.
+    let mut order_only_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -4058,6 +4233,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 stats.bump_kind("SchemaDefaultDivergence");
                 schema_default_divergences += 1;
                 *schema_default_response_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.order_only_paths {
+                *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -4216,6 +4394,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         warnings.push(format!(
             "{n} response body leaf occurrence(s) at {path} classified as schema-derived from \
              confirmed same-correlation column provenance — the candidate did not cause this"
+        ));
+    }
+    // Say which differences were ordering. They are counted as divergences
+    // above like any other body difference; what this adds is WHICH KIND they
+    // are, so a reader can see that a collection came back with the same
+    // members in a different order and decide whether that boundary should
+    // carry a `bag` reply canon — a judgement about the payload, which belongs
+    // to whoever owns it and not to the comparison.
+    for (path, responses) in &order_only_response_paths_seen {
+        warnings.push(format!(
+            "response body path {path} holds the same members in a different order on \
+             {responses} response(s) — the collections are equal as multisets, so the difference \
+             is ordering alone. It is reported once, at the collection, rather than at each \
+             position the two orders disagree on, and it still blocks: declare a `bag` reply \
+             canon on that boundary if its order genuinely carries no meaning"
         ));
     }
     // A declaration that governs nothing is reported as the defect it is. The
@@ -5806,6 +5999,261 @@ mod tests {
             )
             .blocking_leaf_count,
             1
+        );
+    }
+
+    // --- array order is compared structurally, not positionally -------------
+    //
+    // Field names below are arbitrary on purpose. Nothing in the comparison
+    // knows what a payload means; a test that only passed for one service's
+    // schema would be testing the wrong thing.
+
+    fn body_pair(baseline: serde_json::Value, candidate: serde_json::Value) -> HttpDiff {
+        // Built the way the pipeline builds it: the kernel's own positional
+        // diff, so these tests are fed the rows the kernel really emits.
+        let body_diff = deja_kernel::diff_json(&baseline, &candidate, "$", &[]);
+        http_with_bodies("order", true, body_diff, baseline, candidate)
+    }
+
+    fn classify_body(diff: &HttpDiff) -> HttpBodyClassification {
+        classify_http_body_diff(
+            diff,
+            None,
+            &InconclusiveRaceEvidence::default(),
+            &CorrelationColumnProvenance::default(),
+        )
+    }
+
+    /// The fix itself. A permutation is ONE difference, at the collection, for
+    /// every permutation — not however many positions this run's two orders
+    /// happened to disagree on.
+    #[test]
+    fn a_permuted_array_is_one_difference_at_the_collection_whatever_the_permutation() {
+        let baseline = serde_json::json!({ "tags": ["a", "b", "c", "d", "e"] });
+        let mut counts = Vec::new();
+        for rotation in 1..5 {
+            let mut items = ["a", "b", "c", "d", "e"];
+            items.rotate_left(rotation);
+            let diff = body_pair(baseline.clone(), serde_json::json!({ "tags": items }));
+            assert!(
+                diff.body_diff.len() > 1,
+                "the positional diff must be the many-row one being replaced"
+            );
+            let rows = order_canonical_body_diff(&diff).expect("bodies present");
+            assert_eq!(
+                rows.len(),
+                1,
+                "one ordering difference, not one per position"
+            );
+            assert_eq!(rows[0].json_path, "$.tags");
+            counts.push(classify_body(&diff).blocking_leaf_count);
+        }
+        assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
+    }
+
+    /// THE GUARD. An ordering difference is still a difference. Nothing here
+    /// makes the comparison order-blind — it makes it say the same thing every
+    /// run.
+    #[test]
+    fn a_reordering_is_still_a_divergence() {
+        let diff = body_pair(
+            serde_json::json!({ "steps": ["authenticate", "authorize", "capture"] }),
+            serde_json::json!({ "steps": ["capture", "authorize", "authenticate"] }),
+        );
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
+        assert_eq!(classify_body(&diff).order_only_paths, vec!["$.steps"]);
+    }
+
+    /// Members are compared WITH MULTIPLICITY: canonical order is a sort, never
+    /// a dedup, so a dropped duplicate is a real difference and not a
+    /// reordering.
+    #[test]
+    fn a_dropped_duplicate_member_is_not_an_ordering_difference() {
+        let diff = body_pair(
+            serde_json::json!({ "items": ["book", "book"] }),
+            serde_json::json!({ "items": ["book"] }),
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 1);
+        assert!(
+            classification.order_only_paths.is_empty(),
+            "losing a member is a membership difference, not an ordering one"
+        );
+    }
+
+    /// Multiplicity is the whole difference between a multiset and a set. These
+    /// two arrays hold the same DISTINCT members, in the same order, and are
+    /// not the same collection.
+    #[test]
+    fn the_same_members_in_different_quantities_are_not_a_reordering() {
+        let diff = body_pair(
+            serde_json::json!({ "items": ["a", "a", "b"] }),
+            serde_json::json!({ "items": ["a", "b", "b"] }),
+        );
+        let classification = classify_body(&diff);
+        assert!(
+            classification.order_only_paths.is_empty(),
+            "a changed count is a membership difference, not an ordering one"
+        );
+        assert_eq!(classification.blocking_leaf_count, 1);
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows[0].baseline, serde_json::json!("a"));
+        assert_eq!(rows[0].candidate, serde_json::json!("b"));
+    }
+
+    /// A genuinely changed member survives, and lands at a canonical path
+    /// rather than wherever the two orders drifted apart.
+    #[test]
+    fn a_changed_member_survives_canonical_alignment() {
+        let diff = body_pair(
+            serde_json::json!({ "tags": ["a", "b", "c"] }),
+            serde_json::json!({ "tags": ["c", "z", "a"] }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1, "one member changed, one row");
+        assert_eq!(rows[0].baseline, serde_json::json!("b"));
+        assert_eq!(rows[0].candidate, serde_json::json!("z"));
+        assert!(classify_body(&diff).order_only_paths.is_empty());
+    }
+
+    /// A reordering of an OUTER collection is reported at the outer collection
+    /// and not descended into — descending would re-describe one fact as
+    /// however many nested positions this run's orders disagreed on.
+    #[test]
+    fn a_nested_reordering_is_reported_at_the_outermost_collection() {
+        let group = |first: &str, second: &str, inner: [&str; 3]| {
+            serde_json::json!({ "groups": [
+                { "name": first, "members": inner },
+                { "name": second, "members": inner },
+            ]})
+        };
+        let diff = body_pair(
+            group("x", "y", ["1", "2", "3"]),
+            group("y", "x", ["3", "1", "2"]),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].json_path, "$.groups");
+    }
+
+    /// The real response pair this came from: two runs of the same binary
+    /// returning the same nine card networks in different orders. Fifteen
+    /// positional rows become one, and the same one whichever way it is shuffled.
+    #[test]
+    fn the_measured_response_reduces_to_one_stable_difference() {
+        let recorded = serde_json::json!({ "payment_methods_enabled": [
+            { "payment_method_type": "credit", "card_networks": [
+                "AmericanExpress", "DinersClub", "Discover", "JCB", "CartesBancaires",
+                "Visa", "UnionPay", "Mastercard", "Interac"]},
+            { "payment_method_type": "debit", "card_networks": [
+                "Mastercard", "Interac", "DinersClub", "Discover", "JCB",
+                "Visa", "AmericanExpress", "UnionPay", "CartesBancaires"]},
+        ]});
+        let replayed = serde_json::json!({ "payment_methods_enabled": [
+            { "payment_method_type": "debit", "card_networks": [
+                "CartesBancaires", "Mastercard", "Visa", "Discover", "AmericanExpress",
+                "Interac", "JCB", "DinersClub", "UnionPay"]},
+            { "payment_method_type": "credit", "card_networks": [
+                "UnionPay", "DinersClub", "Mastercard", "JCB", "Discover",
+                "Interac", "CartesBancaires", "AmericanExpress", "Visa"]},
+        ]});
+        let diff = body_pair(recorded, replayed);
+        assert!(
+            diff.body_diff.len() >= 15,
+            "the positional diff is the noisy one"
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 1);
+        assert_eq!(
+            classification.order_only_paths,
+            vec!["$.payment_methods_enabled"]
+        );
+    }
+
+    /// A body carrying no arrays at all reaches exactly the rows the kernel
+    /// emitted.
+    #[test]
+    fn a_body_without_arrays_is_unchanged() {
+        let diff = body_pair(
+            serde_json::json!({ "amount": 100, "currency": "USD" }),
+            serde_json::json!({ "amount": 101, "currency": "USD" }),
+        );
+        assert_eq!(
+            order_canonical_body_diff(&diff).expect("bodies present"),
+            diff.body_diff
+        );
+    }
+
+    /// A boundary that declares `bag` says its collections carry no order. THAT
+    /// is where knowledge of a payload lives — in a declaration made by whoever
+    /// owns the semantics, against the boundary it describes.
+    #[test]
+    fn a_declared_bag_reply_canon_absorbs_a_reordering() {
+        let corr = "bag-declared";
+        let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
+        let replayed = serde_json::json!({ "tags": ["c", "a", "b"] });
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                901,
+                Some("bag"),
+                recorded,
+            )],
+        ));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(card.summary.http_body_mismatches, 0);
+    }
+
+    /// …and it absorbs ONLY reordering. A declaration that order is
+    /// insignificant is not a declaration that membership is.
+    #[test]
+    fn a_declared_bag_reply_canon_keeps_a_changed_member_blocking() {
+        let corr = "bag-declared-changed";
+        let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
+        let replayed = serde_json::json!({ "tags": ["c", "a", "z"] });
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                902,
+                Some("bag"),
+                recorded,
+            )],
+        ));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 1);
+        assert_eq!(card.summary.http_body_mismatches, 1);
+    }
+
+    /// The report SAYS a difference was ordering, naming the collection.
+    #[test]
+    fn the_scorecard_names_an_ordering_difference_as_one() {
+        let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
+        let replayed = serde_json::json!({ "tags": ["c", "a", "b"] });
+        let card = detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 1);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("$.tags")
+                && w.contains("same members in a different order")
+                && w.contains("still blocks")),
+            "warnings: {:?}",
+            card.warnings
         );
     }
 
