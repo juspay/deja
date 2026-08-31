@@ -361,6 +361,15 @@ pub fn diff_json(
                     return diff_json(&bv, &cv, path, allowlist);
                 }
             }
+            // Same rule, second encoding: a form-urlencoded body is a map
+            // serialized into a string, and the serializing map's iteration
+            // order is per-process random — prism's Stripe bodies reorder
+            // `metadata[...]` pairs on every process. DISTINCT keys compare
+            // order-insensitively; repeated same-named keys keep their
+            // relative order (that order is array semantics, not noise).
+            if let (Some(bp), Some(cp)) = (parse_form_pairs(b), parse_form_pairs(c)) {
+                return diff_form_pairs(&bp, &cp, path, allowlist);
+            }
             vec![JsonFieldDiff {
                 json_path: path.to_owned(),
                 baseline: baseline.clone(),
@@ -373,6 +382,74 @@ pub fn diff_json(
             candidate: c.clone(),
         }],
     }
+}
+
+/// Read a string as form-urlencoded pairs, STRICTLY: at least two
+/// `&`-separated segments (a single pair cannot be reordered, so bytes
+/// suffice there), every segment non-empty and carrying `key=`, keys
+/// non-empty. Anything else — prose, html, base64 — is not form data and
+/// keeps byte semantics. Values stay percent-ENCODED: both sides were
+/// produced by the same encoder, so encoded equality is value equality and
+/// decoding could only blur that.
+fn parse_form_pairs(raw: &str) -> Option<Vec<(&str, &str)>> {
+    let segments: Vec<&str> = raw.split('&').collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    segments
+        .iter()
+        .map(|segment| match segment.split_once('=') {
+            Some((k, v)) if !k.is_empty() => Some((k, v)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Compare two pair lists: per key, the ordered list of its values must be
+/// equal (repeated-key order is meaningful; distinct-key order is not). A
+/// differing key reports at `{path}.{key}` — the key names the field, which
+/// beats one opaque body diff.
+fn diff_form_pairs(
+    baseline: &[(&str, &str)],
+    candidate: &[(&str, &str)],
+    path: &str,
+    allowlist: &[&str],
+) -> Vec<JsonFieldDiff> {
+    let group = |pairs: &[(&str, &str)]| {
+        let mut by_key: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (k, v) in pairs {
+            by_key.entry((*k).to_owned()).or_default().push((*v).to_owned());
+        }
+        by_key
+    };
+    let b = group(baseline);
+    let c = group(candidate);
+    let mut keys: Vec<&String> = b.keys().chain(c.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut diffs = Vec::new();
+    for k in keys {
+        let key_path = format!("{path}.{k}");
+        if allowlist.contains(&key_path.as_str()) {
+            continue;
+        }
+        let bv = b.get(k);
+        let cv = c.get(k);
+        if bv == cv {
+            continue;
+        }
+        let to_json = |v: Option<&Vec<String>>| match v {
+            None => serde_json::Value::Null,
+            Some(vals) if vals.len() == 1 => serde_json::Value::String(vals[0].clone()),
+            Some(vals) => serde_json::json!(vals),
+        };
+        diffs.push(JsonFieldDiff {
+            json_path: key_path,
+            baseline: to_json(bv),
+            candidate: to_json(cv),
+        });
+    }
+    diffs
 }
 
 /// Build an `HttpDiff` from baseline + candidate, applying the allowlist.
@@ -673,6 +750,57 @@ mod tests {
         let b = serde_json::json!({"echo": "{\"a\":1}"});
         let c = serde_json::json!({"echo": "{\"a\":2}"});
         assert!(diff_json(&b, &c, "$", &["$.echo"]).is_empty());
+    }
+
+    /// Same rule, second encoding: prism serializes the Stripe form body's
+    /// `metadata[...]` map in per-process-random order — identical pairs,
+    /// different byte order, on every replayed response. Distinct-key order
+    /// is serialization noise; the pairs are the behavior.
+    #[test]
+    fn form_encoded_strings_with_reordered_distinct_keys_are_equal() {
+        let b = serde_json::json!({"body":
+            "amount=6540&currency=USD&metadata%5Blogin_date%5D=2019-09-10T10%3A11%3A12Z&metadata%5Budf1%5D=value1"});
+        let c = serde_json::json!({"body":
+            "amount=6540&metadata%5Budf1%5D=value1&metadata%5Blogin_date%5D=2019-09-10T10%3A11%3A12Z&currency=USD"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert!(diff.is_empty(), "distinct-key order is not behavior: {diff:?}");
+    }
+
+    /// …but repeated SAME-named keys are ordered data (array semantics), and
+    /// a real value change reports at its own key, not as one opaque body.
+    #[test]
+    fn form_encoded_repeats_keep_order_and_value_changes_name_their_key() {
+        let b = serde_json::json!({"body": "items=a&items=b"});
+        let c = serde_json::json!({"body": "items=b&items=a"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert_eq!(diff.len(), 1, "repeated-key reorder must stay a diff: {diff:?}");
+        assert_eq!(diff[0].json_path, "$.body.items");
+
+        let b = serde_json::json!({"body": "amount=6540&currency=USD"});
+        let c = serde_json::json!({"body": "currency=USD&amount=9999"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].json_path, "$.body.amount");
+        assert_eq!(diff[0].baseline, serde_json::json!("6540"));
+        assert_eq!(diff[0].candidate, serde_json::json!("9999"));
+    }
+
+    /// The qualifier is STRICT: prose, a lone pair, or an `=`-less segment
+    /// is not form data and keeps byte semantics — over-matching here would
+    /// quietly relax comparisons that were never map-shaped.
+    #[test]
+    fn non_form_strings_keep_byte_semantics() {
+        for (b, c) in [
+            ("a=1", "a=2"),                       // single pair: bytes suffice
+            ("one&two=2", "two=2&one"),           // '='-less segment
+            ("hello world & more", "more & hello"), // prose
+        ] {
+            let bj = serde_json::json!({ "v": b });
+            let cj = serde_json::json!({ "v": c });
+            let diff = diff_json(&bj, &cj, "$", &[]);
+            assert_eq!(diff.len(), 1, "{b:?} vs {c:?} must byte-diff: {diff:?}");
+            assert_eq!(diff[0].json_path, "$.v");
+        }
     }
 
     /// The defect: `text/html` never parses as JSON, so the recorder's `json`
