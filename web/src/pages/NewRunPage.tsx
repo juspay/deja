@@ -58,10 +58,15 @@ export default function NewRunPage() {
   const [params] = useSearchParams();
   const debug = useDebug();
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
-  const [systemUnderTest, setSystemUnderTest] = React.useState("hyperswitch");
+  // A recordings-page link from a scoped (per-system bucket) listing arrives
+  // with `?system=` + `?s3=` already resolved — the row knows its own source,
+  // and retyping either is how the wrong-bucket replay happened.
+  const [systemUnderTest, setSystemUnderTest] = React.useState(
+    params.get("system") ?? "hyperswitch",
+  );
   const [imageRef, setImageRef] = React.useState("");
   const [candidateRepo, setCandidateRepo] = React.useState("");
-  const [s3Path, setS3Path] = React.useState("");
+  const [s3Path, setS3Path] = React.useState(params.get("s3") ?? "");
   const [corrs, setCorrs] = React.useState<string[]>([]);
   const [expectation, setExpectation] = React.useState("");
   const [launched, setLaunched] = React.useState<string | null>(null);

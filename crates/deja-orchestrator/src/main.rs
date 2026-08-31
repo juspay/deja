@@ -690,8 +690,35 @@ async fn v1_available_recordings(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<AvailableQuery>,
 ) -> Response {
-    let cfg = deja_orchestrator::s3::S3Config::from_env();
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+    let mut root =
+        std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    // A named system redirects the scan to its own bucket. The env var IS the
+    // whitelist: an unconfigured system is a 400 naming the var, never a scan
+    // of the default bucket wearing the wrong label.
+    let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
+    if let Some(system) = system_scope {
+        let sys = system.to_uppercase().replace('-', "_");
+        match std::env::var(format!("DEJA_{sys}_S3_BUCKET")) {
+            Ok(bucket) if !bucket.trim().is_empty() => {
+                cfg.bucket = bucket.trim().to_owned();
+                if let Ok(r) = std::env::var(format!("DEJA_{sys}_RECORDING_ROOT")) {
+                    if !r.trim().is_empty() {
+                        root = r.trim().to_owned();
+                    }
+                }
+            }
+            _ => {
+                return error_resp(
+                    400,
+                    &format!(
+                        "system '{system}' has no recording bucket configured: set                          DEJA_{sys}_S3_BUCKET on the orchestrator"
+                    ),
+                )
+            }
+        }
+    }
+    let scan_bucket = cfg.bucket.clone();
     let found = match tokio::task::spawn_blocking(move || {
         deja_compactor::list_landed_recordings(&cfg, &root)
     })
@@ -739,7 +766,11 @@ async fn v1_available_recordings(
             // than none.
             let prism_pattern = std::env::var("DEJA_PRISM_INSTANCE_PATTERN")
                 .unwrap_or_else(|_| "ucs".to_owned());
-            let system = if !r.instances.is_empty() {
+            let system = if let Some(system) = system_scope {
+                // Scoped scan: the SOURCE BUCKET names the system — that is
+                // the whole point of keeping the buckets separate.
+                Some(system)
+            } else if !r.instances.is_empty() {
                 if r.instances.iter().any(|i| i.contains(&prism_pattern)) {
                     Some("prism")
                 } else {
@@ -780,6 +811,10 @@ async fn v1_available_recordings(
                 // Which recorded system minted the session, from the id shape;
                 // null when the shape names neither.
                 "system": system,
+                // The bucket the session was FOUND in — with the scoped scan
+                // this differs from the default, and a replay of the session
+                // needs it to build `s3_source` (`s3://{bucket}/{prefix}`).
+                "bucket": scan_bucket,
                 // The `inst=` discriminators under the session — for a UCS
                 // session this is the recorder's pod name, the only identity
                 // its id does not carry.
@@ -803,6 +838,13 @@ async fn v1_available_recordings(
 struct AvailableQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Which system's recordings to list. Absent = the default bucket
+    /// (`DEJA_S3_BUCKET`). A named system scans ITS bucket
+    /// (`DEJA_<SYSTEM>_S3_BUCKET`, root `DEJA_<SYSTEM>_RECORDING_ROOT`
+    /// default `landing/v1`) — the separate-buckets posture: prism tapes
+    /// carry payment payloads on a tighter retention and never mix into the
+    /// default bucket, so the LISTING goes to them instead.
+    system: Option<String>,
 }
 
 /// What the store can say about one recording's correlations.

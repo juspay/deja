@@ -441,6 +441,10 @@ export type AvailableRecording = {
    *  run-<nanos> shape alone is ambiguous (old router recorders minted it
    *  too), and a wrong badge once sent a router tape into a prism replay. */
   system?: "hyperswitch" | "prism" | null;
+  /** The bucket the session was found in. With a `?system=` scoped listing
+   *  this differs from the default bucket, and a replay needs it to build
+   *  `s3_source` (`s3://{bucket}/{prefix}`). */
+  bucket?: string;
   /** `inst=` discriminators under the session — for a UCS session this is the
    *  recorder's pod name, the only identity its id does not carry. */
   instances?: string[];
@@ -466,9 +470,10 @@ export type AvailableRecordingsPage = {
  * with a 502 — which a caller must render as a failure to look, never as an
  * empty list, because an empty list reads as "no recordings exist".
  */
-export const availableRecordings = (limit = 200, offset = 0) =>
+export const availableRecordings = (limit = 200, offset = 0, system?: string) =>
   request<AvailableRecordingsPage>(
-    `/api/v1/recordings/available?limit=${limit}&offset=${offset}`,
+    `/api/v1/recordings/available?limit=${limit}&offset=${offset}` +
+      (system ? `&system=${encodeURIComponent(system)}` : ""),
   );
 
 // ===========================================================================
