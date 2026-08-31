@@ -727,29 +727,46 @@ async fn v1_available_recordings(
             // that difference should be one field rather than every reader
             // reimplementing the same two shapes.
             let identity = deja_orchestrator::parse_recording_id(&r.session_id);
-            let (described, system) = match &identity {
+            // Which system minted the session. The `inst=` pod names are the
+            // authoritative signal when the scan captured any (the UCS pods
+            // carry the pattern below; router pods do not). The id SHAPE alone
+            // decides only the unambiguous case: rec-<sha>-<time>-<inst> is
+            // the hyperswitch recorder's. run-<nanos> is NOT prism-specific —
+            // the router recorder minted the same shape before ids carried a
+            // revision, and a router tape wearing it was once badged "prism"
+            // and replayed against a prism candidate: every request's
+            // connection reset. Ambiguous stays null; a wrong label is worse
+            // than none.
+            let prism_pattern = std::env::var("DEJA_PRISM_INSTANCE_PATTERN")
+                .unwrap_or_else(|_| "ucs".to_owned());
+            let system = if !r.instances.is_empty() {
+                if r.instances.iter().any(|i| i.contains(&prism_pattern)) {
+                    Some("prism")
+                } else {
+                    Some("hyperswitch")
+                }
+            } else if matches!(
+                identity,
+                deja_orchestrator::RecordingIdentity::Described { .. }
+            ) {
+                Some("hyperswitch")
+            } else {
+                None
+            };
+            let described = match &identity {
                 deja_orchestrator::RecordingIdentity::Described {
                     revision,
                     recorded_at,
                     instance,
-                } => (
-                    serde_json::json!({
-                        "revision": revision,
-                        "recorded_at": recorded_at,
-                        "instance": instance,
-                    }),
-                    // The rec-<sha>-<time>-<inst> shape is the hyperswitch
-                    // recorder's; the boot-derived run-<nanos> shape is the
-                    // UCS recorder's. The id shape is the cheapest honest
-                    // signal the LISTING has — object content would say more,
-                    // but a bucket scan must not read objects.
-                    Some("hyperswitch"),
-                ),
-                deja_orchestrator::RecordingIdentity::BootDerived { booted_at_nanos } => (
-                    serde_json::json!({ "booted_at_nanos": booted_at_nanos }),
-                    Some("prism"),
-                ),
-                deja_orchestrator::RecordingIdentity::Opaque => (serde_json::Value::Null, None),
+                } => serde_json::json!({
+                    "revision": revision,
+                    "recorded_at": recorded_at,
+                    "instance": instance,
+                }),
+                deja_orchestrator::RecordingIdentity::BootDerived { booted_at_nanos } => {
+                    serde_json::json!({ "booted_at_nanos": booted_at_nanos })
+                }
+                deja_orchestrator::RecordingIdentity::Opaque => serde_json::Value::Null,
             };
             serde_json::json!({
                 "recording_id": r.session_id,

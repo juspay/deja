@@ -431,10 +431,12 @@ pub enum RecordingIdentity {
         /// minute stay distinct.
         instance: String,
     },
-    /// A prism/UCS recorder default: `run-<nanos-since-epoch>`, minted at
-    /// process boot (prism's `configured_run_id`). The shape names the SYSTEM
-    /// as a side effect — only the UCS recorder mints these — which is what
-    /// lets the recordings page say "prism" without reading an object.
+    /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
+    /// boot. The prism recorder always mints these — but so did the router
+    /// recorder before ids carried a revision, so the SHAPE alone does not
+    /// name the system; a router tape wearing this id was once badged "prism"
+    /// and replayed against a prism candidate, which reset every connection.
+    /// The `inst=` pod names captured by the scan are the discriminator.
     BootDerived {
         /// Nanoseconds since the epoch at recorder boot, as recorded.
         booted_at_nanos: String,

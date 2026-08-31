@@ -435,9 +435,11 @@ export type AvailableRecording = {
    *  when the catalog itself cannot be read, so the bucket stays visible. */
   pulled: boolean;
   identity: RecordingIdentity | null;
-  /** Which recorded system minted the session, from the id shape — the
-   *  hyperswitch recorder mints `rec-<sha>-<time>-<inst>`, the UCS recorder
-   *  `run-<nanos>`. Null when the shape names neither. */
+  /** Which recorded system minted the session. Derived from the `inst=` pod
+   *  names when the scan captured any (authoritative); the id shape decides
+   *  only the unambiguous rec-<sha>-… case. Null = genuinely unknown — the
+   *  run-<nanos> shape alone is ambiguous (old router recorders minted it
+   *  too), and a wrong badge once sent a router tape into a prism replay. */
   system?: "hyperswitch" | "prism" | null;
   /** `inst=` discriminators under the session — for a UCS session this is the
    *  recorder's pod name, the only identity its id does not carry. */
