@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{resolve_candidate_image, K8sExecutorConfig};
+use super::config::{resolve_candidate_image_for, K8sExecutorConfig};
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
 use super::patch::{
@@ -136,7 +136,8 @@ pub fn launch_spec_for_run(
     expected_schema: Option<&SchemaFingerprint>,
     code_bundle_uri: Option<&str>,
 ) -> Result<LaunchSpec, ExecutorError> {
-    let (candidate_image, code_sha) = resolve_candidate_image(&run.spec.candidate_spec)?;
+    let (candidate_image, code_sha) =
+        resolve_candidate_image_for(&run.spec.candidate_spec, run.spec.system())?;
     let run_spec_json = serde_json::to_string(&run.spec)
         .map_err(|e| ExecutorError::Template(format!("serialize run spec: {e}")))?;
 
@@ -726,7 +727,11 @@ mod tests {
                 mode: crate::RunMode::Replay,
                 system_under_test: Some("prism".into()),
                 candidate_spec: crate::CandidateSpec::PrebuiltImage {
-                    image: "img:abc123".into(),
+                    // Fully qualified: a bare ref for a non-default system
+                    // REFUSES unless DEJA_PRISM_CANDIDATE_IMAGE_REPO is set,
+                    // and env vars are process-global (config.rs owns that
+                    // single-lock test).
+                    image: "reg.example/connector-service:abc123".into(),
                 },
                 candidate_repo: None,
                 recording_id: None,

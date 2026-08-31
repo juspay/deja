@@ -226,9 +226,24 @@ impl K8sExecutorConfig {
 /// ref → CI image), which is not built yet — they error clearly rather than
 /// guess. `LocalPath` is a compose-only mode.
 pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String), ExecutorError> {
+    resolve_candidate_image_for(spec, crate::DEFAULT_SYSTEM_UNDER_TEST)
+}
+
+/// System-aware resolution: a bare ref qualifies against the SYSTEM's image
+/// repo. The default system keeps `DEJA_CANDIDATE_IMAGE_REPO`; any other reads
+/// `DEJA_<SYSTEM>_CANDIDATE_IMAGE_REPO`, and with none configured the bare ref
+/// is REFUSED rather than borrowed: qualifying a prism sha against the
+/// hyperswitch-router repo minted `hyperswitch-router:6548e950c7` — a
+/// reference no registry serves — and the pod sat in ImagePullBackOff until
+/// the health timeout killed the run, twice. A fully-qualified ref is always
+/// taken verbatim, so pasting the whole ECR path needs no configuration.
+pub fn resolve_candidate_image_for(
+    spec: &CandidateSpec,
+    system: &str,
+) -> Result<(String, String), ExecutorError> {
     match spec {
         CandidateSpec::PrebuiltImage { image } => {
-            let image = qualify_candidate_image(image);
+            let image = qualify_candidate_image_for(image, system)?;
             let sha = build_ref_from_tag(image_tag(&image)).to_owned();
             Ok((image, sha))
         }
@@ -259,15 +274,43 @@ pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String),
 /// registry, or a digest reachable without a config change — the convention is
 /// the default, not the only option. With no repo configured a bare ref is also
 /// left alone, so compose (where the "image" is a local tag) is unaffected.
+#[cfg(test)]
 fn qualify_candidate_image(reference: &str) -> String {
+    // Infallible for the default system: with no repo configured a bare ref
+    // is left alone (compose's local tags). Test-only shorthand — production
+    // paths go through `resolve_candidate_image_for`.
+    qualify_candidate_image_for(reference, crate::DEFAULT_SYSTEM_UNDER_TEST)
+        .expect("default-system qualification never refuses")
+}
+
+fn qualify_candidate_image_for(
+    reference: &str,
+    system: &str,
+) -> Result<String, ExecutorError> {
     let reference = reference.trim();
     let already_qualified = reference.contains('/') || reference.contains('@');
     if already_qualified {
-        return reference.to_owned();
+        return Ok(reference.to_owned());
     }
-    let repo = match std::env::var("DEJA_CANDIDATE_IMAGE_REPO") {
+    let repo_var = if system == crate::DEFAULT_SYSTEM_UNDER_TEST {
+        "DEJA_CANDIDATE_IMAGE_REPO".to_owned()
+    } else {
+        format!(
+            "DEJA_{}_CANDIDATE_IMAGE_REPO",
+            system.to_uppercase().replace('-', "_")
+        )
+    };
+    let repo = match std::env::var(&repo_var) {
         Ok(repo) if !repo.trim().is_empty() => repo.trim().trim_end_matches('/').to_owned(),
-        _ => return reference.to_owned(),
+        // The default system tolerates a bare ref (compose local tags); any
+        // other system refuses it — the only silent alternative is qualifying
+        // against the wrong system's repo, which is a guaranteed dead pull.
+        _ if system == crate::DEFAULT_SYSTEM_UNDER_TEST => return Ok(reference.to_owned()),
+        _ => {
+            return Err(ExecutorError::Template(format!(
+                "bare candidate ref '{reference}' for system '{system}': set {repo_var}                  (the system's image repo) or pass a fully-qualified image reference"
+            )))
+        }
     };
     match reference.split_once(':') {
         // `name:tag` with no registry: a caller restating the repo by its last
@@ -281,12 +324,12 @@ fn qualify_candidate_image(reference: &str) -> String {
         // — the pull then fails naming exactly the image that was asked for.
         Some((name, tag)) if !name.is_empty() && !tag.is_empty() => {
             if repo.rsplit('/').next() == Some(name) {
-                format!("{repo}:{tag}")
+                Ok(format!("{repo}:{tag}"))
             } else {
-                reference.to_owned()
+                Ok(reference.to_owned())
             }
         }
-        _ => format!("{repo}:{reference}"),
+        _ => Ok(format!("{repo}:{reference}")),
     }
 }
 
@@ -479,6 +522,47 @@ mod candidate_reference_tests {
         .unwrap();
         assert_eq!(image, format!("{REPO}:7cd937aa1c-release-fast"));
         assert_eq!(sha, "7cd937aa1c");
+
+        // A prism run's bare ref must resolve against PRISM's repo — or
+        // refuse. Qualifying it against the router repo minted
+        // hyperswitch-router:<prism sha>, a reference no registry serves; the
+        // pod sat in ImagePullBackOff until the health timeout killed the
+        // run. Twice. (Same single-lock test: same process-global env vars.)
+        std::env::remove_var("DEJA_PRISM_CANDIDATE_IMAGE_REPO");
+        let err = resolve_candidate_image_for(
+            &CandidateSpec::PrebuiltImage {
+                image: "6548e950c7".into(),
+            },
+            "prism",
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("DEJA_PRISM_CANDIDATE_IMAGE_REPO"), "{msg}");
+
+        std::env::set_var(
+            "DEJA_PRISM_CANDIDATE_IMAGE_REPO",
+            "ecr.example/connector-service",
+        );
+        let (image, sha) = resolve_candidate_image_for(
+            &CandidateSpec::PrebuiltImage {
+                image: "6548e950c7".into(),
+            },
+            "prism",
+        )
+        .unwrap();
+        assert_eq!(image, "ecr.example/connector-service:6548e950c7");
+        assert_eq!(sha, "6548e950c7");
+
+        // A fully-qualified ref is verbatim regardless of configuration.
+        std::env::remove_var("DEJA_PRISM_CANDIDATE_IMAGE_REPO");
+        let (image, _) = resolve_candidate_image_for(
+            &CandidateSpec::PrebuiltImage {
+                image: "ecr.example/connector-service:6548e950c7".into(),
+            },
+            "prism",
+        )
+        .unwrap();
+        assert_eq!(image, "ecr.example/connector-service:6548e950c7");
 
         // With no registry configured a bare ref is untouched — compose builds
         // a local tag and has no registry to resolve against.
