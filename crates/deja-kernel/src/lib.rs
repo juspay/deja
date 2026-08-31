@@ -335,6 +335,38 @@ pub fn diff_json(
             }
             diffs
         }
+        // EMBEDDED JSON IS COMPARED AS JSON, NOT AS BYTES. A string field
+        // that carries a serialized document (prism's rawConnectorRequest
+        // echo, hyperswitch metadata blobs) is byte-compared by default — and
+        // a map stringified by two different PROCESSES serializes its keys in
+        // two different orders (HashMap iteration is per-process random), so
+        // identical behavior diffs on every response. Key order inside a JSON
+        // object is serialization noise, not behavior; the comparator's job
+        // is behavioral equivalence, so both sides are parsed and diffed
+        // structurally — which also locates a REAL inner difference at its
+        // own path instead of reporting one opaque blob.
+        //
+        // Only when BOTH sides parse to an object or array: scalar strings
+        // keep byte semantics ("1.0" vs "1.00" stays a diff — relaxing number
+        // formatting was never asked for), and a non-JSON string on either
+        // side falls through to the leaf diff unchanged. The TAPE is never
+        // touched: this normalizes judgment, not evidence.
+        (serde_json::Value::String(b), serde_json::Value::String(c)) => {
+            if let (Ok(bv), Ok(cv)) = (
+                serde_json::from_str::<serde_json::Value>(b),
+                serde_json::from_str::<serde_json::Value>(c),
+            ) {
+                let structural = |v: &serde_json::Value| v.is_object() || v.is_array();
+                if structural(&bv) && structural(&cv) {
+                    return diff_json(&bv, &cv, path, allowlist);
+                }
+            }
+            vec![JsonFieldDiff {
+                json_path: path.to_owned(),
+                baseline: baseline.clone(),
+                candidate: candidate.clone(),
+            }]
+        }
         (b, c) => vec![JsonFieldDiff {
             json_path: path.to_owned(),
             baseline: b.clone(),
@@ -590,6 +622,58 @@ mod tests {
 
     const HTML: &[u8] =
         b"<!DOCTYPE html><html><body><form method=\"post\" action=\"https://psp/pay\"></form></body></html>";
+
+    /// The defect: a string field carrying a serialized document is
+    /// byte-compared, and a map stringified by two different PROCESSES
+    /// serializes its keys in two different orders (HashMap iteration is
+    /// per-process random) — prism's rawConnectorRequest echo diffed on every
+    /// replayed response over pure key order. Key order inside a JSON object
+    /// is serialization noise, not behavior: embedded JSON is compared AS
+    /// JSON. The tape is untouched — this normalizes judgment, not evidence.
+    #[test]
+    fn embedded_json_strings_compare_structurally_not_bytewise() {
+        let recorded = serde_json::json!({
+            "rawConnectorRequest": {"value":
+                "{\"url\":\"https://api.stripe.com/v1/payment_intents\",\"headers\":{\"stripe-version\":\"2022-11-15\",\"via\":\"HyperSwitch\"}}"}
+        });
+        let replayed = serde_json::json!({
+            "rawConnectorRequest": {"value":
+                "{\"headers\":{\"via\":\"HyperSwitch\",\"stripe-version\":\"2022-11-15\"},\"url\":\"https://api.stripe.com/v1/payment_intents\"}"}
+        });
+        let diff = diff_json(&recorded, &replayed, "$", &[]);
+        assert!(diff.is_empty(), "key order is not behavior: {diff:?}");
+    }
+
+    /// …and the other half: a REAL difference inside the embedded document
+    /// still fails — now located at its own inner path instead of one opaque
+    /// blob diff, which is strictly better reporting.
+    #[test]
+    fn a_real_difference_inside_an_embedded_json_string_still_diverges() {
+        let recorded = serde_json::json!({"echo": "{\"headers\":{\"via\":\"HyperSwitch\"},\"amount\":6540}"});
+        let replayed = serde_json::json!({"echo": "{\"amount\":9999,\"headers\":{\"via\":\"HyperSwitch\"}}"});
+        let diff = diff_json(&recorded, &replayed, "$", &[]);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].json_path, "$.echo.amount");
+        assert_eq!(diff[0].baseline, serde_json::json!(6540));
+        assert_eq!(diff[0].candidate, serde_json::json!(9999));
+    }
+
+    /// Scalar strings keep BYTE semantics: "1.0" and "1.00" parse to equal
+    /// numbers, but relaxing number formatting was never asked for — only
+    /// object/array documents get the structural comparison. And a parent-path
+    /// allowlist entry still suppresses everything beneath, embedded or not.
+    #[test]
+    fn scalar_strings_stay_byte_exact_and_the_allowlist_still_covers_embedded_docs() {
+        let b = serde_json::json!({"v": "1.0"});
+        let c = serde_json::json!({"v": "1.00"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert_eq!(diff.len(), 1, "scalar formatting must stay a diff: {diff:?}");
+        assert_eq!(diff[0].json_path, "$.v");
+
+        let b = serde_json::json!({"echo": "{\"a\":1}"});
+        let c = serde_json::json!({"echo": "{\"a\":2}"});
+        assert!(diff_json(&b, &c, "$", &["$.echo"]).is_empty());
+    }
 
     /// The defect: `text/html` never parses as JSON, so the recorder's `json`
     /// field is null while `text` holds the document. Reading only `json` on
