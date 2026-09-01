@@ -136,7 +136,8 @@ pub fn launch_spec_for_run(
     expected_schema: Option<&SchemaFingerprint>,
     code_bundle_uri: Option<&str>,
 ) -> Result<LaunchSpec, ExecutorError> {
-    let (candidate_image, code_sha) = resolve_candidate_image(&run.spec.candidate_spec)?;
+    let (candidate_image, code_sha) =
+        resolve_candidate_image(&run.spec.candidate_spec, run.spec.system())?;
     let run_spec_json = serde_json::to_string(&run.spec)
         .map_err(|e| ExecutorError::Template(format!("serialize run spec: {e}")))?;
 

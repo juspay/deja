@@ -146,7 +146,9 @@ fn resolve_tarball_url(template: &str, run_repo: Option<&str>, sha: &str) -> Opt
 ///
 /// Neither configured / both fail → None (P1 record-only).
 fn resolve_expected_schema(run: &Run) -> Option<(crate::SchemaFingerprint, String)> {
-    let (_, sha) = crate::executor::resolve_candidate_image(&run.spec.candidate_spec).ok()?;
+    let (_, sha) =
+        crate::executor::resolve_candidate_image(&run.spec.candidate_spec, run.spec.system())
+            .ok()?;
     let s3 = crate::s3::S3Config::from_env();
     let uri = crate::codebundle::bundle_s3_uri(&s3, &sha);
     let nonempty = |s: String| (!s.trim().is_empty()).then_some(s);

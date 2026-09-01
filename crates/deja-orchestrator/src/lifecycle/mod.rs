@@ -272,8 +272,11 @@ fn resolve_candidate(
             // The SAME resolution the k8s executor uses (a bare ref qualifies
             // against DEJA_CANDIDATE_IMAGE_REPO). One spec must not read as two
             // different images depending on which executor picked it up.
-            let (image, _tag) = crate::executor::resolve_candidate_image(&run.spec.candidate_spec)
-                .map_err(|e| e.to_string())?;
+            let (image, _tag) = crate::executor::resolve_candidate_image(
+                &run.spec.candidate_spec,
+                run.spec.system(),
+            )
+            .map_err(|e| e.to_string())?;
             ctx.stage("pulling candidate image", 0, 0);
             let mut cmd = Command::new("docker");
             cmd.args(["pull", &image]);

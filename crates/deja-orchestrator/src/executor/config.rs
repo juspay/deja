@@ -228,10 +228,13 @@ impl K8sExecutorConfig {
 /// the tag IS `sha_C`. The repo-ref variants need the image resolver (candidate
 /// ref → CI image), which is not built yet — they error clearly rather than
 /// guess. `LocalPath` is a compose-only mode.
-pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String), ExecutorError> {
+pub fn resolve_candidate_image(
+    spec: &CandidateSpec,
+    system: &str,
+) -> Result<(String, String), ExecutorError> {
     match spec {
         CandidateSpec::PrebuiltImage { image } => {
-            let image = qualify_candidate_image(image);
+            let image = qualify_candidate_image(image, system);
             let sha = build_ref_from_tag(image_tag(&image)).to_owned();
             Ok((image, sha))
         }
@@ -257,20 +260,43 @@ pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String),
 /// run names a build — a tag, a git sha — and this resolves where that build
 /// lives, from `DEJA_CANDIDATE_IMAGE_REPO`.
 ///
+/// Where a system's candidate images live. The default system reads
+/// `DEJA_CANDIDATE_IMAGE_REPO`; another system reads
+/// `DEJA_<SYSTEM>_CANDIDATE_IMAGE_REPO` and does NOT fall back to it.
+///
+/// The absent fallback is the point. Prism candidates live in their own
+/// registry, so a prism sha qualified against the router's repo names an image
+/// that cannot exist — a guaranteed pull failure that reads as a broken
+/// candidate rather than as unconfigured deployment. Returning `None` instead
+/// leaves the bare reference verbatim, and the pull then fails naming exactly
+/// the image that was asked for. Same principle as `config_source_for`:
+/// borrowing the default system's profile is worse than having none.
+fn candidate_image_repo(system: &str) -> Option<String> {
+    let name = if crate::is_default_system(system) {
+        "DEJA_CANDIDATE_IMAGE_REPO".to_owned()
+    } else {
+        crate::system_env_var(system, "CANDIDATE_IMAGE_REPO")
+    };
+    std::env::var(name)
+        .ok()
+        .filter(|repo| !repo.trim().is_empty())
+        .map(|repo| repo.trim().trim_end_matches('/').to_owned())
+}
+
 /// A reference containing `/` or `@`, or a `:` that is not the registry's port,
 /// is taken as already qualified and used verbatim. That keeps a fork, another
 /// registry, or a digest reachable without a config change — the convention is
 /// the default, not the only option. With no repo configured a bare ref is also
 /// left alone, so compose (where the "image" is a local tag) is unaffected.
-fn qualify_candidate_image(reference: &str) -> String {
+fn qualify_candidate_image(reference: &str, system: &str) -> String {
     let reference = reference.trim();
     let already_qualified = reference.contains('/') || reference.contains('@');
     if already_qualified {
         return reference.to_owned();
     }
-    let repo = match std::env::var("DEJA_CANDIDATE_IMAGE_REPO") {
-        Ok(repo) if !repo.trim().is_empty() => repo.trim().trim_end_matches('/').to_owned(),
-        _ => return reference.to_owned(),
+    let repo = match candidate_image_repo(system) {
+        Some(repo) => repo,
+        None => return reference.to_owned(),
     };
     match reference.split_once(':') {
         // `name:tag` with no registry: a caller restating the repo by its last
@@ -366,9 +392,12 @@ mod tests {
 
     #[test]
     fn resolve_prebuilt_image_takes_tag_as_sha() {
-        let (img, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
-            image: "ecr.io/hyperswitch:ff191d7f".into(),
-        })
+        let (img, sha) = resolve_candidate_image(
+            &CandidateSpec::PrebuiltImage {
+                image: "ecr.io/hyperswitch:ff191d7f".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST,
+        )
         .expect("prebuilt resolves");
         assert_eq!(img, "ecr.io/hyperswitch:ff191d7f");
         assert_eq!(sha, "ff191d7f");
@@ -382,9 +411,12 @@ mod tests {
             // Not a profile suffix — a hyphen alone must not truncate a tag.
             ("2026.08.01.0-hotfix", "2026.08.01.0-hotfix"),
         ] {
-            let (img, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
-                image: format!("ecr.io/hyperswitch:{tag}"),
-            })
+            let (img, sha) = resolve_candidate_image(
+                &CandidateSpec::PrebuiltImage {
+                    image: format!("ecr.io/hyperswitch:{tag}"),
+                },
+                crate::DEFAULT_SYSTEM_UNDER_TEST,
+            )
             .expect("prebuilt resolves");
             assert_eq!(
                 img,
@@ -397,32 +429,44 @@ mod tests {
 
     #[test]
     fn resolve_digest_image_uses_digest_as_sha() {
-        let (_, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
-            image: "ecr.io/hyperswitch@sha256:abcd".into(),
-        })
+        let (_, sha) = resolve_candidate_image(
+            &CandidateSpec::PrebuiltImage {
+                image: "ecr.io/hyperswitch@sha256:abcd".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST,
+        )
         .expect("digest resolves");
         assert_eq!(sha, "sha256:abcd");
     }
 
     #[test]
     fn registry_port_is_not_mistaken_for_a_tag() {
-        let (_, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
-            image: "registry:5000/hyperswitch".into(),
-        })
+        let (_, sha) = resolve_candidate_image(
+            &CandidateSpec::PrebuiltImage {
+                image: "registry:5000/hyperswitch".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST,
+        )
         .expect("bare image resolves");
         assert_eq!(sha, "latest");
     }
 
     #[test]
     fn repo_refs_error_until_resolver_exists() {
-        assert!(resolve_candidate_image(&CandidateSpec::RepoSha {
-            repo: "juspay/hyperswitch".into(),
-            sha: "ff191d7f".into(),
-        })
+        assert!(resolve_candidate_image(
+            &CandidateSpec::RepoSha {
+                repo: "juspay/hyperswitch".into(),
+                sha: "ff191d7f".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST
+        )
         .is_err());
-        assert!(resolve_candidate_image(&CandidateSpec::LocalPath {
-            binary_or_source: "/x".into(),
-        })
+        assert!(resolve_candidate_image(
+            &CandidateSpec::LocalPath {
+                binary_or_source: "/x".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST
+        )
         .is_err());
     }
 }
@@ -441,21 +485,30 @@ mod candidate_reference_tests {
 
         // The only part a run chooses is the build.
         assert_eq!(
-            qualify_candidate_image("dcb9f9e955"),
+            qualify_candidate_image("dcb9f9e955", crate::DEFAULT_SYSTEM_UNDER_TEST),
             format!("{REPO}:dcb9f9e955")
         );
 
         // An already-qualified reference is left alone, so another registry, a
         // fork, or a digest stays reachable without changing configuration.
         let elsewhere = "ghcr.io/someone/hyperswitch-router:abc123";
-        assert_eq!(qualify_candidate_image(elsewhere), elsewhere);
+        assert_eq!(
+            qualify_candidate_image(elsewhere, crate::DEFAULT_SYSTEM_UNDER_TEST),
+            elsewhere
+        );
         let digest = "2236.dkr.ecr.ap-south-1.amazonaws.com/router@sha256:beef";
-        assert_eq!(qualify_candidate_image(digest), digest);
+        assert_eq!(
+            qualify_candidate_image(digest, crate::DEFAULT_SYSTEM_UNDER_TEST),
+            digest
+        );
 
         // And the tag is read from the resolved reference, not the bare one.
-        let (image, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
-            image: "dcb9f9e955".into(),
-        })
+        let (image, sha) = resolve_candidate_image(
+            &CandidateSpec::PrebuiltImage {
+                image: "dcb9f9e955".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST,
+        )
         .unwrap();
         assert_eq!(image, format!("{REPO}:dcb9f9e955"));
         assert_eq!(sha, "dcb9f9e955");
@@ -465,7 +518,10 @@ mod candidate_reference_tests {
         // repo prepended wholesale, minting a double-tag reference no registry
         // serves — the pod sat in ImagePullBackOff until the watch deadline.
         assert_eq!(
-            qualify_candidate_image("hyperswitch-router:671034e3eb"),
+            qualify_candidate_image(
+                "hyperswitch-router:671034e3eb",
+                crate::DEFAULT_SYSTEM_UNDER_TEST
+            ),
             format!("{REPO}:671034e3eb")
         );
 
@@ -473,7 +529,10 @@ mod candidate_reference_tests {
         // verbatim, never silently repointed — the pull then fails naming
         // exactly what was asked for.
         assert_eq!(
-            qualify_candidate_image("hyperswitch-app:671034e3eb"),
+            qualify_candidate_image(
+                "hyperswitch-app:671034e3eb",
+                crate::DEFAULT_SYSTEM_UNDER_TEST
+            ),
             "hyperswitch-app:671034e3eb"
         );
 
@@ -481,18 +540,51 @@ mod candidate_reference_tests {
         // is tagged that way) and comes OFF the code identity — the source of
         // a fast build is the same commit, and the migrations fetch treats
         // this as a git ref.
-        let (image, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
-            image: "7cd937aa1c-release-fast".into(),
-        })
+        let (image, sha) = resolve_candidate_image(
+            &CandidateSpec::PrebuiltImage {
+                image: "7cd937aa1c-release-fast".into(),
+            },
+            crate::DEFAULT_SYSTEM_UNDER_TEST,
+        )
         .unwrap();
         assert_eq!(image, format!("{REPO}:7cd937aa1c-release-fast"));
         assert_eq!(sha, "7cd937aa1c");
 
         // With no registry configured a bare ref is untouched — compose builds
         // a local tag and has no registry to resolve against.
+        // -- per-system registry -------------------------------------------
+        // A non-default system resolves against ITS OWN registry.
+        const PRISM_REPO: &str = "2236.dkr.ecr.ap-south-1.amazonaws.com/connector-service";
+        std::env::set_var("DEJA_PRISM_CANDIDATE_IMAGE_REPO", PRISM_REPO);
+        assert_eq!(
+            qualify_candidate_image("dcb9f9e955", "prism"),
+            format!("{PRISM_REPO}:dcb9f9e955"),
+            "a bare prism ref qualifies against the prism registry"
+        );
+        // …and the default system is NOT diverted by it.
+        assert_eq!(
+            qualify_candidate_image("dcb9f9e955", crate::DEFAULT_SYSTEM_UNDER_TEST),
+            format!("{REPO}:dcb9f9e955")
+        );
+        std::env::remove_var("DEJA_PRISM_CANDIDATE_IMAGE_REPO");
+
+        // THE no-fallback property. With no prism registry configured, a bare
+        // prism ref must NOT borrow the router's repo — that names an image
+        // which cannot exist and reads as a broken candidate. It is left
+        // verbatim so the pull fails naming exactly what was asked for.
+        assert_eq!(
+            qualify_candidate_image("dcb9f9e955", "prism"),
+            "dcb9f9e955",
+            "an unconfigured system must not inherit the default system's registry"
+        );
+        assert_ne!(
+            qualify_candidate_image("dcb9f9e955", "prism"),
+            format!("{REPO}:dcb9f9e955")
+        );
+
         std::env::remove_var("DEJA_CANDIDATE_IMAGE_REPO");
         assert_eq!(
-            qualify_candidate_image("deja-router-local"),
+            qualify_candidate_image("deja-router-local", crate::DEFAULT_SYSTEM_UNDER_TEST),
             "deja-router-local"
         );
     }
