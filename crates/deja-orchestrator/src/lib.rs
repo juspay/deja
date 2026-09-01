@@ -1183,6 +1183,46 @@ mod run_identity_tests {
         }
     }
 
+    /// The contract a RECORDER must satisfy for its ids to carry a revision,
+    /// stated as cases rather than as a format string — because the format
+    /// string is the trap. `rec-<sha>-<MMDDhhmm>-<instance>` describes the
+    /// first case below exactly, and that case does not parse: the instance
+    /// carries hyphens, the body splits into five parts instead of three, and
+    /// the result is `Opaque` with nothing said. Nothing at record time
+    /// reports it; it surfaces later as recordings that select fine and then
+    /// cannot resolve a revision.
+    ///
+    /// A recorder author moving to the `rec-` shape meets this as a failing
+    /// test rather than as a silent absence.
+    #[test]
+    fn the_instance_component_must_be_hyphen_free() {
+        // The shape a naive substitution produces, using a real pod-style
+        // instance id. Reads as conforming; is not.
+        assert_eq!(
+            parse_recording_id("rec-6548e95-09011230-pi-1-1787741712798221595"),
+            RecordingIdentity::Opaque,
+            "a hyphenated instance splits the body into more than three parts"
+        );
+
+        // The same recording with a hyphen-free discriminator parses. That is
+        // the whole difference, and it is why a truncation of an existing id is
+        // not a safe fix — a truncation can still contain a hyphen.
+        assert!(matches!(
+            parse_recording_id("rec-6548e95-09011230-pi1"),
+            RecordingIdentity::Described { ref revision, .. } if revision == "6548e95"
+        ));
+
+        // A revision must be hexdigits: a `v` prefix or a dotted version is not
+        // a git sha and does not parse.
+        for not_a_sha in ["rec-v1a2b3c-09011230-zf", "rec-1.2.3-09011230-zf"] {
+            assert_eq!(
+                parse_recording_id(not_a_sha),
+                RecordingIdentity::Opaque,
+                "{not_a_sha}: revision must be ASCII hexdigits"
+            );
+        }
+    }
+
     #[test]
     fn both_recording_id_shapes_embed_in_a_replay_id() {
         // Whichever shape a recording has, the replay id carries it — the
