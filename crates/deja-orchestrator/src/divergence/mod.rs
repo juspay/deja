@@ -13,6 +13,7 @@
 //!   - candidate call with no table hit     → NovelCall (blocking)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
+//!     …after a truncated recording tail    → InconclusiveTailGap (inconclusive)
 //!   - table entry the candidate never hit  → OmittedCall (blocking)
 //!     …uncorrelated, or non-blocking       → OmittedCallTolerated
 //!   - schema-derived DB/response occurrences → SchemaDefaultDivergence (tolerated)
@@ -271,6 +272,22 @@ pub struct Summary {
     /// divergence. Substitute hits do not contribute seed gaps.
     #[serde(default)]
     pub inconclusive_seed_gaps: u64,
+    /// Calls that could not be conclusively classified because the RECORDING for
+    /// their correlation stops at request teardown — the recorder releases the
+    /// correlation at the API-lock release, so the post-response work the request
+    /// path goes on to do was never captured. The candidate performs that work on
+    /// replay and it necessarily misses the lookup table. Counted here rather
+    /// than as `novel_calls` so a recording limit is not reported as a candidate
+    /// bug, and never as a pass: the correlation's verdict becomes INCONCLUSIVE.
+    ///
+    /// Guarded on the correlation's HTTP response matching in BOTH status and
+    /// body — a tail gap that changed the response is a divergence, not a tail
+    /// gap — and on the call sitting after the reproduced teardown marker. See
+    /// [`tail_gap_evidence`].
+    ///
+    /// Projection of `per_boundary[*].kinds["InconclusiveTailGap"]`.
+    #[serde(default)]
+    pub inconclusive_tail_gaps: u64,
     /// Value-divergence rows that were recognized as a narrow read/write race:
     /// HTTP-clean, same typed DB row, distinct overlapping task buckets. These are
     /// not counted as blocking side-effect divergences; the verdict is explicitly
@@ -336,6 +353,14 @@ pub struct CorrelationOutcome {
     pub scoring_mode: deja_forest::ScoringMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<deja_forest::Alignment>,
+    /// This correlation carried at least one `InconclusiveTailGap`: its
+    /// recording stops at request teardown, so the candidate's post-response
+    /// work has no baseline and the correlation CANNOT be judged clean. Held
+    /// apart from `passed` rather than folded into it — an unjudgeable
+    /// correlation is not a failing one, and it is emphatically not a passing
+    /// one. `passed` is false whenever this is true.
+    #[serde(default)]
+    pub inconclusive: bool,
     pub passed: bool,
 }
 
@@ -429,6 +454,11 @@ impl Scorecard {
             "inconclusive_seed_gaps",
             s.inconclusive_seed_gaps,
             &["InconclusiveSeedGap"],
+        );
+        folds(
+            "inconclusive_tail_gaps",
+            s.inconclusive_tail_gaps,
+            &["InconclusiveTailGap"],
         );
         folds(
             "inconclusive_races",
@@ -2321,15 +2351,19 @@ fn parse_project_canon(id: &str) -> Option<CanonPreset> {
     Some(CanonPreset::Project { include, exclude })
 }
 
+/// The canonical order for a multiset of JSON values: by serialized form. A
+/// SORT, never a dedup, so two collections agree only when their members agree
+/// WITH MULTIPLICITY — losing one of two identical members is still a
+/// difference.
+fn sort_as_bag(items: &mut [serde_json::Value]) {
+    items.sort_by_cached_key(|item| serde_json::to_string(item).unwrap_or_default());
+}
+
 fn bag_canon(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => {
             let mut items: Vec<_> = items.iter().map(bag_canon).collect();
-            items.sort_by(|a, b| {
-                serde_json::to_string(a)
-                    .unwrap_or_default()
-                    .cmp(&serde_json::to_string(b).unwrap_or_default())
-            });
+            sort_as_bag(&mut items);
             serde_json::Value::Array(items)
         }
         serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -2775,8 +2809,21 @@ fn http_diff_absorbed_by_reply_canon(
     recorded_http: Option<&deja::BoundaryEvent>,
     body: &JsonFieldDiff,
 ) -> bool {
-    let Some(CanonPreset::Project { include, exclude }) = recorded_http.and_then(event_reply_canon)
-    else {
+    let Some(canon) = recorded_http.and_then(event_reply_canon) else {
+        return false;
+    };
+    // `bag` is the generic declaration that a boundary's collections carry no
+    // order, and it is the one place knowledge of a particular payload belongs:
+    // stated by whoever owns the semantics, against the boundary it describes,
+    // rather than compiled into the comparison. Without a declaration an
+    // ordering difference is reported like any other.
+    if matches!(canon, CanonPreset::Bag) {
+        return match (&diff.baseline_body, &diff.candidate_body) {
+            (Some(baseline), Some(candidate)) => canon.equivalent(baseline, candidate),
+            _ => false,
+        };
+    }
+    let CanonPreset::Project { include, exclude } = canon else {
         return false;
     };
     if let (Some(baseline), Some(candidate)) = (&diff.baseline_body, &diff.candidate_body) {
@@ -3017,10 +3064,156 @@ fn hidden_form_bodies_equivalent(diff: &HttpDiff) -> bool {
     }
 }
 
+/// Compare two JSON values with array order treated STRUCTURALLY rather than
+/// positionally. Knows nothing about any particular schema, service or field
+/// name: it is a property of comparing JSON, not of what the JSON describes.
+///
+/// Two rules, and both of them report rather than forgive:
+///
+/// - Two arrays holding the SAME members in a different order are one
+///   difference, at the array's own path, instead of a difference at every
+///   position the two orders happen to disagree on. Nine values in a shuffled
+///   order are one fact about ordering, not seven facts about values.
+/// - Two arrays whose members genuinely differ are aligned by canonical order
+///   before being compared, so what surfaces is the membership difference
+///   rather than the positional shift it caused downstream of it.
+///
+/// The point is FAITHFULNESS, not tolerance. An ordering difference is still a
+/// difference and still blocks; it is merely reported once, at the level where
+/// it is true, so the report says the same thing every run. A boundary whose
+/// order genuinely carries no meaning says so with a `bag` reply canon, which
+/// is the generic declaration for exactly that and is honoured below — schema
+/// knowledge belongs in a declaration made by whoever owns the semantics, never
+/// in this file.
+fn order_canonical_diff(
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<JsonFieldDiff>,
+) {
+    if baseline == candidate {
+        return;
+    }
+    match (baseline, candidate) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(c)) => {
+            let mut keys: Vec<&String> = b.keys().chain(c.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                let next = format!("{path}.{key}");
+                order_canonical_diff(
+                    b.get(key).unwrap_or(&serde_json::Value::Null),
+                    c.get(key).unwrap_or(&serde_json::Value::Null),
+                    &next,
+                    out,
+                );
+            }
+        }
+        (serde_json::Value::Array(b), serde_json::Value::Array(c)) => {
+            // Same members, different order. Report it HERE and do not descend:
+            // the ordering is the whole of the difference, and descending would
+            // re-describe it as however many positions this run's two orders
+            // happened to disagree on — which is the count that will not sit
+            // still between runs.
+            if bag_canon(baseline) == bag_canon(candidate) {
+                out.push(JsonFieldDiff {
+                    json_path: path.to_owned(),
+                    baseline: baseline.clone(),
+                    candidate: candidate.clone(),
+                });
+                return;
+            }
+            // Members genuinely differ. Report the MULTISET DIFFERENCE — the
+            // members one side has and the other does not — rather than walking
+            // the two sequences in step. Members present on both sides cancel
+            // however far apart they sit, so substituting one element of nine
+            // is one difference and not the run of positional disagreements
+            // that the substitution shifted everything else into.
+            let key = |value: &serde_json::Value| {
+                serde_json::to_string(&bag_canon(value)).unwrap_or_default()
+            };
+            let mut unmatched_candidates: BTreeMap<String, Vec<&serde_json::Value>> =
+                BTreeMap::new();
+            for item in c {
+                unmatched_candidates
+                    .entry(key(item))
+                    .or_default()
+                    .push(item);
+            }
+            let mut only_baseline: Vec<&serde_json::Value> = Vec::new();
+            for item in b {
+                // Cancel against an equal member wherever it sits. Popping one
+                // occurrence rather than all of them is what keeps this a
+                // multiset difference: a lost duplicate still surfaces.
+                match unmatched_candidates.get_mut(&key(item)) {
+                    Some(pool) if !pool.is_empty() => {
+                        pool.pop();
+                    }
+                    _ => only_baseline.push(item),
+                }
+            }
+            let mut only_candidate: Vec<&serde_json::Value> =
+                unmatched_candidates.into_values().flatten().collect();
+            // Both residues in canonical order, so the pairing below — and
+            // every path it names — is the same on every run.
+            only_baseline.sort_by_cached_key(|item| key(item));
+            only_candidate.sort_by_cached_key(|item| key(item));
+            for index in 0..only_baseline.len().max(only_candidate.len()) {
+                // The index is into the residue, not into the original array:
+                // once order carries no information, a position cannot be
+                // reported as though it did.
+                let next = format!("{path}[{index}]");
+                order_canonical_diff(
+                    only_baseline
+                        .get(index)
+                        .copied()
+                        .unwrap_or(&serde_json::Value::Null),
+                    only_candidate
+                        .get(index)
+                        .copied()
+                        .unwrap_or(&serde_json::Value::Null),
+                    &next,
+                    out,
+                );
+            }
+        }
+        (b, c) => out.push(JsonFieldDiff {
+            json_path: path.to_owned(),
+            baseline: b.clone(),
+            candidate: c.clone(),
+        }),
+    }
+}
+
+/// Is this row an ordering difference — two arrays with identical members in a
+/// different order? Derived from the row itself, so it needs no flag threaded
+/// alongside it and cannot disagree with the values it describes.
+fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
+    matches!(
+        (&row.baseline, &row.candidate),
+        (serde_json::Value::Array(_), serde_json::Value::Array(_))
+    ) && row.baseline != row.candidate
+        && bag_canon(&row.baseline) == bag_canon(&row.candidate)
+}
+
+/// The response's body difference, recomputed with array order handled
+/// structurally. `None` when the run predates full bodies being recorded
+/// alongside the diff, in which case the kernel's own rows are used unchanged.
+fn order_canonical_body_diff(diff: &HttpDiff) -> Option<Vec<JsonFieldDiff>> {
+    let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
+    let mut rows = Vec::new();
+    order_canonical_diff(baseline, candidate, "$", &mut rows);
+    Some(rows)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HttpBodyClassification {
     blocking_leaf_count: usize,
     schema_derived_paths: Vec<String>,
+    /// Paths whose difference is a permutation and nothing else. Still counted
+    /// as blocking — they are named here so the report can SAY that a
+    /// difference was ordering, not so it can stop reporting it.
+    order_only_paths: Vec<String>,
 }
 
 fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
@@ -3045,7 +3238,12 @@ fn classify_http_body_diff(
         return HttpBodyClassification::default();
     }
     let mut classification = HttpBodyClassification::default();
-    for body in &diff.body_diff {
+    // Ordering is resolved BEFORE anything is classified, so every absorber
+    // below sees the path a difference will be reported at rather than
+    // whichever positions this run's ordering scattered it across.
+    let canonical = order_canonical_body_diff(diff);
+    let rows = canonical.as_deref().unwrap_or(&diff.body_diff);
+    for body in rows {
         // Existing explicit absorptions retain precedence over schema
         // provenance; one leaf is classified exactly once.
         if http_diff_absorbed_by_reply_canon(diff, recorded_http, body)
@@ -3060,6 +3258,9 @@ fn classify_http_body_diff(
                 .schema_derived_paths
                 .push(body.json_path.clone());
         } else {
+            if is_order_only_difference(body) {
+                classification.order_only_paths.push(body.json_path.clone());
+            }
             classification.blocking_leaf_count += 1;
         }
     }
@@ -3253,6 +3454,191 @@ pub(crate) fn idempotent_delete_demotions(
         .collect()
 }
 
+/// Key prefix of the router's per-request API lock. The lock is taken at request
+/// entry and RELEASED as the last thing the request path does before the response
+/// is finalized, so a `delete_key` on it is the request-teardown marker.
+const API_LOCK_KEY_PREFIX: &str = "API_LOCK_";
+
+/// Whether this recorded event is the request-teardown marker — the API-lock
+/// release the router performs at response finalization.
+fn is_request_teardown_marker(ev: &deja::BoundaryEvent) -> bool {
+    ev.boundary == "redis"
+        && ev.method_name == "delete_key"
+        && ev
+            .args
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| key.starts_with(API_LOCK_KEY_PREFIX))
+}
+
+/// Correlations whose RECORDING was truncated at request teardown, and the point
+/// in the candidate's observed stream after which its calls therefore have no
+/// recorded baseline to be judged against.
+///
+/// The recorder stops capturing a correlation at the API-lock release, so the
+/// post-response work the request path goes on to do — persisting and notifying
+/// an outgoing webhook, roughly a second later — never reaches the tape. On
+/// replay the candidate does that work for real and every call in it misses the
+/// lookup table. Charging those to the candidate as blocking novel calls reports
+/// a RECORDING limit as a candidate bug; tolerating them silently launders a real
+/// capture gap into a clean pass. Neither is true, so they are their own class:
+/// INCONCLUSIVE, and never passing.
+///
+/// This is [`Summary::inconclusive_seed_gaps`] on a different axis — a missing
+/// baseline that is neither a false match nor a false divergence — and it is
+/// deliberately built the same way: named, counted, folded out of `per_boundary`,
+/// and excluded from the blocking total without being excluded from the verdict.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TailGapEvidence {
+    /// correlation -> index of the FIRST observed call past the one that
+    /// reproduced that correlation's last recorded event. From here on the
+    /// recording has nothing left to say about the correlation.
+    tail_begins_at: HashMap<String, usize>,
+}
+
+impl TailGapEvidence {
+    /// Whether an otherwise-BLOCKING novel call sits in the unrecorded tail.
+    ///
+    /// This positional test is the load-bearing half of the class — see the
+    /// measurement on [`tail_gap_evidence`]. Callers must consult it only after
+    /// every other classification has declined the call, so it can demote
+    /// nothing but a would-be `NovelCall` / `NovelSubtree`.
+    pub(crate) fn covers(&self, correlation: Option<&str>, observed_index: usize) -> bool {
+        correlation
+            .and_then(|correlation| self.tail_begins_at.get(correlation))
+            .is_some_and(|tail_begins_at| observed_index >= *tail_begins_at)
+    }
+
+    /// Re-express these indices against a FILTERED observed stream, where
+    /// `retained` lists — ascending — the original indices that survived.
+    ///
+    /// The graph-mode ledger scores flat-tier correlations through a rebuilt
+    /// sub-stream, and an index means nothing outside the stream it was taken
+    /// from. Handing the original indices to that sub-stream would demote
+    /// whichever calls happened to land on those positions, which is the
+    /// divergence-hiding failure this class exists to avoid.
+    pub(crate) fn remap_to(&self, retained: &[usize]) -> TailGapEvidence {
+        TailGapEvidence {
+            tail_begins_at: self
+                .tail_begins_at
+                .iter()
+                .map(|(correlation, original)| {
+                    (
+                        correlation.clone(),
+                        retained.partition_point(|index| index < original),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Build [`TailGapEvidence`]. A correlation qualifies only when ALL of these
+/// hold; each is doing work, and dropping any one of them widens this from a
+/// truncation class into a divergence-hiding machine.
+///
+///   1. Its recording ENDS at the request-teardown marker. If the tape carries
+///      post-teardown events for the correlation then the recorder did NOT stop
+///      there, and a novel call is a novel call.
+///   2. That last event is not the tape's last event. Per-correlation truncation
+///      is the measured shape; a correlation running to the end of the tape is
+///      left BLOCKING, which is the safe direction to be wrong in.
+///   3. The candidate actually reproduced the teardown marker. Without an
+///      observed counterpart there is no point in the stream to call the tail
+///      start, and the recorded prefix was not reproduced anyway.
+///   4. THE GUARD — the correlation's HTTP status AND body both matched. A tail
+///      gap that changed the response is not a tail gap, it is a divergence. A
+///      correlation with no HTTP diff at all fails this too: absent evidence
+///      that the response matched, the calls stay blocking.
+///
+/// Condition (1) is near-vacuous ALONE and must never be used alone: in a
+/// measured main-app run 71 of 77 correlations ended at the API-lock release, so
+/// it establishes only that the recorder behaves this way generally. What
+/// discriminates is the POSITIONAL test in [`TailGapEvidence::covers`] — the call
+/// must come after the teardown marker was reproduced. That same run carried 16
+/// BLOCKING novel `update_payment_intent` calls inside `payments_operation_core`,
+/// mid-request and HTTP-clean: conditions (1)–(4) all hold for their
+/// correlations, and only their POSITION keeps them blocking, which is correct.
+fn tail_gap_evidence(
+    events: &[deja::BoundaryEvent],
+    observed: &[ObservedCall],
+    http_clean_by_correlation: &HashMap<String, bool>,
+) -> TailGapEvidence {
+    let Some(tape_last_sequence) = events.iter().map(|ev| ev.global_sequence).max() else {
+        return TailGapEvidence::default();
+    };
+    let mut last_recorded: HashMap<&str, &deja::BoundaryEvent> = HashMap::new();
+    for ev in events {
+        let Some(correlation) = ev.correlation_id.as_deref() else {
+            continue;
+        };
+        last_recorded
+            .entry(correlation)
+            .and_modify(|existing| {
+                if ev.global_sequence > existing.global_sequence {
+                    *existing = ev;
+                }
+            })
+            .or_insert(ev);
+    }
+    let mut tail_begins_at = HashMap::new();
+    for (correlation, last) in last_recorded {
+        if !is_request_teardown_marker(last) || last.global_sequence >= tape_last_sequence {
+            continue;
+        }
+        if http_clean_by_correlation.get(correlation) != Some(&true) {
+            continue;
+        }
+        // The observed call that reproduced the teardown marker. Take the LAST
+        // such index: a duplicate resolution must not drag the tail start
+        // earlier and widen the class.
+        let Some(index) = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, obs)| {
+                obs.correlation_id.as_deref() == Some(correlation)
+                    && obs.source_event_global_sequence == Some(last.global_sequence)
+            })
+            .map(|(index, _)| index)
+            .max()
+        else {
+            continue;
+        };
+        tail_begins_at.insert(correlation.to_owned(), index + 1);
+    }
+    TailGapEvidence { tail_begins_at }
+}
+
+/// Per-correlation HTTP cleanliness: status matched AND no blocking body leaf.
+/// A correlation carrying several responses is clean only if every one of them
+/// is, mirroring the `corr_http` fold the per-correlation outcomes use.
+fn http_clean_by_correlation(
+    http_diffs: &[HttpDiff],
+    http_incoming_by_correlation: &HashMap<String, &deja::BoundaryEvent>,
+    inconclusive_race: &InconclusiveRaceEvidence,
+    column_provenance: &CorrelationColumnProvenance,
+) -> HashMap<String, bool> {
+    let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
+    for diff in http_diffs {
+        let clean = diff.status_match
+            && classify_http_body_diff(
+                diff,
+                http_incoming_by_correlation
+                    .get(&diff.correlation_id)
+                    .copied(),
+                inconclusive_race,
+                column_provenance,
+            )
+            .blocking_leaf_count
+                == 0;
+        clean_by_correlation
+            .entry(diff.correlation_id.clone())
+            .and_modify(|existing| *existing &= clean)
+            .or_insert(clean);
+    }
+    clean_by_correlation
+}
+
 pub fn detect(art: &RunArtifacts) -> Scorecard {
     let graph_plan = GraphScoringPlan::build(art);
     detect_with_plan(art, &graph_plan)
@@ -3378,6 +3764,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         idempotent_delete_demotions(&art.events, &art.observed, http_clean);
     let undeclared_concurrency = undeclared_concurrency_warnings(&art.observed);
     let undeclared_concurrency_warnings = undeclared_concurrency.len() as u64;
+    // Truncated-recording tails. Built BEFORE classification because its guard is
+    // a per-correlation HTTP verdict and the novel arms below need it in hand;
+    // the per-correlation outcomes recompute the same cleanliness downstream from
+    // the same two predicates, so the guard and the reported outcome agree.
+    let tail_gap = tail_gap_evidence(
+        &art.events,
+        &art.observed,
+        &http_clean_by_correlation(
+            &art.http_diffs,
+            &http_incoming_by_correlation,
+            &inconclusive_race,
+            &column_provenance,
+        ),
+    );
+    let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_seed_gaps = 0u64;
     let mut inconclusive_races = 0u64;
     // Expected events claimed by a ValueDiverged pairing: counted as the
@@ -3415,6 +3816,14 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 environmental_misses += 1;
             } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
                 stats.bump_kind("DeterministicMiss");
+            } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+                // The recording for this correlation stopped at request teardown
+                // and this call comes after it. There is no baseline to judge it
+                // against, so it is neither novel nor matched — see TailGapEvidence.
+                stats.bump_kind("InconclusiveTailGap");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    tail_gap_correlations.insert(correlation_id.clone());
+                }
             } else {
                 stats.bump_kind("NovelSubtree");
                 blocking_side_effect += 1;
@@ -3701,6 +4110,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // inconclusive rather than a false Novel — see InconclusiveSeedGap.
             stats.bump_kind("InconclusiveSeedGap");
             inconclusive_seed_gaps += 1;
+        } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+            // Last resort before charging the candidate: the recording for this
+            // correlation stopped at request teardown and this call comes after
+            // it, so there is no baseline to judge it against. Reached only once
+            // every other arm has declined the call, which is what keeps the
+            // demotion to would-be NovelCalls alone — see TailGapEvidence.
+            stats.bump_kind("InconclusiveTailGap");
+            if let Some(corr) = &obs.correlation_id {
+                tail_gap_correlations.insert(corr.clone());
+            }
         } else {
             stats.bump_kind("NovelCall");
             blocking_side_effect += 1;
@@ -3769,6 +4188,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let novel_calls =
         kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
+    let inconclusive_tail_gaps = kind_total(&per_boundary, "InconclusiveTailGap");
 
     // --- post-finalization correlated work warnings --------------------------
     for warning in &undeclared_concurrency {
@@ -3789,6 +4209,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // vacuously.
     let mut inapplicable_reply_canons: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    // Response paths whose difference was a permutation and nothing else.
+    // Counted as divergences like any other body difference; named separately
+    // so the report can say WHAT KIND of difference it was.
+    let mut order_only_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -3830,6 +4254,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 schema_default_divergences += 1;
                 *schema_default_response_paths_seen.entry(path).or_insert(0) += 1;
             }
+            for path in body_classification.order_only_paths {
+                *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
+            }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
                 .or_insert((true, true));
@@ -3843,7 +4270,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut matched_correlations = 0u64;
     for (corr, (status_match, body_match)) in &corr_http {
         let side_effect_divergences = corr_side_effect.get(corr).copied().unwrap_or(0);
-        let passed = *status_match && *body_match && side_effect_divergences == 0;
+        // A tail gap costs the correlation its pass without charging it a
+        // divergence. Demoting those calls out of `corr_side_effect` and stopping
+        // there would have handed this correlation a clean `passed` — the
+        // silent-absorption failure — so the unjudgeable state is carried
+        // explicitly instead.
+        let inconclusive = tail_gap_correlations.contains(corr);
+        let passed = *status_match && *body_match && side_effect_divergences == 0 && !inconclusive;
         if passed {
             matched_correlations += 1;
         }
@@ -3858,6 +4291,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 },
             ),
             alignment: graph_plan.scored_alignment(corr, graph_value_nodes.get(corr)),
+            inconclusive,
             passed,
         });
     }
@@ -3895,6 +4329,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "{inconclusive_seed_gaps} inconclusive seed gap(s) (non-blocking)"
         ));
     }
+    // A truncated recording tail is reported and does NOT fail the verdict — but
+    // it does not pass either, so unlike a seed gap it forces `inconclusive`.
+    if inconclusive_tail_gaps > 0 {
+        reasons.push(format!(
+            "{inconclusive_tail_gaps} inconclusive tail-gap call(s) across \
+             {} correlation(s): recording truncated at request teardown",
+            tail_gap_correlations.len()
+        ));
+    }
     if inconclusive_races > 0 {
         reasons.push(format!(
             "{inconclusive_races} inconclusive_race row(s) recognized; auto-rerun recommended"
@@ -3924,11 +4367,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
         - usize::from(inconclusive_seed_gaps > 0)
+        - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
         - usize::from(idempotent_delete_warnings > 0)
         - usize::from(schema_default_divergences > 0)
         - usize::from(undeclared_concurrency_warnings > 0);
-    let inconclusive = nothing || (inconclusive_races > 0 && blocking_reasons == 0);
+    // A tail gap joins a race in forcing INCONCLUSIVE rather than merely
+    // declining to block: the candidate's post-response work went unrecorded, so
+    // a run carrying one has not been shown to be clean and must never report a
+    // pass. A seed gap deliberately does not do this — its missing baseline is a
+    // single call's, not a whole correlation's unjudged tail.
+    let inconclusive = nothing
+        || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0) && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
         "no artifacts ingested for this run yet".to_owned()
@@ -3964,6 +4414,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         warnings.push(format!(
             "{n} response body leaf occurrence(s) at {path} classified as schema-derived from \
              confirmed same-correlation column provenance — the candidate did not cause this"
+        ));
+    }
+    // Say which differences were ordering. They are counted as divergences
+    // above like any other body difference; what this adds is WHICH KIND they
+    // are, so a reader can see that a collection came back with the same
+    // members in a different order and decide whether that boundary should
+    // carry a `bag` reply canon — a judgement about the payload, which belongs
+    // to whoever owns it and not to the comparison.
+    for (path, responses) in &order_only_response_paths_seen {
+        warnings.push(format!(
+            "response body path {path} holds the same members in a different order on \
+             {responses} response(s) — the collections are equal as multisets, so the difference \
+             is ordering alone. It is reported once, at the collection, rather than at each \
+             position the two orders disagree on, and it still blocks: declare a `bag` reply \
+             canon on that boundary if its order genuinely carries no meaning"
         ));
     }
     // A declaration that governs nothing is reported as the defect it is. The
@@ -4027,6 +4492,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             idempotent_delete_warnings,
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
+            inconclusive_tail_gaps,
             inconclusive_races,
             environmental_misses,
             recovered_rank5_calls,
@@ -4316,12 +4782,25 @@ pub(crate) fn build_ledger_with_plan(
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
     let idempotent_delete = idempotent_delete_demotions(events, &art.observed, http_clean);
+    // The SAME evidence the scorecard classifies with, from the same streams, so
+    // a tail-gap row and a tail-gap count cannot come apart.
+    let tail_gap = tail_gap_evidence(
+        events,
+        &art.observed,
+        &http_clean_by_correlation(
+            &art.http_diffs,
+            &http_incoming_by_correlation,
+            &inconclusive_race,
+            &column_provenance,
+        ),
+    );
     Ok(ledger::build_with_plan(
         events,
         &art.observed,
         &art.table,
         &idempotent_delete,
         &inconclusive_race,
+        &tail_gap,
         graph_plan,
     ))
 }
@@ -5544,6 +6023,261 @@ mod tests {
             )
             .blocking_leaf_count,
             1
+        );
+    }
+
+    // --- array order is compared structurally, not positionally -------------
+    //
+    // Field names below are arbitrary on purpose. Nothing in the comparison
+    // knows what a payload means; a test that only passed for one service's
+    // schema would be testing the wrong thing.
+
+    fn body_pair(baseline: serde_json::Value, candidate: serde_json::Value) -> HttpDiff {
+        // Built the way the pipeline builds it: the kernel's own positional
+        // diff, so these tests are fed the rows the kernel really emits.
+        let body_diff = deja_kernel::diff_json(&baseline, &candidate, "$", &[]);
+        http_with_bodies("order", true, body_diff, baseline, candidate)
+    }
+
+    fn classify_body(diff: &HttpDiff) -> HttpBodyClassification {
+        classify_http_body_diff(
+            diff,
+            None,
+            &InconclusiveRaceEvidence::default(),
+            &CorrelationColumnProvenance::default(),
+        )
+    }
+
+    /// The fix itself. A permutation is ONE difference, at the collection, for
+    /// every permutation — not however many positions this run's two orders
+    /// happened to disagree on.
+    #[test]
+    fn a_permuted_array_is_one_difference_at_the_collection_whatever_the_permutation() {
+        let baseline = serde_json::json!({ "tags": ["a", "b", "c", "d", "e"] });
+        let mut counts = Vec::new();
+        for rotation in 1..5 {
+            let mut items = ["a", "b", "c", "d", "e"];
+            items.rotate_left(rotation);
+            let diff = body_pair(baseline.clone(), serde_json::json!({ "tags": items }));
+            assert!(
+                diff.body_diff.len() > 1,
+                "the positional diff must be the many-row one being replaced"
+            );
+            let rows = order_canonical_body_diff(&diff).expect("bodies present");
+            assert_eq!(
+                rows.len(),
+                1,
+                "one ordering difference, not one per position"
+            );
+            assert_eq!(rows[0].json_path, "$.tags");
+            counts.push(classify_body(&diff).blocking_leaf_count);
+        }
+        assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
+    }
+
+    /// THE GUARD. An ordering difference is still a difference. Nothing here
+    /// makes the comparison order-blind — it makes it say the same thing every
+    /// run.
+    #[test]
+    fn a_reordering_is_still_a_divergence() {
+        let diff = body_pair(
+            serde_json::json!({ "steps": ["authenticate", "authorize", "capture"] }),
+            serde_json::json!({ "steps": ["capture", "authorize", "authenticate"] }),
+        );
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
+        assert_eq!(classify_body(&diff).order_only_paths, vec!["$.steps"]);
+    }
+
+    /// Members are compared WITH MULTIPLICITY: canonical order is a sort, never
+    /// a dedup, so a dropped duplicate is a real difference and not a
+    /// reordering.
+    #[test]
+    fn a_dropped_duplicate_member_is_not_an_ordering_difference() {
+        let diff = body_pair(
+            serde_json::json!({ "items": ["book", "book"] }),
+            serde_json::json!({ "items": ["book"] }),
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 1);
+        assert!(
+            classification.order_only_paths.is_empty(),
+            "losing a member is a membership difference, not an ordering one"
+        );
+    }
+
+    /// Multiplicity is the whole difference between a multiset and a set. These
+    /// two arrays hold the same DISTINCT members, in the same order, and are
+    /// not the same collection.
+    #[test]
+    fn the_same_members_in_different_quantities_are_not_a_reordering() {
+        let diff = body_pair(
+            serde_json::json!({ "items": ["a", "a", "b"] }),
+            serde_json::json!({ "items": ["a", "b", "b"] }),
+        );
+        let classification = classify_body(&diff);
+        assert!(
+            classification.order_only_paths.is_empty(),
+            "a changed count is a membership difference, not an ordering one"
+        );
+        assert_eq!(classification.blocking_leaf_count, 1);
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows[0].baseline, serde_json::json!("a"));
+        assert_eq!(rows[0].candidate, serde_json::json!("b"));
+    }
+
+    /// A genuinely changed member survives, and lands at a canonical path
+    /// rather than wherever the two orders drifted apart.
+    #[test]
+    fn a_changed_member_survives_canonical_alignment() {
+        let diff = body_pair(
+            serde_json::json!({ "tags": ["a", "b", "c"] }),
+            serde_json::json!({ "tags": ["c", "z", "a"] }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1, "one member changed, one row");
+        assert_eq!(rows[0].baseline, serde_json::json!("b"));
+        assert_eq!(rows[0].candidate, serde_json::json!("z"));
+        assert!(classify_body(&diff).order_only_paths.is_empty());
+    }
+
+    /// A reordering of an OUTER collection is reported at the outer collection
+    /// and not descended into — descending would re-describe one fact as
+    /// however many nested positions this run's orders disagreed on.
+    #[test]
+    fn a_nested_reordering_is_reported_at_the_outermost_collection() {
+        let group = |first: &str, second: &str, inner: [&str; 3]| {
+            serde_json::json!({ "groups": [
+                { "name": first, "members": inner },
+                { "name": second, "members": inner },
+            ]})
+        };
+        let diff = body_pair(
+            group("x", "y", ["1", "2", "3"]),
+            group("y", "x", ["3", "1", "2"]),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].json_path, "$.groups");
+    }
+
+    /// The real response pair this came from: two runs of the same binary
+    /// returning the same nine card networks in different orders. Fifteen
+    /// positional rows become one, and the same one whichever way it is shuffled.
+    #[test]
+    fn the_measured_response_reduces_to_one_stable_difference() {
+        let recorded = serde_json::json!({ "payment_methods_enabled": [
+            { "payment_method_type": "credit", "card_networks": [
+                "AmericanExpress", "DinersClub", "Discover", "JCB", "CartesBancaires",
+                "Visa", "UnionPay", "Mastercard", "Interac"]},
+            { "payment_method_type": "debit", "card_networks": [
+                "Mastercard", "Interac", "DinersClub", "Discover", "JCB",
+                "Visa", "AmericanExpress", "UnionPay", "CartesBancaires"]},
+        ]});
+        let replayed = serde_json::json!({ "payment_methods_enabled": [
+            { "payment_method_type": "debit", "card_networks": [
+                "CartesBancaires", "Mastercard", "Visa", "Discover", "AmericanExpress",
+                "Interac", "JCB", "DinersClub", "UnionPay"]},
+            { "payment_method_type": "credit", "card_networks": [
+                "UnionPay", "DinersClub", "Mastercard", "JCB", "Discover",
+                "Interac", "CartesBancaires", "AmericanExpress", "Visa"]},
+        ]});
+        let diff = body_pair(recorded, replayed);
+        assert!(
+            diff.body_diff.len() >= 15,
+            "the positional diff is the noisy one"
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 1);
+        assert_eq!(
+            classification.order_only_paths,
+            vec!["$.payment_methods_enabled"]
+        );
+    }
+
+    /// A body carrying no arrays at all reaches exactly the rows the kernel
+    /// emitted.
+    #[test]
+    fn a_body_without_arrays_is_unchanged() {
+        let diff = body_pair(
+            serde_json::json!({ "amount": 100, "currency": "USD" }),
+            serde_json::json!({ "amount": 101, "currency": "USD" }),
+        );
+        assert_eq!(
+            order_canonical_body_diff(&diff).expect("bodies present"),
+            diff.body_diff
+        );
+    }
+
+    /// A boundary that declares `bag` says its collections carry no order. THAT
+    /// is where knowledge of a payload lives — in a declaration made by whoever
+    /// owns the semantics, against the boundary it describes.
+    #[test]
+    fn a_declared_bag_reply_canon_absorbs_a_reordering() {
+        let corr = "bag-declared";
+        let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
+        let replayed = serde_json::json!({ "tags": ["c", "a", "b"] });
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                901,
+                Some("bag"),
+                recorded,
+            )],
+        ));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(card.summary.http_body_mismatches, 0);
+    }
+
+    /// …and it absorbs ONLY reordering. A declaration that order is
+    /// insignificant is not a declaration that membership is.
+    #[test]
+    fn a_declared_bag_reply_canon_keeps_a_changed_member_blocking() {
+        let corr = "bag-declared-changed";
+        let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
+        let replayed = serde_json::json!({ "tags": ["c", "a", "z"] });
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                902,
+                Some("bag"),
+                recorded,
+            )],
+        ));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 1);
+        assert_eq!(card.summary.http_body_mismatches, 1);
+    }
+
+    /// The report SAYS a difference was ordering, naming the collection.
+    #[test]
+    fn the_scorecard_names_an_ordering_difference_as_one() {
+        let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
+        let replayed = serde_json::json!({ "tags": ["c", "a", "b"] });
+        let card = detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 1);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("$.tags")
+                && w.contains("same members in a different order")
+                && w.contains("still blocks")),
+            "warnings: {:?}",
+            card.warnings
         );
     }
 
@@ -7729,6 +8463,306 @@ mod tests {
             card.verdict.reason
         );
         assert!(card.verdict.reason.contains("seed gap"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Truncated recording tails
+    // -----------------------------------------------------------------------
+
+    /// A recorded event at `seq` on `boundary`/`method`, carrying `args`.
+    fn tail_ev(
+        seq: u64,
+        corr: &str,
+        boundary: &str,
+        method: &str,
+        args: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut ev = omitted_ev(seq, boundary, Some(corr));
+        ev.method_name = method.to_owned();
+        ev.args = args;
+        ev
+    }
+
+    /// The router's API-lock release — the request-teardown marker a truncated
+    /// recording ends at.
+    fn teardown_ev(seq: u64, corr: &str) -> deja::BoundaryEvent {
+        tail_ev(
+            seq,
+            corr,
+            "redis",
+            "delete_key",
+            serde_json::json!({"command": "DEL", "key": "API_LOCK_merchant_1_payments_pay_x"}),
+        )
+    }
+
+    fn resolved_obs(boundary: &str, corr: &str, seq: u64) -> ObservedCall {
+        obs(boundary, Some(corr), true, Some(1), Some(seq))
+    }
+
+    /// The measured shape. `c1`'s recording ends at its API-lock release while
+    /// the tape runs on for `c2`, so the truncation is per-correlation. The
+    /// candidate reproduces every recorded `c1` call and then makes one more —
+    /// the post-response webhook work the recorder never captured.
+    ///
+    /// The parameters are exactly what the class must stay sensitive to:
+    /// `status_match` and `body` are THE GUARD's inputs, and `extra_at_tail`
+    /// puts the candidate's unrecorded call after the teardown marker (a tail
+    /// gap) or before it (mid-request work, which is a real novel call).
+    fn tail_gap_art(
+        status_match: bool,
+        body: Vec<JsonFieldDiff>,
+        extra_at_tail: bool,
+    ) -> RunArtifacts {
+        let extra = obs("db", Some("c1"), false, None, None);
+        let mut observed = vec![resolved_obs("db", "c1", 1)];
+        if !extra_at_tail {
+            observed.push(extra.clone());
+        }
+        observed.push(resolved_obs("redis", "c1", 2));
+        if extra_at_tail {
+            observed.push(extra);
+        }
+        observed.push(resolved_obs("db", "c2", 3));
+        art_with_events(
+            vec![
+                seq_entry(Some("c1"), "db", 1),
+                seq_entry(Some("c1"), "redis", 2),
+                seq_entry(Some("c2"), "db", 3),
+            ],
+            observed,
+            vec![http("c1", status_match, body), http("c2", true, vec![])],
+            vec![
+                tail_ev(1, "c1", "db", "m", serde_json::json!({})),
+                teardown_ev(2, "c1"),
+                tail_ev(3, "c2", "db", "m", serde_json::json!({})),
+            ],
+        )
+    }
+
+    /// The measured defect. The recorder stops capturing a correlation at the
+    /// API-lock release, so the post-response webhook work the request path goes
+    /// on to do never reaches the tape. The candidate does it for real on replay
+    /// and every call in it misses the table. That is a RECORDING limit, so it
+    /// is neither a blocking novel call nor a pass.
+    #[test]
+    fn truncated_recording_tail_is_inconclusive_not_a_novel_call() {
+        let card = detect(&tail_gap_art(true, vec![], true));
+        assert_eq!(card.summary.inconclusive_tail_gaps, 1);
+        assert_eq!(card.summary.novel_calls, 0, "a tail gap is not a Novel");
+        assert_eq!(card.summary.side_effect_divergences, 0);
+        // Laundering check: the demotion must not have been bought by matching
+        // FEWER calls.
+        assert_eq!(card.summary.matched_side_effect_calls, 3);
+        assert!(
+            !card.verdict.pass,
+            "an unrecorded tail is not a pass: {}",
+            card.verdict.reason
+        );
+        assert!(card.verdict.inconclusive, "{}", card.verdict.reason);
+        assert!(
+            card.verdict.reason.contains("tail-gap"),
+            "{}",
+            card.verdict.reason
+        );
+
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 scored");
+        assert!(c1.inconclusive, "the correlation cannot be judged");
+        assert!(!c1.passed, "and must never read as passing");
+        assert_eq!(c1.side_effect_divergences, 0);
+
+        // A correlation the recorder captured whole is untouched.
+        let c2 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c2")
+            .expect("c2 scored");
+        assert!(!c2.inconclusive);
+        assert!(c2.passed);
+        assert_eq!(card.summary.matched_correlations, 1, "c1 does not count");
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// THE GUARD. Every correlation this class was built from answered with a
+    /// byte-identical response, which is the only thing that makes calling their
+    /// unrecorded tails inconclusive honest. A tail gap that CHANGED the
+    /// response is not a tail gap, it is a divergence — so a status mismatch
+    /// keeps the very same call BLOCKING.
+    #[test]
+    fn a_status_mismatch_keeps_the_unrecorded_tail_call_blocking() {
+        let card = detect(&tail_gap_art(false, vec![], true));
+        assert_eq!(
+            card.summary.inconclusive_tail_gaps, 0,
+            "a diverged response is not an inconclusive tail"
+        );
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the tail call stays a BLOCKING novel call"
+        );
+        assert_eq!(card.summary.side_effect_divergences, 1);
+        assert!(!card.verdict.pass);
+        assert!(
+            !card.verdict.inconclusive,
+            "a diverged response is a real fail, not an unjudged run"
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// THE GUARD, other half: the status agreed but the BODY did not. Same
+    /// answer — the response differed, so the tail is a divergence.
+    #[test]
+    fn a_body_mismatch_keeps_the_unrecorded_tail_call_blocking() {
+        let card = detect(&tail_gap_art(
+            true,
+            vec![JsonFieldDiff {
+                json_path: "$.amount".to_owned(),
+                baseline: serde_json::json!(100),
+                candidate: serde_json::json!(200),
+            }],
+            true,
+        ));
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.http_body_mismatches, 1);
+        assert!(!card.verdict.pass);
+        assert!(!card.verdict.inconclusive);
+    }
+
+    /// The condition that does the real work. "The recording ends at a teardown
+    /// marker" is very nearly universal — in the measured main-app run it held
+    /// for 71 of 77 correlations — so it cannot be what selects a tail gap. That
+    /// same run carried 16 BLOCKING novel `update_payment_intent` calls inside
+    /// HTTP-clean, teardown-ending correlations, mid-request. Only their
+    /// POSITION keeps them blocking, and it must.
+    #[test]
+    fn a_novel_call_before_the_teardown_marker_stays_blocking() {
+        let card = detect(&tail_gap_art(true, vec![], false));
+        assert_eq!(
+            card.summary.inconclusive_tail_gaps, 0,
+            "mid-request work has a recorded baseline region; it is not a tail"
+        );
+        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(card.summary.side_effect_divergences, 1);
+        assert!(!card.verdict.pass);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// Truncation is the claim, so it has to be evidenced. When the tape carries
+    /// recorded work PAST the correlation's lock release the recorder plainly
+    /// did not stop there, and an extra candidate call is a genuine novel call.
+    #[test]
+    fn a_recording_that_continues_past_teardown_is_not_truncated() {
+        // c1 records work AFTER its lock release, so the recorder plainly did
+        // not stop there. The candidate reproduces all of it and THEN makes an
+        // extra call, in the same trailing position a genuine tail gap would
+        // occupy and with the tape still running on for c2 — so the marker test
+        // is the only thing left that can tell the two apart. (An earlier
+        // version of this fixture put the extra call mid-stream and ended the
+        // tape at c1, and passed under a deleted marker test: the position and
+        // tape-end conditions were catching it instead.)
+        let a = art_with_events(
+            vec![
+                seq_entry(Some("c1"), "db", 1),
+                seq_entry(Some("c1"), "redis", 2),
+                seq_entry(Some("c1"), "db", 3),
+                seq_entry(Some("c2"), "db", 4),
+            ],
+            vec![
+                resolved_obs("db", "c1", 1),
+                resolved_obs("redis", "c1", 2),
+                resolved_obs("db", "c1", 3),
+                obs("db", Some("c1"), false, None, None),
+                resolved_obs("db", "c2", 4),
+            ],
+            vec![http("c1", true, vec![]), http("c2", true, vec![])],
+            vec![
+                tail_ev(1, "c1", "db", "m", serde_json::json!({})),
+                teardown_ev(2, "c1"),
+                tail_ev(3, "c1", "db", "m", serde_json::json!({})),
+                tail_ev(4, "c2", "db", "m", serde_json::json!({})),
+            ],
+        );
+        let card = detect(&a);
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    /// A correlation running to the very end of the tape is left BLOCKING. The
+    /// evidence for truncation is that the recorder kept capturing OTHER work
+    /// after this correlation's lock release; when the tape simply stops there
+    /// that evidence is absent, and the safe reading is the strict one.
+    #[test]
+    fn a_teardown_at_the_end_of_the_tape_is_not_evidence_of_truncation() {
+        let mut a = tail_gap_art(true, vec![], true);
+        // Drop c2, so c1's lock release IS the tape's last recorded event.
+        a.events
+            .retain(|ev| ev.correlation_id.as_deref() != Some("c2"));
+        a.table
+            .entries
+            .retain(|entry| entry.key.correlation_id.as_deref() != Some("c2"));
+        a.observed
+            .retain(|call| call.correlation_id.as_deref() != Some("c2"));
+        a.http_diffs.retain(|diff| diff.correlation_id != "c2");
+        let card = detect(&a);
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(card.summary.novel_calls, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    /// The tail begins where the recording ended, so the candidate has to have
+    /// GOT there. One that never reproduced the lock release has an omission on
+    /// its hands, not an unrecorded tail to be excused.
+    #[test]
+    fn a_candidate_that_never_reached_teardown_has_no_tail_to_excuse() {
+        let mut a = tail_gap_art(true, vec![], true);
+        a.observed
+            .retain(|call| call.source_event_global_sequence != Some(2));
+        let card = detect(&a);
+        assert_eq!(card.summary.inconclusive_tail_gaps, 0);
+        assert_eq!(
+            card.summary.omitted_calls, 1,
+            "the unreproduced lock release is a real omission"
+        );
+        assert_eq!(card.summary.novel_calls, 1);
+        assert!(!card.verdict.pass);
+    }
+
+    /// The ledger and the scorecard must tell ONE story: a demoted tail call
+    /// carries a non-blocking row naming the same class the summary counts.
+    #[test]
+    fn the_ledger_names_a_tail_gap_the_same_way_the_scorecard_counts_it() {
+        let a = tail_gap_art(true, vec![], true);
+        let card = detect(&a);
+        let rows = build_ledger(&a).expect("ledger builds");
+        let tail: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == "inconclusive_tail_gap")
+            .collect();
+        assert_eq!(tail.len() as u64, card.summary.inconclusive_tail_gaps);
+        assert!(
+            tail.iter().all(|row| !row.blocking),
+            "an unjudgeable call is not charged to the candidate"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "novel" && row.blocking),
+            "no blocking novel row may survive alongside the demotion"
+        );
     }
 
     /// REGRESSION (#28 extra-call): an execute-shadow call with NO recorded

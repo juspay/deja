@@ -47,6 +47,13 @@ pub struct K8sExecutorConfig {
     /// executor injects the per-run URI here (Option B). Names are config so no
     /// candidate/template specifics are compiled in.
     pub migrations_init_container: String,
+    /// The initContainer that layers the candidate's own router config (from the
+    /// same CodeBundle) UNDER the recorded one and writes the single file the
+    /// candidate boots from. It reads the bundle URI from the SAME env var, and
+    /// only to name the object in its error when the bundle lacks this
+    /// environment's config — so a config failure says which S3 object failed to
+    /// deliver it, not just which file was missing.
+    pub config_init_container: String,
     pub code_bundle_uri_env: String,
     /// The Job's shared state mount — where the runner writes a run's artifacts
     /// and the candidate reads and writes them.
@@ -97,6 +104,7 @@ impl K8sExecutorConfig {
             template_key: var("DEJA_JOB_TEMPLATE_KEY", "job.json"),
             runner_container: var("DEJA_RUNNER_CONTAINER", "runner"),
             migrations_init_container: var("DEJA_MIGRATIONS_INIT_CONTAINER", "migrations"),
+            config_init_container: var("DEJA_CONFIG_INIT_CONTAINER", "router-config"),
             code_bundle_uri_env: var("DEJA_CODE_BUNDLE_URI_ENV", "DEJA_CODE_BUNDLE_URI"),
             job_state_dir: var("DEJA_JOB_STATE_DIR", "/workspace/state"),
             diagnostics_tail_lines: var("DEJA_DIAGNOSTICS_TAIL_LINES", "2000")
