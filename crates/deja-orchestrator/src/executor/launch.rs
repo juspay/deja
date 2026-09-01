@@ -188,7 +188,7 @@ pub fn launch_spec_for_run(
         jobs_namespace: cfg.jobs_namespace.clone(),
         template_namespace: cfg.template_namespace.clone(),
         template_configmap: cfg.template_configmap.clone(),
-        template_key: cfg.template_key.clone(),
+        template_key: cfg.template_key_for(run.spec.system()),
         candidate_container: candidate_binding.container.clone(),
         candidate_image,
         env,

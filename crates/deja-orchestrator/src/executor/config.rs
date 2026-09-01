@@ -181,6 +181,30 @@ impl K8sExecutorConfig {
         }
     }
 
+    /// The Job template key for a run's `system_under_test`. The default system
+    /// keeps the deployment's configured key (`DEJA_JOB_TEMPLATE_KEY`, itself
+    /// defaulting to `job.json`). Another system reads
+    /// `DEJA_<SYSTEM>_JOB_TEMPLATE_KEY`, falling back to the `job.<system>.json`
+    /// convention the replay-env ConfigMap already ships alongside `job.json`.
+    ///
+    /// Deriving the name rather than requiring one is safe here because the
+    /// consequence of getting it wrong is loud: `fetch_template` refuses by
+    /// name, saying which ConfigMap and which key it looked for. A system whose
+    /// template is named something else sets the variable; nothing has to be
+    /// configured for a system that follows the convention.
+    ///
+    /// Note this is deliberately NOT the base key for a non-default system.
+    /// Falling back to `job.json` would boot a prism run against the router's
+    /// Job — migrations, a database and a config-compose init it does not have
+    /// — and the pod would fail somewhere far from the cause.
+    pub fn template_key_for(&self, system: &str) -> String {
+        if crate::is_default_system(system) {
+            return self.template_key.clone();
+        }
+        std::env::var(crate::system_env_var(system, "JOB_TEMPLATE_KEY"))
+            .unwrap_or_else(|_| format!("job.{system}.json"))
+    }
+
     /// The config-copy source for a run's `system_under_test`. Non-default
     /// systems read `DEJA_<SYSTEM>_CONFIG_SOURCE_{DEPLOYMENT,CONTAINER}`; unset
     /// means NO config copy (empty deployment) — booting a prism candidate off
@@ -298,6 +322,40 @@ fn image_tag(image: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// These variables are process-global, so the template-key cases run under
+    /// one test rather than as separate ones racing the same names.
+    #[test]
+    fn template_key_is_per_system_and_never_borrows_the_routers_job() {
+        let cfg = K8sExecutorConfig::from_env();
+
+        // A non-default system follows the convention the replay-env ConfigMap
+        // already ships, and must NOT fall back to the router's Job.
+        assert_eq!(cfg.template_key_for("prism"), "job.prism.json");
+        assert_ne!(cfg.template_key_for("prism"), cfg.template_key);
+        // The ConfigMap KEY keeps a hyphen; only the variable name folds it.
+        assert_eq!(
+            cfg.template_key_for("payment-core"),
+            "job.payment-core.json"
+        );
+
+        // The default system keeps the deployment's own key, and is not
+        // divertible by a profile variable — including one named for it.
+        std::env::set_var("DEJA_HYPERSWITCH_JOB_TEMPLATE_KEY", "job.WRONG.json");
+        assert_eq!(
+            cfg.template_key_for(crate::DEFAULT_SYSTEM_UNDER_TEST),
+            cfg.template_key,
+            "the default system short-circuits before reading any profile var"
+        );
+        assert_eq!(cfg.template_key_for("hyperswitch"), "job.json");
+        std::env::remove_var("DEJA_HYPERSWITCH_JOB_TEMPLATE_KEY");
+
+        // An explicit profile key overrides the derived convention.
+        std::env::set_var("DEJA_PRISM_JOB_TEMPLATE_KEY", "job.ucs.json");
+        assert_eq!(cfg.template_key_for("prism"), "job.ucs.json");
+        std::env::remove_var("DEJA_PRISM_JOB_TEMPLATE_KEY");
+    }
+
     use super::*;
 
     #[test]
