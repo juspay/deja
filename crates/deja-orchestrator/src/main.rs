@@ -228,6 +228,7 @@ fn app_router(state: AppState) -> Router {
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
+        .route("/systems", get(v1_systems))
         .route("/recordings", get(v1_list_recordings))
         .route("/recordings/available", get(v1_available_recordings))
         .route(
@@ -693,14 +694,12 @@ fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, Str
     let Some(system) = system.filter(|s| !deja_orchestrator::is_default_system(s)) else {
         return Ok((default_bucket.to_owned(), root));
     };
+    let profile = deja_orchestrator::system::system_config(system);
     let bucket_var = deja_orchestrator::system_env_var(system, "S3_BUCKET");
-    let bucket = match std::env::var(&bucket_var) {
-        Ok(b) if !b.trim().is_empty() => b.trim().to_owned(),
-        _ => {
-            return Err(format!(
-                "system '{system}' has no recording bucket configured: set {bucket_var} on the orchestrator"
-            ))
-        }
+    let Some(bucket) = profile.s3_bucket else {
+        return Err(format!(
+            "system '{system}' has no recording bucket configured: set {bucket_var} on the orchestrator"
+        ));
     };
     let root = match std::env::var(deja_orchestrator::system_env_var(system, "RECORDING_ROOT")) {
         Ok(r) if !r.trim().is_empty() => r.trim().to_owned(),
@@ -725,6 +724,54 @@ fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, Str
 /// `?limit=` and `?offset=` page the result; `pulled` says whether the catalog
 /// already has it, so a picker can show what is ready versus what will be
 /// fetched on first use.
+/// The systems this deployment can replay, with the configuration each
+/// resolves to.
+///
+/// A discovery endpoint exists so that no CLIENT has to know the set. The
+/// dashboard used to carry it three times over — a two-option `<select>`, a
+/// TypeScript union that could not express a third system, and prism's own span
+/// namespaces written into a React component — so adding a system meant editing
+/// the browser as well as the orchestrator, in a language where the compiler
+/// enforced the omission. Everything below is data the deployment already
+/// stated; this only puts it where a caller can read it.
+///
+/// `configured` is the honest field: a system in this list may still be missing
+/// what it needs to run. Naming it here and saying it is unconfigured is a
+/// better answer than omitting it, which is indistinguishable from a system
+/// nobody has heard of.
+async fn v1_systems() -> Response {
+    let systems: Vec<serde_json::Value> = deja_orchestrator::system::registry()
+        .into_iter()
+        .map(|s| {
+            // Unusable if its declaration did not parse, whatever else resolved.
+            let configured = s.error.is_none() && (s.is_default || s.s3_bucket.is_some());
+            serde_json::json!({
+                "name": s.name,
+                "is_default": s.is_default,
+                "configured": configured,
+                "s3_bucket": s.s3_bucket,
+                "recording_root": s.recording_root,
+                "manages_stores": s.manages_stores,
+                "manages_stores_declared": s.manages_stores_declared,
+                "has_code_bundle": s.has_code_bundle,
+                "job_template_key": s.job_template_key,
+                "candidate_image_repo": s.candidate_image_repo,
+                "instance_pattern": s.instance_pattern,
+                "scored_span_namespaces": s.scored_span_namespaces,
+                // Declarations this deployment made that are not being used.
+                // Empty is the normal answer; a non-empty one is a
+                // configuration mistake that would otherwise be invisible,
+                // because every one of them degrades to a working default.
+                "warnings": s.warnings,
+                // Present only when the deployment stated something the
+                // orchestrator could not honour. Such a system must not be run.
+                "error": s.error,
+            })
+        })
+        .collect();
+    json_ok(serde_json::json!({ "systems": systems }))
+}
+
 async fn v1_available_recordings(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<AvailableQuery>,
@@ -784,23 +831,25 @@ async fn v1_available_recordings(
             // and replayed against a prism candidate: every request's
             // connection reset. Ambiguous stays null; a wrong label is worse
             // than none.
-            let prism_pattern =
-                std::env::var("DEJA_PRISM_INSTANCE_PATTERN").unwrap_or_else(|_| "ucs".to_owned());
-            let system = if let Some(system) = system_scope {
+            let system: Option<String> = if let Some(system) = system_scope {
                 // Scoped scan: the SOURCE BUCKET names the system — that is
                 // the whole point of keeping the buckets separate.
-                Some(system)
+                Some(system.to_owned())
             } else if !r.instances.is_empty() {
-                if r.instances.iter().any(|i| i.contains(&prism_pattern)) {
-                    Some("prism")
-                } else {
-                    Some("hyperswitch")
-                }
+                // Match every registered system's declared pod-name pattern. No
+                // match is UNKNOWN, not the default system: this arm used to
+                // return hyperswitch for any pod name it did not recognise,
+                // which made a third system silently mislabelled rather than
+                // merely unconfigured, against what the comment above says.
+                deja_orchestrator::system::system_from_instances(&r.instances)
             } else if matches!(
                 identity,
                 deja_orchestrator::RecordingIdentity::Described { .. }
             ) {
-                Some("hyperswitch")
+                // The id SHAPE is positive evidence for exactly one system: the
+                // `rec-<revision>-<time>-<instance>` form is the default
+                // recorder's. No other shape identifies its minter.
+                Some(deja_orchestrator::DEFAULT_SYSTEM_UNDER_TEST.to_owned())
             } else {
                 None
             };

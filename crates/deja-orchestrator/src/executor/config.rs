@@ -152,32 +152,26 @@ impl K8sExecutorConfig {
         if crate::is_default_system(system) {
             return self.candidate_binding.clone();
         }
-        let var = |suffix: &str, prism_default: &str| {
-            let name = crate::system_env_var(system, &format!("CANDIDATE_{suffix}"));
-            std::env::var(name).unwrap_or_else(|_| {
-                if system == "prism" {
-                    prism_default.to_owned()
-                } else {
-                    // Unconfigured non-prism system: fall back to the base
-                    // binding's name for this slot so behavior is at worst the
-                    // pre-profile behavior, never a silent empty var name.
-                    match suffix {
-                        "MODE_ENV" => self.candidate_binding.mode_env.clone(),
-                        "RUN_ID_ENV" => self.candidate_binding.run_id_env.clone(),
-                        "SOURCE_ENV" => self.candidate_binding.source_env.clone(),
-                        "OBSERVED_ENV" => self.candidate_binding.observed_env.clone(),
-                        _ => self.candidate_binding.code_sha_env.clone(),
-                    }
-                }
-            })
+        // The profile comes from the registry, which holds both the declared
+        // names and the defaults shipped for a system deja already knows. A
+        // slot the profile does not carry is UNCONFIGURED for this system, and
+        // falls back to the base binding's name for that slot so behaviour is
+        // at worst the pre-profile behaviour, never a silent empty var name.
+        let profile = crate::system::system_config(system);
+        let var = |slot: &str, base: &str| {
+            profile
+                .candidate_env
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| base.to_owned())
         };
         CandidateBinding {
             container: self.candidate_binding.container.clone(),
-            mode_env: var("MODE_ENV", "CS__DEJA__MODE"),
-            run_id_env: var("RUN_ID_ENV", "CS__DEJA__RUN_ID"),
-            source_env: var("SOURCE_ENV", "CS__DEJA__REPLAY__SOURCE"),
-            observed_env: var("OBSERVED_ENV", "CS__DEJA__REPLAY__OBSERVED_SINK"),
-            code_sha_env: var("CODE_SHA_ENV", "CS__DEJA__IDENTITY__CODE_SHA"),
+            mode_env: var("MODE_ENV", &self.candidate_binding.mode_env),
+            run_id_env: var("RUN_ID_ENV", &self.candidate_binding.run_id_env),
+            source_env: var("SOURCE_ENV", &self.candidate_binding.source_env),
+            observed_env: var("OBSERVED_ENV", &self.candidate_binding.observed_env),
+            code_sha_env: var("CODE_SHA_ENV", &self.candidate_binding.code_sha_env),
         }
     }
 
@@ -195,8 +189,9 @@ impl K8sExecutorConfig {
         if crate::is_default_system(system) {
             return self.template_key.clone();
         }
-        std::env::var(crate::system_env_var(system, "JOB_TEMPLATE_KEY"))
-            .unwrap_or_else(|_| format!("job.{system}.json"))
+        crate::system::system_config(system)
+            .job_template_key
+            .unwrap_or_else(|| format!("job.{system}.json"))
     }
 
     /// The config-copy source for a run's `system_under_test`. Non-default
@@ -208,11 +203,10 @@ impl K8sExecutorConfig {
         if crate::is_default_system(system) {
             return self.config_source.clone();
         }
+        let profile = crate::system::system_config(system);
         ConfigSource {
-            deployment: std::env::var(crate::system_env_var(system, "CONFIG_SOURCE_DEPLOYMENT"))
-                .unwrap_or_default(),
-            container: std::env::var(crate::system_env_var(system, "CONFIG_SOURCE_CONTAINER"))
-                .unwrap_or_default(),
+            deployment: profile.config_source_deployment.unwrap_or_default(),
+            container: profile.config_source_container.unwrap_or_default(),
         }
     }
 }
@@ -286,18 +280,21 @@ fn qualify_candidate_image_for(reference: &str, system: &str) -> Result<String, 
     if already_qualified {
         return Ok(reference.to_owned());
     }
-    let repo_var = if crate::is_default_system(system) {
+    let profile = crate::system::system_config(system);
+    // Named for the error only: the registry has already resolved the value,
+    // but a caller who has to FIX this needs the variable's name, not its value.
+    let repo_var = if profile.is_default {
         "DEJA_CANDIDATE_IMAGE_REPO".to_owned()
     } else {
         crate::system_env_var(system, "CANDIDATE_IMAGE_REPO")
     };
-    let repo = match std::env::var(&repo_var) {
-        Ok(repo) if !repo.trim().is_empty() => repo.trim().trim_end_matches('/').to_owned(),
+    let repo = match profile.candidate_image_repo {
+        Some(repo) => repo,
         // The default system tolerates a bare ref (compose local tags); any
         // other system refuses it — the only silent alternative is qualifying
         // against the wrong system's repo, which is a guaranteed dead pull.
-        _ if crate::is_default_system(system) => return Ok(reference.to_owned()),
-        _ => {
+        None if profile.is_default => return Ok(reference.to_owned()),
+        None => {
             return Err(ExecutorError::Template(format!(
                 "bare candidate ref '{reference}' for system '{system}': set {repo_var}                  (the system's image repo) or pass a fully-qualified image reference"
             )))

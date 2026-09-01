@@ -21,6 +21,23 @@ pub mod lookup;
 pub mod s3;
 pub mod scope;
 pub mod store;
+pub mod system;
+
+/// One lock for tests that mutate process-global environment.
+///
+/// Two modules assert opposite things about the same variable names — one that
+/// prism declares nothing, one that it declares the deployment's values — and
+/// cargo runs them on parallel threads sharing one environment. Per-name
+/// discipline cannot separate them, so they take turns.
+#[cfg(test)]
+pub(crate) mod test_env {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not wedge every later one.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// Specification of a candidate Hyperswitch identity. All five resolution
 /// modes promised in the plan; only `LocalPath` has a real backing impl in
@@ -168,18 +185,13 @@ pub fn is_default_system(system: &str) -> bool {
 /// source decided, so a declaration that was ignored is visible rather than
 /// silent.
 pub fn system_manages_stores(system: &str) -> bool {
-    system_manages_stores_declared(system).unwrap_or_else(|| is_default_system(system))
+    system::system_config(system).manages_stores
 }
 
 /// The declaration alone, absent the default — so a caller can report whether
 /// the answer was declared or inherited.
 pub fn system_manages_stores_declared(system: &str) -> Option<bool> {
-    let raw = std::env::var(system_env_var(system, "MANAGES_STORES")).ok()?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
+    system::system_config(system).manages_stores_declared
 }
 
 /// THE name of a per-system environment variable: `DEJA_<SYSTEM>_<SUFFIX>`,
@@ -341,7 +353,19 @@ impl RunParams {
                 .ids()
                 .map(|ids| ids.iter().cloned().collect()),
             workload: spec.resolved_workload(),
-            scored_span_namespaces: spec.scored_span_namespaces.clone(),
+            // Which span namespaces are scored is the SYSTEM's instrumentation
+            // contract, so the system declares it and a run only overrides it.
+            // It used to be sent by the caller, which in practice meant the
+            // dashboard held `if system == "prism"` and a literal `["ucs::",
+            // "connector::"]` — another system's schema living in deja's UI,
+            // reachable only by whoever went through that form. A run created
+            // by the API or by CI got an empty list and silently scored
+            // nothing, for the same system.
+            scored_span_namespaces: if spec.scored_span_namespaces.is_empty() {
+                system::system_config(spec.system()).scored_span_namespaces
+            } else {
+                spec.scored_span_namespaces.clone()
+            },
             expectation: expectation.map(str::to_owned),
         }
     }
@@ -1024,6 +1048,7 @@ mod system_env_tests {
     /// one test rather than as separate ones racing the same names.
     #[test]
     fn store_management_is_declared_not_inferred_from_the_name() {
+        let _lock = crate::test_env::env_guard();
         // BEHAVIOUR PRESERVING: undeclared, the answer is exactly what the
         // name-based predicate used to give.
         assert!(system_manages_stores(DEFAULT_SYSTEM_UNDER_TEST));
