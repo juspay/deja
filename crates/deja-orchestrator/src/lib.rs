@@ -229,6 +229,14 @@ pub struct RunSpec {
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,
+    /// Span-name prefixes (e.g. `["ucs::", "connector::"]`) whose spans are the
+    /// candidate's DECLARED instrumentation contract: on replay, every recorded
+    /// span under one of these prefixes must be executed again (and with the
+    /// same field values), event-bearing or not. Empty = no shape check — the
+    /// scorecard stays byte-identical, so systems that never declare a
+    /// namespace (hyperswitch) are untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_span_namespaces: Vec<String>,
 }
 
 impl RunSpec {
@@ -313,6 +321,8 @@ pub struct RunParams {
     pub correlation_filter: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub workload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_span_namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expectation: Option<String>,
 }
@@ -331,6 +341,7 @@ impl RunParams {
                 .ids()
                 .map(|ids| ids.iter().cloned().collect()),
             workload: spec.resolved_workload(),
+            scored_span_namespaces: spec.scored_span_namespaces.clone(),
             expectation: expectation.map(str::to_owned),
         }
     }
@@ -477,6 +488,16 @@ pub enum RecordingIdentity {
         /// minute stay distinct.
         instance: String,
     },
+    /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
+    /// boot. The prism recorder always mints these — but so did the router
+    /// recorder before ids carried a revision, so the SHAPE alone does not
+    /// name the system; a router tape wearing this id was once badged "prism"
+    /// and replayed against a prism candidate, which reset every connection.
+    /// The `inst=` pod names captured by the scan are the discriminator.
+    BootDerived {
+        /// Nanoseconds since the epoch at recorder boot, as recorded.
+        booted_at_nanos: String,
+    },
     /// The id carries no provenance. Its parts live in the recording's
     /// envelopes (`code.sha`, `instance_id`) rather than in its name.
     Opaque,
@@ -500,6 +521,16 @@ pub fn recording_id_body(recording_id: &str) -> &str {
 ///
 /// [`Opaque`]: RecordingIdentity::Opaque
 pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
+    // The UCS recorder's boot-derived default: `run-` + a nanosecond epoch.
+    // Digit count pins the era (18-19 digits ≈ 1971-2262), so `run-1` or a
+    // hand-named `run-foo` stays Opaque instead of masquerading as a boot id.
+    if let Some(nanos) = recording_id.strip_prefix("run-") {
+        if (18..=19).contains(&nanos.len()) && nanos.chars().all(|c| c.is_ascii_digit()) {
+            return RecordingIdentity::BootDerived {
+                booted_at_nanos: nanos.to_owned(),
+            };
+        }
+    }
     let Some(body) = recording_id.strip_prefix("rec-") else {
         return RecordingIdentity::Opaque;
     };
@@ -1048,6 +1079,7 @@ mod run_params_tests {
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,
             candidate_spec: CandidateSpec::PrebuiltImage {
@@ -1190,14 +1222,24 @@ mod run_identity_tests {
             }
         );
 
-        // A recorder that does NOT know its revision keeps the older form
-        // rather than minting `rec-unknown-…`, which would claim a provenance
-        // it does not have. Every recording made before ids carried one reads
-        // this way, and stays replayable.
+        // The boot-derived form is the UCS recorder's default run id — the
+        // shape itself names the system, which is what lets a bucket listing
+        // say "prism" without reading an object.
         assert_eq!(
             parse_recording_id("run-1785331134782268537"),
-            RecordingIdentity::Opaque
+            RecordingIdentity::BootDerived {
+                booted_at_nanos: "1785331134782268537".into()
+            }
         );
+        // But only a plausible nanosecond epoch: a hand-minted run id must not
+        // masquerade as a boot instant (or as a system).
+        for not_boot in ["run-1", "run-ucs-capture-aug", "run-178533113478226853700"] {
+            assert_eq!(
+                parse_recording_id(not_boot),
+                RecordingIdentity::Opaque,
+                "{not_boot} should not have parsed"
+            );
+        }
 
         // Anything that does not match the shape is opaque, never half-read:
         // the envelopes carry these facts authoritatively, so a guess here
@@ -1214,6 +1256,46 @@ mod run_identity_tests {
                 parse_recording_id(malformed),
                 RecordingIdentity::Opaque,
                 "{malformed} should not have parsed"
+            );
+        }
+    }
+
+    /// The contract a RECORDER must satisfy for its ids to carry a revision,
+    /// stated as cases rather than as a format string — because the format
+    /// string is the trap. `rec-<sha>-<MMDDhhmm>-<instance>` describes the
+    /// first case below exactly, and that case does not parse: the instance
+    /// carries hyphens, the body splits into five parts instead of three, and
+    /// the result is `Opaque` with nothing said. Nothing at record time
+    /// reports it; it surfaces later as recordings that select fine and then
+    /// cannot resolve a revision.
+    ///
+    /// A recorder author moving to the `rec-` shape meets this as a failing
+    /// test rather than as a silent absence.
+    #[test]
+    fn the_instance_component_must_be_hyphen_free() {
+        // The shape a naive substitution produces, using a real pod-style
+        // instance id. Reads as conforming; is not.
+        assert_eq!(
+            parse_recording_id("rec-6548e95-09011230-pi-1-1787741712798221595"),
+            RecordingIdentity::Opaque,
+            "a hyphenated instance splits the body into more than three parts"
+        );
+
+        // The same recording with a hyphen-free discriminator parses. That is
+        // the whole difference, and it is why a truncation of an existing id is
+        // not a safe fix — a truncation can still contain a hyphen.
+        assert!(matches!(
+            parse_recording_id("rec-6548e95-09011230-pi1"),
+            RecordingIdentity::Described { ref revision, .. } if revision == "6548e95"
+        ));
+
+        // A revision must be hexdigits: a `v` prefix or a dotted version is not
+        // a git sha and does not parse.
+        for not_a_sha in ["rec-v1a2b3c-09011230-zf", "rec-1.2.3-09011230-zf"] {
+            assert_eq!(
+                parse_recording_id(not_a_sha),
+                RecordingIdentity::Opaque,
+                "{not_a_sha}: revision must be ASCII hexdigits"
             );
         }
     }

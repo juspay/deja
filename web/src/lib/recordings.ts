@@ -86,6 +86,15 @@ export function spanOf(dates: string[]): Span {
  */
 export function identityText(identity: RecordingIdentity | null): string | null {
   if (!identity) return null;
+  // The UCS boot-derived shape: the id IS the boot instant.
+  if (identity.booted_at_nanos) {
+    const ms = Number(identity.booted_at_nanos.slice(0, -6));
+    const when = Number.isFinite(ms)
+      ? new Date(ms).toISOString().replace("T", " ").slice(5, 16) + " UTC"
+      : identity.booted_at_nanos;
+    return `recorder booted ${when}`;
+  }
+  if (!identity.revision || !identity.recorded_at || !identity.instance) return null;
   const { revision, recorded_at, instance } = identity;
   const when =
     recorded_at.length === 8
