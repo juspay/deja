@@ -29,7 +29,7 @@
 // real graph node ids — 324 of 325 rows end up addressable — without ever
 // trusting the graph for structure.
 
-import { CallRecord, GraphNode, HttpDiff } from "./api";
+import { CallRecord, GraphNode, HttpDiff, SpanShapeOutcome } from "./api";
 
 export type Side = "rec" | "rep";
 
@@ -37,18 +37,24 @@ export type Side = "rec" | "rep";
 export type Mark =
   | "origin"
   | "consequence"
+  | "field-diff"
   | "response"
   | "omitted"
+  | "missing-span"
   | "novel"
+  | "novel-span"
   | "environmental"
   | "matched";
 
 export const MARK_ORDER: Mark[] = [
   "origin",
   "consequence",
+  "field-diff",
   "response",
   "omitted",
+  "missing-span",
   "novel",
+  "novel-span",
   "environmental",
   "matched",
 ];
@@ -106,6 +112,9 @@ export type SpineNode = {
   hiddenRec: HiddenGroup[];
   hiddenRep: HiddenGroup[];
   presence: Presence;
+  /** The span-shape outcome when this row is (or carries) a SCORED span —
+   *  the run's declared instrumentation contract (`scored_span_namespaces`). */
+  scored: SpanShapeOutcome | null;
   /** Strongest evidence AT this row, `matched` included. */
   mark: Mark | null;
   /**
@@ -157,6 +166,19 @@ export function isTransport(n: GraphNode): boolean {
   return t === "h2" || t === "hyper" || t.startsWith("aws_");
 }
 
+function scoredMarkOf(o: SpanShapeOutcome): Mark {
+  switch (o.status) {
+    case "missing":
+      return "missing-span";
+    case "novel":
+      return "novel-span";
+    case "field_diverged":
+      return "field-diff";
+    default:
+      return "matched";
+  }
+}
+
 function markOf(c: CallRecord): Mark | null {
   switch (c.kind) {
     case "value_diverged":
@@ -206,6 +228,7 @@ export function buildSpine(
   calls: CallRecord[],
   graph: { record: GraphNode[]; replay: GraphNode[] } | undefined,
   https: HttpDiff[],
+  spanShapes?: Map<string, SpanShapeOutcome[]>,
 ): SpineModel {
   const idx = {
     rec: new Map<number, GraphNode>((graph?.record ?? []).map((n) => [n.node_id, n])),
@@ -233,6 +256,7 @@ export function buildSpine(
     hiddenRec: [],
     hiddenRep: [],
     presence: "no-evidence",
+    scored: null,
     mark: null,
     worst: null,
   });
@@ -344,6 +368,75 @@ export function buildSpine(
     for (const id of n.repNodes) if (!owner.rep.has(id)) owner.rep.set(id, n);
   }
 
+  /* ---- scored spans: graft the declared instrumentation contract ----
+   *
+   * The scorer's span-shape section names spans OUTSIDE the event-bearing
+   * skeleton (that is its whole point), so most of them have no ledger row to
+   * hang on. Each outcome carries real graph node ids; a scored span already on
+   * the spine (its chain anchors a call) gets its verdict applied in place, and
+   * an off-spine one becomes a new row under its nearest grafted-or-spine
+   * ancestor. Ancestors first (shorter namespace path), so nesting among scored
+   * spans survives the graft. Runs before the hidden pass, so grafted node ids
+   * are owned and never double-reported as hidden. */
+  for (const [caseId, outcomes] of spanShapes ?? []) {
+    const sorted = [...outcomes].sort(
+      (a, b) => a.path.split(">").length - b.path.split(">").length || a.k - b.k,
+    );
+    for (const o of sorted) {
+      const mark = scoredMarkOf(o);
+      const existing =
+        (o.record_node_id != null ? owner.rec.get(o.record_node_id) : undefined) ??
+        (o.replay_node_id != null ? owner.rep.get(o.replay_node_id) : undefined);
+      if (existing) {
+        existing.scored = o;
+        existing.mark = worse(existing.mark, mark);
+        continue;
+      }
+      // Nearest ancestor with a spine row, on whichever side has evidence.
+      let host: SpineNode | undefined;
+      for (const [side, gid] of [
+        ["rec", o.record_node_id],
+        ["rep", o.replay_node_id],
+      ] as const) {
+        if (gid == null || host) continue;
+        let cur = parentOf(idx[side].get(gid) ?? ({} as GraphNode)) ?? null;
+        const guard = new Set<number>();
+        while (cur != null && !guard.has(cur)) {
+          guard.add(cur);
+          host = owner[side].get(cur);
+          if (host) break;
+          const up = idx[side].get(cur);
+          if (!up) break;
+          cur = parentOf(up);
+        }
+      }
+      host ??= caseRoots.get(caseId);
+      if (!host) continue; // a case the run never drove — nothing to hang on
+      const seg = o.k > 0 ? `${o.span_name}#${o.k}` : o.span_name;
+      const row = fresh(caseId, `${host.path}>${seg}`, host.depth + 1);
+      row.scored = o;
+      row.mark = mark;
+      if (o.record_node_id != null) {
+        row.recNodes.push(o.record_node_id);
+        row.recMs = msOf(idx.rec.get(o.record_node_id));
+        owner.rec.set(o.record_node_id, row);
+      }
+      if (o.replay_node_id != null) {
+        row.repNodes.push(o.replay_node_id);
+        row.repMs = msOf(idx.rep.get(o.replay_node_id));
+        owner.rep.set(o.replay_node_id, row);
+      }
+      row.presence =
+        o.record_node_id != null && o.replay_node_id != null
+          ? "both"
+          : o.record_node_id != null
+            ? "record-only"
+            : "replay-only";
+      nodes.set(row.key, row);
+      host.children.push(row);
+    }
+  }
+
   const unattributed: Unattributed[] = [];
   let hidRec = 0;
   let hidRep = 0;
@@ -425,6 +518,10 @@ export function buildSpine(
         if (m) counts[m] = (counts[m] ?? 0) + 1;
       }
       if (n.http.length) counts.response = (counts.response ?? 0) + n.http.length;
+      if (n.scored) {
+        const m = scoredMarkOf(n.scored);
+        counts[m] = (counts[m] ?? 0) + 1;
+      }
       // Children in first-seen order — the ledger's order, which follows the
       // recorded call sequence. The graph's `sequence` is per-side and cannot
       // order a merged row.

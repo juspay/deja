@@ -689,7 +689,10 @@ fn drive_replay(
     set_status(root, run, RunStatus::Running, None);
     ctx.run_state("running");
     set_stage(root, run, ctx, 4, total, "waiting for replay router");
-    wait_health(demo.replay_port, Duration::from_secs(240))?;
+    wait_health(
+        &format!("http://127.0.0.1:{}/health", demo.replay_port),
+        Duration::from_secs(240),
+    )?;
 
     set_stage(
         root,
@@ -1283,7 +1286,12 @@ fn write_record_graph_nodes(
 /// publish a partial graph as if it were whole — is kept: nothing is
 /// published, and the absence explains itself in the run's own record instead
 /// of on a dead stderr.
-fn extract_record_graph(
+///
+/// `pub` for the out-of-tree dev bridge (prism's `replay-dev.sh`), which
+/// prepares a run root by hand and needs the record graph laid down the same
+/// way the in-pod runner does — without it, every dev run scores flat
+/// (`missing_forest`) and the graph tier never engages locally.
+pub fn extract_record_graph(
     root: &HarnessRoot,
     run: &Run,
     recording_id: &str,
@@ -1537,9 +1545,18 @@ pub struct InPodOptions {
     pub redis_host: String,
     pub redis_port: u16,
     /// Sidecar pg conninfo URL (also what seeding's psql uses via `-d`).
-    pub database_url: String,
-    /// The router container's health/traffic port (pod-shared netns).
-    pub router_port: u16,
+    /// None for a system with no harness-managed stores (prism) — every store
+    /// stage self-skips, so requiring a value would force templates to carry a
+    /// dummy. Required (by name, at use) when the run manages stores.
+    pub database_url: Option<String>,
+    /// The CANDIDATE container's traffic port (pod-shared netns) — the
+    /// kernel's drive target. `RUNNER_CANDIDATE_PORT`; the pre-multi-system
+    /// name `RUNNER_ROUTER_PORT` is read as a legacy alias.
+    pub candidate_port: u16,
+    /// Readiness URL override (`RUNNER_HEALTH_URL`). None = HTTP `/health` on
+    /// `candidate_port`, the router's shape. A prism candidate serves gRPC on
+    /// its traffic port, so its template points this at the metrics endpoint.
+    pub health_url: Option<String>,
     /// deja-kernel binary path inside the runner container.
     pub kernel_bin: String,
     /// Migration command (argv) run at stage 3 with DATABASE_URL set; None
@@ -1604,7 +1621,11 @@ pub fn drive_replay_in_pod(
         ),
         Some(argv) if !argv.is_empty() => {
             let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]).env("DATABASE_URL", &opts.database_url);
+            let database_url = opts
+                .database_url
+                .as_deref()
+                .ok_or("RUNNER_DATABASE_URL is required when the run manages harness stores")?;
+            cmd.args(&argv[1..]).env("DATABASE_URL", database_url);
             let status = run_streamed(cmd, ctx, "migrating sidecar pg", "migrate")?;
             if !status.success() {
                 return Err(format!("migration command failed (status {status})"));
@@ -1631,7 +1652,9 @@ pub fn drive_replay_in_pod(
         let store = StoreExec::direct(
             opts.redis_host.clone(),
             opts.redis_port,
-            opts.database_url.clone(),
+            opts.database_url
+                .clone()
+                .ok_or("RUNNER_DATABASE_URL is required when the run manages harness stores")?,
         );
 
         // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
@@ -1711,10 +1734,14 @@ pub fn drive_replay_in_pod(
         total,
         "driving recorded requests (kernel)",
     );
-    wait_health(opts.router_port, Duration::from_secs(240))?;
+    let health_url = opts
+        .health_url
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}/health", opts.candidate_port));
+    wait_health(&health_url, Duration::from_secs(240))?;
     run_kernel(
         &opts.kernel_bin,
-        opts.router_port,
+        opts.candidate_port,
         root,
         ctx,
         &recording_id,
@@ -4843,13 +4870,16 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
-/// Poll the candidate's `/health` on a host-published port until 200 or timeout.
-fn wait_health(port: u16, timeout: Duration) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/health");
+/// Poll a candidate readiness URL until 200 or timeout. The URL is the
+/// caller's: HTTP `/health` on the traffic port for the router; a prism
+/// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
+/// curl — so its Job template names a probeable URL (`RUNNER_HEALTH_URL`,
+/// e.g. the metrics endpoint) instead of teaching this function systems.
+fn wait_health(url: &str, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         let ok = Command::new("curl")
-            .args(["-fsS", "-o", "/dev/null", "--max-time", "3", &url])
+            .args(["-fsS", "-o", "/dev/null", "--max-time", "3", url])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -5787,6 +5817,7 @@ mod tests {
         Run {
             run_id: "r1".into(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: RunMode::Record,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
@@ -5857,6 +5888,7 @@ mod tests {
         Run {
             run_id: "run-backstop".into(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
@@ -6584,6 +6616,7 @@ mod tests {
         let run = Run {
             run_id: run_id.to_owned(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage {

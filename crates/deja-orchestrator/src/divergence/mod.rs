@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::HarnessRoot;
 
 pub mod ledger;
+pub mod span_shape;
 pub use ledger::CallRecord;
 
 /// Boundaries whose live calls cannot run in the harness (egress is blocked).
@@ -294,6 +295,25 @@ pub struct Summary {
     /// inconclusive so the orchestrator can auto-rerun instead of red-failing.
     #[serde(default)]
     pub inconclusive_races: u64,
+    /// Recorded scored spans (the run's declared `scored_span_namespaces`
+    /// instrumentation contract) the replay never executed. Blocking.
+    ///
+    /// Projection of `per_boundary["graph"].kinds["MissingScoredSpan"]`.
+    #[serde(default)]
+    pub missing_scored_spans: u64,
+    /// Replayed scored spans the tape has no baseline for. Blocking: the tape
+    /// is the contract in both directions, so an un-instrumented (older) tape
+    /// fails against an instrumented candidate by design — re-record it.
+    ///
+    /// Projection of `per_boundary["graph"].kinds["NovelScoredSpan"]`.
+    #[serde(default)]
+    pub novel_scored_spans: u64,
+    /// Paired scored spans whose captured field values differ (the chokepoint
+    /// check: `connector`, `flow`, …). Blocking.
+    ///
+    /// Projection of `per_boundary["graph"].kinds["SpanFieldDiverged"]`.
+    #[serde(default)]
+    pub span_field_divergences: u64,
     /// Novel calls on egress boundaries — tolerated, surfaced separately so a
     /// blocked outbound integration is never read as a candidate bug.
     pub environmental_misses: u64,
@@ -353,6 +373,12 @@ pub struct CorrelationOutcome {
     pub scoring_mode: deja_forest::ScoringMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<deja_forest::Alignment>,
+    /// The scored-span shape comparison, present only when the run declared
+    /// `scored_span_namespaces` AND this correlation carries at least one
+    /// namespaced span on either side — absence keeps opted-out scorecards
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_shape: Option<span_shape::CorrelationSpanShape>,
     /// This correlation carried at least one `InconclusiveTailGap`: its
     /// recording stops at request teardown, so the candidate's post-response
     /// work has no baseline and the correlation CANNOT be judged clean. Held
@@ -490,6 +516,21 @@ impl Scorecard {
             s.http_status_mismatches,
             &["StatusMismatch"],
         );
+        folds(
+            "missing_scored_spans",
+            s.missing_scored_spans,
+            &["MissingScoredSpan"],
+        );
+        folds(
+            "novel_scored_spans",
+            s.novel_scored_spans,
+            &["NovelScoredSpan"],
+        );
+        folds(
+            "span_field_divergences",
+            s.span_field_divergences,
+            &["SpanFieldDiverged"],
+        );
 
         // The headline number: every blocking side-effect divergence, and
         // nothing else. A demotion that stopped excluding itself here would show
@@ -566,6 +607,9 @@ pub struct RunArtifacts {
     /// dropped at load — an undriven test case is excluded, never counted
     /// omitted. `None` = the full recording was driven.
     pub correlation_scope: Option<std::collections::BTreeSet<String>>,
+    /// The run's declared instrumentation contract (`RunSpec::scored_span_namespaces`),
+    /// read off `run.json` at load. Empty = no span-shape check.
+    pub scored_span_namespaces: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -4265,18 +4309,88 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         }
     }
 
+    // --- span-shape check (the declared instrumentation contract) ------------
+    // Runs off the RAW graphs, not the forest: the forest's skeleton prune is
+    // exactly the blind spot this closes (see `span_shape` module doc). Off
+    // unless the run declared namespaces, so opted-out scorecards stay
+    // byte-identical.
+    let mut missing_scored_spans = 0u64;
+    let mut novel_scored_spans = 0u64;
+    let mut span_field_divergences = 0u64;
+    let mut warnings_extra: Vec<String> = Vec::new();
+    let mut span_shapes: BTreeMap<String, span_shape::CorrelationSpanShape> = BTreeMap::new();
+    if !art.scored_span_namespaces.is_empty() {
+        match art.record_graph.as_ref() {
+            None => warnings_extra
+                .push("scored-span shape check skipped: record graph unavailable".to_owned()),
+            Some(record_graph) => {
+                for corr in corr_http.keys() {
+                    let rec: Vec<&deja_core::ExecutionGraphNode> = record_graph
+                        .iter()
+                        .filter(|n| n.correlation_id.as_deref() == Some(corr.as_str()))
+                        .collect();
+                    let rep: Vec<&deja_core::ExecutionGraphNode> = art
+                        .replay_graph
+                        .iter()
+                        .filter(|n| n.correlation_id.as_deref() == Some(corr.as_str()))
+                        .collect();
+                    if let Some(shape) =
+                        span_shape::compare(&rec, &rep, &art.scored_span_namespaces)
+                    {
+                        missing_scored_spans += shape.missing;
+                        novel_scored_spans += shape.novel;
+                        span_field_divergences += shape.field_diverged;
+                        let stats = boundary_entry(&mut per_boundary, "graph");
+                        if stats.note.is_none() {
+                            stats.note = Some(
+                                "scored-span shape: the run's declared instrumentation \
+                                 contract, not a call boundary"
+                                    .to_owned(),
+                            );
+                        }
+                        for _ in 0..shape.missing {
+                            stats.bump_kind("MissingScoredSpan");
+                        }
+                        for _ in 0..shape.novel {
+                            stats.bump_kind("NovelScoredSpan");
+                        }
+                        for _ in 0..shape.field_diverged {
+                            stats.bump_kind("SpanFieldDiverged");
+                        }
+                        // Matched spans ride a kind DIRECTLY: `bump_kind` would
+                        // count them as diverged, and `stats.matched` feeds the
+                        // `matched_side_effect_calls` fold, which counts CALLS —
+                        // a matched span is neither.
+                        if shape.matched > 0 {
+                            *stats
+                                .kinds
+                                .entry("MatchedScoredSpan".to_owned())
+                                .or_insert(0) += shape.matched;
+                        }
+                        span_shapes.insert(corr.clone(), shape);
+                    }
+                }
+            }
+        }
+    }
+
     // --- per-correlation outcomes --------------------------------------------
     let mut per_correlation = Vec::new();
     let mut matched_correlations = 0u64;
     for (corr, (status_match, body_match)) in &corr_http {
         let side_effect_divergences = corr_side_effect.get(corr).copied().unwrap_or(0);
+        let span_shape_clean = span_shapes.get(corr).is_none_or(|shape| shape.clean());
         // A tail gap costs the correlation its pass without charging it a
         // divergence. Demoting those calls out of `corr_side_effect` and stopping
         // there would have handed this correlation a clean `passed` — the
         // silent-absorption failure — so the unjudgeable state is carried
         // explicitly instead.
         let inconclusive = tail_gap_correlations.contains(corr);
-        let passed = *status_match && *body_match && side_effect_divergences == 0 && !inconclusive;
+        let passed = *status_match
+            && *body_match
+            && side_effect_divergences == 0
+            && span_shape_clean
+            && !inconclusive;
         if passed {
             matched_correlations += 1;
         }
@@ -4291,6 +4405,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 },
             ),
             alignment: graph_plan.scored_alignment(corr, graph_value_nodes.get(corr)),
+            span_shape: span_shapes.remove(corr),
             inconclusive,
             passed,
         });
@@ -4321,6 +4436,22 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     }
     if identity_skews > 0 {
         reasons.push(format!("{identity_skews} graph identity skew(s)"));
+    }
+    // Span-shape findings are all BLOCKING: the tape's scored spans are the
+    // candidate's declared contract, in both directions — a replay of a tape
+    // recorded before the candidate was instrumented fails as novel, by design.
+    if missing_scored_spans > 0 {
+        reasons.push(format!("{missing_scored_spans} missing scored span(s)"));
+    }
+    if novel_scored_spans > 0 {
+        reasons.push(format!(
+            "{novel_scored_spans} novel scored span(s) — tape predates the declared instrumentation?"
+        ));
+    }
+    if span_field_divergences > 0 {
+        reasons.push(format!(
+            "{span_field_divergences} scored-span field divergence(s)"
+        ));
     }
     // Seed gaps are reported but do NOT by themselves fail the verdict — a
     // missing baseline is inconclusive, not a divergence.
@@ -4392,6 +4523,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     };
 
     let mut warnings = art.warnings.clone();
+    warnings.extend(warnings_extra);
     for (seq, row) in &inconclusive_race.row_labels {
         warnings.push(format!(
             "inconclusive_race event {seq} on db row {row}: auto-rerun recommended"
@@ -4494,6 +4626,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             inconclusive_seed_gaps,
             inconclusive_tail_gaps,
             inconclusive_races,
+            missing_scored_spans,
+            novel_scored_spans,
+            span_field_divergences,
             environmental_misses,
             recovered_rank5_calls,
             resolved_by_rank,
@@ -4537,6 +4672,10 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .map(crate::scope::RunScope::of)
         .unwrap_or_else(crate::scope::RunScope::entire_session);
     let correlation_scope: Option<std::collections::BTreeSet<String>> = scope.ids().cloned();
+    let scored_span_namespaces = run
+        .as_ref()
+        .map(|run| run.spec.scored_span_namespaces.clone())
+        .unwrap_or_default();
 
     let mut warnings = Vec::new();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
@@ -4701,6 +4840,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         replay_graph,
         events,
         correlation_scope,
+        scored_span_namespaces,
         warnings,
     })
 }
@@ -5346,6 +5486,7 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
                     candidate_spec: crate::CandidateSpec::PrebuiltImage {
@@ -5464,6 +5605,7 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
                     candidate_spec: crate::CandidateSpec::PrebuiltImage {
@@ -5647,6 +5789,7 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
                     candidate_spec: crate::CandidateSpec::PrebuiltImage {
@@ -5880,6 +6023,7 @@ mod tests {
         http: Vec<HttpDiff>,
     ) -> RunArtifacts {
         RunArtifacts {
+            scored_span_namespaces: Vec::new(),
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -6459,6 +6603,7 @@ mod tests {
         assert!(!card.verdict.pass, "real status drift must still block");
 
         let rows = build_ledger(&RunArtifacts {
+            scored_span_namespaces: Vec::new(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -8053,6 +8198,7 @@ mod tests {
             }],
         )];
         let art = RunArtifacts {
+            scored_span_namespaces: Vec::new(),
             run_id: run_id.to_owned(),
             recording_id: Some(recording_id.to_owned()),
             table,
@@ -9643,6 +9789,232 @@ mod tests {
         }
         value
     }
+
+    // --- span-shape check (scored_span_namespaces) ---------------------------
+
+    fn scored_span(
+        node_id: u64,
+        correlation_id: &str,
+        parent_id: Option<u64>,
+        sequence: u64,
+        span_name: &str,
+        fields: &[(&str, &str)],
+    ) -> deja_core::ExecutionGraphNode {
+        let mut node = graph_span(node_id, correlation_id, parent_id, sequence, span_name);
+        node.fields = fields
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
+            .collect();
+        node
+    }
+
+    fn with_scored_namespaces(mut artifacts: RunArtifacts) -> RunArtifacts {
+        artifacts.scored_span_namespaces = vec!["ucs::".to_owned(), "connector::".to_owned()];
+        artifacts
+    }
+
+    /// The instrumented lattice both sides record when nothing regressed:
+    /// scored spans anchored under plain spans, with chokepoint fields.
+    fn instrumented_graph(corr: &str) -> Vec<deja_core::ExecutionGraphNode> {
+        vec![
+            graph_span(1, corr, None, 0, "request"),
+            scored_span(
+                2,
+                corr,
+                Some(1),
+                1,
+                "ucs::flow_orchestration",
+                &[("connector", "stripe"), ("flow", "Authorize")],
+            ),
+            graph_span(3, corr, Some(2), 2, "execute_connector_processing_step"),
+            scored_span(
+                4,
+                corr,
+                Some(3),
+                3,
+                "connector::request_body",
+                &[("connector", "Stripe"), ("flow", "Authorize")],
+            ),
+        ]
+    }
+
+    #[test]
+    fn declaring_no_namespaces_keeps_the_scorecard_byte_identical() {
+        // The opt-out guarantee: with `scored_span_namespaces` undeclared, a
+        // tape full of scored spans must serialize the SAME scorecard as one
+        // with no scored spans at all — the check may not leak a section, a
+        // pseudo-boundary, or a counter into runs that never asked for it
+        // (hyperswitch runs never ask).
+        let corr = "shape-off";
+        let instrumented = with_graphs(
+            art(vec![], vec![], vec![http(corr, true, vec![])]),
+            instrumented_graph(corr),
+            instrumented_graph(corr),
+        );
+        let plain: Vec<deja_core::ExecutionGraphNode> = instrumented_graph(corr)
+            .into_iter()
+            .map(|mut n| {
+                n.span_name = format!("plain_{}", n.node_id);
+                n.fields.clear();
+                n
+            })
+            .collect();
+        let uninstrumented = with_graphs(
+            art(vec![], vec![], vec![http(corr, true, vec![])]),
+            plain.clone(),
+            plain,
+        );
+        let a = serde_json::to_string(&detect(&instrumented)).unwrap();
+        let b = serde_json::to_string(&detect(&uninstrumented)).unwrap();
+        assert_eq!(
+            a, b,
+            "undeclared check must leave no trace in the scorecard"
+        );
+        assert!(!a.contains("span_shape"));
+    }
+
+    #[test]
+    fn matched_scored_spans_pass_and_surface_the_contract_section() {
+        let corr = "shape-clean";
+        let artifacts = with_scored_namespaces(with_graphs(
+            art(vec![], vec![], vec![http(corr, true, vec![])]),
+            instrumented_graph(corr),
+            instrumented_graph(corr),
+        ));
+        let card = detect(&artifacts);
+        assert!(
+            card.verdict.pass,
+            "clean shape must pass: {}",
+            card.verdict.reason
+        );
+        let outcome = &card.per_correlation[0];
+        let shape = outcome
+            .span_shape
+            .as_ref()
+            .expect("span_shape section present");
+        assert_eq!(shape.matched, 2);
+        assert!(shape.clean());
+        assert_eq!(
+            card.per_boundary["graph"].kinds.get("MatchedScoredSpan"),
+            Some(&2),
+            "matched spans ride a kind, not stats.matched (that fold counts calls)"
+        );
+        // The path must contract the plain anchor spans away.
+        assert!(shape
+            .outcomes
+            .iter()
+            .any(|o| o.path == "ucs::flow_orchestration>connector::request_body"));
+    }
+
+    #[test]
+    fn a_scored_span_the_replay_dropped_fails_the_verdict() {
+        let corr = "shape-missing";
+        let mut replay = instrumented_graph(corr);
+        replay.retain(|n| n.span_name != "connector::request_body");
+        let artifacts = with_scored_namespaces(with_graphs(
+            art(vec![], vec![], vec![http(corr, true, vec![])]),
+            instrumented_graph(corr),
+            replay,
+        ));
+        let card = detect(&artifacts);
+        assert!(!card.verdict.pass);
+        assert!(
+            card.verdict.reason.contains("1 missing scored span(s)"),
+            "reason names the finding: {}",
+            card.verdict.reason
+        );
+        assert_eq!(card.summary.missing_scored_spans, 1);
+        assert!(!card.per_correlation[0].passed);
+        let shape = card.per_correlation[0].span_shape.as_ref().unwrap();
+        let miss = shape
+            .outcomes
+            .iter()
+            .find(|o| o.status == span_shape::SpanShapeStatus::Missing)
+            .expect("missing outcome reported");
+        assert_eq!(miss.span_name, "connector::request_body");
+    }
+
+    #[test]
+    fn an_uninstrumented_tape_against_an_instrumented_candidate_fails_as_novel() {
+        // Deliberate policy: the tape is the contract in BOTH directions. A
+        // recording made before the candidate grew its instrumentation fails
+        // (novel) rather than silently passing — re-record it. UCS accepts
+        // this; hyperswitch never declares namespaces, so it cannot hit it.
+        let corr = "shape-novel";
+        let artifacts = with_scored_namespaces(with_graphs(
+            art(vec![], vec![], vec![http(corr, true, vec![])]),
+            vec![graph_span(1, corr, None, 0, "request")],
+            instrumented_graph(corr),
+        ));
+        let card = detect(&artifacts);
+        assert!(!card.verdict.pass);
+        assert!(
+            card.verdict.reason.contains("2 novel scored span(s)"),
+            "reason: {}",
+            card.verdict.reason
+        );
+        assert_eq!(card.summary.novel_scored_spans, 2);
+    }
+
+    #[test]
+    fn record_graph_unavailable_skips_the_check_with_a_warning() {
+        // An absent record graph is an artifact gap, not a shape finding: the
+        // check cannot run, and saying so beats inventing a verdict. The run's
+        // other checks still decide pass/fail.
+        let corr = "shape-nograph";
+        let mut artifacts =
+            with_scored_namespaces(art(vec![], vec![], vec![http(corr, true, vec![])]));
+        artifacts.replay_graph = instrumented_graph(corr);
+        assert!(artifacts.record_graph.is_none());
+        let card = detect(&artifacts);
+        assert!(
+            card.verdict.pass,
+            "skip must not fail: {}",
+            card.verdict.reason
+        );
+        assert!(card
+            .warnings
+            .iter()
+            .any(|w| w.contains("scored-span shape check skipped")));
+        assert!(card.per_correlation[0].span_shape.is_none());
+    }
+
+    #[test]
+    fn a_changed_chokepoint_field_fails_with_the_key_named() {
+        let corr = "shape-field";
+        let mut replay = instrumented_graph(corr);
+        for n in &mut replay {
+            if n.span_name == "ucs::flow_orchestration" {
+                n.fields.insert(
+                    "connector".to_owned(),
+                    serde_json::Value::String("adyen".to_owned()),
+                );
+            }
+        }
+        let artifacts = with_scored_namespaces(with_graphs(
+            art(vec![], vec![], vec![http(corr, true, vec![])]),
+            instrumented_graph(corr),
+            replay,
+        ));
+        let card = detect(&artifacts);
+        assert!(!card.verdict.pass);
+        assert!(
+            card.verdict
+                .reason
+                .contains("1 scored-span field divergence(s)"),
+            "reason: {}",
+            card.verdict.reason
+        );
+        assert_eq!(card.summary.span_field_divergences, 1);
+        let shape = card.per_correlation[0].span_shape.as_ref().unwrap();
+        let div = shape
+            .outcomes
+            .iter()
+            .find(|o| o.status == span_shape::SpanShapeStatus::FieldDiverged)
+            .expect("diverged outcome reported");
+        assert_eq!(div.field_diffs[0].key, "connector");
+    }
+
     #[test]
     fn both_forests_choose_and_serialize_graph_mode() {
         let corr = "graph-both";
