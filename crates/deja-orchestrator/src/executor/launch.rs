@@ -156,7 +156,10 @@ pub fn launch_spec_for_run(
         root: PathBuf::from(&cfg.job_state_dir),
     }
     .replay_contract(&run.run_id);
-    env.extend(cfg.candidate_binding.env_for(&job_contract, &code_sha));
+    // The binding and config source are per-run: the run's `system_under_test`
+    // selects which env-var names carry the replay contract into the candidate.
+    let candidate_binding = cfg.candidate_binding_for(run.spec.system());
+    env.extend(candidate_binding.env_for(&job_contract, &code_sha));
     // The migrations initContainer pulls the candidate's bundle from this URI
     // (Option B). Only injected when the bundle resolved — else the template's
     // placeholder stays and the init no-ops / fails loudly on a bad URI.
@@ -174,9 +177,10 @@ pub fn launch_spec_for_run(
     // One fixed render supplies the config env for every run. An empty name in
     // the profile switches the copy off — the Job then boots with whatever env
     // its template carries.
-    let config_source = (!cfg.config_source.deployment.is_empty()).then(|| ConfigSourceRef {
-        deployment: cfg.config_source.deployment.clone(),
-        container: cfg.config_source.container.clone(),
+    let run_config_source = cfg.config_source_for(run.spec.system());
+    let config_source = (!run_config_source.deployment.is_empty()).then(|| ConfigSourceRef {
+        deployment: run_config_source.deployment.clone(),
+        container: run_config_source.container.clone(),
     });
 
     Ok(LaunchSpec {
@@ -185,7 +189,7 @@ pub fn launch_spec_for_run(
         template_namespace: cfg.template_namespace.clone(),
         template_configmap: cfg.template_configmap.clone(),
         template_key: cfg.template_key.clone(),
-        candidate_container: cfg.candidate_binding.container.clone(),
+        candidate_container: candidate_binding.container.clone(),
         candidate_image,
         env,
         labels: vec![(RUN_ID_LABEL.to_owned(), run.run_id.clone())],
@@ -655,6 +659,7 @@ mod tests {
             run_id: run_id.into(),
             spec: crate::RunSpec {
                 mode: crate::RunMode::Replay,
+                system_under_test: None,
                 candidate_spec: crate::CandidateSpec::PrebuiltImage {
                     image: "img:abc123".into(),
                 },

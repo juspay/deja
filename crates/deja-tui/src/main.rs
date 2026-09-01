@@ -1811,9 +1811,7 @@ fn render_replay_timeline(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             // replay never asked for. Anchored/pure/environmental events are
             // expected to skip substitution and must not read as failures.
             Some(Substitution::NotReplayed) | None => match tier.as_deref() {
-                _ if event.boundary == "http_incoming" => {
-                    ("⚓ anchored (kernel-driven)".to_owned(), Color::Cyan)
-                }
+                _ if event.is_ingress() => ("⚓ anchored (kernel-driven)".to_owned(), Color::Cyan),
                 Some("pure") | Some("excluded") => ("· live (pure)".to_owned(), Color::DarkGray),
                 Some("environmental") => ("≈ environmental".to_owned(), Color::Yellow),
                 _ => ("✗ omitted".to_owned(), Color::Red),

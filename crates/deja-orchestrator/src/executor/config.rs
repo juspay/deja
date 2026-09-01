@@ -140,6 +140,65 @@ impl K8sExecutorConfig {
             },
         }
     }
+
+    /// The candidate env binding for a run's `system_under_test`. The default
+    /// system keeps the base binding (`DEJA_CANDIDATE_*_ENV`, Hyperswitch
+    /// defaults). Any other system is a PROFILE looked up from
+    /// `DEJA_<SYSTEM>_CANDIDATE_{MODE,RUN_ID,SOURCE,OBSERVED,CODE_SHA}_ENV`,
+    /// with shipped defaults for `prism` (the `CS__DEJA__*` keys
+    /// hyperswitch-prism reads). Still data end to end: a new system needs env
+    /// vars, not a recompile.
+    pub fn candidate_binding_for(&self, system: &str) -> CandidateBinding {
+        if system == crate::DEFAULT_SYSTEM_UNDER_TEST {
+            return self.candidate_binding.clone();
+        }
+        let prefix = format!("DEJA_{}_CANDIDATE", system.to_uppercase().replace('-', "_"));
+        let var = |suffix: &str, prism_default: &str| {
+            std::env::var(format!("{prefix}_{suffix}")).unwrap_or_else(|_| {
+                if system == "prism" {
+                    prism_default.to_owned()
+                } else {
+                    // Unconfigured non-prism system: fall back to the base
+                    // binding's name for this slot so behavior is at worst the
+                    // pre-profile behavior, never a silent empty var name.
+                    match suffix {
+                        "MODE_ENV" => self.candidate_binding.mode_env.clone(),
+                        "RUN_ID_ENV" => self.candidate_binding.run_id_env.clone(),
+                        "SOURCE_ENV" => self.candidate_binding.source_env.clone(),
+                        "OBSERVED_ENV" => self.candidate_binding.observed_env.clone(),
+                        _ => self.candidate_binding.code_sha_env.clone(),
+                    }
+                }
+            })
+        };
+        CandidateBinding {
+            container: self.candidate_binding.container.clone(),
+            mode_env: var("MODE_ENV", "CS__DEJA__MODE"),
+            run_id_env: var("RUN_ID_ENV", "CS__DEJA__RUN_ID"),
+            source_env: var("SOURCE_ENV", "CS__DEJA__REPLAY__SOURCE"),
+            observed_env: var("OBSERVED_ENV", "CS__DEJA__REPLAY__OBSERVED_SINK"),
+            code_sha_env: var("CODE_SHA_ENV", "CS__DEJA__IDENTITY__CODE_SHA"),
+        }
+    }
+
+    /// The config-copy source for a run's `system_under_test`. Non-default
+    /// systems read `DEJA_<SYSTEM>_CONFIG_SOURCE_{DEPLOYMENT,CONTAINER}`; unset
+    /// means NO config copy (empty deployment) — booting a prism candidate off
+    /// hyperswitch's rendered env would be wrong, so absent profile data
+    /// disables the copy rather than borrowing the default system's.
+    pub fn config_source_for(&self, system: &str) -> ConfigSource {
+        if system == crate::DEFAULT_SYSTEM_UNDER_TEST {
+            return self.config_source.clone();
+        }
+        let prefix = format!(
+            "DEJA_{}_CONFIG_SOURCE",
+            system.to_uppercase().replace('-', "_")
+        );
+        ConfigSource {
+            deployment: std::env::var(format!("{prefix}_DEPLOYMENT")).unwrap_or_default(),
+            container: std::env::var(format!("{prefix}_CONTAINER")).unwrap_or_default(),
+        }
+    }
 }
 
 /// Resolve a candidate spec to `(image, code_sha)` for the k8s executor. Today

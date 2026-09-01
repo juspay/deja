@@ -131,10 +131,22 @@ pub enum RunStatus {
     Failed,
 }
 
+/// The system a run records/replays when none is named: the original
+/// hyperswitch integration. New `system_under_test` values are free-form data
+/// (a deployment profile key), not an enum — adding a system must never
+/// require an orchestrator recompile.
+pub const DEFAULT_SYSTEM_UNDER_TEST: &str = "hyperswitch";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     pub mode: RunMode,
     pub candidate_spec: CandidateSpec,
+    /// Which system this run drives ("hyperswitch", "prism", ...). Selects the
+    /// candidate's env-binding profile (which env var names carry the replay
+    /// contract) and is displayed on the run. Unset = hyperswitch, so every
+    /// existing caller and stored row keeps meaning what it meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_under_test: Option<String>,
     /// The candidate's source repo (e.g. `juspay/hyperswitch`) — a per-run
     /// PARAMETER, because a candidate image can be built from any repo/fork. The
     /// orchestrator substitutes it into `DEJA_CANDIDATE_TARBALL_URL` (with the
@@ -163,6 +175,15 @@ pub struct RunSpec {
 }
 
 impl RunSpec {
+    /// The system under test with the default applied — never read the raw
+    /// field for dispatch.
+    pub fn system(&self) -> &str {
+        self.system_under_test
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_SYSTEM_UNDER_TEST)
+    }
+
     /// How many times the record workload is driven. THE definition of the
     /// default: the lifecycle worker and the persisted run record both read it
     /// here, so the record cannot name a different number than the one that ran.
@@ -219,6 +240,8 @@ pub struct RunParams {
     pub mode: RunMode,
     pub candidate_spec: CandidateSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_under_test: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_repo: Option<String>,
     /// The recording the run drives. Serialized even when absent: for an
     /// `s3_source` run that has not resolved a session yet, "not resolved" is a
@@ -243,6 +266,7 @@ impl RunParams {
         Self {
             mode: spec.mode,
             candidate_spec: spec.candidate_spec.clone(),
+            system_under_test: spec.system_under_test.clone(),
             candidate_repo: spec.candidate_repo.clone(),
             recording_id: spec.recording_id.clone(),
             s3_source: spec.s3_source.clone(),
@@ -882,6 +906,7 @@ mod run_params_tests {
     fn replay_spec() -> RunSpec {
         RunSpec {
             mode: RunMode::Replay,
+            system_under_test: None,
             candidate_spec: CandidateSpec::PrebuiltImage {
                 image: "registry/hyperswitch:pr-42".to_owned(),
             },

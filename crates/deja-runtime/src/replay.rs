@@ -1187,6 +1187,12 @@ fn is_zero_u64(value: &u64) -> bool {
 pub struct ObservedCall {
     pub correlation_id: Option<String>,
     pub boundary: String,
+    /// Structural role copied from the originating event (`Some("ingress")` on
+    /// the ingress finalizer marker). Lets the scorer recognize ingress rows
+    /// without hardcoding boundary names; `None` on ordinary resolved calls and
+    /// on artifacts written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub trait_name: String,
     pub method_name: String,
     pub args: serde_json::Value,
@@ -1279,6 +1285,8 @@ pub struct ObservedCall {
 struct ObservedCallWire {
     correlation_id: Option<String>,
     boundary: String,
+    #[serde(default)]
+    role: Option<String>,
     trait_name: String,
     method_name: String,
     args: serde_json::Value,
@@ -1332,6 +1340,7 @@ impl From<ObservedCallWire> for ObservedCall {
         Self {
             correlation_id: wire.correlation_id,
             boundary: wire.boundary,
+            role: wire.role,
             trait_name: wire.trait_name,
             method_name: wire.method_name,
             args: wire.args,
@@ -2005,6 +2014,9 @@ impl Resolution {
         ObservedCall {
             correlation_id: self.correlation_id,
             boundary: query.boundary.to_owned(),
+            // Resolved calls are egress by construction — only the ingress
+            // finalizer marker (ReplayHook::record) carries a role.
+            role: None,
             trait_name: query.trait_name.to_owned(),
             method_name: query.method_name.to_owned(),
             args: query.args.clone(),
@@ -2134,11 +2146,13 @@ impl DejaHook for LookupTableHook {
         // Lookup-table replay does not record back; the orchestrator's
         // post-hoc divergence detector consumes the ObservedCall stream instead.
         //
-        // The one exception is the router-side response finalizer. It reaches this
+        // The one exception is the ingress-side response finalizer. It reaches this
         // hook through `LazyEventFinalizer::finalize()` rather than the lookup
         // path, and its replay-side end timestamp is the scorer's authoritative
         // "response finalized" boundary for undeclared-concurrency warnings.
-        if event.boundary != "http_incoming" {
+        // Ingress is self-described (`role: "ingress"`), with the legacy
+        // `http_incoming` name accepted for tapes/recorders that predate `role`.
+        if !event.is_ingress() {
             return;
         }
         let event_lineage = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
@@ -2160,6 +2174,7 @@ impl DejaHook for LookupTableHook {
         self.observed_sink.observed(ObservedCall {
             correlation_id: event.correlation_id,
             boundary: event.boundary,
+            role: event.role,
             trait_name: event.trait_name,
             method_name: event.method_name,
             args: event.args,
@@ -3222,6 +3237,7 @@ mod tests {
             entropy_source: None,
             replay_strategy: crate::ReplayStrategy::default(),
             kind: None,
+            role: None,
             declaration: None,
             raw_draw: None,
             end_timestamp_ns: None,

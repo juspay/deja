@@ -79,7 +79,7 @@ pub use deja_runtime::{
     AsyncRecordWriter, BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder,
     Fidelity, GraphNodeSink, JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink,
     RecordedOutput, RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot,
-    CURRENT_EVENT_SCHEMA_VERSION,
+    CURRENT_EVENT_SCHEMA_VERSION, ROLE_INGRESS,
 };
 /// Re-export callsite identity and runtime hook primitives for the
 /// `DEJA_MODE=record|replay` foundation.
