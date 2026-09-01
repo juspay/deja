@@ -144,6 +144,44 @@ pub fn is_default_system(system: &str) -> bool {
     system == DEFAULT_SYSTEM_UNDER_TEST
 }
 
+/// Whether the harness manages this system's stores: migrating the sidecar
+/// postgres, gating its schema fingerprint, flushing redis, and materialising
+/// the seed plan.
+///
+/// This is a CAPABILITY, not a name. It used to be spelled
+/// `system == DEFAULT_SYSTEM_UNDER_TEST`, which is true of the default system
+/// today but says the wrong thing: it makes "is this the original integration"
+/// decide "does this system have stores the harness owns". Those coincide now
+/// and will not always. A third system with harness-managed stores would have
+/// been treated as stateless — silently skipping the migration, the
+/// fail-closed schema gate, the flush and the seeding — because it was not the
+/// default, and nothing in that path would have said so.
+///
+/// So the capability is declared: `DEJA_<SYSTEM>_MANAGES_STORES`. The default
+/// when undeclared is the previous behaviour exactly — the default system
+/// manages stores, every other system does not — so this is behaviour
+/// preserving on the day it lands and declarable from then on.
+///
+/// An unrecognised value takes that default rather than guessing. In both
+/// directions that degrades to the safe answer (the default system keeps its
+/// stores, another system stays stateless), and the lifecycle names which
+/// source decided, so a declaration that was ignored is visible rather than
+/// silent.
+pub fn system_manages_stores(system: &str) -> bool {
+    system_manages_stores_declared(system).unwrap_or_else(|| is_default_system(system))
+}
+
+/// The declaration alone, absent the default — so a caller can report whether
+/// the answer was declared or inherited.
+pub fn system_manages_stores_declared(system: &str) -> Option<bool> {
+    let raw = std::env::var(system_env_var(system, "MANAGES_STORES")).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// THE name of a per-system environment variable: `DEJA_<SYSTEM>_<SUFFIX>`,
 /// upper-cased with `-` folded to `_` so a hyphenated system name is still a
 /// legal variable name.
@@ -980,6 +1018,45 @@ mod system_env_tests {
                 "{near:?} must not be treated as the default system"
             );
         }
+    }
+
+    /// These variables are process-global, so the capability cases run under
+    /// one test rather than as separate ones racing the same names.
+    #[test]
+    fn store_management_is_declared_not_inferred_from_the_name() {
+        // BEHAVIOUR PRESERVING: undeclared, the answer is exactly what the
+        // name-based predicate used to give.
+        assert!(system_manages_stores(DEFAULT_SYSTEM_UNDER_TEST));
+        assert!(system_manages_stores("hyperswitch"));
+        assert!(!system_manages_stores("prism"));
+        assert_eq!(system_manages_stores_declared("prism"), None);
+
+        // THE DEFECT THIS FIXES: a non-default system that DOES have
+        // harness-managed stores can now say so. Under the old predicate it was
+        // silently stateless — skipping migration, the fail-closed schema gate,
+        // the flush and the seeding — for no reason but its name.
+        std::env::set_var("DEJA_PAYMENT_CORE_MANAGES_STORES", "true");
+        assert!(
+            system_manages_stores("payment-core"),
+            "a declared stateful system must not be treated as stateless"
+        );
+        assert_eq!(system_manages_stores_declared("payment-core"), Some(true));
+        std::env::remove_var("DEJA_PAYMENT_CORE_MANAGES_STORES");
+        assert!(!system_manages_stores("payment-core"));
+
+        // …and the default system can be told it does not, which the name-based
+        // predicate could not express at all.
+        std::env::set_var("DEJA_HYPERSWITCH_MANAGES_STORES", "false");
+        assert!(!system_manages_stores("hyperswitch"));
+        std::env::remove_var("DEJA_HYPERSWITCH_MANAGES_STORES");
+        assert!(system_manages_stores("hyperswitch"));
+
+        // An unrecognised value takes the system's default and reports itself
+        // as undeclared, so the lifecycle can say the declaration was ignored.
+        std::env::set_var("DEJA_PRISM_MANAGES_STORES", "ture");
+        assert_eq!(system_manages_stores_declared("prism"), None);
+        assert!(!system_manages_stores("prism"));
+        std::env::remove_var("DEJA_PRISM_MANAGES_STORES");
     }
 
     #[test]

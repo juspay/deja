@@ -717,7 +717,7 @@ fn drive_replay(
     // (prism: no pg/redis of its own — every store crossing is a recorded
     // boundary) has nothing to flush or seed, and its overlay has no store
     // services to exec into.
-    if run.spec.system() == crate::DEFAULT_SYSTEM_UNDER_TEST {
+    if crate::system_manages_stores(run.spec.system()) {
         // Store transport for this run (S1 seam): compose here; the in-pod k8s
         // runner builds a StoreExec::direct against its sidecars instead.
         let store = StoreExec::compose(
@@ -1610,7 +1610,21 @@ pub fn drive_replay_in_pod(
     // stateless system under test (prism) has no sidecar pg/redis: every store
     // crossing is a recorded boundary, so there is nothing to migrate, gate,
     // flush, or seed — and no sidecar to exec against.
-    let manages_stores = run.spec.system() == crate::DEFAULT_SYSTEM_UNDER_TEST;
+    let manages_stores = crate::system_manages_stores(run.spec.system());
+    // Name which source decided, so a declaration that was ignored — a typo in
+    // the value, say — is visible here rather than silently taking the default.
+    ctx.log(
+        "store management",
+        &format!(
+            "system `{}` {} harness-managed stores ({})",
+            run.spec.system(),
+            if manages_stores { "HAS" } else { "has no" },
+            match crate::system_manages_stores_declared(run.spec.system()) {
+                Some(_) => "declared",
+                None => "default for this system",
+            }
+        ),
+    );
     match &opts.migrate_cmd {
         _ if !manages_stores => ctx.log(
             "migrating sidecar pg",
