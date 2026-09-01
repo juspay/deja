@@ -1,3 +1,4 @@
+import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, availableRecordings, AvailableRecording, RecordingRow } from "../lib/api";
@@ -39,12 +40,17 @@ function Span({ dates }: { dates: string[] }) {
 }
 
 function Identity({ rec }: { rec: AvailableRecording }) {
+  const parts: string[] = [];
   const text = identityText(rec.identity);
+  if (text) parts.push(text);
+  // The `inst=` discriminators — for a UCS session, the recorder's pod name,
+  // which the id itself does not carry.
+  if (rec.instances?.length) parts.push(`pod ${rec.instances.join(", ")}`);
   // No identity means the id predates ids naming a revision. That is the
   // ordinary past — the facts still live in the recording's envelopes — so it
   // reads as a plain dash, not as a missing-data warning.
-  if (!text) return <span className="recdash">—</span>;
-  return <span className="recident">{text}</span>;
+  if (!parts.length) return <span className="recdash">—</span>;
+  return <span className="recident">{parts.join(" · ")}</span>;
 }
 
 /**
@@ -68,9 +74,13 @@ function Identity({ rec }: { rec: AvailableRecording }) {
  * unpulled rows say the count is unknown rather than showing a guess.
  */
 export default function RecordingsPage() {
+  // Which system's bucket to list. The buckets are deliberately separate —
+  // prism tapes carry payment payloads on a tighter retention — so this is a
+  // SOURCE switch, not a client-side filter of one listing.
+  const [system, setSystem] = React.useState<"" | "prism">("");
   const available = useQuery({
-    queryKey: ["recordings-available"],
-    queryFn: () => availableRecordings(),
+    queryKey: ["recordings-available", system],
+    queryFn: () => availableRecordings(200, 0, system || undefined),
   });
   const recs = useQuery({ queryKey: ["recordings"], queryFn: api.recordings });
 
@@ -128,6 +138,15 @@ export default function RecordingsPage() {
   return (
     <>
       <h1>Recordings</h1>
+      <p>
+        <label className="hint">
+          system{" "}
+          <select value={system} onChange={(e) => setSystem(e.target.value as "" | "prism")}>
+            <option value="">hyperswitch (default bucket)</option>
+            <option value="prism">prism / UCS (ucs-deja bucket)</option>
+          </select>
+        </label>
+      </p>
       <p className="hint recintro">
         What is in the bucket. <b>pulled</b> marks the ones the catalog has already ingested —
         which is a record of what has been replayed, not of what exists. Every id here is one
@@ -161,7 +180,14 @@ export default function RecordingsPage() {
               const cat = byId.get(r.recording_id);
               return (
                 <tr key={r.recording_id}>
-                  <td className="mono">{r.recording_id}</td>
+                  <td className="mono">
+                    {r.recording_id}
+                    {/* Only a non-default system is worth a badge — same rule
+                        as the runs list. */}
+                    {r.system === "prism" && (
+                      <span className="chip muted" style={{ marginLeft: 6 }}>prism</span>
+                    )}
+                  </td>
                   <td className="recspan">
                     <Span dates={r.dates} />
                   </td>
@@ -183,7 +209,19 @@ export default function RecordingsPage() {
                     <Identity rec={r} />
                   </td>
                   <td>
-                    <Link to={`/?recording=${r.recording_id}`}>replay →</Link>
+                    {/* A scoped row replays from ITS bucket: the link carries
+                        the system + s3 source so the form needs no retyping. */}
+                    <Link
+                      to={
+                        system
+                          ? `/?recording=${r.recording_id}&system=${system}&s3=${encodeURIComponent(
+                              `s3://${r.bucket}/${r.prefix}`,
+                            )}`
+                          : `/?recording=${r.recording_id}`
+                      }
+                    >
+                      replay →
+                    </Link>
                   </td>
                 </tr>
               );

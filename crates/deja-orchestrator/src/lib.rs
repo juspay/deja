@@ -131,10 +131,79 @@ pub enum RunStatus {
     Failed,
 }
 
+/// The system a run records/replays when none is named: the original
+/// hyperswitch integration. New `system_under_test` values are free-form data
+/// (a deployment profile key), not an enum — adding a system must never
+/// require an orchestrator recompile.
+pub const DEFAULT_SYSTEM_UNDER_TEST: &str = "hyperswitch";
+
+/// Whether `system` is the default system under test. Every per-system lookup
+/// short-circuits on this BEFORE reading any profile variable, so the default
+/// system can never be made to depend on one existing.
+pub fn is_default_system(system: &str) -> bool {
+    system == DEFAULT_SYSTEM_UNDER_TEST
+}
+
+/// Whether the harness manages this system's stores: migrating the sidecar
+/// postgres, gating its schema fingerprint, flushing redis, and materialising
+/// the seed plan.
+///
+/// This is a CAPABILITY, not a name. It used to be spelled
+/// `system == DEFAULT_SYSTEM_UNDER_TEST`, which is true of the default system
+/// today but says the wrong thing: it makes "is this the original integration"
+/// decide "does this system have stores the harness owns". Those coincide now
+/// and will not always. A third system with harness-managed stores would have
+/// been treated as stateless — silently skipping the migration, the
+/// fail-closed schema gate, the flush and the seeding — because it was not the
+/// default, and nothing in that path would have said so.
+///
+/// So the capability is declared: `DEJA_<SYSTEM>_MANAGES_STORES`. The default
+/// when undeclared is the previous behaviour exactly — the default system
+/// manages stores, every other system does not — so this is behaviour
+/// preserving on the day it lands and declarable from then on.
+///
+/// An unrecognised value takes that default rather than guessing. In both
+/// directions that degrades to the safe answer (the default system keeps its
+/// stores, another system stays stateless), and the lifecycle names which
+/// source decided, so a declaration that was ignored is visible rather than
+/// silent.
+pub fn system_manages_stores(system: &str) -> bool {
+    system_manages_stores_declared(system).unwrap_or_else(|| is_default_system(system))
+}
+
+/// The declaration alone, absent the default — so a caller can report whether
+/// the answer was declared or inherited.
+pub fn system_manages_stores_declared(system: &str) -> Option<bool> {
+    let raw = std::env::var(system_env_var(system, "MANAGES_STORES")).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// THE name of a per-system environment variable: `DEJA_<SYSTEM>_<SUFFIX>`,
+/// upper-cased with `-` folded to `_` so a hyphenated system name is still a
+/// legal variable name.
+///
+/// One spelling of that transform, because the failure mode of a second one is
+/// not a compile error. A deployment sets these by hand; a caller that folded
+/// the name differently would read a variable nobody sets and silently take the
+/// unconfigured path, which is the shape this codebase keeps paying for.
+pub fn system_env_var(system: &str, suffix: &str) -> String {
+    format!("DEJA_{}_{suffix}", system.to_uppercase().replace('-', "_"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     pub mode: RunMode,
     pub candidate_spec: CandidateSpec,
+    /// Which system this run drives ("hyperswitch", "prism", ...). Selects the
+    /// candidate's env-binding profile (which env var names carry the replay
+    /// contract) and is displayed on the run. Unset = hyperswitch, so every
+    /// existing caller and stored row keeps meaning what it meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_under_test: Option<String>,
     /// The candidate's source repo (e.g. `juspay/hyperswitch`) — a per-run
     /// PARAMETER, because a candidate image can be built from any repo/fork. The
     /// orchestrator substitutes it into `DEJA_CANDIDATE_TARBALL_URL` (with the
@@ -160,9 +229,26 @@ pub struct RunSpec {
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,
+    /// Span-name prefixes (e.g. `["ucs::", "connector::"]`) whose spans are the
+    /// candidate's DECLARED instrumentation contract: on replay, every recorded
+    /// span under one of these prefixes must be executed again (and with the
+    /// same field values), event-bearing or not. Empty = no shape check — the
+    /// scorecard stays byte-identical, so systems that never declare a
+    /// namespace (hyperswitch) are untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_span_namespaces: Vec<String>,
 }
 
 impl RunSpec {
+    /// The system under test with the default applied — never read the raw
+    /// field for dispatch.
+    pub fn system(&self) -> &str {
+        self.system_under_test
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_SYSTEM_UNDER_TEST)
+    }
+
     /// How many times the record workload is driven. THE definition of the
     /// default: the lifecycle worker and the persisted run record both read it
     /// here, so the record cannot name a different number than the one that ran.
@@ -219,6 +305,8 @@ pub struct RunParams {
     pub mode: RunMode,
     pub candidate_spec: CandidateSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_under_test: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_repo: Option<String>,
     /// The recording the run drives. Serialized even when absent: for an
     /// `s3_source` run that has not resolved a session yet, "not resolved" is a
@@ -233,6 +321,8 @@ pub struct RunParams {
     pub correlation_filter: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub workload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scored_span_namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expectation: Option<String>,
 }
@@ -243,6 +333,7 @@ impl RunParams {
         Self {
             mode: spec.mode,
             candidate_spec: spec.candidate_spec.clone(),
+            system_under_test: spec.system_under_test.clone(),
             candidate_repo: spec.candidate_repo.clone(),
             recording_id: spec.recording_id.clone(),
             s3_source: spec.s3_source.clone(),
@@ -250,6 +341,7 @@ impl RunParams {
                 .ids()
                 .map(|ids| ids.iter().cloned().collect()),
             workload: spec.resolved_workload(),
+            scored_span_namespaces: spec.scored_span_namespaces.clone(),
             expectation: expectation.map(str::to_owned),
         }
     }
@@ -396,6 +488,16 @@ pub enum RecordingIdentity {
         /// minute stay distinct.
         instance: String,
     },
+    /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
+    /// boot. The prism recorder always mints these — but so did the router
+    /// recorder before ids carried a revision, so the SHAPE alone does not
+    /// name the system; a router tape wearing this id was once badged "prism"
+    /// and replayed against a prism candidate, which reset every connection.
+    /// The `inst=` pod names captured by the scan are the discriminator.
+    BootDerived {
+        /// Nanoseconds since the epoch at recorder boot, as recorded.
+        booted_at_nanos: String,
+    },
     /// The id carries no provenance. Its parts live in the recording's
     /// envelopes (`code.sha`, `instance_id`) rather than in its name.
     Opaque,
@@ -419,6 +521,16 @@ pub fn recording_id_body(recording_id: &str) -> &str {
 ///
 /// [`Opaque`]: RecordingIdentity::Opaque
 pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
+    // The UCS recorder's boot-derived default: `run-` + a nanosecond epoch.
+    // Digit count pins the era (18-19 digits ≈ 1971-2262), so `run-1` or a
+    // hand-named `run-foo` stays Opaque instead of masquerading as a boot id.
+    if let Some(nanos) = recording_id.strip_prefix("run-") {
+        if (18..=19).contains(&nanos.len()) && nanos.chars().all(|c| c.is_ascii_digit()) {
+            return RecordingIdentity::BootDerived {
+                booted_at_nanos: nanos.to_owned(),
+            };
+        }
+    }
     let Some(body) = recording_id.strip_prefix("rec-") else {
         return RecordingIdentity::Opaque;
     };
@@ -875,13 +987,101 @@ mod schema_fingerprint_tests {
 }
 
 #[cfg(test)]
+mod system_env_tests {
+    use super::*;
+
+    #[test]
+    fn system_env_var_upper_cases_and_folds_hyphens() {
+        assert_eq!(
+            system_env_var("prism", "S3_BUCKET"),
+            "DEJA_PRISM_S3_BUCKET",
+            "the name a deployment actually sets (infra ships this one)"
+        );
+        // A hyphenated system must still produce a legal variable name; `-` is
+        // not valid in one, so it folds rather than passing through.
+        assert_eq!(
+            system_env_var("payment-core", "JOB_TEMPLATE_KEY"),
+            "DEJA_PAYMENT_CORE_JOB_TEMPLATE_KEY"
+        );
+        assert!(!system_env_var("payment-core", "X").contains('-'));
+    }
+
+    #[test]
+    fn only_the_default_system_short_circuits() {
+        assert!(is_default_system(DEFAULT_SYSTEM_UNDER_TEST));
+        assert!(is_default_system("hyperswitch"));
+        // Near-misses are NOT the default system. This is the sharp edge of
+        // free-form data: each of these takes the non-default path.
+        for near in ["Hyperswitch", "hyperswitch ", "HYPERSWITCH", "prism", ""] {
+            assert!(
+                !is_default_system(near),
+                "{near:?} must not be treated as the default system"
+            );
+        }
+    }
+
+    /// These variables are process-global, so the capability cases run under
+    /// one test rather than as separate ones racing the same names.
+    #[test]
+    fn store_management_is_declared_not_inferred_from_the_name() {
+        // BEHAVIOUR PRESERVING: undeclared, the answer is exactly what the
+        // name-based predicate used to give.
+        assert!(system_manages_stores(DEFAULT_SYSTEM_UNDER_TEST));
+        assert!(system_manages_stores("hyperswitch"));
+        assert!(!system_manages_stores("prism"));
+        assert_eq!(system_manages_stores_declared("prism"), None);
+
+        // THE DEFECT THIS FIXES: a non-default system that DOES have
+        // harness-managed stores can now say so. Under the old predicate it was
+        // silently stateless — skipping migration, the fail-closed schema gate,
+        // the flush and the seeding — for no reason but its name.
+        std::env::set_var("DEJA_PAYMENT_CORE_MANAGES_STORES", "true");
+        assert!(
+            system_manages_stores("payment-core"),
+            "a declared stateful system must not be treated as stateless"
+        );
+        assert_eq!(system_manages_stores_declared("payment-core"), Some(true));
+        std::env::remove_var("DEJA_PAYMENT_CORE_MANAGES_STORES");
+        assert!(!system_manages_stores("payment-core"));
+
+        // …and the default system can be told it does not, which the name-based
+        // predicate could not express at all.
+        std::env::set_var("DEJA_HYPERSWITCH_MANAGES_STORES", "false");
+        assert!(!system_manages_stores("hyperswitch"));
+        std::env::remove_var("DEJA_HYPERSWITCH_MANAGES_STORES");
+        assert!(system_manages_stores("hyperswitch"));
+
+        // An unrecognised value takes the system's default and reports itself
+        // as undeclared, so the lifecycle can say the declaration was ignored.
+        std::env::set_var("DEJA_PRISM_MANAGES_STORES", "ture");
+        assert_eq!(system_manages_stores_declared("prism"), None);
+        assert!(!system_manages_stores("prism"));
+        std::env::remove_var("DEJA_PRISM_MANAGES_STORES");
+    }
+
+    #[test]
+    fn a_spec_with_no_system_resolves_to_the_default() {
+        // The legacy shape: `system_under_test` absent entirely.
+        let legacy: RunSpec = serde_json::from_value(serde_json::json!({
+            "mode": "replay",
+            "candidate_spec": {"kind": "prebuilt_image", "image": "registry/hyperswitch:pr-42"},
+        }))
+        .expect("legacy spec parses");
+        assert_eq!(legacy.system(), DEFAULT_SYSTEM_UNDER_TEST);
+        assert!(is_default_system(legacy.system()));
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod run_params_tests {
     use super::*;
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
+            system_under_test: None,
             candidate_spec: CandidateSpec::PrebuiltImage {
                 image: "registry/hyperswitch:pr-42".to_owned(),
             },
@@ -1022,14 +1222,24 @@ mod run_identity_tests {
             }
         );
 
-        // A recorder that does NOT know its revision keeps the older form
-        // rather than minting `rec-unknown-…`, which would claim a provenance
-        // it does not have. Every recording made before ids carried one reads
-        // this way, and stays replayable.
+        // The boot-derived form is the UCS recorder's default run id — the
+        // shape itself names the system, which is what lets a bucket listing
+        // say "prism" without reading an object.
         assert_eq!(
             parse_recording_id("run-1785331134782268537"),
-            RecordingIdentity::Opaque
+            RecordingIdentity::BootDerived {
+                booted_at_nanos: "1785331134782268537".into()
+            }
         );
+        // But only a plausible nanosecond epoch: a hand-minted run id must not
+        // masquerade as a boot instant (or as a system).
+        for not_boot in ["run-1", "run-ucs-capture-aug", "run-178533113478226853700"] {
+            assert_eq!(
+                parse_recording_id(not_boot),
+                RecordingIdentity::Opaque,
+                "{not_boot} should not have parsed"
+            );
+        }
 
         // Anything that does not match the shape is opaque, never half-read:
         // the envelopes carry these facts authoritatively, so a guess here
@@ -1046,6 +1256,46 @@ mod run_identity_tests {
                 parse_recording_id(malformed),
                 RecordingIdentity::Opaque,
                 "{malformed} should not have parsed"
+            );
+        }
+    }
+
+    /// The contract a RECORDER must satisfy for its ids to carry a revision,
+    /// stated as cases rather than as a format string — because the format
+    /// string is the trap. `rec-<sha>-<MMDDhhmm>-<instance>` describes the
+    /// first case below exactly, and that case does not parse: the instance
+    /// carries hyphens, the body splits into five parts instead of three, and
+    /// the result is `Opaque` with nothing said. Nothing at record time
+    /// reports it; it surfaces later as recordings that select fine and then
+    /// cannot resolve a revision.
+    ///
+    /// A recorder author moving to the `rec-` shape meets this as a failing
+    /// test rather than as a silent absence.
+    #[test]
+    fn the_instance_component_must_be_hyphen_free() {
+        // The shape a naive substitution produces, using a real pod-style
+        // instance id. Reads as conforming; is not.
+        assert_eq!(
+            parse_recording_id("rec-6548e95-09011230-pi-1-1787741712798221595"),
+            RecordingIdentity::Opaque,
+            "a hyphenated instance splits the body into more than three parts"
+        );
+
+        // The same recording with a hyphen-free discriminator parses. That is
+        // the whole difference, and it is why a truncation of an existing id is
+        // not a safe fix — a truncation can still contain a hyphen.
+        assert!(matches!(
+            parse_recording_id("rec-6548e95-09011230-pi1"),
+            RecordingIdentity::Described { ref revision, .. } if revision == "6548e95"
+        ));
+
+        // A revision must be hexdigits: a `v` prefix or a dotted version is not
+        // a git sha and does not parse.
+        for not_a_sha in ["rec-v1a2b3c-09011230-zf", "rec-1.2.3-09011230-zf"] {
+            assert_eq!(
+                parse_recording_id(not_a_sha),
+                RecordingIdentity::Opaque,
+                "{not_a_sha}: revision must be ASCII hexdigits"
             );
         }
     }

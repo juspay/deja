@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{resolve_candidate_image, K8sExecutorConfig};
+use super::config::{resolve_candidate_image_for, K8sExecutorConfig};
 use super::env::runner_env;
 use super::k8s::{job_terminal_verdict, KubeApi, KubeError, KubeTransport};
 use super::patch::{
@@ -136,7 +136,8 @@ pub fn launch_spec_for_run(
     expected_schema: Option<&SchemaFingerprint>,
     code_bundle_uri: Option<&str>,
 ) -> Result<LaunchSpec, ExecutorError> {
-    let (candidate_image, code_sha) = resolve_candidate_image(&run.spec.candidate_spec)?;
+    let (candidate_image, code_sha) =
+        resolve_candidate_image_for(&run.spec.candidate_spec, run.spec.system())?;
     let run_spec_json = serde_json::to_string(&run.spec)
         .map_err(|e| ExecutorError::Template(format!("serialize run spec: {e}")))?;
 
@@ -156,7 +157,10 @@ pub fn launch_spec_for_run(
         root: PathBuf::from(&cfg.job_state_dir),
     }
     .replay_contract(&run.run_id);
-    env.extend(cfg.candidate_binding.env_for(&job_contract, &code_sha));
+    // The binding and config source are per-run: the run's `system_under_test`
+    // selects which env-var names carry the replay contract into the candidate.
+    let candidate_binding = cfg.candidate_binding_for(run.spec.system());
+    env.extend(candidate_binding.env_for(&job_contract, &code_sha));
     // The migrations initContainer pulls the candidate's bundle from this URI
     // (Option B). Only injected when the bundle resolved — else the template's
     // placeholder stays and the init no-ops / fails loudly on a bad URI.
@@ -174,9 +178,10 @@ pub fn launch_spec_for_run(
     // One fixed render supplies the config env for every run. An empty name in
     // the profile switches the copy off — the Job then boots with whatever env
     // its template carries.
-    let config_source = (!cfg.config_source.deployment.is_empty()).then(|| ConfigSourceRef {
-        deployment: cfg.config_source.deployment.clone(),
-        container: cfg.config_source.container.clone(),
+    let run_config_source = cfg.config_source_for(run.spec.system());
+    let config_source = (!run_config_source.deployment.is_empty()).then(|| ConfigSourceRef {
+        deployment: run_config_source.deployment.clone(),
+        container: run_config_source.container.clone(),
     });
 
     Ok(LaunchSpec {
@@ -184,8 +189,10 @@ pub fn launch_spec_for_run(
         jobs_namespace: cfg.jobs_namespace.clone(),
         template_namespace: cfg.template_namespace.clone(),
         template_configmap: cfg.template_configmap.clone(),
-        template_key: cfg.template_key.clone(),
-        candidate_container: cfg.candidate_binding.container.clone(),
+        // Per-system: a prism run resolves `job.prism.json`; the default system
+        // keeps `job.json`. See `template_key_for` for why there is no fallback.
+        template_key: cfg.template_key_for(run.spec.system()),
+        candidate_container: candidate_binding.container.clone(),
         candidate_image,
         env,
         labels: vec![(RUN_ID_LABEL.to_owned(), run.run_id.clone())],
@@ -654,7 +661,9 @@ mod tests {
         Run {
             run_id: run_id.into(),
             spec: crate::RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
+                system_under_test: None,
                 candidate_spec: crate::CandidateSpec::PrebuiltImage {
                     image: "img:abc123".into(),
                 },
@@ -702,6 +711,56 @@ mod tests {
             val(&cfg.candidate_binding.observed_env),
             "/workspace/state/observed/run-42.jsonl"
         );
+    }
+
+    /// A prism run must fetch ITS template key and bind the CS__DEJA__* names —
+    /// the first prism launch in sandbox booted the router template (postgres,
+    /// redis, router-config) and died with "DEJA_RUN_ID unset". The template
+    /// key and the binding both follow the run's system, in the same spec.
+    #[test]
+    fn a_prism_run_resolves_its_own_template_key_and_binding() {
+        let cfg = K8sExecutorConfig::from_env();
+        let run = Run {
+            run_id: "run-43".into(),
+            spec: crate::RunSpec {
+                scored_span_namespaces: Vec::new(),
+                mode: crate::RunMode::Replay,
+                system_under_test: Some("prism".into()),
+                candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                    // Fully qualified: a bare ref for a non-default system
+                    // REFUSES unless DEJA_PRISM_CANDIDATE_IMAGE_REPO is set,
+                    // and env vars are process-global (config.rs owns that
+                    // single-lock test).
+                    image: "reg.example/connector-service:abc123".into(),
+                },
+                candidate_repo: None,
+                recording_id: None,
+                s3_source: None,
+                correlation_filter: None,
+                workload: serde_json::Value::Null,
+            },
+            status: crate::RunStatus::Pending,
+            recording_id: None,
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
+        assert_eq!(spec.template_key, "job.prism.json");
+        assert!(
+            spec.env
+                .iter()
+                .any(|e| e.name == "CS__DEJA__RUN_ID" && e.value == "run-43"),
+            "the prism binding names carry the replay contract"
+        );
+        // And a default-system run keeps the base key untouched.
+        let mut base = run;
+        base.spec.system_under_test = None;
+        let spec = launch_spec_for_run(&base, &cfg, None, None).expect("spec builds");
+        assert_eq!(spec.template_key, cfg.template_key);
     }
 
     /// Both steps that consume the CodeBundle must be pointed at the SAME

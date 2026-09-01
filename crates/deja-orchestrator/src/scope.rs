@@ -387,7 +387,9 @@ impl ScopedRecording {
                         // A CASE. It gets a bucket whether or not it anchors,
                         // so a case that reaches no graph root can be named.
                         Some(correlation) => {
-                            if event.boundary != "http_incoming" {
+                            let is_ingress = event.role.as_deref() == Some(deja::ROLE_INGRESS)
+                                || event.boundary == "http_incoming";
+                            if !is_ingress {
                                 index
                                     .instrumented_work_by_correlation
                                     .insert(correlation.clone());
@@ -639,13 +641,18 @@ struct GraphNodeHead {
 struct BoundaryEventHead {
     #[serde(default)]
     correlation_id: Option<String>,
-    /// Which boundary produced the event. `http_incoming` is the request
+    /// Which boundary produced the event. An ingress event is the request
     /// marker itself — a case whose ONLY event is that marker performed no
     /// instrumented work and legitimately has no graph node. Defaulted so a
     /// pre-field tape parses (and then every event counts as work, the old
     /// behavior).
     #[serde(default)]
     boundary: String,
+    /// Self-described structural role (`"ingress"` on the request marker);
+    /// absent on egress events and pre-`role` tapes, where the legacy
+    /// `http_incoming` boundary name identifies ingress.
+    #[serde(default)]
+    role: Option<String>,
     /// `Option<u64>`, and the Kafka -> Vector -> S3 pipeline stringifies u64s
     /// above `i64::MAX`, so this must accept both forms exactly like the full
     /// `BoundaryEvent` does — otherwise pass 1 silently loses anchors that

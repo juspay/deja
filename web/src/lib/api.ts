@@ -21,6 +21,8 @@ export type CandidateSpecRow =
 export type RunParams = {
   mode: "record" | "replay";
   candidate_spec: CandidateSpecRow;
+  /** Which system the run drives ("hyperswitch" | "prism" | ...); absent = hyperswitch. */
+  system_under_test?: string;
   candidate_repo?: string;
   recording_id: string | null;
   s3_source?: { path: string; region?: string; endpoint?: string };
@@ -189,7 +191,31 @@ export type Scorecard = {
     http_status_match?: boolean;
     http_body_match?: boolean;
     side_effect_divergences?: number;
+    // The scored-span shape section: present only when the run declared
+    // `scored_span_namespaces` and this correlation carries namespaced spans.
+    span_shape?: CorrelationSpanShape;
   }[];
+};
+
+/** One scored span occurrence from the span-shape check (see the scorer's
+ * `span_shape` module): the run's declared instrumentation contract, compared
+ * recorded-vs-replayed outside the event-bearing skeleton. */
+export type SpanShapeOutcome = {
+  path: string;
+  span_name: string;
+  k: number;
+  status: "matched" | "missing" | "novel" | "field_diverged";
+  record_node_id?: number;
+  replay_node_id?: number;
+  field_diffs?: { key: string; recorded?: unknown; replayed?: unknown }[];
+};
+
+export type CorrelationSpanShape = {
+  matched: number;
+  missing: number;
+  novel: number;
+  field_diverged: number;
+  outcomes: SpanShapeOutcome[];
 };
 
 // One side (recorded or observed) of a reconciled boundary call.
@@ -385,12 +411,14 @@ export const api = {
  * recording's envelopes (`code.sha`, `instance_id`).
  */
 export type RecordingIdentity = {
-  /** Short git sha of the recorded system. */
-  revision: string;
+  /** Short git sha of the recorded system. (hyperswitch `rec-…` shape) */
+  revision?: string;
   /** `MMDDhhmm` UTC — when recording began. No year. */
-  recorded_at: string;
+  recorded_at?: string;
   /** Discriminator, so two pods starting in the same minute stay distinct. */
-  instance: string;
+  instance?: string;
+  /** Nanoseconds since epoch at recorder boot (the UCS `run-<nanos>` shape). */
+  booted_at_nanos?: string;
 };
 
 /** One session found in the bucket. */
@@ -407,6 +435,19 @@ export type AvailableRecording = {
    *  when the catalog itself cannot be read, so the bucket stays visible. */
   pulled: boolean;
   identity: RecordingIdentity | null;
+  /** Which recorded system minted the session. Derived from the `inst=` pod
+   *  names when the scan captured any (authoritative); the id shape decides
+   *  only the unambiguous rec-<sha>-… case. Null = genuinely unknown — the
+   *  run-<nanos> shape alone is ambiguous (old router recorders minted it
+   *  too), and a wrong badge once sent a router tape into a prism replay. */
+  system?: "hyperswitch" | "prism" | null;
+  /** The bucket the session was found in. With a `?system=` scoped listing
+   *  this differs from the default bucket, and a replay needs it to build
+   *  `s3_source` (`s3://{bucket}/{prefix}`). */
+  bucket?: string;
+  /** `inst=` discriminators under the session — for a UCS session this is the
+   *  recorder's pod name, the only identity its id does not carry. */
+  instances?: string[];
   /** The prefix the orchestrator would ingest from — reported so a run can be
    *  reproduced by hand, NOT so a caller has to supply it. Bucket-relative: a
    *  `s3_source.path` needs `bucket/` in front of it. */
@@ -429,9 +470,10 @@ export type AvailableRecordingsPage = {
  * with a 502 — which a caller must render as a failure to look, never as an
  * empty list, because an empty list reads as "no recordings exist".
  */
-export const availableRecordings = (limit = 200, offset = 0) =>
+export const availableRecordings = (limit = 200, offset = 0, system?: string) =>
   request<AvailableRecordingsPage>(
-    `/api/v1/recordings/available?limit=${limit}&offset=${offset}`,
+    `/api/v1/recordings/available?limit=${limit}&offset=${offset}` +
+      (system ? `&system=${encodeURIComponent(system)}` : ""),
   );
 
 // ===========================================================================

@@ -611,6 +611,16 @@ main:has(.recintro) { max-width: 1440px; }
 .hiddentbl td { padding: 2px var(--s2); border-bottom: 1px solid var(--border-muted); }
 .hiddentbl td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-subtle); }
 
+/* ---- scored-span field table (record vs replay, in the detail panel) ---- */
+.scoredfields { margin-bottom: var(--s3); }
+.fieldtbl { width: 100%; border-collapse: collapse; font-size: var(--fs-11); margin-top: var(--s2); table-layout: fixed; }
+.fieldtbl th { text-align: left; padding: 2px var(--s2); color: var(--text-subtle); font-weight: 600; }
+.fieldtbl th:first-child, .fieldtbl td:first-child { width: 30%; }
+.fieldtbl td { padding: 2px var(--s2); border-bottom: 1px solid var(--border-muted); vertical-align: top; }
+.fieldtbl td.val { word-break: break-all; }
+.fieldtbl tr.fdiff td { background: rgba(248,81,73,0.16); color: var(--red-fg); }
+.fieldtbl tr.fvolatile td.val { color: var(--text-subtle); }
+
 /* ---- the two panes ---- */
 .uvbody { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s3); align-items: start; }
 @media (max-width: 1180px) { .uvbody { grid-template-columns: minmax(0, 1fr); } }
@@ -637,6 +647,8 @@ main:has(.recintro) { max-width: 1440px; }
 .uvrow.m-consequence, .uvrow.m-response { border-left-color: var(--diff-mod-edge); }
 .uvrow.m-omitted { border-left-color: rgba(248,81,73,0.45); }
 .uvrow.m-novel { border-left-color: var(--diff-add-edge); }
+.uvrow.m-field-diff, .uvrow.m-missing-span { border-left-color: var(--diff-del-edge); }
+.uvrow.m-novel-span { border-left-color: var(--diff-add-edge); }
 .uvrow.m-environmental { border-left-color: var(--border-strong); }
 
 .uvindent { flex-shrink: 0; }
@@ -653,6 +665,9 @@ main:has(.recintro) { max-width: 1440px; }
 .mchip.m-omitted { background: rgba(248,81,73,0.10); color: var(--red-fg); }
 .mchip.m-novel { background: rgba(63,185,80,0.14); color: var(--green-fg); }
 .mchip.m-environmental, .mchip.m-matched { background: var(--surface-overlay); color: var(--text-faint); }
+.mchip.m-field-diff { background: rgba(248,81,73,0.16); color: var(--red-fg); font-weight: 600; }
+.mchip.m-missing-span { background: rgba(248,81,73,0.10); color: var(--red-fg); }
+.mchip.m-novel-span { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
 
 /* Presence is per-side EVIDENCE, never a claim about whether a span ran. */
 .presdot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }

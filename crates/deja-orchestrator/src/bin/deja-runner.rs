@@ -3,7 +3,7 @@
 //! One replay run, then exit — the exit code is the Job's success signal.
 //! The orchestrator created the run and rendered its spec into this pod;
 //! progress flows back through `POST /api/v1/runs/{id}/events`
-//! (`StoreCtx::http`), stores are sidecars reached directly, and the router
+//! (`StoreCtx::http`), stores are sidecars reached directly, and the
 //! candidate is a pod container k8s manages.
 //!
 //! Environment contract (rendered by the Job template / chart):
@@ -13,11 +13,18 @@
 //!   DEJA_API_SERVICE_TOKEN   bearer token when the orchestrator enforces one
 //!   DEJA_RUNNER_ACTOR        X-Deja-Actor value (default system:runner)
 //!   HARNESS_STATE_DIR        pod-local state root on the SHARED workspace
-//!                            volume (default /workspace/state) — the router
+//!                            volume (default /workspace/state) — the candidate
 //!                            container reads the lookup table from here
-//!   RUNNER_DATABASE_URL      sidecar pg conninfo URL (required)
+//!   RUNNER_DATABASE_URL      sidecar pg conninfo URL. Required only for a run
+//!                            that manages harness stores (hyperswitch); a
+//!                            storeless system (prism) sets nothing
 //!   RUNNER_REDIS_HOST/PORT   sidecar redis (default 127.0.0.1:6379)
-//!   RUNNER_ROUTER_PORT       router container port (default 8080)
+//!   RUNNER_CANDIDATE_PORT    candidate container's traffic port — the kernel's
+//!                            drive target (default 8080; RUNNER_ROUTER_PORT is
+//!                            the pre-multi-system name, read as a legacy alias)
+//!   RUNNER_HEALTH_URL        readiness probe URL; unset = HTTP /health on the
+//!                            candidate port (a gRPC candidate names its
+//!                            metrics endpoint instead)
 //!   RUNNER_KERNEL_BIN        deja-kernel path (default target/release/deja-kernel)
 //!   RUNNER_MIGRATE_CMD       whitespace-split argv run at the migrate stage
 //!                            with DATABASE_URL set; unset = pre-migrated pg.
@@ -158,10 +165,21 @@ fn run() -> Result<(), String> {
         redis_port: env("RUNNER_REDIS_PORT", "6379")
             .parse()
             .map_err(|e| format!("RUNNER_REDIS_PORT: {e}"))?,
-        database_url: required("RUNNER_DATABASE_URL")?,
-        router_port: env("RUNNER_ROUTER_PORT", "8080")
+        // Optional: a system with no harness-managed stores (prism) has no
+        // sidecar pg, and every stage that would dial one self-skips. The
+        // store stages re-require it by name if a run that manages stores
+        // arrives without it.
+        database_url: std::env::var("RUNNER_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        // `RUNNER_ROUTER_PORT` is the pre-multi-system name, kept as a legacy
+        // alias so deployed hyperswitch templates keep working unchanged.
+        candidate_port: env("RUNNER_CANDIDATE_PORT", &env("RUNNER_ROUTER_PORT", "8080"))
             .parse()
-            .map_err(|e| format!("RUNNER_ROUTER_PORT: {e}"))?,
+            .map_err(|e| format!("RUNNER_CANDIDATE_PORT: {e}"))?,
+        health_url: std::env::var("RUNNER_HEALTH_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
         kernel_bin: env("RUNNER_KERNEL_BIN", "target/release/deja-kernel"),
         migrate_cmd: std::env::var("RUNNER_MIGRATE_CMD")
             .ok()

@@ -339,6 +339,8 @@ struct EventProbe {
     #[serde(default)]
     boundary: String,
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     event_schema_version: Option<u32>,
 }
 
@@ -460,6 +462,7 @@ struct Accepted {
     gseq: u64,
     correlation_id: Option<String>,
     boundary: String,
+    role: Option<String>,
     raw_line: String,
 }
 
@@ -523,6 +526,13 @@ pub struct LandedRecording {
     /// than one partition, so the scan sees all of it.
     pub prefix: String,
     pub objects: usize,
+    /// `inst=` discriminators seen under the session, sorted. For a session
+    /// whose id names no provenance (the UCS `run-<nanos>` shape) this is the
+    /// only identity the LISTING can offer — it is the recorder's instance id
+    /// (in k8s, the pod name) — and it costs nothing: the segments are already
+    /// in the keys the scan lists.
+    #[serde(default)]
+    pub instances: Vec<String>,
 }
 
 impl LandedRecording {
@@ -549,20 +559,28 @@ pub fn list_landed_recordings(cfg: &S3Config, root: &str) -> Result<Vec<LandedRe
 /// understand can be stated as examples rather than discovered in production.
 pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
     let root = root.trim_end_matches('/');
-    // (session, dates) — BTreeMap so the dates come out sorted without a pass.
-    let mut found: BTreeMap<String, (BTreeSet<String>, usize)> = BTreeMap::new();
+    // (session, (dates, objects, instances)) — BTreeMaps/Sets so everything
+    // comes out sorted without a pass.
+    #[allow(clippy::type_complexity)]
+    let mut found: BTreeMap<String, (BTreeSet<String>, usize, BTreeSet<String>)> = BTreeMap::new();
     for key in keys {
         let Some(rest) = key.strip_prefix(root).map(|r| r.trim_start_matches('/')) else {
             continue;
         };
         let mut date: Option<&str> = None;
         let mut session: Option<&str> = None;
+        let mut instance: Option<&str> = None;
         for segment in rest.split('/') {
             if let Some(d) = segment.strip_prefix("dt=") {
                 date = Some(d);
             } else if let Some(s) = segment.strip_prefix("session=") {
                 session = Some(s);
-                break; // everything below the session belongs to it
+            } else if session.is_some() {
+                // One level below the session: the writer's `inst=` partition.
+                // Anything else there (an object, a different layout) is not an
+                // instance; stop either way — deeper segments are the object's.
+                instance = segment.strip_prefix("inst=");
+                break;
             }
         }
         let Some(session) = session else { continue };
@@ -571,11 +589,14 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
             entry.0.insert(d.to_owned());
         }
         entry.1 += 1;
+        if let Some(inst) = instance {
+            entry.2.insert(inst.to_owned());
+        }
     }
 
     let mut out: Vec<LandedRecording> = found
         .into_iter()
-        .map(|(session_id, (dates, objects))| {
+        .map(|(session_id, (dates, objects, instances))| {
             let dates: Vec<String> = dates.into_iter().collect();
             // One partition: address it directly. Several (or none): address the
             // root, so a straddling session is ingested whole.
@@ -589,6 +610,7 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
                 dates,
                 prefix,
                 objects,
+                instances: instances.into_iter().collect(),
             }
         })
         .collect();
@@ -1014,6 +1036,7 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
             gseq: probe.global_sequence,
             correlation_id: probe.correlation_id,
             boundary: probe.boundary,
+            role: probe.role,
             raw_line: line_str.into_owned(),
         });
     }
@@ -1081,7 +1104,8 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
         row.events += 1;
         row.gseq_min = row.gseq_min.min(acc.gseq);
         row.gseq_max = row.gseq_max.max(acc.gseq);
-        row.has_ingress |= acc.boundary == "http_incoming";
+        row.has_ingress |=
+            acc.role.as_deref() == Some("ingress") || acc.boundary == "http_incoming";
     }
     let correlations: Vec<CorrelationSummary> = order
         .into_iter()
@@ -1183,6 +1207,35 @@ mod tests {
             "a straddling session must be scanned from the shared parent"
         );
         assert_eq!(x.latest_date(), Some("2026-07-30"));
+    }
+
+    #[test]
+    fn instance_discriminators_ride_the_listing() {
+        // For a boot-derived session id the `inst=` segment is the only
+        // identity the listing can offer (in k8s it is the pod name). Captured
+        // from the keys the scan already lists — never from object content.
+        let found = index_landed_keys(
+            "landing/v1",
+            &keys(&[
+                "landing/v1/dt=2026-08-26/session=run-1/inst=sbx-custom-hyperswitch-ucs-a/0.gz",
+                "landing/v1/dt=2026-08-26/session=run-1/inst=sbx-custom-hyperswitch-ucs-b/1.gz",
+                "landing/v1/dt=2026-08-26/session=run-1/inst=sbx-custom-hyperswitch-ucs-a/2.gz",
+                // An object directly under the session (no inst partition)
+                // contributes no instance — and must not invent one.
+                "landing/v1/dt=2026-08-26/session=run-2/manifest.json",
+            ]),
+        );
+        assert_eq!(found.len(), 2);
+        let one = found.iter().find(|r| r.session_id == "run-1").unwrap();
+        assert_eq!(
+            one.instances,
+            vec![
+                "sbx-custom-hyperswitch-ucs-a".to_owned(),
+                "sbx-custom-hyperswitch-ucs-b".to_owned()
+            ]
+        );
+        let two = found.iter().find(|r| r.session_id == "run-2").unwrap();
+        assert!(two.instances.is_empty());
     }
 
     #[test]

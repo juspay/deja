@@ -671,13 +671,17 @@ fn drive_replay(
     // build cache. The parallel runner builds the replay image ONCE up front and
     // sets DEMO_REPLAY_NO_BUILD=1, so isolated runs reuse it instead of rebuilding.
     let build = run.candidate_image.is_none() && std::env::var("DEMO_REPLAY_NO_BUILD").is_err();
+    // The replay service is named after the system under test: the default
+    // system keeps the existing `hyperswitch-replay` service; another system
+    // (e.g. prism) is `<system>-replay` in its own compose overlay.
+    let replay_service = format!("{}-replay", run.spec.system());
     compose_up(
         demo,
         ctx,
         "starting replay router (DEJA_MODE=replay)",
         &recording_id,
         &run.run_id,
-        &["hyperswitch-replay"],
+        &[replay_service.as_str()],
         build,
         &[],
     )?;
@@ -685,7 +689,10 @@ fn drive_replay(
     set_status(root, run, RunStatus::Running, None);
     ctx.run_state("running");
     set_stage(root, run, ctx, 4, total, "waiting for replay router");
-    wait_health(demo.replay_port, Duration::from_secs(240))?;
+    wait_health(
+        &format!("http://127.0.0.1:{}/health", demo.replay_port),
+        Duration::from_secs(240),
+    )?;
 
     set_stage(
         root,
@@ -705,27 +712,34 @@ fn drive_replay(
     // run wrote → short-circuits → "merchant already exists" / UR_15). The
     // in-memory moka cache is already fresh per replay process; only redis carries
     // record's writes over.
-    // Store transport for this run (S1 seam): compose here; the in-pod k8s
-    // runner builds a StoreExec::direct against its sidecars instead.
-    let store = StoreExec::compose(
-        demo.compose_base_args(),
-        demo.compose_env(&recording_id, &run.run_id),
-    );
-    flush_redis(&store)?;
-    // GENERAL SEEDING (replay precondition materialization).
-    // Replay routing is driven by the candidate's explicit per-boundary
-    // declarations plus DEJA_MODE=replay. Seed materialization restores the
-    // recorded preconditions into concrete stores before the replay workload
-    // runs; materialization remains best-effort because scoring can still report
-    // the replay outcome when store seeding is unavailable.
-    let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
-    let seed_certificate_path = root.seed_certificate_path(&run.run_id);
-    // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
-    // publish loop like every other stream artifact. Registering here as well
-    // stored the runner pod's local path verbatim — a row that answered every
-    // read with ENOENT once the pod died — and would now duplicate the row.
-    if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
-        eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
+    // Store preparation (redis flush + seed materialization) belongs to the
+    // DEFAULT system's stateful demo overlay. A stateless system under test
+    // (prism: no pg/redis of its own — every store crossing is a recorded
+    // boundary) has nothing to flush or seed, and its overlay has no store
+    // services to exec into.
+    if crate::system_manages_stores(run.spec.system()) {
+        // Store transport for this run (S1 seam): compose here; the in-pod k8s
+        // runner builds a StoreExec::direct against its sidecars instead.
+        let store = StoreExec::compose(
+            demo.compose_base_args(),
+            demo.compose_env(&recording_id, &run.run_id),
+        );
+        flush_redis(&store)?;
+        // GENERAL SEEDING (replay precondition materialization).
+        // Replay routing is driven by the candidate's explicit per-boundary
+        // declarations plus DEJA_MODE=replay. Seed materialization restores the
+        // recorded preconditions into concrete stores before the replay workload
+        // runs; materialization remains best-effort because scoring can still report
+        // the replay outcome when store seeding is unavailable.
+        let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
+        let seed_certificate_path = root.seed_certificate_path(&run.run_id);
+        // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
+        // publish loop like every other stream artifact. Registering here as well
+        // stored the runner pod's local path verbatim — a row that answered every
+        // read with ENOENT once the pod died — and would now duplicate the row.
+        if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
+            eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
+        }
     }
     run_kernel(
         &demo.kernel_bin,
@@ -1272,7 +1286,12 @@ fn write_record_graph_nodes(
 /// publish a partial graph as if it were whole — is kept: nothing is
 /// published, and the absence explains itself in the run's own record instead
 /// of on a dead stderr.
-fn extract_record_graph(
+///
+/// `pub` for the out-of-tree dev bridge (prism's `replay-dev.sh`), which
+/// prepares a run root by hand and needs the record graph laid down the same
+/// way the in-pod runner does — without it, every dev run scores flat
+/// (`missing_forest`) and the graph tier never engages locally.
+pub fn extract_record_graph(
     root: &HarnessRoot,
     run: &Run,
     recording_id: &str,
@@ -1526,9 +1545,18 @@ pub struct InPodOptions {
     pub redis_host: String,
     pub redis_port: u16,
     /// Sidecar pg conninfo URL (also what seeding's psql uses via `-d`).
-    pub database_url: String,
-    /// The router container's health/traffic port (pod-shared netns).
-    pub router_port: u16,
+    /// None for a system with no harness-managed stores (prism) — every store
+    /// stage self-skips, so requiring a value would force templates to carry a
+    /// dummy. Required (by name, at use) when the run manages stores.
+    pub database_url: Option<String>,
+    /// The CANDIDATE container's traffic port (pod-shared netns) — the
+    /// kernel's drive target. `RUNNER_CANDIDATE_PORT`; the pre-multi-system
+    /// name `RUNNER_ROUTER_PORT` is read as a legacy alias.
+    pub candidate_port: u16,
+    /// Readiness URL override (`RUNNER_HEALTH_URL`). None = HTTP `/health` on
+    /// `candidate_port`, the router's shape. A prism candidate serves gRPC on
+    /// its traffic port, so its template points this at the metrics endpoint.
+    pub health_url: Option<String>,
     /// deja-kernel binary path inside the runner container.
     pub kernel_bin: String,
     /// Migration command (argv) run at stage 3 with DATABASE_URL set; None
@@ -1578,10 +1606,40 @@ pub fn drive_replay_in_pod(
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
     set_stage(root, run, ctx, 3, total, "migrating sidecar pg");
+    // Harness-managed stores belong to the DEFAULT system's profile. A
+    // stateless system under test (prism) has no sidecar pg/redis: every store
+    // crossing is a recorded boundary, so there is nothing to migrate, gate,
+    // flush, or seed — and no sidecar to exec against.
+    let manages_stores = crate::system_manages_stores(run.spec.system());
+    // Name which source decided, so a declaration that was ignored — a typo in
+    // the value, say — is visible here rather than silently taking the default.
+    ctx.log(
+        "store management",
+        &format!(
+            "system `{}` {} harness-managed stores ({})",
+            run.spec.system(),
+            if manages_stores { "HAS" } else { "has no" },
+            match crate::system_manages_stores_declared(run.spec.system()) {
+                Some(_) => "declared",
+                None => "default for this system",
+            }
+        ),
+    );
     match &opts.migrate_cmd {
+        _ if !manages_stores => ctx.log(
+            "migrating sidecar pg",
+            &format!(
+                "system under test `{}` has no harness-managed stores — skipping migration",
+                run.spec.system()
+            ),
+        ),
         Some(argv) if !argv.is_empty() => {
             let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]).env("DATABASE_URL", &opts.database_url);
+            let database_url = opts
+                .database_url
+                .as_deref()
+                .ok_or("RUNNER_DATABASE_URL is required when the run manages harness stores")?;
+            cmd.args(&argv[1..]).env("DATABASE_URL", database_url);
             let status = run_streamed(cmd, ctx, "migrating sidecar pg", "migrate")?;
             if !status.success() {
                 return Err(format!("migration command failed (status {status})"));
@@ -1596,59 +1654,71 @@ pub fn drive_replay_in_pod(
     set_status(root, run, RunStatus::Running, None);
     ctx.run_state("running");
     set_stage(root, run, ctx, 4, total, "seeding sidecar stores");
-    let store = StoreExec::direct(
-        opts.redis_host.clone(),
-        opts.redis_port,
-        opts.database_url.clone(),
-    );
-
-    // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
-    // into it. The live fingerprint is read back from the store; the expected set
-    // is the candidate's own migration versions (supplied by the executor, a
-    // function of the candidate ref — never a harness constant). A mismatch is a
-    // fail-closed refusal that names the drift, not a silent seed-into-wrong-
-    // schema that resurfaces later as a phantom candidate regression.
-    let live_schema = read_schema_fingerprint(&store)?;
-    ctx.log(
-        "seeding sidecar stores",
-        &format!(
-            "live schema: {} migrations applied (head {})",
-            live_schema.count(),
-            live_schema.head().unwrap_or("none"),
-        ),
-    );
-    if let Some(expected) = &opts.expected_schema {
-        if !live_schema.matches(expected) {
-            let (missing, extra) = live_schema.diff(expected);
-            return Err(format!(
-                "schema fingerprint mismatch (P1): candidate expects {} migrations (head {}), \
-                 store has {} (head {}); missing {} [{}], extra {} [{}]. The applied migration set \
-                 is not the candidate's — refusing rather than emit a false verdict.",
-                expected.count(),
-                expected.head().unwrap_or("none"),
-                live_schema.count(),
-                live_schema.head().unwrap_or("none"),
-                missing.len(),
-                sample_versions(&missing),
-                extra.len(),
-                sample_versions(&extra),
-            ));
-        }
+    if !manages_stores {
         ctx.log(
             "seeding sidecar stores",
-            "schema fingerprint matches the candidate (P1 pass)",
+            &format!(
+                "system under test `{}` has no harness-managed stores — skipping schema gate and seeding",
+                run.spec.system()
+            ),
         );
-    }
+    } else {
+        let store = StoreExec::direct(
+            opts.redis_host.clone(),
+            opts.redis_port,
+            opts.database_url
+                .clone()
+                .ok_or("RUNNER_DATABASE_URL is required when the run manages harness stores")?,
+        );
 
-    flush_redis(&store)?;
-    let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
-    let seed_certificate_path = root.seed_certificate_path(&run.run_id);
-    // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
-    // publish loop like every other stream artifact. Registering here as well
-    // stored the runner pod's local path verbatim — a row that answered every
-    // read with ENOENT once the pod died — and would now duplicate the row.
-    if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
-        eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
+        // A1/P1: verify the migrated schema is EXACTLY the candidate's BEFORE seeding
+        // into it. The live fingerprint is read back from the store; the expected set
+        // is the candidate's own migration versions (supplied by the executor, a
+        // function of the candidate ref — never a harness constant). A mismatch is a
+        // fail-closed refusal that names the drift, not a silent seed-into-wrong-
+        // schema that resurfaces later as a phantom candidate regression.
+        let live_schema = read_schema_fingerprint(&store)?;
+        ctx.log(
+            "seeding sidecar stores",
+            &format!(
+                "live schema: {} migrations applied (head {})",
+                live_schema.count(),
+                live_schema.head().unwrap_or("none"),
+            ),
+        );
+        if let Some(expected) = &opts.expected_schema {
+            if !live_schema.matches(expected) {
+                let (missing, extra) = live_schema.diff(expected);
+                return Err(format!(
+                    "schema fingerprint mismatch (P1): candidate expects {} migrations (head {}), \
+                 store has {} (head {}); missing {} [{}], extra {} [{}]. The applied migration set \
+                 is not the candidate's — refusing rather than emit a false verdict.",
+                    expected.count(),
+                    expected.head().unwrap_or("none"),
+                    live_schema.count(),
+                    live_schema.head().unwrap_or("none"),
+                    missing.len(),
+                    sample_versions(&missing),
+                    extra.len(),
+                    sample_versions(&extra),
+                ));
+            }
+            ctx.log(
+                "seeding sidecar stores",
+                "schema fingerprint matches the candidate (P1 pass)",
+            );
+        }
+
+        flush_redis(&store)?;
+        let seed_certificate = materialize_seed_plan(&store, &recording, &run.run_id);
+        let seed_certificate_path = root.seed_certificate_path(&run.run_id);
+        // Written here (the file is stage-4 evidence), REGISTERED at stage 6 by the
+        // publish loop like every other stream artifact. Registering here as well
+        // stored the runner pod's local path verbatim — a row that answered every
+        // read with ENOENT once the pod died — and would now duplicate the row.
+        if let Err(e) = write_json(&seed_certificate_path, &seed_certificate) {
+            eprintln!("lifecycle: seed certificate write failed: {e}; continuing");
+        }
     }
 
     // A2: the candidate boots as a pod sibling with no ordering guarantee vs
@@ -1678,10 +1748,14 @@ pub fn drive_replay_in_pod(
         total,
         "driving recorded requests (kernel)",
     );
-    wait_health(opts.router_port, Duration::from_secs(240))?;
+    let health_url = opts
+        .health_url
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}/health", opts.candidate_port));
+    wait_health(&health_url, Duration::from_secs(240))?;
     run_kernel(
         &opts.kernel_bin,
-        opts.router_port,
+        opts.candidate_port,
         root,
         ctx,
         &recording_id,
@@ -4810,13 +4884,16 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
-/// Poll the candidate's `/health` on a host-published port until 200 or timeout.
-fn wait_health(port: u16, timeout: Duration) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/health");
+/// Poll a candidate readiness URL until 200 or timeout. The URL is the
+/// caller's: HTTP `/health` on the traffic port for the router; a prism
+/// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
+/// curl — so its Job template names a probeable URL (`RUNNER_HEALTH_URL`,
+/// e.g. the metrics endpoint) instead of teaching this function systems.
+fn wait_health(url: &str, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         let ok = Command::new("curl")
-            .args(["-fsS", "-o", "/dev/null", "--max-time", "3", &url])
+            .args(["-fsS", "-o", "/dev/null", "--max-time", "3", url])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -5754,7 +5831,9 @@ mod tests {
         Run {
             run_id: "r1".into(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: RunMode::Record,
+                system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: None,
@@ -5823,7 +5902,9 @@ mod tests {
         Run {
             run_id: "run-backstop".into(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
+                system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: Some(recording_id.to_owned()),
@@ -6140,7 +6221,10 @@ mod tests {
         );
 
         let mut excluded = std::collections::BTreeMap::new();
-        excluded.insert("c-cut".to_owned(), "no `http_incoming` event".to_owned());
+        excluded.insert(
+            "c-cut".to_owned(),
+            "no ingress (`http_incoming`-role) event".to_owned(),
+        );
         let stamp = admission_stamp(
             &TapeAdmission::Computed {
                 checked: 53,
@@ -6162,7 +6246,7 @@ mod tests {
         assert_eq!(stamp.value["correlations_driven"], 2);
         assert_eq!(
             stamp.value["correlations_excluded"]["c-cut"],
-            "no `http_incoming` event"
+            "no ingress (`http_incoming`-role) event"
         );
 
         // An unchecked tape says so in the verdict too, rather than looking
@@ -6546,7 +6630,9 @@ mod tests {
         let run = Run {
             run_id: run_id.to_owned(),
             spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
+                system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage {
                     image: "deja-demo".to_owned(),
                 },

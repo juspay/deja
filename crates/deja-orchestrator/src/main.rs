@@ -670,6 +670,45 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
     }
 }
 
+/// Which bucket and key root a listing request scans, for an optional
+/// `?system=`.
+///
+/// Absent, or naming the DEFAULT system, scans the deployment's own bucket —
+/// naming the default has to mean what omitting it means. It did not: a
+/// `?system=hyperswitch` was refused with a 400 while no parameter at all
+/// returned 200 over the same bucket, so the default system was reachable only
+/// by staying silent about it. That made a caller declaring the system it
+/// replays impossible for the one system every existing caller uses, which is
+/// backwards. The exemption here is the same one `candidate_binding_for` and
+/// `config_source_for` already make.
+///
+/// Any OTHER system must have its bucket configured, and is refused by name if
+/// it does not. The variable is the whitelist: scanning the default bucket and
+/// labelling the rows with another system's name would be a wrong answer
+/// wearing a confident label, which is worse than a refusal that says what to
+/// set. Its root override is optional and only consulted once its bucket
+/// resolves.
+fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, String), String> {
+    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    let Some(system) = system.filter(|s| !deja_orchestrator::is_default_system(s)) else {
+        return Ok((default_bucket.to_owned(), root));
+    };
+    let bucket_var = deja_orchestrator::system_env_var(system, "S3_BUCKET");
+    let bucket = match std::env::var(&bucket_var) {
+        Ok(b) if !b.trim().is_empty() => b.trim().to_owned(),
+        _ => {
+            return Err(format!(
+                "system '{system}' has no recording bucket configured: set {bucket_var} on the orchestrator"
+            ))
+        }
+    };
+    let root = match std::env::var(deja_orchestrator::system_env_var(system, "RECORDING_ROOT")) {
+        Ok(r) if !r.trim().is_empty() => r.trim().to_owned(),
+        _ => root,
+    };
+    Ok((bucket, root))
+}
+
 /// `GET /api/v1/recordings/available` — what is in the bucket, newest first.
 ///
 /// The catalog above lists recordings that have been PULLED, which is a
@@ -690,8 +729,16 @@ async fn v1_available_recordings(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<AvailableQuery>,
 ) -> Response {
-    let cfg = deja_orchestrator::s3::S3Config::from_env();
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+    let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+    let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
+    let root = match scan_scope(system_scope, &cfg.bucket) {
+        Ok((bucket, root)) => {
+            cfg.bucket = bucket;
+            root
+        }
+        Err(message) => return error_resp(400, &message),
+    };
+    let scan_bucket = cfg.bucket.clone();
     let found = match tokio::task::spawn_blocking(move || {
         deja_compactor::list_landed_recordings(&cfg, &root)
     })
@@ -727,6 +774,36 @@ async fn v1_available_recordings(
             // that difference should be one field rather than every reader
             // reimplementing the same two shapes.
             let identity = deja_orchestrator::parse_recording_id(&r.session_id);
+            // Which system minted the session. The `inst=` pod names are the
+            // authoritative signal when the scan captured any (the UCS pods
+            // carry the pattern below; router pods do not). The id SHAPE alone
+            // decides only the unambiguous case: rec-<sha>-<time>-<inst> is
+            // the hyperswitch recorder's. run-<nanos> is NOT prism-specific —
+            // the router recorder minted the same shape before ids carried a
+            // revision, and a router tape wearing it was once badged "prism"
+            // and replayed against a prism candidate: every request's
+            // connection reset. Ambiguous stays null; a wrong label is worse
+            // than none.
+            let prism_pattern =
+                std::env::var("DEJA_PRISM_INSTANCE_PATTERN").unwrap_or_else(|_| "ucs".to_owned());
+            let system = if let Some(system) = system_scope {
+                // Scoped scan: the SOURCE BUCKET names the system — that is
+                // the whole point of keeping the buckets separate.
+                Some(system)
+            } else if !r.instances.is_empty() {
+                if r.instances.iter().any(|i| i.contains(&prism_pattern)) {
+                    Some("prism")
+                } else {
+                    Some("hyperswitch")
+                }
+            } else if matches!(
+                identity,
+                deja_orchestrator::RecordingIdentity::Described { .. }
+            ) {
+                Some("hyperswitch")
+            } else {
+                None
+            };
             let described = match &identity {
                 deja_orchestrator::RecordingIdentity::Described {
                     revision,
@@ -737,6 +814,9 @@ async fn v1_available_recordings(
                     "recorded_at": recorded_at,
                     "instance": instance,
                 }),
+                deja_orchestrator::RecordingIdentity::BootDerived { booted_at_nanos } => {
+                    serde_json::json!({ "booted_at_nanos": booted_at_nanos })
+                }
                 deja_orchestrator::RecordingIdentity::Opaque => serde_json::Value::Null,
             };
             serde_json::json!({
@@ -748,6 +828,17 @@ async fn v1_available_recordings(
                 // Null for a recording whose id names no revision; its envelopes
                 // still carry `code.sha` and `instance_id`.
                 "identity": described,
+                // Which recorded system minted the session, from the id shape;
+                // null when the shape names neither.
+                "system": system,
+                // The bucket the session was FOUND in — with the scoped scan
+                // this differs from the default, and a replay of the session
+                // needs it to build `s3_source` (`s3://{bucket}/{prefix}`).
+                "bucket": scan_bucket,
+                // The `inst=` discriminators under the session — for a UCS
+                // session this is the recorder's pod name, the only identity
+                // its id does not carry.
+                "instances": r.instances,
                 // The prefix the orchestrator would ingest from. Reported so a
                 // run can be reproduced by hand, not so a caller has to supply it.
                 "prefix": r.prefix,
@@ -767,6 +858,13 @@ async fn v1_available_recordings(
 struct AvailableQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Which system's recordings to list. Absent = the default bucket
+    /// (`DEJA_S3_BUCKET`). A named system scans ITS bucket
+    /// (`DEJA_<SYSTEM>_S3_BUCKET`, root `DEJA_<SYSTEM>_RECORDING_ROOT`
+    /// default `landing/v1`) — the separate-buckets posture: prism tapes
+    /// carry payment payloads on a tighter retention and never mix into the
+    /// default bucket, so the LISTING goes to them instead.
+    system: Option<String>,
 }
 
 /// What the store can say about one recording's correlations.
@@ -1383,7 +1481,51 @@ async fn spa_fallback(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
+
+    /// These variables are process-global, so the scan-scope cases run under
+    /// one test rather than as separate ones racing the same names.
+    #[test]
+    fn naming_the_default_system_means_what_omitting_it_means() {
+        const DEFAULT_BUCKET: &str = "hyperswitch-art";
+
+        // THE REGRESSION THIS FIXES. Omitting the parameter and naming the
+        // default system must give the same bucket. They did not: naming it
+        // was a 400, so a caller could reach the default system only by staying
+        // silent about it.
+        let omitted = super::scan_scope(None, DEFAULT_BUCKET).expect("absent system scans default");
+        let named = super::scan_scope(Some("hyperswitch"), DEFAULT_BUCKET)
+            .expect("naming the default system must not be refused");
+        assert_eq!(named, omitted);
+        assert_eq!(named.0, DEFAULT_BUCKET);
+
+        // Another system still MUST be configured, and is refused by name — the
+        // variable is the whitelist, and scanning the default bucket under
+        // another system's label would be a wrong answer wearing a confident
+        // one.
+        let err = super::scan_scope(Some("prism"), DEFAULT_BUCKET)
+            .expect_err("an unconfigured system must be refused, not defaulted");
+        assert!(
+            err.contains("DEJA_PRISM_S3_BUCKET"),
+            "the refusal names the var: {err}"
+        );
+
+        // Configured, it scans its own bucket and leaves the default alone.
+        std::env::set_var("DEJA_PRISM_S3_BUCKET", "ucs-deja");
+        let (bucket, root) = super::scan_scope(Some("prism"), DEFAULT_BUCKET).expect("configured");
+        assert_eq!(bucket, "ucs-deja");
+        assert_ne!(bucket, DEFAULT_BUCKET);
+        // Its root override is optional; absent, it keeps the deployment root.
+        assert_eq!(root, super::scan_scope(None, DEFAULT_BUCKET).unwrap().1);
+        std::env::set_var("DEJA_PRISM_RECORDING_ROOT", "landing/v2");
+        assert_eq!(
+            super::scan_scope(Some("prism"), DEFAULT_BUCKET).unwrap().1,
+            "landing/v2"
+        );
+        std::env::remove_var("DEJA_PRISM_RECORDING_ROOT");
+        std::env::remove_var("DEJA_PRISM_S3_BUCKET");
+    }
 
     use super::*;
     use axum::body::Body;
@@ -1531,7 +1673,9 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
+                system_under_test: None,
                 candidate_spec: deja_orchestrator::CandidateSpec::PrebuiltImage {
                     image: "deja-demo".to_owned(),
                 },

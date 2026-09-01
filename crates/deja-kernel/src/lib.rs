@@ -2,14 +2,18 @@
 //!
 //! Pure-logic surface for the workload player: load a recording of
 //! `BoundaryEvent`s, group by `correlation_id`, reconstruct each
-//! correlation's first `http_incoming` event into a drivable HTTP request,
-//! and compare the candidate's response against the baseline recorded
-//! response. The orchestration shell in `main.rs` wires this to a
-//! `reqwest::blocking::Client` and an HTTP diff sink.
+//! correlation's ingress event into a drivable request, and compare the
+//! candidate's response against the baseline recorded response. The
+//! orchestration shell in `main.rs` dispatches per correlation on the
+//! recorded ingress shape: HTTP ingress (`method`/`path`) drives over the
+//! hand-rolled HTTP/1.1 client, gRPC ingress (`rpc`) over the [`grpc`]
+//! module's HTTP/2 client — one kernel binary, one `KERNEL_*` contract.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub mod grpc;
 
 pub use deja::BoundaryEvent;
 
@@ -131,11 +135,14 @@ pub fn group_by_correlation(
     (by_corr, uncorrelated)
 }
 
-/// Extract the FIRST `boundary == "http_incoming"` event from a correlation
-/// group and reconstruct a driveable request. Returns None when the
-/// correlation has no incoming-HTTP event (background-only correlation).
+/// Extract the FIRST ingress event (self-described `role: "ingress"`, legacy
+/// `http_incoming` name) from a correlation group and reconstruct a driveable
+/// HTTP request. Returns None when the correlation has no ingress event
+/// (background-only correlation) — or when its ingress is not HTTP-shaped
+/// (no `method`/`path`; a gRPC ingress), which the caller hands to
+/// [`grpc::reconstruct_grpc_request`] instead.
 pub fn reconstruct_driver_request(events: &[BoundaryEvent]) -> Option<DriverRequest> {
-    let event = events.iter().find(|e| e.boundary == "http_incoming")?;
+    let event = events.iter().find(|e| e.is_ingress())?;
     let req = &event.request;
     let method = req.get("method")?.as_str()?.to_string();
     let path = req.get("path")?.as_str()?.to_string();
@@ -193,7 +200,7 @@ fn baseline_from_event(event: &BoundaryEvent) -> BaselineResponse {
 /// response diff against the candidate's empty body forever.
 ///
 /// `None` only when the tape says nothing about a body at all.
-fn captured_body_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
+pub(crate) fn captured_body_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
     if let Some(arr) = body.get("raw_bytes").and_then(|v| v.as_array()) {
         return Some(
             arr.iter()
@@ -328,12 +335,124 @@ pub fn diff_json(
             }
             diffs
         }
+        // EMBEDDED JSON IS COMPARED AS JSON, NOT AS BYTES. A string field
+        // that carries a serialized document (prism's rawConnectorRequest
+        // echo, hyperswitch metadata blobs) is byte-compared by default — and
+        // a map stringified by two different PROCESSES serializes its keys in
+        // two different orders (HashMap iteration is per-process random), so
+        // identical behavior diffs on every response. Key order inside a JSON
+        // object is serialization noise, not behavior; the comparator's job
+        // is behavioral equivalence, so both sides are parsed and diffed
+        // structurally — which also locates a REAL inner difference at its
+        // own path instead of reporting one opaque blob.
+        //
+        // Only when BOTH sides parse to an object or array: scalar strings
+        // keep byte semantics ("1.0" vs "1.00" stays a diff — relaxing number
+        // formatting was never asked for), and a non-JSON string on either
+        // side falls through to the leaf diff unchanged. The TAPE is never
+        // touched: this normalizes judgment, not evidence.
+        (serde_json::Value::String(b), serde_json::Value::String(c)) => {
+            if let (Ok(bv), Ok(cv)) = (
+                serde_json::from_str::<serde_json::Value>(b),
+                serde_json::from_str::<serde_json::Value>(c),
+            ) {
+                let structural = |v: &serde_json::Value| v.is_object() || v.is_array();
+                if structural(&bv) && structural(&cv) {
+                    return diff_json(&bv, &cv, path, allowlist);
+                }
+            }
+            // Same rule, second encoding: a form-urlencoded body is a map
+            // serialized into a string, and the serializing map's iteration
+            // order is per-process random — prism's Stripe bodies reorder
+            // `metadata[...]` pairs on every process. DISTINCT keys compare
+            // order-insensitively; repeated same-named keys keep their
+            // relative order (that order is array semantics, not noise).
+            if let (Some(bp), Some(cp)) = (parse_form_pairs(b), parse_form_pairs(c)) {
+                return diff_form_pairs(&bp, &cp, path, allowlist);
+            }
+            vec![JsonFieldDiff {
+                json_path: path.to_owned(),
+                baseline: baseline.clone(),
+                candidate: candidate.clone(),
+            }]
+        }
         (b, c) => vec![JsonFieldDiff {
             json_path: path.to_owned(),
             baseline: b.clone(),
             candidate: c.clone(),
         }],
     }
+}
+
+/// Read a string as form-urlencoded pairs, STRICTLY: at least two
+/// `&`-separated segments (a single pair cannot be reordered, so bytes
+/// suffice there), every segment non-empty and carrying `key=`, keys
+/// non-empty. Anything else — prose, html, base64 — is not form data and
+/// keeps byte semantics. Values stay percent-ENCODED: both sides were
+/// produced by the same encoder, so encoded equality is value equality and
+/// decoding could only blur that.
+fn parse_form_pairs(raw: &str) -> Option<Vec<(&str, &str)>> {
+    let segments: Vec<&str> = raw.split('&').collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    segments
+        .iter()
+        .map(|segment| match segment.split_once('=') {
+            Some((k, v)) if !k.is_empty() => Some((k, v)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Compare two pair lists: per key, the ordered list of its values must be
+/// equal (repeated-key order is meaningful; distinct-key order is not). A
+/// differing key reports at `{path}.{key}` — the key names the field, which
+/// beats one opaque body diff.
+fn diff_form_pairs(
+    baseline: &[(&str, &str)],
+    candidate: &[(&str, &str)],
+    path: &str,
+    allowlist: &[&str],
+) -> Vec<JsonFieldDiff> {
+    let group = |pairs: &[(&str, &str)]| {
+        let mut by_key: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (k, v) in pairs {
+            by_key
+                .entry((*k).to_owned())
+                .or_default()
+                .push((*v).to_owned());
+        }
+        by_key
+    };
+    let b = group(baseline);
+    let c = group(candidate);
+    let mut keys: Vec<&String> = b.keys().chain(c.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut diffs = Vec::new();
+    for k in keys {
+        let key_path = format!("{path}.{k}");
+        if allowlist.contains(&key_path.as_str()) {
+            continue;
+        }
+        let bv = b.get(k);
+        let cv = c.get(k);
+        if bv == cv {
+            continue;
+        }
+        let to_json = |v: Option<&Vec<String>>| match v {
+            None => serde_json::Value::Null,
+            Some(vals) if vals.len() == 1 => serde_json::Value::String(vals[0].clone()),
+            Some(vals) => serde_json::json!(vals),
+        };
+        diffs.push(JsonFieldDiff {
+            json_path: key_path,
+            baseline: to_json(bv),
+            candidate: to_json(cv),
+        });
+    }
+    diffs
 }
 
 /// Build an `HttpDiff` from baseline + candidate, applying the allowlist.
@@ -406,10 +525,38 @@ mod tests {
             entropy_source: None,
             replay_strategy: deja::ReplayStrategy::default(),
             kind: None,
+            role: None,
             declaration: None,
             raw_draw: None,
             end_timestamp_ns: None,
         }
+    }
+
+    #[test]
+    fn reconstruct_finds_ingress_by_role_not_only_by_legacy_name() {
+        // A role-described HTTP ingress under a NEW boundary name reconstructs;
+        // the legacy-name path is covered by every other test in this module.
+        let req = serde_json::json!({ "method": "GET", "path": "/x" });
+        let mut event = json_event(req, serde_json::json!({"status": 200}), 0);
+        event.boundary = "axum_incoming".to_owned();
+        assert!(
+            reconstruct_driver_request(std::slice::from_ref(&event)).is_none(),
+            "an unknown boundary without a role is NOT ingress"
+        );
+        event.role = Some("ingress".to_owned());
+        let drv = reconstruct_driver_request(&[event]).expect("role marks ingress");
+        assert_eq!(drv.path, "/x");
+    }
+
+    #[test]
+    fn grpc_shaped_ingress_yields_none_from_the_http_reconstruct() {
+        // A gRPC ingress (rpc, no method/path) is ingress but not HTTP-drivable;
+        // the drive loop hands it to grpc::reconstruct_grpc_request instead.
+        let req = serde_json::json!({ "rpc": "/types.PaymentService/Authorize" });
+        let mut event = json_event(req, serde_json::json!({}), 0);
+        event.boundary = "grpc_incoming".to_owned();
+        event.role = Some("ingress".to_owned());
+        assert!(reconstruct_driver_request(&[event]).is_none());
     }
 
     #[test]
@@ -555,6 +702,122 @@ mod tests {
 
     const HTML: &[u8] =
         b"<!DOCTYPE html><html><body><form method=\"post\" action=\"https://psp/pay\"></form></body></html>";
+
+    /// The defect: a string field carrying a serialized document is
+    /// byte-compared, and a map stringified by two different PROCESSES
+    /// serializes its keys in two different orders (HashMap iteration is
+    /// per-process random) — prism's rawConnectorRequest echo diffed on every
+    /// replayed response over pure key order. Key order inside a JSON object
+    /// is serialization noise, not behavior: embedded JSON is compared AS
+    /// JSON. The tape is untouched — this normalizes judgment, not evidence.
+    #[test]
+    fn embedded_json_strings_compare_structurally_not_bytewise() {
+        let recorded = serde_json::json!({
+            "rawConnectorRequest": {"value":
+                "{\"url\":\"https://api.stripe.com/v1/payment_intents\",\"headers\":{\"stripe-version\":\"2022-11-15\",\"via\":\"HyperSwitch\"}}"}
+        });
+        let replayed = serde_json::json!({
+            "rawConnectorRequest": {"value":
+                "{\"headers\":{\"via\":\"HyperSwitch\",\"stripe-version\":\"2022-11-15\"},\"url\":\"https://api.stripe.com/v1/payment_intents\"}"}
+        });
+        let diff = diff_json(&recorded, &replayed, "$", &[]);
+        assert!(diff.is_empty(), "key order is not behavior: {diff:?}");
+    }
+
+    /// …and the other half: a REAL difference inside the embedded document
+    /// still fails — now located at its own inner path instead of one opaque
+    /// blob diff, which is strictly better reporting.
+    #[test]
+    fn a_real_difference_inside_an_embedded_json_string_still_diverges() {
+        let recorded =
+            serde_json::json!({"echo": "{\"headers\":{\"via\":\"HyperSwitch\"},\"amount\":6540}"});
+        let replayed =
+            serde_json::json!({"echo": "{\"amount\":9999,\"headers\":{\"via\":\"HyperSwitch\"}}"});
+        let diff = diff_json(&recorded, &replayed, "$", &[]);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].json_path, "$.echo.amount");
+        assert_eq!(diff[0].baseline, serde_json::json!(6540));
+        assert_eq!(diff[0].candidate, serde_json::json!(9999));
+    }
+
+    /// Scalar strings keep BYTE semantics: "1.0" and "1.00" parse to equal
+    /// numbers, but relaxing number formatting was never asked for — only
+    /// object/array documents get the structural comparison. And a parent-path
+    /// allowlist entry still suppresses everything beneath, embedded or not.
+    #[test]
+    fn scalar_strings_stay_byte_exact_and_the_allowlist_still_covers_embedded_docs() {
+        let b = serde_json::json!({"v": "1.0"});
+        let c = serde_json::json!({"v": "1.00"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert_eq!(
+            diff.len(),
+            1,
+            "scalar formatting must stay a diff: {diff:?}"
+        );
+        assert_eq!(diff[0].json_path, "$.v");
+
+        let b = serde_json::json!({"echo": "{\"a\":1}"});
+        let c = serde_json::json!({"echo": "{\"a\":2}"});
+        assert!(diff_json(&b, &c, "$", &["$.echo"]).is_empty());
+    }
+
+    /// Same rule, second encoding: prism serializes the Stripe form body's
+    /// `metadata[...]` map in per-process-random order — identical pairs,
+    /// different byte order, on every replayed response. Distinct-key order
+    /// is serialization noise; the pairs are the behavior.
+    #[test]
+    fn form_encoded_strings_with_reordered_distinct_keys_are_equal() {
+        let b = serde_json::json!({"body":
+            "amount=6540&currency=USD&metadata%5Blogin_date%5D=2019-09-10T10%3A11%3A12Z&metadata%5Budf1%5D=value1"});
+        let c = serde_json::json!({"body":
+            "amount=6540&metadata%5Budf1%5D=value1&metadata%5Blogin_date%5D=2019-09-10T10%3A11%3A12Z&currency=USD"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert!(
+            diff.is_empty(),
+            "distinct-key order is not behavior: {diff:?}"
+        );
+    }
+
+    /// …but repeated SAME-named keys are ordered data (array semantics), and
+    /// a real value change reports at its own key, not as one opaque body.
+    #[test]
+    fn form_encoded_repeats_keep_order_and_value_changes_name_their_key() {
+        let b = serde_json::json!({"body": "items=a&items=b"});
+        let c = serde_json::json!({"body": "items=b&items=a"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert_eq!(
+            diff.len(),
+            1,
+            "repeated-key reorder must stay a diff: {diff:?}"
+        );
+        assert_eq!(diff[0].json_path, "$.body.items");
+
+        let b = serde_json::json!({"body": "amount=6540&currency=USD"});
+        let c = serde_json::json!({"body": "currency=USD&amount=9999"});
+        let diff = diff_json(&b, &c, "$", &[]);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].json_path, "$.body.amount");
+        assert_eq!(diff[0].baseline, serde_json::json!("6540"));
+        assert_eq!(diff[0].candidate, serde_json::json!("9999"));
+    }
+
+    /// The qualifier is STRICT: prose, a lone pair, or an `=`-less segment
+    /// is not form data and keeps byte semantics — over-matching here would
+    /// quietly relax comparisons that were never map-shaped.
+    #[test]
+    fn non_form_strings_keep_byte_semantics() {
+        for (b, c) in [
+            ("a=1", "a=2"),                         // single pair: bytes suffice
+            ("one&two=2", "two=2&one"),             // '='-less segment
+            ("hello world & more", "more & hello"), // prose
+        ] {
+            let bj = serde_json::json!({ "v": b });
+            let cj = serde_json::json!({ "v": c });
+            let diff = diff_json(&bj, &cj, "$", &[]);
+            assert_eq!(diff.len(), 1, "{b:?} vs {c:?} must byte-diff: {diff:?}");
+            assert_eq!(diff[0].json_path, "$.v");
+        }
+    }
 
     /// The defect: `text/html` never parses as JSON, so the recorder's `json`
     /// field is null while `text` holds the document. Reading only `json` on
