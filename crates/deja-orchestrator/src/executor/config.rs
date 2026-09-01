@@ -149,12 +149,12 @@ impl K8sExecutorConfig {
     /// hyperswitch-prism reads). Still data end to end: a new system needs env
     /// vars, not a recompile.
     pub fn candidate_binding_for(&self, system: &str) -> CandidateBinding {
-        if system == crate::DEFAULT_SYSTEM_UNDER_TEST {
+        if crate::is_default_system(system) {
             return self.candidate_binding.clone();
         }
-        let prefix = format!("DEJA_{}_CANDIDATE", system.to_uppercase().replace('-', "_"));
         let var = |suffix: &str, prism_default: &str| {
-            std::env::var(format!("{prefix}_{suffix}")).unwrap_or_else(|_| {
+            let name = crate::system_env_var(system, &format!("CANDIDATE_{suffix}"));
+            std::env::var(name).unwrap_or_else(|_| {
                 if system == "prism" {
                     prism_default.to_owned()
                 } else {
@@ -187,16 +187,14 @@ impl K8sExecutorConfig {
     /// hyperswitch's rendered env would be wrong, so absent profile data
     /// disables the copy rather than borrowing the default system's.
     pub fn config_source_for(&self, system: &str) -> ConfigSource {
-        if system == crate::DEFAULT_SYSTEM_UNDER_TEST {
+        if crate::is_default_system(system) {
             return self.config_source.clone();
         }
-        let prefix = format!(
-            "DEJA_{}_CONFIG_SOURCE",
-            system.to_uppercase().replace('-', "_")
-        );
         ConfigSource {
-            deployment: std::env::var(format!("{prefix}_DEPLOYMENT")).unwrap_or_default(),
-            container: std::env::var(format!("{prefix}_CONTAINER")).unwrap_or_default(),
+            deployment: std::env::var(crate::system_env_var(system, "CONFIG_SOURCE_DEPLOYMENT"))
+                .unwrap_or_default(),
+            container: std::env::var(crate::system_env_var(system, "CONFIG_SOURCE_CONTAINER"))
+                .unwrap_or_default(),
         }
     }
 }

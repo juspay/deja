@@ -137,6 +137,25 @@ pub enum RunStatus {
 /// require an orchestrator recompile.
 pub const DEFAULT_SYSTEM_UNDER_TEST: &str = "hyperswitch";
 
+/// Whether `system` is the default system under test. Every per-system lookup
+/// short-circuits on this BEFORE reading any profile variable, so the default
+/// system can never be made to depend on one existing.
+pub fn is_default_system(system: &str) -> bool {
+    system == DEFAULT_SYSTEM_UNDER_TEST
+}
+
+/// THE name of a per-system environment variable: `DEJA_<SYSTEM>_<SUFFIX>`,
+/// upper-cased with `-` folded to `_` so a hyphenated system name is still a
+/// legal variable name.
+///
+/// One spelling of that transform, because the failure mode of a second one is
+/// not a compile error. A deployment sets these by hand; a caller that folded
+/// the name differently would read a variable nobody sets and silently take the
+/// unconfigured path, which is the shape this codebase keeps paying for.
+pub fn system_env_var(system: &str, suffix: &str) -> String {
+    format!("DEJA_{}_{suffix}", system.to_uppercase().replace('-', "_"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     pub mode: RunMode,
@@ -895,6 +914,53 @@ mod schema_fingerprint_tests {
     fn new_sorts_and_dedups() {
         let fp = SchemaFingerprint::new(vec!["002".into(), "001".into(), "002".into()]);
         assert_eq!(fp.applied, vec!["001".to_string(), "002".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod system_env_tests {
+    use super::*;
+
+    #[test]
+    fn system_env_var_upper_cases_and_folds_hyphens() {
+        assert_eq!(
+            system_env_var("prism", "S3_BUCKET"),
+            "DEJA_PRISM_S3_BUCKET",
+            "the name a deployment actually sets (infra ships this one)"
+        );
+        // A hyphenated system must still produce a legal variable name; `-` is
+        // not valid in one, so it folds rather than passing through.
+        assert_eq!(
+            system_env_var("payment-core", "JOB_TEMPLATE_KEY"),
+            "DEJA_PAYMENT_CORE_JOB_TEMPLATE_KEY"
+        );
+        assert!(!system_env_var("payment-core", "X").contains('-'));
+    }
+
+    #[test]
+    fn only_the_default_system_short_circuits() {
+        assert!(is_default_system(DEFAULT_SYSTEM_UNDER_TEST));
+        assert!(is_default_system("hyperswitch"));
+        // Near-misses are NOT the default system. This is the sharp edge of
+        // free-form data: each of these takes the non-default path.
+        for near in ["Hyperswitch", "hyperswitch ", "HYPERSWITCH", "prism", ""] {
+            assert!(
+                !is_default_system(near),
+                "{near:?} must not be treated as the default system"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spec_with_no_system_resolves_to_the_default() {
+        // The legacy shape: `system_under_test` absent entirely.
+        let legacy: RunSpec = serde_json::from_value(serde_json::json!({
+            "mode": "replay",
+            "candidate_spec": {"kind": "prebuilt_image", "image": "registry/hyperswitch:pr-42"},
+        }))
+        .expect("legacy spec parses");
+        assert_eq!(legacy.system(), DEFAULT_SYSTEM_UNDER_TEST);
+        assert!(is_default_system(legacy.system()));
     }
 }
 
