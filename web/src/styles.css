@@ -611,6 +611,16 @@ main:has(.recintro) { max-width: 1440px; }
 .hiddentbl td { padding: 2px var(--s2); border-bottom: 1px solid var(--border-muted); }
 .hiddentbl td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-subtle); }
 
+/* ---- scored-span field table (record vs replay, in the detail panel) ---- */
+.scoredfields { margin-bottom: var(--s3); }
+.fieldtbl { width: 100%; border-collapse: collapse; font-size: var(--fs-11); margin-top: var(--s2); table-layout: fixed; }
+.fieldtbl th { text-align: left; padding: 2px var(--s2); color: var(--text-subtle); font-weight: 600; }
+.fieldtbl th:first-child, .fieldtbl td:first-child { width: 30%; }
+.fieldtbl td { padding: 2px var(--s2); border-bottom: 1px solid var(--border-muted); vertical-align: top; }
+.fieldtbl td.val { word-break: break-all; }
+.fieldtbl tr.fdiff td { background: rgba(248,81,73,0.16); color: var(--red-fg); }
+.fieldtbl tr.fvolatile td.val { color: var(--text-subtle); }
+
 /* ---- the two panes ---- */
 .uvbody { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s3); align-items: start; }
 @media (max-width: 1180px) { .uvbody { grid-template-columns: minmax(0, 1fr); } }

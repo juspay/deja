@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api, CallRecord, HttpDiff, Scorecard, SpanShapeOutcome } from "../lib/api";
+import { api, CallRecord, GraphNode, HttpDiff, Scorecard, SpanShapeOutcome } from "../lib/api";
 import {
   ancestorKeys,
   buildSpine,
@@ -419,16 +419,84 @@ function HiddenList({ label, groups }: { label: string; groups: SpineNode["hidde
   );
 }
 
+/** Node-id → node lookup per side, for reading a scored span's captured fields. */
+type GraphIndex = { rec: Map<number, GraphNode>; rep: Map<number, GraphNode> };
+
+function ScoredFields({ scored, graphIndex }: { scored: SpanShapeOutcome; graphIndex: GraphIndex }) {
+  const recNode =
+    scored.record_node_id != null ? graphIndex.rec.get(scored.record_node_id) : undefined;
+  const repNode =
+    scored.replay_node_id != null ? graphIndex.rep.get(scored.replay_node_id) : undefined;
+
+  const keys = Array.from(
+    new Set([...Object.keys(recNode?.fields ?? {}), ...Object.keys(repNode?.fields ?? {})]),
+  ).sort();
+  if (keys.length === 0) return null;
+
+  const show = (v: unknown) =>
+    v === undefined ? "—" : typeof v === "string" ? v : JSON.stringify(v);
+  const diffKeys = new Set((scored.field_diffs ?? []).map((d) => d.key));
+
+  return (
+    <div className="scoredfields">
+      <div className="hint">
+        scored span fields — captured on each side, compared by the span-shape check
+      </div>
+      <table className="fieldtbl">
+        <thead>
+          <tr>
+            <th>field</th>
+            <th>record</th>
+            <th>replay</th>
+          </tr>
+        </thead>
+        <tbody>
+          {keys.map((k) => {
+            const rv = show(recNode?.fields?.[k]);
+            const pv = show(repNode?.fields?.[k]);
+            const flagged = diffKeys.has(k);
+            // Differs on the two sides yet not flagged by the scorer = a
+            // volatile key the check deliberately skips (request_id and kin).
+            const volatile = !flagged && !!recNode && !!repNode && rv !== pv;
+            return (
+              <tr
+                key={k}
+                className={flagged ? "fdiff" : volatile ? "fvolatile" : undefined}
+                title={volatile ? "differs, but not compared — volatile key" : undefined}
+              >
+                <td className="mono">{k}</td>
+                <td className="mono val">{rv}</td>
+                <td className="mono val">{pv}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {scored.status === "missing" && (
+        <p className="hint">replay never executed this span — nothing to compare against.</p>
+      )}
+      {scored.status === "novel" && (
+        <p className="hint">
+          the tape has no such span — the replay side carries instrumentation the recording
+          predates.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function SpanDetail({
   node,
   selected,
   onPick,
   boundaryNotes,
+  graphIndex,
 }: {
   node: SpineNode;
   selected: { nodeId: number | null; side: Side };
   onPick: (nodeId: number, side: Side) => void;
   boundaryNotes: Record<string, string | null>;
+  graphIndex: GraphIndex;
 }) {
   // A row is a SITE. When it holds several instances the panel enumerates them
   // and each one is separately addressable, because `(correlation, span_path)`
@@ -480,6 +548,7 @@ function SpanDetail({
       )}
 
       <div className="uvdbody">
+        {node.scored && <ScoredFields scored={node.scored} graphIndex={graphIndex} />}
         {empty && <NoEvidence n={node} />}
         {node.http.map((d, i) => (
           <Response key={`h${i}`} d={d} />
@@ -570,6 +639,16 @@ export default function UnifiedView({
   const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId) });
   const https = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId) });
   const graph = useQuery({ queryKey: ["graph", runId], queryFn: () => api.graph(runId) });
+
+  // Node-id → node per side, so the detail panel can read a scored span's
+  // captured fields. Re-keys the already-fetched graph; no extra request.
+  const graphIndex = React.useMemo<GraphIndex>(() => {
+    const rec = new Map<number, GraphNode>();
+    const rep = new Map<number, GraphNode>();
+    for (const n of graph.data?.record ?? []) rec.set(n.node_id, n);
+    for (const n of graph.data?.replay ?? []) rep.set(n.node_id, n);
+    return { rec, rep };
+  }, [graph.data]);
 
   // The scored-span contract sections, keyed by correlation, for the graft.
   const spanShapes = React.useMemo(() => {
@@ -818,6 +897,7 @@ export default function UnifiedView({
             selected={{ nodeId: wantNode, side: wantSide }}
             onPick={(nodeId, side) => select(selectedNode, { nodeId, side })}
             boundaryNotes={boundaryNotes}
+            graphIndex={graphIndex}
           />
         )}
       </div>
