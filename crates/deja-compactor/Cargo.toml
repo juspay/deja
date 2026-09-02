@@ -16,6 +16,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt"] }
 zstd = "0.13"
+# The declared configuration (`settings`): systems are declared in one TOML
+# document with `DEJA__*` environment overrides, the convention the router and
+# UCS already use. It lives in THIS crate because both readers need it and the
+# orchestrator depends on this one, never the reverse.
+config = { version = "0.15.25", default-features = false, features = ["toml"] }
+# So a bad value names its field (`systems.prism.manages_stores`) rather than a
+# line and column — the deployment can act on the first and not the second.
+serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
 # The seal's write ORDER is the safety property, and asserting it needs an

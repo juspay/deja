@@ -7,6 +7,7 @@ import { RunLaunchModal } from "../components/RunLaunchModal";
 import { RecordingPicker, RecordingSummary } from "../components/RecordingPicker";
 import { CorrelationPicker } from "../components/CorrelationPicker";
 import { spanOf } from "../lib/recordings";
+import { useSystems } from "../lib/systems";
 import { CORRELATION_CAP, useCorrelationCandidates } from "../lib/correlations";
 
 function shellQuote(value: string): string {
@@ -61,9 +62,18 @@ export default function NewRunPage() {
   // A recordings-page link from a scoped (per-system bucket) listing arrives
   // with `?system=` + `?s3=` already resolved — the row knows its own source,
   // and retyping either is how the wrong-bucket replay happened.
+  // Empty until the registry loads, then the deployment's default. This app no
+  // longer names a system: which one is default is the orchestrator's to state,
+  // and hard-coding it here made adding a system a change in two repositories.
+  const systems = useSystems();
   const [systemUnderTest, setSystemUnderTest] = React.useState(
-    params.get("system") ?? "hyperswitch",
+    params.get("system") ?? "",
   );
+  React.useEffect(() => {
+    if (!systemUnderTest && systems.defaultSystem) {
+      setSystemUnderTest(systems.defaultSystem.name);
+    }
+  }, [systemUnderTest, systems.defaultSystem]);
   const [imageRef, setImageRef] = React.useState("");
   const [candidateRepo, setCandidateRepo] = React.useState("");
   const [s3Path, setS3Path] = React.useState(params.get("s3") ?? "");
@@ -130,14 +140,19 @@ export default function NewRunPage() {
       // (auto-resolved when the prefix holds exactly one session).
       recording_id: recordingId.trim() || (s3Path ? null : "<recording_id>"),
     };
-    // hyperswitch is the wire default; only a non-default system is sent, so
-    // existing curl recipes and stored rows keep meaning what they meant.
-    if (systemUnderTest !== "hyperswitch") spec.system_under_test = systemUnderTest;
-    // Prism declares its instrumentation contract: every recorded ucs::* /
-    // connector::* span must replay, with equal field values (the span-shape
-    // check). Sent by default because a prism run without it silently skips
-    // that verification tier.
-    if (systemUnderTest === "prism") spec.scored_span_namespaces = ["ucs::", "connector::"];
+    // Only a non-default system is sent, so existing curl recipes and stored
+    // rows keep meaning what they meant. Which name that is comes from the
+    // orchestrator rather than from a literal here.
+    if (systemUnderTest && !systems.isDefault(systemUnderTest)) {
+      spec.system_under_test = systemUnderTest;
+    }
+    // `scored_span_namespaces` is deliberately NOT set here any more. Which
+    // spans a system scores is that system's instrumentation contract, and it
+    // used to be sent from this form — so a run started from the API or from a
+    // pipeline arrived with an empty list and silently skipped that whole
+    // verification tier, for the same system and the same recording. The
+    // orchestrator now applies the system's declared namespaces to every run,
+    // whoever started it. A run still overrides them by sending its own.
     if (s3Path) spec.s3_source = { path: s3Path };
     if (candidateRepo.trim()) spec.candidate_repo = candidateRepo.trim();
     // The DEFAULT IS SENT, not left implicit, whenever the ids are knowable:
@@ -298,8 +313,12 @@ export default function NewRunPage() {
             value={systemUnderTest}
             onChange={(e) => setSystemUnderTest(e.target.value)}
           >
-            <option value="hyperswitch">hyperswitch</option>
-            <option value="prism">prism (UCS)</option>
+            {systems.selectable.map((sys) => (
+              <option key={sys.name} value={sys.name}>
+                {sys.name}
+                {sys.is_default ? " (default)" : ""}
+              </option>
+            ))}
           </select>
         </label>
 

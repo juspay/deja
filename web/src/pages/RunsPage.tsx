@@ -144,10 +144,10 @@ export default function RunsPage() {
                 <span className="rl-cand mono" title={cand.full}>
                   {cand.label}
                   {/* Only a non-default system is worth a badge — every legacy
-                      row is hyperswitch and would just repeat itself. */}
-                  {systemUnderTest(r) !== "hyperswitch" && (
-                    <> · {systemUnderTest(r)}</>
-                  )}
+                      row named nothing and would just repeat itself. Presence
+                      IS the test: the wire contract says an absent value means
+                      the default, so this needs no name to compare against. */}
+                  {systemUnderTest(r) && <> · {systemUnderTest(r)}</>}
                 </span>
                 <span className="rl-rec mono">{r.recording_id ?? "—"}</span>
                 <span className="rl-said" title={said ?? undefined}>{said ?? "—"}</span>

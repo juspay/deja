@@ -46,6 +46,34 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub mod settings;
+
+/// One lock for every test that touches the declared configuration.
+///
+/// The declaration is process-global — `std::env` — and `cargo test` runs a
+/// crate's tests on parallel threads sharing it. WRITERS hold this so they do
+/// not clobber each other; READERS hold it too, because a reader that loads
+/// while a writer has a different document in place gets a torn answer and
+/// fails a test that had nothing to do with it.
+///
+/// This is a SECOND lock, not a copy of the orchestrator's, and that is correct
+/// rather than duplication: `cargo test` builds one test binary per crate and
+/// runs them as separate processes, so there is no environment shared between
+/// them for a single lock to guard. A lock reached across the crate boundary
+/// would suggest a coordination that does not exist.
+#[cfg(test)]
+pub(crate) mod test_env {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold this as the FIRST statement of any test that reads or writes the
+    /// declaration. Placed after a cleanup line, that cleanup runs unlocked and
+    /// produces a flake that looks like it belongs to whichever test lost.
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not wedge every later one.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, WriteMultipart};

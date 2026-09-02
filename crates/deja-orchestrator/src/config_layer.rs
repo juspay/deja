@@ -586,6 +586,7 @@ z = 1
 
     #[test]
     fn merged_output_reparses_with_tables_after_values() {
+        let _lock = crate::test_env::env_guard();
         // TOML forbids a bare value after a table header at the same level; a
         // merge that reorders keys can produce a document that does not parse.
         // Serializing through `toml::to_string` must keep the output loadable.
@@ -601,6 +602,7 @@ z = 1
 
     #[test]
     fn invalid_base_toml_is_named_as_such() {
+        let _lock = crate::test_env::env_guard();
         let err = layer_toml("this is not toml", "a = 1").expect_err("must fail");
         assert!(
             err.contains("--base config is not valid TOML"),
@@ -610,6 +612,7 @@ z = 1
 
     #[test]
     fn invalid_over_toml_is_named_as_such() {
+        let _lock = crate::test_env::env_guard();
         let err = layer_toml("a = 1", "this is not toml").expect_err("must fail");
         assert!(
             err.contains("--over config is not valid TOML"),

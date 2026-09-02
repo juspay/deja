@@ -20,7 +20,37 @@ pub mod lifecycle;
 pub mod lookup;
 pub mod s3;
 pub mod scope;
+/// The declared configuration, defined in `deja-compactor` and re-exported here
+/// so `crate::settings` keeps meaning what it meant.
+///
+/// It lives in the lower crate because BOTH read the same document: the
+/// orchestrator resolves a system to launch it, and the compactor resolves the
+/// same system to find its recordings. `deja-orchestrator` depends on
+/// `deja-compactor` and the compactor depends on nothing of ours, so the
+/// compactor is the only place both can reach — defining it here would leave the
+/// sealer re-deriving the convention from environment variables and drifting the
+/// moment the document changed shape, which is what it was doing.
+pub use deja_compactor::settings;
 pub mod store;
+pub mod system;
+
+/// One lock for every test that touches the declared configuration.
+///
+/// The configuration is read from process-global environment, and cargo runs
+/// tests on parallel threads sharing it. WRITERS hold this so they do not
+/// clobber each other; READERS hold it too, because a reader that resolves a
+/// system while a writer has a different document in place gets a torn answer
+/// and fails a test that had nothing to do with it. Per-name discipline cannot
+/// separate them — there is one document — so they take turns.
+#[cfg(test)]
+pub(crate) mod test_env {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test must not wedge every later one.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// Specification of a candidate Hyperswitch identity. All five resolution
 /// modes promised in the plan; only `LocalPath` has a real backing impl in
@@ -137,11 +167,34 @@ pub enum RunStatus {
 /// require an orchestrator recompile.
 pub const DEFAULT_SYSTEM_UNDER_TEST: &str = "hyperswitch";
 
-/// Whether `system` is the default system under test. Every per-system lookup
-/// short-circuits on this BEFORE reading any profile variable, so the default
-/// system can never be made to depend on one existing.
+/// The name of the default system: `default_system` in the declared
+/// configuration, else the compiled-in name.
+///
+/// Read once and held for the life of the process. Which system is default is
+/// a deployment fact, and a fact that could change between two calls would let
+/// a run be admitted under one default and launched under another. The cost is
+/// that a test of the override has to run in its own process; the fallback is
+/// tested in-process.
+///
+/// The default system is declared like any other — `DEJA_<NAME>_*` — and this
+/// only says which declared system a caller gets by naming nothing. It used to
+/// be the one system that read UNSUFFIXED variables and ignored its own
+/// `DEJA_<NAME>_*` pair, which made it a different shape from every other
+/// system and meant the deployment could not be read as a list of systems with
+/// one of them marked default. The unsuffixed names still work, as a fallback
+/// for the default system only, so nothing deployed today changes meaning.
+pub fn default_system() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        // The declared configuration names its default; the compiled-in name
+        // is only for a process with no declaration at all.
+        system::declared_default().unwrap_or_else(|| DEFAULT_SYSTEM_UNDER_TEST.to_owned())
+    })
+}
+
+/// Whether `system` is the default system under test.
 pub fn is_default_system(system: &str) -> bool {
-    system == DEFAULT_SYSTEM_UNDER_TEST
+    system == default_system()
 }
 
 /// Whether the harness manages this system's stores: migrating the sidecar
@@ -168,18 +221,13 @@ pub fn is_default_system(system: &str) -> bool {
 /// source decided, so a declaration that was ignored is visible rather than
 /// silent.
 pub fn system_manages_stores(system: &str) -> bool {
-    system_manages_stores_declared(system).unwrap_or_else(|| is_default_system(system))
+    system::system_config(system).manages_stores
 }
 
 /// The declaration alone, absent the default — so a caller can report whether
 /// the answer was declared or inherited.
 pub fn system_manages_stores_declared(system: &str) -> Option<bool> {
-    let raw = std::env::var(system_env_var(system, "MANAGES_STORES")).ok()?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
+    system::system_config(system).manages_stores_declared
 }
 
 /// THE name of a per-system environment variable: `DEJA_<SYSTEM>_<SUFFIX>`,
@@ -246,7 +294,7 @@ impl RunSpec {
         self.system_under_test
             .as_deref()
             .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_SYSTEM_UNDER_TEST)
+            .unwrap_or_else(|| default_system())
     }
 
     /// How many times the record workload is driven. THE definition of the
@@ -341,7 +389,19 @@ impl RunParams {
                 .ids()
                 .map(|ids| ids.iter().cloned().collect()),
             workload: spec.resolved_workload(),
-            scored_span_namespaces: spec.scored_span_namespaces.clone(),
+            // Which span namespaces are scored is the SYSTEM's instrumentation
+            // contract, so the system declares it and a run only overrides it.
+            // It used to be sent by the caller, which in practice meant the
+            // dashboard held `if system == "prism"` and a literal `["ucs::",
+            // "connector::"]` — another system's schema living in deja's UI,
+            // reachable only by whoever went through that form. A run created
+            // by the API or by CI got an empty list and silently scored
+            // nothing, for the same system.
+            scored_span_namespaces: if spec.scored_span_namespaces.is_empty() {
+                system::system_config(spec.system()).scored_span_namespaces
+            } else {
+                spec.scored_span_namespaces.clone()
+            },
             expectation: expectation.map(str::to_owned),
         }
     }
@@ -1008,6 +1068,7 @@ mod system_env_tests {
 
     #[test]
     fn only_the_default_system_short_circuits() {
+        let _lock = crate::test_env::env_guard();
         assert!(is_default_system(DEFAULT_SYSTEM_UNDER_TEST));
         assert!(is_default_system("hyperswitch"));
         // Near-misses are NOT the default system. This is the sharp edge of
@@ -1024,6 +1085,7 @@ mod system_env_tests {
     /// one test rather than as separate ones racing the same names.
     #[test]
     fn store_management_is_declared_not_inferred_from_the_name() {
+        let _lock = crate::test_env::env_guard();
         // BEHAVIOUR PRESERVING: undeclared, the answer is exactly what the
         // name-based predicate used to give.
         assert!(system_manages_stores(DEFAULT_SYSTEM_UNDER_TEST));
@@ -1035,32 +1097,43 @@ mod system_env_tests {
         // harness-managed stores can now say so. Under the old predicate it was
         // silently stateless — skipping migration, the fail-closed schema gate,
         // the flush and the seeding — for no reason but its name.
-        std::env::set_var("DEJA_PAYMENT_CORE_MANAGES_STORES", "true");
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.payment-core]\nmanages_stores = true\n",
+        );
         assert!(
             system_manages_stores("payment-core"),
             "a declared stateful system must not be treated as stateless"
         );
         assert_eq!(system_manages_stores_declared("payment-core"), Some(true));
-        std::env::remove_var("DEJA_PAYMENT_CORE_MANAGES_STORES");
+        std::env::remove_var("DEJA_CONFIG_TOML");
         assert!(!system_manages_stores("payment-core"));
 
         // …and the default system can be told it does not, which the name-based
         // predicate could not express at all.
-        std::env::set_var("DEJA_HYPERSWITCH_MANAGES_STORES", "false");
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\nmanages_stores = false\n",
+        );
         assert!(!system_manages_stores("hyperswitch"));
-        std::env::remove_var("DEJA_HYPERSWITCH_MANAGES_STORES");
+        std::env::remove_var("DEJA_CONFIG_TOML");
         assert!(system_manages_stores("hyperswitch"));
 
-        // An unrecognised value takes the system's default and reports itself
-        // as undeclared, so the lifecycle can say the declaration was ignored.
-        std::env::set_var("DEJA_PRISM_MANAGES_STORES", "ture");
+        // An unrecognised value is a configuration error: the system reports
+        // itself as undeclared and takes its default, and carries the error so
+        // the lifecycle can say the declaration was not honoured.
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.prism]\nmanages_stores = \"ture\"\n",
+        );
         assert_eq!(system_manages_stores_declared("prism"), None);
         assert!(!system_manages_stores("prism"));
-        std::env::remove_var("DEJA_PRISM_MANAGES_STORES");
+        std::env::remove_var("DEJA_CONFIG_TOML");
     }
 
     #[test]
     fn a_spec_with_no_system_resolves_to_the_default() {
+        let _lock = crate::test_env::env_guard();
         // The legacy shape: `system_under_test` absent entirely.
         let legacy: RunSpec = serde_json::from_value(serde_json::json!({
             "mode": "replay",

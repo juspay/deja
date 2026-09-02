@@ -171,7 +171,8 @@ pub fn launch_spec_for_run(
     // does not carry this environment's candidate config.
     if let Some(uri) = code_bundle_uri {
         for container in [&cfg.migrations_init_container, &cfg.config_init_container] {
-            env.push(EnvUpsert::new(container, &cfg.code_bundle_uri_env, uri));
+            let uri_env = cfg.code_bundle_uri_env_for(run.spec.system());
+            env.push(EnvUpsert::new(container, uri_env, uri));
         }
     }
 
@@ -686,6 +687,7 @@ mod tests {
 
     #[test]
     fn candidate_artifact_paths_are_on_the_job_mount() {
+        let _lock = crate::test_env::env_guard();
         let mut cfg = K8sExecutorConfig::from_env();
         cfg.job_state_dir = "/workspace/state".into();
         let run = pending_replay_run("run-42");
@@ -719,6 +721,18 @@ mod tests {
     /// key and the binding both follow the run's system, in the same spec.
     #[test]
     fn a_prism_run_resolves_its_own_template_key_and_binding() {
+        let _lock = crate::test_env::env_guard();
+        // Declared, not shipped. deja used to carry another system's variable
+        // names in a built-in table; they are the deployment's to state, so the
+        // test states them the way the deployment does. Without the
+        // declaration this run boots reading the DEFAULT system's names — which
+        // the assertion at the end of this test checks, because that failure is
+        // silent at launch and only shows up as a candidate that never sees its
+        // run.
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.prism]\ncandidate_env_prefix = \"CS__\"\n",
+        );
         let cfg = K8sExecutorConfig::from_env();
         let run = Run {
             run_id: "run-43".into(),
@@ -757,10 +771,27 @@ mod tests {
             "the prism binding names carry the replay contract"
         );
         // And a default-system run keeps the base key untouched.
-        let mut base = run;
+        let mut base = run.clone();
         base.spec.system_under_test = None;
         let spec = launch_spec_for_run(&base, &cfg, None, None).expect("spec builds");
         assert_eq!(spec.template_key, cfg.template_key);
+
+        // Undeclared, the same prism run falls back to the DEFAULT system's
+        // variable names. That is the failure the declaration above prevents,
+        // and it is worth pinning: nothing fails at launch, so it surfaces only
+        // as a candidate that boots and never sees its run.
+        std::env::remove_var("DEJA_CONFIG_TOML");
+        let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
+        assert!(
+            !spec.env.iter().any(|e| e.name == "CS__DEJA__RUN_ID"),
+            "an undeclared binding must not conjure the names from nowhere"
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|e| e.name == cfg.candidate_binding.run_id_env),
+            "it falls back to the base binding, which is the silent failure"
+        );
     }
 
     /// Both steps that consume the CodeBundle must be pointed at the SAME
@@ -770,6 +801,7 @@ mod tests {
     /// while failing to explain which bundle its config came from.
     #[test]
     fn the_bundle_uri_reaches_every_step_that_reads_the_bundle() {
+        let _lock = crate::test_env::env_guard();
         let cfg = K8sExecutorConfig::from_env();
         let run = pending_replay_run("run-42");
         let uri = "s3://bundles/codebundles/abc123/bundle-v2.tar";
@@ -890,6 +922,7 @@ mod tests {
 
     #[test]
     fn build_job_copies_recorded_env_and_checks_its_secrets() {
+        let _lock = crate::test_env::env_guard();
         // template CM, then the source Deployment, then the secret existence probe.
         let api = KubeApi::new(FakeTransport::new(vec![
             resp(200, template_cm()),
@@ -967,6 +1000,7 @@ mod tests {
 
     #[test]
     fn build_job_fetches_template_and_applies_patch() {
+        let _lock = crate::test_env::env_guard();
         let api = KubeApi::new(FakeTransport::new(vec![resp(200, template_cm())]));
         let job = build_job(&api, &spec()).expect("built");
 

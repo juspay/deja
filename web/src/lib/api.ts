@@ -21,7 +21,11 @@ export type CandidateSpecRow =
 export type RunParams = {
   mode: "record" | "replay";
   candidate_spec: CandidateSpecRow;
-  /** Which system the run drives ("hyperswitch" | "prism" | ...); absent = hyperswitch. */
+  /** Which system the run drives. Absent means the deployment's DEFAULT system,
+   *  which this app deliberately does not name: the set of systems and which of
+   *  them is default are the orchestrator's to state, and it states them at
+   *  `/api/v1/systems`. Hard-coding a name here made adding a system a change in
+   *  two repositories and two languages. */
   system_under_test?: string;
   candidate_repo?: string;
   recording_id: string | null;
@@ -339,7 +343,34 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T;
 }
 
+/** One system this orchestrator can replay, as it resolved from the deployment.
+ *
+ * Every field here is something the environment declared. `configured` false
+ * means the system is named but cannot run — reported rather than hidden,
+ * because a missing row is indistinguishable from a system nobody has heard of.
+ * `error` is set when a declaration could not be parsed, and such a system must
+ * not be offered as a choice. */
+export type SystemRow = {
+  name: string;
+  is_default: boolean;
+  configured: boolean;
+  s3_bucket?: string | null;
+  recording_root?: string | null;
+  manages_stores: boolean;
+  manages_stores_declared?: boolean | null;
+  has_code_bundle: boolean;
+  job_template_key?: string | null;
+  candidate_image_repo?: string | null;
+  instance_pattern?: string | null;
+  scored_span_namespaces: string[];
+  candidate_config_files?: string[] | null;
+  code_bundle_uri_env?: string | null;
+  warnings?: string[];
+  error?: string | null;
+};
+
 export const api = {
+  systems: () => request<{ systems: SystemRow[] }>("/api/v1/systems"),
   recordings: () => request<RecordingRow[]>("/api/v1/recordings"),
   runs: () => request<RunRow[]>("/api/v1/runs"),
   run: (id: string) => request<RunRow>(`/api/v1/runs/${id}`),
@@ -440,7 +471,7 @@ export type AvailableRecording = {
    *  only the unambiguous rec-<sha>-… case. Null = genuinely unknown — the
    *  run-<nanos> shape alone is ambiguous (old router recorders minted it
    *  too), and a wrong badge once sent a router tape into a prism replay. */
-  system?: "hyperswitch" | "prism" | null;
+  system?: string | null;
   /** The bucket the session was found in. With a `?system=` scoped listing
    *  this differs from the default bucket, and a replay needs it to build
    *  `s3_source` (`s3://{bucket}/{prefix}`). */

@@ -180,7 +180,9 @@ pub fn manifest_from_repo(repo_dir: &Path, sha: &str) -> Result<SchemaFingerprin
 
 /// The env var naming the candidate-ref files the bundle carries ALONGSIDE
 /// `migrations/`, as repo-relative paths separated by commas or whitespace.
-pub const CANDIDATE_CONFIG_FILES_ENV: &str = "DEJA_CANDIDATE_CONFIG_FILES";
+/// Where a system declares the config files its bundle carries. Named in the
+/// messages below so an operator reading one knows what to set.
+pub const CANDIDATE_CONFIG_FILES_SETTING: &str = "systems.<name>.candidate_config_files";
 
 /// The candidate-ref files the bundle carries alongside `migrations/` — the
 /// system under test's own config at `sha_C`, whatever that system calls it and
@@ -205,21 +207,20 @@ pub const CANDIDATE_CONFIG_FILES_ENV: &str = "DEJA_CANDIDATE_CONFIG_FILES";
 /// one list, which is exactly as many systems as the bundle producer is
 /// reached for today.
 fn candidate_config_files() -> Vec<String> {
-    candidate_config_files_from(std::env::var(CANDIDATE_CONFIG_FILES_ENV).ok().as_deref())
+    candidate_config_files_for(crate::default_system())
 }
 
-/// Parse the setting: comma- or whitespace-separated repo-relative paths.
-/// Separated from the environment so it is testable, and so a malformed entry
-/// (absolute, or climbing out of the repo) is dropped HERE rather than becoming
-/// a `git archive` pathspec that means something unintended.
-fn candidate_config_files_from(raw: Option<&str>) -> Vec<String> {
-    raw.unwrap_or_default()
-        .split([',', ' ', '\t', '\n'])
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .filter(|p| !p.starts_with('/') && !p.split('/').any(|seg| seg == ".."))
-        .map(str::to_owned)
-        .collect()
+/// The list for one system: its declaration, else nothing. Undeclared never
+/// borrows another system's paths — that is the failure `config_source_for`
+/// already refuses to have — and the bundle producer warns by name when a
+/// system with a bundle declares no files.
+/// The call sites above still ask for the default system, because it is the
+/// only bundle publisher reached today; threading `RunSpec::system()` to them
+/// is what a second publisher needs, and nothing else changes for it.
+pub fn candidate_config_files_for(system: &str) -> Vec<String> {
+    crate::system::system_config(system)
+        .candidate_config_files
+        .unwrap_or_default()
 }
 
 /// The candidate's `migrations/` tree at `sha` as a tar (git archive reads the
@@ -240,7 +241,7 @@ pub fn produce_tar(repo_dir: &Path, sha: &str) -> Result<Vec<u8>, String> {
         // when the file it was told to expect is not in the bundle, but that is
         // one pod away and this is where the decision was made.
         eprintln!(
-            "codebundle: {CANDIDATE_CONFIG_FILES_ENV} is unset, so the bundle for {sha} carries \
+            "codebundle: {CANDIDATE_CONFIG_FILES_SETTING} is not declared, so the bundle for {sha} carries \
              migrations only and no candidate config"
         );
     }
@@ -336,7 +337,7 @@ impl BundleSource {
             }
             Self::Staged { replaced_missing } => format!(
                 "RE-STAGED: the bundle already present for this sha did not carry {replaced_missing:?}, \
-                 which this deployment asks for via {CANDIDATE_CONFIG_FILES_ENV}"
+                 which this deployment asks for via {CANDIDATE_CONFIG_FILES_SETTING}"
             ),
         }
     }
@@ -356,7 +357,7 @@ fn warn_if_still_missing(tar: &[u8], configured: &[String], sha: &str) {
         Ok(missing) if !missing.is_empty() => eprintln!(
             "codebundle: the bundle just produced for {sha} still does not carry {missing:?} — \
              those paths do not exist at that ref, so every run will re-stage and then refuse at \
-             the config layering step. Fix {CANDIDATE_CONFIG_FILES_ENV} or the ref."
+             the config layering step. Fix {CANDIDATE_CONFIG_FILES_SETTING} or the ref."
         ),
         _ => {}
     }
@@ -844,46 +845,6 @@ mod tests {
     /// the setting is parsed as data — and a path that could mean something
     /// unintended as a `git archive` pathspec is dropped here rather than
     /// handed to git.
-    #[test]
-    fn the_configured_file_list_is_parsed_as_data_and_sanitised() {
-        assert!(candidate_config_files_from(None).is_empty());
-        assert!(candidate_config_files_from(Some("   ")).is_empty());
-        assert_eq!(
-            candidate_config_files_from(Some("a/one.toml, b/two.toml")),
-            vec!["a/one.toml".to_owned(), "b/two.toml".to_owned()]
-        );
-        // Whitespace and newlines separate too, so the value can be written as a
-        // YAML block in a chart without becoming one long path.
-        assert_eq!(
-            candidate_config_files_from(Some("a/one.toml\n  b/two.toml\t c/three.toml")),
-            vec![
-                "a/one.toml".to_owned(),
-                "b/two.toml".to_owned(),
-                "c/three.toml".to_owned()
-            ]
-        );
-        // Escaping the repo is not expressible: an absolute path or a `..`
-        // segment is dropped, not passed to git.
-        assert_eq!(
-            candidate_config_files_from(Some("/etc/passwd, ../../secrets.toml, ok/keep.toml")),
-            vec!["ok/keep.toml".to_owned()]
-        );
-    }
-
-    #[test]
-    fn the_exact_rendered_chart_value_parses() {
-        let rendered = "config/deployments/sandbox.toml, config/deployments/production.toml, config/development.toml, config/superposition_seed.toml";
-        assert_eq!(
-            candidate_config_files_from(Some(rendered)),
-            vec![
-                "config/deployments/sandbox.toml".to_owned(),
-                "config/deployments/production.toml".to_owned(),
-                "config/development.toml".to_owned(),
-                "config/superposition_seed.toml".to_owned(),
-            ]
-        );
-    }
-
     /// A real bundle, produced the way the producer produces one, carrying the
     /// files `configured` asks for.
     fn bundle_carrying(configured: &[String], extra: &[(&str, &[u8])]) -> Vec<u8> {
@@ -994,7 +955,7 @@ mod tests {
             "a re-stage must name what was missing: {restaged}"
         );
         assert!(
-            restaged.contains(CANDIDATE_CONFIG_FILES_ENV),
+            restaged.contains(CANDIDATE_CONFIG_FILES_SETTING),
             "and point at the setting that asked for it: {restaged}"
         );
         // The three are mutually distinguishable, which is the property that

@@ -195,9 +195,14 @@ export function whatHappened(run: RunRow): string | null {
   return run.scorecard?.verdict?.reason?.trim() || failureText(run);
 }
 
-/** The run's system under test, with the wire default applied. */
-export function systemUnderTest(run: RunRow): string {
-  return runParams(run)?.system_under_test || "hyperswitch";
+/** The run's system under test as the caller stated it, or null when it stated
+ *  nothing — which on the wire means the deployment's default system.
+ *
+ *  Deliberately not resolved to a name here. Which system is default is the
+ *  orchestrator's to say (`/api/v1/systems`), and substituting a literal made
+ *  every reader of this function quietly assume the same one. */
+export function systemUnderTest(run: RunRow): string | null {
+  return runParams(run)?.system_under_test || null;
 }
 
 /** A candidate ref rendered for a table cell, for every CandidateSpec kind. */

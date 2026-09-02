@@ -228,6 +228,7 @@ fn app_router(state: AppState) -> Router {
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
+        .route("/systems", get(v1_systems))
         .route("/recordings", get(v1_list_recordings))
         .route("/recordings/available", get(v1_available_recordings))
         .route(
@@ -688,24 +689,23 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// wearing a confident label, which is worse than a refusal that says what to
 /// set. Its root override is optional and only consulted once its bucket
 /// resolves.
-fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, String), String> {
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
-    let Some(system) = system.filter(|s| !deja_orchestrator::is_default_system(s)) else {
-        return Ok((default_bucket.to_owned(), root));
-    };
-    let bucket_var = deja_orchestrator::system_env_var(system, "S3_BUCKET");
-    let bucket = match std::env::var(&bucket_var) {
-        Ok(b) if !b.trim().is_empty() => b.trim().to_owned(),
-        _ => {
-            return Err(format!(
-                "system '{system}' has no recording bucket configured: set {bucket_var} on the orchestrator"
-            ))
-        }
-    };
-    let root = match std::env::var(deja_orchestrator::system_env_var(system, "RECORDING_ROOT")) {
-        Ok(r) if !r.trim().is_empty() => r.trim().to_owned(),
-        _ => root,
-    };
+fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
+    // Naming nothing means the default system, and the default system resolves
+    // through the same registry as every other — declared, not special. There
+    // is no fallback to the orchestrator's own bucket: a system that has not
+    // declared where its recordings are cannot be scanned for them.
+    let system = system.unwrap_or_else(|| deja_orchestrator::default_system());
+    let profile = deja_orchestrator::system::system_config(system);
+    let bucket = profile
+        .s3_bucket
+        .ok_or_else(|| {
+            format!(
+                "system '{system}' has no recording bucket declared: set systems.{system}.s3_bucket in the deja configuration"
+            )
+        })?;
+    let root = profile
+        .recording_root
+        .unwrap_or_else(|| "landing/v1".to_owned());
     Ok((bucket, root))
 }
 
@@ -725,13 +725,63 @@ fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, Str
 /// `?limit=` and `?offset=` page the result; `pulled` says whether the catalog
 /// already has it, so a picker can show what is ready versus what will be
 /// fetched on first use.
+/// The systems this deployment can replay, with the configuration each
+/// resolves to.
+///
+/// A discovery endpoint exists so that no CLIENT has to know the set. The
+/// dashboard used to carry it three times over — a two-option `<select>`, a
+/// TypeScript union that could not express a third system, and prism's own span
+/// namespaces written into a React component — so adding a system meant editing
+/// the browser as well as the orchestrator, in a language where the compiler
+/// enforced the omission. Everything below is data the deployment already
+/// stated; this only puts it where a caller can read it.
+///
+/// `configured` is the honest field: a system in this list may still be missing
+/// what it needs to run. Naming it here and saying it is unconfigured is a
+/// better answer than omitting it, which is indistinguishable from a system
+/// nobody has heard of.
+async fn v1_systems() -> Response {
+    let systems: Vec<serde_json::Value> = deja_orchestrator::system::registry()
+        .into_iter()
+        .map(|s| {
+            // Unusable if its declaration did not parse, whatever else resolved.
+            let configured = s.error.is_none() && (s.is_default || s.s3_bucket.is_some());
+            serde_json::json!({
+                "name": s.name,
+                "is_default": s.is_default,
+                "configured": configured,
+                "s3_bucket": s.s3_bucket,
+                "recording_root": s.recording_root,
+                "manages_stores": s.manages_stores,
+                "manages_stores_declared": s.manages_stores_declared,
+                "has_code_bundle": s.has_code_bundle,
+                "job_template_key": s.job_template_key,
+                "candidate_image_repo": s.candidate_image_repo,
+                "instance_pattern": s.instance_pattern,
+                "scored_span_namespaces": s.scored_span_namespaces,
+                "candidate_config_files": s.candidate_config_files,
+                "code_bundle_uri_env": s.code_bundle_uri_env,
+                // Declarations this deployment made that are not being used.
+                // Empty is the normal answer; a non-empty one is a
+                // configuration mistake that would otherwise be invisible,
+                // because every one of them degrades to a working default.
+                "warnings": s.warnings,
+                // Present only when the deployment stated something the
+                // orchestrator could not honour. Such a system must not be run.
+                "error": s.error,
+            })
+        })
+        .collect();
+    json_ok(serde_json::json!({ "systems": systems }))
+}
+
 async fn v1_available_recordings(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<AvailableQuery>,
 ) -> Response {
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
-    let root = match scan_scope(system_scope, &cfg.bucket) {
+    let root = match scan_scope(system_scope) {
         Ok((bucket, root)) => {
             cfg.bucket = bucket;
             root
@@ -784,23 +834,25 @@ async fn v1_available_recordings(
             // and replayed against a prism candidate: every request's
             // connection reset. Ambiguous stays null; a wrong label is worse
             // than none.
-            let prism_pattern =
-                std::env::var("DEJA_PRISM_INSTANCE_PATTERN").unwrap_or_else(|_| "ucs".to_owned());
-            let system = if let Some(system) = system_scope {
+            let system: Option<String> = if let Some(system) = system_scope {
                 // Scoped scan: the SOURCE BUCKET names the system — that is
                 // the whole point of keeping the buckets separate.
-                Some(system)
+                Some(system.to_owned())
             } else if !r.instances.is_empty() {
-                if r.instances.iter().any(|i| i.contains(&prism_pattern)) {
-                    Some("prism")
-                } else {
-                    Some("hyperswitch")
-                }
+                // Match every registered system's declared pod-name pattern. No
+                // match is UNKNOWN, not the default system: this arm used to
+                // return hyperswitch for any pod name it did not recognise,
+                // which made a third system silently mislabelled rather than
+                // merely unconfigured, against what the comment above says.
+                deja_orchestrator::system::system_from_instances(&r.instances)
             } else if matches!(
                 identity,
                 deja_orchestrator::RecordingIdentity::Described { .. }
             ) {
-                Some("hyperswitch")
+                // The id SHAPE is positive evidence for exactly one system: the
+                // `rec-<revision>-<time>-<instance>` form is the default
+                // recorder's. No other shape identifies its minter.
+                Some(deja_orchestrator::default_system().to_owned())
             } else {
                 None
             };
@@ -1484,47 +1536,51 @@ mod tests {
 
     #![allow(clippy::unwrap_used)]
 
-    /// These variables are process-global, so the scan-scope cases run under
-    /// one test rather than as separate ones racing the same names.
+    /// The bin's tests share one process environment too. See the lib's
+    /// `test_env` for why readers hold this as well as writers.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Naming the default system means what omitting it means, and both mean
+    /// the bucket the default system DECLARED. There is no fallback to the
+    /// orchestrator's own bucket any more: a system that has not declared where
+    /// its recordings are cannot be scanned for them, the default included.
     #[test]
     fn naming_the_default_system_means_what_omitting_it_means() {
-        const DEFAULT_BUCKET: &str = "hyperswitch-art";
-
-        // THE REGRESSION THIS FIXES. Omitting the parameter and naming the
-        // default system must give the same bucket. They did not: naming it
-        // was a 400, so a caller could reach the default system only by staying
-        // silent about it.
-        let omitted = super::scan_scope(None, DEFAULT_BUCKET).expect("absent system scans default");
-        let named = super::scan_scope(Some("hyperswitch"), DEFAULT_BUCKET)
-            .expect("naming the default system must not be refused");
-        assert_eq!(named, omitted);
-        assert_eq!(named.0, DEFAULT_BUCKET);
-
-        // Another system still MUST be configured, and is refused by name — the
-        // variable is the whitelist, and scanning the default bucket under
-        // another system's label would be a wrong answer wearing a confident
-        // one.
-        let err = super::scan_scope(Some("prism"), DEFAULT_BUCKET)
-            .expect_err("an unconfigured system must be refused, not defaulted");
-        assert!(
-            err.contains("DEJA_PRISM_S3_BUCKET"),
-            "the refusal names the var: {err}"
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let default = deja_orchestrator::default_system();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            format!(
+                "[systems.{default}]\ns3_bucket = \"declared-art\"\nrecording_root = \"landing/v7\"\n[systems.other]\ns3_bucket = \"other-art\"\n"
+            ),
         );
+        let named = scan_scope(Some(default));
+        let omitted = scan_scope(None);
+        let other = scan_scope(Some("other"));
+        let unknown = scan_scope(Some("zzz"));
+        std::env::remove_var("DEJA_CONFIG_TOML");
 
-        // Configured, it scans its own bucket and leaves the default alone.
-        std::env::set_var("DEJA_PRISM_S3_BUCKET", "ucs-deja");
-        let (bucket, root) = super::scan_scope(Some("prism"), DEFAULT_BUCKET).expect("configured");
-        assert_eq!(bucket, "ucs-deja");
-        assert_ne!(bucket, DEFAULT_BUCKET);
-        // Its root override is optional; absent, it keeps the deployment root.
-        assert_eq!(root, super::scan_scope(None, DEFAULT_BUCKET).unwrap().1);
-        std::env::set_var("DEJA_PRISM_RECORDING_ROOT", "landing/v2");
         assert_eq!(
-            super::scan_scope(Some("prism"), DEFAULT_BUCKET).unwrap().1,
-            "landing/v2"
+            named, omitted,
+            "the same scope, whichever way it is asked for"
         );
-        std::env::remove_var("DEJA_PRISM_RECORDING_ROOT");
-        std::env::remove_var("DEJA_PRISM_S3_BUCKET");
+        assert_eq!(
+            named,
+            Ok(("declared-art".to_owned(), "landing/v7".to_owned())),
+            "the DECLARED bucket, not the orchestrator's own"
+        );
+        assert_eq!(other, Ok(("other-art".to_owned(), "landing/v1".to_owned())));
+        let err = unknown.expect_err("an undeclared system is refused by name");
+        assert!(
+            err.contains("zzz") && err.contains("systems.zzz.s3_bucket"),
+            "{err}"
+        );
+
+        // Undeclared, the default is refused too — asking the orchestrator's
+        // own bucket for recordings would be a wrong answer wearing a
+        // confident label.
+        let bare = scan_scope(None);
+        assert!(bare.is_err(), "no declaration, no scan: {bare:?}");
     }
 
     use super::*;

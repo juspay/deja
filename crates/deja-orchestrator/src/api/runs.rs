@@ -146,19 +146,21 @@ fn resolve_tarball_url(template: &str, run_repo: Option<&str>, sha: &str) -> Opt
 ///
 /// Neither configured / both fail → None (P1 record-only).
 fn resolve_expected_schema(run: &Run) -> Option<(crate::SchemaFingerprint, String)> {
-    // The CodeBundle is a hyperswitch contract: the candidate repo's
-    // migrations/ (the P1 schema gate) plus its config seed. A non-default
-    // system has neither — resolving one anyway would fetch the DEFAULT repo's
-    // migrations for a foreign image sha, and worse, arm the patch to inject
-    // DEJA_CODE_BUNDLE_URI into a `migrations` initContainer that system's job
-    // template deliberately does not have, failing the launch on
-    // ContainerNotFound. No bundle: the lifecycle already skips every store
-    // stage for such systems (`manages_stores`).
-    if run.spec.system() != crate::DEFAULT_SYSTEM_UNDER_TEST {
-        eprintln!(
-            "codebundle: system '{}' has no CodeBundle contract; skipping (P1 not applicable)",
-            run.spec.system()
-        );
+    // Publishing a CodeBundle — the candidate repo's migrations/ (the P1 schema
+    // gate) plus its config seed — is a CAPABILITY, declared as
+    // `DEJA_<SYSTEM>_HAS_CODE_BUNDLE`. It was spelled `system != the default
+    // system`, which is true of every system today and says the wrong thing:
+    // it makes "is this the original integration" decide "does this system ship
+    // migrations the harness can gate on", exactly as `manages_stores` once
+    // did. Resolving a bundle for a system that has none would fetch the
+    // DEFAULT repo's migrations for a foreign image sha, and arm the patch to
+    // inject DEJA_CODE_BUNDLE_URI into a `migrations` initContainer that
+    // system's job template deliberately does not have, failing the launch on
+    // ContainerNotFound. The default when undeclared is the previous behaviour
+    // exactly, so this is behaviour preserving and declarable from now on.
+    let system = run.spec.system();
+    if !crate::system::system_config(system).has_code_bundle {
+        eprintln!("codebundle: system '{system}' has no CodeBundle contract; skipping (P1 not applicable)");
         return None;
     }
     let (_, sha) = crate::executor::resolve_candidate_image(&run.spec.candidate_spec).ok()?;
