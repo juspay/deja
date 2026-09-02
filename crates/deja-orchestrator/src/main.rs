@@ -691,22 +691,12 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// resolves.
 fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
     // Naming nothing means the default system, and the default system resolves
-    // through the same registry as every other — declared, not special. There
-    // is no fallback to the orchestrator's own bucket: a system that has not
-    // declared where its recordings are cannot be scanned for them.
-    let system = system.unwrap_or_else(|| deja_orchestrator::default_system());
-    let profile = deja_orchestrator::system::system_config(system);
-    let bucket = profile
-        .s3_bucket
-        .ok_or_else(|| {
-            format!(
-                "system '{system}' has no recording bucket declared: set systems.{system}.s3_bucket in the deja configuration"
-            )
-        })?;
-    let root = profile
-        .recording_root
-        .unwrap_or_else(|| "landing/v1".to_owned());
-    Ok((bucket, root))
+    // through the same registry as every other — declared, not special.
+    // Delegates so that this endpoint, the correlation endpoint and the replay
+    // pull path cannot disagree about where a recording is.
+    deja_orchestrator::system::recording_scope(
+        system.unwrap_or_else(|| deja_orchestrator::default_system()),
+    )
 }
 
 /// `GET /api/v1/recordings/available` — what is in the bucket, newest first.
