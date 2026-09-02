@@ -947,6 +947,10 @@ struct CorrelationsQuery {
     offset: Option<usize>,
     /// Case-insensitive substring match on the correlation id.
     q: Option<String>,
+    /// Which system's recordings to look in. Absent means the default system,
+    /// exactly as it does on `/recordings/available` — the two endpoints answer
+    /// questions about the same recording and must resolve it the same way.
+    system: Option<String>,
 }
 
 /// `GET /api/v1/recordings/{id}/correlations` — the recorded test cases in a
@@ -971,9 +975,21 @@ async fn v1_recording_correlations(
     if id.trim().is_empty() {
         return error_resp(400, "recording id is required");
     }
-    let cfg = deja_orchestrator::s3::S3Config::from_env();
+    let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+    // Resolve through the same seam `/recordings/available` uses. Without this
+    // the endpoint looked in the deployment's own bucket whatever system was
+    // named, so a recording that listing had just reported — in another
+    // system's bucket — came back "is not in s3://<default>/landing/v1". A
+    // recording cannot exist to one endpoint and not to its sibling.
+    let system = q.system.as_deref().filter(|s| !s.trim().is_empty());
+    let root = match scan_scope(system) {
+        Ok((bucket, root)) => {
+            cfg.bucket = bucket;
+            root
+        }
+        Err(message) => return error_resp(400, &format!("{message} (reading correlations)")),
+    };
     let bucket = cfg.bucket.clone();
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
     let scanned = root.clone();
     let wanted = id.clone();
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
@@ -1551,6 +1567,91 @@ mod tests {
     /// orchestrator's own bucket any more: a system that has not declared where
     /// its recordings are cannot be scanned for them, the default included.
     #[test]
+    /// The WIRING, not just the seam: proof the handler consults the system
+    /// resolver at all. An undeclared system can only produce a 400 through the
+    /// new resolution — before it, `?system=` was ignored entirely and the
+    /// request went on to S3 under the deployment's own bucket. Needs no S3,
+    /// because the refusal happens before any store is built.
+    #[test]
+    fn the_correlations_endpoint_refuses_an_undeclared_system() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let response = rt.block_on(v1_recording_correlations(
+            axum::extract::State(test_state(dir.path())),
+            axum::extract::Path("rec-whatever".to_owned()),
+            axum::extract::Query(CorrelationsQuery {
+                limit: None,
+                offset: None,
+                q: None,
+                system: Some("zzz".to_owned()),
+            }),
+        ));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "an undeclared system is refused, not scanned for in the default bucket"
+        );
+        let body = rt
+            .block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("systems.zzz") && body.contains("correlations"),
+            "the refusal names what to declare AND which endpoint refused: {body}"
+        );
+    }
+
+    /// Both recording endpoints answer questions about the same recording, so
+    /// they must resolve it the same way. `/recordings/available?system=prism`
+    /// reported a recording in `ucs-deja` while
+    /// `/recordings/{id}/correlations?system=prism` looked in the default
+    /// bucket and answered "is not in s3://hyperswitch-art/landing/v1" — a
+    /// recording that existed to one endpoint and not to its sibling.
+    ///
+    /// Values are the deployment's own, so this fails if the document changes
+    /// shape rather than passing against a plausible invention.
+    #[test]
+    fn both_recording_endpoints_resolve_a_system_the_same_way() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n\
+             [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
+             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+        );
+        let prism = scan_scope(Some("prism"));
+        let hyperswitch = scan_scope(Some("hyperswitch"));
+        let omitted = scan_scope(None);
+        let undeclared = scan_scope(Some("zzz"));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        assert_eq!(
+            prism.as_ref().map(|(b, _)| b.as_str()),
+            Ok("ucs-deja"),
+            "a prism recording is in prism's bucket, whichever endpoint asks"
+        );
+        assert_eq!(
+            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            Ok("hyperswitch-art")
+        );
+        assert_eq!(hyperswitch, omitted, "naming the default is omitting it");
+        let refusal = undeclared.expect_err("an undeclared system is refused");
+        assert!(
+            refusal.contains("declared") && refusal.contains("systems.zzz"),
+            "and the refusal names what to declare: {refusal}"
+        );
+    }
+
     fn naming_the_default_system_means_what_omitting_it_means() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let default = deja_orchestrator::default_system();
