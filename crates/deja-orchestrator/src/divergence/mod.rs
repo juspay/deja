@@ -610,6 +610,10 @@ pub struct RunArtifacts {
     /// The run's declared instrumentation contract (`RunSpec::scored_span_namespaces`),
     /// read off `run.json` at load. Empty = no span-shape check.
     pub scored_span_namespaces: Vec<String>,
+    /// Reply canons the run's SYSTEM declares per boundary, resolved from its
+    /// declaration at load. Empty = the recorder's declaration is the whole
+    /// canon, which is the behaviour for a system that declares nothing.
+    pub reply_canons: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<String>,
 }
 
@@ -1751,6 +1755,10 @@ trait Canon {
 enum CanonPreset {
     Sequence,
     Bag,
+    /// `bag:` with paths — those collections carry no order; the rest of the
+    /// body is compared as usual. Bare `bag` stays whole-body (`Bag`), so every
+    /// string recorded before clauses existed keeps its meaning exactly.
+    BagPaths(Vec<String>),
     FinalState,
     AbsentAfter,
     Project {
@@ -1764,6 +1772,7 @@ impl Canon for CanonPreset {
         match self {
             Self::Sequence => "sequence",
             Self::Bag => "bag",
+            Self::BagPaths(_) => "bag",
             Self::FinalState => "final_state",
             Self::AbsentAfter => "absent_after",
             Self::Project { .. } => "project",
@@ -1774,6 +1783,9 @@ impl Canon for CanonPreset {
         match self {
             Self::Sequence => recorded == observed,
             Self::Bag => bag_canon(recorded) == bag_canon(observed),
+            // A per-path clause makes no whole-body claim; it is consulted per
+            // difference, not here.
+            Self::BagPaths(_) => false,
             Self::FinalState => final_state_canon(recorded) == final_state_canon(observed),
             Self::AbsentAfter => {
                 let recorded_reply = delete_reply(&Some(recorded.clone()));
@@ -1790,8 +1802,44 @@ impl Canon for CanonPreset {
     }
 }
 
+/// Every clause of a canon declaration. A declaration is one or more clauses
+/// separated by `;` — `project:!created_at;bag:$.a[]`. A string with no `;`
+/// is a one-clause list whose meaning is exactly what it was before clauses
+/// existed, which is what keeps every recorded declaration valid.
+fn canon_clauses(canon: Option<&deja::CanonRef>) -> Vec<CanonPreset> {
+    let Some(id) = canon.map(|c| c.id.trim()) else {
+        return Vec::new();
+    };
+    id.split(';')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .filter_map(parse_canon_clause)
+        .collect()
+}
+
+fn parse_canon_clause(id: &str) -> Option<CanonPreset> {
+    if let Some(raw) = id.strip_prefix("bag:") {
+        let paths: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(canonical_set_path)
+            .collect();
+        // `bag:` naming nothing is the whole-body preset, not an empty clause.
+        return Some(if paths.is_empty() {
+            CanonPreset::Bag
+        } else {
+            CanonPreset::BagPaths(paths)
+        });
+    }
+    resolve_canon_preset(id)
+}
+
 fn resolve_canon(canon: Option<&deja::CanonRef>) -> Option<CanonPreset> {
-    let id = canon?.id.trim();
+    resolve_canon_preset(canon?.id.trim())
+}
+
+fn resolve_canon_preset(id: &str) -> Option<CanonPreset> {
     match id {
         "sequence" => Some(CanonPreset::Sequence),
         "bag" => Some(CanonPreset::Bag),
@@ -2848,14 +2896,143 @@ fn http_incoming_events_by_correlation(
 /// path the exclude list names. Neither can fire on a projection that resolved
 /// nothing on both sides: `Projection::agrees_with` refuses that comparison, so
 /// an inapplicable canon leaves every difference blocking.
-fn http_diff_absorbed_by_reply_canon(
+/// The document's clauses for one boundary, parsed. Empty when the system
+/// declares none, which is every system until a deployment writes one.
+fn document_clauses_for(
+    reply_canons: &std::collections::BTreeMap<String, String>,
+    boundary: &str,
+) -> Vec<CanonPreset> {
+    reply_canons
+        .get(boundary)
+        .map(|raw| canon_clauses(Some(&deja::CanonRef::new(raw.as_str()))))
+        .unwrap_or_default()
+}
+
+/// Which source supplied the clause that governed a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseSource {
+    Recorder,
+    Document,
+    /// Both named it identically — the document entry is now redundant and can
+    /// be deleted, which is how a deployment learns the vendor declaration has
+    /// landed.
+    Both,
+}
+
+impl ClauseSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recorder => "recorder",
+            Self::Document => "document",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// What the composed canon says about one difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonVerdict {
+    /// No clause governs it; classify as usual.
+    NotGoverned,
+    Absorbed(ClauseSource),
+    /// Both sources named the path with DIFFERENT clauses. Never absorbed — a
+    /// disagreement about what a path means must not decide that a difference
+    /// does not exist.
+    Conflict,
+}
+
+/// Whether a `project` clause in these excludes the path a difference sits at —
+/// the clause type that can disagree with a `bag` clause about one path.
+///
+/// Asks the EXISTING project matcher rather than comparing normalised strings:
+/// a project exclusion is written as a field name and matched by rules of its
+/// own, so a second normalisation here would answer a different question from
+/// the one the absorber answers.
+fn project_clause_excludes(clauses: &[CanonPreset], json_path: &str) -> bool {
+    clauses.iter().any(|clause| match clause {
+        CanonPreset::Project { exclude, .. } => {
+            http_project_excludes_json_diff_path(exclude, json_path)
+        }
+        _ => false,
+    })
+}
+
+/// Paths a `bag` clause names as sets.
+fn bag_clause_paths(clauses: &[CanonPreset]) -> Vec<String> {
+    clauses
+        .iter()
+        .filter_map(|c| match c {
+            CanonPreset::BagPaths(paths) => Some(paths.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// The composed canon's verdict on one body difference: the recorder's clauses
+/// and the document's clauses over one boundary, merged per PATH. The document
+/// is a second contributor, not a fallback — a fallback would never be
+/// consulted, because the only HTTP ingress boundary already carries a
+/// declaration.
+fn canon_verdict_for(
     diff: &HttpDiff,
     recorded_http: Option<&deja::BoundaryEvent>,
     body: &JsonFieldDiff,
+    document_clauses: &[CanonPreset],
+) -> CanonVerdict {
+    let recorder_clauses: Vec<CanonPreset> = recorded_http
+        .and_then(|ev| ev.declaration.as_ref())
+        .map(|d| canon_clauses(d.reply_canon.as_ref()))
+        .unwrap_or_default();
+    if recorder_clauses.is_empty() && document_clauses.is_empty() {
+        return CanonVerdict::NotGoverned;
+    }
+    let path = canonical_set_path(&body.json_path);
+    let (rec_bags, doc_bags) = (
+        bag_clause_paths(&recorder_clauses),
+        bag_clause_paths(document_clauses),
+    );
+    let (in_rec, in_doc) = (
+        rec_bags.iter().any(|p| p == &path),
+        doc_bags.iter().any(|p| p == &path),
+    );
+    if in_rec || in_doc {
+        // A path one source calls a set and the other excludes from comparison
+        // entirely is two different claims about it. Report, do not absorb.
+        let excluded_elsewhere = if in_doc {
+            project_clause_excludes(&recorder_clauses, &body.json_path)
+        } else {
+            project_clause_excludes(document_clauses, &body.json_path)
+        };
+        if excluded_elsewhere {
+            return CanonVerdict::Conflict;
+        }
+        // Absorb only what the existing test already proves is a permutation.
+        if !is_order_only_difference(body) {
+            return CanonVerdict::NotGoverned;
+        }
+        return CanonVerdict::Absorbed(match (in_rec, in_doc) {
+            (true, true) => ClauseSource::Both,
+            (true, false) => ClauseSource::Recorder,
+            _ => ClauseSource::Document,
+        });
+    }
+    // Whole-body clauses keep their existing meaning, and only the recorder can
+    // state one today.
+    for canon in &recorder_clauses {
+        if http_diff_absorbed_by_whole_body_canon(diff, canon, body) {
+            return CanonVerdict::Absorbed(ClauseSource::Recorder);
+        }
+    }
+    CanonVerdict::NotGoverned
+}
+
+fn http_diff_absorbed_by_whole_body_canon(
+    diff: &HttpDiff,
+    canon: &CanonPreset,
+    body: &JsonFieldDiff,
 ) -> bool {
-    let Some(canon) = recorded_http.and_then(event_reply_canon) else {
-        return false;
-    };
+    let canon = canon.clone();
     // `bag` is the generic declaration that a boundary's collections carry no
     // order, and it is the one place knowledge of a particular payload belongs:
     // stated by whoever owns the semantics, against the boundary it describes,
@@ -3258,6 +3435,41 @@ struct HttpBodyClassification {
     /// as blocking — they are named here so the report can SAY that a
     /// difference was ordering, not so it can stop reporting it.
     order_only_paths: Vec<String>,
+    /// Differences a reply-canon clause governed, with the source that supplied
+    /// it. Named and NOT counted as blocking.
+    canon_absorbed: Vec<(String, ClauseSource)>,
+    /// Paths the two sources described differently. Named AND still blocking —
+    /// a disagreement about what a path means must never decide that a
+    /// difference does not exist.
+    canon_conflicts: Vec<String>,
+}
+
+/// A JSON path reduced to the form a declaration is written in: every array
+/// index becomes `[]`, and a trailing `[]` is dropped so that
+/// `$.payment_methods_enabled` and `$.payment_methods_enabled[]` are the same
+/// declaration.
+///
+/// Forgiving on purpose. The canonical differ names a permuted array at the
+/// array's own path (`$.a`) and names a residue element positionally
+/// (`$.a[0].b`), so a deployment writing the array form with `[]` and a
+/// deployment writing it without would otherwise differ in whether their
+/// declaration was ever read — and a declaration that is silently never read is
+/// the failure this codebase keeps paying for.
+fn canonical_set_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut in_index = false;
+    for ch in path.chars() {
+        match ch {
+            '[' => {
+                in_index = true;
+                out.push_str("[]");
+            }
+            ']' => in_index = false,
+            _ if in_index => {}
+            _ => out.push(ch),
+        }
+    }
+    out.strip_suffix("[]").unwrap_or(&out).to_owned()
 }
 
 fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
@@ -3272,12 +3484,25 @@ fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
         .filter(|leaf| !leaf.is_empty() && *leaf != "$")
 }
 
+/// What a body difference is judged against that is the same for every diff in
+/// a run. Grouped so the next run-wide input is a field here rather than a
+/// fifth parameter at four call sites.
+#[derive(Clone, Copy)]
+struct BodyClassificationContext<'a> {
+    race: &'a InconclusiveRaceEvidence,
+    provenance: &'a CorrelationColumnProvenance,
+    /// Reply-canon clauses the SYSTEM DOCUMENT declares for this boundary, in
+    /// the same grammar the recorder mints. A second contributor to the
+    /// boundary's canon, not a fallback.
+    document_clauses: &'a [CanonPreset],
+}
+
 fn classify_http_body_diff(
     diff: &HttpDiff,
     recorded_http: Option<&deja::BoundaryEvent>,
-    race: &InconclusiveRaceEvidence,
-    provenance: &CorrelationColumnProvenance,
+    ctx: BodyClassificationContext<'_>,
 ) -> HttpBodyClassification {
+    let (race, provenance) = (ctx.race, ctx.provenance);
     if hidden_form_bodies_equivalent(diff) {
         return HttpBodyClassification::default();
     }
@@ -3290,9 +3515,18 @@ fn classify_http_body_diff(
     for body in rows {
         // Existing explicit absorptions retain precedence over schema
         // provenance; one leaf is classified exactly once.
-        if http_diff_absorbed_by_reply_canon(diff, recorded_http, body)
-            || race.http_body_diff_attributable(&diff.correlation_id, body)
-        {
+        match canon_verdict_for(diff, recorded_http, body, ctx.document_clauses) {
+            CanonVerdict::Absorbed(source) => {
+                classification
+                    .canon_absorbed
+                    .push((body.json_path.clone(), source));
+                continue;
+            }
+            // Falls through to ordinary classification, so it still blocks.
+            CanonVerdict::Conflict => classification.canon_conflicts.push(body.json_path.clone()),
+            CanonVerdict::NotGoverned => {}
+        }
+        if race.http_body_diff_attributable(&diff.correlation_id, body) {
             continue;
         }
         if json_diff_leaf_field(&body.json_path).is_some_and(|column| {
@@ -3661,6 +3895,7 @@ fn http_clean_by_correlation(
     http_incoming_by_correlation: &HashMap<String, &deja::BoundaryEvent>,
     inconclusive_race: &InconclusiveRaceEvidence,
     column_provenance: &CorrelationColumnProvenance,
+    document_clauses: &[CanonPreset],
 ) -> HashMap<String, bool> {
     let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
     for diff in http_diffs {
@@ -3670,8 +3905,11 @@ fn http_clean_by_correlation(
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
-                inconclusive_race,
-                column_provenance,
+                BodyClassificationContext {
+                    race: inconclusive_race,
+                    provenance: column_provenance,
+                    document_clauses,
+                },
             )
             .blocking_leaf_count
                 == 0;
@@ -3795,8 +4033,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
-                &inconclusive_race,
-                &column_provenance,
+                BodyClassificationContext {
+                    race: &inconclusive_race,
+                    provenance: &column_provenance,
+                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                },
             )
             .blocking_leaf_count
                 > 0
@@ -3820,6 +4061,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             &http_incoming_by_correlation,
             &inconclusive_race,
             &column_provenance,
+            &document_clauses_for(&art.reply_canons, "http_incoming"),
         ),
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
@@ -4257,6 +4499,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // Counted as divergences like any other body difference; named separately
     // so the report can say WHAT KIND of difference it was.
     let mut order_only_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    // Differences a reply-canon clause governed, keyed by path and the source
+    // that supplied the clause. A deployment reads this to see that its
+    // document entry is doing something — and, once the source reads `both`,
+    // that the entry is redundant and can go.
+    let mut canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut canon_conflict_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -4276,8 +4524,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let body_classification = classify_http_body_diff(
                 diff,
                 recorded_http,
-                &inconclusive_race,
-                &column_provenance,
+                BodyClassificationContext {
+                    race: &inconclusive_race,
+                    provenance: &column_provenance,
+                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                },
             );
             let blocking_body_diffs = body_classification.blocking_leaf_count;
             if diff.status_match && blocking_body_diffs == 0 {
@@ -4300,6 +4551,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             for path in body_classification.order_only_paths {
                 *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for (path, source) in body_classification.canon_absorbed {
+                stats.bump_kind("ReplyCanonAbsorbed");
+                *canon_absorbed_seen
+                    .entry((path, source.label()))
+                    .or_insert(0) += 1;
+            }
+            for path in body_classification.canon_conflicts {
+                *canon_conflict_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -4552,15 +4812,40 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // above like any other body difference; what this adds is WHICH KIND they
     // are, so a reader can see that a collection came back with the same
     // members in a different order and decide whether that boundary should
-    // carry a `bag` reply canon — a judgement about the payload, which belongs
-    // to whoever owns it and not to the comparison.
+    // carry a `bag:` clause naming it — a judgement about the payload, which
+    // belongs to whoever owns it and not to the comparison.
     for (path, responses) in &order_only_response_paths_seen {
         warnings.push(format!(
             "response body path {path} holds the same members in a different order on \
              {responses} response(s) — the collections are equal as multisets, so the difference \
              is ordering alone. It is reported once, at the collection, rather than at each \
-             position the two orders disagree on, and it still blocks: declare a `bag` reply \
-             canon on that boundary if its order genuinely carries no meaning"
+             position the two orders disagree on, and it still blocks: add a \
+             `bag:{path}` clause to that boundary's reply canon if its order genuinely carries \
+             no meaning. Name the path — a bare `bag` is the WHOLE body, which would absorb \
+             every other collection in the reply and would replace the boundary's existing \
+             clause rather than join it"
+        ));
+    }
+    // What the canon absorbed, and which source said so. Named rather than
+    // subtracted: a difference that stopped counting is still a difference that
+    // happened, and a reader has to be able to see which declaration decided it
+    // did not matter.
+    for ((path, source), responses) in &canon_absorbed_seen {
+        warnings.push(format!(
+            "response body path {path} differed by ordering alone on {responses} response(s) and \
+             was absorbed by a `bag` reply-canon clause declared by the {source}; the members are \
+             identical as a multiset, so any added, removed or altered member would still block"
+        ));
+    }
+    // Two sources describing one path differently. Absorbed by neither, on
+    // purpose: a disagreement about what a path MEANS must not be resolved into
+    // a decision that a difference does not exist.
+    for (path, responses) in &canon_conflict_paths_seen {
+        warnings.push(format!(
+            "response body path {path} is described differently by the recorder's declaration and \
+             by this deployment's document on {responses} response(s) — one calls it a set, the \
+             other excludes it from comparison. Neither was applied and the difference still \
+             blocks; make the two declarations agree"
         ));
     }
     // A declaration that governs nothing is reported as the defect it is. The
@@ -4675,6 +4960,13 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     let scored_span_namespaces = run
         .as_ref()
         .map(|run| run.spec.scored_span_namespaces.clone())
+        .unwrap_or_default();
+    // The system's own declaration, not the run's: whether an array is a set is
+    // a property of the recorded system's contract, so it is read from the
+    // system rather than restated per run.
+    let reply_canons = run
+        .as_ref()
+        .map(|run| crate::system::system_config(run.spec.system()).reply_canons)
         .unwrap_or_default();
 
     let mut warnings = Vec::new();
@@ -4841,6 +5133,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         events,
         correlation_scope,
         scored_span_namespaces,
+        reply_canons,
         warnings,
     })
 }
@@ -4913,8 +5206,11 @@ pub(crate) fn build_ledger_with_plan(
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
-                &inconclusive_race,
-                &column_provenance,
+                BodyClassificationContext {
+                    race: &inconclusive_race,
+                    provenance: &column_provenance,
+                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                },
             )
             .blocking_leaf_count
                 > 0
@@ -4932,6 +5228,7 @@ pub(crate) fn build_ledger_with_plan(
             &http_incoming_by_correlation,
             &inconclusive_race,
             &column_provenance,
+            &document_clauses_for(&art.reply_canons, "http_incoming"),
         ),
     );
     Ok(ledger::build_with_plan(
@@ -6024,6 +6321,7 @@ mod tests {
     ) -> RunArtifacts {
         RunArtifacts {
             scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -6097,8 +6395,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             0
@@ -6113,8 +6414,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6129,8 +6433,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6145,8 +6452,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6162,8 +6472,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6176,6 +6489,251 @@ mod tests {
     // knows what a payload means; a test that only passed for one service's
     // schema would be testing the wrong thing.
 
+    /// A real `/payments/{id}/client` response pair from the failing
+    /// same-image run, reduced to the subtree every difference sits under. The
+    /// other top-level keys were byte-identical on both sides — they
+    /// contributed nothing to the comparison and are where the merchant data
+    /// lived, so they are not carried into the tree.
+    fn run_fixture(raw: &str) -> HttpDiff {
+        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        let baseline = v["baseline_body"].clone();
+        let candidate = v["candidate_body"].clone();
+        let body: Vec<JsonFieldDiff> =
+            serde_json::from_value(v["body_diff"].clone()).expect("kernel rows parse");
+        http_with_bodies("order", true, body, baseline, candidate)
+    }
+
+    /// Acceptance against the run this change exists for.
+    ///
+    /// Stated honestly: in THIS run whole-body `bag` would also have absorbed
+    /// these, because no response mixed a permutation with a real difference —
+    /// measured, 26 permutation-only bodies and 30 `business_label`-only, none
+    /// carrying both. Per-path is not justified by this run's contents. It is
+    /// justified by the two things that hold regardless: the router's one
+    /// ingress boundary has a single canon slot already holding
+    /// `project:!created_at,!last_synced,!modified_at`, so whole-body `bag`
+    /// cannot be declared there without giving up the timestamp exclusion; and
+    /// whole-body `bag` absorbs EVERY array in the body including ones whose
+    /// order carries meaning, which asserts nothing and is unbounded, where a
+    /// path list asserts exactly what it names.
+    #[test]
+    fn the_runs_own_permutations_are_absorbed_by_the_declared_paths() {
+        let declared =
+            clauses("bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]");
+        for (name, raw) in [
+            (
+                "outer array permuted",
+                include_str!("fixtures/payment_methods_permuted_outer.json"),
+            ),
+            (
+                "inner card_networks permuted",
+                include_str!("fixtures/payment_methods_permuted_inner.json"),
+            ),
+        ] {
+            let diff = run_fixture(raw);
+            assert!(
+                !diff.body_diff.is_empty(),
+                "{name}: the kernel really did report differences"
+            );
+            let c = classify_with_sources(&diff, None, &declared);
+            assert_eq!(c.blocking_leaf_count, 0, "{name} must not block");
+            // The canonical differ reports a permuted collection ONCE, at the
+            // collection, rather than at each position the two orders disagree
+            // on — so the kernel's dozen positional rows become one absorbed
+            // path, which is the count that stays still between runs.
+            assert_eq!(
+                c.canon_absorbed,
+                vec![(
+                    "$.payment_methods_enabled".to_owned(),
+                    ClauseSource::Document
+                )],
+                "{name}"
+            );
+            assert!(c.order_only_paths.is_empty(), "{name}");
+        }
+    }
+
+    fn clauses(declaration: &str) -> Vec<CanonPreset> {
+        canon_clauses(Some(&deja::CanonRef::new(declaration)))
+    }
+
+    /// A recorded ingress carrying a reply-canon declaration, the way the
+    /// router's middleware mints one.
+    fn ingress_declaring(declaration: &str) -> deja::BoundaryEvent {
+        let mut ev: deja::BoundaryEvent = serde_json::from_value(serde_json::json!({
+            "global_sequence": 1,
+            "request_sequence": 0,
+            "correlation_id": "order",
+            "timestamp_ns": 0,
+            "boundary": "http_incoming",
+            "trait_name": "RequestIdMiddleware",
+            "method_name": "call",
+            "call_file": "request_id.rs",
+            "call_line": 1,
+            "call_column": 0,
+            "request": {},
+            "args": {},
+            "response": {},
+            "result": "v",
+            "is_error": false,
+            "duration_us": 0,
+            "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+            "provenance": "recorded",
+            "recon": "lossless",
+            "replay_strategy": "substitute",
+            "bucket_id": "root",
+            "fork_seq": 0,
+        }))
+        .expect("valid BoundaryEvent");
+        ev.declaration = Some(
+            deja::BoundaryDeclaration::default().reply_canon(deja::CanonRef::new(declaration)),
+        );
+        ev
+    }
+
+    fn classify_with_sources(
+        diff: &HttpDiff,
+        recorder: Option<&deja::BoundaryEvent>,
+        document: &[CanonPreset],
+    ) -> HttpBodyClassification {
+        classify_http_body_diff(
+            diff,
+            recorder,
+            BodyClassificationContext {
+                race: &InconclusiveRaceEvidence::default(),
+                provenance: &CorrelationColumnProvenance::default(),
+                document_clauses: document,
+            },
+        )
+    }
+
+    /// Every declaration written before clauses existed parses to a one-clause
+    /// list meaning exactly what it meant. The first string is the one the
+    /// router actually mints today.
+    #[test]
+    fn declarations_written_before_clauses_keep_their_meaning() {
+        for existing in [
+            "project:!created_at,!last_synced,!modified_at",
+            "bag",
+            "sequence",
+            "final_state",
+        ] {
+            let one = resolve_canon(Some(&deja::CanonRef::new(existing)))
+                .expect("the preset still resolves");
+            assert_eq!(
+                clauses(existing),
+                vec![one],
+                "{existing} must parse to exactly its old meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_set_absorbs_a_permutation_and_names_its_source() {
+        let diff = body_pair(
+            serde_json::json!({"a": [{"x": 1}, {"x": 2}]}),
+            serde_json::json!({"a": [{"x": 2}, {"x": 1}]}),
+        );
+        let c = classify_with_sources(&diff, None, &clauses("bag:$.a[]"));
+        assert_eq!(c.blocking_leaf_count, 0, "a permutation of a declared set");
+        assert_eq!(
+            c.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Document)]
+        );
+        // This is the case that was dead under a fallback rule: the document
+        // governs even though the recorder declared nothing.
+        assert!(c.order_only_paths.is_empty());
+    }
+
+    #[test]
+    fn a_changed_member_at_a_declared_set_still_blocks() {
+        for candidate in [
+            serde_json::json!({"a": [1, 3]}),    // altered
+            serde_json::json!({"a": [1, 2, 3]}), // added
+            serde_json::json!({"a": [1]}),       // removed
+        ] {
+            let diff = body_pair(serde_json::json!({"a": [1, 2]}), candidate.clone());
+            let c = classify_with_sources(&diff, None, &clauses("bag:$.a[]"));
+            assert!(
+                c.blocking_leaf_count > 0,
+                "{candidate} is not a permutation and must still block"
+            );
+            assert!(c.canon_absorbed.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_undeclared_permutation_still_blocks_and_is_still_named() {
+        let diff = body_pair(
+            serde_json::json!({"a": [1, 2]}),
+            serde_json::json!({"a": [2, 1]}),
+        );
+        let c = classify_with_sources(&diff, None, &[]);
+        assert_eq!(c.blocking_leaf_count, 1);
+        assert_eq!(c.order_only_paths, vec!["$.a"]);
+        assert!(c.canon_absorbed.is_empty());
+    }
+
+    /// The per-path point: whole-body `bag` absorbs nothing here, because the
+    /// bodies are not bag-equal. A clause naming one path absorbs that path and
+    /// leaves the real difference beside it blocking.
+    #[test]
+    fn a_permutation_is_absorbed_while_a_real_difference_beside_it_still_blocks() {
+        let baseline = serde_json::json!({"a": [1, 2], "label": "old"});
+        let candidate = serde_json::json!({"a": [2, 1], "label": "new"});
+        let whole_body = classify_with_sources(
+            &body_pair(baseline.clone(), candidate.clone()),
+            None,
+            &clauses("bag"),
+        );
+        assert!(
+            whole_body.canon_absorbed.is_empty(),
+            "whole-body bag cannot help a body that also differs for real"
+        );
+        let per_path =
+            classify_with_sources(&body_pair(baseline, candidate), None, &clauses("bag:$.a[]"));
+        assert_eq!(per_path.canon_absorbed.len(), 1, "the permutation");
+        assert_eq!(per_path.blocking_leaf_count, 1, "the label still blocks");
+    }
+
+    #[test]
+    fn both_sources_naming_one_path_is_redundant_and_names_both() {
+        let diff = body_pair(
+            serde_json::json!({"a": [1, 2]}),
+            serde_json::json!({"a": [2, 1]}),
+        );
+        let c = classify_with_sources(
+            &diff,
+            Some(&ingress_declaring("bag:$.a[]")),
+            &clauses("bag:$.a[]"),
+        );
+        assert_eq!(
+            c.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Both)],
+            "reported as redundant so the document line can be deleted"
+        );
+        assert_eq!(c.blocking_leaf_count, 0);
+    }
+
+    #[test]
+    fn sources_describing_one_path_differently_conflict_and_absorb_nothing() {
+        let diff = body_pair(
+            serde_json::json!({"a": [1, 2]}),
+            serde_json::json!({"a": [2, 1]}),
+        );
+        let c = classify_with_sources(
+            &diff,
+            Some(&ingress_declaring("project:!a")),
+            &clauses("bag:$.a[]"),
+        );
+        assert_eq!(c.canon_conflicts, vec!["$.a"]);
+        assert!(c.canon_absorbed.is_empty(), "a conflict absorbs nothing");
+        assert!(
+            c.blocking_leaf_count > 0,
+            "and the difference still blocks — a disagreement must not decide it away"
+        );
+    }
+
     fn body_pair(baseline: serde_json::Value, candidate: serde_json::Value) -> HttpDiff {
         // Built the way the pipeline builds it: the kernel's own positional
         // diff, so these tests are fed the rows the kernel really emits.
@@ -6184,11 +6742,22 @@ mod tests {
     }
 
     fn classify_body(diff: &HttpDiff) -> HttpBodyClassification {
+        classify_body_declaring(diff, &[])
+    }
+
+    /// The same classification, for a system that declares these paths as sets.
+    fn classify_body_declaring(
+        diff: &HttpDiff,
+        document: &[CanonPreset],
+    ) -> HttpBodyClassification {
         classify_http_body_diff(
             diff,
             None,
-            &InconclusiveRaceEvidence::default(),
-            &CorrelationColumnProvenance::default(),
+            BodyClassificationContext {
+                race: &InconclusiveRaceEvidence::default(),
+                provenance: &CorrelationColumnProvenance::default(),
+                document_clauses: document,
+            },
         )
     }
 
@@ -6434,8 +7003,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6604,6 +7176,7 @@ mod tests {
 
         let rows = build_ledger(&RunArtifacts {
             scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -8199,6 +8772,7 @@ mod tests {
         )];
         let art = RunArtifacts {
             scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
             run_id: run_id.to_owned(),
             recording_id: Some(recording_id.to_owned()),
             table,

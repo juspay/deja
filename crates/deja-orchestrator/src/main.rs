@@ -759,6 +759,10 @@ async fn v1_systems() -> Response {
                 "candidate_image_repo": s.candidate_image_repo,
                 "instance_pattern": s.instance_pattern,
                 "scored_span_namespaces": s.scored_span_namespaces,
+                // Reported so a deployment can see the canon the scorer will
+                // apply, rather than inferring it from a verdict that stopped
+                // blocking.
+                "reply_canons": s.reply_canons,
                 // The five variable names a candidate reads, as derived from
                 // the declared prefix (or overridden per slot). Exposed so the
                 // derivation is observable on a deployment, not only asserted
