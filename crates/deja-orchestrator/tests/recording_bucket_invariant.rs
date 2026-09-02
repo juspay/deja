@@ -77,6 +77,37 @@ fn the_recording_readers_still_resolve_per_system() {
     );
 }
 
+/// The same reverse count for the API readers, which resolve differently: they
+/// overwrite a `from_env()` config's bucket from `scan_scope`, so deleting the
+/// resolution leaves the `from_env()` count identical and every other test green.
+///
+/// Measured, not assumed: removing the LISTING's resolution passed all fourteen
+/// binary tests. The correlations endpoint happens to be covered by a handler
+/// test that asserts its refusal, but the listing had nothing.
+///
+/// Counts only the shipped half. The bare substring is far higher because the
+/// tests exercise `scan_scope` heavily, and an invariant that moves whenever
+/// somebody adds a test case is not an invariant.
+#[test]
+fn the_api_recording_readers_still_resolve_per_system() {
+    let main = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+    )
+    .expect("read main");
+    let shipped = main
+        .split_once("#[cfg(test)]")
+        .map(|(before, _)| before)
+        .unwrap_or(&main);
+    assert_eq!(
+        shipped.matches("scan_scope(").count(),
+        3,
+        "one definition and one call from each API reader of a recording — the listing and its \
+         correlations sibling. If one stopped resolving, that endpoint would answer about the \
+         deployment's own bucket while the other answered about the system's, which is the split \
+         this whole change removes."
+    );
+}
+
 #[test]
 fn every_deployment_bucket_read_is_accounted_for() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
