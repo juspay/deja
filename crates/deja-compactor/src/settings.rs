@@ -97,6 +97,33 @@ pub struct SystemDeclaration {
     /// Span prefixes its instrumentation declares as scored.
     #[serde(default, deserialize_with = "list_or_csv")]
     pub scored_span_namespaces: Option<Vec<String>>,
+    /// Reply canons this system declares per BOUNDARY, in the same grammar the
+    /// recorder mints — so moving one to the recorder later is a copy of the
+    /// string and a deletion of the line, not a translation.
+    ///
+    /// A declaration is clauses separated by `;`:
+    /// `project:!created_at,!last_synced;bag:$.a[],$.b[]`. A `bag` clause naming
+    /// paths says those collections carry no order; bare `bag` is the whole
+    /// body, which is what every declaration written before clauses existed
+    /// means. Only a permutation is absorbed — the comparator proves the two
+    /// sides hold the identical multiset first — so an added, removed or
+    /// altered element still differs and still blocks.
+    ///
+    /// These COMPOSE with the recorder's declaration for the same boundary
+    /// rather than deferring to it. A path both sources name identically is
+    /// reported redundant (the document line can go); a path they describe
+    /// differently is reported as a conflict and absorbed by neither.
+    ///
+    /// Keyed by boundary, and for an HTTP reply there is exactly one ingress
+    /// boundary for every route (`http_incoming`, minted by one middleware), so
+    /// a `bag` clause here applies to EVERY route this deployment serves. There
+    /// is no route dimension in either source today; if one is ever needed it
+    /// has to arrive in both at once.
+    ///
+    /// hyperswitch declares:
+    /// `http_incoming = "bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"`
+    #[serde(default)]
+    pub reply_canons: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A list, from either a TOML array or a comma-separated string.

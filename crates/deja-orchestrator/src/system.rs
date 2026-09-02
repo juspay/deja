@@ -110,6 +110,9 @@ pub struct SystemConfig {
     /// Span-name prefixes this system's instrumentation contract declares as
     /// scored. Deja does not know these; the system does, so it declares them.
     pub scored_span_namespaces: Vec<String>,
+    /// Reply canons declared per boundary, in the recorder's own grammar. See
+    /// `SystemDeclaration::reply_canons`.
+    pub reply_canons: std::collections::BTreeMap<String, String>,
     /// Repo-relative config files its CodeBundle carries besides migrations.
     /// `None` on a system with no bundle, or the default system with nothing
     /// declared (the executor's base list applies).
@@ -194,6 +197,56 @@ fn declared(system: &str) -> Result<Option<SystemDeclaration>, String> {
 /// refusal naming the variable to set.
 #[must_use]
 pub fn system_config(name: &str) -> SystemConfig {
+    /// What the DOCUMENT is allowed to contribute to a boundary's reply canon, and
+    /// why anything else is an error rather than a silent no-op.
+    ///
+    /// The document is a second contributor of clauses, not a second place to state
+    /// a whole-body canon. Only `bag:<one or more paths>` can take effect from here:
+    /// a whole-body preset (`bag` alone, `sequence`, `final_state`) or a `project:`
+    /// clause would parse, appear on `/systems`, and never be consulted, because
+    /// whole-body absorption reads the recorder's declaration alone. A clause that
+    /// cannot be honoured is named at resolution, when the deployment applies the
+    /// document, rather than discovered after a run absorbs nothing.
+    ///
+    /// Deliberately strict, and deliberately NOT the parser the recorder's
+    /// declarations go through: that one is lenient about unknown presets, which is
+    /// pre-existing behaviour for strings already recorded and not this seam's to
+    /// change.
+    fn document_reply_canon_error(
+        reply_canons: &std::collections::BTreeMap<String, String>,
+    ) -> Option<String> {
+        for (boundary, declaration) in reply_canons {
+            let clauses: Vec<&str> = declaration
+                .split(';')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            if clauses.is_empty() {
+                return Some(format!(
+                    "reply canon for boundary `{boundary}` declares no clauses: \
+                 remove the entry or give it a `bag:<paths>` clause"
+                ));
+            }
+            for clause in clauses {
+                let Some(paths) = clause.strip_prefix("bag:") else {
+                    return Some(format!(
+                    "reply canon for boundary `{boundary}` has clause `{clause}`: document reply \
+                     canons can only contribute `bag:<paths>` clauses, and a whole-body preset \
+                     is one only the recorder's own declaration can state"
+                ));
+                };
+                if paths.split(',').map(str::trim).all(str::is_empty) {
+                    return Some(format!(
+                    "reply canon for boundary `{boundary}` has clause `{clause}`: a `bag:` clause \
+                     from the document must name at least one path, since bare `bag` is the \
+                     whole-body preset"
+                ));
+                }
+            }
+        }
+        None
+    }
+
     let is_default = is_default_system(name);
     let warnings: Vec<String> = Vec::new();
 
@@ -204,6 +257,8 @@ pub fn system_config(name: &str) -> SystemConfig {
         Ok(None) => (SystemDeclaration::default(), None),
         Err(e) => (SystemDeclaration::default(), Some(e)),
     };
+
+    let reply_canons_resolved = d.reply_canons.clone().unwrap_or_default();
 
     // A prefix names all five slots at once; an explicit per-slot name still
     // wins, for a system whose keys do not follow the convention.
@@ -248,13 +303,16 @@ pub fn system_config(name: &str) -> SystemConfig {
             .map(|v| v.trim_end_matches('/').to_owned()),
         instance_pattern: clean(d.instance_pattern),
         scored_span_namespaces: d.scored_span_namespaces.unwrap_or_default(),
+        reply_canons: reply_canons_resolved.clone(),
         candidate_config_files: d.candidate_config_files,
         code_bundle_uri_env: clean(d.code_bundle_uri_env),
         config_source_deployment: clean(d.config_source_deployment),
         config_source_container: clean(d.config_source_container),
         candidate_env,
         warnings,
-        error,
+        // A declaration that could not be READ wins; otherwise a clause the
+        // document is not allowed to state is itself unhonourable.
+        error: error.or_else(|| document_reply_canon_error(&reply_canons_resolved)),
     }
 }
 
@@ -416,6 +474,14 @@ mod tests {
             "declared, not inherited"
         );
         assert_eq!(h.job_template_key.as_deref(), Some("job.json"));
+        // The document and the comparator are checked against each other here:
+        // this is the exact string a deployment writes, in the exact grammar the
+        // recorder mints, so the move to a vendor declaration is a copy.
+        assert_eq!(
+            h.reply_canons.get("http_incoming").map(String::as_str),
+            Some("bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"),
+            "the payment-methods list is declared unordered for the router's ingress"
+        );
         assert_eq!(
             h.candidate_env.get("MODE_ENV").map(String::as_str),
             Some("ROUTER__DEJA__MODE")
@@ -436,6 +502,10 @@ mod tests {
         assert!(!p.manages_stores && !p.has_code_bundle);
         assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
         assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
+        assert!(
+            p.reply_canons.is_empty(),
+            "a canon declared for one system must not reach another"
+        );
         assert_eq!(p.job_template_key.as_deref(), Some("job.prism.json"));
         assert_eq!(p.candidate_env.len(), 5, "one prefix, five names");
         assert_eq!(
@@ -491,6 +561,14 @@ candidate_config_files = [
 # it the orchestrator refuses bare prism refs by name, because a prism sha
 # qualified against the router repo is a guaranteed dead pull (it happened,
 # twice).
+# The payment-methods list is emitted from an unordered source, so the same
+# methods come back in a different order run to run. Declared in the recorder's
+# own grammar: when the router's declaration at request_id.rs grows this clause,
+# this line is deleted — and until it does, the scorecard reports the path as
+# governed by "both", which is how a deployment knows it is safe to delete.
+[systems.hyperswitch.reply_canons]
+http_incoming = "bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"
+
 [systems.prism]
 s3_bucket = "ucs-deja"
 candidate_image_repo = "223655089699.dkr.ecr.ap-south-1.amazonaws.com/connector-service"
@@ -600,6 +678,69 @@ scored_span_namespaces = ["a::", "b::"]
         assert!(
             refusal.contains("systems.zzz"),
             "and the refusal names what to declare: {refusal}"
+        );
+    }
+
+    /// A document clause that cannot take effect is named where the deployment
+    /// applies it, not discovered after a run absorbs nothing. Each case here
+    /// would otherwise parse, appear on `/systems`, and be silently ignored.
+    #[test]
+    fn a_document_clause_that_cannot_be_honoured_is_an_error() {
+        let _lock = env_guard();
+        for (declaration, expected) in [
+            // Does not parse at all.
+            ("bagg:$.a[]", "can only contribute `bag:<paths>`"),
+            ("bag :$.a[]", "can only contribute `bag:<paths>`"),
+            // Parses, but is a whole-body preset only the recorder can state —
+            // accepted here it would never be consulted.
+            ("bag", "can only contribute `bag:<paths>`"),
+            // A `bag:` that names nothing is the whole-body preset by another spelling.
+            ("bag:", "must name at least one path"),
+            ("bag: , ", "must name at least one path"),
+            ("sequence", "can only contribute `bag:<paths>`"),
+            ("project:!created_at", "can only contribute `bag:<paths>`"),
+            // A valid clause beside an impossible one does not rescue it.
+            ("bag:$.a[];sequence", "can only contribute `bag:<paths>`"),
+            // Present but empty.
+            ("", "declares no clauses"),
+            ("   ;  ", "declares no clauses"),
+        ] {
+            toml(&format!(
+                "default_system = \"hyperswitch\"\n\
+                 [systems.regsys-canon]\n\
+                 s3_bucket = \"b\"\n\
+                 [systems.regsys-canon.reply_canons]\n\
+                 http_incoming = \"{declaration}\"\n"
+            ));
+            let c = system_config("regsys-canon");
+            clear();
+            let error = c.error.unwrap_or_else(|| {
+                panic!("`{declaration}` must be an error, not silently ignored")
+            });
+            assert!(
+                error.contains(expected) && error.contains("http_incoming"),
+                "`{declaration}` must name the boundary and the reason; got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bag_clause_naming_paths_resolves_without_error() {
+        let _lock = env_guard();
+        toml(
+            "default_system = \"hyperswitch\"\n\
+             [systems.regsys-canon-ok]\n\
+             s3_bucket = \"b\"\n\
+             [systems.regsys-canon-ok.reply_canons]\n\
+             http_incoming = \"bag:$.a[],$.b[].c[]\"\n",
+        );
+        let c = system_config("regsys-canon-ok");
+        clear();
+        assert_eq!(c.error, None, "{:?}", c.error);
+        assert_eq!(
+            c.reply_canons.get("http_incoming").map(String::as_str),
+            Some("bag:$.a[],$.b[].c[]"),
+            "and it is carried through to the comparator"
         );
     }
 
