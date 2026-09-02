@@ -614,6 +614,9 @@ pub struct RunArtifacts {
     /// declaration at load. Empty = the recorder's declaration is the whole
     /// canon, which is the behaviour for a system that declares nothing.
     pub reply_canons: std::collections::BTreeMap<String, String>,
+    /// Response paths the run's system asserts an order for. Empty = order
+    /// carries no meaning anywhere, which is the default.
+    pub ordered_response_paths: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -2007,6 +2010,16 @@ pub(crate) fn values_diverge_under_event(
     {
         return false;
     }
+    // An order-only difference is not a divergence. The recorded and observed
+    // values hold the identical multiset, so nothing was added, removed or
+    // changed — only the order a collection was iterated in, which for a
+    // `HashSet` or `HashMap` is seeded per process and carries no information.
+    // Same rule as the response body, and it has to be the same rule: a
+    // permutation absorbed in one and blocking in the other is one fact with
+    // two answers depending on where it happened to be compared.
+    if json_order_only_difference(recorded, observed) {
+        return false;
+    }
     recorded != observed
 }
 
@@ -2911,6 +2924,8 @@ fn document_clauses_for(
 /// Which source supplied the clause that governed a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClauseSource {
+    /// No declaration: order carries no meaning unless a path says otherwise.
+    Default,
     Recorder,
     Document,
     /// Both named it identically — the document entry is now redundant and can
@@ -2922,6 +2937,7 @@ enum ClauseSource {
 impl ClauseSource {
     fn label(self) -> &'static str {
         match self {
+            Self::Default => "default",
             Self::Recorder => "recorder",
             Self::Document => "document",
             Self::Both => "both",
@@ -3409,6 +3425,21 @@ fn order_canonical_diff(
 /// Is this row an ordering difference — two arrays with identical members in a
 /// different order? Derived from the row itself, so it needs no flag threaded
 /// alongside it and cannot disagree with the values it describes.
+/// Whether two JSON values differ ONLY in the order of members inside some
+/// array — the multisets are identical, so no member was added, removed or
+/// changed and nothing but position moved.
+///
+/// THE test, shared by every comparison of two JSON values: response bodies and
+/// the args and results of a matched call. Those were separate paths, and a
+/// permutation was absorbed in one and reported as a value divergence in the
+/// other, for no reason other than which code reached it first.
+pub(crate) fn json_order_only_difference(
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    recorded != observed && bag_canon(recorded) == bag_canon(observed)
+}
+
 fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
     matches!(
         (&row.baseline, &row.candidate),
@@ -3495,6 +3526,8 @@ struct BodyClassificationContext<'a> {
     /// the same grammar the recorder mints. A second contributor to the
     /// boundary's canon, not a fallback.
     document_clauses: &'a [CanonPreset],
+    /// Paths whose order the system ASSERTS. Empty by default.
+    ordered_paths: &'a [String],
 }
 
 fn classify_http_body_diff(
@@ -3510,6 +3543,7 @@ fn classify_http_body_diff(
     // Ordering is resolved BEFORE anything is classified, so every absorber
     // below sees the path a difference will be reported at rather than
     // whichever positions this run's ordering scattered it across.
+    let mut conflicted = false;
     let canonical = order_canonical_body_diff(diff);
     let rows = canonical.as_deref().unwrap_or(&diff.body_diff);
     for body in rows {
@@ -3523,7 +3557,10 @@ fn classify_http_body_diff(
                 continue;
             }
             // Falls through to ordinary classification, so it still blocks.
-            CanonVerdict::Conflict => classification.canon_conflicts.push(body.json_path.clone()),
+            CanonVerdict::Conflict => {
+                classification.canon_conflicts.push(body.json_path.clone());
+                conflicted = true;
+            }
             CanonVerdict::NotGoverned => {}
         }
         if race.http_body_diff_attributable(&diff.correlation_id, body) {
@@ -3537,6 +3574,25 @@ fn classify_http_body_diff(
                 .push(body.json_path.clone());
         } else {
             if is_order_only_difference(body) {
+                // Order carries no meaning unless this path says it does. The
+                // members are identical as a multiset, so nothing was added,
+                // removed or changed; what moved was the order a collection was
+                // iterated in, which for a hash-based collection is seeded per
+                // process and differs between two runs of one image.
+                let path = canonical_set_path(&body.json_path);
+                let asserted = ctx
+                    .ordered_paths
+                    .iter()
+                    .any(|declared| canonical_set_path(declared) == path);
+                // A conflicted path is never absorbed, by the default least of
+                // all: two sources disagreeing about what a path MEANS must not
+                // be settled by a rule that says nothing about it.
+                if !asserted && !conflicted {
+                    classification
+                        .canon_absorbed
+                        .push((body.json_path.clone(), ClauseSource::Default));
+                    continue;
+                }
                 classification.order_only_paths.push(body.json_path.clone());
             }
             classification.blocking_leaf_count += 1;
@@ -3896,6 +3952,7 @@ fn http_clean_by_correlation(
     inconclusive_race: &InconclusiveRaceEvidence,
     column_provenance: &CorrelationColumnProvenance,
     document_clauses: &[CanonPreset],
+    ordered_paths: &[String],
 ) -> HashMap<String, bool> {
     let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
     for diff in http_diffs {
@@ -3909,6 +3966,7 @@ fn http_clean_by_correlation(
                     race: inconclusive_race,
                     provenance: column_provenance,
                     document_clauses,
+                    ordered_paths,
                 },
             )
             .blocking_leaf_count
@@ -4037,6 +4095,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     race: &inconclusive_race,
                     provenance: &column_provenance,
                     document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                    ordered_paths: &art.ordered_response_paths,
                 },
             )
             .blocking_leaf_count
@@ -4062,6 +4121,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             &inconclusive_race,
             &column_provenance,
             &document_clauses_for(&art.reply_canons, "http_incoming"),
+            &art.ordered_response_paths,
         ),
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
@@ -4528,6 +4588,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     race: &inconclusive_race,
                     provenance: &column_provenance,
                     document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                    ordered_paths: &art.ordered_response_paths,
                 },
             );
             let blocking_body_diffs = body_classification.blocking_leaf_count;
@@ -4831,10 +4892,19 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
     for ((path, source), responses) in &canon_absorbed_seen {
+        // The default is not a clause and must not read as one. "Declared by
+        // the default" would describe a declaration nobody made.
+        let by = if *source == "default" {
+            "no path asserts an order for it, and order carries no meaning \
+             unless one does"
+                .to_owned()
+        } else {
+            format!("a `bag` reply-canon clause declared by the {source}")
+        };
         warnings.push(format!(
             "response body path {path} differed by ordering alone on {responses} response(s) and \
-             was absorbed by a `bag` reply-canon clause declared by the {source}; the members are \
-             identical as a multiset, so any added, removed or altered member would still block"
+             was not counted: {by}. The members are identical as a multiset, so any added, \
+             removed or altered member would still block"
         ));
     }
     // Two sources describing one path differently. Absorbed by neither, on
@@ -4967,6 +5037,10 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     let reply_canons = run
         .as_ref()
         .map(|run| crate::system::system_config(run.spec.system()).reply_canons)
+        .unwrap_or_default();
+    let ordered_response_paths = run
+        .as_ref()
+        .map(|run| crate::system::system_config(run.spec.system()).ordered_response_paths)
         .unwrap_or_default();
 
     let mut warnings = Vec::new();
@@ -5134,6 +5208,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         correlation_scope,
         scored_span_namespaces,
         reply_canons,
+        ordered_response_paths,
         warnings,
     })
 }
@@ -5210,6 +5285,7 @@ pub(crate) fn build_ledger_with_plan(
                     race: &inconclusive_race,
                     provenance: &column_provenance,
                     document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                    ordered_paths: &art.ordered_response_paths,
                 },
             )
             .blocking_leaf_count
@@ -5229,6 +5305,7 @@ pub(crate) fn build_ledger_with_plan(
             &inconclusive_race,
             &column_provenance,
             &document_clauses_for(&art.reply_canons, "http_incoming"),
+            &art.ordered_response_paths,
         ),
     );
     Ok(ledger::build_with_plan(
@@ -6322,6 +6399,7 @@ mod tests {
         RunArtifacts {
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            ordered_response_paths: Vec::new(),
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -6399,6 +6477,7 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
+                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6418,6 +6497,7 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
+                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6437,6 +6517,7 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
+                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6456,6 +6537,7 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
+                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6476,6 +6558,7 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
+                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6501,6 +6584,70 @@ mod tests {
         let body: Vec<JsonFieldDiff> =
             serde_json::from_value(v["body_diff"].clone()).expect("kernel rows parse");
         http_with_bodies("order", true, body, baseline, candidate)
+    }
+
+    /// The SAME rule in args, which was a different comparison path entirely.
+    ///
+    /// `values_diverge_under_event` ended in `recorded != observed`, so a
+    /// permuted array in a matched call's args or result was a value
+    /// divergence while the identical permutation in a response body was
+    /// absorbed. The instance that surfaced it: `get_eligible_connectors`
+    /// returns a `HashSet<String>` whose caller collects it straight into a
+    /// JSON array, so the args of a recorded boundary carried a set in
+    /// whatever order that process's hasher produced.
+    #[test]
+    fn a_permutation_in_args_is_not_a_divergence_either() {
+        let recorded = serde_json::json!({ "eligible": ["stripe", "adyen", "cybersource"] });
+        let observed = serde_json::json!({ "eligible": ["cybersource", "stripe", "adyen"] });
+        assert!(
+            !values_diverge_under_event("http_client", &recorded, &observed, None, None),
+            "a set serialised in a different order is not a divergence"
+        );
+
+        // A changed member still is — the multiset moved, so information moved.
+        let changed = serde_json::json!({ "eligible": ["cybersource", "stripe", "braintree"] });
+        assert!(
+            values_diverge_under_event("http_client", &recorded, &changed, None, None),
+            "a substituted member is a real difference"
+        );
+        // …as does a dropped one, because canonical order is a sort, not a dedup.
+        let dropped = serde_json::json!({ "eligible": ["stripe", "adyen"] });
+        assert!(values_diverge_under_event(
+            "http_client",
+            &recorded,
+            &dropped,
+            None,
+            None
+        ));
+    }
+
+    /// The run's own fixtures, with NOTHING declared anywhere. This is the
+    /// acceptance for the flip: the response pairs that failed the same-image
+    /// replay classify clean without a document, a canon or a path list.
+    #[test]
+    fn the_runs_permutations_need_no_declaration_at_all() {
+        for (name, raw) in [
+            (
+                "outer array permuted",
+                include_str!("fixtures/payment_methods_permuted_outer.json"),
+            ),
+            (
+                "inner card_networks permuted",
+                include_str!("fixtures/payment_methods_permuted_inner.json"),
+            ),
+        ] {
+            let diff = run_fixture(raw);
+            let c = classify_with_sources(&diff, None, &[]);
+            assert_eq!(c.blocking_leaf_count, 0, "{name} must not block");
+            assert_eq!(
+                c.canon_absorbed,
+                vec![(
+                    "$.payment_methods_enabled".to_owned(),
+                    ClauseSource::Default
+                )],
+                "{name}: absorbed by the default, with no declaration involved"
+            );
+        }
     }
 
     /// Acceptance against the run this change exists for.
@@ -6603,6 +6750,7 @@ mod tests {
                 race: &InconclusiveRaceEvidence::default(),
                 provenance: &CorrelationColumnProvenance::default(),
                 document_clauses: document,
+                ordered_paths: &[],
             },
         )
     }
@@ -6663,15 +6811,22 @@ mod tests {
     }
 
     #[test]
-    fn an_undeclared_permutation_still_blocks_and_is_still_named() {
+    fn an_undeclared_permutation_is_absorbed_by_default_and_named() {
         let diff = body_pair(
             serde_json::json!({"a": [1, 2]}),
             serde_json::json!({"a": [2, 1]}),
         );
         let c = classify_with_sources(&diff, None, &[]);
-        assert_eq!(c.blocking_leaf_count, 1);
-        assert_eq!(c.order_only_paths, vec!["$.a"]);
-        assert!(c.canon_absorbed.is_empty());
+        assert_eq!(
+            c.blocking_leaf_count, 0,
+            "order carries no meaning by default"
+        );
+        assert_eq!(
+            c.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Default)],
+            "and the default is named as the source, not left anonymous"
+        );
+        assert!(c.order_only_paths.is_empty());
     }
 
     /// The per-path point: whole-body `bag` absorbs nothing here, because the
@@ -6686,10 +6841,14 @@ mod tests {
             None,
             &clauses("bag"),
         );
-        assert!(
-            whole_body.canon_absorbed.is_empty(),
-            "whole-body bag cannot help a body that also differs for real"
+        // Whole-body `bag` still cannot help a body that also differs for real
+        // — but the DEFAULT absorbs the permutation regardless, which is the
+        // point of the flip. Either way the label below still blocks.
+        assert_eq!(
+            whole_body.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Default)]
         );
+        assert_eq!(whole_body.blocking_leaf_count, 1, "the label still blocks");
         let per_path =
             classify_with_sources(&body_pair(baseline, candidate), None, &clauses("bag:$.a[]"));
         assert_eq!(per_path.canon_absorbed.len(), 1, "the permutation");
@@ -6745,6 +6904,23 @@ mod tests {
         classify_body_declaring(diff, &[])
     }
 
+    /// The same classification, for a system that ASSERTS an order at these paths.
+    fn classify_body_declaring_ordered(
+        diff: &HttpDiff,
+        ordered: &[String],
+    ) -> HttpBodyClassification {
+        classify_http_body_diff(
+            diff,
+            None,
+            BodyClassificationContext {
+                race: &InconclusiveRaceEvidence::default(),
+                provenance: &CorrelationColumnProvenance::default(),
+                document_clauses: &[],
+                ordered_paths: ordered,
+            },
+        )
+    }
+
     /// The same classification, for a system that declares these paths as sets.
     fn classify_body_declaring(
         diff: &HttpDiff,
@@ -6757,6 +6933,7 @@ mod tests {
                 race: &InconclusiveRaceEvidence::default(),
                 provenance: &CorrelationColumnProvenance::default(),
                 document_clauses: document,
+                ordered_paths: &[],
             },
         )
     }
@@ -6783,7 +6960,12 @@ mod tests {
                 "one ordering difference, not one per position"
             );
             assert_eq!(rows[0].json_path, "$.tags");
-            counts.push(classify_body(&diff).blocking_leaf_count);
+            // The property this guards is STABILITY: one difference at the
+            // collection, the same number for every permutation. Under the
+            // default that difference is absorbed rather than counted, so the
+            // count is of absorbed paths — but it must still not vary with
+            // which permutation this run happened to produce.
+            counts.push(classify_body(&diff).canon_absorbed.len());
         }
         assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
     }
@@ -6792,13 +6974,25 @@ mod tests {
     /// makes the comparison order-blind — it makes it say the same thing every
     /// run.
     #[test]
-    fn a_reordering_is_still_a_divergence() {
+    fn a_reordering_is_absorbed_unless_the_path_asserts_an_order() {
         let diff = body_pair(
             serde_json::json!({ "steps": ["authenticate", "authorize", "capture"] }),
             serde_json::json!({ "steps": ["capture", "authorize", "authenticate"] }),
         );
-        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
-        assert_eq!(classify_body(&diff).order_only_paths, vec!["$.steps"]);
+        // The default: order carries no meaning, so this is absorbed and named
+        // under the default source rather than counted against the candidate.
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 0);
+        assert_eq!(
+            classify_body(&diff).canon_absorbed,
+            vec![("$.steps".to_owned(), ClauseSource::Default)]
+        );
+        assert!(classify_body(&diff).order_only_paths.is_empty());
+
+        // …and a system that ASSERTS an order for that path gets it back.
+        let asserted = classify_body_declaring_ordered(&diff, &["$.steps".to_owned()]);
+        assert_eq!(asserted.blocking_leaf_count, 1, "a declared order blocks");
+        assert_eq!(asserted.order_only_paths, vec!["$.steps"]);
+        assert!(asserted.canon_absorbed.is_empty());
     }
 
     /// Members are compared WITH MULTIPLICITY: canonical order is a sort, never
@@ -6899,12 +7093,20 @@ mod tests {
             diff.body_diff.len() >= 15,
             "the positional diff is the noisy one"
         );
+        // Fifteen-odd positional rows reduce to ONE difference at the
+        // collection, and under the default that one is absorbed: nothing was
+        // added, removed or changed, only the order a hash-based collection was
+        // iterated in. No declaration of any kind is involved.
         let classification = classify_body(&diff);
-        assert_eq!(classification.blocking_leaf_count, 1);
+        assert_eq!(classification.blocking_leaf_count, 0);
         assert_eq!(
-            classification.order_only_paths,
-            vec!["$.payment_methods_enabled"]
+            classification.canon_absorbed,
+            vec![(
+                "$.payment_methods_enabled".to_owned(),
+                ClauseSource::Default
+            )]
         );
+        assert!(classification.order_only_paths.is_empty());
     }
 
     /// A body carrying no arrays at all reaches exactly the rows the kernel
@@ -6984,11 +7186,13 @@ mod tests {
         let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
         let replayed = serde_json::json!({ "tags": ["c", "a", "b"] });
         let card = detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]));
-        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 1);
+        // Absorbed by default, so it is not a mismatch — but it is still SAID.
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
         assert!(
             card.warnings.iter().any(|w| w.contains("$.tags")
-                && w.contains("same members in a different order")
-                && w.contains("still blocks")),
+                && w.contains("no path asserts an order for it")
+                && w.contains("would still block")),
             "warnings: {:?}",
             card.warnings
         );
@@ -7007,6 +7211,7 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
+                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -7177,6 +7382,7 @@ mod tests {
         let rows = build_ledger(&RunArtifacts {
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            ordered_response_paths: Vec::new(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -8773,6 +8979,7 @@ mod tests {
         let art = RunArtifacts {
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            ordered_response_paths: Vec::new(),
             run_id: run_id.to_owned(),
             recording_id: Some(recording_id.to_owned()),
             table,
