@@ -393,6 +393,40 @@ pub fn set_current_correlation(correlation_id: Option<&str>) {
     }
 }
 
+/// Install `correlation_id` on this thread together with the decision that
+/// belongs to it, taking the decision from the caller instead of the registry.
+///
+/// [`set_current_correlation`] resolves the decision itself. That is right at
+/// ingress and wrong everywhere after it: the host drops the registry entry when
+/// the response is built, so a caller re-resolving later finds nothing, and the
+/// correlation arrives on the thread with its authorization stripped. Work that
+/// outlives the response then crosses boundaries with a correlation and no
+/// decision, and the opt-in capture gate skips it — silently, since a skip
+/// writes nothing.
+///
+/// A caller holding a decision it resolved WHILE the entry was live passes it
+/// here rather than asking again. The span tree is the one such caller today: it
+/// resolves a correlation's decision when the root span is created and can hand
+/// that same answer back on every later poll, on any worker, for as long as
+/// anything still claims to belong to the request.
+///
+/// `None` for `correlation_id` clears the context, exactly as
+/// [`set_current_correlation`] does. `None` for `decision` installs a
+/// correlation with no decision, which the gate reads as
+/// "no decision" and skips — recording stays opt-in.
+pub fn set_current_correlation_with_decision(
+    correlation_id: Option<&str>,
+    decision: Option<RecordDecision>,
+) {
+    match correlation_id {
+        Some(id) => set_current_context(&ContextSnapshot {
+            correlation_id: Some(id.to_owned()),
+            recording_decision: decision,
+        }),
+        None => clear_current_context(),
+    }
+}
+
 /// Guard that restores the previous thread-visible context on drop.
 #[derive(Debug)]
 pub struct ContextGuard {

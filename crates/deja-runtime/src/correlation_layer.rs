@@ -62,7 +62,23 @@ struct SpanContext {
     /// Whether entering this span should engage the correlation scope — false when
     /// the ingress pushed a `Skip` decision for `correlation`. Cached so the hot
     /// path reads a bool, not a decision-registry lookup.
+    ///
+    /// Deliberately NOT the same question as `decision`. This one is permissive
+    /// when no decision exists, because on replay none is ever pushed and the
+    /// scope still has to be engaged — the host's per-correlation DB routing and
+    /// the span-path address both depend on it. `decision` is opt-in for the
+    /// opposite reason. One cell answering both would have to pick a default, and
+    /// either choice breaks one of them.
     observe: bool,
+    /// The recording decision for `correlation`, resolved when this span was
+    /// created and carried for its lifetime.
+    ///
+    /// This is the fix for the post-response tail. The registry entry is dropped
+    /// when the response is built, so re-resolving on a later poll finds nothing;
+    /// resolving once at span creation — while the entry is live — and carrying
+    /// the answer gives the decision the span's own lifetime, which is exactly
+    /// "as long as anything still claims to belong to this request".
+    decision: Option<deja_context::RecordDecision>,
 }
 
 /// The span field that marks a spawned-task boundary: a span carrying
@@ -113,13 +129,31 @@ thread_local! {
     /// only on a CHANGE.
     static CURRENT_CORRELATION: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
 
-    /// Saved previous correlations, one frame per CHANGE (not per span), tagged
-    /// with the span id that caused it. `on_exit` pops the frame its own enter
+    /// The decision this layer installed alongside `CURRENT_CORRELATION`, so a
+    /// restore can put back the exact pair rather than re-resolving the decision
+    /// from a registry entry that may since have been dropped.
+    static CURRENT_DECISION: RefCell<Option<deja_context::RecordDecision>> =
+        const { RefCell::new(None) };
+
+    /// Saved previous correlations and their decisions, one frame per CHANGE (not
+    /// per span), tagged with the span id that caused it. `on_exit` pops the frame its own enter
     /// pushed and restores the exact previous value — so a spawned task polled on a
     /// fresh worker reverts to nothing, which restore-from-parent could not do.
     /// Depth ≈ correlation nesting (≈1 per request).
-    static CORRELATION_RESTORE: RefCell<Vec<(u64, Option<Arc<str>>)>> =
+    static CORRELATION_RESTORE: RefCell<Vec<CorrelationFrame>> =
         const { RefCell::new(Vec::new()) };
+}
+
+/// One correlation change this layer made, tagged with the span that made it.
+///
+/// Correlation and decision are saved together for the same reason they are
+/// installed together: the decision belongs to the correlation, and putting back
+/// one without the other would leave the thread holding a request with someone
+/// else's authorization, or none.
+struct CorrelationFrame {
+    span_id: u64,
+    correlation: Option<Arc<str>>,
+    decision: Option<deja_context::RecordDecision>,
 }
 
 /// Push `span_id`'s path and lineage as the innermost entered span. The only
@@ -160,14 +194,37 @@ fn with_current_cursor<T>(read: impl FnOnce(&SpanCursor) -> T) -> Option<T> {
 /// Enter `target` into deja-context only when it differs from what this layer last
 /// entered on this thread, saving the previous value tagged with `span_id` so the
 /// matching `on_exit` reverts exactly it.
-fn engage_correlation(span_id: u64, target: Option<Arc<str>>) {
+fn engage_correlation(
+    span_id: u64,
+    target: Option<Arc<str>>,
+    decision: Option<deja_context::RecordDecision>,
+) {
     CURRENT_CORRELATION.with(|current| {
         let mut current = current.borrow_mut();
         if current.as_deref() == target.as_deref() {
+            // Same correlation as this thread already holds. A decision belongs to
+            // a correlation and does not change under it, so there is nothing to
+            // reinstall and no frame to push.
             return;
         }
-        CORRELATION_RESTORE.with(|stack| stack.borrow_mut().push((span_id, current.clone())));
-        deja_context::set_current_correlation(target.as_deref());
+        // Installed as-is, including `None`. A span created BEFORE the host pushed
+        // the decision carries none, and so does every span on replay, where no
+        // decision is ever pushed — but that does NOT freeze into a skip, because
+        // `snapshot_recording_decision_for` falls through to the registry whenever
+        // the thread-local holds no decision for the correlation being asked
+        // about. Late binding on a miss is already the context crate's rule, so
+        // re-resolving here would be a second answer to a question that already
+        // has one.
+        let previous_decision = CURRENT_DECISION.with(|cell| *cell.borrow());
+        CORRELATION_RESTORE.with(|stack| {
+            stack.borrow_mut().push(CorrelationFrame {
+                span_id,
+                correlation: current.clone(),
+                decision: previous_decision,
+            })
+        });
+        deja_context::set_current_correlation_with_decision(target.as_deref(), decision);
+        CURRENT_DECISION.with(|cell| *cell.borrow_mut() = decision);
         *current = target;
     });
 }
@@ -176,14 +233,23 @@ fn engage_correlation(span_id: u64, target: Option<Arc<str>>) {
 fn restore_correlation(span_id: u64) {
     let restored = CORRELATION_RESTORE.with(|stack| {
         let mut stack = stack.borrow_mut();
-        if stack.last().is_some_and(|(id, _)| *id == span_id) {
+        if stack.last().is_some_and(|frame| frame.span_id == span_id) {
             stack.pop()
         } else {
             None
         }
     });
-    if let Some((_, previous)) = restored {
-        deja_context::set_current_correlation(previous.as_deref());
+    if let Some(CorrelationFrame {
+        correlation: previous,
+        decision: previous_decision,
+        ..
+    }) = restored
+    {
+        // Put back the exact pair this thread held. Re-resolving the decision
+        // here would read a registry entry that may have been dropped since, and
+        // would strip the authorization off a correlation that still has one.
+        deja_context::set_current_correlation_with_decision(previous.as_deref(), previous_decision);
+        CURRENT_DECISION.with(|cell| *cell.borrow_mut() = previous_decision);
         CURRENT_CORRELATION.with(|current| *current.borrow_mut() = previous);
     }
 }
@@ -340,16 +406,21 @@ where
         };
 
         // Only a span carrying its OWN correlation pays a decision lookup; a span
-        // that inherited its correlation inherits the verdict too.
-        let observe = if own_correlation.is_some() {
-            correlation.as_deref().is_some_and(|id| {
-                !matches!(
-                    deja_context::recording_decision(id),
-                    Some(deja_context::RecordDecision::Skip)
-                )
-            })
+        // that inherited its correlation inherits the verdict too. The lookup
+        // happens HERE, once, while the ingress registry entry is still live —
+        // that timing is what the whole fix rests on.
+        let (observe, decision) = if own_correlation.is_some() {
+            let resolved = correlation
+                .as_deref()
+                .and_then(deja_context::recording_decision);
+            (
+                !matches!(resolved, Some(deja_context::RecordDecision::Skip)),
+                resolved,
+            )
         } else {
-            parent.as_ref().is_some_and(|c| c.observe)
+            parent
+                .as_ref()
+                .map_or((false, None), |c| (c.observe, c.decision))
         };
 
         span.extensions_mut().insert(SpanContext {
@@ -357,6 +428,7 @@ where
             correlation,
             lineage,
             observe,
+            decision,
         });
     }
 
@@ -370,9 +442,10 @@ where
 
         push_span_cursor(id.into_u64(), &cx);
 
-        // Engage the correlation scope unless the ingress sampled this request out.
+        // Engage the correlation scope unless the ingress sampled this request out,
+        // carrying the decision the span resolved when it was created.
         let engaged = cx.observe.then(|| cx.correlation.clone()).flatten();
-        engage_correlation(id.into_u64(), engaged);
+        engage_correlation(id.into_u64(), engaged, cx.decision);
     }
 
     /// Revert everything this span's enter established, addressed by span id.
@@ -492,6 +565,81 @@ mod tests {
                 Some("payments_core>update_payment_intent")
             );
             assert_ne!(path_a, path_b);
+        });
+    }
+
+    #[test]
+    fn a_span_keeps_its_decision_after_ingress_drops_the_registry_entry() {
+        // THE TAIL BUG, at unit level. The host clears a correlation's registry
+        // entry when the response is built, but work detached from the request
+        // outlives that and is still polled afterwards. Its span carries the
+        // correlation; before this fix, entering that span re-resolved the
+        // decision from the registry, found the entry gone, and installed the
+        // correlation with no authorization — so every boundary the detached work
+        // crossed answered `SkipNoDecision` and wrote nothing.
+        //
+        // Resolving the decision when the span is CREATED, while the entry is
+        // live, and carrying it for the span's lifetime is what makes the enter
+        // below still authorized.
+        let correlation = "req-outlives-teardown";
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            deja_context::set_recording_decision(correlation, true);
+
+            // Ingress: the root span is created while the decision is live. The
+            // span is NOT entered — this models work spawned from the request and
+            // not yet polled.
+            let span = tracing::info_span!("deja::http_incoming", request_id = correlation);
+
+            // Teardown: the response is built and the host drops the entry.
+            deja_context::clear_recording_decision(correlation);
+            assert_eq!(
+                deja_context::recording_decision(correlation),
+                None,
+                "precondition: the registry entry is gone, so anything re-resolving \
+                 from it now gets nothing"
+            );
+
+            // The detached tail is polled: the span is entered on a thread that
+            // holds no context of its own, exactly as a fresh worker would.
+            let _entered = span.enter();
+            assert_eq!(
+                deja_context::current_correlation_id().as_deref(),
+                Some(correlation),
+                "the correlation rides the span and was never in question"
+            );
+            assert_eq!(
+                deja_context::recording_decision_for_current(),
+                Some(deja_context::RecordDecision::Record),
+                "the decision must ride the span too; re-resolving it here is what \
+                 silently truncated every correlation's post-response tail"
+            );
+        });
+    }
+
+    #[test]
+    fn a_span_created_before_the_decision_still_resolves_it() {
+        // The other side of the same coin, and the reason this is late-binding on
+        // a miss rather than pure early binding. A span created BEFORE the host
+        // pushes the decision carries none. Freezing that `None` would be a new
+        // bug in place of the old one — the whole request would stop recording —
+        // so a span with no cached decision falls back to a live read.
+        //
+        // This is also the normal state on replay, where no decision is ever
+        // pushed at all.
+        let correlation = "req-span-precedes-decision";
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("deja::http_incoming", request_id = correlation);
+            deja_context::set_recording_decision(correlation, true);
+            let _entered = span.enter();
+            assert_eq!(
+                deja_context::recording_decision_for_current(),
+                Some(deja_context::RecordDecision::Record),
+                "a span that predates the decision must still resolve it, or early \
+                 binding trades the tail bug for a worse one"
+            );
+            deja_context::clear_recording_decision(correlation);
         });
     }
 
