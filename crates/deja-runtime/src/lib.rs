@@ -2203,25 +2203,20 @@ impl LazyEventFinalizer {
         // shutdown flush. A per-request flush adds control-channel pressure
         // for no durability gain and, behind a saturated sink, stalls the
         // response path.
-        clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
+        // Fork sequences are NOT cleared here. They are discarded when the span
+        // that owns the correlation closes, which happens for every request
+        // rather than only for the ones that build a finalizer.
         correlation_id
     }
 }
 
 impl Drop for LazyEventFinalizer {
     fn drop(&mut self) {
-        let cleanup_correlation_id = self
-            .builder
-            .as_ref()
-            .map(|builder| builder.correlation_id.clone());
         // SHADOW GUARANTEE: never finalize while the thread is already unwinding.
         // If the real call panicked, this finalizer is dropped mid-unwind; running
         // `finish` (which can itself panic on serialization/locks) during an unwind
         // escalates to `abort()` and kills the whole process. Drop the event instead.
         if std::thread::panicking() {
-            if let Some(correlation_id) = cleanup_correlation_id {
-                clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
-            }
             return;
         }
         if self.builder.is_some() {
@@ -2240,9 +2235,6 @@ impl Drop for LazyEventFinalizer {
                 // a saturated sink, stalling teardown.
                 hook.request_flush();
             }
-        }
-        if let Some(correlation_id) = cleanup_correlation_id {
-            clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
         }
     }
 }
@@ -2390,11 +2382,20 @@ impl TaskLineage {
         }
     }
 
-    /// Lineage for a spawned-task fork: a fresh bucket under the parent, keyed by
-    /// a `(correlation, parent bucket)`-local sequence. Called by the correlation
-    /// layer when it sees a `deja.fork`-marked span — never from a task-local.
-    fn forked_child_of(parent: Self, correlation_id: Option<&str>) -> Self {
-        let fork_seq = next_fork_seq(correlation_id, &parent.bucket_id);
+    /// Lineage for a spawned-task fork: a fresh bucket under the parent, numbered
+    /// by a sequence local to `fork_path` — the fork span's own logical path.
+    /// Called by the correlation layer when it sees a `deja.fork`-marked span,
+    /// which is the sole creator of these buckets.
+    ///
+    /// The sequence is per-PATH and not per-correlation, and that is the whole
+    /// point. Numbering forks by their arrival order within a correlation made
+    /// the bucket positional: a candidate that spawned one extra task early
+    /// renumbered every later fork, moved each one's occurrence partition, and
+    /// re-addressed everything beneath them — so a single behavioural difference
+    /// arrived as a cascade of unrelated-looking divergences. Numbering within a
+    /// path keeps a change local to the callsite that made it.
+    fn forked_child_of(parent: Self, correlation_id: Option<&str>, fork_path: &str) -> Self {
+        let fork_seq = next_fork_seq(correlation_id, fork_path);
         Self {
             task_id: format!("{}::fork-{fork_seq}", parent.task_id),
             parent_task_id: Some(parent.task_id),
@@ -2404,32 +2405,57 @@ impl TaskLineage {
     }
 }
 
-/// Per-(correlation, parent bucket) counter key for detached fork sequences.
-type ForkCounterKey = (Option<String>, String);
+/// Fork sequences, grouped by correlation so a correlation's whole set is
+/// discarded in one removal when its span closes.
+///
+/// Nested rather than keyed by a `(correlation, path)` pair because the eviction
+/// has to be complete. The flat shape could only remove the one key it was told
+/// about, so every other key a correlation created outlived it: nested forks
+/// unconditionally, and every fork of a sampled-out request, since those never
+/// build the response finalizer that did the clearing. In a process that does not
+/// restart that is unbounded.
+/// Fork sequences for one correlation, keyed by the fork span's logical path.
+type ForkSequences = HashMap<String, u64>;
 
-static FORK_COUNTERS: LazyLock<Mutex<HashMap<ForkCounterKey, u64>>> =
+static FORK_COUNTERS: LazyLock<Mutex<HashMap<Option<String>, ForkSequences>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn next_fork_seq(correlation_id: Option<&str>, parent_bucket_id: &str) -> u64 {
-    let key = (
-        correlation_id.map(str::to_owned),
-        parent_bucket_id.to_owned(),
-    );
+fn next_fork_seq(correlation_id: Option<&str>, fork_path: &str) -> u64 {
     let mut counters = FORK_COUNTERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let next = counters.entry(key).or_insert(1);
+    let next = counters
+        .entry(correlation_id.map(str::to_owned))
+        .or_default()
+        .entry(fork_path.to_owned())
+        .or_insert(1);
     let fork_seq = *next;
     *next += 1;
     fork_seq
 }
 
-fn clear_fork_counter(correlation_id: Option<&str>, parent_bucket_id: &str) {
+/// How many distinct fork paths `correlation_id` currently holds sequences for.
+/// Tests only: eviction is otherwise unobservable, and an eviction nobody can see
+/// is an eviction nobody can prove.
+#[cfg(test)]
+pub(crate) fn fork_counter_paths_for(correlation_id: Option<&str>) -> usize {
+    FORK_COUNTERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&correlation_id.map(str::to_owned))
+        .map_or(0, ForkSequences::len)
+}
+
+/// Discard every fork sequence belonging to `correlation_id`.
+///
+/// Called from the correlation layer when the span that owns the correlation
+/// closes, which is the moment no further fork can be created under it. Span
+/// lifetime is the right clock here and the response is not: a sampled-out
+/// request builds no finalizer, so clearing from there left its counters behind
+/// forever, and the overwhelming majority of requests are sampled out.
+pub(crate) fn clear_fork_counters_for_correlation(correlation_id: Option<&str>) {
     if let Ok(mut counters) = FORK_COUNTERS.lock() {
-        counters.remove(&(
-            correlation_id.map(str::to_owned),
-            parent_bucket_id.to_owned(),
-        ));
+        counters.remove(&correlation_id.map(str::to_owned));
     }
 }
 
