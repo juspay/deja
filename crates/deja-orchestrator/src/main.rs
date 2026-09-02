@@ -691,22 +691,12 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// resolves.
 fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
     // Naming nothing means the default system, and the default system resolves
-    // through the same registry as every other — declared, not special. There
-    // is no fallback to the orchestrator's own bucket: a system that has not
-    // declared where its recordings are cannot be scanned for them.
-    let system = system.unwrap_or_else(|| deja_orchestrator::default_system());
-    let profile = deja_orchestrator::system::system_config(system);
-    let bucket = profile
-        .s3_bucket
-        .ok_or_else(|| {
-            format!(
-                "system '{system}' has no recording bucket declared: set systems.{system}.s3_bucket in the deja configuration"
-            )
-        })?;
-    let root = profile
-        .recording_root
-        .unwrap_or_else(|| "landing/v1".to_owned());
-    Ok((bucket, root))
+    // through the same registry as every other — declared, not special.
+    // Delegates so that this endpoint, the correlation endpoint and the replay
+    // pull path cannot disagree about where a recording is.
+    deja_orchestrator::system::recording_scope(
+        system.unwrap_or_else(|| deja_orchestrator::default_system()),
+    )
 }
 
 /// `GET /api/v1/recordings/available` — what is in the bucket, newest first.
@@ -938,6 +928,12 @@ struct AvailableQuery {
 /// one as a recording with zero correlations, i.e. as nothing worth running.
 enum RecordingCorrelations {
     Sealed(Vec<deja_orchestrator::s3::CorrelationSummary>),
+    /// Sealed, but the index sidecar is absent — a seal written before it
+    /// existed. The manifest still knows how many correlations it covered, so
+    /// the count is answerable even though the rows are not.
+    SealedWithoutIndex {
+        correlations: usize,
+    },
     /// In the landing area, not yet compacted into a sealed session.
     Landing {
         prefix: String,
@@ -951,6 +947,10 @@ struct CorrelationsQuery {
     offset: Option<usize>,
     /// Case-insensitive substring match on the correlation id.
     q: Option<String>,
+    /// Which system's recordings to look in. Absent means the default system,
+    /// exactly as it does on `/recordings/available` — the two endpoints answer
+    /// questions about the same recording and must resolve it the same way.
+    system: Option<String>,
 }
 
 /// `GET /api/v1/recordings/{id}/correlations` — the recorded test cases in a
@@ -975,23 +975,49 @@ async fn v1_recording_correlations(
     if id.trim().is_empty() {
         return error_resp(400, "recording id is required");
     }
-    let cfg = deja_orchestrator::s3::S3Config::from_env();
+    // Resolved through the same `scan_scope` as the listing, so this endpoint
+    // and the one that offered the recording agree on where it is — and scoped
+    // to the system the caller named, so a recording the listing reported in
+    // another system's bucket is readable here rather than answering "is not in
+    // s3://<default>/landing/v1" about a recording that exists.
+    let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+    let root = match scan_scope(q.system.as_deref().filter(|s| !s.trim().is_empty())) {
+        Ok((bucket, root)) => {
+            cfg.bucket = bucket;
+            root
+        }
+        Err(message) => return error_resp(400, &format!("{message} (reading correlations)")),
+    };
     let bucket = cfg.bucket.clone();
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
     let scanned = root.clone();
     let wanted = id.clone();
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
-        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
-            Some(rows) => Ok(RecordingCorrelations::Sealed(rows)),
-            // Not sealed. Whether that means "not ingested yet" or "no such
-            // recording" is a question only the landing area can answer, and
-            // they must not come back as the same thing.
-            None => Ok(
-                match deja_compactor::locate_landing_prefix(&cfg, &wanted, &scanned)? {
+        use deja_compactor::CorrelationIndex;
+        let landing = |cfg: &_| -> Result<RecordingCorrelations, String> {
+            Ok(
+                match deja_compactor::locate_landing_prefix(cfg, &wanted, &scanned)? {
                     Some(prefix) => RecordingCorrelations::Landing { prefix },
                     None => RecordingCorrelations::Unknown,
                 },
-            ),
+            )
+        };
+        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
+            CorrelationIndex::Rows(rows) => Ok(RecordingCorrelations::Sealed(rows)),
+            // Sealed before the index sidecar existed. The recording is real and
+            // the landing area can still say what is in it, so this reads it
+            // from there rather than failing — a missing index is a fact about
+            // the seal, not about the recording.
+            // NOT the landing fallback: we can prove this recording was sealed,
+            // so answering "unknown" when its landing objects have since been
+            // cleaned up would deny a recording we hold the manifest for. The
+            // count is what the manifest knows; the rows are what it lost.
+            CorrelationIndex::SealedWithoutIndex { correlations } => {
+                Ok(RecordingCorrelations::SealedWithoutIndex { correlations })
+            }
+            // Not sealed. Whether that means "not ingested yet" or "no such
+            // recording" is a question only the landing area can answer, and
+            // they must not come back as the same thing.
+            CorrelationIndex::NotSealed => landing(&cfg),
         }
     })
     .await
@@ -1074,6 +1100,23 @@ async fn v1_recording_correlations(
                            knowable without ingesting it, which the first replay run of it does",
             }))
         }
+        // 200, not an error: the recording exists and its size is known. A
+        // caller gets the count it would have summed from the rows, and an
+        // explicit note that the rows themselves are not available — rather
+        // than a 502 about a healthy recording.
+        RecordingCorrelations::SealedWithoutIndex { correlations } => json_ok(serde_json::json!({
+            "recording_id": id,
+            "status": "sealed_without_index",
+            // The manifest's own count. Answerable even though the rows are
+            // not — and NOT zero, which would report a recording we can prove
+            // was sealed as one holding nothing.
+            "total": correlations,
+            "matched": serde_json::Value::Null,
+            "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+            "cases": Vec::<serde_json::Value>::new(),
+            "note": "sealed before the correlation index existed: the manifest knows how many \
+                     correlations the seal covered but not which",
+        })),
         RecordingCorrelations::Unknown => error_resp(
             404,
             &format!("recording {id} is not in s3://{bucket}/{root}"),
@@ -1554,6 +1597,91 @@ mod tests {
     /// the bucket the default system DECLARED. There is no fallback to the
     /// orchestrator's own bucket any more: a system that has not declared where
     /// its recordings are cannot be scanned for them, the default included.
+    /// The WIRING, not just the seam: proof the handler consults the system
+    /// resolver at all. An undeclared system can only produce a 400 through the
+    /// new resolution — before it, `?system=` was ignored entirely and the
+    /// request went on to S3 under the deployment's own bucket. Needs no S3,
+    /// because the refusal happens before any store is built.
+    #[test]
+    fn the_correlations_endpoint_refuses_an_undeclared_system() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let response = rt.block_on(v1_recording_correlations(
+            axum::extract::State(test_state(dir.path())),
+            axum::extract::Path("rec-whatever".to_owned()),
+            axum::extract::Query(CorrelationsQuery {
+                limit: None,
+                offset: None,
+                q: None,
+                system: Some("zzz".to_owned()),
+            }),
+        ));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "an undeclared system is refused, not scanned for in the default bucket"
+        );
+        let body = rt
+            .block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("systems.zzz") && body.contains("correlations"),
+            "the refusal names what to declare AND which endpoint refused: {body}"
+        );
+    }
+
+    /// Both recording endpoints answer questions about the same recording, so
+    /// they must resolve it the same way. `/recordings/available?system=prism`
+    /// reported a recording in `ucs-deja` while
+    /// `/recordings/{id}/correlations?system=prism` looked in the default
+    /// bucket and answered "is not in s3://hyperswitch-art/landing/v1" — a
+    /// recording that existed to one endpoint and not to its sibling.
+    ///
+    /// Values are the deployment's own, so this fails if the document changes
+    /// shape rather than passing against a plausible invention.
+    #[test]
+    fn both_recording_endpoints_resolve_a_system_the_same_way() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n\
+             [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
+             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+        );
+        let prism = scan_scope(Some("prism"));
+        let hyperswitch = scan_scope(Some("hyperswitch"));
+        let omitted = scan_scope(None);
+        let undeclared = scan_scope(Some("zzz"));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        assert_eq!(
+            prism.as_ref().map(|(b, _)| b.as_str()),
+            Ok("ucs-deja"),
+            "a prism recording is in prism's bucket, whichever endpoint asks"
+        );
+        assert_eq!(
+            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            Ok("hyperswitch-art")
+        );
+        assert_eq!(hyperswitch, omitted, "naming the default is omitting it");
+        let refusal = undeclared.expect_err("an undeclared system is refused");
+        assert!(
+            refusal.contains("declared") && refusal.contains("systems.zzz"),
+            "and the refusal names what to declare: {refusal}"
+        );
+    }
+
     #[test]
     fn naming_the_default_system_means_what_omitting_it_means() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

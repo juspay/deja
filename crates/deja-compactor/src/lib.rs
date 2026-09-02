@@ -737,26 +737,66 @@ pub fn correlation_count(cfg: &S3Config, session_id: &str) -> Result<Option<usiz
 /// with its event count, `global_sequence` span, and whether replay can
 /// re-drive it. One manifest GET plus one sidecar GET — the data parts are
 /// never touched. `None` if the recording is not sealed.
+/// What a recording's correlation index turned out to be. Three answers, not
+/// two: "not sealed" and "sealed but its index is missing" are different facts
+/// about a recording and neither is a failure.
+///
+/// The missing-index case is a manifest written before the index sidecar
+/// existed — a legacy `seal_id: ""` seal. Returning `Err` for it made a healthy
+/// recording answer 502, when the landing area can still say what is in it.
+#[derive(Debug, Clone)]
+pub enum CorrelationIndex {
+    /// No manifest for this session; it has not been sealed.
+    NotSealed,
+    /// A manifest, but no index object beside it. The manifest still knows how
+    /// many correlations the seal covered, so that count is the honest answer —
+    /// never an error, and never zero, which would read as "this recording holds
+    /// nothing" about a recording we can prove was sealed.
+    SealedWithoutIndex {
+        correlations: usize,
+    },
+    Rows(Vec<CorrelationSummary>),
+}
+
 pub fn read_correlation_index(
     cfg: &S3Config,
     session_id: &str,
-) -> Result<Option<Vec<CorrelationSummary>>, String> {
+) -> Result<CorrelationIndex, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
     rt.block_on(async {
         let Some(manifest) = manifest_of(&store, session_id).await? else {
-            return Ok(None);
+            return Ok(CorrelationIndex::NotSealed);
         };
-        correlation_index_of(&store, &manifest).await.map(Some)
+        Ok(match correlation_index_of(&store, &manifest).await? {
+            Some(rows) => CorrelationIndex::Rows(rows),
+            None => CorrelationIndex::SealedWithoutIndex {
+                correlations: manifest.counts.correlations,
+            },
+        })
     })
 }
 
+/// `None` when the index object is ABSENT, which is a legacy seal rather than a
+/// failure. Every other store error is still an error: "the sidecar was never
+/// written" and "the bucket would not answer" must not come back as one thing.
 async fn correlation_index_of(
     store: &DynStore,
     manifest: &SessionManifest,
-) -> Result<Vec<CorrelationSummary>, String> {
+) -> Result<Option<Vec<CorrelationSummary>>, String> {
     let key = layout::correlations_key(&manifest.session_id, &manifest.seal_id);
-    let data = get_decoded(store, &object_store::path::Path::from(key.as_str())).await?;
+    let path = object_store::path::Path::from(key.as_str());
+    // Fetched here rather than through `get_decoded` so the absent case can be
+    // told apart before the error is flattened into a string.
+    let bytes = match store.get(&path).await {
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(format!("s3 get {path}: {e}")),
+        Ok(result) => result
+            .bytes()
+            .await
+            .map_err(|e| format!("s3 read {path}: {e}"))?,
+    };
+    let data = decode_object(path.as_ref(), &bytes)?;
     let mut rows = Vec::with_capacity(manifest.counts.correlations);
     for line in data.split(|&b| b == b'\n') {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -766,7 +806,7 @@ async fn correlation_index_of(
             serde_json::from_slice(line).map_err(|e| format!("correlation row in {key}: {e}"))?,
         );
     }
-    Ok(rows)
+    Ok(Some(rows))
 }
 
 /// Stream every envelope line out of a sealed session's data parts, in the
@@ -1505,6 +1545,39 @@ mod tests {
         runtime().unwrap().block_on(f)
     }
 
+    /// A seal written before the index sidecar existed. The manifest is there,
+    /// the index object is not, and that is a fact about the seal rather than a
+    /// failure to read the bucket — so it must not surface as an error, which
+    /// is how it reached the API as a 502 on a healthy recording.
+    ///
+    /// Unreachable today: nothing has ever been sealed. It becomes reachable
+    /// the first time the sealer runs against a session an older layout wrote.
+    #[test]
+    fn a_seal_with_no_index_sidecar_is_a_state_not_an_error() {
+        let store = memory();
+        let manifest = seal(
+            &store,
+            "sess-legacy",
+            &[envelope("i1", 1, Some("c1"), "http_incoming")],
+        );
+        assert!(
+            matches!(block(correlation_index_of(&store, &manifest)), Ok(Some(_))),
+            "the seal just written has its sidecar"
+        );
+
+        // The same session as an older seal wrote it: a manifest carrying no
+        // seal id, so the index is looked for at a key nothing put an object at.
+        let legacy = SessionManifest {
+            seal_id: String::new(),
+            ..manifest
+        };
+        match block(correlation_index_of(&store, &legacy)) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("there is no sidecar at the unscoped key"),
+            Err(e) => panic!("a missing sidecar must not read as a failure: {e}"),
+        }
+    }
+
     fn seal(store: &DynStore, session_id: &str, lines: &[String]) -> SessionManifest {
         block(async {
             let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
@@ -1735,7 +1808,9 @@ mod tests {
             "the count is correlations, not buckets — the uncorrelated one is not a case"
         );
 
-        let rows = block(correlation_index_of(&store, &manifest)).unwrap();
+        let rows = block(correlation_index_of(&store, &manifest))
+            .unwrap()
+            .expect("the sidecar was written");
         assert_eq!(
             rows.len(),
             3,

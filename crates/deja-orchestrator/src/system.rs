@@ -328,6 +328,34 @@ pub fn system_config(name: &str) -> SystemConfig {
 /// The default system is always present, whether or not anything declared it:
 /// it needs no configuration to exist, and a picker that could omit it would be
 /// offering a choice the orchestrator does not actually have.
+/// Where a system's recordings live: its bucket and its key root.
+///
+/// THE resolution, for every reader — the listing endpoints, the correlation
+/// endpoint, and the replay pull path alike. A recording is in one place, so
+/// the question "where" must have one answer; the pull path asking the
+/// environment while the listing asked the registry is how a system could be
+/// listed, offered, and then not found.
+///
+/// No fallback to the deployment's own bucket. A system that has not declared
+/// where its recordings are is refused BY NAME, because scanning somebody
+/// else's bucket under this system's label does not fail — it answers wrongly.
+pub fn recording_scope(system: &str) -> Result<(String, String), String> {
+    let profile = system_config(system);
+    let bucket = profile.s3_bucket.ok_or_else(|| {
+        format!(
+            "system '{system}' has no recording bucket declared: set systems.{system}.s3_bucket in the deja configuration"
+        )
+    })?;
+    let root = profile
+        .recording_root
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_RECORDING_ROOT.to_owned());
+    Ok((bucket, root))
+}
+
+/// The key root a system falls back to when it declares none.
+pub const DEFAULT_RECORDING_ROOT: &str = "landing/v1";
+
 #[must_use]
 pub fn registry() -> Vec<SystemConfig> {
     let mut names: Vec<String> = vec![default_system().to_owned()];
@@ -604,6 +632,52 @@ scored_span_namespaces = ["a::", "b::"]
         assert_eq!(
             c.candidate_env.get("RUN_ID_ENV").map(String::as_str),
             Some("LEGACY_RUN")
+        );
+    }
+
+    /// The replay pull path resolves a recording the same way the listing does.
+    /// It did not: the pull read the deployment's own bucket, so a run whose
+    /// recording lives in another system's bucket failed "no landing objects"
+    /// for a recording the listing had just offered — before admission, which
+    /// is why admission's ingress gap was never the first obstacle.
+    ///
+    /// Deployment values, so this fails if the document changes shape.
+    #[test]
+    fn a_recording_resolves_to_its_own_systems_bucket() {
+        let _lock = env_guard();
+        toml(
+            "default_system = \"hyperswitch\"\n\
+             [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
+             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+        );
+        let prism = recording_scope("prism");
+        let hyperswitch = recording_scope("hyperswitch");
+        let undeclared = recording_scope("zzz");
+        clear();
+
+        assert_eq!(
+            prism.as_ref().map(|(b, _)| b.as_str()),
+            Ok("ucs-deja"),
+            "a prism run pulls from prism's bucket"
+        );
+        assert_eq!(
+            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            Ok("hyperswitch-art")
+        );
+        assert_ne!(
+            prism.as_ref().map(|(b, _)| b.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            "and not from each other's"
+        );
+        assert_eq!(
+            prism.map(|(_, r)| r),
+            Ok(DEFAULT_RECORDING_ROOT.to_owned()),
+            "the LAYOUT is shared; only the bucket is per system"
+        );
+        let refusal = undeclared.expect_err("an undeclared system is refused, never defaulted");
+        assert!(
+            refusal.contains("systems.zzz"),
+            "and the refusal names what to declare: {refusal}"
         );
     }
 
