@@ -1756,6 +1756,62 @@ pub mod db {
 
 /// Private implementation details used by the macro-generated code.
 /// Not part of the public API — the `deja::*` attribute macros call these.
+/// Support for hosts that need to drive their own boundaries from a test.
+///
+/// Recording is gated on a correlation being CURRENT on the thread, not merely
+/// on a decision having been registered for one — [`set_recording_decision`]
+/// alone records nothing. Entering a correlation needs `deja_context::enter`
+/// and `ContextSnapshot`, and a host that only depends on this facade cannot
+/// reach them; it has to add `deja-context` as a second dependency purely to
+/// write a test. This module is the one thing such a test actually needs.
+///
+/// This is NOT [`__private`], which exists for macro expansion and may widen or
+/// change without notice. This surface is small and deliberate: one function,
+/// returning an opaque guard the caller binds and never names.
+///
+/// # Which door this is
+///
+/// Every way of making a correlation current writes the same thread-local pair
+/// through `deja_context::set_current_context`, in one of two shapes:
+///
+/// - **scoped** — `enter` / `enter_correlation_id` return a `ContextGuard` that
+///   restores the previous context on drop. This function is one of these.
+/// - **unscoped** — `set_current_correlation` and
+///   `set_current_correlation_with_decision` return nothing; the caller owns
+///   restoration. The correlation layer uses these for an on-change model where
+///   the span tree restores the previous value, which is why they hand back no
+///   guard.
+///
+/// A test wants the scoped shape: the context must come back down, or it leaks
+/// into whatever runs next in the same binary. So this delegates to `enter`
+/// rather than to the unscoped installers — the alternative would be
+/// reimplementing `ContextGuard` above the facade.
+///
+/// The decision is not ambiguous here, which is the other half of the question:
+/// this always installs `Record`. The unscoped installers can leave a
+/// correlation current with *no* decision — resolved from a registry entry that
+/// may already be gone, or passed as `None` — and the capture gate reads that as
+/// "no decision" and skips, silently. This function has no such state.
+///
+/// ```no_run
+/// let _recording = deja::test_support::recording_correlation("req-under-test");
+/// // boundaries called from here until `_recording` drops are recorded
+/// ```
+pub mod test_support {
+    /// Make `correlation_id` the current correlation, recording every boundary
+    /// crossed while the returned guard is alive.
+    ///
+    /// Bind the guard — dropping it immediately (`let _ = ...`) restores the
+    /// previous context before any boundary runs, which records nothing and is
+    /// the mistake this function exists to make hard.
+    #[must_use = "the correlation is only current while the guard is alive"]
+    pub fn recording_correlation(correlation_id: impl Into<String>) -> deja_context::ContextGuard {
+        deja_context::enter(
+            deja_context::ContextSnapshot::new(correlation_id).with_recording_decision(true),
+        )
+    }
+}
+
 pub mod __private {
     pub use deja_context::current_correlation_id;
     // The single boundary-crossing seam the `#[deja::boundary]` family emits.
