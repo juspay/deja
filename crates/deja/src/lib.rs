@@ -1769,6 +1769,30 @@ pub mod db {
 /// change without notice. This surface is small and deliberate: one function,
 /// returning an opaque guard the caller binds and never names.
 ///
+/// # Which door this is
+///
+/// Every way of making a correlation current writes the same thread-local pair
+/// through `deja_context::set_current_context`, in one of two shapes:
+///
+/// - **scoped** — `enter` / `enter_correlation_id` return a `ContextGuard` that
+///   restores the previous context on drop. This function is one of these.
+/// - **unscoped** — `set_current_correlation` and
+///   `set_current_correlation_with_decision` return nothing; the caller owns
+///   restoration. The correlation layer uses these for an on-change model where
+///   the span tree restores the previous value, which is why they hand back no
+///   guard.
+///
+/// A test wants the scoped shape: the context must come back down, or it leaks
+/// into whatever runs next in the same binary. So this delegates to `enter`
+/// rather than to the unscoped installers — the alternative would be
+/// reimplementing `ContextGuard` above the facade.
+///
+/// The decision is not ambiguous here, which is the other half of the question:
+/// this always installs `Record`. The unscoped installers can leave a
+/// correlation current with *no* decision — resolved from a registry entry that
+/// may already be gone, or passed as `None` — and the capture gate reads that as
+/// "no decision" and skips, silently. This function has no such state.
+///
 /// ```no_run
 /// let _recording = deja::test_support::recording_correlation("req-under-test");
 /// // boundaries called from here until `_recording` drops are recorded
