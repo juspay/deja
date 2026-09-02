@@ -690,21 +690,25 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// set. Its root override is optional and only consulted once its bucket
 /// resolves.
 fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, String), String> {
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
-    let Some(system) = system.filter(|s| !deja_orchestrator::is_default_system(s)) else {
-        return Ok((default_bucket.to_owned(), root));
-    };
+    // Naming nothing means the default system, and the default system resolves
+    // through the same registry as every other — it is declared, not special.
+    // `default_bucket` (the orchestrator's own `DEJA_S3_BUCKET`) is the last
+    // fallback for it alone, so a deployment that never declared a per-system
+    // bucket still scans where it always did.
+    let system = system.unwrap_or_else(|| deja_orchestrator::default_system());
     let profile = deja_orchestrator::system::system_config(system);
-    let bucket_var = deja_orchestrator::system_env_var(system, "S3_BUCKET");
-    let Some(bucket) = profile.s3_bucket else {
-        return Err(format!(
-            "system '{system}' has no recording bucket configured: set {bucket_var} on the orchestrator"
-        ));
-    };
-    let root = match std::env::var(deja_orchestrator::system_env_var(system, "RECORDING_ROOT")) {
-        Ok(r) if !r.trim().is_empty() => r.trim().to_owned(),
-        _ => root,
-    };
+    let bucket = profile
+        .s3_bucket
+        .or_else(|| profile.is_default.then(|| default_bucket.to_owned()))
+        .ok_or_else(|| {
+            format!(
+                "system '{system}' has no recording bucket configured: set {} on the orchestrator",
+                deja_orchestrator::system_env_var(system, "S3_BUCKET")
+            )
+        })?;
+    let root = profile
+        .recording_root
+        .unwrap_or_else(|| "landing/v1".to_owned());
     Ok((bucket, root))
 }
 
@@ -849,7 +853,7 @@ async fn v1_available_recordings(
                 // The id SHAPE is positive evidence for exactly one system: the
                 // `rec-<revision>-<time>-<instance>` form is the default
                 // recorder's. No other shape identifies its minter.
-                Some(deja_orchestrator::DEFAULT_SYSTEM_UNDER_TEST.to_owned())
+                Some(deja_orchestrator::default_system().to_owned())
             } else {
                 None
             };

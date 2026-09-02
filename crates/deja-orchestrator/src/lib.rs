@@ -154,11 +154,41 @@ pub enum RunStatus {
 /// require an orchestrator recompile.
 pub const DEFAULT_SYSTEM_UNDER_TEST: &str = "hyperswitch";
 
-/// Whether `system` is the default system under test. Every per-system lookup
-/// short-circuits on this BEFORE reading any profile variable, so the default
-/// system can never be made to depend on one existing.
+/// The name of the default system: the `default` the systems map names, else
+/// `DEJA_DEFAULT_SYSTEM`, else the compiled-in name.
+///
+/// Read once and held for the life of the process. Which system is default is
+/// a deployment fact, and a fact that could change between two calls would let
+/// a run be admitted under one default and launched under another. The cost is
+/// that a test of the override has to run in its own process; the fallback is
+/// tested in-process.
+///
+/// The default system is declared like any other — `DEJA_<NAME>_*` — and this
+/// only says which declared system a caller gets by naming nothing. It used to
+/// be the one system that read UNSUFFIXED variables and ignored its own
+/// `DEJA_<NAME>_*` pair, which made it a different shape from every other
+/// system and meant the deployment could not be read as a list of systems with
+/// one of them marked default. The unsuffixed names still work, as a fallback
+/// for the default system only, so nothing deployed today changes meaning.
+pub fn default_system() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        // The systems map names its default; DEJA_DEFAULT_SYSTEM is the flat
+        // form's equivalent; the compiled-in name is the last resort.
+        system::declared_default()
+            .or_else(|| {
+                std::env::var("DEJA_DEFAULT_SYSTEM")
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| DEFAULT_SYSTEM_UNDER_TEST.to_owned())
+    })
+}
+
+/// Whether `system` is the default system under test.
 pub fn is_default_system(system: &str) -> bool {
-    system == DEFAULT_SYSTEM_UNDER_TEST
+    system == default_system()
 }
 
 /// Whether the harness manages this system's stores: migrating the sidecar
@@ -258,7 +288,7 @@ impl RunSpec {
         self.system_under_test
             .as_deref()
             .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_SYSTEM_UNDER_TEST)
+            .unwrap_or_else(|| default_system())
     }
 
     /// How many times the record workload is driven. THE definition of the

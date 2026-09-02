@@ -52,6 +52,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 tokio-stream = "0.1"
 async-stream = "0.3"
 envy = "0.4.2"
+serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
 tempfile = "3"

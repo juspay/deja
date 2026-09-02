@@ -149,9 +149,6 @@ impl K8sExecutorConfig {
     /// hyperswitch-prism reads). Still data end to end: a new system needs env
     /// vars, not a recompile.
     pub fn candidate_binding_for(&self, system: &str) -> CandidateBinding {
-        if crate::is_default_system(system) {
-            return self.candidate_binding.clone();
-        }
         // The profile comes from the registry, which holds both the declared
         // names and the defaults shipped for a system deja already knows. A
         // slot the profile does not carry is UNCONFIGURED for this system, and
@@ -186,12 +183,11 @@ impl K8sExecutorConfig {
     /// diagnosis that cost a day. A missing key that says
     /// "job.prism.json not found" costs a minute.
     pub fn template_key_for(&self, system: &str) -> String {
-        if crate::is_default_system(system) {
-            return self.template_key.clone();
-        }
+        // The registry answers for every system; `None` is only ever the
+        // default system with nothing declared, which keeps the base key.
         crate::system::system_config(system)
             .job_template_key
-            .unwrap_or_else(|| format!("job.{system}.json"))
+            .unwrap_or_else(|| self.template_key.clone())
     }
 
     /// The config-copy source for a run's `system_under_test`. Non-default
@@ -200,13 +196,24 @@ impl K8sExecutorConfig {
     /// hyperswitch's rendered env would be wrong, so absent profile data
     /// disables the copy rather than borrowing the default system's.
     pub fn config_source_for(&self, system: &str) -> ConfigSource {
-        if crate::is_default_system(system) {
-            return self.config_source.clone();
-        }
         let profile = crate::system::system_config(system);
+        // Undeclared on the default system means the base source; undeclared
+        // on any other means NO copy, never the default's rendered env.
+        let fallback = if profile.is_default {
+            self.config_source.clone()
+        } else {
+            ConfigSource {
+                deployment: String::new(),
+                container: String::new(),
+            }
+        };
         ConfigSource {
-            deployment: profile.config_source_deployment.unwrap_or_default(),
-            container: profile.config_source_container.unwrap_or_default(),
+            deployment: profile
+                .config_source_deployment
+                .unwrap_or(fallback.deployment),
+            container: profile
+                .config_source_container
+                .unwrap_or(fallback.container),
         }
     }
 }
@@ -217,7 +224,7 @@ impl K8sExecutorConfig {
 /// ref → CI image), which is not built yet — they error clearly rather than
 /// guess. `LocalPath` is a compose-only mode.
 pub fn resolve_candidate_image(spec: &CandidateSpec) -> Result<(String, String), ExecutorError> {
-    resolve_candidate_image_for(spec, crate::DEFAULT_SYSTEM_UNDER_TEST)
+    resolve_candidate_image_for(spec, crate::default_system())
 }
 
 /// System-aware resolution: a bare ref qualifies against the SYSTEM's image
@@ -270,7 +277,7 @@ fn qualify_candidate_image(reference: &str) -> String {
     // Infallible for the default system: with no repo configured a bare ref
     // is left alone (compose's local tags). Test-only shorthand — production
     // paths go through `resolve_candidate_image_for`.
-    qualify_candidate_image_for(reference, crate::DEFAULT_SYSTEM_UNDER_TEST)
+    qualify_candidate_image_for(reference, crate::default_system())
         .expect("default-system qualification never refuses")
 }
 

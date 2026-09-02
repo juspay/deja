@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{is_default_system, system_env_var, DEFAULT_SYSTEM_UNDER_TEST};
+use crate::{default_system, is_default_system, system_env_var};
 
 /// The five candidate-binding slots: which env var name carries each half of
 /// the replay contract into the candidate container. Named here so the profile
@@ -210,6 +210,77 @@ impl Declared {
     }
 }
 
+/// Every system, declared once, as a map from name to the same struct.
+///
+/// This is the shape a deployment should write:
+///
+/// ```text
+/// DEJA_SYSTEMS='{
+///   "default": "hyperswitch",
+///   "systems": {
+///     "hyperswitch": { "s3_bucket": "hyperswitch-art", "candidate_env_prefix": "ROUTER__", ... },
+///     "prism":       { "s3_bucket": "ucs-deja",        "candidate_env_prefix": "CS__",     ... }
+///   }
+/// }'
+/// ```
+///
+/// The keys are the roster — there is no separate list to keep in step with
+/// the entries — and every entry is the same [`Declared`] struct, so a third
+/// system is one more key. The flat `DEJA_<SYSTEM>_<FIELD>` form this replaces
+/// took fifteen variables to say what this says in one, and scattered the
+/// roster and the default among them. It still works, as the fallback for a
+/// system not present in the map, so a deployment written against it keeps
+/// meaning what it meant.
+#[derive(Debug, Default, Deserialize)]
+struct SystemsDeclaration {
+    /// Which system a caller gets by naming nothing.
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    systems: BTreeMap<String, Declared>,
+}
+
+/// The map from `DEJA_SYSTEMS`, when it holds one.
+///
+/// `Ok(None)` is the variable unset, or set to the legacy comma-separated
+/// roster (anything not starting with `{`), which [`registry`] still honours.
+/// `Err` is JSON that did not parse, and names what was wrong — a deployment
+/// that wrote a map and got the flat fallback instead would be silently
+/// misconfigured otherwise.
+/// The default the map names, if a map is present and names one.
+pub(crate) fn declared_default() -> Option<String> {
+    systems_declaration()
+        .ok()
+        .flatten()
+        .and_then(|m| m.default)
+        .map(|d| d.trim().to_owned())
+        .filter(|d| !d.is_empty())
+}
+
+fn systems_declaration() -> Result<Option<SystemsDeclaration>, String> {
+    let Ok(raw) = std::env::var("DEJA_SYSTEMS") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if !raw.starts_with('{') {
+        return Ok(None);
+    }
+    // Through `serde_path_to_error` so a bad value names its FIELD —
+    // `systems.prism.manages_stores` — rather than a line and column into a
+    // document that is one line long. This is the property the router's own
+    // config parsing has, and the reason to parse by type at all.
+    let mut de = serde_json::Deserializer::from_str(raw);
+    serde_path_to_error::deserialize::<_, SystemsDeclaration>(&mut de)
+        .map(Some)
+        .map_err(|e| {
+            format!(
+                "DEJA_SYSTEMS is not a valid systems map at `{}`: {}",
+                e.path(),
+                e.inner()
+            )
+        })
+}
+
 /// Read one system's declaration. `Err` names the variable and the value.
 ///
 /// All-or-nothing PER SYSTEM, which is the blast radius that matches what a bad
@@ -233,16 +304,30 @@ fn declared(system: &str) -> Result<Declared, String> {
 #[must_use]
 pub fn system_config(name: &str) -> SystemConfig {
     let is_default = is_default_system(name);
-    let mut warnings = Vec::new();
+    let warnings: Vec<String> = Vec::new();
 
     // A declaration that does not parse makes this system unusable rather than
     // quietly default. Every field then takes the value it would have had with
     // nothing declared, so the struct stays complete and reportable — `error`
     // is what says not to run it.
-    let (d, error) = match declared(name) {
+    // The map is the declaration. A system absent from it — or a deployment
+    // with no map at all — resolves from the flat DEJA_<NAME>_* form instead.
+    // A map that does not parse still resolves this system from the flat form,
+    // and carries the parse error: unusable, and saying why, rather than every
+    // system answering with nothing and no signal. `error` set is what "must
+    // not run" means, whichever layer produced it.
+    let (map_entry, map_error) = match systems_declaration() {
+        Ok(Some(mut m)) => (m.systems.remove(name), None),
+        Ok(None) => (None, None),
+        Err(e) => (None, Some(e)),
+    };
+    let (d, mut error) = match map_entry.map(Ok).unwrap_or_else(|| declared(name)) {
         Ok(d) => (d, None),
         Err(e) => (Declared::default(), Some(e)),
     };
+    if let Some(e) = map_error {
+        error.get_or_insert(e);
+    }
 
     // A prefix names all five slots at once; an explicit per-slot name still
     // wins, for a system whose keys do not follow the convention.
@@ -269,37 +354,34 @@ pub fn system_config(name: &str) -> SystemConfig {
     }
 
     let clean = |v: Option<String>| v.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    // The default system is declared exactly like any other. The UNSUFFIXED
+    // names are a fallback for it alone, so a deployment written before systems
+    // were declared per name keeps meaning what it meant.
+    let legacy = |var: &str| {
+        if is_default {
+            clean(std::env::var(var).ok())
+        } else {
+            None
+        }
+    };
 
     SystemConfig {
         name: name.to_owned(),
         is_default,
-        s3_bucket: if is_default {
-            if let Some(ignored) = clean(d.s3_bucket) {
-                warnings.push(format!(
-                    "{} = '{ignored}' is set but the default system reads DEJA_S3_BUCKET and ignores it; \
-                     setting it does not change which bucket is scanned",
-                    system_env_var(name, "S3_BUCKET")
-                ));
-            }
-            None
-        } else {
-            clean(d.s3_bucket)
-        },
-        recording_root: clean(d.recording_root),
+        s3_bucket: clean(d.s3_bucket).or_else(|| legacy("DEJA_S3_BUCKET")),
+        recording_root: clean(d.recording_root).or_else(|| legacy("DEJA_RECORDING_ROOT")),
         manages_stores: d.manages_stores.unwrap_or(is_default),
         manages_stores_declared: d.manages_stores,
         has_code_bundle: d.has_code_bundle.unwrap_or(is_default),
-        job_template_key: if is_default {
-            None
-        } else {
-            Some(clean(d.job_template_key).unwrap_or_else(|| format!("job.{name}.json")))
-        },
-        candidate_image_repo: if is_default {
-            clean(std::env::var("DEJA_CANDIDATE_IMAGE_REPO").ok())
-        } else {
-            clean(d.candidate_image_repo)
-        }
-        .map(|v| v.trim_end_matches('/').to_owned()),
+        // `None` for the default means the executor's base key; any other
+        // system resolves `job.<name>.json` by convention so a launch fails
+        // naming the key it wanted rather than borrowing another system's.
+        job_template_key: clean(d.job_template_key)
+            .or_else(|| legacy("DEJA_JOB_TEMPLATE_KEY"))
+            .or_else(|| (!is_default).then(|| format!("job.{name}.json"))),
+        candidate_image_repo: clean(d.candidate_image_repo)
+            .or_else(|| legacy("DEJA_CANDIDATE_IMAGE_REPO"))
+            .map(|v| v.trim_end_matches('/').to_owned()),
         instance_pattern: clean(d.instance_pattern),
         scored_span_namespaces: d
             .scored_span_namespaces
@@ -310,16 +392,10 @@ pub fn system_config(name: &str) -> SystemConfig {
                     .collect()
             })
             .unwrap_or_default(),
-        config_source_deployment: if is_default {
-            None
-        } else {
-            clean(d.config_source_deployment)
-        },
-        config_source_container: if is_default {
-            None
-        } else {
-            clean(d.config_source_container)
-        },
+        config_source_deployment: clean(d.config_source_deployment)
+            .or_else(|| legacy("DEJA_CONFIG_SOURCE_DEPLOYMENT")),
+        config_source_container: clean(d.config_source_container)
+            .or_else(|| legacy("DEJA_CONFIG_SOURCE_CONTAINER")),
         candidate_env,
         warnings,
         error,
@@ -340,7 +416,28 @@ pub fn system_config(name: &str) -> SystemConfig {
 /// offering a choice the orchestrator does not actually have.
 #[must_use]
 pub fn registry() -> Vec<SystemConfig> {
-    let mut names: Vec<String> = vec![DEFAULT_SYSTEM_UNDER_TEST.to_owned()];
+    let mut names: Vec<String> = vec![default_system().to_owned()];
+
+    match systems_declaration() {
+        // The map IS the roster: every key, default first.
+        Ok(Some(m)) => {
+            for name in m.systems.keys() {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+            return names.iter().map(|n| system_config(n)).collect();
+        }
+        // A map that did not parse is reported on the default system rather
+        // than swallowed: the caller asked for a registry and gets one whose
+        // first entry says why it is not the one they declared.
+        Err(e) => {
+            let mut only = system_config(&names[0]);
+            only.error.get_or_insert(e);
+            return vec![only];
+        }
+        Ok(None) => {}
+    }
 
     match std::env::var("DEJA_SYSTEMS") {
         Ok(raw) if !raw.trim().is_empty() => {
@@ -412,6 +509,7 @@ pub fn match_instances(registry: &[SystemConfig], instances: &[String]) -> Optio
 mod tests {
     use super::*;
     use crate::test_env::env_guard;
+    use crate::DEFAULT_SYSTEM_UNDER_TEST;
 
     // Tests here mutate process-global environment, so each uses a system name
     // of its own. `registry()` additionally SCANS the environment when
@@ -432,40 +530,50 @@ mod tests {
         }
     }
 
+    /// The default system is declared like any other, and its own `DEJA_<NAME>_*`
+    /// pair wins. It used to be the one system that IGNORED that pair and read
+    /// unsuffixed names instead — a different shape from every other system,
+    /// which meant a deployment could not be read as a list of systems with one
+    /// marked default. The unsuffixed names survive as its fallback only.
     #[test]
-    fn the_default_system_needs_no_configuration_to_be_complete() {
+    fn the_default_system_is_declared_like_any_other_with_legacy_names_as_fallback() {
         let _lock = env_guard();
-        // Set the variable the default system must NOT consult. Asserting None
-        // with it unset proves only that nothing was there to read; the
-        // invariant is that the default ignores it even when it is present.
-        //
-        // This is not hypothetical. An orchestrator without the short-circuit
-        // refuses `?system=hyperswitch` with an error naming this exact
-        // variable, so an operator following that advice sets it — and the
-        // default system must keep reading the deployment's own bucket rather
-        // than silently repointing at whatever was set to quiet the error.
-        std::env::set_var(
-            system_env_var(DEFAULT_SYSTEM_UNDER_TEST, "S3_BUCKET"),
-            "wrong-bucket",
-        );
-        let d = system_config(DEFAULT_SYSTEM_UNDER_TEST);
-        std::env::remove_var(system_env_var(DEFAULT_SYSTEM_UNDER_TEST, "S3_BUCKET"));
+        let name = DEFAULT_SYSTEM_UNDER_TEST;
+        let own = system_env_var(name, "S3_BUCKET");
+        std::env::set_var("DEJA_S3_BUCKET", "legacy-bucket");
+        std::env::remove_var(&own);
 
+        // Nothing declared per name: falls back to the unsuffixed variable.
+        let d = system_config(name);
         assert!(d.is_default);
-        // None means "reads the deployment's own DEJA_S3_BUCKET", never
-        // "unconfigured": the default must not depend on a per-system variable.
-        assert_eq!(
-            d.s3_bucket, None,
-            "the default system must ignore its per-system bucket"
+        assert_eq!(d.s3_bucket.as_deref(), Some("legacy-bucket"));
+        assert!(
+            d.manages_stores && d.has_code_bundle,
+            "capabilities default to true"
         );
-        assert_eq!(d.job_template_key, None);
-        assert!(d.manages_stores);
-        assert!(d.has_code_bundle);
-        assert_eq!(d.manages_stores_declared, None);
+        assert_eq!(
+            d.job_template_key, None,
+            "None means the executor's base key"
+        );
+
+        // Declared per name: that wins, like it does for every other system.
+        std::env::set_var(&own, "declared-bucket");
+        let d = system_config(name);
+        std::env::remove_var(&own);
+        std::env::remove_var("DEJA_S3_BUCKET");
+        assert_eq!(d.s3_bucket.as_deref(), Some("declared-bucket"));
+        assert!(
+            d.warnings.is_empty(),
+            "declaring it is not a mistake any more"
+        );
+
+        // Neither: genuinely unconfigured, and says so rather than inventing one.
+        assert_eq!(system_config(name).s3_bucket, None);
     }
 
     #[test]
     fn a_declared_system_resolves_every_field_from_its_own_variables() {
+        let _lock = env_guard();
         let s = "regsys-full";
         set(s, "S3_BUCKET", "regsys-bucket");
         set(s, "RECORDING_ROOT", "landing/v9");
@@ -506,6 +614,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_system_is_unconfigured_rather_than_defaulted() {
+        let _lock = env_guard();
         let c = system_config("regsys-absent");
         assert!(!c.is_default);
         assert_eq!(c.s3_bucket, None);
@@ -528,6 +637,7 @@ mod tests {
     /// four could drift while the fifth still looked right.
     #[test]
     fn a_prefix_names_all_five_slots_and_an_explicit_name_still_wins() {
+        let _lock = env_guard();
         let s = "regsys-prefix";
         set(s, "S3_BUCKET", "b");
         set(s, "CANDIDATE_ENV_PREFIX", "CS__");
@@ -563,12 +673,35 @@ mod tests {
         );
     }
 
+    /// A map that does not parse is a deployment error, and the registry says
+    /// so rather than quietly falling back to the flat form — a deployment that
+    /// wrote a map and got something else would otherwise be misconfigured with
+    /// no signal at all.
+    #[test]
+    fn a_malformed_systems_map_is_reported_not_swallowed() {
+        let _lock = env_guard();
+        std::env::set_var(
+            "DEJA_SYSTEMS",
+            r#"{ "systems": { "prism": { "manages_stores": "nope" } } }"#,
+        );
+        let reg = registry();
+        std::env::remove_var("DEJA_SYSTEMS");
+        let err = reg[0]
+            .error
+            .as_deref()
+            .expect("the first entry carries the parse error");
+        assert!(err.contains("DEJA_SYSTEMS"), "names the variable: {err}");
+        assert!(err.contains("manages_stores"), "names the field: {err}");
+        assert_eq!(reg.len(), 1, "no half-parsed roster is offered");
+    }
+
     /// deja knows no system by name. A name it has seen before still resolves to
     /// nothing until the deployment declares it — which is the property that
     /// makes `GET /systems` honest, because every value it reports is one
     /// somebody chose rather than one deja assumed on their behalf.
     #[test]
     fn a_name_deja_has_seen_before_still_gets_nothing_for_free() {
+        let _lock = env_guard();
         let c = system_config("prism");
         assert_eq!(c.instance_pattern, None, "no built-in pod-name pattern");
         assert!(
@@ -595,6 +728,7 @@ mod tests {
     /// that latitude into a typed design is how it becomes permanent.
     #[test]
     fn a_capability_accepts_the_types_spellings_and_no_others() {
+        let _lock = env_guard();
         let s = "regsys-spell";
         set(s, "S3_BUCKET", "b");
         for (raw, want) in [("true", true), ("false", false)] {
@@ -652,6 +786,7 @@ mod tests {
 
     #[test]
     fn an_unrecognised_pod_name_is_unknown_and_not_the_default_system() {
+        let _lock = env_guard();
         let reg = vec![
             config(DEFAULT_SYSTEM_UNDER_TEST, None),
             config("regsys-pat", Some("regpod")),
@@ -672,6 +807,7 @@ mod tests {
 
     #[test]
     fn a_system_declaring_no_pattern_never_matches() {
+        let _lock = env_guard();
         let reg = vec![
             config(DEFAULT_SYSTEM_UNDER_TEST, None),
             config("regsys-nopat", None),
@@ -685,12 +821,14 @@ mod tests {
 
     #[test]
     fn the_default_system_is_never_matched_by_pattern() {
+        let _lock = env_guard();
         let reg = vec![config(DEFAULT_SYSTEM_UNDER_TEST, Some("router"))];
         assert_eq!(match_instances(&reg, &["inst=router-7".to_owned()]), None);
     }
 
     #[test]
     fn a_declaration_that_does_not_parse_makes_that_system_unusable() {
+        let _lock = env_guard();
         let s = "regsys-bad";
         set(s, "S3_BUCKET", "b");
         set(s, "MANAGES_STORES", "perhaps");
@@ -708,6 +846,7 @@ mod tests {
 
     #[test]
     fn one_systems_bad_declaration_does_not_disturb_another() {
+        let _lock = env_guard();
         let a = "regsys-iso-bad";
         let b = "regsys-iso-good";
         set(a, "MANAGES_STORES", "perhaps");
@@ -725,114 +864,112 @@ mod tests {
         assert_eq!(good.s3_bucket.as_deref(), Some("fine"));
     }
 
+    /// The default system's NAME is a deployment fact too. Read once for the
+    /// life of the process, so the override can only be exercised in a process
+    /// started with it set; what is checked here is that the fallback holds and
+    /// that the two ways of asking agree.
     #[test]
-    fn a_per_system_bucket_on_the_default_system_is_reported_as_ignored() {
+    fn the_default_system_name_falls_back_to_the_compiled_in_one() {
         let _lock = env_guard();
-        std::env::set_var(
-            system_env_var(DEFAULT_SYSTEM_UNDER_TEST, "S3_BUCKET"),
-            "wrong-bucket",
-        );
-        let d = system_config(DEFAULT_SYSTEM_UNDER_TEST);
-        std::env::remove_var(system_env_var(DEFAULT_SYSTEM_UNDER_TEST, "S3_BUCKET"));
-
-        assert_eq!(d.s3_bucket, None, "still ignored");
-        // This is the trap an unreconciled orchestrator walks an operator into:
-        // its 400 names this variable, setting it quiets the error without
-        // deploying anything, and nothing afterwards says the value is unused.
-        assert!(
-            d.warnings.iter().any(|w| w.contains("wrong-bucket")),
-            "the variable the pre-reconciliation error tells you to set must not \
-             be silently unused: {:?}",
-            d.warnings
-        );
+        assert_eq!(crate::default_system(), DEFAULT_SYSTEM_UNDER_TEST);
+        assert!(is_default_system(crate::default_system()));
+        assert!(!is_default_system("regsys-not-default"));
     }
 
     #[test]
     fn a_correctly_configured_system_warns_about_nothing() {
+        let _lock = env_guard();
         let s = "regsys-clean";
         set(s, "S3_BUCKET", "b");
         set(s, "MANAGES_STORES", "false");
         assert!(system_config(s).warnings.is_empty());
     }
 
-    #[test]
-    /// The deployment's declared values, resolved by the code that reads them.
+    /// The deployment's declaration, resolved by the code that reads it.
     ///
     /// A copy of what sandbox actually sets (infra:
     /// deployment-configs/replay-orchestrator/sandbox-values-dep.yaml), so the
-    /// producer and the consumer of these variables are checked against each
+    /// producer and the consumer of this document are checked against each
     /// other rather than each being separately plausible. Copies drift, and a
-    /// drifted copy here is a failing test rather than a silent misconfiguration
-    /// — which is the direction that costs least.
+    /// drifted copy here is a failing test rather than a silent misconfiguration.
+    #[test]
     fn sbx_deployment_values_resolve_as_intended() {
         let _lock = env_guard();
-        // Verbatim from deployment-configs/replay-orchestrator/sandbox-values-dep.yaml
+        for v in ["DEJA_PRISM_S3_BUCKET", "DEJA_HYPERSWITCH_S3_BUCKET"] {
+            std::env::remove_var(v);
+        }
         std::env::set_var("DEJA_S3_BUCKET", "hyperswitch-art");
-        std::env::set_var("DEJA_PRISM_S3_BUCKET", "ucs-deja");
         std::env::set_var(
-            "DEJA_PRISM_CANDIDATE_IMAGE_REPO",
-            "223655089699.dkr.ecr.ap-south-1.amazonaws.com/connector-service",
+            "DEJA_SYSTEMS",
+            r#"{
+              "default": "hyperswitch",
+              "systems": {
+                "hyperswitch": {
+                  "s3_bucket": "hyperswitch-art",
+                  "candidate_image_repo": "223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router",
+                  "candidate_env_prefix": "ROUTER__",
+                  "manages_stores": true,
+                  "has_code_bundle": true,
+                  "job_template_key": "job.json"
+                },
+                "prism": {
+                  "s3_bucket": "ucs-deja",
+                  "candidate_image_repo": "223655089699.dkr.ecr.ap-south-1.amazonaws.com/connector-service",
+                  "candidate_env_prefix": "CS__",
+                  "manages_stores": false,
+                  "has_code_bundle": false,
+                  "instance_pattern": "ucs",
+                  "scored_span_namespaces": ["ucs::", "connector::"]
+                }
+              }
+            }"#,
         );
-        std::env::set_var("DEJA_PRISM_MANAGES_STORES", "false");
-        std::env::set_var("DEJA_PRISM_HAS_CODE_BUNDLE", "false");
-        std::env::set_var("DEJA_PRISM_INSTANCE_PATTERN", "ucs");
-        std::env::set_var("DEJA_PRISM_SCORED_SPAN_NAMESPACES", "ucs::,connector::");
-        std::env::set_var("DEJA_PRISM_CANDIDATE_ENV_PREFIX", "CS__");
-        std::env::remove_var("DEJA_SYSTEMS");
 
         let reg = registry();
         let names: Vec<&str> = reg.iter().map(|s| s.name.as_str()).collect();
-        assert!(
-            names.contains(&"prism"),
-            "prism must be discovered from its bucket alone, with no list to maintain: {names:?}"
-        );
-
-        let p = reg
-            .iter()
-            .find(|s| s.name == "prism")
-            .expect("prism is in the registry");
-        assert_eq!(p.s3_bucket.as_deref(), Some("ucs-deja"));
-        assert!(!p.manages_stores);
-        assert!(!p.has_code_bundle);
-        assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
-        assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
-        // The candidate binding is declared too, now that deja ships none. If
-        // these are ever dropped from the deployment a prism candidate boots
-        // reading the DEFAULT system's variable names and never sees its run.
-        assert_eq!(p.candidate_env.len(), 5, "all five slots declared");
         assert_eq!(
-            p.candidate_env.get("MODE_ENV").map(String::as_str),
-            Some("CS__DEJA__MODE")
-        );
-        assert_eq!(p.job_template_key.as_deref(), Some("job.prism.json"));
-        assert!(
-            p.warnings.is_empty(),
-            "no ignored declarations: {:?}",
-            p.warnings
+            names,
+            vec!["hyperswitch", "prism"],
+            "the map's keys are the roster"
         );
 
         let h = reg
             .iter()
             .find(|s| s.is_default)
-            .expect("the default system is always listed");
-        assert_eq!(h.s3_bucket, None, "default reads DEJA_S3_BUCKET");
+            .expect("a default is marked");
+        assert_eq!(h.name, "hyperswitch");
+        assert_eq!(h.s3_bucket.as_deref(), Some("hyperswitch-art"));
         assert!(h.manages_stores && h.has_code_bundle);
+        assert_eq!(
+            h.manages_stores_declared,
+            Some(true),
+            "declared, not inherited"
+        );
+        assert_eq!(h.job_template_key.as_deref(), Some("job.json"));
+        assert_eq!(
+            h.candidate_env.get("MODE_ENV").map(String::as_str),
+            Some("ROUTER__DEJA__MODE")
+        );
+        assert_eq!(h.error, None);
         assert!(h.warnings.is_empty());
 
-        // Leave the environment as found: another module's tests assert that
-        // prism declares nothing, and a leaked variable here fails them from a
-        // distance, in whichever order cargo happens to schedule them.
-        for v in [
-            "DEJA_PRISM_S3_BUCKET",
-            "DEJA_PRISM_CANDIDATE_IMAGE_REPO",
-            "DEJA_PRISM_MANAGES_STORES",
-            "DEJA_PRISM_HAS_CODE_BUNDLE",
-            "DEJA_PRISM_INSTANCE_PATTERN",
-            "DEJA_PRISM_SCORED_SPAN_NAMESPACES",
-            "DEJA_PRISM_CANDIDATE_ENV_PREFIX",
-        ] {
-            std::env::remove_var(v);
-        }
+        let p = reg
+            .iter()
+            .find(|s| s.name == "prism")
+            .expect("prism is declared");
+        assert!(!p.is_default);
+        assert_eq!(p.s3_bucket.as_deref(), Some("ucs-deja"));
+        assert!(!p.manages_stores && !p.has_code_bundle);
+        assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
+        assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
+        assert_eq!(p.job_template_key.as_deref(), Some("job.prism.json"));
+        assert_eq!(p.candidate_env.len(), 5, "one prefix, five names");
+        assert_eq!(
+            p.candidate_env.get("RUN_ID_ENV").map(String::as_str),
+            Some("CS__DEJA__RUN_ID")
+        );
+        assert_eq!(p.error, None);
+        assert!(p.warnings.is_empty());
 
         // The attribution that used to mislabel: a router pod is now unknown.
         assert_eq!(
@@ -843,5 +980,8 @@ mod tests {
             match_instances(&reg, &["inst=hyperswitch-router-abc".to_owned()]),
             None
         );
+
+        std::env::remove_var("DEJA_SYSTEMS");
+        std::env::remove_var("DEJA_S3_BUCKET");
     }
 }
