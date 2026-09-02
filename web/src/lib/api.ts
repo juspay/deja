@@ -363,6 +363,9 @@ export type SystemRow = {
   candidate_image_repo?: string | null;
   instance_pattern?: string | null;
   scored_span_namespaces: string[];
+  /** Slot name → the env var the candidate reads it from, derived from
+   *  candidate_env_prefix or overridden per slot. */
+  candidate_env?: Record<string, string>;
   candidate_config_files?: string[] | null;
   code_bundle_uri_env?: string | null;
   warnings?: string[];
