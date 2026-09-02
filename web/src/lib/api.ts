@@ -363,6 +363,8 @@ export type SystemRow = {
   candidate_image_repo?: string | null;
   instance_pattern?: string | null;
   scored_span_namespaces: string[];
+  candidate_config_files?: string[] | null;
+  code_bundle_uri_env?: string | null;
   warnings?: string[];
   error?: string | null;
 };
