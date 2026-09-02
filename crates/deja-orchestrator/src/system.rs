@@ -40,6 +40,21 @@ pub const CANDIDATE_ENV_SLOTS: [&str; 5] = [
     "CODE_SHA_ENV",
 ];
 
+/// The key each slot occupies inside a candidate's configuration, without the
+/// prefix that says whose configuration it is.
+///
+/// These halves are DEJA'S contract, identical for every system, which is what
+/// makes the prefix below sufficient. A deployment naming all five in full was
+/// restating deja's own convention four more times than necessary, in a form
+/// where four could be wrong while the fifth looked right.
+const CANDIDATE_ENV_KEYS: [(&str, &str); 5] = [
+    ("MODE_ENV", "DEJA__MODE"),
+    ("RUN_ID_ENV", "DEJA__RUN_ID"),
+    ("SOURCE_ENV", "DEJA__REPLAY__SOURCE"),
+    ("OBSERVED_ENV", "DEJA__REPLAY__OBSERVED_SINK"),
+    ("CODE_SHA_ENV", "DEJA__IDENTITY__CODE_SHA"),
+];
+
 // The five candidate-binding slots are declared per system, like everything
 // else about it. There is deliberately no table of built-in profiles here.
 //
@@ -61,11 +76,7 @@ pub const CANDIDATE_ENV_SLOTS: [&str; 5] = [
 // DEJA_<SYSTEM>_HAS_CODE_BUNDLE=false
 // DEJA_<SYSTEM>_INSTANCE_PATTERN=a-substring-of-its-pod-names
 // DEJA_<SYSTEM>_SCORED_SPAN_NAMESPACES=its::,span::prefixes::
-// DEJA_<SYSTEM>_CANDIDATE_MODE_ENV=ITS__MODE
-// DEJA_<SYSTEM>_CANDIDATE_RUN_ID_ENV=ITS__RUN_ID
-// DEJA_<SYSTEM>_CANDIDATE_SOURCE_ENV=ITS__REPLAY__SOURCE
-// DEJA_<SYSTEM>_CANDIDATE_OBSERVED_ENV=ITS__REPLAY__OBSERVED_SINK
-// DEJA_<SYSTEM>_CANDIDATE_CODE_SHA_ENV=ITS__IDENTITY__CODE_SHA
+// DEJA_<SYSTEM>_CANDIDATE_ENV_PREFIX=ITS__
 // ```
 
 /// Everything the orchestrator can say about one system, resolved together.
@@ -176,6 +187,9 @@ struct Declared {
     scored_span_namespaces: Option<Vec<String>>,
     config_source_deployment: Option<String>,
     config_source_container: Option<String>,
+    /// The system's own configuration prefix — `CS__` for a service whose keys
+    /// are `CS__DEJA__MODE`. One fact, from which all five names follow.
+    candidate_env_prefix: Option<String>,
     candidate_mode_env: Option<String>,
     candidate_run_id_env: Option<String>,
     candidate_source_env: Option<String>,
@@ -230,9 +244,26 @@ pub fn system_config(name: &str) -> SystemConfig {
         Err(e) => (Declared::default(), Some(e)),
     };
 
+    // A prefix names all five slots at once; an explicit per-slot name still
+    // wins, for a system whose keys do not follow the convention.
+    let prefix = d
+        .candidate_env_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
     let mut candidate_env = BTreeMap::new();
     for (slot, declared_name) in d.candidate_slots() {
-        if let Some(value) = declared_name.cloned() {
+        let value = declared_name.cloned().or_else(|| {
+            prefix.map(|p| {
+                let key = CANDIDATE_ENV_KEYS
+                    .iter()
+                    .find(|(s, _)| *s == slot)
+                    .map(|(_, k)| *k)
+                    .unwrap_or_default();
+                format!("{p}{key}")
+            })
+        });
+        if let Some(value) = value {
             candidate_env.insert(slot.to_owned(), value);
         }
     }
@@ -492,6 +523,46 @@ mod tests {
         );
     }
 
+    /// The prefix is the fact; the five names follow from it. Declaring them one
+    /// by one restated deja's own convention four extra times, in a form where
+    /// four could drift while the fifth still looked right.
+    #[test]
+    fn a_prefix_names_all_five_slots_and_an_explicit_name_still_wins() {
+        let s = "regsys-prefix";
+        set(s, "S3_BUCKET", "b");
+        set(s, "CANDIDATE_ENV_PREFIX", "CS__");
+        let c = system_config(s);
+        assert_eq!(c.error, None);
+        assert_eq!(c.candidate_env.len(), 5, "one declaration, five names");
+        assert_eq!(
+            c.candidate_env.get("MODE_ENV").map(String::as_str),
+            Some("CS__DEJA__MODE")
+        );
+        assert_eq!(
+            c.candidate_env.get("OBSERVED_ENV").map(String::as_str),
+            Some("CS__DEJA__REPLAY__OBSERVED_SINK")
+        );
+        assert_eq!(
+            c.candidate_env.get("CODE_SHA_ENV").map(String::as_str),
+            Some("CS__DEJA__IDENTITY__CODE_SHA")
+        );
+
+        // A system whose keys do not follow the convention overrides one slot
+        // without having to restate the other four.
+        set(s, "CANDIDATE_RUN_ID_ENV", "LEGACY_RUN");
+        let o = system_config(s);
+        std::env::remove_var(system_env_var(s, "CANDIDATE_RUN_ID_ENV"));
+        assert_eq!(
+            o.candidate_env.get("RUN_ID_ENV").map(String::as_str),
+            Some("LEGACY_RUN")
+        );
+        assert_eq!(
+            o.candidate_env.get("MODE_ENV").map(String::as_str),
+            Some("CS__DEJA__MODE"),
+            "overriding one slot must not disturb the others"
+        );
+    }
+
     /// deja knows no system by name. A name it has seen before still resolves to
     /// nothing until the deployment declares it — which is the property that
     /// makes `GET /systems` honest, because every value it reports is one
@@ -706,20 +777,7 @@ mod tests {
         std::env::set_var("DEJA_PRISM_HAS_CODE_BUNDLE", "false");
         std::env::set_var("DEJA_PRISM_INSTANCE_PATTERN", "ucs");
         std::env::set_var("DEJA_PRISM_SCORED_SPAN_NAMESPACES", "ucs::,connector::");
-        std::env::set_var("DEJA_PRISM_CANDIDATE_MODE_ENV", "CS__DEJA__MODE");
-        std::env::set_var("DEJA_PRISM_CANDIDATE_RUN_ID_ENV", "CS__DEJA__RUN_ID");
-        std::env::set_var(
-            "DEJA_PRISM_CANDIDATE_SOURCE_ENV",
-            "CS__DEJA__REPLAY__SOURCE",
-        );
-        std::env::set_var(
-            "DEJA_PRISM_CANDIDATE_OBSERVED_ENV",
-            "CS__DEJA__REPLAY__OBSERVED_SINK",
-        );
-        std::env::set_var(
-            "DEJA_PRISM_CANDIDATE_CODE_SHA_ENV",
-            "CS__DEJA__IDENTITY__CODE_SHA",
-        );
+        std::env::set_var("DEJA_PRISM_CANDIDATE_ENV_PREFIX", "CS__");
         std::env::remove_var("DEJA_SYSTEMS");
 
         let reg = registry();
@@ -771,11 +829,7 @@ mod tests {
             "DEJA_PRISM_HAS_CODE_BUNDLE",
             "DEJA_PRISM_INSTANCE_PATTERN",
             "DEJA_PRISM_SCORED_SPAN_NAMESPACES",
-            "DEJA_PRISM_CANDIDATE_MODE_ENV",
-            "DEJA_PRISM_CANDIDATE_RUN_ID_ENV",
-            "DEJA_PRISM_CANDIDATE_SOURCE_ENV",
-            "DEJA_PRISM_CANDIDATE_OBSERVED_ENV",
-            "DEJA_PRISM_CANDIDATE_CODE_SHA_ENV",
+            "DEJA_PRISM_CANDIDATE_ENV_PREFIX",
         ] {
             std::env::remove_var(v);
         }

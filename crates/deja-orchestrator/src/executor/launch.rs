@@ -727,15 +727,10 @@ mod tests {
         // the assertion at the end of this test checks, because that failure is
         // silent at launch and only shows up as a candidate that never sees its
         // run.
-        for (suffix, value) in [
-            ("CANDIDATE_MODE_ENV", "CS__DEJA__MODE"),
-            ("CANDIDATE_RUN_ID_ENV", "CS__DEJA__RUN_ID"),
-            ("CANDIDATE_SOURCE_ENV", "CS__DEJA__REPLAY__SOURCE"),
-            ("CANDIDATE_OBSERVED_ENV", "CS__DEJA__REPLAY__OBSERVED_SINK"),
-            ("CANDIDATE_CODE_SHA_ENV", "CS__DEJA__IDENTITY__CODE_SHA"),
-        ] {
-            std::env::set_var(crate::system_env_var("prism", suffix), value);
-        }
+        std::env::set_var(
+            crate::system_env_var("prism", "CANDIDATE_ENV_PREFIX"),
+            "CS__",
+        );
         let cfg = K8sExecutorConfig::from_env();
         let run = Run {
             run_id: "run-43".into(),
@@ -783,15 +778,7 @@ mod tests {
         // variable names. That is the failure the declaration above prevents,
         // and it is worth pinning: nothing fails at launch, so it surfaces only
         // as a candidate that boots and never sees its run.
-        for suffix in [
-            "CANDIDATE_MODE_ENV",
-            "CANDIDATE_RUN_ID_ENV",
-            "CANDIDATE_SOURCE_ENV",
-            "CANDIDATE_OBSERVED_ENV",
-            "CANDIDATE_CODE_SHA_ENV",
-        ] {
-            std::env::remove_var(crate::system_env_var("prism", suffix));
-        }
+        std::env::remove_var(crate::system_env_var("prism", "CANDIDATE_ENV_PREFIX"));
         let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
         assert!(
             !spec.env.iter().any(|e| e.name == "CS__DEJA__RUN_ID"),
