@@ -386,6 +386,20 @@ pub fn enter_correlation_id(correlation_id: impl Into<String>) -> ContextGuard {
 /// returns no restore guard — the caller owns restoration. The correlation layer
 /// uses it for an on-change model where the previous value is restored from the
 /// span tree rather than an RAII guard per span.
+///
+/// # The entry may already be gone
+///
+/// A host typically drops the registry entry when the response is built, so a
+/// caller reaching this afterwards resolves nothing and the correlation arrives
+/// on the thread with no decision at all. The capture gate reads that as "no
+/// decision" and skips — and a skip writes nothing, so the result cannot be told
+/// apart from a correlation that had nothing to record. That is what makes this
+/// failure hard to notice: not a wrong value, but an absence that looks exactly
+/// like the legitimate empty case.
+///
+/// Use this only where the entry is known to be live. Work that outlives the
+/// response should resolve the decision while it still is, and pass it to
+/// [`set_current_correlation_with_decision`].
 pub fn set_current_correlation(correlation_id: Option<&str>) {
     match correlation_id {
         Some(id) => set_current_context(&ContextSnapshot::new(id)),
@@ -412,8 +426,10 @@ pub fn set_current_correlation(correlation_id: Option<&str>) {
 ///
 /// `None` for `correlation_id` clears the context, exactly as
 /// [`set_current_correlation`] does. `None` for `decision` installs a
-/// correlation with no decision, which the gate reads as
-/// "no decision" and skips — recording stays opt-in.
+/// correlation with no decision, which the gate reads as "no decision" and skips
+/// — and a skip writes nothing, so it cannot be told apart from a correlation
+/// that had nothing to record. Recording stays opt-in, and an absent decision
+/// fails quiet rather than loud.
 pub fn set_current_correlation_with_decision(
     correlation_id: Option<&str>,
     decision: Option<RecordDecision>,
