@@ -759,6 +759,12 @@ async fn v1_systems() -> Response {
                 "candidate_image_repo": s.candidate_image_repo,
                 "instance_pattern": s.instance_pattern,
                 "scored_span_namespaces": s.scored_span_namespaces,
+                // The five variable names a candidate reads, as derived from
+                // the declared prefix (or overridden per slot). Exposed so the
+                // derivation is observable on a deployment, not only asserted
+                // in a test: "prism reads CS__DEJA__RUN_ID" is a fact worth
+                // reading off the running orchestrator.
+                "candidate_env": s.candidate_env,
                 "candidate_config_files": s.candidate_config_files,
                 "code_bundle_uri_env": s.code_bundle_uri_env,
                 // Declarations this deployment made that are not being used.
