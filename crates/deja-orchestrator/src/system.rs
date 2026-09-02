@@ -40,38 +40,33 @@ pub const CANDIDATE_ENV_SLOTS: [&str; 5] = [
     "CODE_SHA_ENV",
 ];
 
-/// Defaults shipped for a system deja already knows, applied only where the
-/// deployment has declared nothing.
-///
-/// These are DEFAULTS, not knowledge: every one is overridable by the matching
-/// `DEJA_<SYSTEM>_*` variable, and a system absent from this table is fully
-/// configurable — it simply starts from the generic fallbacks. The table exists
-/// so the values live in one readable place instead of as `if system == "prism"`
-/// inside three different closures, which is where they were.
-struct ShippedProfile {
-    system: &'static str,
-    instance_pattern: &'static str,
-    scored_span_namespaces: &'static [&'static str],
-    candidate_env: [(&'static str, &'static str); 5],
-}
-
-const SHIPPED_PROFILES: &[ShippedProfile] = &[ShippedProfile {
-    system: "prism",
-    // UCS pods carry this in their `inst=` name; router pods do not.
-    instance_pattern: "ucs",
-    scored_span_namespaces: &["ucs::", "connector::"],
-    candidate_env: [
-        ("MODE_ENV", "CS__DEJA__MODE"),
-        ("RUN_ID_ENV", "CS__DEJA__RUN_ID"),
-        ("SOURCE_ENV", "CS__DEJA__REPLAY__SOURCE"),
-        ("OBSERVED_ENV", "CS__DEJA__REPLAY__OBSERVED_SINK"),
-        ("CODE_SHA_ENV", "CS__DEJA__IDENTITY__CODE_SHA"),
-    ],
-}];
-
-fn shipped(system: &str) -> Option<&'static ShippedProfile> {
-    SHIPPED_PROFILES.iter().find(|p| p.system == system)
-}
+// The five candidate-binding slots are declared per system, like everything
+// else about it. There is deliberately no table of built-in profiles here.
+//
+// One used to exist, carrying prism's real values: the substring of its pod
+// names, the span prefixes its instrumentation declares, and the `CS__DEJA__*`
+// variable names its candidate reads. Those are facts about another service,
+// and a service's facts do not belong in the instrument that observes it. Deja
+// cannot verify them, cannot notice when that service changes them, and a
+// deployment reading `GET /systems` could not tell a value it had chosen from
+// one deja had assumed on its behalf — the two rendered identically.
+//
+// So every value comes from the environment, and a system that declares
+// nothing is unconfigured rather than quietly complete. A full declaration
+// looks like the following, and lives in the deployment rather than here:
+//
+// ```text
+// DEJA_<SYSTEM>_S3_BUCKET=its-recording-bucket
+// DEJA_<SYSTEM>_MANAGES_STORES=false
+// DEJA_<SYSTEM>_HAS_CODE_BUNDLE=false
+// DEJA_<SYSTEM>_INSTANCE_PATTERN=a-substring-of-its-pod-names
+// DEJA_<SYSTEM>_SCORED_SPAN_NAMESPACES=its::,span::prefixes::
+// DEJA_<SYSTEM>_CANDIDATE_MODE_ENV=ITS__MODE
+// DEJA_<SYSTEM>_CANDIDATE_RUN_ID_ENV=ITS__RUN_ID
+// DEJA_<SYSTEM>_CANDIDATE_SOURCE_ENV=ITS__REPLAY__SOURCE
+// DEJA_<SYSTEM>_CANDIDATE_OBSERVED_ENV=ITS__REPLAY__OBSERVED_SINK
+// DEJA_<SYSTEM>_CANDIDATE_CODE_SHA_ENV=ITS__IDENTITY__CODE_SHA
+// ```
 
 /// Everything the orchestrator can say about one system, resolved together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,7 +219,6 @@ fn declared(system: &str) -> Result<Declared, String> {
 #[must_use]
 pub fn system_config(name: &str) -> SystemConfig {
     let is_default = is_default_system(name);
-    let profile = shipped(name);
     let mut warnings = Vec::new();
 
     // A declaration that does not parse makes this system unusable rather than
@@ -238,15 +232,7 @@ pub fn system_config(name: &str) -> SystemConfig {
 
     let mut candidate_env = BTreeMap::new();
     for (slot, declared_name) in d.candidate_slots() {
-        let value = declared_name.cloned().or_else(|| {
-            profile.and_then(|p| {
-                p.candidate_env
-                    .iter()
-                    .find(|(s, _)| *s == slot)
-                    .map(|(_, v)| (*v).to_owned())
-            })
-        });
-        if let Some(value) = value {
+        if let Some(value) = declared_name.cloned() {
             candidate_env.insert(slot.to_owned(), value);
         }
     }
@@ -283,8 +269,7 @@ pub fn system_config(name: &str) -> SystemConfig {
             clean(d.candidate_image_repo)
         }
         .map(|v| v.trim_end_matches('/').to_owned()),
-        instance_pattern: clean(d.instance_pattern)
-            .or_else(|| profile.map(|p| p.instance_pattern.to_owned())),
+        instance_pattern: clean(d.instance_pattern),
         scored_span_namespaces: d
             .scored_span_namespaces
             .map(|v| {
@@ -293,16 +278,7 @@ pub fn system_config(name: &str) -> SystemConfig {
                     .filter(|s| !s.is_empty())
                     .collect()
             })
-            .unwrap_or_else(|| {
-                profile
-                    .map(|p| {
-                        p.scored_span_namespaces
-                            .iter()
-                            .map(|s| (*s).to_owned())
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }),
+            .unwrap_or_default(),
         config_source_deployment: if is_default {
             None
         } else {
@@ -516,33 +492,30 @@ mod tests {
         );
     }
 
+    /// deja knows no system by name. A name it has seen before still resolves to
+    /// nothing until the deployment declares it — which is the property that
+    /// makes `GET /systems` honest, because every value it reports is one
+    /// somebody chose rather than one deja assumed on their behalf.
     #[test]
-    fn a_shipped_profile_supplies_defaults_and_a_declaration_beats_it() {
-        let p = system_config("prism");
-        assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
-        assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
-        assert_eq!(
-            p.candidate_env.get("MODE_ENV").map(String::as_str),
-            Some("CS__DEJA__MODE")
+    fn a_name_deja_has_seen_before_still_gets_nothing_for_free() {
+        let c = system_config("prism");
+        assert_eq!(c.instance_pattern, None, "no built-in pod-name pattern");
+        assert!(
+            c.scored_span_namespaces.is_empty(),
+            "no built-in span namespaces"
         );
-
-        // Overridden on a system that HAS a shipped profile — the only case
-        // where precedence is observable. Declaring on a system with no profile
-        // would pass whichever way round the two were tried.
-        set("prism", "INSTANCE_PATTERN", "declared-wins");
-        set("prism", "SCORED_SPAN_NAMESPACES", "only::");
-        set("prism", "CANDIDATE_MODE_ENV", "DECLARED__MODE");
-        let o = system_config("prism");
+        assert!(c.candidate_env.is_empty(), "no built-in candidate binding");
+        assert_eq!(c.s3_bucket, None);
+        // Declared, it resolves — the only way anything resolves.
+        set("prism", "INSTANCE_PATTERN", "ucs");
+        set("prism", "CANDIDATE_MODE_ENV", "CS__DEJA__MODE");
+        let d = system_config("prism");
         std::env::remove_var(system_env_var("prism", "INSTANCE_PATTERN"));
-        std::env::remove_var(system_env_var("prism", "SCORED_SPAN_NAMESPACES"));
         std::env::remove_var(system_env_var("prism", "CANDIDATE_MODE_ENV"));
-
-        assert_eq!(o.instance_pattern.as_deref(), Some("declared-wins"));
-        assert_eq!(o.scored_span_namespaces, vec!["only::"]);
+        assert_eq!(d.instance_pattern.as_deref(), Some("ucs"));
         assert_eq!(
-            o.candidate_env.get("MODE_ENV").map(String::as_str),
-            Some("DECLARED__MODE"),
-            "a shipped value is a default, not knowledge"
+            d.candidate_env.get("MODE_ENV").map(String::as_str),
+            Some("CS__DEJA__MODE")
         );
     }
 
@@ -733,6 +706,20 @@ mod tests {
         std::env::set_var("DEJA_PRISM_HAS_CODE_BUNDLE", "false");
         std::env::set_var("DEJA_PRISM_INSTANCE_PATTERN", "ucs");
         std::env::set_var("DEJA_PRISM_SCORED_SPAN_NAMESPACES", "ucs::,connector::");
+        std::env::set_var("DEJA_PRISM_CANDIDATE_MODE_ENV", "CS__DEJA__MODE");
+        std::env::set_var("DEJA_PRISM_CANDIDATE_RUN_ID_ENV", "CS__DEJA__RUN_ID");
+        std::env::set_var(
+            "DEJA_PRISM_CANDIDATE_SOURCE_ENV",
+            "CS__DEJA__REPLAY__SOURCE",
+        );
+        std::env::set_var(
+            "DEJA_PRISM_CANDIDATE_OBSERVED_ENV",
+            "CS__DEJA__REPLAY__OBSERVED_SINK",
+        );
+        std::env::set_var(
+            "DEJA_PRISM_CANDIDATE_CODE_SHA_ENV",
+            "CS__DEJA__IDENTITY__CODE_SHA",
+        );
         std::env::remove_var("DEJA_SYSTEMS");
 
         let reg = registry();
@@ -751,6 +738,14 @@ mod tests {
         assert!(!p.has_code_bundle);
         assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
         assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
+        // The candidate binding is declared too, now that deja ships none. If
+        // these are ever dropped from the deployment a prism candidate boots
+        // reading the DEFAULT system's variable names and never sees its run.
+        assert_eq!(p.candidate_env.len(), 5, "all five slots declared");
+        assert_eq!(
+            p.candidate_env.get("MODE_ENV").map(String::as_str),
+            Some("CS__DEJA__MODE")
+        );
         assert_eq!(p.job_template_key.as_deref(), Some("job.prism.json"));
         assert!(
             p.warnings.is_empty(),
@@ -776,6 +771,11 @@ mod tests {
             "DEJA_PRISM_HAS_CODE_BUNDLE",
             "DEJA_PRISM_INSTANCE_PATTERN",
             "DEJA_PRISM_SCORED_SPAN_NAMESPACES",
+            "DEJA_PRISM_CANDIDATE_MODE_ENV",
+            "DEJA_PRISM_CANDIDATE_RUN_ID_ENV",
+            "DEJA_PRISM_CANDIDATE_SOURCE_ENV",
+            "DEJA_PRISM_CANDIDATE_OBSERVED_ENV",
+            "DEJA_PRISM_CANDIDATE_CODE_SHA_ENV",
         ] {
             std::env::remove_var(v);
         }

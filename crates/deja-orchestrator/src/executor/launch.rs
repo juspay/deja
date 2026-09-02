@@ -719,6 +719,23 @@ mod tests {
     /// key and the binding both follow the run's system, in the same spec.
     #[test]
     fn a_prism_run_resolves_its_own_template_key_and_binding() {
+        let _lock = crate::test_env::env_guard();
+        // Declared, not shipped. deja used to carry another system's variable
+        // names in a built-in table; they are the deployment's to state, so the
+        // test states them the way the deployment does. Without the
+        // declaration this run boots reading the DEFAULT system's names — which
+        // the assertion at the end of this test checks, because that failure is
+        // silent at launch and only shows up as a candidate that never sees its
+        // run.
+        for (suffix, value) in [
+            ("CANDIDATE_MODE_ENV", "CS__DEJA__MODE"),
+            ("CANDIDATE_RUN_ID_ENV", "CS__DEJA__RUN_ID"),
+            ("CANDIDATE_SOURCE_ENV", "CS__DEJA__REPLAY__SOURCE"),
+            ("CANDIDATE_OBSERVED_ENV", "CS__DEJA__REPLAY__OBSERVED_SINK"),
+            ("CANDIDATE_CODE_SHA_ENV", "CS__DEJA__IDENTITY__CODE_SHA"),
+        ] {
+            std::env::set_var(crate::system_env_var("prism", suffix), value);
+        }
         let cfg = K8sExecutorConfig::from_env();
         let run = Run {
             run_id: "run-43".into(),
@@ -757,10 +774,35 @@ mod tests {
             "the prism binding names carry the replay contract"
         );
         // And a default-system run keeps the base key untouched.
-        let mut base = run;
+        let mut base = run.clone();
         base.spec.system_under_test = None;
         let spec = launch_spec_for_run(&base, &cfg, None, None).expect("spec builds");
         assert_eq!(spec.template_key, cfg.template_key);
+
+        // Undeclared, the same prism run falls back to the DEFAULT system's
+        // variable names. That is the failure the declaration above prevents,
+        // and it is worth pinning: nothing fails at launch, so it surfaces only
+        // as a candidate that boots and never sees its run.
+        for suffix in [
+            "CANDIDATE_MODE_ENV",
+            "CANDIDATE_RUN_ID_ENV",
+            "CANDIDATE_SOURCE_ENV",
+            "CANDIDATE_OBSERVED_ENV",
+            "CANDIDATE_CODE_SHA_ENV",
+        ] {
+            std::env::remove_var(crate::system_env_var("prism", suffix));
+        }
+        let spec = launch_spec_for_run(&run, &cfg, None, None).expect("spec builds");
+        assert!(
+            !spec.env.iter().any(|e| e.name == "CS__DEJA__RUN_ID"),
+            "an undeclared binding must not conjure the names from nowhere"
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|e| e.name == cfg.candidate_binding.run_id_env),
+            "it falls back to the base binding, which is the silent failure"
+        );
     }
 
     /// Both steps that consume the CodeBundle must be pointed at the SAME

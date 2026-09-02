@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, availableRecordings, AvailableRecording, RecordingRow } from "../lib/api";
 import { catalogById, identityText, spanOf } from "../lib/recordings";
+import { useSystems } from "../lib/systems";
 
 /* The seal/coverage badges read the compactor's manifest: a sealed session
    with zero per-instance gseq gaps is replay-grade; gaps or no manifest mean
@@ -77,7 +78,11 @@ export default function RecordingsPage() {
   // Which system's bucket to list. The buckets are deliberately separate —
   // prism tapes carry payment payloads on a tighter retention — so this is a
   // SOURCE switch, not a client-side filter of one listing.
-  const [system, setSystem] = React.useState<"" | "prism">("");
+  // Empty means the deployment's default bucket. Any other value is a system
+  // name from `/api/v1/systems` — a string rather than a union, so a third
+  // system needs no change to this file.
+  const [system, setSystem] = React.useState<string>("");
+  const systems = useSystems();
   const available = useQuery({
     queryKey: ["recordings-available", system],
     queryFn: () => availableRecordings(200, 0, system || undefined),
@@ -141,9 +146,20 @@ export default function RecordingsPage() {
       <p>
         <label className="hint">
           system{" "}
-          <select value={system} onChange={(e) => setSystem(e.target.value as "" | "prism")}>
-            <option value="">hyperswitch (default bucket)</option>
-            <option value="prism">prism / UCS (ucs-deja bucket)</option>
+          <select value={system} onChange={(e) => setSystem(e.target.value)}>
+            <option value="">
+              {systems.defaultSystem
+                ? `${systems.defaultSystem.name} (default bucket)`
+                : "default bucket"}
+            </option>
+            {systems.selectable
+              .filter((s) => !s.is_default)
+              .map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.name}
+                  {s.s3_bucket ? ` (${s.s3_bucket} bucket)` : ""}
+                </option>
+              ))}
           </select>
         </label>
       </p>
@@ -183,9 +199,10 @@ export default function RecordingsPage() {
                   <td className="mono">
                     {r.recording_id}
                     {/* Only a non-default system is worth a badge — same rule
-                        as the runs list. */}
-                    {r.system === "prism" && (
-                      <span className="chip muted" style={{ marginLeft: 6 }}>prism</span>
+                        as the runs list. Which name is default comes from the
+                        orchestrator, so a third system badges itself. */}
+                    {r.system && !systems.isDefault(r.system) && (
+                      <span className="chip muted" style={{ marginLeft: 6 }}>{r.system}</span>
                     )}
                   </td>
                   <td className="recspan">
