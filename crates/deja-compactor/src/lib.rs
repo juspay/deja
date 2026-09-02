@@ -166,11 +166,68 @@ impl S3Config {
     }
 }
 
+/// Where `system`'s recordings land, from the declared document.
+///
+/// This replaced a `DEJA_<SYSTEM>_S3_BUCKET` variable and a `DEFAULT_SYSTEM`
+/// constant of this crate's own. Systems are now declared in one TOML document
+/// (see [`settings`]) and the flat form is gone from the deployment with no
+/// compatibility layer, so anything still reading it resolves nothing.
+///
+/// An undeclared system is an ERROR, and the default system is not exempt: it is
+/// declared like any other and has no implicit bucket. Falling back to the
+/// deployment's own `DEJA_S3_BUCKET` would not fail — it would list one system's
+/// recordings under another system's name, and the caller would have no way to
+/// tell. The refusal names the table to add.
+///
+/// This duplicates the rule the orchestrator applies in `scan_scope`, and the
+/// duplication is forced rather than chosen: `deja-orchestrator` depends on this
+/// crate, so `system::system_config` is not reachable from here. Both resolve the
+/// same document through [`settings::load`], which is why the declaration was
+/// moved down to this crate in the first place — the two agree on the source even
+/// though they cannot share the resolver.
+pub fn bucket_for_system(system: &str) -> Result<String, String> {
+    let declared = settings::load()?;
+    declared
+        .systems
+        .get(system)
+        .and_then(|d| d.s3_bucket.as_deref())
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "system '{system}' has no recording bucket declared: set \
+                 systems.{system}.s3_bucket in the deja configuration"
+            )
+        })
+}
+
+/// The key prefix `system`'s recordings land under.
+///
+/// A declared `recording_root` wins; otherwise the layout every deployment uses.
+/// Unlike the bucket this has a default, because a missing root is a system
+/// using the standard layout while a missing bucket is a system nobody has said
+/// anything about. Same precedence as the orchestrator's `scan_scope`.
+pub fn recording_root_for(system: &str) -> Result<String, String> {
+    Ok(settings::load()?
+        .systems
+        .get(system)
+        .and_then(|d| d.recording_root.as_deref())
+        .map(|r| r.trim().trim_end_matches('/').to_owned())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| DEFAULT_RECORDING_ROOT.to_owned()))
+}
+
+/// The landing layout a system uses unless it declares another.
+pub const DEFAULT_RECORDING_ROOT: &str = "landing/v1";
+
 /// Key layout for one session in the bucket.
 pub mod layout {
-    pub fn landing_prefix(session_id: &str) -> String {
-        format!("landing/v1/session={session_id}")
+    /// The flat landing prefix for a session under an EXPLICIT root. Pure, so
+    /// the key shape can be asserted without the environment taking part.
+    pub fn landing_prefix_in(root: &str, session_id: &str) -> String {
+        format!("{}/session={session_id}", root.trim_end_matches('/'))
     }
+
     pub fn session_root(session_id: &str) -> String {
         format!("sessions/v1/{session_id}")
     }
@@ -283,18 +340,67 @@ pub struct DataPart {
     pub bytes: usize,
 }
 
+/// The most distinct `boundary` values one correlation's row will carry.
+///
+/// Boundaries are a closed vocabulary in every recorder that exists, so a real
+/// correlation has a handful — but `boundary` arrives as a STRING from the
+/// envelope, which means a buggy or hostile producer decides its cardinality,
+/// not this crate. Without a cap, one such producer turns every index row into
+/// an unbounded string set and the sidecar stops being the cheap thing a reader
+/// can pull instead of the tape. Exceeding it is recorded rather than hidden
+/// (see `boundaries_truncated`).
+pub const MAX_BOUNDARIES_PER_CORRELATION: usize = 16;
+
 /// Per-correlation row of the `index/correlations` sidecar. Rows are in TAPE
 /// ORDER — each correlation's first appearance in the recording — so "the first
 /// N" means the earliest N requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrelationSummary {
     pub correlation_id: Option<String>,
     pub events: u64,
     pub gseq_min: u64,
     pub gseq_max: u64,
-    /// Whether the correlation has an `http_incoming` event — i.e. replay
-    /// can re-drive it from the recording alone.
-    pub has_ingress: bool,
+    /// The distinct `boundary` values observed on this correlation, sorted.
+    ///
+    /// EVIDENCE, not a verdict. This row used to carry `has_ingress: bool`,
+    /// defined as "the correlation has an `http_incoming` event — i.e. replay can
+    /// re-drive it from the recording alone". Those are not the same statement,
+    /// and collapsing them put a claim here that this crate cannot support:
+    /// whether a correlation is drivable depends on the recorded system's ingress
+    /// convention, `deja-compactor` has no dependency on `deja` (so it cannot
+    /// even name `ROLE_INGRESS`), and a system whose entry point is
+    /// `grpc_incoming` had every correlation reported as not drivable — asserted
+    /// as fact, by an instrument with no way to know.
+    ///
+    /// **To decide drivability, a consumer matches this against the ingress
+    /// boundary of the system that produced the recording** — `http_incoming`
+    /// for the default system, `grpc_incoming` for a gRPC one. The judgement
+    /// moved here deliberately: it did not move to the consumer entirely, because
+    /// computing it needs a full pass over the tape and the sealer is the only
+    /// thing that already makes one, so a consumer deriving it from scratch would
+    /// have to pull the tape — the exact cost this index exists to avoid. The
+    /// fact is recorded once, by the pass that is already reading; the judgement
+    /// is made by the code that knows the convention.
+    pub boundaries: Vec<String>,
+    /// The distinct `role` values observed on this correlation, sorted.
+    ///
+    /// The companion to [`Self::boundaries`], and the same kind of evidence: a
+    /// recorder that stamps `role: "ingress"` says so here, and a consumer that
+    /// knows its system stamps roles reads drivability off this instead of the
+    /// boundary name. Recorded rather than folded into a verdict for the same
+    /// reason — this crate cannot import any system's ingress constant.
+    ///
+    /// `#[serde(default)]` so a seal written before roles were recorded still
+    /// reads, without a re-seal.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// The correlation carried more distinct boundary values than
+    /// [`MAX_BOUNDARIES_PER_CORRELATION`], so `boundaries` is the first that many
+    /// in sorted order and the absence of a boundary from it proves nothing.
+    /// Said out loud because a silently truncated set would answer a drivability
+    /// question with a confident "no".
+    #[serde(default)]
+    pub boundaries_truncated: bool,
 }
 
 // -- envelope probing --------------------------------------------------------
@@ -356,6 +462,11 @@ impl<'a> EnvelopeProbe<'a> {
 struct CaptureProbe {
     #[serde(default)]
     mode: Option<String>,
+    /// Which session the envelope belongs to. Only content can say this: the
+    /// deployed aggregator's date partitions are shared, so a prefix that holds
+    /// one session's objects generally holds others' too.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -682,13 +793,282 @@ pub fn object_exists(cfg: &S3Config, key: &str) -> Result<bool, String> {
 }
 
 /// Count landing objects for a session (the lifecycle's quiesce poll).
-pub fn count_landing_objects(cfg: &S3Config, session_id: &str) -> Result<usize, String> {
+pub fn count_landing_objects(
+    cfg: &S3Config,
+    session_id: &str,
+    root: &str,
+) -> Result<usize, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
     rt.block_on(async {
-        Ok(list_keys(&store, &layout::landing_prefix(session_id))
-            .await?
-            .len())
+        Ok(
+            list_keys(&store, &layout::landing_prefix_in(root, session_id))
+                .await?
+                .len(),
+        )
+    })
+}
+
+/// The end-of-stream marker kind the recorder writes when a producer shuts
+/// down cleanly (`deja-runtime`'s `MarkerKind::Eof`). It is the ONLY positive
+/// evidence in the landing that a producer is finished; everything else is an
+/// inference from silence.
+const MARKER_KIND_EOF: &str = "eof";
+
+#[derive(Deserialize)]
+struct MarkerProbe {
+    #[serde(default)]
+    artifact_type: Option<String>,
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    marker: Option<MarkerBody>,
+    #[serde(default)]
+    capture: Option<CaptureProbe>,
+}
+
+#[derive(Deserialize)]
+struct MarkerBody {
+    #[serde(default)]
+    kind: String,
+}
+
+/// What the landing says about whether a session is still being written.
+///
+/// A recorder session does NOT close when a workload finishes — it closes when
+/// the pod does. So "unsealed" is the normal state of a healthy recording and is
+/// not evidence of truncation, and "has not been written to lately" is not the
+/// same fact as "is finished". These are kept apart because a sealer that treats
+/// them as one either seals recordings that are still growing or never seals the
+/// ones whose pod was killed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SealReadiness {
+    /// Not in the landing under this root at all.
+    Absent,
+    /// Written to within the quiet period. Sealing now would seal a prefix of
+    /// the recording.
+    Active { quiet_for_secs: u64, objects: usize },
+    /// Every producer instance that appears in this session emitted its
+    /// end-of-stream marker. The recording is finished, whatever the clock says.
+    Complete { instances: usize, objects: usize },
+    /// Quiet for longer than the period, but at least one instance never said it
+    /// finished — the usual cause is a pod that was killed rather than shut
+    /// down, which never gets to write its marker. Sealing is correct here, and
+    /// the instances that went silent are named rather than assumed complete.
+    Quiesced {
+        quiet_for_secs: u64,
+        objects: usize,
+        instances_without_eof: Vec<String>,
+    },
+}
+
+impl SealReadiness {
+    /// Whether a sealer should act. Both terminal states are sealable: the
+    /// difference between them is what the sealer can HONESTLY say afterwards,
+    /// not whether the seal is valid.
+    pub fn should_seal(&self) -> bool {
+        matches!(
+            self,
+            SealReadiness::Complete { .. } | SealReadiness::Quiesced { .. }
+        )
+    }
+
+    /// Landing objects belonging to this session right now. `Absent` is zero —
+    /// a landing that has been cleaned up behind a seal holds nothing.
+    pub fn objects(&self) -> usize {
+        match self {
+            SealReadiness::Absent => 0,
+            SealReadiness::Active { objects, .. }
+            | SealReadiness::Complete { objects, .. }
+            | SealReadiness::Quiesced { objects, .. } => *objects,
+        }
+    }
+}
+
+/// What a sealing pass should do about one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealDecision {
+    /// Write a seal. For an already-sealed session this is a RE-seal, because
+    /// the landing has grown since.
+    Seal { resealing: bool },
+    /// A seal already covers everything that has landed. Nothing to do.
+    AlreadyCurrent { sealed_objects: usize },
+    /// Not finished yet.
+    NotReady,
+}
+
+/// Decide a sealing pass from the seal that exists and what the landing now
+/// holds. Pure, because this is the rule a cron applies thousands of times and
+/// it must be assertable without a bucket.
+///
+/// "Already sealed" is NOT on its own a reason to skip. A recorder session does
+/// not close when a workload finishes — it closes when the pod does — so a
+/// session can go quiet for hours, get sealed, and then resume. Skipping it
+/// forever on the presence of a manifest would leave that manifest as a
+/// confident statement about an incomplete recording, which is worse than
+/// having no manifest at all: readers take the manifest fast path and stop
+/// looking at the landing, so the events that arrived after the seal become
+/// invisible rather than merely unsealed.
+///
+/// The landing object count decides it. The manifest records how many objects
+/// its seal was built from, so more objects now means the recording grew, and a
+/// re-seal supersedes the short manifest — safely, because seals are
+/// content-addressed: the longer seal writes a disjoint key set and the manifest
+/// PUT that names it is last and atomic.
+///
+/// Fewer or equal means nothing new, INCLUDING the case where the landing has
+/// been swept behind an existing seal (zero objects), which must not read as a
+/// reason to re-seal from nothing.
+pub fn seal_decision(
+    existing: Option<&SessionManifest>,
+    readiness: &SealReadiness,
+) -> SealDecision {
+    match existing {
+        Some(manifest) if readiness.objects() <= manifest.counts.landing_objects => {
+            SealDecision::AlreadyCurrent {
+                sealed_objects: manifest.counts.landing_objects,
+            }
+        }
+        // Grown, or never sealed. Either way the readiness gate still applies:
+        // a session that is still being written is sealed as a prefix of itself.
+        _ if !readiness.should_seal() => SealDecision::NotReady,
+        existing => SealDecision::Seal {
+            resealing: existing.is_some(),
+        },
+    }
+}
+
+/// Whether a landing key names this session. The deployed layout puts
+/// `session={id}` in the key, so a shared date partition can still be attributed
+/// without reading a single object. A key that names NO session is kept, because
+/// the only layout that produces one is the flat prefix, which names the session
+/// once for all of its keys.
+fn key_names_session(key: &str, session_id: &str) -> bool {
+    let mut named = false;
+    for segment in key.split('/') {
+        if let Some(s) = segment.strip_prefix("session=") {
+            if s == session_id {
+                return true;
+            }
+            named = true;
+        }
+    }
+    !named
+}
+
+/// Judge whether a session is finished, from the landing alone.
+///
+/// Cheap first: quiescence comes from the LISTING (no object is fetched), so a
+/// sealer polling a bucket full of live recordings pays one list per session and
+/// stops there. Only once a session has gone quiet are its objects read, to look
+/// for the end-of-stream markers that distinguish "finished" from "went silent".
+///
+/// `quiet_after_secs` has to exceed the aggregator's flush interval, or a
+/// session is "quiet" between two flushes of a workload still running.
+pub fn seal_readiness(
+    cfg: &S3Config,
+    session_id: &str,
+    root: &str,
+    quiet_after_secs: u64,
+) -> Result<SealReadiness, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(readiness_of(&store, session_id, root, quiet_after_secs))
+}
+
+async fn readiness_of(
+    store: &DynStore,
+    session_id: &str,
+    root: &str,
+    quiet_after_secs: u64,
+) -> Result<SealReadiness, String> {
+    let Some(location) = locate_landing(store, session_id, root).await? else {
+        return Ok(SealReadiness::Absent);
+    };
+
+    let prefix_path = object_store::path::Path::from(location.prefix.as_str());
+    let metas: Vec<object_store::ObjectMeta> =
+        store
+            .list(Some(&prefix_path))
+            .try_collect()
+            .await
+            .map_err(|e| format!("s3 list {}: {e}", location.prefix))?;
+    let mine: Vec<&object_store::ObjectMeta> = metas
+        .iter()
+        .filter(|m| key_names_session(m.location.as_ref(), session_id))
+        .collect();
+    if mine.is_empty() {
+        return Ok(SealReadiness::Absent);
+    }
+
+    let newest = mine
+        .iter()
+        .map(|m| m.last_modified.timestamp())
+        .max()
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // A clock skewed so the newest object is in the future reads as zero quiet
+    // time, not as a huge one — erring towards "still active" leaves the
+    // recording alone, which is the recoverable mistake.
+    let quiet_for_secs = now.saturating_sub(newest).max(0) as u64;
+    let objects = mine.len();
+
+    if quiet_for_secs < quiet_after_secs {
+        return Ok(SealReadiness::Active {
+            quiet_for_secs,
+            objects,
+        });
+    }
+
+    // Quiet. Now it is worth reading the objects to tell a finished recording
+    // from one whose producer was killed.
+    let mut instances: BTreeSet<String> = BTreeSet::new();
+    let mut with_eof: BTreeSet<String> = BTreeSet::new();
+    for meta in &mine {
+        let data = get_decoded(store, &meta.location).await?;
+        for line in data.split(|&b| b == b'\n') {
+            if line.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let line = String::from_utf8_lossy(line);
+            let Ok(probe) = serde_json::from_str::<MarkerProbe>(&line) else {
+                continue;
+            };
+            // A shared partition holds other sessions; only content separates
+            // them, and an instance id from the wrong session would report a
+            // producer this recording never had.
+            if let Some(sid) = probe.capture.as_ref().and_then(|c| c.session_id.as_deref()) {
+                if sid != session_id {
+                    continue;
+                }
+            }
+            let Some(instance) = probe.instance_id.clone() else {
+                continue;
+            };
+            instances.insert(instance.clone());
+            if probe.artifact_type.as_deref() == Some(ARTIFACT_TYPE_MARKER)
+                && probe.marker.map(|m| m.kind).as_deref() == Some(MARKER_KIND_EOF)
+            {
+                with_eof.insert(instance);
+            }
+        }
+    }
+
+    let without: Vec<String> = instances.difference(&with_eof).cloned().collect();
+    if without.is_empty() && !instances.is_empty() {
+        return Ok(SealReadiness::Complete {
+            instances: instances.len(),
+            objects,
+        });
+    }
+    Ok(SealReadiness::Quiesced {
+        quiet_for_secs,
+        objects,
+        instances_without_eof: without,
     })
 }
 
@@ -722,6 +1102,49 @@ async fn manifest_of(
         Err(e) => Err(format!("manifest get: {e}")),
     }
 }
+
+/// Manifests for many recordings at once, in the order asked for.
+///
+/// One store, one runtime, and the GETs go out concurrently. A listing enriches
+/// a PAGE of recordings, so doing this one at a time would be one connection
+/// setup and one round trip per row, serially, on the request path.
+///
+/// A recording that is not sealed yields `None`; a recording whose manifest
+/// cannot be READ also yields `None`, because a listing that fails wholesale
+/// because one manifest is corrupt tells the caller less than a listing that
+/// reports that row as unsealed. The distinction that matters to a caller —
+/// sealed versus not — is preserved; the distinction between "absent" and
+/// "unreadable" belongs to the single-recording read, which reports it.
+pub fn read_manifests(
+    cfg: &S3Config,
+    session_ids: &[String],
+) -> Result<Vec<Option<SessionManifest>>, String> {
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    Ok(rt.block_on(manifests_of(&store, session_ids)))
+}
+
+/// The batch read's store-facing half, separated from its connection setup so
+/// the ordering guarantee callers depend on can be tested against a store rather
+/// than asserted about a bucket.
+async fn manifests_of(store: &DynStore, session_ids: &[String]) -> Vec<Option<SessionManifest>> {
+    use futures::StreamExt;
+    futures::stream::iter(
+        session_ids
+            .iter()
+            .map(|id| async { manifest_of(store, id).await.unwrap_or(None) }),
+    )
+    .buffered(MANIFEST_FETCH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+}
+
+/// Manifest GETs in flight while enriching a listing. Bounded so a large page
+/// does not open a connection per row.
+const MANIFEST_FETCH_CONCURRENCY: usize = 16;
 
 /// How many correlations a sealed recording holds, WITHOUT pulling the tape.
 ///
@@ -840,28 +1263,134 @@ async fn session_lines(
 /// Compact one session: landing objects → data parts + correlations index,
 /// manifest written last (the seal). Idempotent — recompacting the same landing
 /// data writes identical bytes to identical keys.
-pub fn compact_session(cfg: &S3Config, session_id: &str) -> Result<SessionManifest, String> {
+/// The `root` is the caller's, not this crate's: where a system's recordings
+/// land is declared per system now, so a compactor that resolved it from a
+/// global would seal the wrong prefix for every system but one.
+pub fn compact_session(
+    cfg: &S3Config,
+    session_id: &str,
+    root: &str,
+) -> Result<SessionManifest, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(compact_session_inner(&store, session_id))
+    rt.block_on(compact_session_inner(&store, session_id, root))
+}
+
+/// Where a session's landing objects actually are, and whether the prefix that
+/// holds them holds anything else.
+struct LandingLocation {
+    prefix: String,
+    /// True when the prefix is a shared partition parent. Attribution then has
+    /// to come from each envelope's `capture.session_id`, never from the key —
+    /// a session that runs across midnight is addressed from the parent of two
+    /// date partitions, and every other session that landed in that window is
+    /// under it too.
+    shared: bool,
+}
+
+/// Find a session's landing, in either layout a bucket may use.
+///
+/// The flat `{root}/session={id}` layout is tried first: one cheap list, exact
+/// when it hits. The deployed Vector aggregator partitions by DATE first, so a
+/// session it wrote is not under the flat prefix at all — which is why sealing
+/// by id used to fail with "no landing objects" for a recording plainly present
+/// in the bucket. Both layouts are read, because which one a bucket uses belongs
+/// to the deployment.
+async fn locate_landing(
+    store: &DynStore,
+    session_id: &str,
+    root: &str,
+) -> Result<Option<LandingLocation>, String> {
+    let flat = layout::landing_prefix_in(root, session_id);
+    if !list_keys(store, &flat).await?.is_empty() {
+        return Ok(Some(LandingLocation {
+            prefix: flat,
+            shared: false,
+        }));
+    }
+    let keys: Vec<String> = list_keys(store, root)
+        .await?
+        .into_iter()
+        .map(|p| p.as_ref().to_owned())
+        .collect();
+    Ok(index_landed_keys(root, &keys)
+        .into_iter()
+        .find(|found| found.session_id == session_id)
+        .map(|found| LandingLocation {
+            // A session under exactly one partition is addressed at
+            // `{root}/dt=…/session={id}`, which names it; one that straddles is
+            // addressed at the root, which does not.
+            shared: found.dates.len() > 1,
+            prefix: found.prefix,
+        }))
+}
+
+/// The lines of ONE session out of objects that may hold several, and the number
+/// of objects that actually carried it.
+///
+/// The object count is not the size of the scan. A shared partition holds other
+/// sessions, and reporting their objects as this recording's landing would
+/// describe a landing it never had — the same accounting the prefix-scanning
+/// ingest already keeps.
+fn select_session_lines<'a>(chunks: &'a [Vec<u8>], session_id: &str) -> (Vec<Cow<'a, str>>, usize) {
+    let mut lines = Vec::new();
+    let mut objects = 0usize;
+    for chunk in chunks {
+        let before = lines.len();
+        for line in chunk.split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(line);
+            if envelope_session(&line).as_deref() == Some(session_id) {
+                lines.push(line);
+            }
+        }
+        if lines.len() > before {
+            objects += 1;
+        }
+    }
+    (lines, objects)
+}
+
+/// The session an envelope line declares, or `None` when it declares none — a
+/// line that cannot say which recording it belongs to cannot be attributed to
+/// one, and guessing from the key is exactly what the shared prefix forbids.
+fn envelope_session(line: &str) -> Option<String> {
+    serde_json::from_str::<EnvelopeProbe>(line)
+        .ok()?
+        .capture?
+        .session_id
 }
 
 async fn compact_session_inner(
     store: &DynStore,
     session_id: &str,
+    root: &str,
 ) -> Result<SessionManifest, String> {
-    let landing = layout::landing_prefix(session_id);
-    let keys = list_keys(store, &landing).await?;
-    if keys.is_empty() {
-        return Err(format!("no landing objects under {landing}"));
-    }
+    let Some(location) = locate_landing(store, session_id, root).await? else {
+        return Err(format!(
+            "no landing objects for session {session_id} under {root} — it was \
+             never landed, or it landed under a different root"
+        ));
+    };
+    let keys = list_keys(store, &location.prefix).await?;
     let mut chunks = Vec::with_capacity(keys.len());
     for key in &keys {
         chunks.push(get_decoded(store, key).await?);
     }
 
-    let collated = collate(chunk_lines(&chunks));
-    write_seal(store, session_id, collated, keys.len()).await
+    let (lines, landing_objects) = if location.shared {
+        select_session_lines(&chunks, session_id)
+    } else {
+        (chunk_lines(&chunks).collect(), keys.len())
+    };
+    if lines.is_empty() {
+        return Err(format!(
+            "no envelope lines for session {session_id} under {}",
+            location.prefix
+        ));
+    }
+
+    let collated = collate(lines.into_iter());
+    write_seal(store, session_id, collated, landing_objects).await
 }
 
 /// Seal a recording from envelope lines a caller has ALREADY read.
@@ -1166,14 +1695,34 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
                 events: 0,
                 gseq_min: acc.gseq,
                 gseq_max: acc.gseq,
-                has_ingress: false,
+                boundaries: Vec::new(),
+                roles: Vec::new(),
+                boundaries_truncated: false,
             }
         });
         row.events += 1;
         row.gseq_min = row.gseq_min.min(acc.gseq);
         row.gseq_max = row.gseq_max.max(acc.gseq);
-        row.has_ingress |=
-            acc.role.as_deref() == Some("ingress") || acc.boundary == "http_incoming";
+        // Distinct, sorted, capped. Kept as a sorted Vec rather than a set so
+        // the row serialises in one order for one recording — a seal is
+        // content-addressed and two sealers of the same landing must produce
+        // byte-identical objects.
+        if let Err(at) = row.boundaries.binary_search(&acc.boundary) {
+            if row.boundaries.len() < MAX_BOUNDARIES_PER_CORRELATION {
+                row.boundaries.insert(at, acc.boundary.clone());
+            } else {
+                row.boundaries_truncated = true;
+            }
+        }
+        if let Some(role) = acc.role.as_deref() {
+            if let Err(at) = row.roles.binary_search(&role.to_owned()) {
+                if row.roles.len() < MAX_BOUNDARIES_PER_CORRELATION {
+                    row.roles.insert(at, role.to_owned());
+                } else {
+                    row.boundaries_truncated = true;
+                }
+            }
+        }
     }
     let correlations: Vec<CorrelationSummary> = order
         .into_iter()
@@ -1212,7 +1761,7 @@ pub fn locate_landing_prefix(
     root: &str,
 ) -> Result<Option<String>, String> {
     // The flat layout first: one cheap list, and it is exact when it hits.
-    let flat = layout::landing_prefix(session_id);
+    let flat = layout::landing_prefix_in(root, session_id);
     if !list_objects(cfg, &flat)?.is_empty() {
         return Ok(Some(flat));
     }
@@ -1468,14 +2017,23 @@ mod tests {
             .iter()
             .find(|r| r.correlation_id.as_deref() == Some("c1"))
             .unwrap();
-        assert!(c1.has_ingress);
+        // The row records which boundaries were SEEN; deciding whether that
+        // makes the correlation drivable belongs to a caller that knows the
+        // recorded system's ingress convention.
+        // c1 is a request that also made a db call: the row records BOTH, in
+        // sorted order, because it reports what the correlation was made of
+        // rather than answering one question about it.
+        assert_eq!(
+            c1.boundaries,
+            vec!["db".to_owned(), "http_incoming".to_owned()]
+        );
         assert_eq!(c1.events, 2);
         let c2 = c
             .correlations
             .iter()
             .find(|r| r.correlation_id.as_deref() == Some("c2"))
             .unwrap();
-        assert!(!c2.has_ingress);
+        assert_eq!(c2.boundaries, vec!["redis".to_owned()]);
     }
 
     #[test]
@@ -1828,16 +2386,18 @@ mod tests {
             .find(|r| r.correlation_id.as_deref() == Some("c1"))
             .unwrap();
         assert_eq!(c1.events, 2);
-        assert!(
-            c1.has_ingress,
-            "c1 has an http_incoming, so replay can re-drive it"
+        assert_eq!(
+            c1.boundaries,
+            vec!["db".to_owned(), "http_incoming".to_owned()],
+            "the index says what c1 was made of; a caller that knows this \
+             system's ingress boundary reads drivability off it"
         );
-        assert!(
-            !rows
-                .iter()
+        assert_eq!(
+            rows.iter()
                 .find(|r| r.correlation_id.as_deref() == Some("c2"))
                 .unwrap()
-                .has_ingress
+                .boundaries,
+            vec!["redis".to_owned()]
         );
 
         let reads = log.reads();
@@ -2067,5 +2627,637 @@ mod tests {
         async fn abort(&mut self) -> object_store::Result<()> {
             self.inner.abort().await
         }
+    }
+    // -- the deployment's layout and per-system resolution --------------------
+
+    fn envelope_for(session: &str, inst: &str, gseq: u64, corr: Option<&str>) -> String {
+        let corr_json = match corr {
+            Some(c) => format!(r#""{c}""#),
+            None => "null".to_owned(),
+        };
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"{inst}","capture":{{"mode":"session","session_id":"{session}"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"{session}","global_sequence":{gseq},"correlation_id":{corr_json},"boundary":"http_incoming","event_schema_version":1}}}}"#
+        )
+    }
+
+    fn eof_marker(session: &str, inst: &str) -> String {
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_sink_marker","instance_id":"{inst}","capture":{{"mode":"session","session_id":"{session}"}},"marker":{{"kind":"eof","last_seq":9,"records_written":9,"records_dropped":0}}}}"#
+        )
+    }
+
+    fn put_object_at(store: &DynStore, key: &str, lines: &[String]) {
+        block(put(store, key, lines.join("\n").into_bytes())).unwrap();
+    }
+
+    #[test]
+    fn the_landing_prefix_follows_the_configured_root() {
+        // The orchestrator has resolved DEJA_RECORDING_ROOT for a while and the
+        // compactor hardcoded landing/v1, so a deployment that set the variable
+        // got a reader looking in one place and a sealer reading from another.
+        // The key SHAPE is unchanged — only the root is the deployment's.
+        assert_eq!(
+            layout::landing_prefix_in("landing/v1", "s1"),
+            "landing/v1/session=s1"
+        );
+        assert_eq!(
+            layout::landing_prefix_in("tapes/v3", "s1"),
+            "tapes/v3/session=s1"
+        );
+        // A trailing slash on a declared root must not double up.
+        assert_eq!(
+            layout::landing_prefix_in("tapes/v3/", "s1"),
+            "tapes/v3/session=s1"
+        );
+    }
+
+    #[test]
+    fn a_landing_key_is_attributed_to_the_session_it_names() {
+        // The deployed layout puts session={id} in the key, so a shared date
+        // partition can be split without fetching a single object.
+        assert!(key_names_session(
+            "landing/v1/dt=2026-09-01/session=s1/inst=i1/0.json",
+            "s1"
+        ));
+        assert!(!key_names_session(
+            "landing/v1/dt=2026-09-01/session=s2/inst=i1/0.json",
+            "s1"
+        ));
+        // A key that names NO session belongs to whatever prefix produced it —
+        // only the flat layout does that, and it names the session once for all
+        // of its keys.
+        assert!(key_names_session("landing/v1/session=s1/0.json", "s1"));
+        assert!(key_names_session("some/opaque/key.json", "s1"));
+    }
+
+    #[test]
+    fn a_shared_partition_yields_one_sessions_lines_and_one_sessions_object_count() {
+        // A session spanning midnight is addressed from the parent of two date
+        // partitions, so the objects under it belong to other recordings too.
+        // Counting the scan as this recording's landing would report a landing
+        // it never had.
+        let a = vec![
+            envelope_for("s1", "i1", 0, Some("c1")),
+            envelope_for("s2", "i9", 0, Some("c9")),
+        ];
+        let b = vec![envelope_for("s2", "i9", 1, Some("c9"))];
+        let c = vec![envelope_for("s1", "i1", 1, Some("c1"))];
+        let chunks: Vec<Vec<u8>> = [a, b, c]
+            .iter()
+            .map(|lines| lines.join("\n").into_bytes())
+            .collect();
+
+        let (lines, objects) = select_session_lines(&chunks, "s1");
+        assert_eq!(lines.len(), 2, "only s1's envelopes belong to s1");
+        assert!(lines.iter().all(|l| l.contains(r#""session_id":"s1""#)));
+        // Three objects were scanned; two carried s1.
+        assert_eq!(
+            objects, 2,
+            "the object that held only s2 is not s1's landing"
+        );
+    }
+
+    #[test]
+    fn a_session_the_aggregator_partitioned_by_date_can_be_sealed_by_id() {
+        // The deployed Vector aggregator partitions by date BEFORE the session,
+        // so a session it wrote is not under the flat prefix at all. Sealing by
+        // id used to fail with "no landing objects" for a recording plainly in
+        // the bucket — which was every recording the deployment actually makes.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-01/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                envelope_for("s1", "i1", 1, Some("c1")),
+            ],
+        );
+
+        let manifest = block(compact_session_inner(&store, "s1", DEFAULT_RECORDING_ROOT)).unwrap();
+        assert_eq!(manifest.session_id, "s1");
+        assert_eq!(manifest.counts.events, 2);
+        assert_eq!(manifest.counts.correlations, 1);
+    }
+
+    #[test]
+    fn sealing_a_straddling_session_takes_only_its_own_events() {
+        // Two dates → the shared root is the only prefix that sees all of it,
+        // and every other session that landed in that window is under it too.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-01/session=s1/inst=i1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-02/session=s1/inst=i1/0.json",
+            &[envelope_for("s1", "i1", 1, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-02/session=s2/inst=i9/0.json",
+            &[
+                envelope_for("s2", "i9", 0, Some("c9")),
+                envelope_for("s2", "i9", 1, Some("c9")),
+            ],
+        );
+
+        let manifest = block(compact_session_inner(&store, "s1", DEFAULT_RECORDING_ROOT)).unwrap();
+        assert_eq!(
+            manifest.counts.events, 2,
+            "s2's events are a different recording"
+        );
+        assert_eq!(manifest.counts.correlations, 1, "c9 belongs to s2");
+        assert_eq!(
+            manifest.counts.landing_objects, 2,
+            "s2's object is not part of s1's landing"
+        );
+    }
+
+    // -- when is a session done -----------------------------------------------
+
+    #[test]
+    fn a_session_still_being_written_is_not_ready_to_seal() {
+        // A recorder session does not close while its pod runs, so an unsealed
+        // session is the NORMAL state of a healthy recording. Sealing one that
+        // is still growing seals a prefix of it.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        // The object was just written, so any realistic quiet period is unmet.
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 900)).unwrap();
+        assert!(
+            matches!(readiness, SealReadiness::Active { .. }),
+            "expected Active, got {readiness:?}"
+        );
+        assert!(!readiness.should_seal());
+    }
+
+    #[test]
+    fn a_session_whose_producers_all_signed_off_is_complete() {
+        // The end-of-stream marker is the only POSITIVE evidence in the landing
+        // that a producer finished. When every instance wrote one, the recording
+        // is done regardless of how recently the last object landed.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(
+            readiness,
+            SealReadiness::Complete {
+                instances: 1,
+                objects: 1
+            }
+        );
+        assert!(readiness.should_seal());
+    }
+
+    #[test]
+    fn a_producer_that_never_signed_off_is_named_rather_than_assumed_complete() {
+        // A pod that is killed rather than shut down never writes its marker.
+        // The recording is still sealable — it is quiet, and waiting forever
+        // helps nobody — but the seal covers what landed, and the instance that
+        // went silent is named so the difference is not silently lost.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i2/0.json",
+            &[envelope_for("s1", "i2", 0, Some("c2"))],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match &readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(instances_without_eof, &vec!["i2".to_owned()]),
+            other => panic!("expected Quiesced naming i2, got {other:?}"),
+        }
+        assert!(readiness.should_seal());
+    }
+
+    #[test]
+    fn a_session_that_never_landed_is_absent_not_finished() {
+        // "Nothing is there" and "it is finished" must not be the same answer:
+        // a sealer that conflates them would try to seal a typo.
+        let store = memory();
+        let readiness = block(readiness_of(&store, "nope", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(readiness, SealReadiness::Absent);
+        assert!(!readiness.should_seal());
+    }
+
+    #[test]
+    fn readiness_ignores_another_sessions_producers_in_a_shared_partition() {
+        // Instance ids from the wrong session would report a producer this
+        // recording never had — and, being marker-less, would hold the seal
+        // back forever.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-01/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-02/session=s1/inst=i1/1.json",
+            &[
+                envelope_for("s1", "i1", 1, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        // Same window, different recording, still running.
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-02/session=s2/inst=i9/0.json",
+            &[envelope_for("s2", "i9", 0, Some("c9"))],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(
+            readiness,
+            SealReadiness::Complete {
+                instances: 1,
+                objects: 2
+            },
+            "i9 belongs to s2 and must not hold s1's seal back"
+        );
+    }
+
+    // -- what a listing can say about a recording without pulling it ----------
+
+    #[test]
+    fn a_batch_of_manifests_answers_in_the_order_asked_and_nulls_the_unsealed() {
+        // The listing enriches a PAGE, so the rows have to line up with the ids
+        // by position. An unsealed recording must come back as "not counted",
+        // never as a recording with zero correlations.
+        let store = memory();
+        // Two sealed recordings with DIFFERENT counts, and the unsealed one off
+        // centre: a symmetric fixture would pass just as happily if the batch
+        // came back reversed, which is the one thing this test exists to catch.
+        let two = seal(
+            &store,
+            "s1",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                envelope_for("s1", "i1", 1, Some("c2")),
+            ],
+        );
+        let one = seal(&store, "s2", &[envelope_for("s2", "i2", 0, Some("c9"))]);
+        assert_eq!((two.counts.correlations, one.counts.correlations), (2, 1));
+
+        let ids = ["s1".to_owned(), "missing".to_owned(), "s2".to_owned()];
+        let got = block(manifests_of(&store, &ids));
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref().unwrap().counts.correlations, 2);
+        assert!(
+            got[1].is_none(),
+            "an unsealed recording is not a recording with zero correlations"
+        );
+        assert_eq!(got[2].as_ref().unwrap().counts.correlations, 1);
+    }
+    // -- a session that resumes after it was sealed ---------------------------
+
+    fn manifest_covering(landing_objects: usize) -> SessionManifest {
+        let store = memory();
+        let mut m = seal(&store, "s1", &[envelope_for("s1", "i1", 0, Some("c1"))]);
+        m.counts.landing_objects = landing_objects;
+        m
+    }
+
+    #[test]
+    fn a_session_that_grew_after_being_sealed_is_sealed_again() {
+        // A recorder session closes when its POD does, not when a workload
+        // finishes, so a session can go quiet for hours, get sealed, and then
+        // resume — a tape whose objects span two date partitions is exactly that
+        // shape. Skipping it forever because a manifest exists would leave that
+        // manifest as a confident statement about an incomplete recording, and
+        // that is worse than no manifest: readers take the manifest fast path
+        // and stop reading the landing, so everything recorded after the seal
+        // becomes invisible rather than merely unsealed.
+        let sealed_two = manifest_covering(2);
+        let landing_now = SealReadiness::Quiesced {
+            quiet_for_secs: 1_000,
+            objects: 5,
+            instances_without_eof: vec!["i1".to_owned()],
+        };
+        assert_eq!(
+            seal_decision(Some(&sealed_two), &landing_now),
+            SealDecision::Seal { resealing: true }
+        );
+    }
+
+    #[test]
+    fn a_seal_that_already_covers_the_landing_is_left_alone() {
+        // The steady state. A cron re-runs constantly and must not rewrite a
+        // recording that has not changed.
+        let sealed_five = manifest_covering(5);
+        let unchanged = SealReadiness::Complete {
+            instances: 1,
+            objects: 5,
+        };
+        assert_eq!(
+            seal_decision(Some(&sealed_five), &unchanged),
+            SealDecision::AlreadyCurrent { sealed_objects: 5 }
+        );
+    }
+
+    #[test]
+    fn a_swept_landing_behind_a_seal_is_not_a_reason_to_reseal_from_nothing() {
+        // Once a session is sealed its landing may be cleaned up. Zero objects
+        // now is not "the recording shrank" — it is "the landing is gone" — and
+        // re-sealing from it would try to build a seal out of nothing.
+        let sealed_five = manifest_covering(5);
+        assert_eq!(
+            seal_decision(Some(&sealed_five), &SealReadiness::Absent),
+            SealDecision::AlreadyCurrent { sealed_objects: 5 }
+        );
+    }
+
+    #[test]
+    fn a_grown_session_still_being_written_waits_rather_than_resealing() {
+        // Growth is not permission to seal. A session that is actively landing
+        // gets sealed as a prefix of itself, which is the thing the quiet period
+        // exists to prevent — and a re-seal makes it worse, because it REPLACES
+        // a manifest that was correct for what it covered.
+        let sealed_two = manifest_covering(2);
+        let still_writing = SealReadiness::Active {
+            quiet_for_secs: 5,
+            objects: 9,
+        };
+        assert_eq!(
+            seal_decision(Some(&sealed_two), &still_writing),
+            SealDecision::NotReady
+        );
+    }
+
+    #[test]
+    fn an_unsealed_quiet_session_seals_for_the_first_time() {
+        let ready = SealReadiness::Complete {
+            instances: 1,
+            objects: 3,
+        };
+        assert_eq!(
+            seal_decision(None, &ready),
+            SealDecision::Seal { resealing: false }
+        );
+        assert_eq!(
+            seal_decision(None, &SealReadiness::Absent),
+            SealDecision::NotReady
+        );
+    }
+
+    #[test]
+    fn readiness_reports_the_object_count_the_decision_compares_against() {
+        // The decision is only as good as this number; Absent must be zero
+        // rather than "unknown treated as large".
+        assert_eq!(SealReadiness::Absent.objects(), 0);
+        assert_eq!(
+            SealReadiness::Active {
+                quiet_for_secs: 1,
+                objects: 7
+            }
+            .objects(),
+            7
+        );
+        assert_eq!(
+            SealReadiness::Complete {
+                instances: 2,
+                objects: 4
+            }
+            .objects(),
+            4
+        );
+        assert_eq!(
+            SealReadiness::Quiesced {
+                quiet_for_secs: 1,
+                objects: 6,
+                instances_without_eof: vec![]
+            }
+            .objects(),
+            6
+        );
+    }
+    // -- the index records evidence, not a drivability verdict ----------------
+
+    fn envelope_bnd(session: &str, gseq: u64, corr: &str, boundary: &str) -> String {
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"i1","capture":{{"mode":"session","session_id":"{session}"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"{session}","global_sequence":{gseq},"correlation_id":"{corr}","boundary":"{boundary}","event_schema_version":1}}}}"#
+        )
+    }
+
+    fn row_for<'a>(c: &'a Collated, id: &str) -> &'a CorrelationSummary {
+        c.correlations
+            .iter()
+            .find(|r| r.correlation_id.as_deref() == Some(id))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_grpc_ingress_correlation_is_recorded_rather_than_judged_undrivable() {
+        // The defect this replaces: `has_ingress` was `boundary ==
+        // "http_incoming"`, so a system whose entry point is `grpc_incoming` had
+        // every correlation reported as not drivable — asserted as fact by a
+        // crate that cannot import any system's ingress convention. The row now
+        // says what it saw, and a caller that knows the convention decides.
+        let lines: Vec<String> = vec![
+            envelope_bnd("s1", 0, "c1", "grpc_incoming"),
+            envelope_bnd("s1", 1, "c1", "grpc_outgoing"),
+        ];
+        let c = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let row = row_for(&c, "c1");
+        assert_eq!(
+            row.boundaries,
+            vec!["grpc_incoming".to_owned(), "grpc_outgoing".to_owned()],
+            "the gRPC entry point must survive into the index verbatim"
+        );
+        assert!(!row.boundaries_truncated);
+    }
+
+    #[test]
+    fn boundaries_are_distinct_and_sorted_so_two_sealers_agree_byte_for_byte() {
+        // A seal is content-addressed: two sealers reading the same landing must
+        // write byte-identical objects. A set whose iteration order depended on
+        // insertion would break that for the index sidecar.
+        let lines: Vec<String> = vec![
+            envelope_bnd("s1", 0, "c1", "redis"),
+            envelope_bnd("s1", 1, "c1", "http_incoming"),
+            envelope_bnd("s1", 2, "c1", "redis"),
+            envelope_bnd("s1", 3, "c1", "db"),
+            envelope_bnd("s1", 4, "c1", "http_incoming"),
+        ];
+        let c = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let row = row_for(&c, "c1");
+        assert_eq!(
+            row.boundaries,
+            vec![
+                "db".to_owned(),
+                "http_incoming".to_owned(),
+                "redis".to_owned()
+            ],
+            "distinct, and in one order for one recording"
+        );
+        assert_eq!(row.events, 5, "deduping boundaries is not deduping events");
+    }
+
+    #[test]
+    fn a_correlation_with_too_many_boundaries_says_it_was_truncated() {
+        // `boundary` is a STRING from the envelope, so a buggy or hostile
+        // producer decides its cardinality. The cap keeps the sidecar cheap; the
+        // flag keeps it honest, because a silently truncated set would answer a
+        // drivability question with a confident "no".
+        let mut lines: Vec<String> = Vec::new();
+        for n in 0..(MAX_BOUNDARIES_PER_CORRELATION as u64 + 5) {
+            lines.push(envelope_bnd("s1", n, "c1", &format!("boundary_{n:03}")));
+        }
+        let c = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let row = row_for(&c, "c1");
+        assert_eq!(row.boundaries.len(), MAX_BOUNDARIES_PER_CORRELATION);
+        assert!(
+            row.boundaries_truncated,
+            "over the cap, the row must say the set is incomplete"
+        );
+        assert_eq!(
+            row.events,
+            MAX_BOUNDARIES_PER_CORRELATION as u64 + 5,
+            "capping the boundary set must not lose events"
+        );
+    }
+
+    #[test]
+    fn a_correlation_at_exactly_the_cap_is_not_reported_as_truncated() {
+        // The boundary condition itself: a recording that happens to use exactly
+        // the cap is COMPLETE, and reporting it as truncated would tell a reader
+        // its absent boundaries prove nothing when in fact they do.
+        let mut lines: Vec<String> = Vec::new();
+        for n in 0..(MAX_BOUNDARIES_PER_CORRELATION as u64) {
+            lines.push(envelope_bnd("s1", n, "c1", &format!("boundary_{n:03}")));
+        }
+        let c = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let row = row_for(&c, "c1");
+        assert_eq!(row.boundaries.len(), MAX_BOUNDARIES_PER_CORRELATION);
+        assert!(!row.boundaries_truncated);
+    }
+    // -- the sealer resolves a system the way the deployment declares it -------
+
+    /// The sandbox document's load-bearing lines for a SEALER, verbatim from
+    /// `deja-orchestrator`'s `INFRA_TOML` fixture (which carries the whole
+    /// document and is asserted by `sbx_deployment_values_resolve_as_intended`).
+    /// Only the facts the sealer uses are repeated here; the orchestrator's copy
+    /// stays the one that pins the rest.
+    const SBX_DOC: &str = r#"default_system = "hyperswitch"
+[systems.hyperswitch]
+s3_bucket = "hyperswitch-art"
+[systems.prism]
+s3_bucket = "ucs-deja"
+"#;
+
+    fn with_doc<T>(doc: &str, f: impl FnOnce() -> T) -> T {
+        std::env::set_var("DEJA_CONFIG_TOML", doc);
+        let out = f();
+        std::env::remove_var("DEJA_CONFIG_TOML");
+        out
+    }
+
+    #[test]
+    fn the_sealer_resolves_the_deployed_document_the_way_the_orchestrator_does() {
+        // Two readers, one document. The orchestrator resolves a system to
+        // launch it; the sealer resolves the same system to find its recordings.
+        // They cannot share a resolver — deja-orchestrator depends on this crate
+        // — so this asserts they agree on the deployed values rather than on an
+        // abstraction.
+        let _lock = test_env::env_guard();
+        with_doc(SBX_DOC, || {
+            assert_eq!(bucket_for_system("hyperswitch").unwrap(), "hyperswitch-art");
+            assert_eq!(bucket_for_system("prism").unwrap(), "ucs-deja");
+            // Neither declares a root, so both use the standard layout — the
+            // same default `scan_scope` applies.
+            assert_eq!(recording_root_for("prism").unwrap(), DEFAULT_RECORDING_ROOT);
+        });
+    }
+
+    #[test]
+    fn an_undeclared_system_is_refused_by_name_not_given_another_systems_bucket() {
+        // The failure this prevents is silent: the sealer would read one
+        // system's landing and write a seal into another system's sessions/v1,
+        // and nothing downstream could tell. Refusing names the table to add.
+        let _lock = test_env::env_guard();
+        with_doc(SBX_DOC, || {
+            let err = bucket_for_system("regsys-not-declared").unwrap_err();
+            assert!(
+                err.contains("systems.regsys-not-declared.s3_bucket"),
+                "the refusal must name the table to add, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_default_system_has_no_implicit_bucket_either() {
+        // It is declared like any other. A document that declares nothing yields
+        // nothing — never the deployment's own DEJA_S3_BUCKET wearing the
+        // default system's name.
+        let _lock = test_env::env_guard();
+        with_doc("default_system = \"hyperswitch\"\n", || {
+            assert!(bucket_for_system("hyperswitch").is_err());
+        });
+    }
+
+    #[test]
+    fn a_declared_root_wins_over_the_standard_layout() {
+        let _lock = test_env::env_guard();
+        with_doc(
+            "[systems.odd]\ns3_bucket = \"b\"\nrecording_root = \"tapes/v3/\"\n",
+            || {
+                // Trailing slash trimmed, so the key shape does not double up.
+                assert_eq!(recording_root_for("odd").unwrap(), "tapes/v3");
+            },
+        );
+    }
+    #[test]
+    fn a_role_stamped_ingress_is_recorded_as_its_own_evidence() {
+        // Roles are the OTHER half of the evidence, for a recorder that stamps
+        // `role: "ingress"` rather than naming its boundary `http_incoming`.
+        // Recorded, not folded into a verdict, for the same reason as
+        // boundaries: this crate cannot import any system's ingress constant.
+        let lines: Vec<String> = vec![
+            format!(
+                r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"i1","capture":{{"mode":"session","session_id":"s1"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"s1","global_sequence":0,"correlation_id":"c1","boundary":"grpc_incoming","role":"ingress","event_schema_version":1}}}}"#
+            ),
+            format!(
+                r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"i1","capture":{{"mode":"session","session_id":"s1"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"s1","global_sequence":1,"correlation_id":"c1","boundary":"grpc_outgoing","event_schema_version":1}}}}"#
+            ),
+        ];
+        let c = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let row = row_for(&c, "c1");
+        assert_eq!(
+            row.roles,
+            vec!["ingress".to_owned()],
+            "the stamped role must survive into the index"
+        );
+        assert_eq!(
+            row.boundaries,
+            vec!["grpc_incoming".to_owned(), "grpc_outgoing".to_owned()],
+            "and it does not replace the boundary evidence"
+        );
     }
 }

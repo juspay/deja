@@ -814,11 +814,53 @@ async fn v1_available_recordings(
     let total = found.len();
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let page: Vec<serde_json::Value> = found
+    let page_rows: Vec<deja_compactor::LandedRecording> =
+        found.into_iter().skip(offset).take(limit).collect();
+
+    // What each recording HOLDS, for the rows actually being returned.
+    //
+    // Until now this endpoint could offer only `objects` — a count of S3 objects
+    // — and every caller choosing a recording had to guess from it whether the
+    // tape was worth replaying. It is a bad proxy in both directions: the
+    // recording that broke five PR replays was picked because it was in the
+    // pulled catalog, and a two-object tape in this very bucket holds twelve
+    // correlations. `correlations` is the number the choice actually wants — how
+    // many recorded test cases are in there — and the seal already knows it, so
+    // reporting it costs one small GET per row and never touches a data part.
+    //
+    // How many of them are DRIVABLE is a further question, and deliberately not
+    // answered here: it depends on the recorded system's ingress convention,
+    // which this endpoint does not know. The correlation index carries the
+    // per-correlation boundaries a caller needs to decide it (see
+    // `CorrelationSummary::boundaries`); a count on this row would have to pick a
+    // convention and would be wrong for every system that does not share it.
+    //
+    // Enrichment, not a precondition: a recording that is not sealed keeps every
+    // field it had, and reports its seal facts as null rather than as zero. Zero
+    // correlations and "not counted yet" are different answers, and a picker that
+    // rendered the second as the first would hide good recordings as empty ones.
+    let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
+    // The SCANNED bucket, not the deployment's default. The rows above came from
+    // whichever bucket `scan_scope` resolved for the named system, so reading
+    // their manifests from `from_env()` would look for a prism recording's seal
+    // in hyperswitch-art — finding nothing, and reporting every prism row as
+    // unsealed with null counts. That failure is silent: "not sealed" is a valid
+    // answer, so nothing downstream could tell it from the truth.
+    let mut cfg_for_manifests = deja_orchestrator::s3::S3Config::from_env();
+    cfg_for_manifests.bucket = scan_bucket.clone();
+    let manifests = tokio::task::spawn_blocking(move || {
+        deja_compactor::read_manifests(&cfg_for_manifests, &ids)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+
+    let page: Vec<serde_json::Value> = page_rows
         .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
+            let manifest = manifests.get(i).and_then(Option::as_ref);
             // The id's provenance is parsed HERE, not by the client: a
             // recording made before ids carried a revision reports none, and
             // that difference should be one field rather than every reader
@@ -894,6 +936,27 @@ async fn v1_available_recordings(
                 // The prefix the orchestrator would ingest from. Reported so a
                 // run can be reproduced by hand, not so a caller has to supply it.
                 "prefix": r.prefix,
+                // Seal facts. Null, never zero, when the recording is unsealed.
+                "sealed": manifest.is_some(),
+                "correlations": manifest.map(|m| m.counts.correlations),
+                "events": manifest.map(|m| m.counts.events),
+                // `sealed_instances`, not `instances`, and the prefix is load
+                // bearing: the LISTING also reports instances — the `inst=` pod
+                // names it can read straight off the keys — and that is a
+                // different fact from this one, which is how many producers the
+                // SEAL recorded per-instance coverage for. Both are worth having
+                // and they can disagree (a pod that wrote objects the seal has
+                // not covered yet). Sharing the key would not fail: `json!` keeps
+                // the last of two identical keys, so one of the two facts would
+                // vanish silently and readers would get a list or a number
+                // depending on which line came last.
+                "sealed_instances": manifest.map(|m| m.instances.len()),
+                // Capture gaps: `global_sequence` ranges the recorder allocated
+                // whose events never reached the tape. Already computed at seal
+                // time and, until now, surfaced nowhere — it is the evidence the
+                // tail-truncation work was reconstructing from ledger sequence
+                // numbers by hand.
+                "gaps": manifest.map(|m| m.instances.iter().map(|i| i.gaps.len()).sum::<usize>()),
             })
         })
         .collect();
