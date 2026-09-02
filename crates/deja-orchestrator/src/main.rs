@@ -934,6 +934,12 @@ struct AvailableQuery {
 /// one as a recording with zero correlations, i.e. as nothing worth running.
 enum RecordingCorrelations {
     Sealed(Vec<deja_orchestrator::s3::CorrelationSummary>),
+    /// Sealed, but the index sidecar is absent — a seal written before it
+    /// existed. The manifest still knows how many correlations it covered, so
+    /// the count is answerable even though the rows are not.
+    SealedWithoutIndex {
+        correlations: usize,
+    },
     /// In the landing area, not yet compacted into a sealed session.
     Landing {
         prefix: String,
@@ -975,14 +981,13 @@ async fn v1_recording_correlations(
     if id.trim().is_empty() {
         return error_resp(400, "recording id is required");
     }
+    // Resolved through the same `scan_scope` as the listing, so this endpoint
+    // and the one that offered the recording agree on where it is — and scoped
+    // to the system the caller named, so a recording the listing reported in
+    // another system's bucket is readable here rather than answering "is not in
+    // s3://<default>/landing/v1" about a recording that exists.
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
-    // Resolve through the same seam `/recordings/available` uses. Without this
-    // the endpoint looked in the deployment's own bucket whatever system was
-    // named, so a recording that listing had just reported — in another
-    // system's bucket — came back "is not in s3://<default>/landing/v1". A
-    // recording cannot exist to one endpoint and not to its sibling.
-    let system = q.system.as_deref().filter(|s| !s.trim().is_empty());
-    let root = match scan_scope(system) {
+    let root = match scan_scope(q.system.as_deref().filter(|s| !s.trim().is_empty())) {
         Ok((bucket, root)) => {
             cfg.bucket = bucket;
             root
@@ -993,17 +998,32 @@ async fn v1_recording_correlations(
     let scanned = root.clone();
     let wanted = id.clone();
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
-        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
-            Some(rows) => Ok(RecordingCorrelations::Sealed(rows)),
-            // Not sealed. Whether that means "not ingested yet" or "no such
-            // recording" is a question only the landing area can answer, and
-            // they must not come back as the same thing.
-            None => Ok(
-                match deja_compactor::locate_landing_prefix(&cfg, &wanted, &scanned)? {
+        use deja_compactor::CorrelationIndex;
+        let landing = |cfg: &_| -> Result<RecordingCorrelations, String> {
+            Ok(
+                match deja_compactor::locate_landing_prefix(cfg, &wanted, &scanned)? {
                     Some(prefix) => RecordingCorrelations::Landing { prefix },
                     None => RecordingCorrelations::Unknown,
                 },
-            ),
+            )
+        };
+        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
+            CorrelationIndex::Rows(rows) => Ok(RecordingCorrelations::Sealed(rows)),
+            // Sealed before the index sidecar existed. The recording is real and
+            // the landing area can still say what is in it, so this reads it
+            // from there rather than failing — a missing index is a fact about
+            // the seal, not about the recording.
+            // NOT the landing fallback: we can prove this recording was sealed,
+            // so answering "unknown" when its landing objects have since been
+            // cleaned up would deny a recording we hold the manifest for. The
+            // count is what the manifest knows; the rows are what it lost.
+            CorrelationIndex::SealedWithoutIndex { correlations } => {
+                Ok(RecordingCorrelations::SealedWithoutIndex { correlations })
+            }
+            // Not sealed. Whether that means "not ingested yet" or "no such
+            // recording" is a question only the landing area can answer, and
+            // they must not come back as the same thing.
+            CorrelationIndex::NotSealed => landing(&cfg),
         }
     })
     .await
@@ -1086,6 +1106,23 @@ async fn v1_recording_correlations(
                            knowable without ingesting it, which the first replay run of it does",
             }))
         }
+        // 200, not an error: the recording exists and its size is known. A
+        // caller gets the count it would have summed from the rows, and an
+        // explicit note that the rows themselves are not available — rather
+        // than a 502 about a healthy recording.
+        RecordingCorrelations::SealedWithoutIndex { correlations } => json_ok(serde_json::json!({
+            "recording_id": id,
+            "status": "sealed_without_index",
+            // The manifest's own count. Answerable even though the rows are
+            // not — and NOT zero, which would report a recording we can prove
+            // was sealed as one holding nothing.
+            "total": correlations,
+            "matched": serde_json::Value::Null,
+            "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+            "cases": Vec::<serde_json::Value>::new(),
+            "note": "sealed before the correlation index existed: the manifest knows how many \
+                     correlations the seal covered but not which",
+        })),
         RecordingCorrelations::Unknown => error_resp(
             404,
             &format!("recording {id} is not in s3://{bucket}/{root}"),
@@ -1566,7 +1603,6 @@ mod tests {
     /// the bucket the default system DECLARED. There is no fallback to the
     /// orchestrator's own bucket any more: a system that has not declared where
     /// its recordings are cannot be scanned for them, the default included.
-    #[test]
     /// The WIRING, not just the seam: proof the handler consults the system
     /// resolver at all. An undeclared system can only produce a 400 through the
     /// new resolution — before it, `?system=` was ignored entirely and the
@@ -1652,6 +1688,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn naming_the_default_system_means_what_omitting_it_means() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let default = deja_orchestrator::default_system();
