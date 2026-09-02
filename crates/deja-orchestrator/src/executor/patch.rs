@@ -378,6 +378,7 @@ mod tests {
     /// the recorded values they must displace.
     #[test]
     fn config_env_copy_lands_verbatim_and_run_env_wins() {
+        let _lock = crate::test_env::env_guard();
         let copied_env = vec![
             json!({ "name": "RUN_ENV", "value": "sandbox" }),
             json!({ "name": "ROUTER__MASTER_DATABASE__HOST", "value": "sbx-pg.internal" }),
@@ -474,6 +475,7 @@ mod tests {
 
     #[test]
     fn patches_name_labels_image_and_upserts_env() {
+        let _lock = crate::test_env::env_guard();
         let patch = JobPatch {
             job_name: "deja-replay-run7".into(),
             labels: vec![("deja.run-id".into(), "run7".into())],

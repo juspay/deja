@@ -106,6 +106,7 @@ mod tests {
 
     #[test]
     fn candidate_env_maps_artifacts_to_the_bound_vars() {
+        let _lock = crate::test_env::env_guard();
         let root =
             HarnessRoot::new(std::env::temp_dir().join("deja-test-env-binding")).expect("root");
         let contract = root.replay_contract("run-5");

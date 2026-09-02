@@ -195,6 +195,14 @@ impl K8sExecutorConfig {
     /// means NO config copy (empty deployment) — booting a prism candidate off
     /// hyperswitch's rendered env would be wrong, so absent profile data
     /// disables the copy rather than borrowing the default system's.
+    /// The variable a system's init containers read the bundle URI from.
+    /// Declared per system; the base name for the default system undeclared.
+    pub fn code_bundle_uri_env_for(&self, system: &str) -> String {
+        crate::system::system_config(system)
+            .code_bundle_uri_env
+            .unwrap_or_else(|| self.code_bundle_uri_env.clone())
+    }
+
     pub fn config_source_for(&self, system: &str) -> ConfigSource {
         let profile = crate::system::system_config(system);
         // Undeclared on the default system means the base source; undeclared
@@ -289,12 +297,8 @@ fn qualify_candidate_image_for(reference: &str, system: &str) -> Result<String, 
     }
     let profile = crate::system::system_config(system);
     // Named for the error only: the registry has already resolved the value,
-    // but a caller who has to FIX this needs the variable's name, not its value.
-    let repo_var = if profile.is_default {
-        "DEJA_CANDIDATE_IMAGE_REPO".to_owned()
-    } else {
-        crate::system_env_var(system, "CANDIDATE_IMAGE_REPO")
-    };
+    // but a caller who has to FIX this needs to know where to declare it.
+    let repo_var = format!("systems.{system}.candidate_image_repo");
     let repo = match profile.candidate_image_repo {
         Some(repo) => repo,
         // The default system tolerates a bare ref (compose local tags); any
@@ -367,6 +371,7 @@ mod tests {
 
     #[test]
     fn resolve_prebuilt_image_takes_tag_as_sha() {
+        let _lock = crate::test_env::env_guard();
         let (img, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
             image: "ecr.io/hyperswitch:ff191d7f".into(),
         })
@@ -377,6 +382,7 @@ mod tests {
 
     #[test]
     fn a_profile_suffix_is_stripped_from_the_ref_but_kept_on_the_image() {
+        let _lock = crate::test_env::env_guard();
         for (tag, want_ref) in [
             ("7cd937aa1c-release-fast", "7cd937aa1c"),
             ("7cd937aa1c-dev", "7cd937aa1c"),
@@ -398,6 +404,7 @@ mod tests {
 
     #[test]
     fn resolve_digest_image_uses_digest_as_sha() {
+        let _lock = crate::test_env::env_guard();
         let (_, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
             image: "ecr.io/hyperswitch@sha256:abcd".into(),
         })
@@ -407,6 +414,7 @@ mod tests {
 
     #[test]
     fn registry_port_is_not_mistaken_for_a_tag() {
+        let _lock = crate::test_env::env_guard();
         let (_, sha) = resolve_candidate_image(&CandidateSpec::PrebuiltImage {
             image: "registry:5000/hyperswitch".into(),
         })
@@ -416,6 +424,7 @@ mod tests {
 
     #[test]
     fn repo_refs_error_until_resolver_exists() {
+        let _lock = crate::test_env::env_guard();
         assert!(resolve_candidate_image(&CandidateSpec::RepoSha {
             repo: "juspay/hyperswitch".into(),
             sha: "ff191d7f".into(),
@@ -436,7 +445,8 @@ mod per_system_template_tests {
     /// One test, one lock: `DEJA_PRISM_JOB_TEMPLATE_KEY` is process-global.
     #[test]
     fn the_template_key_follows_the_system_and_never_falls_back_to_the_router_template() {
-        std::env::remove_var("DEJA_PRISM_JOB_TEMPLATE_KEY");
+        let _lock = crate::test_env::env_guard();
+        std::env::remove_var("DEJA_CONFIG_TOML");
         let cfg = K8sExecutorConfig::from_env();
 
         // The default system keeps the base key — zero change for every
@@ -457,7 +467,10 @@ mod per_system_template_tests {
         );
 
         // The env override wins, same pattern as the candidate binding.
-        std::env::set_var("DEJA_PRISM_JOB_TEMPLATE_KEY", "job.prism-v2.json");
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.prism]\njob_template_key = \"job.prism-v2.json\"\n",
+        );
         assert_eq!(cfg.template_key_for("prism"), "job.prism-v2.json");
         std::env::remove_var("DEJA_PRISM_JOB_TEMPLATE_KEY");
     }
@@ -472,8 +485,15 @@ mod candidate_reference_tests {
     /// lock rather than as separate tests racing the same variable.
     #[test]
     fn a_bare_ref_resolves_against_the_deployment_registry() {
+        let _lock = crate::test_env::env_guard();
         const REPO: &str = "2236.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router";
-        std::env::set_var("DEJA_CANDIDATE_IMAGE_REPO", REPO);
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            format!(
+                "[systems.{}]\ncandidate_image_repo = \"{REPO}\"\n",
+                crate::default_system()
+            ),
+        );
 
         // The only part a run chooses is the build.
         assert_eq!(
@@ -529,7 +549,14 @@ mod candidate_reference_tests {
         // hyperswitch-router:<prism sha>, a reference no registry serves; the
         // pod sat in ImagePullBackOff until the health timeout killed the
         // run. Twice. (Same single-lock test: same process-global env vars.)
-        std::env::remove_var("DEJA_PRISM_CANDIDATE_IMAGE_REPO");
+        // prism is not declared: only the default system is in the document.
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            format!(
+                "[systems.{}]\ncandidate_image_repo = \"{REPO}\"\n",
+                crate::default_system()
+            ),
+        );
         let err = resolve_candidate_image_for(
             &CandidateSpec::PrebuiltImage {
                 image: "6548e950c7".into(),
@@ -538,11 +565,11 @@ mod candidate_reference_tests {
         )
         .unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("DEJA_PRISM_CANDIDATE_IMAGE_REPO"), "{msg}");
+        assert!(msg.contains("systems.prism.candidate_image_repo"), "{msg}");
 
         std::env::set_var(
-            "DEJA_PRISM_CANDIDATE_IMAGE_REPO",
-            "ecr.example/connector-service",
+            "DEJA_CONFIG_TOML",
+            "[systems.prism]\ncandidate_image_repo = \"ecr.example/connector-service\"\n",
         );
         let (image, sha) = resolve_candidate_image_for(
             &CandidateSpec::PrebuiltImage {
@@ -555,7 +582,7 @@ mod candidate_reference_tests {
         assert_eq!(sha, "6548e950c7");
 
         // A fully-qualified ref is verbatim regardless of configuration.
-        std::env::remove_var("DEJA_PRISM_CANDIDATE_IMAGE_REPO");
+        std::env::remove_var("DEJA_CONFIG_TOML");
         let (image, _) = resolve_candidate_image_for(
             &CandidateSpec::PrebuiltImage {
                 image: "ecr.example/connector-service:6548e950c7".into(),
@@ -567,7 +594,7 @@ mod candidate_reference_tests {
 
         // With no registry configured a bare ref is untouched — compose builds
         // a local tag and has no registry to resolve against.
-        std::env::remove_var("DEJA_CANDIDATE_IMAGE_REPO");
+        std::env::remove_var("DEJA_CONFIG_TOML");
         assert_eq!(
             qualify_candidate_image("deja-router-local"),
             "deja-router-local"

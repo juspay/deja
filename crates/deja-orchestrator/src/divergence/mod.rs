@@ -9840,6 +9840,7 @@ mod tests {
 
     #[test]
     fn declaring_no_namespaces_keeps_the_scorecard_byte_identical() {
+        let _lock = crate::test_env::env_guard();
         // The opt-out guarantee: with `scored_span_namespaces` undeclared, a
         // tape full of scored spans must serialize the SAME scorecard as one
         // with no scored spans at all — the check may not leak a section, a

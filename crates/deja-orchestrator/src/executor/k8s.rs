@@ -578,6 +578,7 @@ mod tests {
 
     #[test]
     fn from_env_builds_base_and_reads_sa_files() {
+        let _lock = crate::test_env::env_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("ca.crt"), b"-----BEGIN CERTIFICATE-----\n")
             .expect("write ca");

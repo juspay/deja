@@ -5854,6 +5854,7 @@ mod tests {
 
     #[test]
     fn isolated_parallel_replays_use_tail_ids_and_preserve_shared_opt_out() {
+        let _lock = crate::test_env::env_guard();
         let _env_lock = DEMO_REPLAY_SHARED_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -7488,6 +7489,7 @@ mod tests {
 
     #[test]
     fn seed_db_renders_encrypted_bytea_key_as_hex_literal_from_metadata() {
+        let _lock = crate::test_env::env_guard();
         // merchant_key_store row exactly as recorded: `key` is the `Encryption`
         // serde shape {"inner":[<u8>...]}; it is treated as bytea only because
         // catalog metadata says that column is bytea.
