@@ -647,8 +647,12 @@ struct CaptureProbe {
 
 /// Count landing objects for a recording (the "did Vector land anything yet /
 /// has the flush settled" poll the lifecycle runs before compacting).
-pub fn count_session_objects(cfg: &S3Config, recording_id: &str) -> Result<usize, String> {
-    deja_compactor::count_landing_objects(cfg, recording_id)
+pub fn count_session_objects(
+    cfg: &S3Config,
+    recording_id: &str,
+    root: &str,
+) -> Result<usize, String> {
+    deja_compactor::count_landing_objects(cfg, recording_id, root)
 }
 
 /// Pull a session recording into `dest` (the canonical
@@ -657,11 +661,12 @@ pub fn count_session_objects(cfg: &S3Config, recording_id: &str) -> Result<usize
 pub fn pull_recording(
     cfg: &S3Config,
     recording_id: &str,
+    root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, deja_compactor::SessionManifest), String> {
     let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
         Some(m) => m,
-        None => deja_compactor::compact_session(cfg, recording_id)?,
+        None => deja_compactor::compact_session(cfg, recording_id, root)?,
     };
     let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
     let chunk = lines.join("\n").into_bytes();
