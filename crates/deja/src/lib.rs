@@ -64,6 +64,10 @@ pub use deja_runtime::DejaCorrelationLayer;
 pub use deja_runtime::DejaHook;
 /// Re-export the execution graph tracing layer for framework logger setup.
 pub use deja_runtime::ExecutionGraphLayer;
+/// What a `Substitute` boundary missed — the value a boundary's `on_miss`
+/// expression turns into the host's own error. Deja names the miss; the host
+/// decides which of its types can represent one.
+pub use deja_runtime::SubstituteMiss;
 /// Re-export the request-boundary fail-stop guard. A `Substitute` miss stops the
 /// request by panic-unwind (the only type-erased stop available for an arbitrary
 /// return type); actix has no per-request panic isolation, so without this guard
@@ -1767,7 +1771,7 @@ pub mod __private {
     #[allow(deprecated)]
     pub use deja_runtime::{
         boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_or_miss,
-        execute_shadow_observe_boundary, execute_shadow_peek_boundary,
+        dispatch_or_miss, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
         fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
         next_boundary_occurrence, observation_is_active, record_boundary_async,
         record_boundary_async_lazy, record_boundary_sync, record_boundary_sync_lazy,
