@@ -75,10 +75,14 @@ pub struct SystemConfig {
     pub name: String,
     /// Whether this is the system a caller gets by naming nothing.
     pub is_default: bool,
-    /// `DEJA_<SYSTEM>_S3_BUCKET`. `None` for the default system, which reads the
-    /// deployment's own `DEJA_S3_BUCKET` — deliberately, so the default can
-    /// never be made to depend on a per-system variable existing. `None` for
-    /// any other system means UNDECLARED, and the caller refuses by name.
+    /// Where this system's recordings land. `None` means UNDECLARED and the
+    /// caller refuses by name — for EVERY system including the default, which
+    /// is declared like any other. This deliberately drops the old fallback to
+    /// the deployment's own `DEJA_S3_BUCKET`: the default system no longer has
+    /// an implicit bucket, so a deployment that declares no systems lists
+    /// nothing rather than silently listing the orchestrator's own bucket.
+    /// The deploy consequence: the document must be present BEFORE a build
+    /// carrying this is rolled out, or the listing endpoint refuses everything.
     pub s3_bucket: Option<String>,
     /// `DEJA_<SYSTEM>_RECORDING_ROOT`. `None` = the deployment-wide root. The
     /// key LAYOUT is shared across systems; only the bucket is per-system.

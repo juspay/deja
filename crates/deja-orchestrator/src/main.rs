@@ -689,12 +689,11 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// wearing a confident label, which is worse than a refusal that says what to
 /// set. Its root override is optional and only consulted once its bucket
 /// resolves.
-fn scan_scope(system: Option<&str>, default_bucket: &str) -> Result<(String, String), String> {
+fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
     // Naming nothing means the default system, and the default system resolves
     // through the same registry as every other — declared, not special. There
     // is no fallback to the orchestrator's own bucket: a system that has not
     // declared where its recordings are cannot be scanned for them.
-    let _ = default_bucket;
     let system = system.unwrap_or_else(|| deja_orchestrator::default_system());
     let profile = deja_orchestrator::system::system_config(system);
     let bucket = profile
@@ -782,7 +781,7 @@ async fn v1_available_recordings(
 ) -> Response {
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
-    let root = match scan_scope(system_scope, &cfg.bucket) {
+    let root = match scan_scope(system_scope) {
         Ok((bucket, root)) => {
             cfg.bucket = bucket;
             root
@@ -1555,10 +1554,10 @@ mod tests {
                 "[systems.{default}]\ns3_bucket = \"declared-art\"\nrecording_root = \"landing/v7\"\n[systems.other]\ns3_bucket = \"other-art\"\n"
             ),
         );
-        let named = scan_scope(Some(default), "orchestrator-own");
-        let omitted = scan_scope(None, "orchestrator-own");
-        let other = scan_scope(Some("other"), "orchestrator-own");
-        let unknown = scan_scope(Some("zzz"), "orchestrator-own");
+        let named = scan_scope(Some(default));
+        let omitted = scan_scope(None);
+        let other = scan_scope(Some("other"));
+        let unknown = scan_scope(Some("zzz"));
         std::env::remove_var("DEJA_CONFIG_TOML");
 
         assert_eq!(
@@ -1580,7 +1579,7 @@ mod tests {
         // Undeclared, the default is refused too — asking the orchestrator's
         // own bucket for recordings would be a wrong answer wearing a
         // confident label.
-        let bare = scan_scope(None, "orchestrator-own");
+        let bare = scan_scope(None);
         assert!(bare.is_err(), "no declaration, no scan: {bare:?}");
     }
 
