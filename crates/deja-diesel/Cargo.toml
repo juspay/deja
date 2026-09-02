@@ -15,10 +15,10 @@ deja-runtime = { path = "../deja-runtime" }
 # `postgres_backend` gives the Pg backend types WITHOUT linking libpq (the
 # wrapped connection type supplies the actual connection implementation);
 # `r2d2` gives the `R2D2Connection` trait the bb8/r2d2 pool managers require.
-# Pinned to the 2.2 line: the wrapper is compiled into hosts that pin their
-# own diesel (hyperswitch: 2.2.10), and this trait surface is exempt from
+# Pinned to the 2.3 line: the wrapper is compiled into hosts that pin their
+# own diesel (hyperswitch: 2.3.12), and this trait surface is exempt from
 # diesel's semver promise — revisit the pin together with the host.
-diesel = { version = "~2.2.10", default-features = false, features = [
+diesel = { version = "~2.3", default-features = false, features = [
     "postgres_backend",
     "r2d2",
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
@@ -26,22 +26,22 @@ diesel = { version = "~2.2.10", default-features = false, features = [
 # The in-band pool helpers (`get_result_captured` and friends) pair a query's
 # result with its own connection's capture inside async-bb8-diesel's `run`
 # closure — the one place both exist in the same lexical scope. Pinned to the
-# exact version hyperswitch resolves (0.2.1; diesel with default-features off,
+# exact version hyperswitch resolves (0.3.0; diesel with default-features off,
 # no libpq linkage) so the helper bounds mirror its combinators one-to-one.
-async-bb8-diesel = "0.2.1"
+async-bb8-diesel = "0.3.0"
 
 [dev-dependencies]
 # Real-postgres round-trip test (ignored by default; needs a reachable
 # database): the full `postgres` feature links libpq and provides
 # `PgConnection` to wrap.
-diesel = { version = "~2.2.10", features = ["postgres"] }
+diesel = { version = "~2.3", features = ["postgres"] }
 tempfile = "3"
 # Pool-path tests: they mirror hyperswitch's execution stack exactly (it drives
 # diesel through async-bb8-diesel over a bb8 pool), so the pairing is proven
 # through the same call path production uses — the capture put and take on the
 # `spawn_blocking` thread, the pair riding the future back to the async task —
 # and not just through a bare connection.
-bb8 = "0.8.6"
+bb8 = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]
