@@ -20,7 +20,17 @@ pub mod lifecycle;
 pub mod lookup;
 pub mod s3;
 pub mod scope;
-pub mod settings;
+/// The declared configuration, defined in `deja-compactor` and re-exported here
+/// so `crate::settings` keeps meaning what it meant.
+///
+/// It lives in the lower crate because BOTH read the same document: the
+/// orchestrator resolves a system to launch it, and the compactor resolves the
+/// same system to find its recordings. `deja-orchestrator` depends on
+/// `deja-compactor` and the compactor depends on nothing of ours, so the
+/// compactor is the only place both can reach — defining it here would leave the
+/// sealer re-deriving the convention from environment variables and drifting the
+/// moment the document changed shape, which is what it was doing.
+pub use deja_compactor::settings;
 pub mod store;
 pub mod system;
 

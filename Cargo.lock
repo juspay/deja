@@ -549,11 +549,13 @@ name = "deja-compactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "config",
  "flate2",
  "futures",
  "object_store",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "tokio",
  "zstd",
@@ -628,7 +630,6 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
- "config",
  "deja",
  "deja-compactor",
  "deja-context",
@@ -644,7 +645,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_path_to_error",
  "sha2",
  "tar",
  "tempfile",

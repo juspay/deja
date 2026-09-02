@@ -155,17 +155,20 @@ pub struct SystemConfig {
 
 use crate::settings::{self, SystemDeclaration};
 
-impl SystemDeclaration {
-    /// The declared candidate-binding slot names, keyed by [`CANDIDATE_ENV_SLOTS`].
-    fn candidate_slots(&self) -> [(&'static str, Option<&String>); 5] {
-        [
-            ("MODE_ENV", self.candidate_mode_env.as_ref()),
-            ("RUN_ID_ENV", self.candidate_run_id_env.as_ref()),
-            ("SOURCE_ENV", self.candidate_source_env.as_ref()),
-            ("OBSERVED_ENV", self.candidate_observed_env.as_ref()),
-            ("CODE_SHA_ENV", self.candidate_code_sha_env.as_ref()),
-        ]
-    }
+/// The declared candidate-binding slot names, keyed by [`CANDIDATE_ENV_SLOTS`].
+///
+/// A free function rather than a method: `SystemDeclaration` is defined in
+/// `deja-compactor` now, so an inherent impl here is not allowed — and it should
+/// not be. Which slots a CANDIDATE binds is the resolver's concern, and the
+/// sealer that shares the declaration has no candidates to bind.
+fn candidate_slots(d: &SystemDeclaration) -> [(&'static str, Option<&String>); 5] {
+    [
+        ("MODE_ENV", d.candidate_mode_env.as_ref()),
+        ("RUN_ID_ENV", d.candidate_run_id_env.as_ref()),
+        ("SOURCE_ENV", d.candidate_source_env.as_ref()),
+        ("OBSERVED_ENV", d.candidate_observed_env.as_ref()),
+        ("CODE_SHA_ENV", d.candidate_code_sha_env.as_ref()),
+    ]
 }
 
 /// The default the declared configuration names, if it names one.
@@ -210,7 +213,7 @@ pub fn system_config(name: &str) -> SystemConfig {
         .map(str::trim)
         .filter(|p| !p.is_empty());
     let mut candidate_env = BTreeMap::new();
-    for (slot, declared_name) in d.candidate_slots() {
+    for (slot, declared_name) in candidate_slots(&d) {
         let value = declared_name.cloned().or_else(|| {
             prefix.map(|p| {
                 let key = CANDIDATE_ENV_KEYS

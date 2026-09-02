@@ -269,4 +269,36 @@ s3_bucket = "ucs-deja"
         let s = load().expect("loads");
         assert!(s.systems.is_empty());
     }
+
+    /// The reason this module lives in THIS crate rather than the orchestrator.
+    ///
+    /// The sealer takes a system name and has to find that system's recordings.
+    /// Before the declaration existed it re-derived the answer from a flat
+    /// `DEJA_<SYSTEM>_S3_BUCKET` variable — a second spelling of one convention,
+    /// which went stale the moment the deployment moved to a document. It can
+    /// read the document only if the document is defined at or below it, and
+    /// `deja-orchestrator` depends on `deja-compactor`, never the reverse.
+    ///
+    /// So this test is the seam: if it stops compiling, the sealer has lost its
+    /// ability to resolve a system and is back to guessing from variables.
+    #[test]
+    fn the_sealer_can_resolve_a_systems_bucket_from_the_declaration() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.prism]\ns3_bucket = \"ucs-deja\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+        );
+        let s = load().expect("loads");
+        clear();
+
+        let bucket = |name: &str| s.systems.get(name).and_then(|d| d.s3_bucket.as_deref());
+        assert_eq!(bucket("prism"), Some("ucs-deja"));
+        assert_eq!(bucket("hyperswitch"), Some("hyperswitch-art"));
+        // An undeclared system resolves to nothing — which a caller must report
+        // as "not declared", never by falling back to another system's bucket.
+        // Borrowing one system's recordings under another's name would not fail;
+        // it would answer confidently and wrongly.
+        assert_eq!(bucket("nope"), None);
+    }
 }
