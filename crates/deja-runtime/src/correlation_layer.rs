@@ -70,6 +70,10 @@ struct SpanContext {
     /// opposite reason. One cell answering both would have to pick a default, and
     /// either choice breaks one of them.
     observe: bool,
+    /// Whether this span carries the correlation ITSELF rather than inheriting it.
+    /// The owner is the one span whose close means no further fork can appear
+    /// under that correlation, so it is the one that discards its fork sequences.
+    owns_correlation: bool,
     /// The recording decision for `correlation`, resolved when this span was
     /// created and carried for its lifetime.
     ///
@@ -397,6 +401,7 @@ where
             Arc::new(crate::TaskLineage::forked_child_of(
                 base,
                 correlation.as_deref(),
+                &path,
             ))
         } else {
             parent.as_ref().map_or_else(
@@ -428,6 +433,7 @@ where
             correlation,
             lineage,
             observe,
+            owns_correlation: own_correlation.is_some(),
             decision,
         });
     }
@@ -458,6 +464,28 @@ where
     fn on_exit(&self, id: &Id, _ctx: Context<'_, S>) {
         pop_span_cursor(id.into_u64());
         restore_correlation(id.into_u64());
+    }
+
+    /// Discard the correlation's fork sequences when the span that owns the
+    /// correlation closes.
+    ///
+    /// Span lifetime is the right clock. A span closes when the last handle to it
+    /// is dropped, which is after every task that carried it has finished, so it
+    /// is exactly the moment no further fork can be created under that
+    /// correlation — and it happens for every request, sampled in or out. The
+    /// response finalizer that used to do this exists only on the recording path,
+    /// so a sampled-out request left its counters behind forever, and almost every
+    /// request is sampled out.
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        let Some(cx) = ctx
+            .span(&id)
+            .and_then(|span| span.extensions().get::<SpanContext>().cloned())
+        else {
+            return;
+        };
+        if cx.owns_correlation {
+            crate::clear_fork_counters_for_correlation(cx.correlation.as_deref());
+        }
     }
 }
 
@@ -640,6 +668,94 @@ mod tests {
                  binding trades the tail bug for a worse one"
             );
             deja_context::clear_recording_decision(correlation);
+        });
+    }
+
+    #[test]
+    fn an_extra_fork_does_not_renumber_the_forks_that_follow_it() {
+        // THE CASCADE, and the reason fork sequences are per-path. Numbering forks
+        // by arrival order within a correlation made the bucket positional: a
+        // candidate that spawned one extra task early shifted every later fork's
+        // number, moved each one's occurrence partition, and re-addressed every
+        // call beneath them. One behavioural difference arrived as a cascade of
+        // divergences that looked unrelated to it and to each other.
+        //
+        // Two correlations stand in for the two runs, since a candidate differs
+        // from its recording by construction — that difference IS the replay — and
+        // re-recording cannot help, because this happens within a single
+        // tape/candidate pair.
+        fn fork_bucket_at_the_common_path() -> String {
+            let leg = tracing::info_span!("leg");
+            let _leg = leg.enter();
+            let fork = crate::fork_span();
+            let _fork = fork.enter();
+            let bucket = entered_lineage().bucket_id;
+            assert!(bucket.contains("::fork-"), "expected a fork bucket");
+            bucket
+        }
+
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            // The run the recording captured: one fork, at the path of interest.
+            let recorded = {
+                let root = tracing::info_span!("deja::http_incoming", request_id = "req-recorded");
+                let _root = root.enter();
+                fork_bucket_at_the_common_path()
+            };
+
+            // The candidate: identical except that it forks once more, earlier,
+            // at a DIFFERENT path — the one-extra-spawn difference.
+            let candidate = {
+                let root = tracing::info_span!("deja::http_incoming", request_id = "req-candidate");
+                let _root = root.enter();
+                {
+                    let other = tracing::info_span!("added_by_the_candidate");
+                    let _other = other.enter();
+                    let extra = crate::fork_span();
+                    let _extra = extra.enter();
+                    assert!(entered_lineage().bucket_id.contains("::fork-"));
+                }
+                fork_bucket_at_the_common_path()
+            };
+
+            assert_eq!(
+                candidate, recorded,
+                "a fork elsewhere in the request must not renumber this one; that \
+                 renumbering is the cascade, and it turns one behavioural change \
+                 into many apparently unrelated divergences"
+            );
+        });
+    }
+
+    #[test]
+    fn a_correlations_fork_sequences_are_discarded_when_its_span_closes() {
+        // The counter is global, so something has to discard it, and the response
+        // finalizer is the wrong clock: it exists only on the recording path, so a
+        // sampled-out request — which is nearly all of them — left its entries
+        // behind forever. A span closes either way, and it closes only once every
+        // task holding it is done, which is exactly when no further fork can
+        // appear under that correlation.
+        let correlation = "req-fork-eviction";
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            {
+                let root = tracing::info_span!("deja::http_incoming", request_id = correlation);
+                let _root = root.enter();
+                let fork = crate::fork_span();
+                let _fork = fork.enter();
+                assert!(entered_lineage().bucket_id.contains("::fork-"));
+                assert_eq!(
+                    crate::fork_counter_paths_for(Some(correlation)),
+                    1,
+                    "the fork must have taken a sequence while the request was live"
+                );
+            }
+            assert_eq!(
+                crate::fork_counter_paths_for(Some(correlation)),
+                0,
+                "closing the span that owns the correlation must discard its \
+                 sequences; anything left here leaks for the life of the process"
+            );
         });
     }
 
