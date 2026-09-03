@@ -2396,10 +2396,22 @@ impl TaskLineage {
     /// path keeps a change local to the callsite that made it.
     fn forked_child_of(parent: Self, correlation_id: Option<&str>, fork_path: &str) -> Self {
         let fork_seq = next_fork_seq(correlation_id, fork_path);
+        // The path goes in the id, not just in the counter. Numbering per path is
+        // what keeps a fork elsewhere in the request from renumbering this one,
+        // but composing the id from the sequence alone made two paths collide,
+        // because every path's sequence starts at 1. A bucket says "this work is
+        // an unordered region", so two sites sharing one tells the scorer they
+        // are ordered with respect to each other and a real race between them
+        // reads as a divergence.
+        //
+        // FNV-1a, the same stable hash the callsite addresses use: deterministic
+        // across runs and across toolchains, which a `DefaultHasher` is not, so
+        // a recording and a candidate agree on it.
+        let site = stable_callsite_hash(fork_path);
         Self {
-            task_id: format!("{}::fork-{fork_seq}", parent.task_id),
+            task_id: format!("{}::fork-{site:x}-{fork_seq}", parent.task_id),
             parent_task_id: Some(parent.task_id),
-            bucket_id: format!("{}::fork-{fork_seq}", parent.bucket_id),
+            bucket_id: format!("{}::fork-{site:x}-{fork_seq}", parent.bucket_id),
             fork_seq,
         }
     }

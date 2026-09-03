@@ -2700,7 +2700,8 @@ fn observed_end_timestamp_ns(obs: &ObservedCall) -> u64 {
 
 /// Whether an observed call ran inside a spawned fork region — a non-root
 /// lineage bucket minted by the correlation layer for a `deja.fork` span. Such
-/// buckets are `{parent}::fork-{seq}`, so their id carries the `::fork-` marker.
+/// buckets are `{parent}::fork-{site}-{seq}`, so their id carries the `::fork-`
+/// marker. Only the marker is read here; the shape of the rest is the layer's.
 /// Fork regions are unordered relative to the request's synchronous path.
 fn is_fork_region(obs: &ObservedCall) -> bool {
     obs.bucket_id

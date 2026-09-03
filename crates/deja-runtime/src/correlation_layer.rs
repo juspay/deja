@@ -672,6 +672,54 @@ mod tests {
     }
 
     #[test]
+    fn two_fork_sites_in_one_correlation_get_distinct_buckets() {
+        // The property the OLD per-correlation counter gave for free, and which
+        // the per-path counter removed: two different fork call sites in one
+        // request must land in different lineage buckets.
+        //
+        // A bucket says "this work is an unordered region". The scorer excuses a
+        // divergence between two events whose buckets differ, and treats a shared
+        // bucket as an ordering claim. So two genuinely concurrent detached tasks
+        // sharing a bucket means a real race between them stops being excused and
+        // arrives as a divergence — the exact failure per-path numbering was
+        // introduced to prevent, from the other direction.
+        //
+        // Numbering per path is right; composing the bucket from the sequence
+        // alone was not, because two paths both start at 1.
+        fn bucket_under(site: &'static str) -> String {
+            let leg = tracing::info_span!("leg", site = site);
+            let _leg = leg.enter();
+            let fork = crate::fork_span();
+            let _fork = fork.enter();
+            entered_lineage().bucket_id
+        }
+
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-two-sites");
+            let _root = root.enter();
+            let a = {
+                let outer = tracing::info_span!("site_a");
+                let _outer = outer.enter();
+                bucket_under("a")
+            };
+            let b = {
+                let outer = tracing::info_span!("site_b");
+                let _outer = outer.enter();
+                bucket_under("b")
+            };
+            assert!(a.contains("::fork-") && b.contains("::fork-"));
+            assert_ne!(
+                a, b,
+                "two distinct fork sites in one correlation must not share a \
+                 bucket; a shared bucket tells the scorer they are ordered with \
+                 respect to each other, and a real race between them then reads \
+                 as a divergence"
+            );
+        });
+    }
+
+    #[test]
     fn an_extra_fork_does_not_renumber_the_forks_that_follow_it() {
         // THE CASCADE, and the reason fork sequences are per-path. Numbering forks
         // by arrival order within a correlation made the bucket positional: a
