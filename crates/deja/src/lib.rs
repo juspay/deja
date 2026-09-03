@@ -1823,7 +1823,7 @@ pub mod __private {
     #[allow(deprecated)]
     pub use deja_runtime::{
         boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_or_miss,
-        execute_shadow_observe_boundary, execute_shadow_peek_boundary,
+        execute_shadow_observe_boundary, execute_shadow_peek_boundary, fail_stop_absent_executor,
         fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
         next_boundary_occurrence, observation_is_active, record_boundary_async,
         record_boundary_async_lazy, record_boundary_sync, record_boundary_sync_lazy,
