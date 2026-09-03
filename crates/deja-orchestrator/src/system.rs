@@ -113,9 +113,6 @@ pub struct SystemConfig {
     /// Reply canons declared per boundary, in the recorder's own grammar. See
     /// `SystemDeclaration::reply_canons`.
     pub reply_canons: std::collections::BTreeMap<String, String>,
-    /// Response paths whose array order is asserted. Empty = order carries no
-    /// meaning anywhere; see `SystemDeclaration::ordered_response_paths`.
-    pub ordered_response_paths: Vec<String>,
     /// Repo-relative config files its CodeBundle carries besides migrations.
     /// `None` on a system with no bundle, or the default system with nothing
     /// declared (the executor's base list applies).
@@ -307,7 +304,6 @@ pub fn system_config(name: &str) -> SystemConfig {
         instance_pattern: clean(d.instance_pattern),
         scored_span_namespaces: d.scored_span_namespaces.unwrap_or_default(),
         reply_canons: reply_canons_resolved.clone(),
-        ordered_response_paths: d.ordered_response_paths.unwrap_or_default(),
         candidate_config_files: d.candidate_config_files,
         code_bundle_uri_env: clean(d.code_bundle_uri_env),
         config_source_deployment: clean(d.config_source_deployment),

@@ -124,24 +124,6 @@ pub struct SystemDeclaration {
     /// `http_incoming = "bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"`
     #[serde(default)]
     pub reply_canons: Option<std::collections::BTreeMap<String, String>>,
-
-    /// Response paths whose array order IS asserted, in the same `$.a.b[]` form
-    /// the classifier emits. Empty by default, which is the point.
-    ///
-    /// Order is treated as carrying NO meaning everywhere unless a path is
-    /// named here. That is the deliberate default: the collections a service
-    /// serialises into JSON arrays are mostly sets and maps whose iteration
-    /// order is seeded per process, so an order-only difference is almost
-    /// always noise, and adjudicating it site by site costs more than it
-    /// returns. A path listed here goes back to blocking — for a routing
-    /// priority list, a retry ladder, a paginated page, anything whose order a
-    /// client is entitled to rely on.
-    ///
-    /// The cost of the default, stated plainly: the comparator can no longer
-    /// tell an INTENDED order change from a hash-seed permutation unless the
-    /// path is named here. A removed sort at an undeclared path will not block.
-    #[serde(default, deserialize_with = "list_or_csv")]
-    pub ordered_response_paths: Option<Vec<String>>,
 }
 
 /// A list, from either a TOML array or a comma-separated string.
