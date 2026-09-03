@@ -3281,6 +3281,33 @@ pub fn fail_stop_substitute_unreconstructable(boundary: &str, method: &str, reas
     );
 }
 
+/// Replay fail-stop on a Substitute boundary that has no executor beneath it.
+///
+/// Some boundaries are constructed for substitution only — nothing is wired
+/// underneath them to run, because the deployment that built them never meant to
+/// reach the real thing. A miss there is not the ordinary Substitute miss that
+/// [`fail_stop_substitute_miss`] describes, and that stop's remedy does not
+/// apply: declaring `replay_strategy = Execute` prescribes running a boundary
+/// which does not exist. What this stop has to say instead is that the recording
+/// is short an entry, and that the candidate cannot be blamed for a request that
+/// never reached it.
+///
+/// `target` is the only host-specific part — whatever the absent executor would
+/// have addressed, named so an operator reading the stop knows which call went
+/// unanswered.
+#[cold]
+#[inline(never)]
+pub fn fail_stop_absent_executor(boundary: &str, method: &str, target: &str) -> ! {
+    panic!(
+        "{FAIL_STOP_SENTINEL} Substitute boundary `{boundary}::{method}` was \
+         constructed for substitution only and has no executor for `{target}`. \
+         The recording holds no entry for these args, so there is nothing to \
+         substitute and nothing this boundary could have executed; halting this \
+         request. The miss is a gap in the recording, and establishes nothing \
+         about the candidate either way."
+    );
+}
+
 /// Fail-stop when an Execute replay cannot acquire the shadow-observation token.
 ///
 /// Execute mode must observe the live boundary against reconstructed state. If
@@ -5952,6 +5979,41 @@ mod tests {
         .fall_through_silent();
 
         assert_eq!(obs.correlation_id.as_deref(), Some("req-1"));
+    }
+
+    /// An absent-executor stop is only useful if the guard can classify it, so
+    /// it must carry the sentinel; and it is only readable if it names the
+    /// target the missing executor would have addressed. Both are the halves of
+    /// a contract that lives in two places, so both are asserted here.
+    #[test]
+    fn fail_stop_absent_executor_carries_sentinel_and_names_target() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            fail_stop_absent_executor("grpc", "decide_gateway", "dynamo:8000")
+        });
+        std::panic::set_hook(prev);
+
+        let payload = result.expect_err("a boundary with no executor must fail-stop");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with(FAIL_STOP_SENTINEL),
+            "the stop must carry the sentinel or `catch_fail_stop` re-raises it as a bug \
+             panic instead of scoring it (got: {msg:?})"
+        );
+        assert!(
+            msg.contains("dynamo:8000"),
+            "the stop must name the target the absent executor would have addressed \
+             (got: {msg:?})"
+        );
+        assert!(
+            msg.contains("grpc") && msg.contains("decide_gateway"),
+            "the stop must identify the boundary (got: {msg:?})"
+        );
     }
 
     /// The execute-shadow observer firewall is loud, never silent: a
