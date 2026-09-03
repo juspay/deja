@@ -614,9 +614,6 @@ pub struct RunArtifacts {
     /// declaration at load. Empty = the recorder's declaration is the whole
     /// canon, which is the behaviour for a system that declares nothing.
     pub reply_canons: std::collections::BTreeMap<String, String>,
-    /// Response paths the run's system asserts an order for. Empty = order
-    /// carries no meaning anywhere, which is the default.
-    pub ordered_response_paths: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -3526,8 +3523,6 @@ struct BodyClassificationContext<'a> {
     /// the same grammar the recorder mints. A second contributor to the
     /// boundary's canon, not a fallback.
     document_clauses: &'a [CanonPreset],
-    /// Paths whose order the system ASSERTS. Empty by default.
-    ordered_paths: &'a [String],
 }
 
 fn classify_http_body_diff(
@@ -3579,15 +3574,10 @@ fn classify_http_body_diff(
                 // removed or changed; what moved was the order a collection was
                 // iterated in, which for a hash-based collection is seeded per
                 // process and differs between two runs of one image.
-                let path = canonical_set_path(&body.json_path);
-                let asserted = ctx
-                    .ordered_paths
-                    .iter()
-                    .any(|declared| canonical_set_path(declared) == path);
                 // A conflicted path is never absorbed, by the default least of
                 // all: two sources disagreeing about what a path MEANS must not
                 // be settled by a rule that says nothing about it.
-                if !asserted && !conflicted {
+                if !conflicted {
                     classification
                         .canon_absorbed
                         .push((body.json_path.clone(), ClauseSource::Default));
@@ -3952,7 +3942,6 @@ fn http_clean_by_correlation(
     inconclusive_race: &InconclusiveRaceEvidence,
     column_provenance: &CorrelationColumnProvenance,
     document_clauses: &[CanonPreset],
-    ordered_paths: &[String],
 ) -> HashMap<String, bool> {
     let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
     for diff in http_diffs {
@@ -3966,7 +3955,6 @@ fn http_clean_by_correlation(
                     race: inconclusive_race,
                     provenance: column_provenance,
                     document_clauses,
-                    ordered_paths,
                 },
             )
             .blocking_leaf_count
@@ -4095,7 +4083,6 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     race: &inconclusive_race,
                     provenance: &column_provenance,
                     document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
-                    ordered_paths: &art.ordered_response_paths,
                 },
             )
             .blocking_leaf_count
@@ -4121,7 +4108,6 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             &inconclusive_race,
             &column_provenance,
             &document_clauses_for(&art.reply_canons, "http_incoming"),
-            &art.ordered_response_paths,
         ),
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
@@ -4588,7 +4574,6 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     race: &inconclusive_race,
                     provenance: &column_provenance,
                     document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
-                    ordered_paths: &art.ordered_response_paths,
                 },
             );
             let blocking_body_diffs = body_classification.blocking_leaf_count;
@@ -5038,11 +5023,6 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .as_ref()
         .map(|run| crate::system::system_config(run.spec.system()).reply_canons)
         .unwrap_or_default();
-    let ordered_response_paths = run
-        .as_ref()
-        .map(|run| crate::system::system_config(run.spec.system()).ordered_response_paths)
-        .unwrap_or_default();
-
     let mut warnings = Vec::new();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
     let (observed, mut replay_graph) =
@@ -5208,7 +5188,6 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         correlation_scope,
         scored_span_namespaces,
         reply_canons,
-        ordered_response_paths,
         warnings,
     })
 }
@@ -5285,7 +5264,6 @@ pub(crate) fn build_ledger_with_plan(
                     race: &inconclusive_race,
                     provenance: &column_provenance,
                     document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
-                    ordered_paths: &art.ordered_response_paths,
                 },
             )
             .blocking_leaf_count
@@ -5305,7 +5283,6 @@ pub(crate) fn build_ledger_with_plan(
             &inconclusive_race,
             &column_provenance,
             &document_clauses_for(&art.reply_canons, "http_incoming"),
-            &art.ordered_response_paths,
         ),
     );
     Ok(ledger::build_with_plan(
@@ -6399,7 +6376,6 @@ mod tests {
         RunArtifacts {
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
-            ordered_response_paths: Vec::new(),
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -6477,7 +6453,6 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
-                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6497,7 +6472,6 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
-                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6517,7 +6491,6 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
-                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6537,7 +6510,6 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
-                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6558,7 +6530,6 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
-                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -6750,7 +6721,6 @@ mod tests {
                 race: &InconclusiveRaceEvidence::default(),
                 provenance: &CorrelationColumnProvenance::default(),
                 document_clauses: document,
-                ordered_paths: &[],
             },
         )
     }
@@ -6904,23 +6874,6 @@ mod tests {
         classify_body_declaring(diff, &[])
     }
 
-    /// The same classification, for a system that ASSERTS an order at these paths.
-    fn classify_body_declaring_ordered(
-        diff: &HttpDiff,
-        ordered: &[String],
-    ) -> HttpBodyClassification {
-        classify_http_body_diff(
-            diff,
-            None,
-            BodyClassificationContext {
-                race: &InconclusiveRaceEvidence::default(),
-                provenance: &CorrelationColumnProvenance::default(),
-                document_clauses: &[],
-                ordered_paths: ordered,
-            },
-        )
-    }
-
     /// The same classification, for a system that declares these paths as sets.
     fn classify_body_declaring(
         diff: &HttpDiff,
@@ -6933,7 +6886,6 @@ mod tests {
                 race: &InconclusiveRaceEvidence::default(),
                 provenance: &CorrelationColumnProvenance::default(),
                 document_clauses: document,
-                ordered_paths: &[],
             },
         )
     }
@@ -6970,11 +6922,12 @@ mod tests {
         assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
     }
 
-    /// THE GUARD. An ordering difference is still a difference. Nothing here
-    /// makes the comparison order-blind — it makes it say the same thing every
-    /// run.
+    /// THE GUARD on the default. A permutation is absorbed and NAMED, never
+    /// silently dropped: the scorecard says a difference was seen and why it
+    /// did not count. What still blocks is a change of membership, which the
+    /// sibling tests pin.
     #[test]
-    fn a_reordering_is_absorbed_unless_the_path_asserts_an_order() {
+    fn a_reordering_is_absorbed_and_named_under_the_default() {
         let diff = body_pair(
             serde_json::json!({ "steps": ["authenticate", "authorize", "capture"] }),
             serde_json::json!({ "steps": ["capture", "authorize", "authenticate"] }),
@@ -6987,12 +6940,6 @@ mod tests {
             vec![("$.steps".to_owned(), ClauseSource::Default)]
         );
         assert!(classify_body(&diff).order_only_paths.is_empty());
-
-        // …and a system that ASSERTS an order for that path gets it back.
-        let asserted = classify_body_declaring_ordered(&diff, &["$.steps".to_owned()]);
-        assert_eq!(asserted.blocking_leaf_count, 1, "a declared order blocks");
-        assert_eq!(asserted.order_only_paths, vec!["$.steps"]);
-        assert!(asserted.canon_absorbed.is_empty());
     }
 
     /// Members are compared WITH MULTIPLICITY: canonical order is a sort, never
@@ -7211,7 +7158,6 @@ mod tests {
                     race: &InconclusiveRaceEvidence::default(),
                     provenance: &CorrelationColumnProvenance::default(),
                     document_clauses: &[],
-                    ordered_paths: &[],
                 },
             )
             .blocking_leaf_count,
@@ -7382,7 +7328,6 @@ mod tests {
         let rows = build_ledger(&RunArtifacts {
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
-            ordered_response_paths: Vec::new(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -8979,7 +8924,6 @@ mod tests {
         let art = RunArtifacts {
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
-            ordered_response_paths: Vec::new(),
             run_id: run_id.to_owned(),
             recording_id: Some(recording_id.to_owned()),
             table,
