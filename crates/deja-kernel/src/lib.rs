@@ -352,14 +352,8 @@ pub fn diff_json(
         // side falls through to the leaf diff unchanged. The TAPE is never
         // touched: this normalizes judgment, not evidence.
         (serde_json::Value::String(b), serde_json::Value::String(c)) => {
-            if let (Ok(bv), Ok(cv)) = (
-                serde_json::from_str::<serde_json::Value>(b),
-                serde_json::from_str::<serde_json::Value>(c),
-            ) {
-                let structural = |v: &serde_json::Value| v.is_object() || v.is_array();
-                if structural(&bv) && structural(&cv) {
-                    return diff_json(&bv, &cv, path, allowlist);
-                }
+            if let Some((bv, cv)) = embedded_json_documents(b, c) {
+                return diff_json(&bv, &cv, path, allowlist);
             }
             // Same rule, second encoding: a form-urlencoded body is a map
             // serialized into a string, and the serializing map's iteration
@@ -384,6 +378,34 @@ pub fn diff_json(
     }
 }
 
+/// Read two strings as one embedded JSON document each — `Some` only when
+/// BOTH sides parse to an object or array. This is the qualifier every
+/// judgment shares: scalar strings keep byte semantics ("1.0" vs "1.00"
+/// stays a diff), prose stays opaque, and a document on only ONE side is a
+/// real difference, not an encoding to see through.
+///
+/// Public because the DECODING POLICY — what a string means — must be stated
+/// exactly once. The scorer's order-canonical body recompute judges the same
+/// responses this file's `diff_json` does; when it read strings its own way
+/// (as bytes) the two engines disagreed about the same response: the kernel
+/// reported zero rows while the recompute blocked on prism's
+/// `rawConnectorRequest` echo, whose embedded headers map serializes in
+/// per-process order. HOW a decoded document is compared stays each engine's
+/// own; WHAT a string carries is answered here.
+pub fn embedded_json_documents(
+    baseline: &str,
+    candidate: &str,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let (Ok(bv), Ok(cv)) = (
+        serde_json::from_str::<serde_json::Value>(baseline),
+        serde_json::from_str::<serde_json::Value>(candidate),
+    ) else {
+        return None;
+    };
+    let structural = |v: &serde_json::Value| v.is_object() || v.is_array();
+    (structural(&bv) && structural(&cv)).then_some((bv, cv))
+}
+
 /// Read a string as form-urlencoded pairs, STRICTLY: at least two
 /// `&`-separated segments (a single pair cannot be reordered, so bytes
 /// suffice there), every segment non-empty and carrying `key=`, keys
@@ -391,7 +413,11 @@ pub fn diff_json(
 /// keeps byte semantics. Values stay percent-ENCODED: both sides were
 /// produced by the same encoder, so encoded equality is value equality and
 /// decoding could only blur that.
-fn parse_form_pairs(raw: &str) -> Option<Vec<(&str, &str)>> {
+///
+/// Public for the same reason as [`embedded_json_documents`]: the strict
+/// qualifier is decoding policy, and both body-diff engines must apply the
+/// same one.
+pub fn parse_form_pairs(raw: &str) -> Option<Vec<(&str, &str)>> {
     let segments: Vec<&str> = raw.split('&').collect();
     if segments.len() < 2 {
         return None;
@@ -409,7 +435,11 @@ fn parse_form_pairs(raw: &str) -> Option<Vec<(&str, &str)>> {
 /// equal (repeated-key order is meaningful; distinct-key order is not). A
 /// differing key reports at `{path}.{key}` — the key names the field, which
 /// beats one opaque body diff.
-fn diff_form_pairs(
+///
+/// Public alongside [`parse_form_pairs`]: which orderings a form body may
+/// vary in is judgment policy (the form-urlencoded spec deliberately leaves
+/// it to applications), so it is stated once and shared, never re-derived.
+pub fn diff_form_pairs(
     baseline: &[(&str, &str)],
     candidate: &[(&str, &str)],
     path: &str,

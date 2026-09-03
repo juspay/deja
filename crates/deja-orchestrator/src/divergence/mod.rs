@@ -3412,6 +3412,31 @@ fn order_canonical_diff(
                 );
             }
         }
+        // A string that CARRIES a document is judged as that document, not as
+        // bytes — prism's `rawConnectorRequest` echo stringifies a headers map
+        // in per-process HashMap order, so byte semantics fail identical
+        // behavior on every response. WHAT a string means (embedded JSON? form
+        // pairs? neither?) is the kernel's decoding policy, imported so the
+        // two body-diff engines cannot disagree about the same response again;
+        // HOW the decoded document is compared stays THIS engine's own
+        // recursion, so the array canon above applies inside embedded
+        // documents too. Nesting costs nothing extra: the echo's form-encoded
+        // `body` string re-enters this arm on recursion.
+        (serde_json::Value::String(b), serde_json::Value::String(c)) => {
+            if let Some((bv, cv)) = deja_kernel::embedded_json_documents(b, c) {
+                order_canonical_diff(&bv, &cv, path, out);
+            } else if let (Some(bp), Some(cp)) =
+                (deja_kernel::parse_form_pairs(b), deja_kernel::parse_form_pairs(c))
+            {
+                out.extend(deja_kernel::diff_form_pairs(&bp, &cp, path, &[]));
+            } else {
+                out.push(JsonFieldDiff {
+                    json_path: path.to_owned(),
+                    baseline: baseline.clone(),
+                    candidate: candidate.clone(),
+                });
+            }
+        }
         (b, c) => out.push(JsonFieldDiff {
             json_path: path.to_owned(),
             baseline: b.clone(),
@@ -7069,6 +7094,82 @@ mod tests {
             order_canonical_body_diff(&diff).expect("bodies present"),
             diff.body_diff
         );
+    }
+
+    // --- strings that carry documents are judged as documents ---------------
+    //
+    // The kernel's `diff_json` learned this first; this recompute judged the
+    // same responses its own way (as bytes) and the two engines disagreed
+    // about the same body — zero kernel rows beside a blocking recompute
+    // leaf. The decoding policy is now imported from the kernel so one
+    // response gets one answer.
+
+    /// The measured response pair this came from: prism's
+    /// `rawConnectorRequest` echo — an embedded JSON string whose headers map
+    /// serializes in per-process HashMap order, carrying a form-encoded body
+    /// whose pair order is per-process random too. Identical behavior, 17
+    /// blocked responses per replay before this arm existed.
+    #[test]
+    fn the_measured_echo_reduces_to_no_difference() {
+        let recorded = serde_json::json!({ "status": "CHARGED", "rawConnectorRequest": { "value":
+            "{\"url\":\"https://api.stripe.com/v1/payment_intents\",\"method\":\"POST\",\"headers\":{\"Content-Type\":\"application/x-www-form-urlencoded\",\"stripe-version\":\"2022-11-15\",\"Authorization\":\"Bearer sk_test_synthesized\"},\"body\":\"amount=1000&currency=USD&metadata[order_id]=ord_1\"}" }});
+        let replayed = serde_json::json!({ "status": "CHARGED", "rawConnectorRequest": { "value":
+            "{\"headers\":{\"Authorization\":\"Bearer sk_test_synthesized\",\"stripe-version\":\"2022-11-15\",\"Content-Type\":\"application/x-www-form-urlencoded\"},\"method\":\"POST\",\"url\":\"https://api.stripe.com/v1/payment_intents\",\"body\":\"currency=USD&metadata[order_id]=ord_1&amount=1000\"}" }});
+        let diff = body_pair(recorded, replayed);
+        assert!(
+            diff.body_diff.is_empty(),
+            "the kernel already judged these equivalent; the recompute must agree"
+        );
+        assert!(order_canonical_body_diff(&diff)
+            .expect("bodies present")
+            .is_empty());
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 0);
+    }
+
+    /// Seeing through the encoding is not tolerance: a value that genuinely
+    /// changed inside the embedded document blocks, and blocks at ITS path —
+    /// the inner field, not one opaque blob.
+    #[test]
+    fn a_real_change_inside_an_embedded_document_reports_at_its_inner_path() {
+        let diff = body_pair(
+            serde_json::json!({ "echo":
+                "{\"method\":\"POST\",\"headers\":{\"Authorization\":\"Bearer old\"}}" }),
+            serde_json::json!({ "echo":
+                "{\"headers\":{\"Authorization\":\"Bearer new\"},\"method\":\"POST\"}" }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].json_path, "$.echo.headers.Authorization");
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
+    }
+
+    /// HOW a decoded document is compared is this engine's own: an array
+    /// reordered inside an embedded string is one ordering fact at its
+    /// collection, exactly as it would be outside one.
+    #[test]
+    fn an_array_inside_an_embedded_document_uses_the_array_canon() {
+        let diff = body_pair(
+            serde_json::json!({ "doc": "{\"tags\":[\"a\",\"b\",\"c\"]}" }),
+            serde_json::json!({ "doc": "{\"tags\":[\"c\",\"a\",\"b\"]}" }),
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 1);
+        assert_eq!(classification.order_only_paths, vec!["$.doc.tags"]);
+    }
+
+    /// The strict qualifiers hold through the new arm: two strings that carry
+    /// no document — prose, scalars — keep byte semantics and block as one
+    /// leaf.
+    #[test]
+    fn prose_strings_keep_byte_semantics() {
+        let diff = body_pair(
+            serde_json::json!({ "note": "approved by risk" }),
+            serde_json::json!({ "note": "approved by ops" }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].json_path, "$.note");
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
     }
 
     /// A boundary that declares `bag` says its collections carry no order. THAT
