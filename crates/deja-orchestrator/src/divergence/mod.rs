@@ -2100,16 +2100,75 @@ fn update_returning_equivalent(
             )
 }
 
-pub(crate) fn values_diverge_under_event(
+/// `boundary::method` — how an absorbed matched call is named on the scorecard.
+fn call_site_label(obs: &ObservedCall) -> String {
+    format!("{}::{}", obs.boundary, obs.method_name)
+}
+
+/// Who said the order of a matched call's args or result carries no meaning.
+///
+/// Two variants, deliberately not [`ClauseSource`]: on this path only a clause
+/// the RECORDER stamped or the order-blind DEFAULT can decide, because the
+/// per-system document declares reply canons for the HTTP reply and is not
+/// consulted for matched calls. Reusing the four-variant type would put two
+/// arms in every match that cannot fire, and a reader would take "documents are
+/// handled here" from their presence. The labels ARE shared with
+/// `ClauseSource` — `recorder`, `default` — so a consumer aggregating
+/// absorptions across both engines reads one vocabulary; a test pins that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueCanonSource {
+    /// A `bag` clause on the recorded event — stamped by the codec from the
+    /// boundary's own contract, or declared statically at the site.
+    Recorder,
+    /// No clause: order carries no meaning unless a path says otherwise (#102).
+    Default,
+}
+
+impl ValueCanonSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recorder => "recorder",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Why two matched values that are not equal were not counted as a divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueAbsorption {
+    /// An order-only difference, forgiven by a clause or by the default. THIS
+    /// is the number the strict flip waits on: when the default goes, every
+    /// `Default` here becomes a divergence and every `Recorder` stays green.
+    Canon(ValueCanonSource),
+    /// A db-boundary equivalence that describes the two databases rather than
+    /// the candidate: a replay-local SERIAL, an error's diagnostic text, an
+    /// `UPDATE … RETURNING` whose returned rows the statement itself explains.
+    DbInfrastructure,
+}
+
+/// The comparison of a matched call's recorded and observed values, with its
+/// reason. Callers that only need the bool use [`values_diverge_under_event`];
+/// callers that need to SAY why a difference stopped counting use this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueVerdict {
+    Equal,
+    Absorbed(ValueAbsorption),
+    Diverged,
+}
+
+fn value_verdict(
     boundary: &str,
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
     event: Option<&deja::BoundaryEvent>,
     observed_sql: Option<&str>,
-) -> bool {
+) -> ValueVerdict {
+    if recorded == observed {
+        return ValueVerdict::Equal;
+    }
     if let Some(event) = event {
         if declared_clauses_equivalent(&event_value_clauses(event), recorded, observed) {
-            return false;
+            return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Recorder));
         }
     }
     if is_db_boundary(boundary)
@@ -2123,7 +2182,7 @@ pub(crate) fn values_diverge_under_event(
                 observed,
             ))
     {
-        return false;
+        return ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure);
     }
     // An order-only difference is not a divergence. The recorded and observed
     // values hold the identical multiset, so nothing was added, removed or
@@ -2133,27 +2192,60 @@ pub(crate) fn values_diverge_under_event(
     // permutation absorbed in one and blocking in the other is one fact with
     // two answers depending on where it happened to be compared.
     if json_order_only_difference(recorded, observed) {
-        return false;
+        return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
     }
-    recorded != observed
+    ValueVerdict::Diverged
 }
 
+/// Whether a matched call's values diverge — the bool a caller that only routes
+/// on the outcome needs. A caller that has to REPORT why a difference did not
+/// count must use [`value_verdict`] instead: taking this bool because it is
+/// here is how a reason gets discarded on the way to the scorecard.
+pub(crate) fn values_diverge_under_event(
+    boundary: &str,
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+    event: Option<&deja::BoundaryEvent>,
+    observed_sql: Option<&str>,
+) -> bool {
+    matches!(
+        value_verdict(boundary, recorded, observed, event, observed_sql),
+        ValueVerdict::Diverged
+    )
+}
+
+/// [`value_verdict`] for an execute-shadow observed call against its recorded
+/// baseline; `None` when the call carries no pair to compare (not resolved, not
+/// a shadow, or a side missing).
+fn observed_value_verdict(
+    obs: &ObservedCall,
+    event: Option<&deja::BoundaryEvent>,
+) -> Option<ValueVerdict> {
+    if !obs.resolved || obs.provenance != deja::Provenance::Shadow {
+        return None;
+    }
+    match (&obs.recorded_result, &obs.observed_result) {
+        (Some(recorded), Some(observed)) => Some(value_verdict(
+            &obs.boundary,
+            recorded,
+            observed,
+            event,
+            obs.args.get("sql").and_then(serde_json::Value::as_str),
+        )),
+        _ => None,
+    }
+}
+
+/// See [`values_diverge_under_event`] for why a caller needing the reason must
+/// not take this bool.
 pub(crate) fn observed_value_diverged(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
 ) -> bool {
-    obs.resolved
-        && obs.provenance == deja::Provenance::Shadow
-        && match (&obs.recorded_result, &obs.observed_result) {
-            (Some(recorded), Some(observed)) => values_diverge_under_event(
-                &obs.boundary,
-                recorded,
-                observed,
-                event,
-                obs.args.get("sql").and_then(serde_json::Value::as_str),
-            ),
-            _ => false,
-        }
+    matches!(
+        observed_value_verdict(obs, event),
+        Some(ValueVerdict::Diverged)
+    )
 }
 
 fn is_unit_value(value: &serde_json::Value) -> bool {
@@ -4175,6 +4267,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // and, beside them, the ones we could not confirm because the recorded
     // statement was missing, so an empty class says which cause applies.
     let mut schema_default_divergences = 0u64;
+    // Matched calls whose args/result differed by ordering alone and were not
+    // counted, keyed by call site and by who said the order carries no
+    // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
+    // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
+    let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
     // Race evidence needs to be discovered before HTTP body classification:
@@ -4308,11 +4405,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // ValueDiverged (the args-aligned flavor — a READ, or a WRITE whose
             // operand did not change). The re-keyed WRITE whose operand DID change
             // misses args and is paired args-free in the Novel branch below.
-            let diverged = observed_value_diverged(
+            let verdict = observed_value_verdict(
                 obs,
                 obs.source_event_global_sequence
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::Canon(source))) = verdict {
+                stats.bump_kind("ValueCanonAbsorbed");
+                *value_canon_absorbed_seen
+                    .entry((call_site_label(obs), source.label()))
+                    .or_insert(0) += 1;
+            }
+            let diverged = matches!(verdict, Some(ValueVerdict::Diverged));
             if diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -4481,14 +4585,20 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let value_diverged = order_mismatch
-                || values_diverge_under_event(
-                    &obs.boundary,
-                    &recorded_val,
-                    &observed_val,
-                    twin_event,
-                    obs.args.get("sql").and_then(serde_json::Value::as_str),
-                );
+            let verdict = value_verdict(
+                &obs.boundary,
+                &recorded_val,
+                &observed_val,
+                twin_event,
+                obs.args.get("sql").and_then(serde_json::Value::as_str),
+            );
+            if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
+                stats.bump_kind("ValueCanonAbsorbed");
+                *value_canon_absorbed_seen
+                    .entry((call_site_label(obs), source.label()))
+                    .or_insert(0) += 1;
+            }
+            let value_diverged = order_mismatch || matches!(verdict, ValueVerdict::Diverged);
             if value_diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -4995,6 +5105,19 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // subtracted: a difference that stopped counting is still a difference that
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
+    for ((call_site, source), calls) in &value_canon_absorbed_seen {
+        let by = if *source == "default" {
+            "no clause asserts an order for it, and order carries no meaning unless one does"
+                .to_owned()
+        } else {
+            format!("a `bag` clause on the recorded event, stamped by the {source}")
+        };
+        warnings.push(format!(
+            "matched call {call_site} differed by ordering alone on {calls} call(s) and was not \
+             counted: {by}. The members are identical as a multiset, so any added, removed or \
+             altered member would still block"
+        ));
+    }
     for ((path, source), responses) in &canon_absorbed_seen {
         // The default is not a clause and must not read as one. "Declared by
         // the default" would describe a declaration nobody made.
@@ -7001,6 +7124,134 @@ mod tests {
             0,
             "guard: nothing was reached"
         );
+    }
+
+    /// One vocabulary across both engines: the source label a matched-call
+    /// absorption is keyed by is the label the HTTP reply path keys by. If
+    /// either side renames, a consumer aggregating absorptions would silently
+    /// split one fact into two — this is what stops that.
+    #[test]
+    fn value_canon_source_labels_are_clause_source_labels() {
+        assert_eq!(
+            ValueCanonSource::Recorder.label(),
+            ClauseSource::Recorder.label()
+        );
+        assert_eq!(
+            ValueCanonSource::Default.label(),
+            ClauseSource::Default.label()
+        );
+    }
+
+    fn scored_matched_call(
+        declaration: Option<&str>,
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> Scorecard {
+        let mut event = db_read_declaring(declaration.unwrap_or(""));
+        event.correlation_id = Some("c1".to_owned());
+        event.global_sequence = 1;
+        if declaration.is_none() {
+            event.declaration = None;
+        }
+        detect(&art_with_events(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![exec_obs(
+                "db",
+                Some("c1"),
+                true,
+                Some(1),
+                Some(recorded),
+                observed,
+            )],
+            vec![],
+            vec![event],
+        ))
+    }
+
+    fn value_canon_warning(card: &Scorecard) -> Option<&String> {
+        card.warnings
+            .iter()
+            .find(|w| w.starts_with("matched call db::m differed by ordering alone"))
+    }
+
+    /// THE NUMBER THE FLIP WAITS ON. A matched call whose rows differed by
+    /// ordering alone is counted ONCE under one kind, and the scorecard says
+    /// who forgave it: the codec's stamped clause here.
+    #[test]
+    fn a_matched_call_absorbed_by_a_stamped_clause_is_counted_with_its_source() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            rows(&["b", "a"]),
+            rows(&["a", "b"]),
+        );
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "absorbed, so not a divergence"
+        );
+        let warning = value_canon_warning(&card).expect("the absorption is named");
+        assert!(
+            warning.contains("stamped by the recorder"),
+            "the source is the recorder's clause: {warning}"
+        );
+        assert!(
+            !warning.contains("no clause asserts"),
+            "not the default: {warning}"
+        );
+    }
+
+    /// The same permutation with NO clause is absorbed by #102's default, and
+    /// the scorecard says so — with the default named as what it is, not as a
+    /// declaration nobody made. When the default goes, this row is the one
+    /// that turns into a divergence and the row above is the one that stays.
+    #[test]
+    fn a_matched_call_absorbed_by_the_default_is_counted_with_that_source() {
+        let card = scored_matched_call(None, rows(&["b", "a"]), rows(&["a", "b"]));
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        let warning = value_canon_warning(&card).expect("the absorption is named");
+        assert!(warning.contains("no clause asserts an order"), "{warning}");
+        assert!(!warning.contains("recorder"), "{warning}");
+    }
+
+    /// A member that changed is a divergence, and is NOT counted as an
+    /// absorption: the count means "order alone", nothing looser.
+    #[test]
+    fn a_changed_row_is_a_divergence_and_not_an_absorption() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            rows(&["b", "a"]),
+            rows(&["a", "z"]),
+        );
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(value_canon_warning(&card).is_none());
+    }
+
+    /// A db-infrastructure equivalence — a replay-local SERIAL `id` — is
+    /// forgiven for its own reason and must not swell the ordering count.
+    #[test]
+    fn a_db_infrastructure_equivalence_is_not_a_canon_absorption() {
+        let recorded = db_envelope(serde_json::json!([{ "id": 7, "ref": "a" }]));
+        let observed = db_envelope(serde_json::json!([{ "id": 9, "ref": "a" }]));
+        assert_eq!(
+            value_verdict("db", &recorded, &observed, None, None),
+            ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure)
+        );
+        let card = scored_matched_call(None, recorded, observed);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert_eq!(card.summary.value_divergences, 0);
+    }
+
+    /// Equal values are equal: not absorbed, not counted, nothing to say.
+    #[test]
+    fn equal_values_are_not_an_absorption() {
+        assert_eq!(
+            value_verdict("db", &rows(&["a"]), &rows(&["a"]), None, None),
+            ValueVerdict::Equal
+        );
+        let card = scored_matched_call(None, rows(&["a", "b"]), rows(&["a", "b"]));
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(value_canon_warning(&card).is_none());
     }
 
     /// The path grammar the HTTP path already accepts — with or without `[]`,
