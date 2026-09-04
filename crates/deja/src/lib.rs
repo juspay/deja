@@ -207,6 +207,13 @@ pub fn replay_search_path_sql_for(correlation: &str) -> String {
     )
 }
 
+/// Type-directed capture canonicalisation: a collection whose static Rust type
+/// says its order carries no information is recorded in a canonical order, so an
+/// order difference in a tape means somebody changed it. Lives in `deja-runtime`
+/// because macro-generated code names that crate directly; re-exported here
+/// because this facade is the surface a vendor writes against.
+pub use deja_runtime::canonical;
+
 /// Small JSON helpers shared by framework-specific boundary hooks.
 /// Capture any value for the tape with graceful degradation, resolved at
 /// compile time via autoref specialization:
@@ -257,7 +264,7 @@ pub mod value {
     }
     impl<T: serde::Serialize + ?Sized> CaptureSerde for &Capture<'_, T> {
         fn deja_capture(&self) -> serde_json::Value {
-            serde_json::to_value(self.0).unwrap_or_else(|_| {
+            crate::canonical::to_value(self.0).unwrap_or_else(|_| {
                 serde_json::json!({
                     "deja_unserializable": std::any::type_name::<T>(),
                 })
@@ -306,7 +313,7 @@ pub mod value {
     /// JSON-null if the value cannot be serialized (it never panics, so a
     /// serialize failure can't take down an instrumented call site).
     pub fn serialize<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Value {
-        serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+        crate::canonical::to_value_or_null(value)
     }
 
     /// Capture the full Rust debug representation of an error.
@@ -340,7 +347,7 @@ pub mod value {
     /// Requires the value to implement `serde::Serialize`; the macro only emits
     /// a call to this for boundaries opted into replay (`#[deja::…(replay)]`).
     pub fn result_serialize<T: serde::Serialize + ?Sized>(value: &T) -> (serde_json::Value, bool) {
-        let json = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
+        let json = crate::canonical::to_value_or_null(value);
         let is_error = matches!(&json, serde_json::Value::Object(map) if map.contains_key("Err"));
         (json, is_error)
     }
@@ -356,10 +363,7 @@ pub mod value {
         result: &Result<T, E>,
     ) -> (serde_json::Value, bool) {
         match result {
-            Ok(value) => (
-                serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
-                false,
-            ),
+            Ok(value) => (crate::canonical::to_value_or_null(value), false),
             Err(error) => (
                 serde_json::json!({ "deja_err": format!("{error:?}") }),
                 true,
@@ -840,7 +844,7 @@ pub mod value {
     {
         let record = match result {
             Ok(value) => DejaDatabaseResult::ok(
-                serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
+                crate::canonical::to_value_or_null(value),
                 std::any::type_name::<T>(),
             ),
             Err(error) => {
@@ -962,8 +966,7 @@ pub mod codec {
                     serde_json::json!({
                         "version": crate::value::DejaDatabaseResult::VERSION,
                         "result": "Ok",
-                        "value": serde_json::to_value(inner)
-                            .unwrap_or(serde_json::Value::Null),
+                        "value": crate::canonical::to_value_or_null(inner),
                         "type_name": std::any::type_name::<T>(),
                     }),
                     false,
@@ -975,8 +978,7 @@ pub mod codec {
                         // For a fieldless enum this serializes to the bare
                         // variant-name string ("NotFound"), keeping the wire
                         // `kind` identical to the legacy hand-rolled mapping.
-                        "kind": serde_json::to_value(report.current_context())
-                            .unwrap_or(serde_json::Value::Null),
+                        "kind": crate::canonical::to_value_or_null(report.current_context()),
                         "message": format!("{report:?}"),
                     }),
                     true,

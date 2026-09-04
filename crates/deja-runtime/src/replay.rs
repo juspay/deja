@@ -1163,7 +1163,12 @@ pub struct LookupKey {
     pub fork_seq: u64,
     /// Rank-specific call-site address (see [`Address`]).
     pub address: Address,
-    /// Canonical, order-independent hash of the call's serialized args.
+    /// Canonical hash of the call's serialized args: order-INDEPENDENT for
+    /// object keys (they are sorted before hashing) and order-DEPENDENT for
+    /// array elements (they are hashed in position). Both halves matter and the
+    /// distinction is load-bearing — this field sits on the key itself rather
+    /// than inside [`Address`], so it is part of EVERY rank, and a permuted
+    /// array therefore misses at all of them at once. See [`hash_value`].
     pub args_hash: u64,
     /// Nth call to `(correlation_id, bucket_id, address, args_hash)`; 0 for a unique call.
     pub occurrence: u32,
