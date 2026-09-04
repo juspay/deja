@@ -1648,6 +1648,34 @@ pub fn installed_runtime_hook() -> Option<Arc<RuntimeHook>> {
 // Builder for BoundaryEvent (used by generated delegation code)
 // ---------------------------------------------------------------------------
 
+/// The event's declaration: the site's static one, with a per-event reply canon
+/// (see [`RecordedOutput::reply_canon`]) appended as a clause. `None` when both
+/// are absent, exactly as before the per-event slot existed, so an undeclared
+/// site's events are byte-identical to what they were.
+///
+/// Composition is textual and ordered — `static;derived` — because that is the
+/// clause grammar the comparator already parses (`project:!a;bag:$.b[]`), and
+/// because a reader of the tape should see the static declaration first, where
+/// it always was.
+fn declaration_with_reply_canon(
+    declaration: Option<BoundaryDeclaration>,
+    derived: Option<CanonRef>,
+) -> Option<BoundaryDeclaration> {
+    let declaration = declaration.filter(|declaration| !declaration.is_empty());
+    let Some(derived) = derived else {
+        return declaration;
+    };
+    let mut declaration = declaration.unwrap_or_default();
+    declaration.reply_canon = Some(match declaration.reply_canon.take() {
+        Some(existing) if !existing.id.trim().is_empty() => CanonRef {
+            id: format!("{};{}", existing.id.trim(), derived.id.trim()),
+            version: existing.version.or(derived.version),
+        },
+        _ => derived,
+    });
+    Some(declaration)
+}
+
 /// Captured output of a boundary call.
 ///
 /// Existing extractors that return `(serde_json::Value, bool)` convert into this
@@ -1671,6 +1699,17 @@ pub struct RecordedOutput {
     pub result_image: Option<serde_json::Value>,
     /// Explicit pre-image of affected state before the boundary completed.
     pub pre_image: Option<serde_json::Value>,
+    /// A reply canon the PRODUCER derived for this one event, from evidence it
+    /// alone holds at capture time — the statement it ran, the command it sent.
+    /// Composed onto the site's static declaration at finish (a clause appended
+    /// with `;`), so the comparator reads one declaration and cannot tell which
+    /// half was static. This is how a boundary whose CONTRACT says "unordered"
+    /// while its Rust type says `Vec` gets its order marked as meaningless
+    /// without anyone declaring a path by hand — and marked, never sorted: the
+    /// service may legally observe `Vec` order on replay, so the rows are
+    /// recorded as they arrived.
+    #[allow(clippy::struct_field_names)]
+    pub reply_canon: Option<CanonRef>,
 }
 
 impl RecordedOutput {
@@ -1683,7 +1722,14 @@ impl RecordedOutput {
             write_set: Vec::new(),
             result_image: None,
             pre_image: None,
+            reply_canon: None,
         }
+    }
+
+    /// Attach a reply canon derived for this event.
+    pub fn with_reply_canon(mut self, canon: CanonRef) -> Self {
+        self.reply_canon = Some(canon);
+        self
     }
 
     /// Attach additional explicit read keys.
@@ -1766,6 +1812,8 @@ pub struct EventBuilder {
     explicit_output: Option<serde_json::Value>,
     explicit_result_image: Option<serde_json::Value>,
     explicit_pre_image: Option<serde_json::Value>,
+    /// See [`RecordedOutput::reply_canon`].
+    explicit_reply_canon: Option<CanonRef>,
     /// Optional structured call-site identity attached to the emitted event.
     pub callsite_identity: Option<CallsiteIdentity>,
     /// DECLARED boundary semantics (declarative boundary model). Defaults to
@@ -1889,6 +1937,7 @@ impl EventBuilder {
             explicit_write_set: None,
             explicit_output: None,
             explicit_result_image: None,
+            explicit_reply_canon: None,
             explicit_pre_image: None,
             callsite_identity: None,
             semantics: BoundarySemantics::undeclared(),
@@ -2017,6 +2066,9 @@ impl EventBuilder {
         if let Some(image) = output.pre_image {
             builder.explicit_pre_image = Some(image);
         }
+        if let Some(canon) = output.reply_canon {
+            builder.explicit_reply_canon = Some(canon);
+        }
         builder.finish(hook, output.result, output.is_error);
     }
 
@@ -2043,6 +2095,7 @@ impl EventBuilder {
             explicit_output,
             explicit_result_image,
             explicit_pre_image,
+            explicit_reply_canon,
             callsite_identity,
             semantics,
             role,
@@ -2120,9 +2173,7 @@ impl EventBuilder {
             replay_strategy: semantics.replay_strategy,
             kind: semantics.kind,
             role: role.map(str::to_owned),
-            declaration: semantics
-                .declaration
-                .filter(|declaration| !declaration.is_empty()),
+            declaration: declaration_with_reply_canon(semantics.declaration, explicit_reply_canon),
             raw_draw: None,
             end_timestamp_ns: Some(end_ns),
         };
@@ -6106,5 +6157,116 @@ mod tests {
 
         rx.recv_timeout(std::time::Duration::from_secs(1))
             .expect("fork spawn did not run immediately like tokio::spawn");
+    }
+}
+
+#[cfg(test)]
+mod reply_canon_merge_tests {
+    use super::*;
+
+    fn canon(id: &str) -> CanonRef {
+        CanonRef::new(id)
+    }
+
+    /// PROPERTY: an undeclared site whose output derives nothing records exactly
+    /// what it did before the per-event slot existed — `None`, not an empty
+    /// declaration.
+    #[test]
+    fn nothing_derived_leaves_the_declaration_untouched() {
+        assert_eq!(declaration_with_reply_canon(None, None), None);
+        let empty = BoundaryDeclaration::default();
+        assert_eq!(declaration_with_reply_canon(Some(empty), None), None);
+        let declared = BoundaryDeclaration::default().effect(EffectKind::Redis);
+        assert_eq!(
+            declaration_with_reply_canon(Some(declared.clone()), None),
+            Some(declared)
+        );
+    }
+
+    /// A site that declared nothing gets a declaration carrying only the
+    /// derived clause.
+    #[test]
+    fn a_derived_canon_on_an_undeclared_site_becomes_the_declaration() {
+        let got = declaration_with_reply_canon(None, Some(canon("bag:$.value[]")))
+            .expect("a declaration");
+        assert_eq!(
+            got.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("bag:$.value[]")
+        );
+        assert!(got.effect.is_none() && got.state_canon.is_none());
+    }
+
+    /// The static clause comes first, the derived one is appended — the clause
+    /// grammar the comparator parses, and the reader sees the static declaration
+    /// where it always was.
+    #[test]
+    fn a_derived_canon_is_appended_to_the_sites_static_clause() {
+        let site = BoundaryDeclaration::default()
+            .effect(EffectKind::Redis)
+            .reply_canon(canon("project:!created_at"));
+        let got = declaration_with_reply_canon(Some(site), Some(canon("bag:$.value[]")))
+            .expect("a declaration");
+        assert_eq!(
+            got.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("project:!created_at;bag:$.value[]")
+        );
+        assert_eq!(
+            got.effect,
+            Some(EffectKind::Redis),
+            "the rest of the static declaration survives"
+        );
+    }
+
+    /// A blank static canon is not a clause; appending to it would produce a
+    /// leading `;`, which the parser would skip but a reader would not.
+    #[test]
+    fn a_blank_static_canon_is_replaced_not_appended_to() {
+        let site = BoundaryDeclaration::default().reply_canon(canon("   "));
+        let got = declaration_with_reply_canon(Some(site), Some(canon("bag:$.value[]")))
+            .expect("a declaration");
+        assert_eq!(
+            got.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("bag:$.value[]")
+        );
+    }
+
+    /// The whole path: a RecordedOutput carrying a canon reaches the event's
+    /// declaration through `finish_recorded`, composed with the site's own.
+    #[test]
+    fn finish_recorded_stamps_the_output_canon_onto_the_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = RecordingHook::new(dir.path()).expect("recording hook");
+        let builder = EventBuilder::start(
+            &hook,
+            "db",
+            "T",
+            "filter",
+            std::panic::Location::caller(),
+            serde_json::json!({ "sql": "SELECT 1" }),
+        )
+        .with_semantics(BoundarySemantics {
+            replay_strategy: ReplayStrategy::Execute,
+            kind: None,
+            declaration: Some(BoundaryDeclaration::default().effect(EffectKind::Db)),
+        });
+        let output = RecordedOutput::new(serde_json::json!({ "value": [2, 1] }), false)
+            .with_reply_canon(canon("bag:$.value[]"));
+        builder.finish_recorded(&hook, output);
+        hook.flush().expect("flush");
+
+        let events = read_events(dir.path()).expect("events");
+        assert_eq!(events.len(), 1);
+        let declaration = events[0].declaration.as_ref().expect("declared");
+        assert_eq!(
+            declaration.effect,
+            Some(EffectKind::Db),
+            "the static half survives"
+        );
+        assert_eq!(
+            declaration.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("bag:$.value[]")
+        );
+        // Marked, never sorted.
+        assert_eq!(events[0].result, serde_json::json!({ "value": [2, 1] }));
     }
 }

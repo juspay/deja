@@ -233,6 +233,20 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
             parse_quote!(::deja::value::result_debug(__deja_result))
         }
     });
+    // The `#[deja::redis]` kit routes the capture through
+    // `::deja::redis::recorded_reply`, which reads the site's recorded `command`
+    // and stamps the reply canon for commands whose reply carries no order. The
+    // extractor cannot see `__deja_boundary_args` (it is moved into the args
+    // thunk), so the kit binds a clone for it first; every other preset emits
+    // nothing here and its extractor is byte-identical to before.
+    let (canon_prelude, result_expr): (TokenStream, Expr) = match preset {
+        Preset::Redis => (
+            quote! { let __deja_canon_args = __deja_boundary_args.clone(); },
+            parse_quote!(::deja::redis::recorded_reply({ #result_expr }, &__deja_canon_args)),
+        ),
+        _ => (TokenStream::new(), result_expr),
+    };
+
     let correlation_expr = args
         .correlation
         .unwrap_or_else(|| parse_quote!(None::<String>));
@@ -414,6 +428,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     let __deja_caller = ::std::panic::Location::caller();
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
+                            #canon_prelude
                             ::deja::__private::dispatch_async(
                                 __deja_observation,
                                 move || __deja_boundary_args,
@@ -446,6 +461,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     let __deja_caller = ::std::panic::Location::caller();
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
+                            #canon_prelude
                             ::std::boxed::Box::pin(::deja::__private::dispatch_async(
                                 __deja_observation,
                                 move || __deja_boundary_args,
@@ -475,6 +491,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     let __deja_caller = ::std::panic::Location::caller();
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
+                            #canon_prelude
                             ::deja::__private::dispatch(
                                 __deja_observation,
                                 move || __deja_boundary_args,
