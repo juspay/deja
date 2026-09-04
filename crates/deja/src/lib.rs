@@ -901,6 +901,15 @@ pub mod value {
 pub mod codec {
     use std::marker::PhantomData;
 
+    /// The reply canon a protocol codec stamps on a result whose members carry
+    /// no order BY THE BOUNDARY'S OWN CONTRACT while the Rust type says `Vec`:
+    /// rows of a `SELECT` with no `ORDER BY`, keys from a redis `SCAN`. Names the
+    /// `value` array of the `ResultCodec` envelope. Marked, never sorted — the
+    /// rows are recorded as they arrived, so a service that (legally, wrongly)
+    /// takes `.first()` of an unordered result gets on replay exactly what it
+    /// got in the recording.
+    pub const UNORDERED_VALUE_ROWS_CANON: &str = "bag:$.value[]";
+
     /// The capture/reconstruct contract for one boundary return type.
     pub trait ReplayCodec {
         /// The boundary's return type (what `dispatch` resolves `T` to).
@@ -1639,8 +1648,74 @@ pub mod db {
             if let Some(image) = image {
                 output = output.with_result_image(image);
             }
+            // A multi-row result is a set of rows unless the statement said
+            // otherwise. Derived here, from the statement this boundary ran,
+            // because this is the one place both the rows and the SQL are in
+            // hand; nobody declares a path.
+            if value.is_array() && !sql_has_top_level_order_by(sql) {
+                output = output.with_reply_canon(crate::CanonRef::new(
+                    crate::codec::UNORDERED_VALUE_ROWS_CANON,
+                ));
+            }
         }
         output
+    }
+
+    /// Does this statement impose an order on its rows at the top level?
+    ///
+    /// `ORDER BY` inside a subquery orders the subquery, not the rows this
+    /// boundary returns, so nesting depth is tracked. String literals are
+    /// skipped so a bound value containing the words does not count, and
+    /// diesel's trailing `-- binds: [...]` list is cut off for the same reason.
+    /// Conservative on anything it cannot follow — unbalanced parentheses, an
+    /// unterminated quote — it answers `true`, i.e. "ordered", which leaves the
+    /// result exactly as it was recorded before this existed.
+    #[must_use]
+    pub fn sql_has_top_level_order_by(sql: &str) -> bool {
+        let statement = sql.split(" -- binds: ").next().unwrap_or(sql);
+        let bytes = statement.as_bytes();
+        let mut depth: usize = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'(' => depth += 1,
+                b')' => match depth.checked_sub(1) {
+                    Some(next) => depth = next,
+                    None => return true,
+                },
+                quote @ (b'\'' | b'"') => {
+                    // Skip to the closing quote; a doubled quote is an escape.
+                    let mut close = index + 1;
+                    loop {
+                        match bytes.get(close) {
+                            None => return true,
+                            Some(&byte) if byte == quote => {
+                                if bytes.get(close + 1) == Some(&quote) {
+                                    close += 2;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Some(_) => close += 1,
+                        }
+                    }
+                    index = close;
+                }
+                _ if depth == 0
+                    && statement.is_char_boundary(index)
+                    && statement[index..]
+                        .get(..8)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("ORDER BY"))
+                    && (index == 0 || bytes[index - 1].is_ascii_whitespace()) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        // Parentheses still open at the end: a statement this cannot follow.
+        depth != 0
     }
 
     /// Metadata for a database query boundary.
@@ -1799,6 +1874,60 @@ pub mod db {
 /// let _recording = deja::test_support::recording_correlation("req-under-test");
 /// // boundaries called from here until `_recording` drops are recorded
 /// ```
+/// The Redis protocol's own statements about order, applied by the
+/// `#[deja::redis]` kit to the reply of every redis boundary. Redis, not any
+/// service: which commands return an unordered collection is a property of the
+/// protocol, read off the `command` the site already records in its args.
+pub mod redis {
+    /// Commands whose reply is a SET or a scan page by Redis's contract — the
+    /// members arrive in whatever order the server's hash table held them.
+    /// `LRANGE`, `ZRANGE`, `XRANGE` and every list/stream/sorted-set read are
+    /// deliberately absent: their order is the value.
+    pub const UNORDERED_REPLY_COMMANDS: &[&str] = &[
+        "SCAN",
+        "SSCAN",
+        "HSCAN",
+        "SMEMBERS",
+        "SINTER",
+        "SUNION",
+        "SDIFF",
+        "KEYS",
+        "HKEYS",
+        "HVALS",
+        "SRANDMEMBER",
+    ];
+
+    /// Shape the recorded reply of a redis boundary: the codec's capture, with
+    /// the reply canon stamped when the recorded `command` is one whose reply
+    /// carries no order. `args` is the site's own args object; a site that
+    /// records no `command` gets no mark.
+    #[must_use]
+    pub fn recorded_reply(
+        capture: (serde_json::Value, bool),
+        args: &serde_json::Value,
+    ) -> crate::RecordedOutput {
+        let output = crate::RecordedOutput::from(capture);
+        if output.is_error {
+            return output;
+        }
+        let unordered = args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| {
+                UNORDERED_REPLY_COMMANDS
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(command))
+            });
+        if unordered {
+            output.with_reply_canon(crate::CanonRef::new(
+                crate::codec::UNORDERED_VALUE_ROWS_CANON,
+            ))
+        } else {
+            output
+        }
+    }
+}
+
 pub mod test_support {
     /// Make `correlation_id` the current correlation, recording every boundary
     /// crossed while the returned guard is alive.

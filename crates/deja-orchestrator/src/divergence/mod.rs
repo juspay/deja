@@ -1835,6 +1835,10 @@ fn parse_canon_clause(id: &str) -> Option<CanonPreset> {
     resolve_canon_preset(id)
 }
 
+/// A declaration read as ONE preset. Production readers now go through
+/// [`canon_clauses`], which understands `;` and `bag:`; this stays for the
+/// preset-parser tests, which exercise the single-preset grammar directly.
+#[cfg(test)]
 fn resolve_canon(canon: Option<&deja::CanonRef>) -> Option<CanonPreset> {
     resolve_canon_preset(canon?.id.trim())
 }
@@ -1853,20 +1857,134 @@ fn resolve_canon_preset(id: &str) -> Option<CanonPreset> {
     }
 }
 
-fn event_state_canon(ev: &deja::BoundaryEvent) -> Option<CanonPreset> {
-    resolve_canon(ev.declaration.as_ref()?.state_canon.as_ref())
+/// Every clause of the event's state canon, then — only if there are none —
+/// every clause of its reply canon. The precedence is the one the single-preset
+/// reader always had (state shadows reply); what changed is that a declaration
+/// is read as the clause list it is, so a recorder-stamped `bag:$.value[]`
+/// appended to a site's static clause resolves instead of falling through
+/// `parse_project_canon` to `None`.
+fn event_value_clauses(ev: &deja::BoundaryEvent) -> Vec<CanonPreset> {
+    let Some(declaration) = ev.declaration.as_ref() else {
+        return Vec::new();
+    };
+    let state = canon_clauses(declaration.state_canon.as_ref());
+    if !state.is_empty() {
+        return state;
+    }
+    canon_clauses(declaration.reply_canon.as_ref())
 }
 
 fn event_reply_canon(ev: &deja::BoundaryEvent) -> Option<CanonPreset> {
-    resolve_canon(ev.declaration.as_ref()?.reply_canon.as_ref())
+    canon_clauses(ev.declaration.as_ref()?.reply_canon.as_ref())
+        .into_iter()
+        .next()
 }
 
+/// The names of every reply clause, `;`-joined — one clause reads exactly as it
+/// did before clauses existed.
 pub(crate) fn event_reply_canon_kind(ev: &deja::BoundaryEvent) -> Option<String> {
-    event_reply_canon(ev).map(|canon| canon.preset_name().to_owned())
+    let names: Vec<String> = canon_clauses(ev.declaration.as_ref()?.reply_canon.as_ref())
+        .iter()
+        .map(|clause| clause.preset_name().to_owned())
+        .collect();
+    (!names.is_empty()).then(|| names.join(";"))
 }
 
-fn event_value_canon(ev: &deja::BoundaryEvent) -> Option<CanonPreset> {
-    event_state_canon(ev).or_else(|| event_reply_canon(ev))
+/// Sort the arrays a `bag:` clause names, IN PLACE, and count how many the path
+/// actually reached. Non-recursive on purpose: the clause says the members of
+/// THIS collection carry no order; arrays inside a member keep theirs, because
+/// nothing said otherwise about them.
+///
+/// The count is the guard against a clause that names nothing: a path that
+/// resolves on neither side sorts nothing, and "both sides unchanged" must not
+/// be read as "both sides equivalent under the clause".
+fn sort_declared_bags(value: &mut serde_json::Value, path: &str) -> usize {
+    fn walk(value: &mut serde_json::Value, segments: &[&str]) -> usize {
+        let Some((head, rest)) = segments.split_first() else {
+            return match value {
+                serde_json::Value::Array(items) => {
+                    sort_as_bag(items);
+                    1
+                }
+                _ => 0,
+            };
+        };
+        let (key, each) = match head.strip_suffix("[]") {
+            Some(key) => (key, true),
+            None => (*head, false),
+        };
+        let Some(next) = value.get_mut(key) else {
+            return 0;
+        };
+        if each {
+            match next {
+                serde_json::Value::Array(items) => {
+                    items.iter_mut().map(|item| walk(item, rest)).sum()
+                }
+                _ => 0,
+            }
+        } else {
+            walk(next, rest)
+        }
+    }
+    let normalised = canonical_set_path(path);
+    let trimmed = normalised.strip_prefix("$.").unwrap_or(&normalised);
+    if trimmed.is_empty() || trimmed == "$" {
+        return match value {
+            serde_json::Value::Array(items) => {
+                sort_as_bag(items);
+                1
+            }
+            _ => 0,
+        };
+    }
+    let segments: Vec<&str> = trimmed.split('.').collect();
+    walk(value, &segments)
+}
+
+/// Two matched values under a `bag:` clause with paths: equal once every named
+/// collection is sorted on both sides, and nothing else is touched.
+///
+/// Equality is on the WHOLE value, which is what refuses a change of shape: a
+/// path present on one side and absent on the other leaves an array facing a
+/// missing key or a scalar, and no amount of sorting makes those equal. A rule
+/// that compared the reached counts was tried and could not be killed by any
+/// mutation — it duplicated what equality already guaranteed — so it is not
+/// here. The counts [`sort_declared_bags`] returns are for the tests, which use
+/// them to prove a path was reached and a sort did work before trusting an
+/// equivalence.
+fn bag_paths_equivalent(
+    paths: &[String],
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    let mut recorded = recorded.clone();
+    let mut observed = observed.clone();
+    for path in paths {
+        sort_declared_bags(&mut recorded, path);
+        sort_declared_bags(&mut observed, path);
+    }
+    recorded == observed
+}
+
+/// Does any clause the event declares make these two values equivalent?
+///
+/// Per-path `bag:` clauses are the one preset [`Canon::equivalent`] cannot
+/// answer alone (it returns `false` for them by design — "consulted per
+/// difference, not here"), so they are answered here by sorting the named
+/// collections. Routing a composed declaration to this function WITHOUT that
+/// per-path answer would be worse than not routing it: the clause would resolve,
+/// `equivalent` would refuse it unconditionally, and a correctly stamped
+/// recorder declaration would start manufacturing divergences.
+fn declared_clauses_equivalent(
+    clauses: &[CanonPreset],
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    clauses.iter().any(|clause| match clause {
+        CanonPreset::BagPaths(paths) => bag_paths_equivalent(paths, recorded, observed),
+        other => declared_value_equivalent(other, recorded, observed),
+    })
 }
 
 fn declared_value_equivalent(
@@ -1989,8 +2107,8 @@ pub(crate) fn values_diverge_under_event(
     event: Option<&deja::BoundaryEvent>,
     observed_sql: Option<&str>,
 ) -> bool {
-    if let Some(canon) = event.and_then(event_value_canon) {
-        if declared_value_equivalent(&canon, recorded, observed) {
+    if let Some(event) = event {
+        if declared_clauses_equivalent(&event_value_clauses(event), recorded, observed) {
             return false;
         }
     }
@@ -6708,6 +6826,210 @@ mod tests {
             deja::BoundaryDeclaration::default().reply_canon(deja::CanonRef::new(declaration)),
         );
         ev
+    }
+
+    /// A recorded DB read whose codec stamped a reply canon, the way
+    /// `deja::db::recorded_output` does for a multi-row statement with no
+    /// `ORDER BY`. Starts from the ingress builder and re-addresses it.
+    fn db_read_declaring(declaration: &str) -> deja::BoundaryEvent {
+        let mut ev = ingress_declaring(declaration);
+        ev.boundary = "db".to_owned();
+        ev.trait_name = "diesel_models::query::generics".to_owned();
+        ev.method_name = "generic_filter".to_owned();
+        ev
+    }
+
+    /// The `ResultCodec` envelope a marked reply arrives in. Rows are keyed by
+    /// a STRING column on purpose: `db_normalize_infra` strips integer `id`
+    /// fields as replay-local SERIALs, and a test whose rows were only ids would
+    /// compare equal for that reason and prove nothing about the clause.
+    fn db_envelope(rows: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "version": 1, "result": "Ok", "value": rows, "type_name": "Vec<Row>" })
+    }
+
+    fn rows(refs: &[&str]) -> serde_json::Value {
+        db_envelope(serde_json::Value::Array(
+            refs.iter()
+                .map(|r| serde_json::json!({ "ref": r }))
+                .collect(),
+        ))
+    }
+
+    /// The clause-aware answer, on its own. `values_diverge_under_event` still
+    /// carries #102's order-blind default beneath this, so a pure permutation is
+    /// absorbed there with or without a clause; the unit that has to be right —
+    /// and that the flip in §6 will leave standing alone — is this one.
+    fn equivalent_under(
+        ev: &deja::BoundaryEvent,
+        r: &serde_json::Value,
+        o: &serde_json::Value,
+    ) -> bool {
+        declared_clauses_equivalent(&event_value_clauses(ev), r, o)
+    }
+
+    /// The recorder-stamped clause is honoured on a MATCHED result: two row sets
+    /// that differ only in order are equivalent under `bag:$.value[]`.
+    ///
+    /// Two vacuity guards, because this can pass for the wrong reason: (1) the
+    /// same pair with NO clause must not be equivalent, so the answer is
+    /// attributable to the clause; (2) the sort must have reordered something —
+    /// the values differ before and agree after.
+    #[test]
+    fn a_recorder_stamped_bag_clause_absorbs_a_row_permutation_on_a_matched_result() {
+        let recorded = rows(&["b", "a", "c"]);
+        let observed = rows(&["a", "c", "b"]);
+        assert_ne!(recorded, observed, "guard: the two are not already equal");
+
+        assert!(
+            !equivalent_under(&db_read_declaring(""), &recorded, &observed),
+            "guard: with no clause, nothing here calls them equivalent"
+        );
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(equivalent_under(&declared, &recorded, &observed));
+        assert!(
+            !values_diverge_under_event("db", &recorded, &observed, Some(&declared), None),
+            "and the full comparison agrees"
+        );
+
+        // Guard: the path resolved and the sort did work on both sides.
+        let (mut r, mut o) = (recorded.clone(), observed.clone());
+        assert_eq!(sort_declared_bags(&mut r, "$.value[]"), 1);
+        assert_eq!(sort_declared_bags(&mut o, "$.value[]"), 1);
+        assert_ne!(r, recorded, "the sort reordered the recorded rows");
+        assert_eq!(r, o, "and the two agree once sorted");
+    }
+
+    /// The clause is COMPOSED onto a site's static declaration and still reaches
+    /// the comparison — the routing that used to parse the whole string as one
+    /// preset and get `None`.
+    #[test]
+    fn a_stamped_clause_composed_after_a_static_one_still_resolves() {
+        let recorded = rows(&["b", "a"]);
+        let observed = rows(&["a", "b"]);
+        let composed = db_read_declaring(&format!(
+            "project:!created_at;{}",
+            deja::codec::UNORDERED_VALUE_ROWS_CANON
+        ));
+        assert_eq!(
+            event_reply_canon_kind(&composed).as_deref(),
+            Some("project;bag")
+        );
+        assert!(equivalent_under(&composed, &recorded, &observed));
+        assert!(
+            !equivalent_under(
+                &db_read_declaring("project:!created_at"),
+                &recorded,
+                &observed
+            ),
+            "guard: the project clause alone does not call a permutation equivalent"
+        );
+    }
+
+    /// A member that CHANGED is still a divergence: the clause forgives order,
+    /// not content. Asserted through the full comparison too, on a boundary with
+    /// no db-specific equivalences of its own.
+    #[test]
+    fn a_changed_row_still_diverges_under_the_bag_clause() {
+        let recorded = rows(&["b", "a"]);
+        let observed = rows(&["a", "z"]);
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(!equivalent_under(&declared, &recorded, &observed));
+        assert!(values_diverge_under_event(
+            "redis",
+            &recorded,
+            &observed,
+            Some(&declared),
+            None
+        ));
+    }
+
+    /// A lost duplicate is still a divergence: a bag, not a set.
+    #[test]
+    fn a_dropped_duplicate_row_still_diverges_under_the_bag_clause() {
+        let recorded = rows(&["a", "a", "b"]);
+        let observed = rows(&["b", "a"]);
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(!equivalent_under(&declared, &recorded, &observed));
+    }
+
+    /// NON-RECURSIVE: the clause says the ROWS carry no order. An array inside a
+    /// row keeps its order, and reordering it is a real difference.
+    #[test]
+    fn an_array_inside_a_row_keeps_its_order_under_the_bag_clause() {
+        let recorded = db_envelope(serde_json::json!([{ "ref": "a", "steps": ["x", "y"] }]));
+        let observed = db_envelope(serde_json::json!([{ "ref": "a", "steps": ["y", "x"] }]));
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(
+            !equivalent_under(&declared, &recorded, &observed),
+            "the members were sorted; the array inside a member was not"
+        );
+    }
+
+    /// ASYMMETRY: the path resolves on one side and not the other. That is a
+    /// change of shape, and a per-path canon must not absorb it by sorting what
+    /// is there and comparing. Both directions.
+    #[test]
+    fn a_path_present_on_one_side_only_is_never_absorbed() {
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        let with_rows = rows(&["b", "a"]);
+        let no_rows = serde_json::json!({ "version": 1, "result": "Ok", "type_name": "Vec<Row>" });
+        let scalar = serde_json::json!({ "version": 1, "result": "Ok", "value": "x", "type_name": "Vec<Row>" });
+
+        assert!(!equivalent_under(&declared, &with_rows, &no_rows));
+        assert!(!equivalent_under(&declared, &no_rows, &with_rows));
+        assert!(!equivalent_under(&declared, &with_rows, &scalar));
+        assert!(!equivalent_under(&declared, &scalar, &with_rows));
+
+        // Guard: the count is what carries this — one side reached the array,
+        // the other did not.
+        let (mut r, mut n) = (with_rows.clone(), no_rows.clone());
+        assert_eq!(sort_declared_bags(&mut r, "$.value[]"), 1);
+        assert_eq!(sort_declared_bags(&mut n, "$.value[]"), 0);
+    }
+
+    /// A clause whose path resolves on NEITHER side governs nothing. "Both sides
+    /// unchanged" must not read as "both sides equivalent under the clause".
+    #[test]
+    fn a_clause_that_reaches_nothing_absorbs_nothing() {
+        let declared = db_read_declaring("bag:$.elsewhere[]");
+        let recorded = rows(&["b", "a"]);
+        let observed = rows(&["a", "b"]);
+        assert!(!equivalent_under(&declared, &recorded, &observed));
+        let mut r = recorded.clone();
+        assert_eq!(
+            sort_declared_bags(&mut r, "$.elsewhere[]"),
+            0,
+            "guard: nothing was reached"
+        );
+    }
+
+    /// The path grammar the HTTP path already accepts — with or without `[]`,
+    /// and descending through `[]` into each member.
+    #[test]
+    fn sort_declared_bags_walks_the_same_paths_the_http_path_reads() {
+        let mut v =
+            serde_json::json!({ "value": [ { "tags": ["b", "a"] }, { "tags": ["d", "c"] } ] });
+        assert_eq!(sort_declared_bags(&mut v, "$.value[].tags[]"), 2);
+        assert_eq!(
+            v,
+            serde_json::json!({ "value": [ { "tags": ["a", "b"] }, { "tags": ["c", "d"] } ] })
+        );
+
+        let mut w = serde_json::json!({ "value": [3, 1, 2] });
+        assert_eq!(
+            sort_declared_bags(&mut w, "$.value"),
+            1,
+            "the bare form works too"
+        );
+        assert_eq!(w, serde_json::json!({ "value": [1, 2, 3] }));
+
+        let mut top = serde_json::json!([2, 1]);
+        assert_eq!(
+            sort_declared_bags(&mut top, "$"),
+            1,
+            "the whole value as a bag"
+        );
+        assert_eq!(top, serde_json::json!([1, 2]));
     }
 
     fn classify_with_sources(
