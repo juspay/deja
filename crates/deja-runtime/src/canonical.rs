@@ -159,7 +159,7 @@ impl Serializer for Canonical {
     type SerializeTupleStruct = SeqBuilder;
     type SerializeTupleVariant = VariantSeqBuilder;
     type SerializeMap = MapBuilder;
-    type SerializeStruct = MapBuilder;
+    type SerializeStruct = StructBuilder;
     type SerializeStructVariant = VariantMapBuilder;
 
     fn serialize_bool(self, value: bool) -> Result<Value, Self::Error> {
@@ -301,14 +301,17 @@ impl Serializer for Canonical {
     }
     fn serialize_map(self, len: Option<usize>) -> Result<MapBuilder, Self::Error> {
         Ok(MapBuilder {
-            entries: serde_json::Map::with_capacity(len.unwrap_or(0)),
+            entries: Vec::with_capacity(len.unwrap_or(0)),
             pending_key: None,
         })
     }
-    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<MapBuilder, Self::Error> {
-        Ok(MapBuilder {
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<StructBuilder, Self::Error> {
+        Ok(StructBuilder {
             entries: serde_json::Map::with_capacity(len),
-            pending_key: None,
         })
     }
     fn serialize_struct_variant(
@@ -415,9 +418,42 @@ impl ser::SerializeTupleVariant for VariantSeqBuilder {
     }
 }
 
+/// The builder for a MAP — a `HashMap`, a `BTreeMap`, anything reached through
+/// `serialize_map`. Entries are collected and emitted in KEY order, whatever
+/// `serde_json::Map` would do with them: a consumer may build `serde_json` with
+/// `preserve_order` (hyperswitch's router does, through `josekit`, `thirtyfour`
+/// and `ucs_common_utils`), and then `Map` is an `IndexMap` that keeps
+/// insertion order — which for a `HashMap` is this process's hash order, put
+/// onto the tape as JSON object key order. Sorting here makes a map canonical
+/// on every build. Structs do NOT go through this: their field order is
+/// declaration order, deterministic on every run of a build, so
+/// [`StructBuilder`] inserts straight into the map and pays nothing.
 struct MapBuilder {
-    entries: serde_json::Map<String, Value>,
+    entries: Vec<(String, Value)>,
     pending_key: Option<String>,
+}
+
+/// The builder for a STRUCT. Field names are static and arrive in declaration
+/// order, so the key order on the tape is the same on every run whether or not
+/// `serde_json::Map` preserves insertion order.
+struct StructBuilder {
+    entries: serde_json::Map<String, Value>,
+}
+
+/// Put map entries in key order. `serde_json` keeps the LAST value for a
+/// duplicate key; the stable sort keeps duplicates in arrival order so the
+/// insert loop in [`finish_map`] does the same.
+fn sort_map_entries(entries: &mut [(String, Value)]) {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+}
+
+fn finish_map(mut entries: Vec<(String, Value)>) -> Value {
+    sort_map_entries(&mut entries);
+    let mut map = serde_json::Map::with_capacity(entries.len());
+    for (key, value) in entries {
+        map.insert(key, value);
+    }
+    Value::Object(map)
 }
 
 /// A map key, by the same rules `serde_json` applies: strings and the scalars
@@ -455,15 +491,15 @@ impl ser::SerializeMap for MapBuilder {
             .take()
             .ok_or_else(|| error("value serialized before key"))?;
         self.entries
-            .insert(key, value.serialize(Canonical::for_type::<T>())?);
+            .push((key, value.serialize(Canonical::for_type::<T>())?));
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
-        Ok(Value::Object(self.entries))
+        Ok(finish_map(self.entries))
     }
 }
 
-impl ser::SerializeStruct for MapBuilder {
+impl ser::SerializeStruct for StructBuilder {
     type Ok = Value;
     type Error = serde_json::Error;
     fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error>
@@ -766,6 +802,33 @@ mod tests {
         );
         assert!(to_value(&map).is_err(), "and so does this, by falling back");
         assert_eq!(to_value_or_null(&map), serde_json::Value::Null);
+    }
+
+    /// A MAP's keys are emitted in key order whatever `serde_json::Map` does with
+    /// insertion order. Asserted on the entry list the builder sorts, not on the
+    /// finished `Map` — on a `BTreeMap`-backed build the finished map is sorted
+    /// whether or not anybody sorted it, and a test on it would pass for that
+    /// reason alone. The consumer this exists for (`preserve_order` on) is the
+    /// one whose `Map` would not have sorted them.
+    #[test]
+    fn map_entries_are_emitted_in_key_order() {
+        let mut entries = vec![
+            ("zeta".to_owned(), Value::from(1)),
+            ("alpha".to_owned(), Value::from(2)),
+            ("mid".to_owned(), Value::from(3)),
+        ];
+        sort_map_entries(&mut entries);
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["alpha", "mid", "zeta"]);
+
+        let map: HashMap<String, u8> = [("zeta", 1u8), ("alpha", 2), ("mid", 3)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        let value = to_value(&map).expect("canonical");
+        let emitted: Vec<&String> = value.as_object().expect("object").keys().collect();
+        assert_eq!(emitted, ["alpha", "mid", "zeta"]);
+        assert_eq!(value, serde_json::to_value(&map).expect("serde_json"));
     }
 
     /// Integer and boolean map keys are accepted, exactly as `serde_json`
