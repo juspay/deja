@@ -1,6 +1,7 @@
 //! Thin CLI over the compactor lib — and the entry point a scheduled sealing
 //! job calls.
 //!
+//!   deja-compactor systems                   → every system the document declares
 //!   deja-compactor list      [system]        → what is landed, and what is sealed
 //!   deja-compactor readiness <id> [system]   → is this session finished?
 //!   deja-compactor seal      <id> [system]   → seal it, but ONLY if it is finished
@@ -72,17 +73,21 @@ fn print_json<T: serde::Serialize>(value: &T) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
-    // `list` takes the system in the id slot; everything else takes an id first.
+    // `systems` takes nothing, `list` takes the system in the id slot, and
+    // everything else takes an id first.
     let (session_id, system) = match cmd {
+        "systems" => ("", None),
         "list" => ("", args.get(2).map(String::as_str)),
         _ => (
             args.get(2).map(String::as_str).unwrap_or(""),
             args.get(3).map(String::as_str),
         ),
     };
-    if cmd.is_empty() || (cmd != "list" && session_id.is_empty()) {
+    let needs_id = !matches!(cmd, "systems" | "list");
+    if cmd.is_empty() || (needs_id && session_id.is_empty()) {
         eprintln!(
-            "usage: deja-compactor <list|readiness|seal|compact|manifest> [session_id] [system]"
+            "usage: deja-compactor <systems|list|readiness|seal|compact|manifest> \
+             [session_id] [system]"
         );
         std::process::exit(2);
     }
@@ -94,6 +99,16 @@ fn main() {
 }
 
 fn run(cmd: &str, session_id: &str, system: Option<&str>) -> Result<(), String> {
+    // Answered before any scope is resolved: the roster is a fact about the
+    // document, not about one system, and asking for it must not fail because
+    // some unrelated system has no bucket declared. It is also what a caller
+    // runs FIRST, to find out which systems to resolve at all.
+    if cmd == "systems" {
+        for name in deja_compactor::declared_systems()? {
+            println!("{name}");
+        }
+        return Ok(());
+    }
     let (cfg, root, system) = scope_for(system)?;
     match cmd {
         "list" => {
