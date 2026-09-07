@@ -201,6 +201,38 @@ pub fn bucket_for_system(system: &str) -> Result<String, String> {
         })
 }
 
+/// Every system the deployment declares, in a stable order.
+///
+/// The roster is the `[systems.<name>]` tables themselves — there is no second
+/// list to keep in step, and adding a system is one more table. A sealer that
+/// has to visit every system reads it from here rather than from a list its
+/// chart repeats, because a chart-side roster drifts from the document the first
+/// time someone adds a system to one and not the other, and the symptom is a
+/// system that silently never gets sealed.
+///
+/// Empty is an ERROR rather than an empty list, and that is the point: a caller
+/// looping over the result would otherwise iterate zero times, do nothing, and
+/// report success. "No systems are declared" and "every system is already
+/// sealed" are different facts and must not arrive as the same one.
+pub fn declared_systems() -> Result<Vec<String>, String> {
+    let declared = settings::load()?;
+    let names: Vec<String> = declared
+        .systems
+        .keys()
+        .map(|k| k.trim().to_owned())
+        .filter(|k| !k.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(format!(
+            "the deja configuration declares no systems, so there is nothing to \
+             seal: add a [systems.<name>] table with an s3_bucket to \
+             DEJA_CONFIG_TOML or {}",
+            settings::DEFAULT_CONFIG_FILE
+        ));
+    }
+    Ok(names)
+}
+
 /// The key prefix `system`'s recordings land under.
 ///
 /// A declared `recording_root` wins; otherwise the layout every deployment uses.
@@ -3258,6 +3290,62 @@ s3_bucket = "ucs-deja"
             row.boundaries,
             vec!["grpc_incoming".to_owned(), "grpc_outgoing".to_owned()],
             "and it does not replace the boundary evidence"
+        );
+    }
+    // -- the roster a sealer loops over -------------------------------------
+
+    #[test]
+    fn the_declared_tables_are_the_roster() {
+        // A sealer that must visit every system reads the roster here rather
+        // than from a list its chart repeats. A chart-side roster drifts from
+        // the document the first time someone adds a system to one and not the
+        // other, and the symptom is a system that silently never gets sealed.
+        let _lock = test_env::env_guard();
+        with_doc(SBX_DOC, || {
+            assert_eq!(
+                declared_systems().unwrap(),
+                vec!["hyperswitch".to_owned(), "prism".to_owned()],
+                "the tables are the roster, in a stable order"
+            );
+        });
+    }
+
+    #[test]
+    fn a_document_declaring_no_systems_is_an_error_not_an_empty_roster() {
+        // The failure this prevents is silent. A caller looping over an empty
+        // list iterates zero times, seals nothing, and exits 0 — so "no systems
+        // are declared" would arrive looking exactly like "everything is
+        // already sealed". The refusal names where to declare one.
+        let _lock = test_env::env_guard();
+        with_doc("default_system = \"hyperswitch\"\n", || {
+            let err = declared_systems().unwrap_err();
+            assert!(
+                err.contains("declares no systems"),
+                "must say the roster is empty, got: {err}"
+            );
+            assert!(
+                err.contains(settings::DEFAULT_CONFIG_FILE),
+                "must name where a system is declared, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_system_with_no_bucket_stays_in_the_roster() {
+        // It is NOT filtered out here. Dropping it would make the sealer skip
+        // it in silence; leaving it in means the pass reaches it and
+        // `bucket_for_system` refuses BY NAME, which is the whole point of that
+        // refusal. A misconfigured system should be loud, not absent.
+        let _lock = test_env::env_guard();
+        with_doc(
+            "[systems.hyperswitch]\ns3_bucket = \"b\"\n[systems.prism]\n",
+            || {
+                assert!(declared_systems().unwrap().contains(&"prism".to_owned()));
+                assert!(
+                    bucket_for_system("prism").is_err(),
+                    "and it is refused when the pass reaches it"
+                );
+            },
         );
     }
 }
