@@ -26,7 +26,15 @@
 //! recorder's verdict, the one every other boundary already goes through: for
 //! a correlation the sampler skipped it answers no-op before any sequence or
 //! occurrence is allocated, so a sampled-out request's draw leaves nothing on
-//! the tape and nothing in the hook. The seam has no gate of its own. The memo is a cell on the correlation's SPAN context
+//! the tape and nothing in the hook. The seam has no gate of its own.
+//!
+//! Outside record and replay the seam is inert, and structurally so rather
+//! than by a check: the cell lives on `SpanContext`, only
+//! `DejaCorrelationLayer` creates one, and the host installs that layer only
+//! while recording or replaying. A correlation made current by any other
+//! door — `deja_context::enter` alone, say — has no span context, no cell,
+//! and takes the std arm; `a_correlation_entered_without_a_span_is_not_seeded`
+//! is that case, asserted. The memo is a cell on the correlation's SPAN context
 //! (`correlation_layer::SpanContext`): the span that carries the `request_id`
 //! mints it, every span created beneath clones the handle, and the innermost
 //! entered span's handle rides on the thread's span cursor for this module to
