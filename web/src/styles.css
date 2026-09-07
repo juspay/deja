@@ -704,6 +704,8 @@ main:has(.recintro) { max-width: 1440px; }
 .evidence.ev-omitted { border-left-color: rgba(248,81,73,0.5); }
 .evidence.ev-env { border-left-color: var(--border-strong); }
 .evidence.ev-novel { border-left-color: var(--diff-add-edge); }
+.evidence.ev-identity-skew { border-left-color: rgba(210,153,34,0.6); }
+.evidence.ev-unknown { border-left-color: rgba(139,148,158,0.6); }
 .evidence.ev-http { border-left-color: var(--cyan); }
 .evidence.ev-none { border-left-color: var(--border); background: var(--surface); }
 .evidence h4 { font-size: var(--fs-11); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; margin: var(--s3) 0 var(--s1); font-weight: 600; }
