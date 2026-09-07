@@ -718,4 +718,109 @@ mod tests {
         .join()
         .expect("the thread must exit cleanly; a panic in a TLS destructor aborts");
     }
+
+    /// A `spawn_fork` tail reuses its request's key pair, and the memo is still
+    /// there when it runs.
+    ///
+    /// `spawn_fork` is the one detached path here that carries a correlation by
+    /// CONTEXT SNAPSHOT rather than by a held span handle — `capture_current()` +
+    /// `scope_snapshot`, instrumented with a fresh `fork_span()` rather than
+    /// `in_current_span()`. That made it the candidate for a real defect: if the
+    /// request's span could close before the tail ran, eviction would fire, the
+    /// tail would draw again, and one correlation would end up with two key pairs
+    /// and two `hash_seed` events.
+    ///
+    /// It does not happen, and the assertion below records WHY rather than just
+    /// that: `fork_span()` is created while the request span is current, so it is
+    /// that span's CHILD, and tracing's registry keeps a parent open until its
+    /// children close. The request span therefore cannot close while the tail is
+    /// outstanding — the same structural protection `.in_current_span()` gives,
+    /// reached by a different route. This test is the lock on that property; if a
+    /// future change makes the fork span parentless, this fails rather than the
+    /// tape quietly gaining a second event.
+    ///
+    /// Current-thread runtime and a thread-local subscriber, so the tail is polled
+    /// on this thread and `on_close` can actually run — the ordering
+    /// `fork_retains_request_context.rs` pins for the same reason.
+    #[test]
+    fn a_spawn_fork_tail_reuses_the_requests_keys() {
+        use tracing_subscriber::prelude::*;
+
+        const CORRELATION: &str = "corr-fork-tail";
+        let tail_saw: Arc<Mutex<Option<HashKeys>>> = Arc::new(Mutex::new(None));
+        let memo_held_when_tail_ran: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        let subscriber = tracing_subscriber::registry().with(crate::DejaCorrelationLayer::new());
+        let request_keys = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let request_keys = {
+                    let request = tracing::info_span!(
+                        "deja::http_incoming",
+                        request_id = %CORRELATION
+                    );
+                    let _entered = request.enter();
+
+                    let drawn = keys_now().expect("the request itself must be seeded");
+
+                    let saw = Arc::clone(&tail_saw);
+                    let held = Arc::clone(&memo_held_when_tail_ran);
+                    crate::spawn_fork(async move {
+                        // Record whether the memo was STILL populated at the
+                        // moment the tail ran. That is the fact that decides
+                        // which mechanism is protecting us.
+                        *held.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(memo_holds(CORRELATION));
+                        *saw.lock().unwrap_or_else(|p| p.into_inner()) = keys_now();
+                    });
+
+                    drawn
+                };
+                // The request span is dropped; let teardown win the race before
+                // the tail is polled, which is what makes this a defect and not
+                // a theory.
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                request_keys
+            })
+        });
+
+        // VACUITY GUARD. Eviction must be live in this setup, or "the tail
+        // matched" would prove nothing — it could just mean nothing is ever
+        // cleared. The span has closed by now, so the memo must be gone.
+        assert!(
+            !memo_holds(CORRELATION),
+            "precondition: the request span must CLOSE and evict once the tail is \
+             done, or this setup cannot tell a reused pair from a memo that is \
+             simply never cleared"
+        );
+
+        let held = memo_held_when_tail_ran
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("the tail must have run");
+        assert!(
+            held,
+            "the memo must still be populated when the tail runs — that is the \
+             span-lifetime guarantee this seam leans on. If this flips to false, \
+             `fork_span()` has stopped being a child of the request span, and the \
+             tail is now drawing its own pair"
+        );
+
+        let tail_keys = tail_saw
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("the tail must have run and been inside the correlation");
+
+        assert_eq!(
+            tail_keys, request_keys,
+            "a detached tail must iterate the same way its request did. Drawing \
+             again here gives one correlation two key pairs and puts a second \
+             hash_seed event on the tape, which is the exactly-once property gone"
+        );
+    }
 }
