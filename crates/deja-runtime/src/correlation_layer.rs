@@ -191,8 +191,32 @@ fn pop_span_cursor(span_id: u64) {
 /// Read the innermost entered span's cursor. The only read path, and it hands out
 /// no value when no span is entered — a caller cannot take a path or a bucket
 /// without that question having been answered.
+///
+/// # This CANNOT panic, and that is a property callers rely on
+///
+/// `ENTERED_SPANS` is a `RefCell<Vec<_>>`, and a `Vec` has a destructor, so the
+/// thread-local has one too. `LocalKey::with` panics with "cannot access a TLS
+/// value during or after destruction" once it has run — and a read that reaches
+/// this function from another thread-local's destructor during thread teardown
+/// (tokio, tracing and metrics layers all tear down that way) would turn into a
+/// panic inside a destructor, which is a double panic and an abort of the whole
+/// process. A `borrow` while a writer holds `borrow_mut` — a `Debug` impl invoked
+/// under `push_span_cursor`'s closure is enough — panics the same way.
+///
+/// Both accesses are therefore fallible, and both failures answer "no span
+/// entered": no path, no bucket, no keys. That is always a safe answer, because
+/// every caller already handles `None` for the ordinary reason. Recording is
+/// invisible instrumentation and must never be why a service falls over.
 fn with_current_cursor<T>(read: impl FnOnce(&SpanCursor) -> T) -> Option<T> {
-    ENTERED_SPANS.with(|stack| stack.borrow().last().map(read))
+    ENTERED_SPANS
+        .try_with(|stack| {
+            stack
+                .try_borrow()
+                .ok()
+                .and_then(|stack| stack.last().map(read))
+        })
+        .ok()
+        .flatten()
 }
 
 /// Enter `target` into deja-context only when it differs from what this layer last
@@ -495,6 +519,40 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The cursor read is reachable from other thread-locals' destructors during
+    /// thread teardown — `Default::default()` on a hash collection runs there —
+    /// and `ENTERED_SPANS` has a destructor of its own. With a plain `with` the
+    /// read panics inside a destructor, which is an abort of the process, not a
+    /// failed test: the discriminating mutation is `try_with` → `with`, and its
+    /// signature is SIGABRT of this binary. A green suite alone cannot tell.
+    #[test]
+    fn reading_the_cursor_during_tls_teardown_does_not_abort() {
+        struct ReadsTheCursorWhileDying;
+
+        impl Drop for ReadsTheCursorWhileDying {
+            fn drop(&mut self) {
+                // `None` is the right answer here; a panic is the wrong one.
+                let path = crate::current_span_path();
+                assert!(path.is_none(), "no span is entered during teardown");
+            }
+        }
+
+        thread_local! {
+            static BOMB: ReadsTheCursorWhileDying = const { ReadsTheCursorWhileDying };
+        }
+
+        std::thread::spawn(|| {
+            // Register the bomb FIRST so its destructor runs AFTER the cursor
+            // stack's, which is the ordering that reaches the destroyed cell.
+            BOMB.with(|_| {});
+            // Touch the cursor stack so it is initialised on this thread and
+            // therefore has a destructor to run.
+            let _ = crate::current_span_path();
+        })
+        .join()
+        .expect("the thread must exit cleanly; a panic in a TLS destructor aborts");
+    }
+
     use super::*;
     use deja_context::current_correlation_id;
     use tracing_subscriber::prelude::*;
