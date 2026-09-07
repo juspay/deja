@@ -639,7 +639,13 @@ export default function ReportPage() {
               tree with one detail panel now. */}
           <section id="execution">
             <h2>Execution — recorded against replayed</h2>
-            <UnifiedView runId={runId} scorecard={r.scorecard} />
+            <UnifiedView
+              runId={runId}
+              scorecard={r.scorecard}
+              systemName={
+                typeof r.params.system_under_test === "string" ? r.params.system_under_test : null
+              }
+            />
           </section>
         </>
       )}
