@@ -107,6 +107,13 @@ pub struct SystemConfig {
     /// minted a recording when the source bucket does not say. `None` means no
     /// guess is possible, which must read as "unknown", never as "the default".
     pub instance_pattern: Option<String>,
+    /// The anchored prefix of its primary deployment's pod names. Keeps
+    /// recording SELECTION on the main pods and off custom ones, which run
+    /// their own code and whose tapes are not what a pull-request replay wants
+    /// to be compared against. `None` means undeclared, and a caller asking to
+    /// be restricted to main instances is refused naming this field rather than
+    /// served every pod's recordings.
+    pub main_instance_prefix: Option<String>,
     /// Span-name prefixes this system's instrumentation contract declares as
     /// scored. Deja does not know these; the system does, so it declares them.
     pub scored_span_namespaces: Vec<String>,
@@ -302,6 +309,7 @@ pub fn system_config(name: &str) -> SystemConfig {
         candidate_image_repo: clean(d.candidate_image_repo)
             .map(|v| v.trim_end_matches('/').to_owned()),
         instance_pattern: clean(d.instance_pattern),
+        main_instance_prefix: clean(d.main_instance_prefix),
         scored_span_namespaces: d.scored_span_namespaces.unwrap_or_default(),
         reply_canons: reply_canons_resolved.clone(),
         candidate_config_files: d.candidate_config_files,
@@ -474,6 +482,28 @@ mod tests {
             "declared, not inherited"
         );
         assert_eq!(h.job_template_key.as_deref(), Some("job.json"));
+        const MAIN: &str = "sbx-hyperswitch-server-";
+        assert_eq!(
+            h.main_instance_prefix.as_deref(),
+            Some(MAIN),
+            "recording selection needs to know which pods are the main deployment"
+        );
+        // The anchor is the point of the field, so the test states it: the
+        // custom deployments must fail this prefix. If someone ever shortens the
+        // declaration to the bare service name, this is what fails.
+        for custom in [
+            "sbx-custom-cug-hyperswitch-server-54d4746479-d2qr7",
+            "sbx-custom-vbt-hyperswitch-server-f984678bf-57vvv",
+        ] {
+            assert!(
+                custom.contains("hyperswitch-server"),
+                "precondition: the custom pod carries the bare service name"
+            );
+            assert!(
+                !custom.starts_with(MAIN),
+                "`{custom}` must not read as the main deployment"
+            );
+        }
         // The document and the comparator are checked against each other here:
         // this is the exact string a deployment writes, in the exact grammar the
         // recorder mints, so the move to a vendor declaration is a copy.
@@ -542,6 +572,12 @@ candidate_env_prefix = "ROUTER__"
 manages_stores = true
 has_code_bundle = true
 job_template_key = "job.json"
+# Which pods are the PRIMARY deployment. Sandbox also runs custom pods
+# (sbx-custom-cug-…, sbx-custom-vbt-…) which carry their own code and whose
+# tapes are not what a pull-request replay wants to be compared against.
+# Anchored, and it has to be: the custom names contain the bare service name
+# `hyperswitch-server`, so only the `sbx-` boundary separates them.
+main_instance_prefix = "sbx-hyperswitch-server-"
 candidate_config_files = [
   "config/deployments/sandbox.toml",
   "config/deployments/production.toml",
