@@ -7128,6 +7128,77 @@ mod tests {
         assert_eq!(card.summary.http_body_mismatches, 1);
     }
 
+    /// TWO COUNTERS, TWO UNITS, ON PURPOSE — and now pinned, because nothing
+    /// pinned them.
+    ///
+    /// `summary.http_body_mismatches` counts RESPONSES that carry a blocking
+    /// body difference. `per_boundary.http_incoming.kinds.BodyMismatch` counts
+    /// the diverging FIELDS inside them. One response with two bad fields is one
+    /// of the first and two of the second, so the two numbers are expected to
+    /// disagree, and `Scorecard::counter_disagreements` deliberately does not
+    /// fold this pair for that reason.
+    ///
+    /// That is easy to re-discover as a bug, and has been. A sweep of live
+    /// scorecards found summary totalling 2 against a per-boundary total of 3,
+    /// which looks exactly like the accounting error this crate keeps finding
+    /// for real elsewhere, and the obvious
+    /// "fix" — making them agree, or registering the pair in
+    /// `counter_disagreements` — would have destroyed a real distinction and
+    /// made the report lie about how many responses were affected. Every
+    /// existing body test happened to use a single diverging field, so summary
+    /// and kind were both 1 in all of them and either counter could be changed
+    /// into the other with the whole suite still green. Both of those mutations
+    /// were run and both survived.
+    ///
+    /// This is the shape the live data had: two responses, three fields.
+    #[test]
+    fn the_summary_counts_responses_while_the_per_boundary_ledger_counts_fields() {
+        let one_field_recorded = serde_json::json!({ "status": "charged" });
+        let one_field_replayed = serde_json::json!({ "status": "failed" });
+        let two_field_recorded = serde_json::json!({ "status": "charged", "amount": 100 });
+        let two_field_replayed = serde_json::json!({ "status": "failed", "amount": 250 });
+
+        let card = detect(&art(
+            vec![],
+            vec![],
+            vec![
+                http_with_bodies(
+                    "one-bad-field",
+                    true,
+                    deja_kernel::diff_json(&one_field_recorded, &one_field_replayed, "$", &[]),
+                    one_field_recorded,
+                    one_field_replayed,
+                ),
+                http_with_bodies(
+                    "two-bad-fields",
+                    true,
+                    deja_kernel::diff_json(&two_field_recorded, &two_field_replayed, "$", &[]),
+                    two_field_recorded,
+                    two_field_replayed,
+                ),
+            ],
+        ));
+
+        assert_eq!(
+            card.summary.http_body_mismatches, 2,
+            "two RESPONSES diverged; this counter is responses, not fields"
+        );
+        assert_eq!(
+            kind_count(&card, "http_incoming", "BodyMismatch"),
+            3,
+            "three FIELDS diverged across those two responses; this counter is fields"
+        );
+        // The disagreement is expected, so the self-check must not report it.
+        // Folding this pair would fire on every run where one response carries
+        // more than one bad field — which is most of them.
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "responses-vs-fields is a deliberate difference in UNIT, not a \
+             counter disagreement: {:?}",
+            card.counter_disagreements()
+        );
+    }
+
     /// The report SAYS a difference was ordering, naming the collection.
     #[test]
     fn the_scorecard_names_an_ordering_difference_as_one() {
