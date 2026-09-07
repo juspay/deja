@@ -15,15 +15,28 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use deja_runtime::{read_events, DejaRandomState, RecordingHook, RuntimeHook};
+use deja_runtime::{
+    read_events, DejaCorrelationLayer, DejaRandomState, RecordingHook, RuntimeHook,
+};
+use tracing_subscriber::prelude::*;
 
 const CORRELATION: &str = "req-hash-seed-one-event";
 
-/// Recording is opt-in and scoped to the request that carries the decision.
-fn recording_correlation() -> deja_context::ContextGuard {
-    deja_context::enter(
-        deja_context::ContextSnapshot::new(CORRELATION).with_recording_decision(true),
-    )
+/// Run `f` inside a recording request: the ingress span carrying the
+/// correlation, under the correlation layer, with the sampler's decision for it
+/// registered BEFORE the span is created — the layer resolves the decision once,
+/// at span creation, and carries it for the span's lifetime.
+///
+/// A real span, not a bare `deja_context::enter`: the correlation's hash-key cell
+/// lives on the span, and a correlation with no span is deliberately not seeded.
+fn in_a_recording_request<T>(f: impl FnOnce() -> T) -> T {
+    deja_context::set_recording_decision(CORRELATION, deja_context::RecordDecision::Record);
+    let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+    tracing::subscriber::with_default(subscriber, || {
+        let request = tracing::info_span!("deja::http_incoming", request_id = %CORRELATION);
+        let _entered = request.enter();
+        f()
+    })
 }
 
 #[test]
@@ -33,9 +46,7 @@ fn a_correlation_records_exactly_one_hash_key_event() {
     deja_runtime::set_global_runtime_hook(Some(RuntimeHook::Recording(Arc::clone(&hook))))
         .expect("install recording hook");
 
-    let recorded_keys = {
-        let _guard = recording_correlation();
-
+    let recorded_keys = in_a_recording_request(|| {
         // Several collections, of both kinds, built at different moments — the
         // shape a real request has. All of them must share ONE draw.
         let mut first: HashMap<u32, u32, DejaRandomState> = HashMap::default();
@@ -54,7 +65,7 @@ fn a_correlation_records_exactly_one_hash_key_event() {
 
         // Whatever the seam drew, every collection above is using it.
         DejaRandomState::default()
-    };
+    });
 
     hook.flush().expect("flush the recorder");
 
@@ -83,6 +94,18 @@ fn a_correlation_records_exactly_one_hash_key_event() {
         !event.is_error,
         "a hash-key draw cannot fail; an error image here means the seam recorded \
          something it should not have"
+    );
+
+    // The event is addressed by the request span's path like every other
+    // boundary in the request: `draw_and_record` stamps `current_span_path()`.
+    assert_eq!(
+        event
+            .callsite_identity
+            .as_ref()
+            .and_then(|identity| identity.span_path.as_deref()),
+        Some("deja::http_incoming"),
+        "the hash-key event must carry the request span's path, or it sits \
+         outside the span-path address the rest of the request is keyed by"
     );
 
     // The tape must hold the REAL pair. A masked or absent image would replay as

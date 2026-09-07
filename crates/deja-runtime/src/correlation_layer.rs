@@ -83,6 +83,23 @@ struct SpanContext {
     /// the answer gives the decision the span's own lifetime, which is exactly
     /// "as long as anything still claims to belong to this request".
     decision: Option<deja_context::RecordDecision>,
+    /// The cell every collection built under this correlation draws its hash
+    /// keys from. Minted by the span that brings the correlation and shared BY
+    /// HANDLE with every span beneath it — a child clones the parent's `Arc` in
+    /// `on_new_span` — so a `spawn_fork` tail running under its `fork_span()`
+    /// child reads the same cell its request did, and the cell lives exactly as
+    /// long as the request's span tree. There is no registry to evict from.
+    /// `None` when no ancestor carried a correlation.
+    hash_keys: Option<crate::hash_seed::HashKeyCell>,
+}
+
+impl SpanContext {
+    /// The correlation this span engages on enter: its own, unless the ingress
+    /// sampled the request out, in which case none — and then nothing keyed by
+    /// correlation happens under it, hash keys included.
+    fn engaged_correlation(&self) -> Option<Arc<str>> {
+        self.observe.then(|| self.correlation.clone()).flatten()
+    }
 }
 
 /// The span field that marks a spawned-task boundary: a span carrying
@@ -113,6 +130,12 @@ struct SpanCursor {
     path: Arc<str>,
     /// Task lineage of the owning span.
     lineage: Arc<crate::TaskLineage>,
+    /// The correlation the owning span ENGAGED (`None` when it carries none or
+    /// the ingress sampled it out) and the cell its collections draw hash keys
+    /// from. On the cursor rather than looked up through the span tree because
+    /// the read runs for every collection the service builds.
+    correlation: Option<Arc<str>>,
+    hash_keys: Option<crate::hash_seed::HashKeyCell>,
 }
 
 thread_local! {
@@ -168,6 +191,8 @@ fn push_span_cursor(span_id: u64, cx: &SpanContext) {
             span_id,
             path: Arc::clone(&cx.path),
             lineage: Arc::clone(&cx.lineage),
+            correlation: cx.engaged_correlation(),
+            hash_keys: cx.hash_keys.clone(),
         });
     });
 }
@@ -217,6 +242,27 @@ fn with_current_cursor<T>(read: impl FnOnce(&SpanCursor) -> T) -> Option<T> {
         })
         .ok()
         .flatten()
+}
+
+/// The engaged correlation and hash-key cell of the innermost entered span —
+/// the hash-seed seam's only read, and the reason both ride on the cursor.
+///
+/// The two are handed out BY REFERENCE, inside the read. A caller that may go
+/// on to dispatch a boundary must clone them out and return first: the cursor
+/// stack is a `RefCell`, and a span entered while this shared borrow is held —
+/// the recording hook is free to enter one — would `borrow_mut` it in
+/// `push_span_cursor` and panic inside the caller's `Default::default()`.
+pub(crate) fn with_current_hash_keys<T>(
+    read: impl FnOnce(&Arc<str>, &crate::hash_seed::HashKeyCell) -> T,
+) -> Option<T> {
+    with_current_cursor(|cursor| {
+        cursor
+            .correlation
+            .as_ref()
+            .zip(cursor.hash_keys.as_ref())
+            .map(|(correlation, cell)| read(correlation, cell))
+    })
+    .flatten()
 }
 
 /// Enter `target` into deja-context only when it differs from what this layer last
@@ -452,6 +498,18 @@ where
                 .map_or((false, None), |c| (c.observe, c.decision))
         };
 
+        // The hash-key cell: fresh when this span brings a correlation its parent
+        // does not already carry, otherwise the parent's own handle. An inner span
+        // that re-stamps the SAME `request_id` is one request, not two, and must
+        // not draw a second pair.
+        let hash_keys = match (own_correlation.as_deref(), parent.as_ref()) {
+            (Some(own), Some(parent)) if parent.correlation.as_deref() == Some(own) => {
+                parent.hash_keys.clone()
+            }
+            (Some(_), _) => Some(Arc::new(std::sync::OnceLock::new())),
+            (None, parent) => parent.and_then(|c| c.hash_keys.clone()),
+        };
+
         span.extensions_mut().insert(SpanContext {
             path,
             correlation,
@@ -459,6 +517,7 @@ where
             observe,
             owns_correlation: own_correlation.is_some(),
             decision,
+            hash_keys,
         });
     }
 
@@ -474,8 +533,7 @@ where
 
         // Engage the correlation scope unless the ingress sampled this request out,
         // carrying the decision the span resolved when it was created.
-        let engaged = cx.observe.then(|| cx.correlation.clone()).flatten();
-        engage_correlation(id.into_u64(), engaged, cx.decision);
+        engage_correlation(id.into_u64(), cx.engaged_correlation(), cx.decision);
     }
 
     /// Revert everything this span's enter established, addressed by span id.
@@ -490,8 +548,8 @@ where
         restore_correlation(id.into_u64());
     }
 
-    /// Discard the correlation's per-correlation state — fork sequences and
-    /// memoized hash keys — when the span that owns the correlation closes.
+    /// Discard the correlation's fork sequences when the span that owns the
+    /// correlation closes.
     ///
     /// Span lifetime is the right clock. A span closes when the last handle to it
     /// is dropped, which is after every task that carried it has finished, so it
@@ -509,10 +567,6 @@ where
         };
         if cx.owns_correlation {
             crate::clear_fork_counters_for_correlation(cx.correlation.as_deref());
-            // Same clock, same reason: the memoized hash keys are per-correlation
-            // state, and without this the memo grows by one entry per request for
-            // the life of the process.
-            crate::hash_seed::clear_hash_keys_for_correlation(cx.correlation.as_deref());
         }
     }
 }

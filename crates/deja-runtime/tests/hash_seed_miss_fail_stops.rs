@@ -20,7 +20,8 @@
 
 use std::collections::HashMap;
 
-use deja_runtime::DejaRandomState;
+use deja_runtime::{DejaCorrelationLayer, DejaRandomState};
+use tracing_subscriber::prelude::*;
 
 #[test]
 fn a_hash_key_miss_fail_stops_instead_of_drawing_a_fresh_pair() {
@@ -43,17 +44,25 @@ fn a_hash_key_miss_fail_stops_instead_of_drawing_a_fresh_pair() {
         .expect("install runtime hook");
     drop(dir);
 
-    let _guard = deja_context::enter(deja_context::ContextSnapshot::new("req-hash-seed-miss"));
+    // A real request span under the layer: the correlation's hash-key cell lives
+    // on the span, and on replay no decision is ever pushed — the scope engages
+    // on the span alone.
+    let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        let request = tracing::info_span!("deja::http_incoming", request_id = "req-hash-seed-miss");
+        let _entered = request.enter();
 
-    // The deliberate fail-stop would otherwise print as if the test failed.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let outcome = std::panic::catch_unwind(|| {
-        let mut map: HashMap<u32, u32, DejaRandomState> = HashMap::default();
-        map.insert(1, 1);
-        map
+        // The deliberate fail-stop would otherwise print as if the test failed.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| {
+            let mut map: HashMap<u32, u32, DejaRandomState> = HashMap::default();
+            map.insert(1, 1);
+            map
+        });
+        std::panic::set_hook(previous);
+        outcome
     });
-    std::panic::set_hook(previous);
 
     let payload = outcome.expect_err(
         "a hash-key miss must fail-stop. Returning a freshly drawn pair would let \
