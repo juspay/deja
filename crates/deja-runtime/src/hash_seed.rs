@@ -14,10 +14,19 @@
 //! type, records the keys through a boundary, and serves the recorded pair on
 //! replay.
 //!
-//! # One seed per correlation
+//! # One seed per correlation, sampled or not
 //!
 //! Every collection inside one correlation shares one key pair, drawn once and
-//! memoized. The memo is a cell on the correlation's SPAN context
+//! memoized — for EVERY correlation, recorded or not. A recorded request must
+//! run the hashing regime production runs, or the recording is evidence about
+//! a regime only recorded requests see: an order-dependent behaviour anywhere in
+//! the service would show on the ~2% that is sampled and not on the rest, or
+//! the reverse. So the draw is unconditional, and every correlation draws
+//! through the same boundary. Whether the crossing is WRITTEN is the
+//! recorder's verdict, the one every other boundary already goes through: for
+//! a correlation the sampler skipped it answers no-op before any sequence or
+//! occurrence is allocated, so a sampled-out request's draw leaves nothing on
+//! the tape and nothing in the hook. The seam has no gate of its own. The memo is a cell on the correlation's SPAN context
 //! (`correlation_layer::SpanContext`): the span that carries the `request_id`
 //! mints it, every span created beneath clones the handle, and the innermost
 //! entered span's handle rides on the thread's span cursor for this module to
@@ -145,7 +154,9 @@ pub enum DejaRandomState {
 }
 
 impl Default for DejaRandomState {
-    /// Branches on whether a correlation is engaged on this thread.
+    /// Branches on whether a span carrying a correlation is entered on this
+    /// thread — not on whether the request is being recorded. A sampled-out
+    /// request is seeded like a recorded one, so the two run one regime.
     ///
     /// Outside a correlation this must be std EXACTLY — same type, same draw,
     /// same increment — because a process that is not recording should not pay
@@ -286,6 +297,13 @@ fn keys_for_current_correlation() -> Option<HashKeys> {
 
 /// Draw a fresh key pair, or serve the recorded one, through a `Substitute`
 /// boundary.
+///
+/// Called for every correlation, sampled in or out. There is deliberately no
+/// \"is this request recorded?\" check here: the recorder's capture verdict
+/// answers that for every boundary, and for a skipped correlation it is a
+/// no-op before a sequence or an occurrence is allocated. A second gate in the
+/// seam would have no observable effect, and an unobservable guarantee is the
+/// kind that later reads as tested when it never was.
 ///
 /// # This boundary FAIL-STOPS on a replay miss, deliberately
 ///
@@ -645,16 +663,16 @@ mod tests {
         );
     }
 
-    /// A request the ingress sampled OUT is not seeded, though its span carries
-    /// a correlation.
+    /// A request the ingress sampled OUT is seeded like a recorded one.
     ///
-    /// The cursor carries the ENGAGED correlation, not the raw field. A `Skip`
-    /// decision means nothing keyed by correlation happens under that span, and
-    /// drawing a pair for it would be a boundary dispatch on a request that
-    /// opted out of every boundary. The span path is asserted first so the test
-    /// cannot pass by the span never having been live under the layer.
+    /// Recorded and unrecorded traffic must run ONE hashing regime, or a
+    /// recording is evidence about a regime only recorded requests see. The
+    /// sampler's decision gates the EVENT, not the seed — the integration test
+    /// in `hash_seed_one_event_per_correlation.rs` asserts the "no event" half.
+    /// The span path is asserted first so the test cannot pass by the span
+    /// never having been live under the layer.
     #[test]
-    fn a_sampled_out_request_is_not_seeded() {
+    fn a_sampled_out_request_is_seeded() {
         const CORRELATION: &str = "corr-sampled-out";
         deja_context::set_recording_decision(CORRELATION, deja_context::RecordDecision::Skip);
         let (path, seeded) = under_the_layer(|| {
@@ -668,10 +686,41 @@ mod tests {
             "precondition: the request span must be live under the layer"
         );
         assert!(
-            seeded.is_none(),
-            "a sampled-out request must take the std arm — it engages no \
-             correlation, so it has no cell to draw into"
+            seeded.is_some(),
+            "a sampled-out request must be seeded — on the std arm it would run a \
+             different hashing regime from the requests that are recorded, and \
+             the recording would stop being a witness of production"
         );
+    }
+
+    /// A nested span carrying a DIFFERENT `request_id` mints its own cell, and
+    /// the parent's is untouched when it is left.
+    ///
+    /// This is the seam between "inherits" and "mints", and the one a later
+    /// refactor of `on_new_span`'s match gets wrong: collapse the re-stamp arm
+    /// into "always inherit" and a second request nested under a first would
+    /// silently share its pair — and its `hash_seed` event.
+    #[test]
+    fn a_nested_span_with_a_different_request_id_mints_its_own_cell() {
+        under_the_layer(|| {
+            let outer = request_span("corr-nested-outer");
+            let _entered = outer.enter();
+            let outer_keys = keys_now().expect("seeded");
+
+            let inner = tracing::info_span!("inner", request_id = "corr-nested-inner");
+            let inner_keys = inner.in_scope(keys_now).expect("seeded");
+            assert_ne!(
+                inner_keys, outer_keys,
+                "a different request_id is a different correlation and must draw \
+                 its own pair"
+            );
+
+            assert_eq!(
+                keys_now().expect("seeded"),
+                outer_keys,
+                "leaving the inner span must restore the outer correlation's pair"
+            );
+        });
     }
 
     /// The cell feeds the hasher. Probed with a pair chosen HERE and written

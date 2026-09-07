@@ -39,12 +39,23 @@ fn in_a_recording_request<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// The process's one recording hook and the directory it writes to. Two tests
+/// share a binary here, and `set_global_runtime_hook` is a one-shot.
+fn recording_hook() -> &'static (tempfile::TempDir, Arc<RecordingHook>) {
+    static HOOK: std::sync::OnceLock<(tempfile::TempDir, Arc<RecordingHook>)> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = Arc::new(RecordingHook::new(dir.path()).expect("recording hook"));
+        deja_runtime::set_global_runtime_hook(Some(RuntimeHook::Recording(Arc::clone(&hook))))
+            .expect("install recording hook");
+        (dir, hook)
+    })
+}
+
 #[test]
 fn a_correlation_records_exactly_one_hash_key_event() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let hook = Arc::new(RecordingHook::new(dir.path()).expect("recording hook"));
-    deja_runtime::set_global_runtime_hook(Some(RuntimeHook::Recording(Arc::clone(&hook))))
-        .expect("install recording hook");
+    let (dir, hook) = recording_hook();
 
     let recorded_keys = in_a_recording_request(|| {
         // Several collections, of both kinds, built at different moments — the
@@ -72,7 +83,9 @@ fn a_correlation_records_exactly_one_hash_key_event() {
     let events = read_events(dir.path()).expect("read the tape");
     let seed_events: Vec<_> = events
         .iter()
-        .filter(|event| event.boundary == "hash_seed")
+        .filter(|event| {
+            event.boundary == "hash_seed" && event.correlation_id.as_deref() == Some(CORRELATION)
+        })
         .collect();
 
     assert_eq!(
@@ -121,5 +134,45 @@ fn a_correlation_records_exactly_one_hash_key_event() {
         "the recorded image must carry the exposed key pair the process actually \
          used — masking it here would put `***` on the tape and substitute nothing \
          on replay"
+    );
+}
+
+/// The other half of "one regime, sampled or not": a request the ingress
+/// sampled OUT is seeded — the unit test asserts that — and leaves NOTHING on
+/// the tape, no `hash_seed` event and no event of any kind under its
+/// correlation. The seeded arm is asserted first so the absence below cannot
+/// pass because the request was simply never seeded.
+#[test]
+fn a_sampled_out_request_is_seeded_and_records_nothing() {
+    const SAMPLED_OUT: &str = "req-hash-seed-sampled-out";
+    let (dir, hook) = recording_hook();
+
+    deja_context::set_recording_decision(SAMPLED_OUT, deja_context::RecordDecision::Skip);
+    let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+    let state = tracing::subscriber::with_default(subscriber, || {
+        let request = tracing::info_span!("deja::http_incoming", request_id = %SAMPLED_OUT);
+        let _entered = request.enter();
+        let mut map: HashMap<u32, u32, DejaRandomState> = HashMap::default();
+        map.insert(1, 1);
+        DejaRandomState::default()
+    });
+    deja_context::clear_recording_decision(SAMPLED_OUT);
+
+    assert!(
+        matches!(state, DejaRandomState::Seeded(_)),
+        "precondition: a sampled-out request must take the seeded arm, or the \
+         absence asserted below is vacuous"
+    );
+
+    hook.flush().expect("flush the recorder");
+    let events = read_events(dir.path()).expect("read the tape");
+    let under_it: Vec<_> = events
+        .iter()
+        .filter(|event| event.correlation_id.as_deref() == Some(SAMPLED_OUT))
+        .collect();
+    assert!(
+        under_it.is_empty(),
+        "a sampled-out request must leave nothing on the tape — its draw is a \
+         bare draw, not a boundary crossing. Got: {under_it:#?}"
     );
 }

@@ -130,10 +130,11 @@ struct SpanCursor {
     path: Arc<str>,
     /// Task lineage of the owning span.
     lineage: Arc<crate::TaskLineage>,
-    /// The correlation the owning span ENGAGED (`None` when it carries none or
-    /// the ingress sampled it out) and the cell its collections draw hash keys
-    /// from. On the cursor rather than looked up through the span tree because
-    /// the read runs for every collection the service builds.
+    /// The owning span's correlation and the cell its collections draw hash
+    /// keys from. On the cursor rather than looked up through the span tree
+    /// because the read runs for every collection the service builds. Every
+    /// correlation is seeded, sampled in or out; whether its draw is WRITTEN is
+    /// the recorder's verdict, not the cursor's.
     correlation: Option<Arc<str>>,
     hash_keys: Option<crate::hash_seed::HashKeyCell>,
 }
@@ -191,7 +192,7 @@ fn push_span_cursor(span_id: u64, cx: &SpanContext) {
             span_id,
             path: Arc::clone(&cx.path),
             lineage: Arc::clone(&cx.lineage),
-            correlation: cx.engaged_correlation(),
+            correlation: cx.correlation.clone(),
             hash_keys: cx.hash_keys.clone(),
         });
     });
@@ -244,8 +245,8 @@ fn with_current_cursor<T>(read: impl FnOnce(&SpanCursor) -> T) -> Option<T> {
         .flatten()
 }
 
-/// The engaged correlation and hash-key cell of the innermost entered span —
-/// the hash-seed seam's only read, and the reason both ride on the cursor.
+/// The correlation and hash-key cell of the innermost entered span — the
+/// hash-seed seam's only read, and the reason both ride on the cursor.
 ///
 /// The two are handed out BY REFERENCE, inside the read. A caller that may go
 /// on to dispatch a boundary must clone them out and return first: the cursor
