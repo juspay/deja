@@ -288,8 +288,10 @@ pub fn spawn_k8s_run(
             }
             Err(e) => return ctx.finish(false, Some(&format!("launch job: {e}"))),
         };
-        // Poll to a terminal Job state. A 1h ceiling bounds a stuck Job; the
-        // Job's own activeDeadlineSeconds (template) is the authoritative timeout.
+        // Poll to a terminal Job state. The Job's own activeDeadlineSeconds is
+        // the authoritative timeout and the watch reads it off the Job, so the
+        // two cannot drift; this hour is only the ceiling for a template that
+        // declares no deadline at all.
         match watch_to_terminal(
             &api,
             &cfg.jobs_namespace,

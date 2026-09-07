@@ -543,23 +543,54 @@ pub fn launch<T: KubeTransport>(
     }
 }
 
+/// How much longer than the Job's own deadline this watches for.
+///
+/// Once `activeDeadlineSeconds` passes, kubernetes still has to notice and
+/// write the Failed condition. Watching to exactly the deadline would race that
+/// write and report "no terminal state" for a Job that is about to report one.
+/// Generous on purpose: the cost of waiting is one more poll, the cost of
+/// giving up early is a healthy run reported as failed.
+const WATCH_GRACE: Duration = Duration::from_secs(300);
+
 /// Poll a Job to its terminal verdict. `Some(true)` complete, `Some(false)`
 /// failed, `None` if the deadline passed while still running. Tolerates a
 /// transient NotFound (the Job may not be visible the instant after create).
 /// The sleep makes this the live half; the interpretation it delegates to
 /// `job_terminal_verdict` is unit-tested separately.
+///
+/// The ceiling is read from THE JOB rather than passed in, because the Job's
+/// `activeDeadlineSeconds` is what actually stops it. Those two numbers were
+/// set independently and drifted: the caller watched for one hour while the
+/// deployed template allowed two, so any replay lasting between them was
+/// reported as "did not reach a terminal state" while its pod was healthy,
+/// inside its budget, and often on the way to succeeding. Deriving the ceiling
+/// from the object makes that drift unrepresentable rather than merely fixed.
+///
+/// `fallback_deadline` applies only when the Job declares no deadline of its
+/// own, where something still has to bound a stuck watch.
 pub fn watch_to_terminal<T: KubeTransport>(
     api: &KubeApi<T>,
     namespace: &str,
     name: &str,
     poll: Duration,
-    deadline: Duration,
+    fallback_deadline: Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<Option<bool>, ExecutorError> {
     let start = Instant::now();
+    let mut deadline = fallback_deadline;
+    let mut from_job = false;
     loop {
         match api.get_job(namespace, name) {
             Ok(job) => {
+                // Read once, from the first Job that is visible. A later read
+                // cannot lower it: shortening the ceiling mid-watch would
+                // reintroduce exactly the early giveup this removes.
+                if !from_job {
+                    if let Some(secs) = crate::executor::k8s::job_active_deadline_secs(&job) {
+                        deadline = Duration::from_secs(secs) + WATCH_GRACE;
+                        from_job = true;
+                    }
+                }
                 if let Some(verdict) = job_terminal_verdict(&job) {
                     return Ok(Some(verdict));
                 }
@@ -1149,6 +1180,86 @@ mod tests {
         )
         .expect("watch");
         assert_eq!(v, None);
+    }
+
+    /// The drift this change makes unrepresentable, as a test. A zero fallback
+    /// is what the old code would have given up on after the first
+    /// still-running read; a Job that declares its own deadline must be watched
+    /// to THAT instead, so the second read lands and the run is not reported
+    /// failed while its pod is healthy.
+    #[test]
+    fn a_jobs_own_deadline_outranks_the_fallback() {
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(
+                200,
+                json!({"spec": {"activeDeadlineSeconds": 7200}, "status": {"active": 1}}),
+            ),
+            resp(
+                200,
+                json!({"spec": {"activeDeadlineSeconds": 7200}, "status": {"succeeded": 1}}),
+            ),
+        ]));
+        let v = watch_to_terminal(
+            &api,
+            "replay-sbx",
+            "j",
+            Duration::from_millis(1),
+            Duration::from_secs(0),
+            |_| {},
+        )
+        .expect("watch");
+        assert_eq!(
+            v,
+            Some(true),
+            "a Job with its own budget must not be abandoned at the fallback"
+        );
+    }
+
+    /// The grace, specifically. Kubernetes writes the Failed condition AFTER
+    /// activeDeadlineSeconds passes, so a watch that stopped exactly at the
+    /// deadline would race that write and report no verdict for a Job that is
+    /// about to give one. Deadline zero here: without the grace this gives up
+    /// before the second read.
+    #[test]
+    fn the_watch_outlives_the_jobs_deadline_by_the_grace() {
+        let api = KubeApi::new(FakeTransport::new(vec![
+            resp(
+                200,
+                json!({"spec": {"activeDeadlineSeconds": 0}, "status": {"active": 1}}),
+            ),
+            resp(
+                200,
+                json!({"spec": {"activeDeadlineSeconds": 0},
+                       "status": {"conditions": [{"type": "Failed", "status": "True"}]}}),
+            ),
+        ]));
+        let v = watch_to_terminal(
+            &api,
+            "replay-sbx",
+            "j",
+            Duration::from_millis(1),
+            Duration::from_secs(0),
+            |_| {},
+        )
+        .expect("watch");
+        assert_eq!(
+            v,
+            Some(false),
+            "the DeadlineExceeded verdict must be read, not raced"
+        );
+    }
+
+    #[test]
+    fn job_active_deadline_is_read_from_the_spec() {
+        use crate::executor::k8s::job_active_deadline_secs;
+        assert_eq!(
+            job_active_deadline_secs(&json!({"spec": {"activeDeadlineSeconds": 7200}})),
+            Some(7200)
+        );
+        // A template that declares none must read as "unknown", so the caller
+        // keeps its fallback rather than inheriting a zero.
+        assert_eq!(job_active_deadline_secs(&json!({"spec": {}})), None);
+        assert_eq!(job_active_deadline_secs(&json!({})), None);
     }
 
     #[test]
