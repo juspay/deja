@@ -169,7 +169,52 @@ fn clear_current_context() {
 
 /// Return the current thread-visible correlation ID.
 pub fn current_correlation_id() -> Option<String> {
-    CURRENT_CONTEXT.with(|cell| cell.borrow().clone())
+    with_current_correlation_id(|id| id.map(str::to_owned))
+}
+
+/// Read the current thread-visible correlation ID **without cloning it**.
+///
+/// [`current_correlation_id`] allocates on every call, which is the right price
+/// for a caller that keeps the id. It is the wrong price for a caller on a hot
+/// path that only needs to know whether a correlation is engaged: the hash-seed
+/// `BuildHasher` runs on every `HashMap::new()` in an instrumented service, and
+/// a `String` allocation there would be paid by the overwhelming majority of
+/// constructions that are outside any correlation and answer `None`.
+///
+/// # This CANNOT panic, and that is the point
+///
+/// Both accesses are fallible and both fall back to "no correlation":
+///
+/// - `try_with` rather than `with`. `CURRENT_CONTEXT` holds a `String`, so it
+///   has a destructor, and `LocalKey::with` panics with "cannot access a TLS
+///   value during or after destruction" once that destructor has run. A
+///   `HashMap` constructed during thread teardown — tokio, tracing and metrics
+///   layers all do this — would otherwise panic inside `Default::default()`,
+///   and during an unwind that is a double panic and an abort.
+/// - `try_borrow` rather than `borrow`. A shared borrow taken while a writer
+///   holds `borrow_mut` panics; a collection built inside a `Debug` impl invoked
+///   under that writer is enough to reach it.
+///
+/// Recording is invisible instrumentation: it must never be the reason a service
+/// falls over. Answering `None` degrades a caller to std behaviour, which is
+/// always a safe answer.
+pub fn with_current_correlation_id<R>(f: impl FnOnce(Option<&str>) -> R) -> R {
+    let mut f = Some(f);
+    let called = CURRENT_CONTEXT.try_with(|cell| {
+        let borrowed = cell.try_borrow().ok()?;
+        // `f` is consumed here; the outer `Option` records that it ran, so the
+        // fallback below cannot call it twice.
+        Some(f.take().map(|f| f(borrowed.as_deref())))
+    });
+    match called {
+        Ok(Some(Some(result))) => result,
+        // TLS gone, borrow contended, or the closure was never reached.
+        _ => match f.take() {
+            Some(f) => f(None),
+            // Unreachable: `f` is taken only on the path that returns above.
+            None => unreachable!("with_current_correlation_id ran its closure twice"),
+        },
+    }
 }
 
 /// What is physically in the cell, owner and all. Tests only: production code
