@@ -197,13 +197,17 @@ pub struct Summary {
     /// several — so the two are deliberately not the same number.
     pub http_body_mismatches: u64,
     /// Every blocking side-effect divergence:
-    /// `omitted_calls + value_divergences + identity_skews`.
+    /// `omitted_calls + value_divergences`.
     ///
-    /// `novel_calls` is deliberately NOT a term. A novel call is a call the
-    /// candidate added, and this counter is a statement about the calls the
-    /// recording holds — whether each still happened, with the same args, to the
-    /// same result. An addition is reported under `novel_calls` and judged
-    /// nowhere.
+    /// This counter is a statement about the calls the RECORDING HOLDS — whether
+    /// each still happened, with the same args, to the same result. Three things
+    /// are deliberately not terms, for one reason each:
+    ///
+    /// - `novel_calls` and `absorbed_misses` are calls the candidate ADDED, and
+    ///   an addition says nothing about that set.
+    /// - `identity_skews` is a disagreement about pairing ORDER between two
+    ///   methods that both resolved every call; a content difference is counted
+    ///   under `value_divergences` instead.
     pub side_effect_divergences: u64,
     /// Misses the REQUEST SURVIVED: a boundary declared `on_miss`, the declared
     /// value was returned, and the correlation continued on an answer the
@@ -587,10 +591,15 @@ impl Scorecard {
         // `recording_coverage`, not in a divergence counter. `absorbed_misses`
         // and `CorrelationOutcome::absorbed_misses` carry the fact; nothing yet
         // spends it, and that is the follow-up.
-        let blocking = s.omitted_calls + s.value_divergences + s.identity_skews;
+        //
+        // `identity_skews` is not a term either, and for a different reason: a
+        // skew is a disagreement about pairing ORDER between two methods that
+        // both resolved every call, so it cannot be hiding a content difference —
+        // that would be counted under `value_divergences`.
+        let blocking = s.omitted_calls + s.value_divergences;
         if s.side_effect_divergences != blocking {
             out.push(format!(
-                "summary.side_effect_divergences = {}, but omitted + value + identity = {blocking}",
+                "summary.side_effect_divergences = {}, but omitted + value = {blocking}",
                 s.side_effect_divergences
             ));
         }
@@ -4226,12 +4235,24 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         }
         if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
             let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            // ORDER, AND ONLY ORDER. A skew means both sides made the same
+            // calls and each one resolved to its own recorded event — the two
+            // PAIRING methods disagree about which goes with which. The lookup
+            // pairs by args and is order-independent; the graph aligner pairs
+            // structurally by position. Run the same work concurrently and the
+            // two disagree, which is the skew.
+            //
+            // A skew therefore cannot hide a content difference. Under Execute
+            // the candidate runs the real boundary and a differing result is
+            // `ValueDivergedOrigin`; under Substitute the recorded value is
+            // served and there is nothing to differ. Either way the mechanism
+            // that would catch content is elsewhere and still blocking.
+            //
+            // So this is the rule c7c8918 already established for arrays —
+            // "a permutation of an identical multiset is not a difference" —
+            // reaching graph pairing. Counted and named, charged to nothing.
             stats.bump_kind("IdentitySkew");
             identity_skews += 1;
-            blocking_side_effect += 1;
-            if let Some(correlation_id) = &obs.correlation_id {
-                *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
-            }
             consumed.extend(aligned_event);
             consumed.extend(served_event);
             continue;
@@ -4361,12 +4382,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     for (observed_index, obs) in deferred {
         if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
             let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            // Order only — see the note on the pass-1 arm.
             stats.bump_kind("IdentitySkew");
             identity_skews += 1;
-            blocking_side_effect += 1;
-            if let Some(correlation_id) = &obs.correlation_id {
-                *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
-            }
             paired_consumed.extend(aligned_event);
             paired_consumed.extend(served_event);
             continue;
@@ -4848,8 +4866,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // `corr_side_effect`).
         reasons.push(format!("{value_divergences} value divergence(s)"));
     }
+    // Reported, non-blocking: a skew says two pairing methods disagreed about
+    // order on calls that both resolved, which the same-multiset rule already
+    // treats as not a difference. A content difference is counted elsewhere and
+    // still blocks.
     if identity_skews > 0 {
-        reasons.push(format!("{identity_skews} graph identity skew(s)"));
+        reasons.push(format!(
+            "{identity_skews} graph identity skew(s) (non-blocking): concurrent \
+             fan-out reordered work both sides performed"
+        ));
     }
     // Span-shape findings are all BLOCKING: the tape's scored spans are the
     // candidate's declared contract, in both directions — a replay of a tape
@@ -4921,6 +4946,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
         - usize::from(novel_calls > 0)
+        - usize::from(absorbed_misses > 0)
+        - usize::from(identity_skews > 0)
         - usize::from(inconclusive_seed_gaps > 0)
         - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
@@ -11397,8 +11424,21 @@ mod tests {
             1
         );
     }
+    /// A bind-order swap is a SKEW and not a divergence.
+    ///
+    /// This fixture is the change's best evidence, which is why it is rewritten
+    /// rather than deleted: two sibling spans with identical names, the recorded
+    /// side pairing 51→501 (bind a) and 52→502 (bind b), the observed side
+    /// serving them the other way round. Every call resolved to its own recorded
+    /// event; the two PAIRING methods disagree, and that disagreement is the
+    /// skew. It is the same shape as a concurrent fan-out reordering work both
+    /// sides performed.
+    ///
+    /// Both bindings are still asserted below. If this test could pass without
+    /// naming the skew, the change would be untested — the classification is the
+    /// thing that has to survive, only its cost changes.
     #[test]
-    fn same_statement_bind_order_swap_is_blocking_identity_skew() {
+    fn same_statement_bind_order_swap_is_a_tolerated_identity_skew() {
         let corr = "identity-swap";
         let result = serde_json::json!({"result": "Ok", "value": []});
         let events = vec![
@@ -11480,13 +11520,35 @@ mod tests {
             BTreeSet::from([(Some(501), Some(502)), (Some(502), Some(501))])
         );
         assert_eq!(card.summary.identity_skews, 2);
-        assert_eq!(card.summary.side_effect_divergences, 2);
-        assert_eq!(kind_count(&card, "db", "IdentitySkew"), 2);
-        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+        assert_eq!(
+            kind_count(&card, "db", "IdentitySkew"),
+            2,
+            "the skew must still be NAMED — tolerating it is not dropping it"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and charged to nothing: both sides ran the same two statements and \
+             each resolved to its own recorded event"
+        );
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            0,
+            "a content difference would be counted HERE, which is why a skew \
+             cannot be hiding one"
+        );
         assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
         assert_eq!(card.summary.matched_side_effect_calls, 0);
-        assert!(!outcome.passed);
-        assert!(!card.verdict.pass);
+        assert!(
+            outcome.passed,
+            "the response matched and every call resolved; the order the two \
+             pairing methods disagree about is not a difference"
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.verdict.reason.contains("identity skew"),
+            "and the verdict must still SAY the skew happened: {}",
+            card.verdict.reason
+        );
         assert!(card.counter_disagreements().is_empty());
     }
     #[test]
