@@ -39,6 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
+pub mod canonical;
 pub mod correlation_layer;
 pub mod graph;
 pub mod replay;
@@ -293,8 +294,30 @@ impl DejaRecord {
 /// task-lineage/canonicalization scaffolding. v8 switches detached spawning to a
 /// stamp-only model and adds canonical `bucket_id` plus `fork_seq` lineage.
 /// (The optional `role` field is additive within v8: absent on old tapes,
-/// defaulted on read, and never required by any consumer.)
-pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 8;
+/// defaulted on read, and never required by any consumer.) v9 canonicalises
+/// capture by TYPE ([`canonical`]): a collection whose static Rust type says its
+/// order carries no information — a `HashSet`, at any nesting depth — is
+/// recorded in a canonical order instead of in this process's hash-seed order.
+///
+/// v9 adds and removes NO field; it changes what the existing `args` and
+/// `result` hold, which is why it takes a version rather than a comment. What a
+/// pre-v9 tape means when read afterwards, stated plainly because #100 showed
+/// what silence costs: **its arrays are in whatever order the recording
+/// process's hash seed produced.** Two consequences, and both are real:
+///
+/// - `canonical_args_hash` hashes array elements in position, so a v9 candidate
+///   computes a different `args_hash` from a pre-v9 tape at any site whose args
+///   carry such a collection, and therefore misses at every address rank. The
+///   unresolved call is still repaired by the scorer's args-free twin pairing,
+///   but it is a miss. **A pre-v9 recording is re-recorded rather than replayed
+///   against a v9 candidate** — the same call made for #100's `bucket_id`
+///   composition change, which is this same shape.
+/// - A strict array comparison across the version line would report an ordering
+///   difference that is a capture-version artefact and nothing else, so any such
+///   comparison must be gated on the RECORDING's `event_schema_version >= 9`.
+///
+/// Self-consistent within a v9 recording, exactly as v6 was for `capture!`.
+pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 9;
 
 /// The [`BoundaryEvent::role`] value marking a correlation's ingress root.
 pub const ROLE_INGRESS: &str = "ingress";
