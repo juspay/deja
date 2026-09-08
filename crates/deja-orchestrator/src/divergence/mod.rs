@@ -10,7 +10,7 @@
 //! Classification (V1):
 //!   - resolved hit                         → matched (recorded per address rank)
 //!   - resolved only at rank 6 (sequence)   → Recovered (fragility flag)
-//!   - candidate call with no table hit     → NovelCall (blocking)
+//!   - candidate call with no table hit     → NovelCall (reported, not scored)
 //!     …absorbed by a declared `on_miss`     → NovelCallAbsorbed (request survived)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
@@ -197,7 +197,13 @@ pub struct Summary {
     /// several — so the two are deliberately not the same number.
     pub http_body_mismatches: u64,
     /// Every blocking side-effect divergence:
-    /// `omitted_calls + novel_calls + value_divergences + identity_skews`.
+    /// `omitted_calls + value_divergences + identity_skews`.
+    ///
+    /// `novel_calls` is deliberately NOT a term. A novel call is a call the
+    /// candidate added, and this counter is a statement about the calls the
+    /// recording holds — whether each still happened, with the same args, to the
+    /// same result. An addition is reported under `novel_calls` and judged
+    /// nowhere.
     pub side_effect_divergences: u64,
     /// Misses the REQUEST SURVIVED: a boundary declared `on_miss`, the declared
     /// value was returned, and the correlation continued on an answer the
@@ -551,14 +557,26 @@ impl Scorecard {
         // The headline number: every blocking side-effect divergence, and
         // nothing else. A demotion that stopped excluding itself here would show
         // up as a verdict nobody could account for from the breakdown.
-        let blocking = s.omitted_calls
-            + s.novel_calls
-            + s.absorbed_misses
-            + s.value_divergences
-            + s.identity_skews;
+        //
+        // Neither `novel_calls` NOR `absorbed_misses` is a term. The headline is
+        // a statement about the calls the recording holds — omitted, re-keyed, or
+        // answered differently. Both of those are calls the candidate ADDED, and
+        // an addition says nothing about that set.
+        //
+        // Absorbed misses leave with novel ones deliberately. An absorbed miss is
+        // a novel call the process SURVIVED, so it cannot be the more serious of
+        // the two: charging it while an unabsorbed novel call goes free would say
+        // a miss that killed nothing costs more than one that did. What an
+        // absorbed miss does cost is CONFIDENCE — the correlation continued on a
+        // value the recording never held — and that is a statement about what the
+        // run is a verdict over, which belongs in the coverage stamp beside
+        // `recording_coverage`, not in a divergence counter. `absorbed_misses`
+        // and `CorrelationOutcome::absorbed_misses` carry the fact; nothing yet
+        // spends it, and that is the follow-up.
+        let blocking = s.omitted_calls + s.value_divergences + s.identity_skews;
         if s.side_effect_divergences != blocking {
             out.push(format!(
-                "summary.side_effect_divergences = {}, but omitted + novel + absorbed + value + identity = {blocking}",
+                "summary.side_effect_divergences = {}, but omitted + value + identity = {blocking}",
                 s.side_effect_divergences
             ));
         }
@@ -4183,11 +4201,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     tail_gap_correlations.insert(correlation_id.clone());
                 }
             } else {
+                // Shown, not scored — the graph tier's form of the same call the
+                // flat arm below makes. A novel subtree is added work, at a
+                // coarser granularity than a novel call and of the same kind, so
+                // it is counted and named and charged to nothing. See the note on
+                // the `NovelCall` arm.
                 stats.bump_kind("NovelSubtree");
-                blocking_side_effect += 1;
-                if let Some(correlation_id) = &obs.correlation_id {
-                    *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
-                }
             }
             continue;
         }
@@ -4494,18 +4513,35 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // Blocking treatment is deliberately UNCHANGED here: this change
             // makes absorption visible, it does not decide what a novel call
             // costs. That question is its own change.
+            // Charged to nothing, for the same reason an unabsorbed novel call
+            // is: it is a call the candidate ADDED. It cannot be the more serious
+            // of the two — the process survived this one — so charging it while
+            // the other goes free would say a miss that killed nothing costs more
+            // than one that did.
+            //
+            // What it costs is CONFIDENCE, not a divergence: the correlation
+            // carried on using a value the recording never held. `absorbed_misses`
+            // here and on the correlation is what carries that, and spending it
+            // belongs in the coverage stamp rather than in this counter.
             stats.bump_kind("NovelCallAbsorbed");
-            blocking_side_effect += 1;
             if let Some(corr) = &obs.correlation_id {
-                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
                 *corr_absorbed.entry(corr.clone()).or_insert(0) += 1;
             }
         } else {
+            // SHOWN, NOT SCORED. A candidate that calls something the recording
+            // never held has ADDED a call, and adding one is what a change is —
+            // it is not evidence that anything which WAS there behaves
+            // differently. The verdict is a statement about the matched set: of
+            // the calls the recording holds, did the args and the results still
+            // agree. An insertion says nothing about that set, so it is counted
+            // and named on the scorecard and charged to nothing.
+            //
+            // What this deliberately gives up: a novel WRITE is an effect the
+            // baseline never produced, and after this it no longer fails a
+            // correlation on its own. That is a real gap, and the fix for it is
+            // to classify by the declared `OperationKind` already on the event —
+            // not to keep failing every novel read to catch it.
             stats.bump_kind("NovelCall");
-            blocking_side_effect += 1;
-            if let Some(corr) = &obs.correlation_id {
-                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
-            }
         }
     }
 
@@ -4781,8 +4817,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     if omitted_calls > 0 {
         reasons.push(format!("{omitted_calls} omitted side-effect call(s)"));
     }
+    // Reported, non-blocking. A novel call is one the candidate ADDED, and the
+    // verdict is a statement about the calls the recording holds — whether each
+    // still happened, with the same args, to the same result. Adding a call is
+    // what a change IS, so failing on it fails every candidate that does the
+    // thing it was written to do, and a verdict that cries wolf on every real PR
+    // stops being read.
     if novel_calls > 0 {
-        reasons.push(format!("{novel_calls} novel side-effect call(s)"));
+        reasons.push(format!(
+            "{novel_calls} novel side-effect call(s) (non-blocking)"
+        ));
     }
     if value_divergences > 0 {
         // The total-derivative catch: a real-boundary value diff flips the
@@ -4862,6 +4906,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // only "reasons" are those still avoids a blocking failure (race becomes an
     // explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
+        - usize::from(novel_calls > 0)
         - usize::from(inconclusive_seed_gaps > 0)
         - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
@@ -8448,13 +8493,18 @@ mod tests {
             ],
             vec![http("c1", true, vec![])],
         ));
-        assert_eq!(card.summary.novel_calls, 1, "the correlated one blocks");
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the correlated one is named under the blocking-class name"
+        );
         assert_eq!(card.summary.novel_calls_tolerated, 1);
         assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
         assert_eq!(kind_count(&card, "redis", "NovelCallTolerated"), 1);
         assert_eq!(
-            card.summary.side_effect_divergences, 1,
-            "background work does not fail a candidate"
+            card.summary.side_effect_divergences, 0,
+            "neither one fails a candidate now — but they stay NAMED APART, which \
+             is what this test guards: a reader must still be able to tell an \
+             addition inside the request from background work nobody owns"
         );
     }
 
@@ -8506,6 +8556,18 @@ mod tests {
             c1.absorbed_misses, 1,
             "the correlation must carry how much of it ran on supplied values"
         );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and it must not be CHARGED: an absorbed miss is an added call the \
+             process survived, so it cannot cost more than an unabsorbed one, \
+             which costs nothing. What it costs is confidence, and that is \
+             carried by absorbed_misses rather than by this counter"
+        );
+        assert!(
+            c1.passed,
+            "the response matched and every recorded call resolved: {}",
+            card.verdict.reason
+        );
         assert!(
             card.verdict.reason.contains("absorbed miss"),
             "and the verdict must SAY so rather than leaving it to a breakdown \
@@ -8553,15 +8615,37 @@ mod tests {
         assert_eq!(card.summary.absorbed_misses, 0);
     }
 
+    /// A novel call is REPORTED and does not fail the run.
+    ///
+    /// The http diff is the point of the fixture, not decoration. The previous
+    /// version of this test passed no diff at all, so the correlation had nothing
+    /// to compare and `pass` was already false before the novel call was
+    /// considered — it asserted the old policy without being able to observe it,
+    /// and it went on passing when the policy was reversed. With a clean response
+    /// in hand, `pass` answers the question actually being asked: the candidate
+    /// reproduced everything the recording held and added one call on top.
     #[test]
-    fn novel_call_fails() {
+    fn a_novel_call_is_reported_and_does_not_fail_the_run() {
         let card = detect(&art(
             vec![],
             vec![obs("redis", Some("c1"), false, None, None)],
-            vec![],
+            vec![http("c1", true, vec![])],
         ));
-        assert!(!card.verdict.pass);
-        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the addition must still be shown"
+        );
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and charged to nothing"
+        );
+        assert!(
+            card.verdict.pass,
+            "an added call is not evidence that anything which WAS recorded \
+             behaves differently: {}",
+            card.verdict.reason
+        );
     }
 
     #[test]
@@ -9631,10 +9715,19 @@ mod tests {
         );
         assert_eq!(
             card.summary.novel_calls, 1,
-            "the tail call stays a BLOCKING novel call"
+            "the tail call stays an ordinary novel call — it is not excused into \
+             the inconclusive class"
         );
-        assert_eq!(card.summary.side_effect_divergences, 1);
-        assert!(!card.verdict.pass);
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "the novel call itself charges nothing; the RESPONSE is what fails \
+             this correlation, which is the guard's whole point"
+        );
+        assert!(
+            !card.verdict.pass,
+            "the status diverged, so the candidate failed on the thing that is \
+             actually compared"
+        );
         assert!(
             !card.verdict.inconclusive,
             "a diverged response is a real fail, not an unjudged run"
@@ -9668,20 +9761,42 @@ mod tests {
 
     /// The condition that does the real work. "The recording ends at a teardown
     /// marker" is very nearly universal — in the measured main-app run it held
-    /// for 71 of 77 correlations — so it cannot be what selects a tail gap. That
-    /// same run carried 16 BLOCKING novel `update_payment_intent` calls inside
-    /// HTTP-clean, teardown-ending correlations, mid-request. Only their
-    /// POSITION keeps them blocking, and it must.
+    /// for 71 of 77 correlations — so it cannot be what selects a tail gap. What
+    /// selects one is POSITION: the call comes after the correlation's last
+    /// recorded event was already reproduced.
+    ///
+    /// That distinction still decides the verdict, and now decides MORE than it
+    /// used to. A tail gap means the run cannot judge the correlation, so it is
+    /// `inconclusive` and cannot pass. A mid-request novel call is an ADDITION to
+    /// a correlation the run judged fine, so it is reported and the correlation
+    /// passes on its matched calls and its identical response. Before, both
+    /// failed and only the reason differed; the position test now has to be right
+    /// or a correlation flips between pass and inconclusive.
     #[test]
-    fn a_novel_call_before_the_teardown_marker_stays_blocking() {
+    fn a_novel_call_before_the_teardown_marker_is_not_a_tail_gap() {
         let card = detect(&tail_gap_art(true, vec![], false));
         assert_eq!(
             card.summary.inconclusive_tail_gaps, 0,
             "mid-request work has a recorded baseline region; it is not a tail"
         );
-        assert_eq!(card.summary.novel_calls, 1);
-        assert_eq!(card.summary.side_effect_divergences, 1);
-        assert!(!card.verdict.pass);
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "it is still a novel call, and still reported as one"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "an added call is not a divergence of the calls the recording holds"
+        );
+        assert!(
+            card.verdict.pass,
+            "the response matched and every recorded call was reproduced; an \
+             extra call on top of that is not a regression: {}",
+            card.verdict.reason
+        );
+        assert!(
+            !card.verdict.inconclusive,
+            "the run judged this correlation; nothing about it was unjudgeable"
+        );
         assert!(
             card.counter_disagreements().is_empty(),
             "{:?}",
@@ -9727,7 +9842,16 @@ mod tests {
         let card = detect(&a);
         assert_eq!(card.summary.inconclusive_tail_gaps, 0);
         assert_eq!(card.summary.novel_calls, 1);
-        assert!(!card.verdict.pass);
+        // The claim under test is that this is an ORDINARY novel call and not an
+        // unrecorded tail. Novel calls no longer fail a verdict, so assert the
+        // classification that decides it: a tail gap would force `inconclusive`,
+        // and this must not.
+        assert!(
+            !card.verdict.inconclusive,
+            "the strict reading is an ordinary novel call, so the run stays judged \
+             rather than being excused as an unrecorded tail: {}",
+            card.verdict.reason
+        );
     }
 
     /// A correlation running to the very end of the tape is left BLOCKING. The
@@ -9749,7 +9873,16 @@ mod tests {
         let card = detect(&a);
         assert_eq!(card.summary.inconclusive_tail_gaps, 0);
         assert_eq!(card.summary.novel_calls, 1);
-        assert!(!card.verdict.pass);
+        // The claim under test is that this is an ORDINARY novel call and not an
+        // unrecorded tail. Novel calls no longer fail a verdict, so assert the
+        // classification that decides it: a tail gap would force `inconclusive`,
+        // and this must not.
+        assert!(
+            !card.verdict.inconclusive,
+            "the strict reading is an ordinary novel call, so the run stays judged \
+             rather than being excused as an unrecorded tail: {}",
+            card.verdict.reason
+        );
     }
 
     /// The tail begins where the recording ended, so the candidate has to have
@@ -9799,7 +9932,7 @@ mod tests {
     /// peek set seed_gap=true for this case, so the tally swallowed it as a
     /// non-blocking InconclusiveSeedGap (verdict PASS, catch masked).
     #[test]
-    fn novel_execute_call_without_seed_gap_is_a_blocking_novel() {
+    fn novel_execute_call_without_seed_gap_is_a_novel_call_not_a_seed_gap() {
         // Build the observation exactly as the FIXED execute-shadow path emits it:
         // Shadow provenance, no baseline, resolved=false, seed_gap=false.
         let mut o = exec_obs(
@@ -9818,10 +9951,21 @@ mod tests {
         ));
         assert_eq!(card.summary.inconclusive_seed_gaps, 0, "not a seed gap");
         assert_eq!(card.summary.novel_calls, 1, "novel call is a NovelCall");
+        // The catch this guards is the CLASSIFICATION, which is what #28 broke:
+        // the peek flagged seed_gap, the tally swallowed the extra call as an
+        // InconclusiveSeedGap, and the extra-call catch was masked. Novel calls no
+        // longer fail a verdict, so `!pass` can no longer stand in for "classified
+        // correctly" — assert the two classes directly instead, which is what the
+        // regression was ever about.
         assert!(
-            !card.verdict.pass,
-            "a novel Execute call with no recording must FAIL the verdict (blocking): {}",
+            !card.verdict.inconclusive,
+            "a novel Execute call must not be excused into the unjudged class: {}",
             card.verdict.reason
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "NovelCall"),
+            1,
+            "and it must be named under its own class, not another"
         );
     }
 
@@ -11149,7 +11293,10 @@ mod tests {
         assert_eq!(card.summary.matched_side_effect_calls, 2);
         assert_eq!(card.summary.omitted_calls, 2);
         assert_eq!(card.summary.novel_calls, 1);
-        assert_eq!(card.summary.side_effect_divergences, 3);
+        // Two omitted calls charge; the novel subtree is reported and charges
+        // nothing, so the weighted accounting the two tiers keep independent is
+        // over the omissions alone.
+        assert_eq!(card.summary.side_effect_divergences, 2);
         assert!(card.counter_disagreements().is_empty());
         let rows = build_ledger(&artifacts).expect("mixed-tier ledger builds");
         assert_eq!(
@@ -11530,6 +11677,37 @@ mod tests {
                 + card.summary.side_effect_divergences
         }
 
+        /// The sibling of [`assert_one_blocking`] for a class that is REPORTED
+        /// and not scored.
+        ///
+        /// Sensitivity is still the point: the detector must NOTICE the injected
+        /// call and name its class, or a mutation that blinded it would go
+        /// unseen. What changed is only the consequence — so this asserts the
+        /// naming exactly as strictly, and pins the non-consequence as well, which
+        /// `assert_one_blocking` could not do.
+        fn assert_one_reported_not_scored(
+            card: &Scorecard,
+            boundary: &str,
+            kind: &str,
+            protected_signal: &str,
+        ) {
+            assert_eq!(
+                kind_count(card, boundary, kind),
+                1,
+                "{protected_signal}: the scorer must name the expected {kind} class"
+            );
+            assert_eq!(
+                blocking_divergences(card),
+                0,
+                "{protected_signal}: a reported-not-scored class must charge nothing"
+            );
+            assert!(
+                card.verdict.pass,
+                "{protected_signal}: it must not fail the verdict either: {}",
+                card.verdict.reason
+            );
+        }
+
         fn assert_one_blocking(
             card: &Scorecard,
             boundary: &str,
@@ -11733,7 +11911,7 @@ mod tests {
                 vec![http(corr, true, vec![])],
             ));
 
-            assert_one_blocking(
+            assert_one_reported_not_scored(
                 &card,
                 "redis",
                 "NovelCall",
