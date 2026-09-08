@@ -318,6 +318,17 @@ impl<T: KubeTransport> KubeApi<T> {
 /// `Some(true)` on complete, `Some(false)` on failed, `None` while still
 /// running. Reads the standard `conditions[].type in {Complete, Failed}` with
 /// `status == "True"`, falling back to the `succeeded`/`failed` counts.
+/// The Job's own `activeDeadlineSeconds`, in seconds.
+///
+/// This is the AUTHORITATIVE timeout for a replay: kubernetes stops the Job at
+/// it and marks the Job Failed with reason DeadlineExceeded. A watcher that
+/// gives up earlier reports a run as failed while its pod is healthy and still
+/// working, which is a strictly worse failure than a timeout because nothing
+/// about the cluster looks wrong.
+pub fn job_active_deadline_secs(job: &Value) -> Option<u64> {
+    job.get("spec")?.get("activeDeadlineSeconds")?.as_u64()
+}
+
 pub fn job_terminal_verdict(job: &Value) -> Option<bool> {
     let status = job.get("status")?;
     if let Some(conds) = status.get("conditions").and_then(Value::as_array) {
