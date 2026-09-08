@@ -961,6 +961,28 @@ async fn v1_available_recordings(
                 }
                 deja_orchestrator::RecordingIdentity::Opaque => serde_json::Value::Null,
             };
+            // An id that names no revision is not the same as a recording whose
+            // revision is unknown. The envelopes carry `code.sha`, the seal
+            // already collected it, and this endpoint already holds the
+            // manifest for the row — so report it rather than making every
+            // reader open the tape to find out. Purely additive: it fills a
+            // field that was null, and never overrides what an id did say,
+            // because the two spell a sha at different lengths and reconciling
+            // them is a separate question from filling a gap.
+            let described = match (described, manifest.and_then(manifest_revision)) {
+                (serde_json::Value::Null, Some(revision)) => serde_json::json!({
+                    "revision": revision,
+                    "revision_source": "manifest",
+                }),
+                (serde_json::Value::Object(mut o), Some(revision))
+                    if !o.contains_key("revision") =>
+                {
+                    o.insert("revision".into(), revision.into());
+                    o.insert("revision_source".into(), "manifest".into());
+                    serde_json::Value::Object(o)
+                }
+                (other, _) => other,
+            };
             serde_json::json!({
                 "recording_id": r.session_id,
                 "dates": r.dates,
@@ -1051,6 +1073,32 @@ async fn v1_available_recordings(
 /// name `sbx-hyperswitch-server`. A substring test — which is what the
 /// neighbouring `instance_pattern` does, for a different question — admits
 /// precisely the pods this one exists to exclude.
+/// The revision a sealed recording's ENVELOPES claim, when they claim exactly
+/// one.
+///
+/// The manifest's `code` is the distinct code identities seen across the
+/// session's envelopes, which is where the revision authoritatively lives —
+/// `parse_recording_id`'s own documentation says so: "An id is a convenience,
+/// and the recording's envelopes carry the same facts authoritatively."
+///
+/// Zero or several read as UNKNOWN rather than as a pick. A recording whose
+/// envelopes disagree about which code produced them has no single revision,
+/// and naming one of them would be a confident lie in exactly the case where a
+/// caller most needs to know it cannot compare a candidate to this tape.
+fn manifest_revision(manifest: &deja_compactor::SessionManifest) -> Option<String> {
+    let distinct: std::collections::BTreeSet<&str> = manifest
+        .code
+        .iter()
+        .filter_map(|c| c.sha.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    match distinct.len() {
+        1 => distinct.into_iter().next().map(str::to_owned),
+        _ => None,
+    }
+}
+
 fn from_main_deployment(r: &deja_compactor::LandedRecording, prefix: &str) -> bool {
     !r.instances.is_empty() && r.instances.iter().all(|i| i.starts_with(prefix))
 }
@@ -2425,6 +2473,87 @@ mod tests {
             assert!(reason.starts_with(base), "state {state:?}: {reason}");
         }
     }
+    // ---- identity: the revision the envelopes claim ----
+
+    fn manifest_with_codes(shas: &[Option<&str>]) -> deja_compactor::SessionManifest {
+        let code: Vec<serde_json::Value> = shas
+            .iter()
+            .map(|s| serde_json::json!({ "sha": s, "deja_version": null }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "session_id": "s",
+            "status": "sealed",
+            "capture_mode": "session",
+            "envelope_schema_versions": [1],
+            "event_schema_versions": [1],
+            "code": code,
+            "instances": [],
+            "counts": {
+                "landing_objects": 1, "lines_in": 1, "events": 1,
+                "duplicates_dropped": 0, "correlations": 1
+            },
+            "data_parts": [],
+            "created_unix_ms": 0
+        }))
+        .unwrap()
+    }
+
+    /// The gap this closes: a recording whose ID names no revision still has one
+    /// in its envelopes, and the seal already collected it.
+    #[test]
+    fn a_single_envelope_sha_is_the_recordings_revision() {
+        let m = manifest_with_codes(&[Some("4157177")]);
+        assert_eq!(super::manifest_revision(&m).as_deref(), Some("4157177"));
+    }
+
+    /// Several entries naming the SAME sha is one revision, not an ambiguity —
+    /// the manifest holds one entry per distinct code identity, but nothing
+    /// stops a repeat, and collapsing to a set is what makes that harmless.
+    #[test]
+    fn repeated_entries_naming_one_sha_are_not_ambiguous() {
+        let m = manifest_with_codes(&[Some("4157177"), Some("4157177")]);
+        assert_eq!(super::manifest_revision(&m).as_deref(), Some("4157177"));
+    }
+
+    /// Two different shas means the recording spans revisions, so it has no
+    /// single one. Picking either would be a confident lie in exactly the case
+    /// where a caller most needs to know it cannot compare a candidate to this
+    /// tape.
+    #[test]
+    fn two_envelope_shas_read_as_unknown_not_as_a_pick() {
+        let m = manifest_with_codes(&[Some("4157177"), Some("72b65cb")]);
+
+        // The precondition: both really are present, so this is testing the
+        // ambiguity rule and not an empty collection.
+        assert_eq!(m.code.len(), 2, "precondition: two code identities");
+
+        assert_eq!(super::manifest_revision(&m), None);
+    }
+
+    /// Absent and blank both mean "not stated". A blank would otherwise become
+    /// a revision that renders as an empty string and compares equal to
+    /// nothing, which is worse than reporting none.
+    #[test]
+    fn absent_or_blank_shas_are_not_a_revision() {
+        assert_eq!(super::manifest_revision(&manifest_with_codes(&[])), None);
+        assert_eq!(
+            super::manifest_revision(&manifest_with_codes(&[None])),
+            None
+        );
+        assert_eq!(
+            super::manifest_revision(&manifest_with_codes(&[Some("   ")])),
+            None
+        );
+        // ...and a blank alongside a real one does not make the real one
+        // ambiguous.
+        assert_eq!(
+            super::manifest_revision(&manifest_with_codes(&[Some("  "), Some("4157177")]))
+                .as_deref(),
+            Some("4157177")
+        );
+    }
+
     // ---- recording selection: order, and which pods count ----
 
     fn landed(session_id: &str, date: &str, instances: &[&str]) -> deja_compactor::LandedRecording {
