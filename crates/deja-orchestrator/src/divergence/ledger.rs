@@ -101,10 +101,16 @@ pub struct CallRecord {
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | novel | inconclusive_tail_gap | omitted |
-    /// environmental | deterministic |
+    /// matched | recovered | novel | novel_absorbed | inconclusive_seed_gap |
+    /// inconclusive_tail_gap | omitted | environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
     /// identity_skew | pruned_subtree | novel_subtree
+    ///
+    /// Every kind the scorecard tolerates is non-blocking HERE too: this row is
+    /// what the viewer routes on, and the scorecard and the ledger are two
+    /// answers to one question. `identity_skew`, `novel_absorbed` and
+    /// `inconclusive_seed_gap` were once blocking here while charged to nothing
+    /// there, and the viewer showed the wrong answer.
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
@@ -394,11 +400,22 @@ pub(crate) fn build_with_inconclusive(
         } else if obs.correlation_id.is_none() {
             // uncorrelated background-task novel call — tolerated in V1
             ("novel", false)
+        } else if obs.seed_gap {
+            // No baseline for the container this call read, so nothing to be
+            // novel against. Mirrors the scorecard's `InconclusiveSeedGap`, in
+            // the scorecard's own precedence: seed gap before tail gap before
+            // an absorbed miss.
+            ("inconclusive_seed_gap", false)
         } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
             // The recording for this correlation stops at request teardown and
             // this call comes after it: no baseline, so neither matched nor
             // novel. Mirrors the scorecard's `InconclusiveTailGap`.
             ("inconclusive_tail_gap", false)
+        } else if obs.absorbed {
+            // A novel call the process survived on a declared `on_miss` value.
+            // Named apart from the unabsorbed novel calls and charged to
+            // nothing, as the scorecard's `NovelCallAbsorbed` is.
+            ("novel_absorbed", false)
         } else {
             ("novel", true)
         };
@@ -691,7 +708,12 @@ pub(crate) fn build_with_plan(
                     let mut observed = observed_side(call);
                     let (kind, blocking, origin) =
                         if matches!(outcome, NodeOutcome::IdentitySkew { .. }) {
-                            ("identity_skew".to_owned(), true, false)
+                            // Order, and only order: both sides made the call and
+                            // each resolved to its own recorded event; the two
+                            // pairing methods disagree about which goes with
+                            // which. The scorecard charges it to nothing, and so
+                            // does this row.
+                            ("identity_skew".to_owned(), false, false)
                         } else if computed_divergence == Some(true) {
                             let schema_default =
                                 observed_schema_default_divergence(call, aligned_event);

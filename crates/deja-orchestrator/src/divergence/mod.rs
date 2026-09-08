@@ -369,6 +369,16 @@ impl BoundaryStats {
         *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
         self.diverged += 1;
     }
+
+    /// Name a kind WITHOUT counting a divergence: for a call the same-multiset
+    /// rule says is not a difference — an order-only absorption, whose call is
+    /// matched and stays matched. Naming it through `bump_kind` counted one call
+    /// as both matched and diverged, so it read as a red divergence everywhere
+    /// `diverged` is summed while its name reached only the warnings.
+    /// `matched + diverged` over a boundary is the number of calls scored on it.
+    fn note_kind(&mut self, kind: &str) {
+        *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
+    }
 }
 
 /// How many calls across every boundary were classified `kind`.
@@ -4490,7 +4500,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
             if let Some(ValueVerdict::Absorbed(ValueAbsorption::Canon(source))) = verdict {
-                stats.bump_kind("ValueCanonAbsorbed");
+                stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
@@ -4669,7 +4679,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 obs.args.get("sql").and_then(serde_json::Value::as_str),
             );
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
-                stats.bump_kind("ValueCanonAbsorbed");
+                stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
@@ -4944,7 +4954,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
             }
             for (path, source) in body_classification.canon_absorbed {
-                stats.bump_kind("ReplyCanonAbsorbed");
+                stats.note_kind("ReplyCanonAbsorbed");
                 *canon_absorbed_seen
                     .entry((path, source.label()))
                     .or_insert(0) += 1;
