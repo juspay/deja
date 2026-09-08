@@ -183,16 +183,24 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
       c.blocking
     )
       // Agreement is an allow-list here too. Skipping every unrecognised kind
-      // kept blocking rows — pruned_subtree, novel_subtree, identity_skew — out
-      // of the findings list entirely, so a reader who trusted the list saw a
-      // clean run.
+      // kept rows the scorer emitted as blocking — pruned_subtree,
+      // novel_subtree, and at the time identity_skew — out of the findings
+      // list entirely, so a reader who trusted the list saw a clean run.
       //
-      // The findings list is for what counts against the verdict, so an
-      // unrecognised kind earns a place here by the scorer's own `blocking`
-      // flag rather than by a list of benign kinds kept in the viewer. Such a
-      // list would drift from the scorer the way the four-kind dispatch did.
-      // A non-blocking unrecognised kind is still marked and still navigable in
-      // the tree, and its panel names it — it is simply not called a finding.
+      // The named ranks above are placed by KIND, and two of them are not
+      // verdict items at all: `environmental` and `identity-skew` are the tail
+      // of RANKS, "what was never the candidate's fault" — non-blocking on the
+      // ledger since #124 made a skew order rather than a difference, and
+      // shown here on purpose, so a tolerated skew is visible where a reader
+      // judges the run instead of hidden by its own tolerance. Their labels and
+      // panels say they do not count.
+      //
+      // Only an UNRECOGNISED kind earns a place here by the scorer's own
+      // `blocking` flag rather than by a list of benign kinds kept in the
+      // viewer. Such a list would drift from the scorer the way the four-kind
+      // dispatch did. A non-blocking unrecognised kind is still marked and
+      // still navigable in the tree, and its panel names it — it is simply not
+      // called a finding.
       rank = "unknown";
     if (!rank) continue; // matched / recovered / deterministic are not findings
     // Anchor on the side that owns the evidence: the recording for a call the
