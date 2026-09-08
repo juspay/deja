@@ -99,7 +99,15 @@ function RunHeader({ run }: { run: RunRow }) {
 
 /* -------------------------------------------------------------- findings --- */
 
-type FindingRank = "origin" | "consequence" | "http" | "omitted" | "novel" | "environmental";
+type FindingRank =
+  | "origin"
+  | "consequence"
+  | "http"
+  | "omitted"
+  | "novel"
+  | "environmental"
+  | "identity-skew"
+  | "unknown";
 
 type Finding = {
   rank: FindingRank;
@@ -121,7 +129,16 @@ type Finding = {
 // The order a reader should meet them: what changed, what that changed, what the
 // caller saw, then what did not happen, then what was never the candidate's
 // fault. The last two are consequences of the first, not independent findings.
-const RANKS: FindingRank[] = ["origin", "consequence", "http", "omitted", "novel", "environmental"];
+const RANKS: FindingRank[] = [
+  "origin",
+  "consequence",
+  "http",
+  "omitted",
+  "novel",
+  "environmental",
+  "identity-skew",
+  "unknown",
+];
 
 const RANK_BLURB: Record<FindingRank, string> = {
   origin:
@@ -133,6 +150,10 @@ const RANK_BLURB: Record<FindingRank, string> = {
   novel: "the candidate made a call the recording did not",
   environmental:
     "an environment miss, not a candidate change (egress is blocked in the replay sandbox)",
+  "identity-skew":
+    "both sides made the call but disagree on which recorded call it is: the served event and the structurally aligned one differ, so the address is ambiguous",
+  unknown:
+    "a kind the scorer emits and this dashboard has no panel for — unreviewed, not agreement",
 };
 
 function leafOf(path?: string): string {
@@ -151,9 +172,28 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
   for (const c of calls) {
     let rank: FindingRank | null = null;
     if (c.kind === "value_diverged") rank = c.origin ? "origin" : "consequence";
-    else if (c.kind === "omitted") rank = "omitted";
-    else if (c.kind === "novel") rank = "novel";
+    else if (c.kind === "omitted" || c.kind === "pruned_subtree") rank = "omitted";
+    else if (c.kind === "novel" || c.kind === "novel_subtree") rank = "novel";
     else if (c.kind === "environmental") rank = "environmental";
+    else if (c.kind === "identity_skew") rank = "identity-skew";
+    else if (
+      c.kind !== "matched" &&
+      c.kind !== "recovered" &&
+      c.kind !== "deterministic" &&
+      c.blocking
+    )
+      // Agreement is an allow-list here too. Skipping every unrecognised kind
+      // kept blocking rows — pruned_subtree, novel_subtree, identity_skew — out
+      // of the findings list entirely, so a reader who trusted the list saw a
+      // clean run.
+      //
+      // The findings list is for what counts against the verdict, so an
+      // unrecognised kind earns a place here by the scorer's own `blocking`
+      // flag rather than by a list of benign kinds kept in the viewer. Such a
+      // list would drift from the scorer the way the four-kind dispatch did.
+      // A non-blocking unrecognised kind is still marked and still navigable in
+      // the tree, and its panel names it — it is simply not called a finding.
+      rank = "unknown";
     if (!rank) continue; // matched / recovered / deterministic are not findings
     // Anchor on the side that owns the evidence: the recording for a call the
     // candidate did not make, the candidate for one the recording did not. The

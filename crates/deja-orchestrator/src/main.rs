@@ -691,22 +691,12 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// resolves.
 fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
     // Naming nothing means the default system, and the default system resolves
-    // through the same registry as every other — declared, not special. There
-    // is no fallback to the orchestrator's own bucket: a system that has not
-    // declared where its recordings are cannot be scanned for them.
-    let system = system.unwrap_or_else(|| deja_orchestrator::default_system());
-    let profile = deja_orchestrator::system::system_config(system);
-    let bucket = profile
-        .s3_bucket
-        .ok_or_else(|| {
-            format!(
-                "system '{system}' has no recording bucket declared: set systems.{system}.s3_bucket in the deja configuration"
-            )
-        })?;
-    let root = profile
-        .recording_root
-        .unwrap_or_else(|| "landing/v1".to_owned());
-    Ok((bucket, root))
+    // through the same registry as every other — declared, not special.
+    // Delegates so that this endpoint, the correlation endpoint and the replay
+    // pull path cannot disagree about where a recording is.
+    deja_orchestrator::system::recording_scope(
+        system.unwrap_or_else(|| deja_orchestrator::default_system()),
+    )
 }
 
 /// `GET /api/v1/recordings/available` — what is in the bucket, newest first.
@@ -759,6 +749,10 @@ async fn v1_systems() -> Response {
                 "candidate_image_repo": s.candidate_image_repo,
                 "instance_pattern": s.instance_pattern,
                 "scored_span_namespaces": s.scored_span_namespaces,
+                // Reported so a deployment can see the canon the scorer will
+                // apply, rather than inferring it from a verdict that stopped
+                // blocking.
+                "reply_canons": s.reply_canons,
                 // The five variable names a candidate reads, as derived from
                 // the declared prefix (or overridden per slot). Exposed so the
                 // derivation is observable on a deployment, not only asserted
@@ -820,11 +814,53 @@ async fn v1_available_recordings(
     let total = found.len();
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let page: Vec<serde_json::Value> = found
+    let page_rows: Vec<deja_compactor::LandedRecording> =
+        found.into_iter().skip(offset).take(limit).collect();
+
+    // What each recording HOLDS, for the rows actually being returned.
+    //
+    // Until now this endpoint could offer only `objects` — a count of S3 objects
+    // — and every caller choosing a recording had to guess from it whether the
+    // tape was worth replaying. It is a bad proxy in both directions: the
+    // recording that broke five PR replays was picked because it was in the
+    // pulled catalog, and a two-object tape in this very bucket holds twelve
+    // correlations. `correlations` is the number the choice actually wants — how
+    // many recorded test cases are in there — and the seal already knows it, so
+    // reporting it costs one small GET per row and never touches a data part.
+    //
+    // How many of them are DRIVABLE is a further question, and deliberately not
+    // answered here: it depends on the recorded system's ingress convention,
+    // which this endpoint does not know. The correlation index carries the
+    // per-correlation boundaries a caller needs to decide it (see
+    // `CorrelationSummary::boundaries`); a count on this row would have to pick a
+    // convention and would be wrong for every system that does not share it.
+    //
+    // Enrichment, not a precondition: a recording that is not sealed keeps every
+    // field it had, and reports its seal facts as null rather than as zero. Zero
+    // correlations and "not counted yet" are different answers, and a picker that
+    // rendered the second as the first would hide good recordings as empty ones.
+    let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
+    // The SCANNED bucket, not the deployment's default. The rows above came from
+    // whichever bucket `scan_scope` resolved for the named system, so reading
+    // their manifests from `from_env()` would look for a prism recording's seal
+    // in hyperswitch-art — finding nothing, and reporting every prism row as
+    // unsealed with null counts. That failure is silent: "not sealed" is a valid
+    // answer, so nothing downstream could tell it from the truth.
+    let mut cfg_for_manifests = deja_orchestrator::s3::S3Config::from_env();
+    cfg_for_manifests.bucket = scan_bucket.clone();
+    let manifests = tokio::task::spawn_blocking(move || {
+        deja_compactor::read_manifests(&cfg_for_manifests, &ids)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+
+    let page: Vec<serde_json::Value> = page_rows
         .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
+            let manifest = manifests.get(i).and_then(Option::as_ref);
             // The id's provenance is parsed HERE, not by the client: a
             // recording made before ids carried a revision reports none, and
             // that difference should be one field rather than every reader
@@ -900,6 +936,27 @@ async fn v1_available_recordings(
                 // The prefix the orchestrator would ingest from. Reported so a
                 // run can be reproduced by hand, not so a caller has to supply it.
                 "prefix": r.prefix,
+                // Seal facts. Null, never zero, when the recording is unsealed.
+                "sealed": manifest.is_some(),
+                "correlations": manifest.map(|m| m.counts.correlations),
+                "events": manifest.map(|m| m.counts.events),
+                // `sealed_instances`, not `instances`, and the prefix is load
+                // bearing: the LISTING also reports instances — the `inst=` pod
+                // names it can read straight off the keys — and that is a
+                // different fact from this one, which is how many producers the
+                // SEAL recorded per-instance coverage for. Both are worth having
+                // and they can disagree (a pod that wrote objects the seal has
+                // not covered yet). Sharing the key would not fail: `json!` keeps
+                // the last of two identical keys, so one of the two facts would
+                // vanish silently and readers would get a list or a number
+                // depending on which line came last.
+                "sealed_instances": manifest.map(|m| m.instances.len()),
+                // Capture gaps: `global_sequence` ranges the recorder allocated
+                // whose events never reached the tape. Already computed at seal
+                // time and, until now, surfaced nowhere — it is the evidence the
+                // tail-truncation work was reconstructing from ledger sequence
+                // numbers by hand.
+                "gaps": manifest.map(|m| m.instances.iter().map(|i| i.gaps.len()).sum::<usize>()),
             })
         })
         .collect();
@@ -934,6 +991,12 @@ struct AvailableQuery {
 /// one as a recording with zero correlations, i.e. as nothing worth running.
 enum RecordingCorrelations {
     Sealed(Vec<deja_orchestrator::s3::CorrelationSummary>),
+    /// Sealed, but the index sidecar is absent — a seal written before it
+    /// existed. The manifest still knows how many correlations it covered, so
+    /// the count is answerable even though the rows are not.
+    SealedWithoutIndex {
+        correlations: usize,
+    },
     /// In the landing area, not yet compacted into a sealed session.
     Landing {
         prefix: String,
@@ -947,6 +1010,10 @@ struct CorrelationsQuery {
     offset: Option<usize>,
     /// Case-insensitive substring match on the correlation id.
     q: Option<String>,
+    /// Which system's recordings to look in. Absent means the default system,
+    /// exactly as it does on `/recordings/available` — the two endpoints answer
+    /// questions about the same recording and must resolve it the same way.
+    system: Option<String>,
 }
 
 /// `GET /api/v1/recordings/{id}/correlations` — the recorded test cases in a
@@ -971,23 +1038,49 @@ async fn v1_recording_correlations(
     if id.trim().is_empty() {
         return error_resp(400, "recording id is required");
     }
-    let cfg = deja_orchestrator::s3::S3Config::from_env();
+    // Resolved through the same `scan_scope` as the listing, so this endpoint
+    // and the one that offered the recording agree on where it is — and scoped
+    // to the system the caller named, so a recording the listing reported in
+    // another system's bucket is readable here rather than answering "is not in
+    // s3://<default>/landing/v1" about a recording that exists.
+    let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+    let root = match scan_scope(q.system.as_deref().filter(|s| !s.trim().is_empty())) {
+        Ok((bucket, root)) => {
+            cfg.bucket = bucket;
+            root
+        }
+        Err(message) => return error_resp(400, &format!("{message} (reading correlations)")),
+    };
     let bucket = cfg.bucket.clone();
-    let root = std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
     let scanned = root.clone();
     let wanted = id.clone();
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
-        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
-            Some(rows) => Ok(RecordingCorrelations::Sealed(rows)),
-            // Not sealed. Whether that means "not ingested yet" or "no such
-            // recording" is a question only the landing area can answer, and
-            // they must not come back as the same thing.
-            None => Ok(
-                match deja_compactor::locate_landing_prefix(&cfg, &wanted, &scanned)? {
+        use deja_compactor::CorrelationIndex;
+        let landing = |cfg: &_| -> Result<RecordingCorrelations, String> {
+            Ok(
+                match deja_compactor::locate_landing_prefix(cfg, &wanted, &scanned)? {
                     Some(prefix) => RecordingCorrelations::Landing { prefix },
                     None => RecordingCorrelations::Unknown,
                 },
-            ),
+            )
+        };
+        match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
+            CorrelationIndex::Rows(rows) => Ok(RecordingCorrelations::Sealed(rows)),
+            // Sealed before the index sidecar existed. The recording is real and
+            // the landing area can still say what is in it, so this reads it
+            // from there rather than failing — a missing index is a fact about
+            // the seal, not about the recording.
+            // NOT the landing fallback: we can prove this recording was sealed,
+            // so answering "unknown" when its landing objects have since been
+            // cleaned up would deny a recording we hold the manifest for. The
+            // count is what the manifest knows; the rows are what it lost.
+            CorrelationIndex::SealedWithoutIndex { correlations } => {
+                Ok(RecordingCorrelations::SealedWithoutIndex { correlations })
+            }
+            // Not sealed. Whether that means "not ingested yet" or "no such
+            // recording" is a question only the landing area can answer, and
+            // they must not come back as the same thing.
+            CorrelationIndex::NotSealed => landing(&cfg),
         }
     })
     .await
@@ -1070,6 +1163,23 @@ async fn v1_recording_correlations(
                            knowable without ingesting it, which the first replay run of it does",
             }))
         }
+        // 200, not an error: the recording exists and its size is known. A
+        // caller gets the count it would have summed from the rows, and an
+        // explicit note that the rows themselves are not available — rather
+        // than a 502 about a healthy recording.
+        RecordingCorrelations::SealedWithoutIndex { correlations } => json_ok(serde_json::json!({
+            "recording_id": id,
+            "status": "sealed_without_index",
+            // The manifest's own count. Answerable even though the rows are
+            // not — and NOT zero, which would report a recording we can prove
+            // was sealed as one holding nothing.
+            "total": correlations,
+            "matched": serde_json::Value::Null,
+            "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+            "cases": Vec::<serde_json::Value>::new(),
+            "note": "sealed before the correlation index existed: the manifest knows how many \
+                     correlations the seal covered but not which",
+        })),
         RecordingCorrelations::Unknown => error_resp(
             404,
             &format!("recording {id} is not in s3://{bucket}/{root}"),
@@ -1206,8 +1316,92 @@ async fn v1_scorecard(State(st): State<AppState>, Path(id): Path<String>) -> Res
         }
     }
     match divergence::scorecard(&st.root, &id) {
-        Ok(card) => json_ok(serde_json::to_value(&card).unwrap_or_default()),
+        Ok(mut card) => {
+            // An empty scorecard has three possible causes and they are not the
+            // same news. The scorer can only report that nothing arrived; which
+            // cause applies is a fact about the RUN, and this is the one place
+            // that holds both.
+            if card.verdict.reason == divergence::NO_ARTIFACTS_REASON {
+                let (state, failure) = run_disposition(&st, &id).await;
+                card.verdict.reason = empty_scorecard_reason(state.as_deref(), failure.as_deref());
+            }
+            json_ok(serde_json::to_value(&card).unwrap_or_default())
+        }
         Err(e) => error_resp(500, &format!("scorecard: {e}")),
+    }
+}
+
+/// The run's state and failure message, preferring the STORE row.
+///
+/// Order matters and is not arbitrary. The file store is the worker's LIVE
+/// snapshot, and on the k8s path it is not where a terminal state lands:
+/// `StoreCtx` reports through Postgres or the ingest endpoint and never writes
+/// back to `run.json`. The run this was found on still said `resolving` on disk
+/// an hour after the row said `failed`, so reading the file first would state
+/// the opposite of the truth with full confidence. The file remains the
+/// fallback because a compose deployment has no store, and there it is the only
+/// record there is.
+async fn run_disposition(st: &AppState, id: &str) -> (Option<String>, Option<String>) {
+    if let Some(store) = &st.store {
+        if let Ok(Some(row)) = store.get_run(id).await {
+            let failure = row
+                .failure
+                .as_ref()
+                .and_then(|f| f.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            return (Some(row.state), failure);
+        }
+    }
+    match runs::get(&st.root, id) {
+        Ok(run) => (
+            serde_json::to_value(run.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned)),
+            run.failure_reason,
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// Why a scorecard that judged nothing is empty, said in the run's own terms.
+///
+/// [`divergence::detect`] is handed the artifacts and nothing else, so the most
+/// it can say is that none arrived. WHY none arrived is a property of the run,
+/// and the three answers are different news that must not arrive as one
+/// sentence:
+///
+///  - the run is still going, so artifacts may genuinely still appear;
+///  - the run is over and FAILED, so they never will — and the failure says why;
+///  - the run is over and COMPLETED yet ingested nothing, which is an anomaly in
+///    its own right and the loudest of the three, because a run that succeeded
+///    without comparing anything is a hole in the pipeline rather than a result.
+///
+/// The standing rule this serves: an empty result names which of its possible
+/// causes applies. This one previously named none of them, and said "yet" —
+/// which told a reader the artifacts were on their way for runs that had died
+/// an hour before.
+fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String {
+    let base = divergence::NO_ARTIFACTS_REASON;
+    match state {
+        Some("failed") => format!(
+            "{base}: the run FAILED before producing any — {}. Nothing was compared, so \
+             nothing here is evidence about the candidate",
+            failure.unwrap_or("no failure message was recorded against the run")
+        ),
+        Some("completed") => format!(
+            "{base}, yet the run reports COMPLETED — a run that finished without ingesting \
+             anything has not scored the candidate, and this scorecard must not be read as \
+             though it had"
+        ),
+        Some(other) => format!(
+            "{base}: the run is still {other}, so this is a snapshot of a run in progress \
+             rather than a verdict on it"
+        ),
+        None => format!(
+            "{base}, and the run itself could not be read — whether more are coming is \
+             therefore unknown, not \"not yet\""
+        ),
     }
 }
 
@@ -1550,6 +1744,91 @@ mod tests {
     /// the bucket the default system DECLARED. There is no fallback to the
     /// orchestrator's own bucket any more: a system that has not declared where
     /// its recordings are cannot be scanned for them, the default included.
+    /// The WIRING, not just the seam: proof the handler consults the system
+    /// resolver at all. An undeclared system can only produce a 400 through the
+    /// new resolution — before it, `?system=` was ignored entirely and the
+    /// request went on to S3 under the deployment's own bucket. Needs no S3,
+    /// because the refusal happens before any store is built.
+    #[test]
+    fn the_correlations_endpoint_refuses_an_undeclared_system() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let response = rt.block_on(v1_recording_correlations(
+            axum::extract::State(test_state(dir.path())),
+            axum::extract::Path("rec-whatever".to_owned()),
+            axum::extract::Query(CorrelationsQuery {
+                limit: None,
+                offset: None,
+                q: None,
+                system: Some("zzz".to_owned()),
+            }),
+        ));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "an undeclared system is refused, not scanned for in the default bucket"
+        );
+        let body = rt
+            .block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("systems.zzz") && body.contains("correlations"),
+            "the refusal names what to declare AND which endpoint refused: {body}"
+        );
+    }
+
+    /// Both recording endpoints answer questions about the same recording, so
+    /// they must resolve it the same way. `/recordings/available?system=prism`
+    /// reported a recording in `ucs-deja` while
+    /// `/recordings/{id}/correlations?system=prism` looked in the default
+    /// bucket and answered "is not in s3://hyperswitch-art/landing/v1" — a
+    /// recording that existed to one endpoint and not to its sibling.
+    ///
+    /// Values are the deployment's own, so this fails if the document changes
+    /// shape rather than passing against a plausible invention.
+    #[test]
+    fn both_recording_endpoints_resolve_a_system_the_same_way() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n\
+             [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
+             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+        );
+        let prism = scan_scope(Some("prism"));
+        let hyperswitch = scan_scope(Some("hyperswitch"));
+        let omitted = scan_scope(None);
+        let undeclared = scan_scope(Some("zzz"));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        assert_eq!(
+            prism.as_ref().map(|(b, _)| b.as_str()),
+            Ok("ucs-deja"),
+            "a prism recording is in prism's bucket, whichever endpoint asks"
+        );
+        assert_eq!(
+            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            Ok("hyperswitch-art")
+        );
+        assert_eq!(hyperswitch, omitted, "naming the default is omitting it");
+        let refusal = undeclared.expect_err("an undeclared system is refused");
+        assert!(
+            refusal.contains("declared") && refusal.contains("systems.zzz"),
+            "and the refusal names what to declare: {refusal}"
+        );
+    }
+
     #[test]
     fn naming_the_default_system_means_what_omitting_it_means() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1934,5 +2213,104 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    // -- an empty scorecard names WHICH of its causes applies -----------------
+    //
+    // The rule these serve is the repo's standing one: an empty result names
+    // which of its possible causes applies. A run that failed at step 1 of 6
+    // used to answer "no artifacts ingested for this run yet" — true about the
+    // artifacts, silent about the run, and the "yet" told the reader more were
+    // coming when the run had been dead for an hour.
+
+    /// THE SEAM. `detect` writes this reason and the scorecard endpoint matches
+    /// on it to decide whether to name the run's disposition. If the scorer's
+    /// wording drifts, the endpoint stops matching and the naming silently stops
+    /// happening — the exact producer/consumer split that keeps costing this
+    /// repo. Nothing else in the suite would notice, so this is the thing that
+    /// notices.
+    #[test]
+    fn the_scorer_emits_exactly_the_reason_the_endpoint_matches_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        // No artifacts of any kind: the `nothing` arm of `detect`.
+        let card = deja_orchestrator::divergence::scorecard(&root, "run-with-nothing").unwrap();
+        assert!(
+            card.verdict.inconclusive,
+            "an artifact-less run is not judgeable"
+        );
+        assert!(!card.verdict.pass, "and it certainly does not pass");
+        assert_eq!(
+            card.verdict.reason,
+            deja_orchestrator::divergence::NO_ARTIFACTS_REASON,
+            "the endpoint keys off this exact string; if the scorer's wording moved, \
+             `v1_scorecard` has silently stopped naming why runs are empty"
+        );
+    }
+
+    /// A run that FAILED says so, and carries the failure that explains it.
+    #[test]
+    fn a_failed_run_says_the_run_failed_and_why() {
+        let reason = empty_scorecard_reason(
+            Some("failed"),
+            Some("job did not reach a terminal state within the watch deadline"),
+        );
+        assert!(reason.contains("FAILED"), "{reason}");
+        assert!(
+            reason.contains("job did not reach a terminal state within the watch deadline"),
+            "the run's own failure is the answer to \"why is this empty\": {reason}"
+        );
+        // The precise regression: no claim that anything is still on its way.
+        assert!(
+            !reason.contains(" yet"),
+            "a finished run's scorecard must not imply artifacts are still coming: {reason}"
+        );
+    }
+
+    /// A failed run with no recorded message still says the run failed. The
+    /// missing message is named as missing rather than papered over with the
+    /// in-progress wording, which would be the wrong answer entirely.
+    #[test]
+    fn a_failed_run_without_a_message_still_says_it_failed() {
+        let reason = empty_scorecard_reason(Some("failed"), None);
+        assert!(reason.contains("FAILED"), "{reason}");
+        assert!(reason.contains("no failure message"), "{reason}");
+        assert!(!reason.contains(" yet"), "{reason}");
+    }
+
+    /// A run still in flight keeps the honest in-progress reading — this is the
+    /// one case where "more may arrive" is true, and it must not be lost to the
+    /// fix for the case where it is false.
+    #[test]
+    fn a_running_run_is_not_reported_as_finished() {
+        let reason = empty_scorecard_reason(Some("resolving"), None);
+        assert!(reason.contains("still resolving"), "{reason}");
+        assert!(!reason.contains("FAILED"), "{reason}");
+    }
+
+    /// COMPLETED with nothing ingested is the loudest of the three: the run did
+    /// not fail, so nothing else will flag it, and a reader skimming for red has
+    /// no other cue that the pipeline dropped the whole comparison.
+    #[test]
+    fn a_completed_run_that_ingested_nothing_is_called_out() {
+        let reason = empty_scorecard_reason(Some("completed"), None);
+        assert!(reason.contains("COMPLETED"), "{reason}");
+        assert!(reason.contains("has not scored the candidate"), "{reason}");
+    }
+
+    /// Every arm names a cause. A bare restatement of the base reason would be
+    /// the old behaviour wearing the new code's clothes, and this is what would
+    /// catch a future arm added without one.
+    #[test]
+    fn no_arm_leaves_the_cause_unnamed() {
+        let base = deja_orchestrator::divergence::NO_ARTIFACTS_REASON;
+        for state in [Some("failed"), Some("completed"), Some("running"), None] {
+            let reason = empty_scorecard_reason(state, None);
+            assert!(
+                reason.len() > base.len(),
+                "state {state:?} added nothing to the bare reason: {reason}"
+            );
+            assert!(reason.starts_with(base), "state {state:?}: {reason}");
+        }
     }
 }

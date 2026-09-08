@@ -64,6 +64,14 @@ pub use deja_runtime::DejaCorrelationLayer;
 pub use deja_runtime::DejaHook;
 /// Re-export the execution graph tracing layer for framework logger setup.
 pub use deja_runtime::ExecutionGraphLayer;
+/// What a boundary does when its `Substitute` lookup misses. The boundary macro
+/// emits `Absorb` for a site that declares `on_miss`, so the emitted observation
+/// records that the request survived the miss rather than being stopped by it.
+pub use deja_runtime::MissPolicy;
+/// What a `Substitute` boundary missed — the value a boundary's `on_miss`
+/// expression turns into the host's own error. Deja names the miss; the host
+/// decides which of its types can represent one.
+pub use deja_runtime::SubstituteMiss;
 /// Re-export the request-boundary fail-stop guard. A `Substitute` miss stops the
 /// request by panic-unwind (the only type-erased stop available for an arbitrary
 /// return type); actix has no per-request panic isolation, so without this guard
@@ -207,6 +215,13 @@ pub fn replay_search_path_sql_for(correlation: &str) -> String {
     )
 }
 
+/// Type-directed capture canonicalisation: a collection whose static Rust type
+/// says its order carries no information is recorded in a canonical order, so an
+/// order difference in a tape means somebody changed it. Lives in `deja-runtime`
+/// because macro-generated code names that crate directly; re-exported here
+/// because this facade is the surface a vendor writes against.
+pub use deja_runtime::canonical;
+
 /// Small JSON helpers shared by framework-specific boundary hooks.
 /// Capture any value for the tape with graceful degradation, resolved at
 /// compile time via autoref specialization:
@@ -257,7 +272,7 @@ pub mod value {
     }
     impl<T: serde::Serialize + ?Sized> CaptureSerde for &Capture<'_, T> {
         fn deja_capture(&self) -> serde_json::Value {
-            serde_json::to_value(self.0).unwrap_or_else(|_| {
+            crate::canonical::to_value(self.0).unwrap_or_else(|_| {
                 serde_json::json!({
                     "deja_unserializable": std::any::type_name::<T>(),
                 })
@@ -306,7 +321,7 @@ pub mod value {
     /// JSON-null if the value cannot be serialized (it never panics, so a
     /// serialize failure can't take down an instrumented call site).
     pub fn serialize<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Value {
-        serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+        crate::canonical::to_value_or_null(value)
     }
 
     /// Capture the full Rust debug representation of an error.
@@ -340,7 +355,7 @@ pub mod value {
     /// Requires the value to implement `serde::Serialize`; the macro only emits
     /// a call to this for boundaries opted into replay (`#[deja::…(replay)]`).
     pub fn result_serialize<T: serde::Serialize + ?Sized>(value: &T) -> (serde_json::Value, bool) {
-        let json = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
+        let json = crate::canonical::to_value_or_null(value);
         let is_error = matches!(&json, serde_json::Value::Object(map) if map.contains_key("Err"));
         (json, is_error)
     }
@@ -356,10 +371,7 @@ pub mod value {
         result: &Result<T, E>,
     ) -> (serde_json::Value, bool) {
         match result {
-            Ok(value) => (
-                serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
-                false,
-            ),
+            Ok(value) => (crate::canonical::to_value_or_null(value), false),
             Err(error) => (
                 serde_json::json!({ "deja_err": format!("{error:?}") }),
                 true,
@@ -840,7 +852,7 @@ pub mod value {
     {
         let record = match result {
             Ok(value) => DejaDatabaseResult::ok(
-                serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
+                crate::canonical::to_value_or_null(value),
                 std::any::type_name::<T>(),
             ),
             Err(error) => {
@@ -896,6 +908,15 @@ pub mod value {
 /// the DB result envelope) plug in without the bespoke `replay_with` flag.
 pub mod codec {
     use std::marker::PhantomData;
+
+    /// The reply canon a protocol codec stamps on a result whose members carry
+    /// no order BY THE BOUNDARY'S OWN CONTRACT while the Rust type says `Vec`:
+    /// rows of a `SELECT` with no `ORDER BY`, keys from a redis `SCAN`. Names the
+    /// `value` array of the `ResultCodec` envelope. Marked, never sorted — the
+    /// rows are recorded as they arrived, so a service that (legally, wrongly)
+    /// takes `.first()` of an unordered result gets on replay exactly what it
+    /// got in the recording.
+    pub const UNORDERED_VALUE_ROWS_CANON: &str = "bag:$.value[]";
 
     /// The capture/reconstruct contract for one boundary return type.
     pub trait ReplayCodec {
@@ -962,8 +983,7 @@ pub mod codec {
                     serde_json::json!({
                         "version": crate::value::DejaDatabaseResult::VERSION,
                         "result": "Ok",
-                        "value": serde_json::to_value(inner)
-                            .unwrap_or(serde_json::Value::Null),
+                        "value": crate::canonical::to_value_or_null(inner),
                         "type_name": std::any::type_name::<T>(),
                     }),
                     false,
@@ -975,8 +995,7 @@ pub mod codec {
                         // For a fieldless enum this serializes to the bare
                         // variant-name string ("NotFound"), keeping the wire
                         // `kind` identical to the legacy hand-rolled mapping.
-                        "kind": serde_json::to_value(report.current_context())
-                            .unwrap_or(serde_json::Value::Null),
+                        "kind": crate::canonical::to_value_or_null(report.current_context()),
                         "message": format!("{report:?}"),
                     }),
                     true,
@@ -1637,8 +1656,74 @@ pub mod db {
             if let Some(image) = image {
                 output = output.with_result_image(image);
             }
+            // A multi-row result is a set of rows unless the statement said
+            // otherwise. Derived here, from the statement this boundary ran,
+            // because this is the one place both the rows and the SQL are in
+            // hand; nobody declares a path.
+            if value.is_array() && !sql_has_top_level_order_by(sql) {
+                output = output.with_reply_canon(crate::CanonRef::new(
+                    crate::codec::UNORDERED_VALUE_ROWS_CANON,
+                ));
+            }
         }
         output
+    }
+
+    /// Does this statement impose an order on its rows at the top level?
+    ///
+    /// `ORDER BY` inside a subquery orders the subquery, not the rows this
+    /// boundary returns, so nesting depth is tracked. String literals are
+    /// skipped so a bound value containing the words does not count, and
+    /// diesel's trailing `-- binds: [...]` list is cut off for the same reason.
+    /// Conservative on anything it cannot follow — unbalanced parentheses, an
+    /// unterminated quote — it answers `true`, i.e. "ordered", which leaves the
+    /// result exactly as it was recorded before this existed.
+    #[must_use]
+    pub fn sql_has_top_level_order_by(sql: &str) -> bool {
+        let statement = sql.split(" -- binds: ").next().unwrap_or(sql);
+        let bytes = statement.as_bytes();
+        let mut depth: usize = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'(' => depth += 1,
+                b')' => match depth.checked_sub(1) {
+                    Some(next) => depth = next,
+                    None => return true,
+                },
+                quote @ (b'\'' | b'"') => {
+                    // Skip to the closing quote; a doubled quote is an escape.
+                    let mut close = index + 1;
+                    loop {
+                        match bytes.get(close) {
+                            None => return true,
+                            Some(&byte) if byte == quote => {
+                                if bytes.get(close + 1) == Some(&quote) {
+                                    close += 2;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Some(_) => close += 1,
+                        }
+                    }
+                    index = close;
+                }
+                _ if depth == 0
+                    && statement.is_char_boundary(index)
+                    && statement[index..]
+                        .get(..8)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("ORDER BY"))
+                    && (index == 0 || bytes[index - 1].is_ascii_whitespace()) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        // Parentheses still open at the end: a statement this cannot follow.
+        depth != 0
     }
 
     /// Metadata for a database query boundary.
@@ -1756,6 +1841,116 @@ pub mod db {
 
 /// Private implementation details used by the macro-generated code.
 /// Not part of the public API — the `deja::*` attribute macros call these.
+/// Support for hosts that need to drive their own boundaries from a test.
+///
+/// Recording is gated on a correlation being CURRENT on the thread, not merely
+/// on a decision having been registered for one — [`set_recording_decision`]
+/// alone records nothing. Entering a correlation needs `deja_context::enter`
+/// and `ContextSnapshot`, and a host that only depends on this facade cannot
+/// reach them; it has to add `deja-context` as a second dependency purely to
+/// write a test. This module is the one thing such a test actually needs.
+///
+/// This is NOT [`__private`], which exists for macro expansion and may widen or
+/// change without notice. This surface is small and deliberate: one function,
+/// returning an opaque guard the caller binds and never names.
+///
+/// # Which door this is
+///
+/// Every way of making a correlation current writes the same thread-local pair
+/// through `deja_context::set_current_context`, in one of two shapes:
+///
+/// - **scoped** — `enter` / `enter_correlation_id` return a `ContextGuard` that
+///   restores the previous context on drop. This function is one of these.
+/// - **unscoped** — `set_current_correlation` and
+///   `set_current_correlation_with_decision` return nothing; the caller owns
+///   restoration. The correlation layer uses these for an on-change model where
+///   the span tree restores the previous value, which is why they hand back no
+///   guard.
+///
+/// A test wants the scoped shape: the context must come back down, or it leaks
+/// into whatever runs next in the same binary. So this delegates to `enter`
+/// rather than to the unscoped installers — the alternative would be
+/// reimplementing `ContextGuard` above the facade.
+///
+/// The decision is not ambiguous here, which is the other half of the question:
+/// this always installs `Record`. The unscoped installers can leave a
+/// correlation current with *no* decision — resolved from a registry entry that
+/// may already be gone, or passed as `None` — and the capture gate reads that as
+/// "no decision" and skips, silently. This function has no such state.
+///
+/// ```no_run
+/// let _recording = deja::test_support::recording_correlation("req-under-test");
+/// // boundaries called from here until `_recording` drops are recorded
+/// ```
+/// The Redis protocol's own statements about order, applied by the
+/// `#[deja::redis]` kit to the reply of every redis boundary. Redis, not any
+/// service: which commands return an unordered collection is a property of the
+/// protocol, read off the `command` the site already records in its args.
+pub mod redis {
+    /// Commands whose reply is a SET or a scan page by Redis's contract — the
+    /// members arrive in whatever order the server's hash table held them.
+    /// `LRANGE`, `ZRANGE`, `XRANGE` and every list/stream/sorted-set read are
+    /// deliberately absent: their order is the value.
+    pub const UNORDERED_REPLY_COMMANDS: &[&str] = &[
+        "SCAN",
+        "SSCAN",
+        "HSCAN",
+        "SMEMBERS",
+        "SINTER",
+        "SUNION",
+        "SDIFF",
+        "KEYS",
+        "HKEYS",
+        "HVALS",
+        "SRANDMEMBER",
+    ];
+
+    /// Shape the recorded reply of a redis boundary: the codec's capture, with
+    /// the reply canon stamped when the recorded `command` is one whose reply
+    /// carries no order. `args` is the site's own args object; a site that
+    /// records no `command` gets no mark.
+    #[must_use]
+    pub fn recorded_reply(
+        capture: (serde_json::Value, bool),
+        args: &serde_json::Value,
+    ) -> crate::RecordedOutput {
+        let output = crate::RecordedOutput::from(capture);
+        if output.is_error {
+            return output;
+        }
+        let unordered = args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| {
+                UNORDERED_REPLY_COMMANDS
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(command))
+            });
+        if unordered {
+            output.with_reply_canon(crate::CanonRef::new(
+                crate::codec::UNORDERED_VALUE_ROWS_CANON,
+            ))
+        } else {
+            output
+        }
+    }
+}
+
+pub mod test_support {
+    /// Make `correlation_id` the current correlation, recording every boundary
+    /// crossed while the returned guard is alive.
+    ///
+    /// Bind the guard — dropping it immediately (`let _ = ...`) restores the
+    /// previous context before any boundary runs, which records nothing and is
+    /// the mistake this function exists to make hard.
+    #[must_use = "the correlation is only current while the guard is alive"]
+    pub fn recording_correlation(correlation_id: impl Into<String>) -> deja_context::ContextGuard {
+        deja_context::enter(
+            deja_context::ContextSnapshot::new(correlation_id).with_recording_decision(true),
+        )
+    }
+}
+
 pub mod __private {
     pub use deja_context::current_correlation_id;
     // The single boundary-crossing seam the `#[deja::boundary]` family emits.
@@ -1767,13 +1962,13 @@ pub mod __private {
     #[allow(deprecated)]
     pub use deja_runtime::{
         boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_or_miss,
-        execute_shadow_observe_boundary, execute_shadow_peek_boundary,
-        fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
-        next_boundary_occurrence, observation_is_active, record_boundary_async,
-        record_boundary_async_lazy, record_boundary_sync, record_boundary_sync_lazy,
-        replay_boundary, replay_is_active, runtime_mode, stable_callsite_hash, BoundarySpec,
-        CallsiteIdentity, CallsiteSource, CrossingObservation, ExecuteMode, ExecuteShadowToken,
-        Reconstructed, RecordedOutput, RuntimeMode,
+        dispatch_or_miss, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
+        fail_stop_absent_executor, fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss,
+        finish_boundary_event, next_boundary_occurrence, observation_is_active,
+        record_boundary_async, record_boundary_async_lazy, record_boundary_sync,
+        record_boundary_sync_lazy, replay_boundary, replay_is_active, runtime_mode,
+        stable_callsite_hash, BoundarySpec, CallsiteIdentity, CallsiteSource, CrossingObservation,
+        ExecuteMode, ExecuteShadowToken, Reconstructed, RecordedOutput, RuntimeMode,
     };
     // Declarative boundary model: the per-site `ReplayStrategy` enum selects
     // Execute or Substitute behavior, and `BoundarySemantics` is the descriptor

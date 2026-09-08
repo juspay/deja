@@ -720,11 +720,20 @@ fn extract_arg_key(pat: &Pat) -> Option<String> {
     }
 }
 
-/// Build `serde_json::json!({ "arg1": &arg1, "arg2": &arg2, ... })` for all
-/// non-self typed parameters whose patterns yield a simple identifier.
+/// Build the args object for all non-self typed parameters whose patterns yield
+/// a simple identifier.
 ///
 /// Uses `&arg` so the original value is borrowed, not moved — this preserves
 /// the variable for the subsequent delegation call to `self.$inner.method(...)`.
+///
+/// Each value goes through `canonical::to_value_or_null` rather than
+/// `serde_json::json!`, for two reasons. It canonicalises a collection whose
+/// static type says its order carries no information, which is the whole point
+/// of capturing while the type is still in hand. And `json!` on an expression
+/// expands to `to_value(&x).unwrap()`, so a serialization failure in a delegated
+/// trait method panicked the request — the recorder is invisible instrumentation
+/// and must never do that. The `Serialize` bound is unchanged, so a type that
+/// did not compile here still does not.
 fn build_args_json(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>) -> TokenStream {
     let mut entries: Vec<TokenStream> = Vec::new();
 
@@ -734,7 +743,9 @@ fn build_args_json(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma
             if let Some(key) = extract_arg_key(pat) {
                 let key_lit = syn::LitStr::new(&key, proc_macro2::Span::call_site());
                 let val = extract_arg_name(pat);
-                entries.push(quote!(#key_lit: &#val));
+                entries.push(quote!(
+                    #key_lit: ::deja_runtime::canonical::to_value_or_null(&#val)
+                ));
             }
         }
     }
@@ -785,7 +796,7 @@ fn result_json_expr(opaque: bool) -> TokenStream {
         }
     } else {
         quote! {
-            match ::serde_json::to_value(&__deja_result) {
+            match ::deja_runtime::canonical::to_value(&__deja_result) {
                 ::core::result::Result::Ok(val) => {
                     let is_err = ::deja_runtime::serialized_result_is_error(&val);
                     (val, is_err)

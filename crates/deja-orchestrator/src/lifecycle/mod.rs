@@ -599,7 +599,7 @@ fn drive_record(
     // (Vector batches every 5s). Observed first-object latency is ~60s, so give
     // a comfortable budget; the stable-count check returns early once the flush
     // settles, so a healthy run does NOT wait the whole window.
-    wait_s3_objects(&recording_id, Duration::from_secs(180))?;
+    wait_s3_objects(&recording_id, run.spec.system(), Duration::from_secs(180))?;
 
     set_stage(
         root,
@@ -609,7 +609,7 @@ fn drive_record(
         total,
         "compacting + pulling session from S3",
     );
-    pull_recording(root, ctx, &recording_id)?;
+    pull_recording(root, ctx, &recording_id, run.spec.system())?;
 
     // Register what this run produced. Execution-graph nodes ride the tape
     // itself as `DejaRecord::GraphNode` lines, so the events artifact is the
@@ -806,7 +806,7 @@ fn stage_resolve_recording(
                 &format!("fetching recording {recording_id}"),
             );
             if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
-                pull_recording(root, ctx, &recording_id)?;
+                pull_recording(root, ctx, &recording_id, run.spec.system())?;
             }
             recording_id
         }
@@ -4910,13 +4910,21 @@ fn wait_health(url: &str, timeout: Duration) -> Result<(), String> {
 /// Wait until at least one object exists under the session's landing prefix
 /// and the count stops growing (Vector batch flush settled). Native S3 list —
 /// no `mc` container round-trips.
-fn wait_s3_objects(recording_id: &str, timeout: Duration) -> Result<(), String> {
-    let cfg = crate::s3::S3Config::from_env();
+fn wait_s3_objects(recording_id: &str, system: &str, timeout: Duration) -> Result<(), String> {
+    // The recording's OWN bucket. Polling the deployment's default for a
+    // recording that lives elsewhere counts zero objects forever, and reports
+    // it as a recording that never landed.
+    // One call for both halves. Resolving the bucket here and the root at the
+    // count below, through two functions, is how a later call site comes to
+    // resolve one and forget the other — which is the defect this pair fixes.
+    let (bucket, root) = crate::system::recording_scope(system)?;
+    let mut cfg = crate::s3::S3Config::from_env();
+    cfg.bucket = bucket;
     let deadline = Instant::now() + timeout;
     let mut last = 0usize;
     let mut stable = 0u8;
     loop {
-        let count = crate::s3::count_session_objects(&cfg, recording_id).unwrap_or(0);
+        let count = crate::s3::count_session_objects(&cfg, recording_id, &root).unwrap_or(0);
         if count > 0 && count == last {
             stable += 1;
             if stable >= 2 {
@@ -4945,8 +4953,20 @@ fn wait_s3_objects(recording_id: &str, timeout: Duration) -> Result<(), String> 
 /// streams the data parts (see `deja-compactor`). The ingest report and the
 /// sealing manifest are persisted next to the events file and registered as
 /// artifacts; the recording catalog row upserts from the manifest.
-fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Result<(), String> {
-    let cfg = crate::s3::S3Config::from_env();
+fn pull_recording(
+    root: &HarnessRoot,
+    ctx: &StoreCtx,
+    recording_id: &str,
+    system: &str,
+) -> Result<(), String> {
+    // Resolved through the registry, like every other reader of a recording. It
+    // used to be the deployment's default bucket, so a run whose recording lives
+    // in another system's bucket failed "no landing objects" for a recording the
+    // listing had just offered — a failure BEFORE admission, which is why
+    // admission's own ingress gap was never the first obstacle.
+    let (bucket, landing_root) = crate::system::recording_scope(system)?;
+    let mut cfg = crate::s3::S3Config::from_env();
+    cfg.bucket = bucket;
     // A recording named by id alone still has to be FOUND. The compactor looks
     // under its own flat layout; the deployed aggregator partitions by date
     // first, so a session it wrote is not there and the pull failed with "no
@@ -4958,8 +4978,11 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
     // it: a session spanning two dates is addressed from the shared parent, so
     // the prefix holds other sessions too, and only content can separate them.
     if deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
-        let root_prefix =
-            std::env::var("DEJA_RECORDING_ROOT").unwrap_or_else(|_| "landing/v1".to_owned());
+        // Where this system's recordings land is declared per system, so the
+        // root comes from the run's system rather than from one global: a
+        // deployment replaying two systems has two answers and a global would
+        // give the wrong one to whichever system is not the default.
+        let root_prefix = landing_root.clone();
         let prefix = deja_compactor::locate_landing_prefix(&cfg, recording_id, &root_prefix)?
             .ok_or_else(|| {
                 format!(
@@ -4976,7 +4999,7 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
         return Ok(());
     }
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
-    let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &dest)?;
+    let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &landing_root, &dest)?;
     let gaps: usize = manifest.instances.iter().map(|i| i.gaps.len()).sum();
     let line = format!(
         "ingested {recording_id}: {} landing object(s), {} line(s), {} duplicate(s) dropped → \
@@ -5131,6 +5154,30 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+
+    /// The refusal reaches the PULL PATH, not just the resolver.
+    ///
+    /// An undeclared system must refuse rather than poll the deployment's own
+    /// bucket, which is how a prism tape looked absent. This gives the landing
+    /// poll a failure it did not have before, so it must name the table to add
+    /// — a run failing at stage 1 with "not found" would send a deployment
+    /// looking for a missing recording instead of a missing declaration.
+    #[test]
+    fn an_undeclared_system_refuses_the_pull_by_name() {
+        let _lock = crate::test_env::env_guard();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+        );
+        let refused = wait_s3_objects("rec-1", "zzz", std::time::Duration::from_secs(1));
+        std::env::remove_var("DEJA_CONFIG_TOML");
+
+        let message = refused.expect_err("an undeclared system must not be polled for");
+        assert!(
+            message.contains("systems.zzz.s3_bucket"),
+            "the refusal names the table to declare, not a missing recording: {message}"
+        );
+    }
     use super::*;
     use crate::scope::{RunScope, ScopedRecording, TapeSlot};
     use crate::{CandidateSpec, RunSpec};

@@ -1,0 +1,104 @@
+{
+  "request_path": "/payments/pay_BNQOR0LiW69d4seUoEZC/client",
+  "status_baseline": 200,
+  "status_candidate": 200,
+  "body_diff": [
+    {
+      "baseline": "AmericanExpress",
+      "candidate": "Visa",
+      "json_path": "$.payment_methods_enabled[0].card_networks[0]"
+    },
+    {
+      "baseline": "UnionPay",
+      "candidate": "DinersClub",
+      "json_path": "$.payment_methods_enabled[0].card_networks[1]"
+    },
+    {
+      "baseline": "Visa",
+      "candidate": "Mastercard",
+      "json_path": "$.payment_methods_enabled[0].card_networks[2]"
+    },
+    {
+      "baseline": "Mastercard",
+      "candidate": "AmericanExpress",
+      "json_path": "$.payment_methods_enabled[0].card_networks[3]"
+    },
+    {
+      "baseline": "DinersClub",
+      "candidate": "UnionPay",
+      "json_path": "$.payment_methods_enabled[0].card_networks[4]"
+    },
+    {
+      "baseline": "Mastercard",
+      "candidate": "Visa",
+      "json_path": "$.payment_methods_enabled[1].card_networks[0]"
+    },
+    {
+      "baseline": "Visa",
+      "candidate": "Mastercard",
+      "json_path": "$.payment_methods_enabled[1].card_networks[1]"
+    }
+  ],
+  "baseline_body": {
+    "payment_methods_enabled": [
+      {
+        "card_networks": [
+          "AmericanExpress",
+          "UnionPay",
+          "Visa",
+          "Mastercard",
+          "DinersClub"
+        ],
+        "collect_billing_details_from_wallets": null,
+        "collect_shipping_details_from_wallets": null,
+        "customer_acceptance_support": "supported",
+        "payment_experience": null,
+        "payment_method": "card",
+        "payment_method_type": "credit"
+      },
+      {
+        "card_networks": [
+          "Mastercard",
+          "Visa"
+        ],
+        "collect_billing_details_from_wallets": null,
+        "collect_shipping_details_from_wallets": null,
+        "customer_acceptance_support": "supported",
+        "payment_experience": null,
+        "payment_method": "card",
+        "payment_method_type": "debit"
+      }
+    ]
+  },
+  "candidate_body": {
+    "payment_methods_enabled": [
+      {
+        "card_networks": [
+          "Visa",
+          "DinersClub",
+          "Mastercard",
+          "AmericanExpress",
+          "UnionPay"
+        ],
+        "collect_billing_details_from_wallets": null,
+        "collect_shipping_details_from_wallets": null,
+        "customer_acceptance_support": "supported",
+        "payment_experience": null,
+        "payment_method": "card",
+        "payment_method_type": "credit"
+      },
+      {
+        "card_networks": [
+          "Visa",
+          "Mastercard"
+        ],
+        "collect_billing_details_from_wallets": null,
+        "collect_shipping_details_from_wallets": null,
+        "customer_acceptance_support": "supported",
+        "payment_experience": null,
+        "payment_method": "card",
+        "payment_method_type": "debit"
+      }
+    ]
+  }
+}

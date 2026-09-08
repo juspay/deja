@@ -39,6 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
+pub mod canonical;
 pub mod correlation_layer;
 pub mod graph;
 pub mod replay;
@@ -293,8 +294,30 @@ impl DejaRecord {
 /// task-lineage/canonicalization scaffolding. v8 switches detached spawning to a
 /// stamp-only model and adds canonical `bucket_id` plus `fork_seq` lineage.
 /// (The optional `role` field is additive within v8: absent on old tapes,
-/// defaulted on read, and never required by any consumer.)
-pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 8;
+/// defaulted on read, and never required by any consumer.) v9 canonicalises
+/// capture by TYPE ([`canonical`]): a collection whose static Rust type says its
+/// order carries no information — a `HashSet`, at any nesting depth — is
+/// recorded in a canonical order instead of in this process's hash-seed order.
+///
+/// v9 adds and removes NO field; it changes what the existing `args` and
+/// `result` hold, which is why it takes a version rather than a comment. What a
+/// pre-v9 tape means when read afterwards, stated plainly because #100 showed
+/// what silence costs: **its arrays are in whatever order the recording
+/// process's hash seed produced.** Two consequences, and both are real:
+///
+/// - `canonical_args_hash` hashes array elements in position, so a v9 candidate
+///   computes a different `args_hash` from a pre-v9 tape at any site whose args
+///   carry such a collection, and therefore misses at every address rank. The
+///   unresolved call is still repaired by the scorer's args-free twin pairing,
+///   but it is a miss. **A pre-v9 recording is re-recorded rather than replayed
+///   against a v9 candidate** — the same call made for #100's `bucket_id`
+///   composition change, which is this same shape.
+/// - A strict array comparison across the version line would report an ordering
+///   difference that is a capture-version artefact and nothing else, so any such
+///   comparison must be gated on the RECORDING's `event_schema_version >= 9`.
+///
+/// Self-consistent within a v9 recording, exactly as v6 was for `capture!`.
+pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 9;
 
 /// The [`BoundaryEvent::role`] value marking a correlation's ingress root.
 pub const ROLE_INGRESS: &str = "ingress";
@@ -800,6 +823,14 @@ where
 /// Hooks that opt into context-aware replay implement
 /// [`DejaHook::try_replay_with_context`].
 pub struct ReplayLookup<'a> {
+    /// What this boundary does when the lookup MISSES.
+    ///
+    /// Carried on the query rather than derived later because it is only knowable
+    /// here: the observation is written by the hook BEFORE the seam reaches its
+    /// miss branch, so nothing downstream can tell a miss the process absorbed
+    /// from one that killed the request. Both leave `resolved: false` and
+    /// `Provenance::Recorded`. See [`MissPolicy`].
+    pub miss_policy: MissPolicy,
     /// Boundary tag (e.g. `"storage"`, `"redis"`, `"http_client"`).
     pub boundary: &'a str,
     /// Trait name at the boundary.
@@ -814,9 +845,30 @@ pub struct ReplayLookup<'a> {
     pub caller_location: Option<&'a std::panic::Location<'a>>,
 }
 
-// ---------------------------------------------------------------------------
-// Call-site helper
-// ---------------------------------------------------------------------------
+/// What a `Substitute` boundary does when its replay lookup MISSES.
+///
+/// This is a property of the DECLARATION, not of the call: a boundary either has
+/// a caller with an honest degraded path (and declares `on_miss`, so a miss is
+/// absorbed and the request continues) or it does not (and a miss stops the
+/// request). It rides the [`ReplayLookup`] so the emitted observation can say
+/// which of the two happened.
+///
+/// Why it has to be carried rather than worked out afterwards: the miss is
+/// recorded before the seam decides. A run whose absorbed misses are
+/// indistinguishable from its fatal ones gets quieter and less trustworthy at the
+/// same time, which is the failure this exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissPolicy {
+    /// A miss stops the request. The default, and right wherever no value is
+    /// honest — egress, and anything whose absence would silently condition the
+    /// rest of the correlation on a value the recording never held.
+    #[default]
+    FailStop,
+    /// A miss returns the declared value and the request continues. The miss is
+    /// still scored; only the continuation changes.
+    Absorb,
+}
 
 // ---------------------------------------------------------------------------
 // Hook trait
@@ -1625,6 +1677,34 @@ pub fn installed_runtime_hook() -> Option<Arc<RuntimeHook>> {
 // Builder for BoundaryEvent (used by generated delegation code)
 // ---------------------------------------------------------------------------
 
+/// The event's declaration: the site's static one, with a per-event reply canon
+/// (see [`RecordedOutput::reply_canon`]) appended as a clause. `None` when both
+/// are absent, exactly as before the per-event slot existed, so an undeclared
+/// site's events are byte-identical to what they were.
+///
+/// Composition is textual and ordered — `static;derived` — because that is the
+/// clause grammar the comparator already parses (`project:!a;bag:$.b[]`), and
+/// because a reader of the tape should see the static declaration first, where
+/// it always was.
+fn declaration_with_reply_canon(
+    declaration: Option<BoundaryDeclaration>,
+    derived: Option<CanonRef>,
+) -> Option<BoundaryDeclaration> {
+    let declaration = declaration.filter(|declaration| !declaration.is_empty());
+    let Some(derived) = derived else {
+        return declaration;
+    };
+    let mut declaration = declaration.unwrap_or_default();
+    declaration.reply_canon = Some(match declaration.reply_canon.take() {
+        Some(existing) if !existing.id.trim().is_empty() => CanonRef {
+            id: format!("{};{}", existing.id.trim(), derived.id.trim()),
+            version: existing.version.or(derived.version),
+        },
+        _ => derived,
+    });
+    Some(declaration)
+}
+
 /// Captured output of a boundary call.
 ///
 /// Existing extractors that return `(serde_json::Value, bool)` convert into this
@@ -1648,6 +1728,17 @@ pub struct RecordedOutput {
     pub result_image: Option<serde_json::Value>,
     /// Explicit pre-image of affected state before the boundary completed.
     pub pre_image: Option<serde_json::Value>,
+    /// A reply canon the PRODUCER derived for this one event, from evidence it
+    /// alone holds at capture time — the statement it ran, the command it sent.
+    /// Composed onto the site's static declaration at finish (a clause appended
+    /// with `;`), so the comparator reads one declaration and cannot tell which
+    /// half was static. This is how a boundary whose CONTRACT says "unordered"
+    /// while its Rust type says `Vec` gets its order marked as meaningless
+    /// without anyone declaring a path by hand — and marked, never sorted: the
+    /// service may legally observe `Vec` order on replay, so the rows are
+    /// recorded as they arrived.
+    #[allow(clippy::struct_field_names)]
+    pub reply_canon: Option<CanonRef>,
 }
 
 impl RecordedOutput {
@@ -1660,7 +1751,14 @@ impl RecordedOutput {
             write_set: Vec::new(),
             result_image: None,
             pre_image: None,
+            reply_canon: None,
         }
+    }
+
+    /// Attach a reply canon derived for this event.
+    pub fn with_reply_canon(mut self, canon: CanonRef) -> Self {
+        self.reply_canon = Some(canon);
+        self
     }
 
     /// Attach additional explicit read keys.
@@ -1743,6 +1841,8 @@ pub struct EventBuilder {
     explicit_output: Option<serde_json::Value>,
     explicit_result_image: Option<serde_json::Value>,
     explicit_pre_image: Option<serde_json::Value>,
+    /// See [`RecordedOutput::reply_canon`].
+    explicit_reply_canon: Option<CanonRef>,
     /// Optional structured call-site identity attached to the emitted event.
     pub callsite_identity: Option<CallsiteIdentity>,
     /// DECLARED boundary semantics (declarative boundary model). Defaults to
@@ -1866,6 +1966,7 @@ impl EventBuilder {
             explicit_write_set: None,
             explicit_output: None,
             explicit_result_image: None,
+            explicit_reply_canon: None,
             explicit_pre_image: None,
             callsite_identity: None,
             semantics: BoundarySemantics::undeclared(),
@@ -1994,6 +2095,9 @@ impl EventBuilder {
         if let Some(image) = output.pre_image {
             builder.explicit_pre_image = Some(image);
         }
+        if let Some(canon) = output.reply_canon {
+            builder.explicit_reply_canon = Some(canon);
+        }
         builder.finish(hook, output.result, output.is_error);
     }
 
@@ -2020,6 +2124,7 @@ impl EventBuilder {
             explicit_output,
             explicit_result_image,
             explicit_pre_image,
+            explicit_reply_canon,
             callsite_identity,
             semantics,
             role,
@@ -2097,9 +2202,7 @@ impl EventBuilder {
             replay_strategy: semantics.replay_strategy,
             kind: semantics.kind,
             role: role.map(str::to_owned),
-            declaration: semantics
-                .declaration
-                .filter(|declaration| !declaration.is_empty()),
+            declaration: declaration_with_reply_canon(semantics.declaration, explicit_reply_canon),
             raw_draw: None,
             end_timestamp_ns: Some(end_ns),
         };
@@ -2203,25 +2306,20 @@ impl LazyEventFinalizer {
         // shutdown flush. A per-request flush adds control-channel pressure
         // for no durability gain and, behind a saturated sink, stalls the
         // response path.
-        clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
+        // Fork sequences are NOT cleared here. They are discarded when the span
+        // that owns the correlation closes, which happens for every request
+        // rather than only for the ones that build a finalizer.
         correlation_id
     }
 }
 
 impl Drop for LazyEventFinalizer {
     fn drop(&mut self) {
-        let cleanup_correlation_id = self
-            .builder
-            .as_ref()
-            .map(|builder| builder.correlation_id.clone());
         // SHADOW GUARANTEE: never finalize while the thread is already unwinding.
         // If the real call panicked, this finalizer is dropped mid-unwind; running
         // `finish` (which can itself panic on serialization/locks) during an unwind
         // escalates to `abort()` and kills the whole process. Drop the event instead.
         if std::thread::panicking() {
-            if let Some(correlation_id) = cleanup_correlation_id {
-                clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
-            }
             return;
         }
         if self.builder.is_some() {
@@ -2240,9 +2338,6 @@ impl Drop for LazyEventFinalizer {
                 // a saturated sink, stalling teardown.
                 hook.request_flush();
             }
-        }
-        if let Some(correlation_id) = cleanup_correlation_id {
-            clear_fork_counter(correlation_id.as_deref(), ROOT_TASK_ID);
         }
     }
 }
@@ -2390,46 +2485,92 @@ impl TaskLineage {
         }
     }
 
-    /// Lineage for a spawned-task fork: a fresh bucket under the parent, keyed by
-    /// a `(correlation, parent bucket)`-local sequence. Called by the correlation
-    /// layer when it sees a `deja.fork`-marked span — never from a task-local.
-    fn forked_child_of(parent: Self, correlation_id: Option<&str>) -> Self {
-        let fork_seq = next_fork_seq(correlation_id, &parent.bucket_id);
+    /// Lineage for a spawned-task fork: a fresh bucket under the parent, numbered
+    /// by a sequence local to `fork_path` — the fork span's own logical path.
+    /// Called by the correlation layer when it sees a `deja.fork`-marked span,
+    /// which is the sole creator of these buckets.
+    ///
+    /// The sequence is per-PATH and not per-correlation, and that is the whole
+    /// point. Numbering forks by their arrival order within a correlation made
+    /// the bucket positional: a candidate that spawned one extra task early
+    /// renumbered every later fork, moved each one's occurrence partition, and
+    /// re-addressed everything beneath them — so a single behavioural difference
+    /// arrived as a cascade of unrelated-looking divergences. Numbering within a
+    /// path keeps a change local to the callsite that made it.
+    fn forked_child_of(parent: Self, correlation_id: Option<&str>, fork_path: &str) -> Self {
+        let fork_seq = next_fork_seq(correlation_id, fork_path);
+        // The path goes in the id, not just in the counter. Numbering per path is
+        // what keeps a fork elsewhere in the request from renumbering this one,
+        // but composing the id from the sequence alone made two paths collide,
+        // because every path's sequence starts at 1. A bucket says "this work is
+        // an unordered region", so two sites sharing one tells the scorer they
+        // are ordered with respect to each other and a real race between them
+        // reads as a divergence.
+        //
+        // FNV-1a, the same stable hash the callsite addresses use: deterministic
+        // across runs and across toolchains, which a `DefaultHasher` is not, so
+        // a recording and a candidate agree on it.
+        let site = stable_callsite_hash(fork_path);
         Self {
-            task_id: format!("{}::fork-{fork_seq}", parent.task_id),
+            task_id: format!("{}::fork-{site:x}-{fork_seq}", parent.task_id),
             parent_task_id: Some(parent.task_id),
-            bucket_id: format!("{}::fork-{fork_seq}", parent.bucket_id),
+            bucket_id: format!("{}::fork-{site:x}-{fork_seq}", parent.bucket_id),
             fork_seq,
         }
     }
 }
 
-/// Per-(correlation, parent bucket) counter key for detached fork sequences.
-type ForkCounterKey = (Option<String>, String);
+/// Fork sequences, grouped by correlation so a correlation's whole set is
+/// discarded in one removal when its span closes.
+///
+/// Nested rather than keyed by a `(correlation, path)` pair because the eviction
+/// has to be complete. The flat shape could only remove the one key it was told
+/// about, so every other key a correlation created outlived it: nested forks
+/// unconditionally, and every fork of a sampled-out request, since those never
+/// build the response finalizer that did the clearing. In a process that does not
+/// restart that is unbounded.
+/// Fork sequences for one correlation, keyed by the fork span's logical path.
+type ForkSequences = HashMap<String, u64>;
 
-static FORK_COUNTERS: LazyLock<Mutex<HashMap<ForkCounterKey, u64>>> =
+static FORK_COUNTERS: LazyLock<Mutex<HashMap<Option<String>, ForkSequences>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn next_fork_seq(correlation_id: Option<&str>, parent_bucket_id: &str) -> u64 {
-    let key = (
-        correlation_id.map(str::to_owned),
-        parent_bucket_id.to_owned(),
-    );
+fn next_fork_seq(correlation_id: Option<&str>, fork_path: &str) -> u64 {
     let mut counters = FORK_COUNTERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let next = counters.entry(key).or_insert(1);
+    let next = counters
+        .entry(correlation_id.map(str::to_owned))
+        .or_default()
+        .entry(fork_path.to_owned())
+        .or_insert(1);
     let fork_seq = *next;
     *next += 1;
     fork_seq
 }
 
-fn clear_fork_counter(correlation_id: Option<&str>, parent_bucket_id: &str) {
+/// How many distinct fork paths `correlation_id` currently holds sequences for.
+/// Tests only: eviction is otherwise unobservable, and an eviction nobody can see
+/// is an eviction nobody can prove.
+#[cfg(test)]
+pub(crate) fn fork_counter_paths_for(correlation_id: Option<&str>) -> usize {
+    FORK_COUNTERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&correlation_id.map(str::to_owned))
+        .map_or(0, ForkSequences::len)
+}
+
+/// Discard every fork sequence belonging to `correlation_id`.
+///
+/// Called from the correlation layer when the span that owns the correlation
+/// closes, which is the moment no further fork can be created under it. Span
+/// lifetime is the right clock here and the response is not: a sampled-out
+/// request builds no finalizer, so clearing from there left its counters behind
+/// forever, and the overwhelming majority of requests are sampled out.
+pub(crate) fn clear_fork_counters_for_correlation(correlation_id: Option<&str>) {
     if let Ok(mut counters) = FORK_COUNTERS.lock() {
-        counters.remove(&(
-            correlation_id.map(str::to_owned),
-            parent_bucket_id.to_owned(),
-        ));
+        counters.remove(&correlation_id.map(str::to_owned));
     }
 }
 
@@ -2810,12 +2951,14 @@ pub fn replay_boundary(
     spec: &BoundarySpec,
     args: &serde_json::Value,
     identity: Option<&CallsiteIdentity>,
+    miss_policy: MissPolicy,
 ) -> Option<serde_json::Value> {
     let hook = global_runtime_hook_from_env()?;
     if !hook.is_active() {
         return None;
     }
     hook.try_replay_with_context(ReplayLookup {
+        miss_policy,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -2868,6 +3011,7 @@ pub fn execute_shadow_peek_boundary(
         return None;
     }
     hook.execute_shadow_peek(ReplayLookup {
+        miss_policy: crate::MissPolicy::FailStop,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -3204,6 +3348,67 @@ pub fn fail_stop_substitute_miss(boundary: &str, method: &str) -> ! {
     );
 }
 
+/// What a Substitute boundary missed, as a value the HOST can carry.
+///
+/// The fail-stop is type-erased on purpose (see [`fail_stop_substitute_miss`]):
+/// deja cannot construct the boundary's `E`, because a `replay_ok` site never
+/// names it. `on_miss` inverts that — the DECLARATION SITE builds the value,
+/// where the concrete type is known — and this marker is what deja contributes
+/// to it. It names the miss so a degraded continuation stays attributable: a
+/// host error enum takes it with `#[from]` and the resulting error says which
+/// boundary, which method and which args had no recorded answer, instead of an
+/// ad-hoc string that reads like an ordinary application failure.
+///
+/// Deja defines what a miss IS. Which of the host's types can represent one is
+/// the host's decision, made at the boundary declaration — no host error type
+/// appears anywhere in deja.
+///
+/// The blocking NovelCall divergence was ALREADY emitted before this value is
+/// built; the marker is for the caller's error path, never a substitute for
+/// scoring the miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubstituteMiss {
+    /// The boundary tag (`"imc"`, `"http_outgoing"`, …).
+    pub boundary: &'static str,
+    /// The declaring component (`component = ...`, or `module_path!()`).
+    pub component: &'static str,
+    /// The boundary method / operation name.
+    pub method: &'static str,
+    /// The structured args image that found no recorded answer — the same value
+    /// the lookup was keyed on, so a miss can be matched against the tape.
+    pub args: serde_json::Value,
+}
+
+impl SubstituteMiss {
+    /// Build the marker. Called by the boundary macro's `on_miss` shape; a
+    /// hand-written seam that owns the same four facts may call it directly.
+    pub const fn new(
+        boundary: &'static str,
+        component: &'static str,
+        method: &'static str,
+        args: serde_json::Value,
+    ) -> Self {
+        Self {
+            boundary,
+            component,
+            method,
+            args,
+        }
+    }
+}
+
+impl std::fmt::Display for SubstituteMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "deja replay: Substitute boundary `{}::{}` ({}) has no recorded value for these args: {}",
+            self.component, self.method, self.boundary, self.args
+        )
+    }
+}
+
+impl std::error::Error for SubstituteMiss {}
+
 /// The stable prefix EVERY deja replay fail-stop panic message carries.
 ///
 /// This is the in-band channel between a fail-stop and [`catch_fail_stop`]: the
@@ -3240,6 +3445,33 @@ pub fn fail_stop_substitute_unreconstructable(boundary: &str, method: &str, reas
          this build cannot read, so re-record after any change to a captured \
          type or its codec. Re-running is unsafe; halting this request. Declare \
          `replay_strategy = Execute` to recompute instead of substituting."
+    );
+}
+
+/// Replay fail-stop on a Substitute boundary that has no executor beneath it.
+///
+/// Some boundaries are constructed for substitution only — nothing is wired
+/// underneath them to run, because the deployment that built them never meant to
+/// reach the real thing. A miss there is not the ordinary Substitute miss that
+/// [`fail_stop_substitute_miss`] describes, and that stop's remedy does not
+/// apply: declaring `replay_strategy = Execute` prescribes running a boundary
+/// which does not exist. What this stop has to say instead is that the recording
+/// is short an entry, and that the candidate cannot be blamed for a request that
+/// never reached it.
+///
+/// `target` is the only host-specific part — whatever the absent executor would
+/// have addressed, named so an operator reading the stop knows which call went
+/// unanswered.
+#[cold]
+#[inline(never)]
+pub fn fail_stop_absent_executor(boundary: &str, method: &str, target: &str) -> ! {
+    panic!(
+        "{FAIL_STOP_SENTINEL} Substitute boundary `{boundary}::{method}` was \
+         constructed for substitution only and has no executor for `{target}`. \
+         The recording holds no entry for these args, so there is nothing to \
+         substitute and nothing this boundary could have executed; halting this \
+         request. The miss is a gap in the recording, and establishes nothing \
+         about the candidate either way."
     );
 }
 
@@ -3455,6 +3687,43 @@ where
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
+    // Default: a Substitute-miss has no honest value and re-running is unsafe,
+    // so STOP (see `fail_stop_substitute_miss`). A boundary whose caller has a
+    // deterministic degraded path declares `on_miss` and routes through
+    // `dispatch_or_miss` instead. Mirrors `dispatch` / `dispatch_async_or_miss`.
+    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
+    dispatch_or_miss(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        MissPolicy::FailStop,
+        move || fail_stop_substitute_miss(boundary, method),
+    )
+}
+
+/// [`dispatch`] with a caller-supplied `on_miss` value for the Substitute-miss
+/// branch — the sync twin of [`dispatch_async_or_miss`]. See it for the full
+/// contract: the blocking NovelCall divergence is still emitted before `on_miss`
+/// runs, and a HIT whose recorded value cannot be reconstructed still fail-stops.
+pub fn dispatch_or_miss<T, A, F, C, R, O, M>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    miss_policy: MissPolicy,
+    on_miss: M,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    F: FnOnce() -> T,
+    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    M: FnOnce() -> T,
+{
     match runtime_mode() {
         RuntimeMode::Disabled => record_only_path(obs, args, run, extract),
         RuntimeMode::Record => record_only_path(obs, args, run, extract),
@@ -3494,6 +3763,7 @@ where
                         &obs.spec,
                         &boundary_args,
                         Some(&obs.identity),
+                        miss_policy,
                     ) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
@@ -3505,9 +3775,7 @@ where
                                 )
                             }
                         },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
+                        None => on_miss(),
                     }
                 }
             }
@@ -3594,9 +3862,15 @@ where
     // unsafe, so STOP (see `fail_stop_substitute_miss`). A boundary whose caller
     // has a deterministic degraded path uses `dispatch_async_or_miss` instead.
     let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_async_or_miss(obs, args, run, reconstruct, extract, move || {
-        fail_stop_substitute_miss(boundary, method)
-    })
+    dispatch_async_or_miss(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        MissPolicy::FailStop,
+        move || fail_stop_substitute_miss(boundary, method),
+    )
     .await
 }
 
@@ -3616,6 +3890,7 @@ pub async fn dispatch_async_or_miss<T, A, Fut, F, C, R, O, M>(
     run: F,
     reconstruct: C,
     extract: R,
+    miss_policy: MissPolicy,
     on_miss: M,
 ) -> T
 where
@@ -3662,6 +3937,7 @@ where
                         &obs.spec,
                         &boundary_args,
                         Some(&obs.identity),
+                        miss_policy,
                     ) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
@@ -3755,6 +4031,7 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -3777,6 +4054,7 @@ where
                 }
                 ExecuteMode::Lookup => {
                     match obs.hook.try_replay_with_context(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -3838,6 +4116,7 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -3860,6 +4139,7 @@ where
                 }
                 ExecuteMode::Lookup => {
                     match obs.hook.try_replay_with_context(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -5353,6 +5633,7 @@ mod tests {
                 observed_result: None,
                 provenance: crate::Provenance::Shadow,
                 seed_gap: false,
+                absorbed: false,
             }))
         }
         fn execute_shadow_observe(
@@ -5916,6 +6197,41 @@ mod tests {
         assert_eq!(obs.correlation_id.as_deref(), Some("req-1"));
     }
 
+    /// An absent-executor stop is only useful if the guard can classify it, so
+    /// it must carry the sentinel; and it is only readable if it names the
+    /// target the missing executor would have addressed. Both are the halves of
+    /// a contract that lives in two places, so both are asserted here.
+    #[test]
+    fn fail_stop_absent_executor_carries_sentinel_and_names_target() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            fail_stop_absent_executor("grpc", "decide_gateway", "dynamo:8000")
+        });
+        std::panic::set_hook(prev);
+
+        let payload = result.expect_err("a boundary with no executor must fail-stop");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        assert!(
+            msg.starts_with(FAIL_STOP_SENTINEL),
+            "the stop must carry the sentinel or `catch_fail_stop` re-raises it as a bug \
+             panic instead of scoring it (got: {msg:?})"
+        );
+        assert!(
+            msg.contains("dynamo:8000"),
+            "the stop must name the target the absent executor would have addressed \
+             (got: {msg:?})"
+        );
+        assert!(
+            msg.contains("grpc") && msg.contains("decide_gateway"),
+            "the stop must identify the boundary (got: {msg:?})"
+        );
+    }
+
     /// The execute-shadow observer firewall is loud, never silent: a
     /// non-panicking observer runs exactly once, and a panicking observer
     /// RE-RAISES (after a diagnostic) instead of letting the dispatch arm
@@ -5983,5 +6299,116 @@ mod tests {
 
         rx.recv_timeout(std::time::Duration::from_secs(1))
             .expect("fork spawn did not run immediately like tokio::spawn");
+    }
+}
+
+#[cfg(test)]
+mod reply_canon_merge_tests {
+    use super::*;
+
+    fn canon(id: &str) -> CanonRef {
+        CanonRef::new(id)
+    }
+
+    /// PROPERTY: an undeclared site whose output derives nothing records exactly
+    /// what it did before the per-event slot existed — `None`, not an empty
+    /// declaration.
+    #[test]
+    fn nothing_derived_leaves_the_declaration_untouched() {
+        assert_eq!(declaration_with_reply_canon(None, None), None);
+        let empty = BoundaryDeclaration::default();
+        assert_eq!(declaration_with_reply_canon(Some(empty), None), None);
+        let declared = BoundaryDeclaration::default().effect(EffectKind::Redis);
+        assert_eq!(
+            declaration_with_reply_canon(Some(declared.clone()), None),
+            Some(declared)
+        );
+    }
+
+    /// A site that declared nothing gets a declaration carrying only the
+    /// derived clause.
+    #[test]
+    fn a_derived_canon_on_an_undeclared_site_becomes_the_declaration() {
+        let got = declaration_with_reply_canon(None, Some(canon("bag:$.value[]")))
+            .expect("a declaration");
+        assert_eq!(
+            got.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("bag:$.value[]")
+        );
+        assert!(got.effect.is_none() && got.state_canon.is_none());
+    }
+
+    /// The static clause comes first, the derived one is appended — the clause
+    /// grammar the comparator parses, and the reader sees the static declaration
+    /// where it always was.
+    #[test]
+    fn a_derived_canon_is_appended_to_the_sites_static_clause() {
+        let site = BoundaryDeclaration::default()
+            .effect(EffectKind::Redis)
+            .reply_canon(canon("project:!created_at"));
+        let got = declaration_with_reply_canon(Some(site), Some(canon("bag:$.value[]")))
+            .expect("a declaration");
+        assert_eq!(
+            got.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("project:!created_at;bag:$.value[]")
+        );
+        assert_eq!(
+            got.effect,
+            Some(EffectKind::Redis),
+            "the rest of the static declaration survives"
+        );
+    }
+
+    /// A blank static canon is not a clause; appending to it would produce a
+    /// leading `;`, which the parser would skip but a reader would not.
+    #[test]
+    fn a_blank_static_canon_is_replaced_not_appended_to() {
+        let site = BoundaryDeclaration::default().reply_canon(canon("   "));
+        let got = declaration_with_reply_canon(Some(site), Some(canon("bag:$.value[]")))
+            .expect("a declaration");
+        assert_eq!(
+            got.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("bag:$.value[]")
+        );
+    }
+
+    /// The whole path: a RecordedOutput carrying a canon reaches the event's
+    /// declaration through `finish_recorded`, composed with the site's own.
+    #[test]
+    fn finish_recorded_stamps_the_output_canon_onto_the_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = RecordingHook::new(dir.path()).expect("recording hook");
+        let builder = EventBuilder::start(
+            &hook,
+            "db",
+            "T",
+            "filter",
+            std::panic::Location::caller(),
+            serde_json::json!({ "sql": "SELECT 1" }),
+        )
+        .with_semantics(BoundarySemantics {
+            replay_strategy: ReplayStrategy::Execute,
+            kind: None,
+            declaration: Some(BoundaryDeclaration::default().effect(EffectKind::Db)),
+        });
+        let output = RecordedOutput::new(serde_json::json!({ "value": [2, 1] }), false)
+            .with_reply_canon(canon("bag:$.value[]"));
+        builder.finish_recorded(&hook, output);
+        hook.flush().expect("flush");
+
+        let events = read_events(dir.path()).expect("events");
+        assert_eq!(events.len(), 1);
+        let declaration = events[0].declaration.as_ref().expect("declared");
+        assert_eq!(
+            declaration.effect,
+            Some(EffectKind::Db),
+            "the static half survives"
+        );
+        assert_eq!(
+            declaration.reply_canon.as_ref().map(|c| c.id.as_str()),
+            Some("bag:$.value[]")
+        );
+        // Marked, never sorted.
+        assert_eq!(events[0].result, serde_json::json!({ "value": [2, 1] }));
     }
 }

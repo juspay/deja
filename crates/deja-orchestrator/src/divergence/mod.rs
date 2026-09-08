@@ -10,7 +10,8 @@
 //! Classification (V1):
 //!   - resolved hit                         → matched (recorded per address rank)
 //!   - resolved only at rank 6 (sequence)   → Recovered (fragility flag)
-//!   - candidate call with no table hit     → NovelCall (blocking)
+//!   - candidate call with no table hit     → NovelCall (reported, not scored)
+//!     …absorbed by a declared `on_miss`     → NovelCallAbsorbed (request survived)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!     …after a truncated recording tail    → InconclusiveTailGap (inconclusive)
@@ -196,8 +197,27 @@ pub struct Summary {
     /// several — so the two are deliberately not the same number.
     pub http_body_mismatches: u64,
     /// Every blocking side-effect divergence:
-    /// `omitted_calls + novel_calls + value_divergences + identity_skews`.
+    /// `omitted_calls + value_divergences`.
+    ///
+    /// This counter is a statement about the calls the RECORDING HOLDS — whether
+    /// each still happened, with the same args, to the same result. Three things
+    /// are deliberately not terms, for one reason each:
+    ///
+    /// - `novel_calls` and `absorbed_misses` are calls the candidate ADDED, and
+    ///   an addition says nothing about that set.
+    /// - `identity_skews` is a disagreement about pairing ORDER between two
+    ///   methods that both resolved every call; a content difference is counted
+    ///   under `value_divergences` instead.
     pub side_effect_divergences: u64,
+    /// Misses the REQUEST SURVIVED: a boundary declared `on_miss`, the declared
+    /// value was returned, and the correlation continued on an answer the
+    /// recording never held.
+    ///
+    /// Projection of `per_boundary[*].kinds["NovelCallAbsorbed"]`, and it has to
+    /// be a projection: a kind with no folded summary field never reaches the
+    /// headline and is invisible in practice however carefully it is counted.
+    #[serde(default)]
+    pub absorbed_misses: u64,
     pub matched_side_effect_calls: u64,
     /// BLOCKING omissions: recorded calls the candidate never made, on a
     /// correlated, blocking boundary. These are what the verdict acts on.
@@ -387,8 +407,27 @@ pub struct CorrelationOutcome {
     /// one. `passed` is false whenever this is true.
     #[serde(default)]
     pub inconclusive: bool,
+    /// How many misses this correlation ABSORBED. Everything it did after the
+    /// first one ran on a value the recording never held, which is a fact about
+    /// how much this correlation's verdict is worth and belongs beside it.
+    #[serde(default)]
+    pub absorbed_misses: u64,
     pub passed: bool,
 }
+
+/// The verdict reason [`detect`] gives a run that ingested no artifacts at all.
+///
+/// A shared `const` rather than a literal on each side, because the scorecard
+/// ENDPOINT matches on it to decide whether to add the run's own terminal state
+/// to the reason. A sentinel string spelled once by its producer and again by
+/// its consumer is the drift this repo keeps writing defenses against; there is
+/// one spelling and both sides read it from here.
+///
+/// It deliberately does NOT say "yet". Whether more artifacts are still coming
+/// is a fact about the RUN, and [`detect`] is handed only the artifacts — it
+/// cannot see the run at all. The word was asserting a transience nobody had
+/// checked, on runs that had already failed an hour earlier.
+pub const NO_ARTIFACTS_REASON: &str = "no artifacts ingested for this run";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
@@ -460,6 +499,7 @@ impl Scorecard {
             &["OmittedCallTolerated"],
         );
         folds("novel_calls", s.novel_calls, &["NovelCall", "NovelSubtree"]);
+        folds("absorbed_misses", s.absorbed_misses, &["NovelCallAbsorbed"]);
         folds(
             "novel_calls_tolerated",
             s.novel_calls_tolerated,
@@ -535,10 +575,31 @@ impl Scorecard {
         // The headline number: every blocking side-effect divergence, and
         // nothing else. A demotion that stopped excluding itself here would show
         // up as a verdict nobody could account for from the breakdown.
-        let blocking = s.omitted_calls + s.novel_calls + s.value_divergences + s.identity_skews;
+        //
+        // Neither `novel_calls` NOR `absorbed_misses` is a term. The headline is
+        // a statement about the calls the recording holds — omitted, re-keyed, or
+        // answered differently. Both of those are calls the candidate ADDED, and
+        // an addition says nothing about that set.
+        //
+        // Absorbed misses leave with novel ones deliberately. An absorbed miss is
+        // a novel call the process SURVIVED, so it cannot be the more serious of
+        // the two: charging it while an unabsorbed novel call goes free would say
+        // a miss that killed nothing costs more than one that did. What an
+        // absorbed miss does cost is CONFIDENCE — the correlation continued on a
+        // value the recording never held — and that is a statement about what the
+        // run is a verdict over, which belongs in the coverage stamp beside
+        // `recording_coverage`, not in a divergence counter. `absorbed_misses`
+        // and `CorrelationOutcome::absorbed_misses` carry the fact; nothing yet
+        // spends it, and that is the follow-up.
+        //
+        // `identity_skews` is not a term either, and for a different reason: a
+        // skew is a disagreement about pairing ORDER between two methods that
+        // both resolved every call, so it cannot be hiding a content difference —
+        // that would be counted under `value_divergences`.
+        let blocking = s.omitted_calls + s.value_divergences;
         if s.side_effect_divergences != blocking {
             out.push(format!(
-                "summary.side_effect_divergences = {}, but omitted + novel + value + identity = {blocking}",
+                "summary.side_effect_divergences = {}, but omitted + value = {blocking}",
                 s.side_effect_divergences
             ));
         }
@@ -610,6 +671,10 @@ pub struct RunArtifacts {
     /// The run's declared instrumentation contract (`RunSpec::scored_span_namespaces`),
     /// read off `run.json` at load. Empty = no span-shape check.
     pub scored_span_namespaces: Vec<String>,
+    /// Reply canons the run's SYSTEM declares per boundary, resolved from its
+    /// declaration at load. Empty = the recorder's declaration is the whole
+    /// canon, which is the behaviour for a system that declares nothing.
+    pub reply_canons: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<String>,
 }
 
@@ -1751,6 +1816,10 @@ trait Canon {
 enum CanonPreset {
     Sequence,
     Bag,
+    /// `bag:` with paths — those collections carry no order; the rest of the
+    /// body is compared as usual. Bare `bag` stays whole-body (`Bag`), so every
+    /// string recorded before clauses existed keeps its meaning exactly.
+    BagPaths(Vec<String>),
     FinalState,
     AbsentAfter,
     Project {
@@ -1764,6 +1833,7 @@ impl Canon for CanonPreset {
         match self {
             Self::Sequence => "sequence",
             Self::Bag => "bag",
+            Self::BagPaths(_) => "bag",
             Self::FinalState => "final_state",
             Self::AbsentAfter => "absent_after",
             Self::Project { .. } => "project",
@@ -1774,6 +1844,9 @@ impl Canon for CanonPreset {
         match self {
             Self::Sequence => recorded == observed,
             Self::Bag => bag_canon(recorded) == bag_canon(observed),
+            // A per-path clause makes no whole-body claim; it is consulted per
+            // difference, not here.
+            Self::BagPaths(_) => false,
             Self::FinalState => final_state_canon(recorded) == final_state_canon(observed),
             Self::AbsentAfter => {
                 let recorded_reply = delete_reply(&Some(recorded.clone()));
@@ -1790,8 +1863,48 @@ impl Canon for CanonPreset {
     }
 }
 
+/// Every clause of a canon declaration. A declaration is one or more clauses
+/// separated by `;` — `project:!created_at;bag:$.a[]`. A string with no `;`
+/// is a one-clause list whose meaning is exactly what it was before clauses
+/// existed, which is what keeps every recorded declaration valid.
+fn canon_clauses(canon: Option<&deja::CanonRef>) -> Vec<CanonPreset> {
+    let Some(id) = canon.map(|c| c.id.trim()) else {
+        return Vec::new();
+    };
+    id.split(';')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .filter_map(parse_canon_clause)
+        .collect()
+}
+
+fn parse_canon_clause(id: &str) -> Option<CanonPreset> {
+    if let Some(raw) = id.strip_prefix("bag:") {
+        let paths: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(canonical_set_path)
+            .collect();
+        // `bag:` naming nothing is the whole-body preset, not an empty clause.
+        return Some(if paths.is_empty() {
+            CanonPreset::Bag
+        } else {
+            CanonPreset::BagPaths(paths)
+        });
+    }
+    resolve_canon_preset(id)
+}
+
+/// A declaration read as ONE preset. Production readers now go through
+/// [`canon_clauses`], which understands `;` and `bag:`; this stays for the
+/// preset-parser tests, which exercise the single-preset grammar directly.
+#[cfg(test)]
 fn resolve_canon(canon: Option<&deja::CanonRef>) -> Option<CanonPreset> {
-    let id = canon?.id.trim();
+    resolve_canon_preset(canon?.id.trim())
+}
+
+fn resolve_canon_preset(id: &str) -> Option<CanonPreset> {
     match id {
         "sequence" => Some(CanonPreset::Sequence),
         "bag" => Some(CanonPreset::Bag),
@@ -1805,20 +1918,134 @@ fn resolve_canon(canon: Option<&deja::CanonRef>) -> Option<CanonPreset> {
     }
 }
 
-fn event_state_canon(ev: &deja::BoundaryEvent) -> Option<CanonPreset> {
-    resolve_canon(ev.declaration.as_ref()?.state_canon.as_ref())
+/// Every clause of the event's state canon, then — only if there are none —
+/// every clause of its reply canon. The precedence is the one the single-preset
+/// reader always had (state shadows reply); what changed is that a declaration
+/// is read as the clause list it is, so a recorder-stamped `bag:$.value[]`
+/// appended to a site's static clause resolves instead of falling through
+/// `parse_project_canon` to `None`.
+fn event_value_clauses(ev: &deja::BoundaryEvent) -> Vec<CanonPreset> {
+    let Some(declaration) = ev.declaration.as_ref() else {
+        return Vec::new();
+    };
+    let state = canon_clauses(declaration.state_canon.as_ref());
+    if !state.is_empty() {
+        return state;
+    }
+    canon_clauses(declaration.reply_canon.as_ref())
 }
 
 fn event_reply_canon(ev: &deja::BoundaryEvent) -> Option<CanonPreset> {
-    resolve_canon(ev.declaration.as_ref()?.reply_canon.as_ref())
+    canon_clauses(ev.declaration.as_ref()?.reply_canon.as_ref())
+        .into_iter()
+        .next()
 }
 
+/// The names of every reply clause, `;`-joined — one clause reads exactly as it
+/// did before clauses existed.
 pub(crate) fn event_reply_canon_kind(ev: &deja::BoundaryEvent) -> Option<String> {
-    event_reply_canon(ev).map(|canon| canon.preset_name().to_owned())
+    let names: Vec<String> = canon_clauses(ev.declaration.as_ref()?.reply_canon.as_ref())
+        .iter()
+        .map(|clause| clause.preset_name().to_owned())
+        .collect();
+    (!names.is_empty()).then(|| names.join(";"))
 }
 
-fn event_value_canon(ev: &deja::BoundaryEvent) -> Option<CanonPreset> {
-    event_state_canon(ev).or_else(|| event_reply_canon(ev))
+/// Sort the arrays a `bag:` clause names, IN PLACE, and count how many the path
+/// actually reached. Non-recursive on purpose: the clause says the members of
+/// THIS collection carry no order; arrays inside a member keep theirs, because
+/// nothing said otherwise about them.
+///
+/// The count is the guard against a clause that names nothing: a path that
+/// resolves on neither side sorts nothing, and "both sides unchanged" must not
+/// be read as "both sides equivalent under the clause".
+fn sort_declared_bags(value: &mut serde_json::Value, path: &str) -> usize {
+    fn walk(value: &mut serde_json::Value, segments: &[&str]) -> usize {
+        let Some((head, rest)) = segments.split_first() else {
+            return match value {
+                serde_json::Value::Array(items) => {
+                    sort_as_bag(items);
+                    1
+                }
+                _ => 0,
+            };
+        };
+        let (key, each) = match head.strip_suffix("[]") {
+            Some(key) => (key, true),
+            None => (*head, false),
+        };
+        let Some(next) = value.get_mut(key) else {
+            return 0;
+        };
+        if each {
+            match next {
+                serde_json::Value::Array(items) => {
+                    items.iter_mut().map(|item| walk(item, rest)).sum()
+                }
+                _ => 0,
+            }
+        } else {
+            walk(next, rest)
+        }
+    }
+    let normalised = canonical_set_path(path);
+    let trimmed = normalised.strip_prefix("$.").unwrap_or(&normalised);
+    if trimmed.is_empty() || trimmed == "$" {
+        return match value {
+            serde_json::Value::Array(items) => {
+                sort_as_bag(items);
+                1
+            }
+            _ => 0,
+        };
+    }
+    let segments: Vec<&str> = trimmed.split('.').collect();
+    walk(value, &segments)
+}
+
+/// Two matched values under a `bag:` clause with paths: equal once every named
+/// collection is sorted on both sides, and nothing else is touched.
+///
+/// Equality is on the WHOLE value, which is what refuses a change of shape: a
+/// path present on one side and absent on the other leaves an array facing a
+/// missing key or a scalar, and no amount of sorting makes those equal. A rule
+/// that compared the reached counts was tried and could not be killed by any
+/// mutation — it duplicated what equality already guaranteed — so it is not
+/// here. The counts [`sort_declared_bags`] returns are for the tests, which use
+/// them to prove a path was reached and a sort did work before trusting an
+/// equivalence.
+fn bag_paths_equivalent(
+    paths: &[String],
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    let mut recorded = recorded.clone();
+    let mut observed = observed.clone();
+    for path in paths {
+        sort_declared_bags(&mut recorded, path);
+        sort_declared_bags(&mut observed, path);
+    }
+    recorded == observed
+}
+
+/// Does any clause the event declares make these two values equivalent?
+///
+/// Per-path `bag:` clauses are the one preset [`Canon::equivalent`] cannot
+/// answer alone (it returns `false` for them by design — "consulted per
+/// difference, not here"), so they are answered here by sorting the named
+/// collections. Routing a composed declaration to this function WITHOUT that
+/// per-path answer would be worse than not routing it: the clause would resolve,
+/// `equivalent` would refuse it unconditionally, and a correctly stamped
+/// recorder declaration would start manufacturing divergences.
+fn declared_clauses_equivalent(
+    clauses: &[CanonPreset],
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    clauses.iter().any(|clause| match clause {
+        CanonPreset::BagPaths(paths) => bag_paths_equivalent(paths, recorded, observed),
+        other => declared_value_equivalent(other, recorded, observed),
+    })
 }
 
 fn declared_value_equivalent(
@@ -1934,16 +2161,75 @@ fn update_returning_equivalent(
             )
 }
 
-pub(crate) fn values_diverge_under_event(
+/// `boundary::method` — how an absorbed matched call is named on the scorecard.
+fn call_site_label(obs: &ObservedCall) -> String {
+    format!("{}::{}", obs.boundary, obs.method_name)
+}
+
+/// Who said the order of a matched call's args or result carries no meaning.
+///
+/// Two variants, deliberately not [`ClauseSource`]: on this path only a clause
+/// the RECORDER stamped or the order-blind DEFAULT can decide, because the
+/// per-system document declares reply canons for the HTTP reply and is not
+/// consulted for matched calls. Reusing the four-variant type would put two
+/// arms in every match that cannot fire, and a reader would take "documents are
+/// handled here" from their presence. The labels ARE shared with
+/// `ClauseSource` — `recorder`, `default` — so a consumer aggregating
+/// absorptions across both engines reads one vocabulary; a test pins that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueCanonSource {
+    /// A `bag` clause on the recorded event — stamped by the codec from the
+    /// boundary's own contract, or declared statically at the site.
+    Recorder,
+    /// No clause: order carries no meaning unless a path says otherwise (#102).
+    Default,
+}
+
+impl ValueCanonSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recorder => "recorder",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Why two matched values that are not equal were not counted as a divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueAbsorption {
+    /// An order-only difference, forgiven by a clause or by the default. THIS
+    /// is the number the strict flip waits on: when the default goes, every
+    /// `Default` here becomes a divergence and every `Recorder` stays green.
+    Canon(ValueCanonSource),
+    /// A db-boundary equivalence that describes the two databases rather than
+    /// the candidate: a replay-local SERIAL, an error's diagnostic text, an
+    /// `UPDATE … RETURNING` whose returned rows the statement itself explains.
+    DbInfrastructure,
+}
+
+/// The comparison of a matched call's recorded and observed values, with its
+/// reason. Callers that only need the bool use [`values_diverge_under_event`];
+/// callers that need to SAY why a difference stopped counting use this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueVerdict {
+    Equal,
+    Absorbed(ValueAbsorption),
+    Diverged,
+}
+
+fn value_verdict(
     boundary: &str,
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
     event: Option<&deja::BoundaryEvent>,
     observed_sql: Option<&str>,
-) -> bool {
-    if let Some(canon) = event.and_then(event_value_canon) {
-        if declared_value_equivalent(&canon, recorded, observed) {
-            return false;
+) -> ValueVerdict {
+    if recorded == observed {
+        return ValueVerdict::Equal;
+    }
+    if let Some(event) = event {
+        if declared_clauses_equivalent(&event_value_clauses(event), recorded, observed) {
+            return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Recorder));
         }
     }
     if is_db_boundary(boundary)
@@ -1957,27 +2243,70 @@ pub(crate) fn values_diverge_under_event(
                 observed,
             ))
     {
-        return false;
+        return ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure);
     }
-    recorded != observed
+    // An order-only difference is not a divergence. The recorded and observed
+    // values hold the identical multiset, so nothing was added, removed or
+    // changed — only the order a collection was iterated in, which for a
+    // `HashSet` or `HashMap` is seeded per process and carries no information.
+    // Same rule as the response body, and it has to be the same rule: a
+    // permutation absorbed in one and blocking in the other is one fact with
+    // two answers depending on where it happened to be compared.
+    if json_order_only_difference(recorded, observed) {
+        return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
+    }
+    ValueVerdict::Diverged
 }
 
+/// Whether a matched call's values diverge — the bool a caller that only routes
+/// on the outcome needs. A caller that has to REPORT why a difference did not
+/// count must use [`value_verdict`] instead: taking this bool because it is
+/// here is how a reason gets discarded on the way to the scorecard.
+pub(crate) fn values_diverge_under_event(
+    boundary: &str,
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+    event: Option<&deja::BoundaryEvent>,
+    observed_sql: Option<&str>,
+) -> bool {
+    matches!(
+        value_verdict(boundary, recorded, observed, event, observed_sql),
+        ValueVerdict::Diverged
+    )
+}
+
+/// [`value_verdict`] for an execute-shadow observed call against its recorded
+/// baseline; `None` when the call carries no pair to compare (not resolved, not
+/// a shadow, or a side missing).
+fn observed_value_verdict(
+    obs: &ObservedCall,
+    event: Option<&deja::BoundaryEvent>,
+) -> Option<ValueVerdict> {
+    if !obs.resolved || obs.provenance != deja::Provenance::Shadow {
+        return None;
+    }
+    match (&obs.recorded_result, &obs.observed_result) {
+        (Some(recorded), Some(observed)) => Some(value_verdict(
+            &obs.boundary,
+            recorded,
+            observed,
+            event,
+            obs.args.get("sql").and_then(serde_json::Value::as_str),
+        )),
+        _ => None,
+    }
+}
+
+/// See [`values_diverge_under_event`] for why a caller needing the reason must
+/// not take this bool.
 pub(crate) fn observed_value_diverged(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
 ) -> bool {
-    obs.resolved
-        && obs.provenance == deja::Provenance::Shadow
-        && match (&obs.recorded_result, &obs.observed_result) {
-            (Some(recorded), Some(observed)) => values_diverge_under_event(
-                &obs.boundary,
-                recorded,
-                observed,
-                event,
-                obs.args.get("sql").and_then(serde_json::Value::as_str),
-            ),
-            _ => false,
-        }
+    matches!(
+        observed_value_verdict(obs, event),
+        Some(ValueVerdict::Diverged)
+    )
 }
 
 fn is_unit_value(value: &serde_json::Value) -> bool {
@@ -2642,7 +2971,8 @@ fn observed_end_timestamp_ns(obs: &ObservedCall) -> u64 {
 
 /// Whether an observed call ran inside a spawned fork region — a non-root
 /// lineage bucket minted by the correlation layer for a `deja.fork` span. Such
-/// buckets are `{parent}::fork-{seq}`, so their id carries the `::fork-` marker.
+/// buckets are `{parent}::fork-{site}-{seq}`, so their id carries the `::fork-`
+/// marker. Only the marker is read here; the shape of the rest is the layer's.
 /// Fork regions are unordered relative to the request's synchronous path.
 fn is_fork_region(obs: &ObservedCall) -> bool {
     obs.bucket_id
@@ -2848,14 +3178,146 @@ fn http_incoming_events_by_correlation(
 /// path the exclude list names. Neither can fire on a projection that resolved
 /// nothing on both sides: `Projection::agrees_with` refuses that comparison, so
 /// an inapplicable canon leaves every difference blocking.
-fn http_diff_absorbed_by_reply_canon(
+/// The document's clauses for one boundary, parsed. Empty when the system
+/// declares none, which is every system until a deployment writes one.
+fn document_clauses_for(
+    reply_canons: &std::collections::BTreeMap<String, String>,
+    boundary: &str,
+) -> Vec<CanonPreset> {
+    reply_canons
+        .get(boundary)
+        .map(|raw| canon_clauses(Some(&deja::CanonRef::new(raw.as_str()))))
+        .unwrap_or_default()
+}
+
+/// Which source supplied the clause that governed a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseSource {
+    /// No declaration: order carries no meaning unless a path says otherwise.
+    Default,
+    Recorder,
+    Document,
+    /// Both named it identically — the document entry is now redundant and can
+    /// be deleted, which is how a deployment learns the vendor declaration has
+    /// landed.
+    Both,
+}
+
+impl ClauseSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Recorder => "recorder",
+            Self::Document => "document",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// What the composed canon says about one difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonVerdict {
+    /// No clause governs it; classify as usual.
+    NotGoverned,
+    Absorbed(ClauseSource),
+    /// Both sources named the path with DIFFERENT clauses. Never absorbed — a
+    /// disagreement about what a path means must not decide that a difference
+    /// does not exist.
+    Conflict,
+}
+
+/// Whether a `project` clause in these excludes the path a difference sits at —
+/// the clause type that can disagree with a `bag` clause about one path.
+///
+/// Asks the EXISTING project matcher rather than comparing normalised strings:
+/// a project exclusion is written as a field name and matched by rules of its
+/// own, so a second normalisation here would answer a different question from
+/// the one the absorber answers.
+fn project_clause_excludes(clauses: &[CanonPreset], json_path: &str) -> bool {
+    clauses.iter().any(|clause| match clause {
+        CanonPreset::Project { exclude, .. } => {
+            http_project_excludes_json_diff_path(exclude, json_path)
+        }
+        _ => false,
+    })
+}
+
+/// Paths a `bag` clause names as sets.
+fn bag_clause_paths(clauses: &[CanonPreset]) -> Vec<String> {
+    clauses
+        .iter()
+        .filter_map(|c| match c {
+            CanonPreset::BagPaths(paths) => Some(paths.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// The composed canon's verdict on one body difference: the recorder's clauses
+/// and the document's clauses over one boundary, merged per PATH. The document
+/// is a second contributor, not a fallback — a fallback would never be
+/// consulted, because the only HTTP ingress boundary already carries a
+/// declaration.
+fn canon_verdict_for(
     diff: &HttpDiff,
     recorded_http: Option<&deja::BoundaryEvent>,
     body: &JsonFieldDiff,
+    document_clauses: &[CanonPreset],
+) -> CanonVerdict {
+    let recorder_clauses: Vec<CanonPreset> = recorded_http
+        .and_then(|ev| ev.declaration.as_ref())
+        .map(|d| canon_clauses(d.reply_canon.as_ref()))
+        .unwrap_or_default();
+    if recorder_clauses.is_empty() && document_clauses.is_empty() {
+        return CanonVerdict::NotGoverned;
+    }
+    let path = canonical_set_path(&body.json_path);
+    let (rec_bags, doc_bags) = (
+        bag_clause_paths(&recorder_clauses),
+        bag_clause_paths(document_clauses),
+    );
+    let (in_rec, in_doc) = (
+        rec_bags.iter().any(|p| p == &path),
+        doc_bags.iter().any(|p| p == &path),
+    );
+    if in_rec || in_doc {
+        // A path one source calls a set and the other excludes from comparison
+        // entirely is two different claims about it. Report, do not absorb.
+        let excluded_elsewhere = if in_doc {
+            project_clause_excludes(&recorder_clauses, &body.json_path)
+        } else {
+            project_clause_excludes(document_clauses, &body.json_path)
+        };
+        if excluded_elsewhere {
+            return CanonVerdict::Conflict;
+        }
+        // Absorb only what the existing test already proves is a permutation.
+        if !is_order_only_difference(body) {
+            return CanonVerdict::NotGoverned;
+        }
+        return CanonVerdict::Absorbed(match (in_rec, in_doc) {
+            (true, true) => ClauseSource::Both,
+            (true, false) => ClauseSource::Recorder,
+            _ => ClauseSource::Document,
+        });
+    }
+    // Whole-body clauses keep their existing meaning, and only the recorder can
+    // state one today.
+    for canon in &recorder_clauses {
+        if http_diff_absorbed_by_whole_body_canon(diff, canon, body) {
+            return CanonVerdict::Absorbed(ClauseSource::Recorder);
+        }
+    }
+    CanonVerdict::NotGoverned
+}
+
+fn http_diff_absorbed_by_whole_body_canon(
+    diff: &HttpDiff,
+    canon: &CanonPreset,
+    body: &JsonFieldDiff,
 ) -> bool {
-    let Some(canon) = recorded_http.and_then(event_reply_canon) else {
-        return false;
-    };
+    let canon = canon.clone();
     // `bag` is the generic declaration that a boundary's collections carry no
     // order, and it is the one place knowledge of a particular payload belongs:
     // stated by whoever owns the semantics, against the boundary it describes,
@@ -3232,6 +3694,21 @@ fn order_canonical_diff(
 /// Is this row an ordering difference — two arrays with identical members in a
 /// different order? Derived from the row itself, so it needs no flag threaded
 /// alongside it and cannot disagree with the values it describes.
+/// Whether two JSON values differ ONLY in the order of members inside some
+/// array — the multisets are identical, so no member was added, removed or
+/// changed and nothing but position moved.
+///
+/// THE test, shared by every comparison of two JSON values: response bodies and
+/// the args and results of a matched call. Those were separate paths, and a
+/// permutation was absorbed in one and reported as a value divergence in the
+/// other, for no reason other than which code reached it first.
+pub(crate) fn json_order_only_difference(
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    recorded != observed && bag_canon(recorded) == bag_canon(observed)
+}
+
 fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
     matches!(
         (&row.baseline, &row.candidate),
@@ -3258,6 +3735,41 @@ struct HttpBodyClassification {
     /// as blocking — they are named here so the report can SAY that a
     /// difference was ordering, not so it can stop reporting it.
     order_only_paths: Vec<String>,
+    /// Differences a reply-canon clause governed, with the source that supplied
+    /// it. Named and NOT counted as blocking.
+    canon_absorbed: Vec<(String, ClauseSource)>,
+    /// Paths the two sources described differently. Named AND still blocking —
+    /// a disagreement about what a path means must never decide that a
+    /// difference does not exist.
+    canon_conflicts: Vec<String>,
+}
+
+/// A JSON path reduced to the form a declaration is written in: every array
+/// index becomes `[]`, and a trailing `[]` is dropped so that
+/// `$.payment_methods_enabled` and `$.payment_methods_enabled[]` are the same
+/// declaration.
+///
+/// Forgiving on purpose. The canonical differ names a permuted array at the
+/// array's own path (`$.a`) and names a residue element positionally
+/// (`$.a[0].b`), so a deployment writing the array form with `[]` and a
+/// deployment writing it without would otherwise differ in whether their
+/// declaration was ever read — and a declaration that is silently never read is
+/// the failure this codebase keeps paying for.
+fn canonical_set_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut in_index = false;
+    for ch in path.chars() {
+        match ch {
+            '[' => {
+                in_index = true;
+                out.push_str("[]");
+            }
+            ']' => in_index = false,
+            _ if in_index => {}
+            _ => out.push(ch),
+        }
+    }
+    out.strip_suffix("[]").unwrap_or(&out).to_owned()
 }
 
 fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
@@ -3272,12 +3784,25 @@ fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
         .filter(|leaf| !leaf.is_empty() && *leaf != "$")
 }
 
+/// What a body difference is judged against that is the same for every diff in
+/// a run. Grouped so the next run-wide input is a field here rather than a
+/// fifth parameter at four call sites.
+#[derive(Clone, Copy)]
+struct BodyClassificationContext<'a> {
+    race: &'a InconclusiveRaceEvidence,
+    provenance: &'a CorrelationColumnProvenance,
+    /// Reply-canon clauses the SYSTEM DOCUMENT declares for this boundary, in
+    /// the same grammar the recorder mints. A second contributor to the
+    /// boundary's canon, not a fallback.
+    document_clauses: &'a [CanonPreset],
+}
+
 fn classify_http_body_diff(
     diff: &HttpDiff,
     recorded_http: Option<&deja::BoundaryEvent>,
-    race: &InconclusiveRaceEvidence,
-    provenance: &CorrelationColumnProvenance,
+    ctx: BodyClassificationContext<'_>,
 ) -> HttpBodyClassification {
+    let (race, provenance) = (ctx.race, ctx.provenance);
     if hidden_form_bodies_equivalent(diff) {
         return HttpBodyClassification::default();
     }
@@ -3285,14 +3810,27 @@ fn classify_http_body_diff(
     // Ordering is resolved BEFORE anything is classified, so every absorber
     // below sees the path a difference will be reported at rather than
     // whichever positions this run's ordering scattered it across.
+    let mut conflicted = false;
     let canonical = order_canonical_body_diff(diff);
     let rows = canonical.as_deref().unwrap_or(&diff.body_diff);
     for body in rows {
         // Existing explicit absorptions retain precedence over schema
         // provenance; one leaf is classified exactly once.
-        if http_diff_absorbed_by_reply_canon(diff, recorded_http, body)
-            || race.http_body_diff_attributable(&diff.correlation_id, body)
-        {
+        match canon_verdict_for(diff, recorded_http, body, ctx.document_clauses) {
+            CanonVerdict::Absorbed(source) => {
+                classification
+                    .canon_absorbed
+                    .push((body.json_path.clone(), source));
+                continue;
+            }
+            // Falls through to ordinary classification, so it still blocks.
+            CanonVerdict::Conflict => {
+                classification.canon_conflicts.push(body.json_path.clone());
+                conflicted = true;
+            }
+            CanonVerdict::NotGoverned => {}
+        }
+        if race.http_body_diff_attributable(&diff.correlation_id, body) {
             continue;
         }
         if json_diff_leaf_field(&body.json_path).is_some_and(|column| {
@@ -3303,6 +3841,20 @@ fn classify_http_body_diff(
                 .push(body.json_path.clone());
         } else {
             if is_order_only_difference(body) {
+                // Order carries no meaning unless this path says it does. The
+                // members are identical as a multiset, so nothing was added,
+                // removed or changed; what moved was the order a collection was
+                // iterated in, which for a hash-based collection is seeded per
+                // process and differs between two runs of one image.
+                // A conflicted path is never absorbed, by the default least of
+                // all: two sources disagreeing about what a path MEANS must not
+                // be settled by a rule that says nothing about it.
+                if !conflicted {
+                    classification
+                        .canon_absorbed
+                        .push((body.json_path.clone(), ClauseSource::Default));
+                    continue;
+                }
                 classification.order_only_paths.push(body.json_path.clone());
             }
             classification.blocking_leaf_count += 1;
@@ -3661,6 +4213,7 @@ fn http_clean_by_correlation(
     http_incoming_by_correlation: &HashMap<String, &deja::BoundaryEvent>,
     inconclusive_race: &InconclusiveRaceEvidence,
     column_provenance: &CorrelationColumnProvenance,
+    document_clauses: &[CanonPreset],
 ) -> HashMap<String, bool> {
     let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
     for diff in http_diffs {
@@ -3670,8 +4223,11 @@ fn http_clean_by_correlation(
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
-                inconclusive_race,
-                column_provenance,
+                BodyClassificationContext {
+                    race: inconclusive_race,
+                    provenance: column_provenance,
+                    document_clauses,
+                },
             )
             .blocking_leaf_count
                 == 0;
@@ -3772,6 +4328,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // and, beside them, the ones we could not confirm because the recorded
     // statement was missing, so an empty class says which cause applies.
     let mut schema_default_divergences = 0u64;
+    // Matched calls whose args/result differed by ordering alone and were not
+    // counted, keyed by call site and by who said the order carries no
+    // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
+    // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
+    let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
     // Race evidence needs to be discovered before HTTP body classification:
@@ -3795,8 +4356,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
-                &inconclusive_race,
-                &column_provenance,
+                BodyClassificationContext {
+                    race: &inconclusive_race,
+                    provenance: &column_provenance,
+                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                },
             )
             .blocking_leaf_count
                 > 0
@@ -3820,6 +4384,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             &http_incoming_by_correlation,
             &inconclusive_race,
             &column_provenance,
+            &document_clauses_for(&art.reply_canons, "http_incoming"),
         ),
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
@@ -3837,6 +4402,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut environmental_misses = 0u64;
     let mut blocking_side_effect = 0u64;
     let mut corr_side_effect: BTreeMap<String, u64> = BTreeMap::new();
+    // Absorbed misses, per correlation. Held apart from `corr_side_effect`
+    // because it answers a different question: not "did this correlation
+    // diverge" but "how much of what it did ran on values the recording never
+    // held".
+    let mut corr_absorbed: BTreeMap<String, u64> = BTreeMap::new();
 
     // PASS 1 — resolved calls claim their recorded events. The verdict must be
     // a function of the two SETS (recorded events × observed calls), never of
@@ -3869,22 +4439,35 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     tail_gap_correlations.insert(correlation_id.clone());
                 }
             } else {
+                // Shown, not scored — the graph tier's form of the same call the
+                // flat arm below makes. A novel subtree is added work, at a
+                // coarser granularity than a novel call and of the same kind, so
+                // it is counted and named and charged to nothing. See the note on
+                // the `NovelCall` arm.
                 stats.bump_kind("NovelSubtree");
-                blocking_side_effect += 1;
-                if let Some(correlation_id) = &obs.correlation_id {
-                    *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
-                }
             }
             continue;
         }
         if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
             let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            // ORDER, AND ONLY ORDER. A skew means both sides made the same
+            // calls and each one resolved to its own recorded event — the two
+            // PAIRING methods disagree about which goes with which. The lookup
+            // pairs by args and is order-independent; the graph aligner pairs
+            // structurally by position. Run the same work concurrently and the
+            // two disagree, which is the skew.
+            //
+            // A skew therefore cannot hide a content difference. Under Execute
+            // the candidate runs the real boundary and a differing result is
+            // `ValueDivergedOrigin`; under Substitute the recorded value is
+            // served and there is nothing to differ. Either way the mechanism
+            // that would catch content is elsewhere and still blocking.
+            //
+            // So this is the rule c7c8918 already established for arrays —
+            // "a permutation of an identical multiset is not a difference" —
+            // reaching graph pairing. Counted and named, charged to nothing.
             stats.bump_kind("IdentitySkew");
             identity_skews += 1;
-            blocking_side_effect += 1;
-            if let Some(correlation_id) = &obs.correlation_id {
-                *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
-            }
             consumed.extend(aligned_event);
             consumed.extend(served_event);
             continue;
@@ -3901,11 +4484,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // ValueDiverged (the args-aligned flavor — a READ, or a WRITE whose
             // operand did not change). The re-keyed WRITE whose operand DID change
             // misses args and is paired args-free in the Novel branch below.
-            let diverged = observed_value_diverged(
+            let verdict = observed_value_verdict(
                 obs,
                 obs.source_event_global_sequence
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::Canon(source))) = verdict {
+                stats.bump_kind("ValueCanonAbsorbed");
+                *value_canon_absorbed_seen
+                    .entry((call_site_label(obs), source.label()))
+                    .or_insert(0) += 1;
+            }
+            let diverged = matches!(verdict, Some(ValueVerdict::Diverged));
             if diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -4014,12 +4604,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     for (observed_index, obs) in deferred {
         if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
             let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            // Order only — see the note on the pass-1 arm.
             stats.bump_kind("IdentitySkew");
             identity_skews += 1;
-            blocking_side_effect += 1;
-            if let Some(correlation_id) = &obs.correlation_id {
-                *corr_side_effect.entry(correlation_id.clone()).or_insert(0) += 1;
-            }
             paired_consumed.extend(aligned_event);
             paired_consumed.extend(served_event);
             continue;
@@ -4074,14 +4661,20 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let value_diverged = order_mismatch
-                || values_diverge_under_event(
-                    &obs.boundary,
-                    &recorded_val,
-                    &observed_val,
-                    twin_event,
-                    obs.args.get("sql").and_then(serde_json::Value::as_str),
-                );
+            let verdict = value_verdict(
+                &obs.boundary,
+                &recorded_val,
+                &observed_val,
+                twin_event,
+                obs.args.get("sql").and_then(serde_json::Value::as_str),
+            );
+            if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
+                stats.bump_kind("ValueCanonAbsorbed");
+                *value_canon_absorbed_seen
+                    .entry((call_site_label(obs), source.label()))
+                    .or_insert(0) += 1;
+            }
+            let value_diverged = order_mismatch || matches!(verdict, ValueVerdict::Diverged);
             if value_diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -4164,12 +4757,51 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             if let Some(corr) = &obs.correlation_id {
                 tail_gap_correlations.insert(corr.clone());
             }
-        } else {
-            stats.bump_kind("NovelCall");
-            blocking_side_effect += 1;
+        } else if obs.absorbed {
+            // A miss the REQUEST SURVIVED: the boundary declared `on_miss`, the
+            // declared value was returned, and everything after it in this
+            // correlation ran on an answer the recording never held.
+            //
+            // Named apart from `NovelCall` for the reason `NovelCallTolerated`
+            // is: it is a different thing, not a different count of the same
+            // thing. A reader deciding whether to trust a clean-looking body diff
+            // has to be able to see that the run continued on a supplied value —
+            // and it is invisible everywhere else, because the observation is
+            // written before the seam reaches its miss branch and carries
+            // `resolved: false` and `Provenance::Recorded` either way.
+            //
+            // Blocking treatment is deliberately UNCHANGED here: this change
+            // makes absorption visible, it does not decide what a novel call
+            // costs. That question is its own change.
+            // Charged to nothing, for the same reason an unabsorbed novel call
+            // is: it is a call the candidate ADDED. It cannot be the more serious
+            // of the two — the process survived this one — so charging it while
+            // the other goes free would say a miss that killed nothing costs more
+            // than one that did.
+            //
+            // What it costs is CONFIDENCE, not a divergence: the correlation
+            // carried on using a value the recording never held. `absorbed_misses`
+            // here and on the correlation is what carries that, and spending it
+            // belongs in the coverage stamp rather than in this counter.
+            stats.bump_kind("NovelCallAbsorbed");
             if let Some(corr) = &obs.correlation_id {
-                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+                *corr_absorbed.entry(corr.clone()).or_insert(0) += 1;
             }
+        } else {
+            // SHOWN, NOT SCORED. A candidate that calls something the recording
+            // never held has ADDED a call, and adding one is what a change is —
+            // it is not evidence that anything which WAS there behaves
+            // differently. The verdict is a statement about the matched set: of
+            // the calls the recording holds, did the args and the results still
+            // agree. An insertion says nothing about that set, so it is counted
+            // and named on the scorecard and charged to nothing.
+            //
+            // What this deliberately gives up: a novel WRITE is an effect the
+            // baseline never produced, and after this it no longer fails a
+            // correlation on its own. That is a real gap, and the fix for it is
+            // to classify by the declared `OperationKind` already on the event —
+            // not to keep failing every novel read to catch it.
+            stats.bump_kind("NovelCall");
         }
     }
 
@@ -4232,6 +4864,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let novel_calls =
         kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
+    let absorbed_misses = kind_total(&per_boundary, "NovelCallAbsorbed");
     let inconclusive_tail_gaps = kind_total(&per_boundary, "InconclusiveTailGap");
 
     // --- post-finalization correlated work warnings --------------------------
@@ -4257,6 +4890,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // Counted as divergences like any other body difference; named separately
     // so the report can say WHAT KIND of difference it was.
     let mut order_only_response_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    // Differences a reply-canon clause governed, keyed by path and the source
+    // that supplied the clause. A deployment reads this to see that its
+    // document entry is doing something — and, once the source reads `both`,
+    // that the entry is redundant and can go.
+    let mut canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut canon_conflict_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -4276,8 +4915,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let body_classification = classify_http_body_diff(
                 diff,
                 recorded_http,
-                &inconclusive_race,
-                &column_provenance,
+                BodyClassificationContext {
+                    race: &inconclusive_race,
+                    provenance: &column_provenance,
+                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                },
             );
             let blocking_body_diffs = body_classification.blocking_leaf_count;
             if diff.status_match && blocking_body_diffs == 0 {
@@ -4300,6 +4942,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             for path in body_classification.order_only_paths {
                 *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for (path, source) in body_classification.canon_absorbed {
+                stats.bump_kind("ReplyCanonAbsorbed");
+                *canon_absorbed_seen
+                    .entry((path, source.label()))
+                    .or_insert(0) += 1;
+            }
+            for path in body_classification.canon_conflicts {
+                *canon_conflict_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -4407,6 +5058,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             alignment: graph_plan.scored_alignment(corr, graph_value_nodes.get(corr)),
             span_shape: span_shapes.remove(corr),
             inconclusive,
+            absorbed_misses: corr_absorbed.get(corr).copied().unwrap_or(0),
             passed,
         });
     }
@@ -4425,8 +5077,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     if omitted_calls > 0 {
         reasons.push(format!("{omitted_calls} omitted side-effect call(s)"));
     }
+    // Reported, non-blocking. A novel call is one the candidate ADDED, and the
+    // verdict is a statement about the calls the recording holds — whether each
+    // still happened, with the same args, to the same result. Adding a call is
+    // what a change IS, so failing on it fails every candidate that does the
+    // thing it was written to do, and a verdict that cries wolf on every real PR
+    // stops being read.
     if novel_calls > 0 {
-        reasons.push(format!("{novel_calls} novel side-effect call(s)"));
+        reasons.push(format!(
+            "{novel_calls} novel side-effect call(s) (non-blocking)"
+        ));
     }
     if value_divergences > 0 {
         // The total-derivative catch: a real-boundary value diff flips the
@@ -4434,8 +5094,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // `corr_side_effect`).
         reasons.push(format!("{value_divergences} value divergence(s)"));
     }
+    // Reported, non-blocking: a skew says two pairing methods disagreed about
+    // order on calls that both resolved, which the same-multiset rule already
+    // treats as not a difference. A content difference is counted elsewhere and
+    // still blocks.
     if identity_skews > 0 {
-        reasons.push(format!("{identity_skews} graph identity skew(s)"));
+        reasons.push(format!(
+            "{identity_skews} graph identity skew(s) (non-blocking): concurrent \
+             fan-out reordered work both sides performed"
+        ));
     }
     // Span-shape findings are all BLOCKING: the tape's scored spans are the
     // candidate's declared contract, in both directions — a replay of a tape
@@ -4451,6 +5118,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     if span_field_divergences > 0 {
         reasons.push(format!(
             "{span_field_divergences} scored-span field divergence(s)"
+        ));
+    }
+    // Absorbed misses are REPORTED here whatever the blocking policy is, because
+    // the alternative is a run that got quieter without saying why. Everything
+    // after an absorbed miss ran on a value the recording never held.
+    if absorbed_misses > 0 {
+        reasons.push(format!(
+            "{absorbed_misses} absorbed miss(es): the request continued on a \
+             declared value the recording did not hold"
         ));
     }
     // Seed gaps are reported but do NOT by themselves fail the verdict — a
@@ -4497,6 +5173,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // only "reasons" are those still avoids a blocking failure (race becomes an
     // explicit inconclusive verdict).
     let blocking_reasons = reasons.len()
+        - usize::from(novel_calls > 0)
+        - usize::from(absorbed_misses > 0)
+        - usize::from(identity_skews > 0)
         - usize::from(inconclusive_seed_gaps > 0)
         - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
@@ -4512,7 +5191,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0) && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
-        "no artifacts ingested for this run yet".to_owned()
+        NO_ARTIFACTS_REASON.to_owned()
     } else if inconclusive {
         reasons.join("; ")
     } else if pass && reasons.is_empty() {
@@ -4552,15 +5231,62 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // above like any other body difference; what this adds is WHICH KIND they
     // are, so a reader can see that a collection came back with the same
     // members in a different order and decide whether that boundary should
-    // carry a `bag` reply canon — a judgement about the payload, which belongs
-    // to whoever owns it and not to the comparison.
+    // carry a `bag:` clause naming it — a judgement about the payload, which
+    // belongs to whoever owns it and not to the comparison.
     for (path, responses) in &order_only_response_paths_seen {
         warnings.push(format!(
             "response body path {path} holds the same members in a different order on \
              {responses} response(s) — the collections are equal as multisets, so the difference \
              is ordering alone. It is reported once, at the collection, rather than at each \
-             position the two orders disagree on, and it still blocks: declare a `bag` reply \
-             canon on that boundary if its order genuinely carries no meaning"
+             position the two orders disagree on, and it still blocks: add a \
+             `bag:{path}` clause to that boundary's reply canon if its order genuinely carries \
+             no meaning. Name the path — a bare `bag` is the WHOLE body, which would absorb \
+             every other collection in the reply and would replace the boundary's existing \
+             clause rather than join it"
+        ));
+    }
+    // What the canon absorbed, and which source said so. Named rather than
+    // subtracted: a difference that stopped counting is still a difference that
+    // happened, and a reader has to be able to see which declaration decided it
+    // did not matter.
+    for ((call_site, source), calls) in &value_canon_absorbed_seen {
+        let by = if *source == "default" {
+            "no clause asserts an order for it, and order carries no meaning unless one does"
+                .to_owned()
+        } else {
+            format!("a `bag` clause on the recorded event, stamped by the {source}")
+        };
+        warnings.push(format!(
+            "matched call {call_site} differed by ordering alone on {calls} call(s) and was not \
+             counted: {by}. The members are identical as a multiset, so any added, removed or \
+             altered member would still block"
+        ));
+    }
+    for ((path, source), responses) in &canon_absorbed_seen {
+        // The default is not a clause and must not read as one. "Declared by
+        // the default" would describe a declaration nobody made.
+        let by = if *source == "default" {
+            "no path asserts an order for it, and order carries no meaning \
+             unless one does"
+                .to_owned()
+        } else {
+            format!("a `bag` reply-canon clause declared by the {source}")
+        };
+        warnings.push(format!(
+            "response body path {path} differed by ordering alone on {responses} response(s) and \
+             was not counted: {by}. The members are identical as a multiset, so any added, \
+             removed or altered member would still block"
+        ));
+    }
+    // Two sources describing one path differently. Absorbed by neither, on
+    // purpose: a disagreement about what a path MEANS must not be resolved into
+    // a decision that a difference does not exist.
+    for (path, responses) in &canon_conflict_paths_seen {
+        warnings.push(format!(
+            "response body path {path} is described differently by the recorder's declaration and \
+             by this deployment's document on {responses} response(s) — one calls it a set, the \
+             other excludes it from comparison. Neither was applied and the difference still \
+             blocks; make the two declarations agree"
         ));
     }
     // A declaration that governs nothing is reported as the defect it is. The
@@ -4616,6 +5342,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             omitted_calls,
             omitted_calls_tolerated,
             novel_calls,
+            absorbed_misses,
             novel_calls_tolerated,
             value_divergences,
             identity_skews,
@@ -4676,7 +5403,13 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .as_ref()
         .map(|run| run.spec.scored_span_namespaces.clone())
         .unwrap_or_default();
-
+    // The system's own declaration, not the run's: whether an array is a set is
+    // a property of the recorded system's contract, so it is read from the
+    // system rather than restated per run.
+    let reply_canons = run
+        .as_ref()
+        .map(|run| crate::system::system_config(run.spec.system()).reply_canons)
+        .unwrap_or_default();
     let mut warnings = Vec::new();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
     let (observed, mut replay_graph) =
@@ -4841,6 +5574,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         events,
         correlation_scope,
         scored_span_namespaces,
+        reply_canons,
         warnings,
     })
 }
@@ -4913,8 +5647,11 @@ pub(crate) fn build_ledger_with_plan(
                 http_incoming_by_correlation
                     .get(&diff.correlation_id)
                     .copied(),
-                &inconclusive_race,
-                &column_provenance,
+                BodyClassificationContext {
+                    race: &inconclusive_race,
+                    provenance: &column_provenance,
+                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
+                },
             )
             .blocking_leaf_count
                 > 0
@@ -4932,6 +5669,7 @@ pub(crate) fn build_ledger_with_plan(
             &http_incoming_by_correlation,
             &inconclusive_race,
             &column_provenance,
+            &document_clauses_for(&art.reply_canons, "http_incoming"),
         ),
     );
     Ok(ledger::build_with_plan(
@@ -5446,6 +6184,7 @@ mod tests {
             observed_result: None,
             provenance: deja::Provenance::default(),
             seed_gap: false,
+            absorbed: false,
         }
     }
 
@@ -6024,6 +6763,7 @@ mod tests {
     ) -> RunArtifacts {
         RunArtifacts {
             scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -6097,8 +6837,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             0
@@ -6113,8 +6856,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6129,8 +6875,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6145,8 +6894,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6162,8 +6914,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6176,6 +6931,658 @@ mod tests {
     // knows what a payload means; a test that only passed for one service's
     // schema would be testing the wrong thing.
 
+    /// A real `/payments/{id}/client` response pair from the failing
+    /// same-image run, reduced to the subtree every difference sits under. The
+    /// other top-level keys were byte-identical on both sides — they
+    /// contributed nothing to the comparison and are where the merchant data
+    /// lived, so they are not carried into the tree.
+    fn run_fixture(raw: &str) -> HttpDiff {
+        let v: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        let baseline = v["baseline_body"].clone();
+        let candidate = v["candidate_body"].clone();
+        let body: Vec<JsonFieldDiff> =
+            serde_json::from_value(v["body_diff"].clone()).expect("kernel rows parse");
+        http_with_bodies("order", true, body, baseline, candidate)
+    }
+
+    /// The SAME rule in args, which was a different comparison path entirely.
+    ///
+    /// `values_diverge_under_event` ended in `recorded != observed`, so a
+    /// permuted array in a matched call's args or result was a value
+    /// divergence while the identical permutation in a response body was
+    /// absorbed. The instance that surfaced it: `get_eligible_connectors`
+    /// returns a `HashSet<String>` whose caller collects it straight into a
+    /// JSON array, so the args of a recorded boundary carried a set in
+    /// whatever order that process's hasher produced.
+    #[test]
+    fn a_permutation_in_args_is_not_a_divergence_either() {
+        let recorded = serde_json::json!({ "eligible": ["stripe", "adyen", "cybersource"] });
+        let observed = serde_json::json!({ "eligible": ["cybersource", "stripe", "adyen"] });
+        assert!(
+            !values_diverge_under_event("http_client", &recorded, &observed, None, None),
+            "a set serialised in a different order is not a divergence"
+        );
+
+        // A changed member still is — the multiset moved, so information moved.
+        let changed = serde_json::json!({ "eligible": ["cybersource", "stripe", "braintree"] });
+        assert!(
+            values_diverge_under_event("http_client", &recorded, &changed, None, None),
+            "a substituted member is a real difference"
+        );
+        // …as does a dropped one, because canonical order is a sort, not a dedup.
+        let dropped = serde_json::json!({ "eligible": ["stripe", "adyen"] });
+        assert!(values_diverge_under_event(
+            "http_client",
+            &recorded,
+            &dropped,
+            None,
+            None
+        ));
+    }
+
+    /// The run's own fixtures, with NOTHING declared anywhere. This is the
+    /// acceptance for the flip: the response pairs that failed the same-image
+    /// replay classify clean without a document, a canon or a path list.
+    #[test]
+    fn the_runs_permutations_need_no_declaration_at_all() {
+        for (name, raw) in [
+            (
+                "outer array permuted",
+                include_str!("fixtures/payment_methods_permuted_outer.json"),
+            ),
+            (
+                "inner card_networks permuted",
+                include_str!("fixtures/payment_methods_permuted_inner.json"),
+            ),
+        ] {
+            let diff = run_fixture(raw);
+            let c = classify_with_sources(&diff, None, &[]);
+            assert_eq!(c.blocking_leaf_count, 0, "{name} must not block");
+            assert_eq!(
+                c.canon_absorbed,
+                vec![(
+                    "$.payment_methods_enabled".to_owned(),
+                    ClauseSource::Default
+                )],
+                "{name}: absorbed by the default, with no declaration involved"
+            );
+        }
+    }
+
+    /// Acceptance against the run this change exists for.
+    ///
+    /// Stated honestly: in THIS run whole-body `bag` would also have absorbed
+    /// these, because no response mixed a permutation with a real difference —
+    /// measured, 26 permutation-only bodies and 30 `business_label`-only, none
+    /// carrying both. Per-path is not justified by this run's contents. It is
+    /// justified by the two things that hold regardless: the router's one
+    /// ingress boundary has a single canon slot already holding
+    /// `project:!created_at,!last_synced,!modified_at`, so whole-body `bag`
+    /// cannot be declared there without giving up the timestamp exclusion; and
+    /// whole-body `bag` absorbs EVERY array in the body including ones whose
+    /// order carries meaning, which asserts nothing and is unbounded, where a
+    /// path list asserts exactly what it names.
+    #[test]
+    fn the_runs_own_permutations_are_absorbed_by_the_declared_paths() {
+        let declared =
+            clauses("bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]");
+        for (name, raw) in [
+            (
+                "outer array permuted",
+                include_str!("fixtures/payment_methods_permuted_outer.json"),
+            ),
+            (
+                "inner card_networks permuted",
+                include_str!("fixtures/payment_methods_permuted_inner.json"),
+            ),
+        ] {
+            let diff = run_fixture(raw);
+            assert!(
+                !diff.body_diff.is_empty(),
+                "{name}: the kernel really did report differences"
+            );
+            let c = classify_with_sources(&diff, None, &declared);
+            assert_eq!(c.blocking_leaf_count, 0, "{name} must not block");
+            // The canonical differ reports a permuted collection ONCE, at the
+            // collection, rather than at each position the two orders disagree
+            // on — so the kernel's dozen positional rows become one absorbed
+            // path, which is the count that stays still between runs.
+            assert_eq!(
+                c.canon_absorbed,
+                vec![(
+                    "$.payment_methods_enabled".to_owned(),
+                    ClauseSource::Document
+                )],
+                "{name}"
+            );
+            assert!(c.order_only_paths.is_empty(), "{name}");
+        }
+    }
+
+    fn clauses(declaration: &str) -> Vec<CanonPreset> {
+        canon_clauses(Some(&deja::CanonRef::new(declaration)))
+    }
+
+    /// A recorded ingress carrying a reply-canon declaration, the way the
+    /// router's middleware mints one.
+    fn ingress_declaring(declaration: &str) -> deja::BoundaryEvent {
+        let mut ev: deja::BoundaryEvent = serde_json::from_value(serde_json::json!({
+            "global_sequence": 1,
+            "request_sequence": 0,
+            "correlation_id": "order",
+            "timestamp_ns": 0,
+            "boundary": "http_incoming",
+            "trait_name": "RequestIdMiddleware",
+            "method_name": "call",
+            "call_file": "request_id.rs",
+            "call_line": 1,
+            "call_column": 0,
+            "request": {},
+            "args": {},
+            "response": {},
+            "result": "v",
+            "is_error": false,
+            "duration_us": 0,
+            "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+            "provenance": "recorded",
+            "recon": "lossless",
+            "replay_strategy": "substitute",
+            "bucket_id": "root",
+            "fork_seq": 0,
+        }))
+        .expect("valid BoundaryEvent");
+        ev.declaration = Some(
+            deja::BoundaryDeclaration::default().reply_canon(deja::CanonRef::new(declaration)),
+        );
+        ev
+    }
+
+    /// A recorded DB read whose codec stamped a reply canon, the way
+    /// `deja::db::recorded_output` does for a multi-row statement with no
+    /// `ORDER BY`. Starts from the ingress builder and re-addresses it.
+    fn db_read_declaring(declaration: &str) -> deja::BoundaryEvent {
+        let mut ev = ingress_declaring(declaration);
+        ev.boundary = "db".to_owned();
+        ev.trait_name = "diesel_models::query::generics".to_owned();
+        ev.method_name = "generic_filter".to_owned();
+        ev
+    }
+
+    /// The `ResultCodec` envelope a marked reply arrives in. Rows are keyed by
+    /// a STRING column on purpose: `db_normalize_infra` strips integer `id`
+    /// fields as replay-local SERIALs, and a test whose rows were only ids would
+    /// compare equal for that reason and prove nothing about the clause.
+    fn db_envelope(rows: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "version": 1, "result": "Ok", "value": rows, "type_name": "Vec<Row>" })
+    }
+
+    fn rows(refs: &[&str]) -> serde_json::Value {
+        db_envelope(serde_json::Value::Array(
+            refs.iter()
+                .map(|r| serde_json::json!({ "ref": r }))
+                .collect(),
+        ))
+    }
+
+    /// The clause-aware answer, on its own. `values_diverge_under_event` still
+    /// carries #102's order-blind default beneath this, so a pure permutation is
+    /// absorbed there with or without a clause; the unit that has to be right —
+    /// and that the flip in §6 will leave standing alone — is this one.
+    fn equivalent_under(
+        ev: &deja::BoundaryEvent,
+        r: &serde_json::Value,
+        o: &serde_json::Value,
+    ) -> bool {
+        declared_clauses_equivalent(&event_value_clauses(ev), r, o)
+    }
+
+    /// The recorder-stamped clause is honoured on a MATCHED result: two row sets
+    /// that differ only in order are equivalent under `bag:$.value[]`.
+    ///
+    /// Two vacuity guards, because this can pass for the wrong reason: (1) the
+    /// same pair with NO clause must not be equivalent, so the answer is
+    /// attributable to the clause; (2) the sort must have reordered something —
+    /// the values differ before and agree after.
+    #[test]
+    fn a_recorder_stamped_bag_clause_absorbs_a_row_permutation_on_a_matched_result() {
+        let recorded = rows(&["b", "a", "c"]);
+        let observed = rows(&["a", "c", "b"]);
+        assert_ne!(recorded, observed, "guard: the two are not already equal");
+
+        assert!(
+            !equivalent_under(&db_read_declaring(""), &recorded, &observed),
+            "guard: with no clause, nothing here calls them equivalent"
+        );
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(equivalent_under(&declared, &recorded, &observed));
+        assert!(
+            !values_diverge_under_event("db", &recorded, &observed, Some(&declared), None),
+            "and the full comparison agrees"
+        );
+
+        // Guard: the path resolved and the sort did work on both sides.
+        let (mut r, mut o) = (recorded.clone(), observed.clone());
+        assert_eq!(sort_declared_bags(&mut r, "$.value[]"), 1);
+        assert_eq!(sort_declared_bags(&mut o, "$.value[]"), 1);
+        assert_ne!(r, recorded, "the sort reordered the recorded rows");
+        assert_eq!(r, o, "and the two agree once sorted");
+    }
+
+    /// The clause is COMPOSED onto a site's static declaration and still reaches
+    /// the comparison — the routing that used to parse the whole string as one
+    /// preset and get `None`.
+    #[test]
+    fn a_stamped_clause_composed_after_a_static_one_still_resolves() {
+        let recorded = rows(&["b", "a"]);
+        let observed = rows(&["a", "b"]);
+        let composed = db_read_declaring(&format!(
+            "project:!created_at;{}",
+            deja::codec::UNORDERED_VALUE_ROWS_CANON
+        ));
+        assert_eq!(
+            event_reply_canon_kind(&composed).as_deref(),
+            Some("project;bag")
+        );
+        assert!(equivalent_under(&composed, &recorded, &observed));
+        assert!(
+            !equivalent_under(
+                &db_read_declaring("project:!created_at"),
+                &recorded,
+                &observed
+            ),
+            "guard: the project clause alone does not call a permutation equivalent"
+        );
+    }
+
+    /// A member that CHANGED is still a divergence: the clause forgives order,
+    /// not content. Asserted through the full comparison too, on a boundary with
+    /// no db-specific equivalences of its own.
+    #[test]
+    fn a_changed_row_still_diverges_under_the_bag_clause() {
+        let recorded = rows(&["b", "a"]);
+        let observed = rows(&["a", "z"]);
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(!equivalent_under(&declared, &recorded, &observed));
+        assert!(values_diverge_under_event(
+            "redis",
+            &recorded,
+            &observed,
+            Some(&declared),
+            None
+        ));
+    }
+
+    /// A lost duplicate is still a divergence: a bag, not a set.
+    #[test]
+    fn a_dropped_duplicate_row_still_diverges_under_the_bag_clause() {
+        let recorded = rows(&["a", "a", "b"]);
+        let observed = rows(&["b", "a"]);
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(!equivalent_under(&declared, &recorded, &observed));
+    }
+
+    /// NON-RECURSIVE: the clause says the ROWS carry no order. An array inside a
+    /// row keeps its order, and reordering it is a real difference.
+    #[test]
+    fn an_array_inside_a_row_keeps_its_order_under_the_bag_clause() {
+        let recorded = db_envelope(serde_json::json!([{ "ref": "a", "steps": ["x", "y"] }]));
+        let observed = db_envelope(serde_json::json!([{ "ref": "a", "steps": ["y", "x"] }]));
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        assert!(
+            !equivalent_under(&declared, &recorded, &observed),
+            "the members were sorted; the array inside a member was not"
+        );
+    }
+
+    /// ASYMMETRY: the path resolves on one side and not the other. That is a
+    /// change of shape, and a per-path canon must not absorb it by sorting what
+    /// is there and comparing. Both directions.
+    #[test]
+    fn a_path_present_on_one_side_only_is_never_absorbed() {
+        let declared = db_read_declaring(deja::codec::UNORDERED_VALUE_ROWS_CANON);
+        let with_rows = rows(&["b", "a"]);
+        let no_rows = serde_json::json!({ "version": 1, "result": "Ok", "type_name": "Vec<Row>" });
+        let scalar = serde_json::json!({ "version": 1, "result": "Ok", "value": "x", "type_name": "Vec<Row>" });
+
+        assert!(!equivalent_under(&declared, &with_rows, &no_rows));
+        assert!(!equivalent_under(&declared, &no_rows, &with_rows));
+        assert!(!equivalent_under(&declared, &with_rows, &scalar));
+        assert!(!equivalent_under(&declared, &scalar, &with_rows));
+
+        // Guard: the count is what carries this — one side reached the array,
+        // the other did not.
+        let (mut r, mut n) = (with_rows.clone(), no_rows.clone());
+        assert_eq!(sort_declared_bags(&mut r, "$.value[]"), 1);
+        assert_eq!(sort_declared_bags(&mut n, "$.value[]"), 0);
+    }
+
+    /// A clause whose path resolves on NEITHER side governs nothing. "Both sides
+    /// unchanged" must not read as "both sides equivalent under the clause".
+    #[test]
+    fn a_clause_that_reaches_nothing_absorbs_nothing() {
+        let declared = db_read_declaring("bag:$.elsewhere[]");
+        let recorded = rows(&["b", "a"]);
+        let observed = rows(&["a", "b"]);
+        assert!(!equivalent_under(&declared, &recorded, &observed));
+        let mut r = recorded.clone();
+        assert_eq!(
+            sort_declared_bags(&mut r, "$.elsewhere[]"),
+            0,
+            "guard: nothing was reached"
+        );
+    }
+
+    /// One vocabulary across both engines: the source label a matched-call
+    /// absorption is keyed by is the label the HTTP reply path keys by. If
+    /// either side renames, a consumer aggregating absorptions would silently
+    /// split one fact into two — this is what stops that.
+    #[test]
+    fn value_canon_source_labels_are_clause_source_labels() {
+        assert_eq!(
+            ValueCanonSource::Recorder.label(),
+            ClauseSource::Recorder.label()
+        );
+        assert_eq!(
+            ValueCanonSource::Default.label(),
+            ClauseSource::Default.label()
+        );
+    }
+
+    fn scored_matched_call(
+        declaration: Option<&str>,
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> Scorecard {
+        let mut event = db_read_declaring(declaration.unwrap_or(""));
+        event.correlation_id = Some("c1".to_owned());
+        event.global_sequence = 1;
+        if declaration.is_none() {
+            event.declaration = None;
+        }
+        detect(&art_with_events(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![exec_obs(
+                "db",
+                Some("c1"),
+                true,
+                Some(1),
+                Some(recorded),
+                observed,
+            )],
+            vec![],
+            vec![event],
+        ))
+    }
+
+    fn value_canon_warning(card: &Scorecard) -> Option<&String> {
+        card.warnings
+            .iter()
+            .find(|w| w.starts_with("matched call db::m differed by ordering alone"))
+    }
+
+    /// THE NUMBER THE FLIP WAITS ON. A matched call whose rows differed by
+    /// ordering alone is counted ONCE under one kind, and the scorecard says
+    /// who forgave it: the codec's stamped clause here.
+    #[test]
+    fn a_matched_call_absorbed_by_a_stamped_clause_is_counted_with_its_source() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            rows(&["b", "a"]),
+            rows(&["a", "b"]),
+        );
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "absorbed, so not a divergence"
+        );
+        let warning = value_canon_warning(&card).expect("the absorption is named");
+        assert!(
+            warning.contains("stamped by the recorder"),
+            "the source is the recorder's clause: {warning}"
+        );
+        assert!(
+            !warning.contains("no clause asserts"),
+            "not the default: {warning}"
+        );
+    }
+
+    /// The same permutation with NO clause is absorbed by #102's default, and
+    /// the scorecard says so — with the default named as what it is, not as a
+    /// declaration nobody made. When the default goes, this row is the one
+    /// that turns into a divergence and the row above is the one that stays.
+    #[test]
+    fn a_matched_call_absorbed_by_the_default_is_counted_with_that_source() {
+        let card = scored_matched_call(None, rows(&["b", "a"]), rows(&["a", "b"]));
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        let warning = value_canon_warning(&card).expect("the absorption is named");
+        assert!(warning.contains("no clause asserts an order"), "{warning}");
+        assert!(!warning.contains("recorder"), "{warning}");
+    }
+
+    /// A member that changed is a divergence, and is NOT counted as an
+    /// absorption: the count means "order alone", nothing looser.
+    #[test]
+    fn a_changed_row_is_a_divergence_and_not_an_absorption() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            rows(&["b", "a"]),
+            rows(&["a", "z"]),
+        );
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert!(value_canon_warning(&card).is_none());
+    }
+
+    /// A db-infrastructure equivalence — a replay-local SERIAL `id` — is
+    /// forgiven for its own reason and must not swell the ordering count.
+    #[test]
+    fn a_db_infrastructure_equivalence_is_not_a_canon_absorption() {
+        let recorded = db_envelope(serde_json::json!([{ "id": 7, "ref": "a" }]));
+        let observed = db_envelope(serde_json::json!([{ "id": 9, "ref": "a" }]));
+        assert_eq!(
+            value_verdict("db", &recorded, &observed, None, None),
+            ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure)
+        );
+        let card = scored_matched_call(None, recorded, observed);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert_eq!(card.summary.value_divergences, 0);
+    }
+
+    /// Equal values are equal: not absorbed, not counted, nothing to say.
+    #[test]
+    fn equal_values_are_not_an_absorption() {
+        assert_eq!(
+            value_verdict("db", &rows(&["a"]), &rows(&["a"]), None, None),
+            ValueVerdict::Equal
+        );
+        let card = scored_matched_call(None, rows(&["a", "b"]), rows(&["a", "b"]));
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(value_canon_warning(&card).is_none());
+    }
+
+    /// The path grammar the HTTP path already accepts — with or without `[]`,
+    /// and descending through `[]` into each member.
+    #[test]
+    fn sort_declared_bags_walks_the_same_paths_the_http_path_reads() {
+        let mut v =
+            serde_json::json!({ "value": [ { "tags": ["b", "a"] }, { "tags": ["d", "c"] } ] });
+        assert_eq!(sort_declared_bags(&mut v, "$.value[].tags[]"), 2);
+        assert_eq!(
+            v,
+            serde_json::json!({ "value": [ { "tags": ["a", "b"] }, { "tags": ["c", "d"] } ] })
+        );
+
+        let mut w = serde_json::json!({ "value": [3, 1, 2] });
+        assert_eq!(
+            sort_declared_bags(&mut w, "$.value"),
+            1,
+            "the bare form works too"
+        );
+        assert_eq!(w, serde_json::json!({ "value": [1, 2, 3] }));
+
+        let mut top = serde_json::json!([2, 1]);
+        assert_eq!(
+            sort_declared_bags(&mut top, "$"),
+            1,
+            "the whole value as a bag"
+        );
+        assert_eq!(top, serde_json::json!([1, 2]));
+    }
+
+    fn classify_with_sources(
+        diff: &HttpDiff,
+        recorder: Option<&deja::BoundaryEvent>,
+        document: &[CanonPreset],
+    ) -> HttpBodyClassification {
+        classify_http_body_diff(
+            diff,
+            recorder,
+            BodyClassificationContext {
+                race: &InconclusiveRaceEvidence::default(),
+                provenance: &CorrelationColumnProvenance::default(),
+                document_clauses: document,
+            },
+        )
+    }
+
+    /// Every declaration written before clauses existed parses to a one-clause
+    /// list meaning exactly what it meant. The first string is the one the
+    /// router actually mints today.
+    #[test]
+    fn declarations_written_before_clauses_keep_their_meaning() {
+        for existing in [
+            "project:!created_at,!last_synced,!modified_at",
+            "bag",
+            "sequence",
+            "final_state",
+        ] {
+            let one = resolve_canon(Some(&deja::CanonRef::new(existing)))
+                .expect("the preset still resolves");
+            assert_eq!(
+                clauses(existing),
+                vec![one],
+                "{existing} must parse to exactly its old meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_set_absorbs_a_permutation_and_names_its_source() {
+        let diff = body_pair(
+            serde_json::json!({"a": [{"x": 1}, {"x": 2}]}),
+            serde_json::json!({"a": [{"x": 2}, {"x": 1}]}),
+        );
+        let c = classify_with_sources(&diff, None, &clauses("bag:$.a[]"));
+        assert_eq!(c.blocking_leaf_count, 0, "a permutation of a declared set");
+        assert_eq!(
+            c.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Document)]
+        );
+        // This is the case that was dead under a fallback rule: the document
+        // governs even though the recorder declared nothing.
+        assert!(c.order_only_paths.is_empty());
+    }
+
+    #[test]
+    fn a_changed_member_at_a_declared_set_still_blocks() {
+        for candidate in [
+            serde_json::json!({"a": [1, 3]}),    // altered
+            serde_json::json!({"a": [1, 2, 3]}), // added
+            serde_json::json!({"a": [1]}),       // removed
+        ] {
+            let diff = body_pair(serde_json::json!({"a": [1, 2]}), candidate.clone());
+            let c = classify_with_sources(&diff, None, &clauses("bag:$.a[]"));
+            assert!(
+                c.blocking_leaf_count > 0,
+                "{candidate} is not a permutation and must still block"
+            );
+            assert!(c.canon_absorbed.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_undeclared_permutation_is_absorbed_by_default_and_named() {
+        let diff = body_pair(
+            serde_json::json!({"a": [1, 2]}),
+            serde_json::json!({"a": [2, 1]}),
+        );
+        let c = classify_with_sources(&diff, None, &[]);
+        assert_eq!(
+            c.blocking_leaf_count, 0,
+            "order carries no meaning by default"
+        );
+        assert_eq!(
+            c.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Default)],
+            "and the default is named as the source, not left anonymous"
+        );
+        assert!(c.order_only_paths.is_empty());
+    }
+
+    /// The per-path point: whole-body `bag` absorbs nothing here, because the
+    /// bodies are not bag-equal. A clause naming one path absorbs that path and
+    /// leaves the real difference beside it blocking.
+    #[test]
+    fn a_permutation_is_absorbed_while_a_real_difference_beside_it_still_blocks() {
+        let baseline = serde_json::json!({"a": [1, 2], "label": "old"});
+        let candidate = serde_json::json!({"a": [2, 1], "label": "new"});
+        let whole_body = classify_with_sources(
+            &body_pair(baseline.clone(), candidate.clone()),
+            None,
+            &clauses("bag"),
+        );
+        // Whole-body `bag` still cannot help a body that also differs for real
+        // — but the DEFAULT absorbs the permutation regardless, which is the
+        // point of the flip. Either way the label below still blocks.
+        assert_eq!(
+            whole_body.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Default)]
+        );
+        assert_eq!(whole_body.blocking_leaf_count, 1, "the label still blocks");
+        let per_path =
+            classify_with_sources(&body_pair(baseline, candidate), None, &clauses("bag:$.a[]"));
+        assert_eq!(per_path.canon_absorbed.len(), 1, "the permutation");
+        assert_eq!(per_path.blocking_leaf_count, 1, "the label still blocks");
+    }
+
+    #[test]
+    fn both_sources_naming_one_path_is_redundant_and_names_both() {
+        let diff = body_pair(
+            serde_json::json!({"a": [1, 2]}),
+            serde_json::json!({"a": [2, 1]}),
+        );
+        let c = classify_with_sources(
+            &diff,
+            Some(&ingress_declaring("bag:$.a[]")),
+            &clauses("bag:$.a[]"),
+        );
+        assert_eq!(
+            c.canon_absorbed,
+            vec![("$.a".to_owned(), ClauseSource::Both)],
+            "reported as redundant so the document line can be deleted"
+        );
+        assert_eq!(c.blocking_leaf_count, 0);
+    }
+
+    #[test]
+    fn sources_describing_one_path_differently_conflict_and_absorb_nothing() {
+        let diff = body_pair(
+            serde_json::json!({"a": [1, 2]}),
+            serde_json::json!({"a": [2, 1]}),
+        );
+        let c = classify_with_sources(
+            &diff,
+            Some(&ingress_declaring("project:!a")),
+            &clauses("bag:$.a[]"),
+        );
+        assert_eq!(c.canon_conflicts, vec!["$.a"]);
+        assert!(c.canon_absorbed.is_empty(), "a conflict absorbs nothing");
+        assert!(
+            c.blocking_leaf_count > 0,
+            "and the difference still blocks — a disagreement must not decide it away"
+        );
+    }
+
     fn body_pair(baseline: serde_json::Value, candidate: serde_json::Value) -> HttpDiff {
         // Built the way the pipeline builds it: the kernel's own positional
         // diff, so these tests are fed the rows the kernel really emits.
@@ -6184,11 +7591,22 @@ mod tests {
     }
 
     fn classify_body(diff: &HttpDiff) -> HttpBodyClassification {
+        classify_body_declaring(diff, &[])
+    }
+
+    /// The same classification, for a system that declares these paths as sets.
+    fn classify_body_declaring(
+        diff: &HttpDiff,
+        document: &[CanonPreset],
+    ) -> HttpBodyClassification {
         classify_http_body_diff(
             diff,
             None,
-            &InconclusiveRaceEvidence::default(),
-            &CorrelationColumnProvenance::default(),
+            BodyClassificationContext {
+                race: &InconclusiveRaceEvidence::default(),
+                provenance: &CorrelationColumnProvenance::default(),
+                document_clauses: document,
+            },
         )
     }
 
@@ -6214,22 +7632,34 @@ mod tests {
                 "one ordering difference, not one per position"
             );
             assert_eq!(rows[0].json_path, "$.tags");
-            counts.push(classify_body(&diff).blocking_leaf_count);
+            // The property this guards is STABILITY: one difference at the
+            // collection, the same number for every permutation. Under the
+            // default that difference is absorbed rather than counted, so the
+            // count is of absorbed paths — but it must still not vary with
+            // which permutation this run happened to produce.
+            counts.push(classify_body(&diff).canon_absorbed.len());
         }
         assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
     }
 
-    /// THE GUARD. An ordering difference is still a difference. Nothing here
-    /// makes the comparison order-blind — it makes it say the same thing every
-    /// run.
+    /// THE GUARD on the default. A permutation is absorbed and NAMED, never
+    /// silently dropped: the scorecard says a difference was seen and why it
+    /// did not count. What still blocks is a change of membership, which the
+    /// sibling tests pin.
     #[test]
-    fn a_reordering_is_still_a_divergence() {
+    fn a_reordering_is_absorbed_and_named_under_the_default() {
         let diff = body_pair(
             serde_json::json!({ "steps": ["authenticate", "authorize", "capture"] }),
             serde_json::json!({ "steps": ["capture", "authorize", "authenticate"] }),
         );
-        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
-        assert_eq!(classify_body(&diff).order_only_paths, vec!["$.steps"]);
+        // The default: order carries no meaning, so this is absorbed and named
+        // under the default source rather than counted against the candidate.
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 0);
+        assert_eq!(
+            classify_body(&diff).canon_absorbed,
+            vec![("$.steps".to_owned(), ClauseSource::Default)]
+        );
+        assert!(classify_body(&diff).order_only_paths.is_empty());
     }
 
     /// Members are compared WITH MULTIPLICITY: canonical order is a sort, never
@@ -6330,12 +7760,20 @@ mod tests {
             diff.body_diff.len() >= 15,
             "the positional diff is the noisy one"
         );
+        // Fifteen-odd positional rows reduce to ONE difference at the
+        // collection, and under the default that one is absorbed: nothing was
+        // added, removed or changed, only the order a hash-based collection was
+        // iterated in. No declaration of any kind is involved.
         let classification = classify_body(&diff);
-        assert_eq!(classification.blocking_leaf_count, 1);
+        assert_eq!(classification.blocking_leaf_count, 0);
         assert_eq!(
-            classification.order_only_paths,
-            vec!["$.payment_methods_enabled"]
+            classification.canon_absorbed,
+            vec![(
+                "$.payment_methods_enabled".to_owned(),
+                ClauseSource::Default
+            )]
         );
+        assert!(classification.order_only_paths.is_empty());
     }
 
     /// A body carrying no arrays at all reaches exactly the rows the kernel
@@ -6409,17 +7847,90 @@ mod tests {
         assert_eq!(card.summary.http_body_mismatches, 1);
     }
 
+    /// TWO COUNTERS, TWO UNITS, ON PURPOSE — and now pinned, because nothing
+    /// pinned them.
+    ///
+    /// `summary.http_body_mismatches` counts RESPONSES that carry a blocking
+    /// body difference. `per_boundary.http_incoming.kinds.BodyMismatch` counts
+    /// the diverging FIELDS inside them. One response with two bad fields is one
+    /// of the first and two of the second, so the two numbers are expected to
+    /// disagree, and `Scorecard::counter_disagreements` deliberately does not
+    /// fold this pair for that reason.
+    ///
+    /// That is easy to re-discover as a bug, and has been. A sweep of live
+    /// scorecards found summary totalling 2 against a per-boundary total of 3,
+    /// which looks exactly like the accounting error this crate keeps finding
+    /// for real elsewhere, and the obvious
+    /// "fix" — making them agree, or registering the pair in
+    /// `counter_disagreements` — would have destroyed a real distinction and
+    /// made the report lie about how many responses were affected. Every
+    /// existing body test happened to use a single diverging field, so summary
+    /// and kind were both 1 in all of them and either counter could be changed
+    /// into the other with the whole suite still green. Both of those mutations
+    /// were run and both survived.
+    ///
+    /// This is the shape the live data had: two responses, three fields.
+    #[test]
+    fn the_summary_counts_responses_while_the_per_boundary_ledger_counts_fields() {
+        let one_field_recorded = serde_json::json!({ "status": "charged" });
+        let one_field_replayed = serde_json::json!({ "status": "failed" });
+        let two_field_recorded = serde_json::json!({ "status": "charged", "amount": 100 });
+        let two_field_replayed = serde_json::json!({ "status": "failed", "amount": 250 });
+
+        let card = detect(&art(
+            vec![],
+            vec![],
+            vec![
+                http_with_bodies(
+                    "one-bad-field",
+                    true,
+                    deja_kernel::diff_json(&one_field_recorded, &one_field_replayed, "$", &[]),
+                    one_field_recorded,
+                    one_field_replayed,
+                ),
+                http_with_bodies(
+                    "two-bad-fields",
+                    true,
+                    deja_kernel::diff_json(&two_field_recorded, &two_field_replayed, "$", &[]),
+                    two_field_recorded,
+                    two_field_replayed,
+                ),
+            ],
+        ));
+
+        assert_eq!(
+            card.summary.http_body_mismatches, 2,
+            "two RESPONSES diverged; this counter is responses, not fields"
+        );
+        assert_eq!(
+            kind_count(&card, "http_incoming", "BodyMismatch"),
+            3,
+            "three FIELDS diverged across those two responses; this counter is fields"
+        );
+        // The disagreement is expected, so the self-check must not report it.
+        // Folding this pair would fire on every run where one response carries
+        // more than one bad field — which is most of them.
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "responses-vs-fields is a deliberate difference in UNIT, not a \
+             counter disagreement: {:?}",
+            card.counter_disagreements()
+        );
+    }
+
     /// The report SAYS a difference was ordering, naming the collection.
     #[test]
     fn the_scorecard_names_an_ordering_difference_as_one() {
         let recorded = serde_json::json!({ "tags": ["a", "b", "c"] });
         let replayed = serde_json::json!({ "tags": ["c", "a", "b"] });
         let card = detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]));
-        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 1);
+        // Absorbed by default, so it is not a mismatch — but it is still SAID.
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
         assert!(
             card.warnings.iter().any(|w| w.contains("$.tags")
-                && w.contains("same members in a different order")
-                && w.contains("still blocks")),
+                && w.contains("no path asserts an order for it")
+                && w.contains("would still block")),
             "warnings: {:?}",
             card.warnings
         );
@@ -6434,8 +7945,11 @@ mod tests {
             classify_http_body_diff(
                 &diff,
                 None,
-                &InconclusiveRaceEvidence::default(),
-                &CorrelationColumnProvenance::default(),
+                BodyClassificationContext {
+                    race: &InconclusiveRaceEvidence::default(),
+                    provenance: &CorrelationColumnProvenance::default(),
+                    document_clauses: &[],
+                },
             )
             .blocking_leaf_count,
             1
@@ -6604,6 +8118,7 @@ mod tests {
 
         let rows = build_ledger(&RunArtifacts {
             scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -7663,25 +9178,159 @@ mod tests {
             ],
             vec![http("c1", true, vec![])],
         ));
-        assert_eq!(card.summary.novel_calls, 1, "the correlated one blocks");
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the correlated one is named under the blocking-class name"
+        );
         assert_eq!(card.summary.novel_calls_tolerated, 1);
         assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
         assert_eq!(kind_count(&card, "redis", "NovelCallTolerated"), 1);
         assert_eq!(
-            card.summary.side_effect_divergences, 1,
-            "background work does not fail a candidate"
+            card.summary.side_effect_divergences, 0,
+            "neither one fails a candidate now — but they stay NAMED APART, which \
+             is what this test guards: a reader must still be able to tell an \
+             addition inside the request from background work nobody owns"
         );
     }
 
+    /// An observed call that MISSED and was absorbed by a declared `on_miss`.
+    fn absorbed_obs(boundary: &str, corr: &str) -> ObservedCall {
+        let mut o = obs(boundary, Some(corr), false, None, None);
+        o.absorbed = true;
+        o
+    }
+
+    /// An absorbed miss is named APART from an ordinary novel call, counted in
+    /// its own summary field, and carried on the correlation.
+    ///
+    /// Everything after it in that correlation ran on a value the recording never
+    /// held. Before this it was indistinguishable from a miss that killed the
+    /// request — same `resolved: false`, same `Provenance::Recorded` — so a run
+    /// could get quieter without anything saying why.
     #[test]
-    fn novel_call_fails() {
+    fn an_absorbed_miss_is_named_apart_and_counted() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1")],
+            vec![http("c1", true, vec![])],
+        ));
+
+        assert_eq!(
+            kind_count(&card, "redis", "NovelCallAbsorbed"),
+            1,
+            "the absorbed miss must carry its own kind"
+        );
+        assert_eq!(
+            kind_count(&card, "redis", "NovelCall"),
+            0,
+            "and must NOT also be counted as an ordinary novel call — one call, \
+             one classification"
+        );
+        assert_eq!(card.summary.absorbed_misses, 1);
+        assert_eq!(
+            card.summary.novel_calls, 0,
+            "novel_calls counts the misses that were not absorbed"
+        );
+
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert_eq!(
+            c1.absorbed_misses, 1,
+            "the correlation must carry how much of it ran on supplied values"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and it must not be CHARGED: an absorbed miss is an added call the \
+             process survived, so it cannot cost more than an unabsorbed one, \
+             which costs nothing. What it costs is confidence, and that is \
+             carried by absorbed_misses rather than by this counter"
+        );
+        assert!(
+            c1.passed,
+            "the response matched and every recorded call resolved: {}",
+            card.verdict.reason
+        );
+        assert!(
+            card.verdict.reason.contains("absorbed miss"),
+            "and the verdict must SAY so rather than leaving it to a breakdown \
+             nobody reads: {}",
+            card.verdict.reason
+        );
+    }
+
+    /// The summary field must be a PROJECTION of the ledger, not a tally kept
+    /// beside it.
+    ///
+    /// This is the failure mode `ReplyCanonAbsorbed` already has: a kind with no
+    /// folded summary field never reaches the headline, so it is invisible in
+    /// practice however carefully it is counted. Breaking the number here must be
+    /// caught by the self-consistency guard.
+    #[test]
+    fn absorbed_misses_is_a_fold_of_the_ledger() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1"), absorbed_obs("db", "c1")],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(card.summary.absorbed_misses, 2);
+
+        let mut tampered = card.clone();
+        tampered.summary.absorbed_misses = 0;
+        assert!(
+            !tampered.counter_disagreements().is_empty(),
+            "a summary that disagrees with its per-boundary ledger must be \
+             reported as a scorer bug"
+        );
+    }
+
+    /// An ordinary miss is untouched: absorption is opt-in at the boundary, so a
+    /// boundary that declares nothing must not start reporting absorbed misses.
+    #[test]
+    fn a_miss_that_was_not_absorbed_stays_an_ordinary_novel_call() {
         let card = detect(&art(
             vec![],
             vec![obs("redis", Some("c1"), false, None, None)],
-            vec![],
+            vec![http("c1", true, vec![])],
         ));
-        assert!(!card.verdict.pass);
-        assert_eq!(card.summary.novel_calls, 1);
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "redis", "NovelCallAbsorbed"), 0);
+        assert_eq!(card.summary.absorbed_misses, 0);
+    }
+
+    /// A novel call is REPORTED and does not fail the run.
+    ///
+    /// The http diff is the point of the fixture, not decoration. The previous
+    /// version of this test passed no diff at all, so the correlation had nothing
+    /// to compare and `pass` was already false before the novel call was
+    /// considered — it asserted the old policy without being able to observe it,
+    /// and it went on passing when the policy was reversed. With a clean response
+    /// in hand, `pass` answers the question actually being asked: the candidate
+    /// reproduced everything the recording held and added one call on top.
+    #[test]
+    fn a_novel_call_is_reported_and_does_not_fail_the_run() {
+        let card = detect(&art(
+            vec![],
+            vec![obs("redis", Some("c1"), false, None, None)],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "the addition must still be shown"
+        );
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and charged to nothing"
+        );
+        assert!(
+            card.verdict.pass,
+            "an added call is not evidence that anything which WAS recorded \
+             behaves differently: {}",
+            card.verdict.reason
+        );
     }
 
     #[test]
@@ -8199,6 +9848,7 @@ mod tests {
         )];
         let art = RunArtifacts {
             scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
             run_id: run_id.to_owned(),
             recording_id: Some(recording_id.to_owned()),
             table,
@@ -8750,10 +10400,19 @@ mod tests {
         );
         assert_eq!(
             card.summary.novel_calls, 1,
-            "the tail call stays a BLOCKING novel call"
+            "the tail call stays an ordinary novel call — it is not excused into \
+             the inconclusive class"
         );
-        assert_eq!(card.summary.side_effect_divergences, 1);
-        assert!(!card.verdict.pass);
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "the novel call itself charges nothing; the RESPONSE is what fails \
+             this correlation, which is the guard's whole point"
+        );
+        assert!(
+            !card.verdict.pass,
+            "the status diverged, so the candidate failed on the thing that is \
+             actually compared"
+        );
         assert!(
             !card.verdict.inconclusive,
             "a diverged response is a real fail, not an unjudged run"
@@ -8787,20 +10446,42 @@ mod tests {
 
     /// The condition that does the real work. "The recording ends at a teardown
     /// marker" is very nearly universal — in the measured main-app run it held
-    /// for 71 of 77 correlations — so it cannot be what selects a tail gap. That
-    /// same run carried 16 BLOCKING novel `update_payment_intent` calls inside
-    /// HTTP-clean, teardown-ending correlations, mid-request. Only their
-    /// POSITION keeps them blocking, and it must.
+    /// for 71 of 77 correlations — so it cannot be what selects a tail gap. What
+    /// selects one is POSITION: the call comes after the correlation's last
+    /// recorded event was already reproduced.
+    ///
+    /// That distinction still decides the verdict, and now decides MORE than it
+    /// used to. A tail gap means the run cannot judge the correlation, so it is
+    /// `inconclusive` and cannot pass. A mid-request novel call is an ADDITION to
+    /// a correlation the run judged fine, so it is reported and the correlation
+    /// passes on its matched calls and its identical response. Before, both
+    /// failed and only the reason differed; the position test now has to be right
+    /// or a correlation flips between pass and inconclusive.
     #[test]
-    fn a_novel_call_before_the_teardown_marker_stays_blocking() {
+    fn a_novel_call_before_the_teardown_marker_is_not_a_tail_gap() {
         let card = detect(&tail_gap_art(true, vec![], false));
         assert_eq!(
             card.summary.inconclusive_tail_gaps, 0,
             "mid-request work has a recorded baseline region; it is not a tail"
         );
-        assert_eq!(card.summary.novel_calls, 1);
-        assert_eq!(card.summary.side_effect_divergences, 1);
-        assert!(!card.verdict.pass);
+        assert_eq!(
+            card.summary.novel_calls, 1,
+            "it is still a novel call, and still reported as one"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "an added call is not a divergence of the calls the recording holds"
+        );
+        assert!(
+            card.verdict.pass,
+            "the response matched and every recorded call was reproduced; an \
+             extra call on top of that is not a regression: {}",
+            card.verdict.reason
+        );
+        assert!(
+            !card.verdict.inconclusive,
+            "the run judged this correlation; nothing about it was unjudgeable"
+        );
         assert!(
             card.counter_disagreements().is_empty(),
             "{:?}",
@@ -8846,7 +10527,16 @@ mod tests {
         let card = detect(&a);
         assert_eq!(card.summary.inconclusive_tail_gaps, 0);
         assert_eq!(card.summary.novel_calls, 1);
-        assert!(!card.verdict.pass);
+        // The claim under test is that this is an ORDINARY novel call and not an
+        // unrecorded tail. Novel calls no longer fail a verdict, so assert the
+        // classification that decides it: a tail gap would force `inconclusive`,
+        // and this must not.
+        assert!(
+            !card.verdict.inconclusive,
+            "the strict reading is an ordinary novel call, so the run stays judged \
+             rather than being excused as an unrecorded tail: {}",
+            card.verdict.reason
+        );
     }
 
     /// A correlation running to the very end of the tape is left BLOCKING. The
@@ -8868,7 +10558,16 @@ mod tests {
         let card = detect(&a);
         assert_eq!(card.summary.inconclusive_tail_gaps, 0);
         assert_eq!(card.summary.novel_calls, 1);
-        assert!(!card.verdict.pass);
+        // The claim under test is that this is an ORDINARY novel call and not an
+        // unrecorded tail. Novel calls no longer fail a verdict, so assert the
+        // classification that decides it: a tail gap would force `inconclusive`,
+        // and this must not.
+        assert!(
+            !card.verdict.inconclusive,
+            "the strict reading is an ordinary novel call, so the run stays judged \
+             rather than being excused as an unrecorded tail: {}",
+            card.verdict.reason
+        );
     }
 
     /// The tail begins where the recording ended, so the candidate has to have
@@ -8918,7 +10617,7 @@ mod tests {
     /// peek set seed_gap=true for this case, so the tally swallowed it as a
     /// non-blocking InconclusiveSeedGap (verdict PASS, catch masked).
     #[test]
-    fn novel_execute_call_without_seed_gap_is_a_blocking_novel() {
+    fn novel_execute_call_without_seed_gap_is_a_novel_call_not_a_seed_gap() {
         // Build the observation exactly as the FIXED execute-shadow path emits it:
         // Shadow provenance, no baseline, resolved=false, seed_gap=false.
         let mut o = exec_obs(
@@ -8937,10 +10636,21 @@ mod tests {
         ));
         assert_eq!(card.summary.inconclusive_seed_gaps, 0, "not a seed gap");
         assert_eq!(card.summary.novel_calls, 1, "novel call is a NovelCall");
+        // The catch this guards is the CLASSIFICATION, which is what #28 broke:
+        // the peek flagged seed_gap, the tally swallowed the extra call as an
+        // InconclusiveSeedGap, and the extra-call catch was masked. Novel calls no
+        // longer fail a verdict, so `!pass` can no longer stand in for "classified
+        // correctly" — assert the two classes directly instead, which is what the
+        // regression was ever about.
         assert!(
-            !card.verdict.pass,
-            "a novel Execute call with no recording must FAIL the verdict (blocking): {}",
+            !card.verdict.inconclusive,
+            "a novel Execute call must not be excused into the unjudged class: {}",
             card.verdict.reason
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "NovelCall"),
+            1,
+            "and it must be named under its own class, not another"
         );
     }
 
@@ -10268,7 +11978,10 @@ mod tests {
         assert_eq!(card.summary.matched_side_effect_calls, 2);
         assert_eq!(card.summary.omitted_calls, 2);
         assert_eq!(card.summary.novel_calls, 1);
-        assert_eq!(card.summary.side_effect_divergences, 3);
+        // Two omitted calls charge; the novel subtree is reported and charges
+        // nothing, so the weighted accounting the two tiers keep independent is
+        // over the omissions alone.
+        assert_eq!(card.summary.side_effect_divergences, 2);
         assert!(card.counter_disagreements().is_empty());
         let rows = build_ledger(&artifacts).expect("mixed-tier ledger builds");
         assert_eq!(
@@ -10284,8 +11997,21 @@ mod tests {
             1
         );
     }
+    /// A bind-order swap is a SKEW and not a divergence.
+    ///
+    /// This fixture is the change's best evidence, which is why it is rewritten
+    /// rather than deleted: two sibling spans with identical names, the recorded
+    /// side pairing 51→501 (bind a) and 52→502 (bind b), the observed side
+    /// serving them the other way round. Every call resolved to its own recorded
+    /// event; the two PAIRING methods disagree, and that disagreement is the
+    /// skew. It is the same shape as a concurrent fan-out reordering work both
+    /// sides performed.
+    ///
+    /// Both bindings are still asserted below. If this test could pass without
+    /// naming the skew, the change would be untested — the classification is the
+    /// thing that has to survive, only its cost changes.
     #[test]
-    fn same_statement_bind_order_swap_is_blocking_identity_skew() {
+    fn same_statement_bind_order_swap_is_a_tolerated_identity_skew() {
         let corr = "identity-swap";
         let result = serde_json::json!({"result": "Ok", "value": []});
         let events = vec![
@@ -10367,13 +12093,35 @@ mod tests {
             BTreeSet::from([(Some(501), Some(502)), (Some(502), Some(501))])
         );
         assert_eq!(card.summary.identity_skews, 2);
-        assert_eq!(card.summary.side_effect_divergences, 2);
-        assert_eq!(kind_count(&card, "db", "IdentitySkew"), 2);
-        assert_eq!(kind_count(&card, "db", "ValueDiverged"), 0);
+        assert_eq!(
+            kind_count(&card, "db", "IdentitySkew"),
+            2,
+            "the skew must still be NAMED — tolerating it is not dropping it"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and charged to nothing: both sides ran the same two statements and \
+             each resolved to its own recorded event"
+        );
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            0,
+            "a content difference would be counted HERE, which is why a skew \
+             cannot be hiding one"
+        );
         assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
         assert_eq!(card.summary.matched_side_effect_calls, 0);
-        assert!(!outcome.passed);
-        assert!(!card.verdict.pass);
+        assert!(
+            outcome.passed,
+            "the response matched and every call resolved; the order the two \
+             pairing methods disagree about is not a difference"
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.verdict.reason.contains("identity skew"),
+            "and the verdict must still SAY the skew happened: {}",
+            card.verdict.reason
+        );
         assert!(card.counter_disagreements().is_empty());
     }
     #[test]
@@ -10649,6 +12397,37 @@ mod tests {
                 + card.summary.side_effect_divergences
         }
 
+        /// The sibling of [`assert_one_blocking`] for a class that is REPORTED
+        /// and not scored.
+        ///
+        /// Sensitivity is still the point: the detector must NOTICE the injected
+        /// call and name its class, or a mutation that blinded it would go
+        /// unseen. What changed is only the consequence — so this asserts the
+        /// naming exactly as strictly, and pins the non-consequence as well, which
+        /// `assert_one_blocking` could not do.
+        fn assert_one_reported_not_scored(
+            card: &Scorecard,
+            boundary: &str,
+            kind: &str,
+            protected_signal: &str,
+        ) {
+            assert_eq!(
+                kind_count(card, boundary, kind),
+                1,
+                "{protected_signal}: the scorer must name the expected {kind} class"
+            );
+            assert_eq!(
+                blocking_divergences(card),
+                0,
+                "{protected_signal}: a reported-not-scored class must charge nothing"
+            );
+            assert!(
+                card.verdict.pass,
+                "{protected_signal}: it must not fail the verdict either: {}",
+                card.verdict.reason
+            );
+        }
+
         fn assert_one_blocking(
             card: &Scorecard,
             boundary: &str,
@@ -10852,7 +12631,7 @@ mod tests {
                 vec![http(corr, true, vec![])],
             ));
 
-            assert_one_blocking(
+            assert_one_reported_not_scored(
                 &card,
                 "redis",
                 "NovelCall",

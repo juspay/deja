@@ -53,6 +53,71 @@ impl CandidateBinding {
     }
 }
 
+/// The declared systems document, carried from the orchestrator into the Job.
+///
+/// The lifecycle stages run IN THE POD (`drive_replay_in_pod`), and the pull
+/// path resolves a recording's bucket from the declaration rather than from
+/// `DEJA_S3_*`. A runner without the document therefore sees no systems at all
+/// and refuses stage 1 by name — "system 'hyperswitch' has no recording bucket
+/// declared" — for a system the orchestrator can see perfectly well. The
+/// declaration was resolved, consulted, and never delivered to the process that
+/// needed it.
+///
+/// One source, carried by the launcher. NOT duplicated into the replay-env
+/// chart: two copies of a document is how they come to disagree.
+///
+/// All three layers `settings::load` reads are forwarded, because the effective
+/// declaration is their composition and not any one of them:
+///   - `DEJA_CONFIG_TOML` verbatim when the deployment sets it inline
+///   - otherwise the config FILE's contents, inline, because the Job cannot
+///     mount the orchestrator's filesystem
+///   - and every `DEJA__` override, so a value the orchestrator resolved from
+///     the environment resolves the same way in the pod
+fn declared_config_env(container: &str) -> Vec<EnvUpsert> {
+    let mut out = Vec::new();
+    let inline = std::env::var("DEJA_CONFIG_TOML")
+        .ok()
+        .filter(|d| !d.trim().is_empty());
+    let document = inline.or_else(|| {
+        let path = std::env::var("DEJA_CONFIG_FILE")
+            .ok()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| crate::settings::DEFAULT_CONFIG_FILE.to_owned());
+        match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => Some(text),
+            Ok(_) => None,
+            Err(e) => {
+                // Absent is normal — the deployment may configure inline or not
+                // at all. Present-but-unreadable is not, and it would surface
+                // as the pod refusing a system the orchestrator can see.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "executor: config file {path} could not be read ({e}); the Job will \
+                         launch without the systems document and will refuse to resolve a \
+                         recording's bucket"
+                    );
+                }
+                None
+            }
+        }
+    });
+    if let Some(document) = document {
+        out.push(EnvUpsert::new(container, "DEJA_CONFIG_TOML", &document));
+    }
+    // Overrides travel with it: `DEJA__SYSTEMS__PRISM__S3_BUCKET` resolved in
+    // the orchestrator must resolve in the pod, or the two disagree about a
+    // system the document alone does not fully describe.
+    let mut overrides: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("DEJA__"))
+        .collect();
+    overrides.sort();
+    for (key, value) in overrides {
+        out.push(EnvUpsert::new(container, &key, &value));
+    }
+    out
+}
+
 /// The runner container's PER-RUN env. The static runner wiring (DB/redis
 /// sidecar coords, HARNESS_STATE_DIR, orchestrator URL) belongs to the Job
 /// template; only these vary run-to-run.
@@ -70,6 +135,7 @@ pub fn runner_env(
         EnvUpsert::new(container, "DEJA_RUN_ID", run_id),
         EnvUpsert::new(container, "DEJA_RUN_SPEC", run_spec_json),
     ];
+    env.extend(declared_config_env(container));
     if let Some(fp) = expected_migrations {
         // Newline-separated — the runner parses RUNNER_EXPECTED_MIGRATIONS the
         // same way (one version per line).
@@ -143,5 +209,67 @@ mod tests {
         );
         assert_eq!(find(&with, "DEJA_RUN_ID").value, "run-5");
         assert!(with.iter().all(|e| e.container == "runner"));
+    }
+
+    /// The declaration has to REACH the pod, not merely exist.
+    ///
+    /// The stages that resolve a recording's bucket run in the runner inside
+    /// the Job. Before this, the Job's env carried the `DEJA_S3_*` slots and
+    /// not the systems document, so the pod's `settings::load()` saw no systems
+    /// and refused stage 1 by name for a system the orchestrator had resolved
+    /// perfectly well — every replay failed in twelve seconds.
+    #[test]
+    fn the_job_carries_the_declaration_the_pod_resolves_from() {
+        let _lock = crate::test_env::env_guard();
+        const DOCUMENT: &str = "default_system = \"hyperswitch\"\n\
+                                [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n";
+        std::env::set_var("DEJA_CONFIG_TOML", DOCUMENT);
+        std::env::set_var("DEJA__SYSTEMS__PRISM__S3_BUCKET", "ucs-deja");
+        let env = runner_env("runner", "run-1", "{}", None);
+        std::env::remove_var("DEJA__SYSTEMS__PRISM__S3_BUCKET");
+
+        let carried = env
+            .iter()
+            .find(|e| e.name == "DEJA_CONFIG_TOML")
+            .expect("the Job must receive the document");
+        assert_eq!(carried.value, DOCUMENT, "verbatim, not re-serialised");
+        assert_eq!(carried.container, "runner");
+
+        // Overrides travel with it, or the pod resolves a different roster from
+        // the same document.
+        assert!(
+            env.iter()
+                .any(|e| e.name == "DEJA__SYSTEMS__PRISM__S3_BUCKET" && e.value == "ucs-deja"),
+            "a DEJA__ override the orchestrator resolved must reach the pod"
+        );
+
+        // And what it receives is enough to resolve from: this is the call the
+        // pull path makes at stage 1.
+        assert_eq!(
+            crate::system::recording_scope("hyperswitch").map(|(b, _)| b),
+            Ok("hyperswitch-art".to_owned()),
+            "the pod's resolution succeeds on the carried document"
+        );
+        std::env::remove_var("DEJA_CONFIG_TOML");
+    }
+
+    /// A deployment that configures by FILE gets its contents inline, because
+    /// the Job cannot mount the orchestrator's filesystem.
+    #[test]
+    fn a_file_configured_deployment_sends_its_contents() {
+        let _lock = crate::test_env::env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deja.toml");
+        std::fs::write(&path, "default_system = \"hyperswitch\"\n").expect("write config");
+        std::env::remove_var("DEJA_CONFIG_TOML");
+        std::env::set_var("DEJA_CONFIG_FILE", &path);
+        let env = runner_env("runner", "run-1", "{}", None);
+        std::env::remove_var("DEJA_CONFIG_FILE");
+
+        let carried = env
+            .iter()
+            .find(|e| e.name == "DEJA_CONFIG_TOML")
+            .expect("the file's contents travel inline");
+        assert!(carried.value.contains("default_system"));
     }
 }
