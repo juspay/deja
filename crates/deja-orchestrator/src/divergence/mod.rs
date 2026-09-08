@@ -411,6 +411,20 @@ pub struct CorrelationOutcome {
     pub passed: bool,
 }
 
+/// The verdict reason [`detect`] gives a run that ingested no artifacts at all.
+///
+/// A shared `const` rather than a literal on each side, because the scorecard
+/// ENDPOINT matches on it to decide whether to add the run's own terminal state
+/// to the reason. A sentinel string spelled once by its producer and again by
+/// its consumer is the drift this repo keeps writing defenses against; there is
+/// one spelling and both sides read it from here.
+///
+/// It deliberately does NOT say "yet". Whether more artifacts are still coming
+/// is a fact about the RUN, and [`detect`] is handed only the artifacts — it
+/// cannot see the run at all. The word was asserting a transience nobody had
+/// checked, on runs that had already failed an hour earlier.
+pub const NO_ARTIFACTS_REASON: &str = "no artifacts ingested for this run";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
     pub pass: bool,
@@ -4922,7 +4936,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0) && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
-        "no artifacts ingested for this run yet".to_owned()
+        NO_ARTIFACTS_REASON.to_owned()
     } else if inconclusive {
         reasons.join("; ")
     } else if pass && reasons.is_empty() {

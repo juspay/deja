@@ -1316,8 +1316,92 @@ async fn v1_scorecard(State(st): State<AppState>, Path(id): Path<String>) -> Res
         }
     }
     match divergence::scorecard(&st.root, &id) {
-        Ok(card) => json_ok(serde_json::to_value(&card).unwrap_or_default()),
+        Ok(mut card) => {
+            // An empty scorecard has three possible causes and they are not the
+            // same news. The scorer can only report that nothing arrived; which
+            // cause applies is a fact about the RUN, and this is the one place
+            // that holds both.
+            if card.verdict.reason == divergence::NO_ARTIFACTS_REASON {
+                let (state, failure) = run_disposition(&st, &id).await;
+                card.verdict.reason = empty_scorecard_reason(state.as_deref(), failure.as_deref());
+            }
+            json_ok(serde_json::to_value(&card).unwrap_or_default())
+        }
         Err(e) => error_resp(500, &format!("scorecard: {e}")),
+    }
+}
+
+/// The run's state and failure message, preferring the STORE row.
+///
+/// Order matters and is not arbitrary. The file store is the worker's LIVE
+/// snapshot, and on the k8s path it is not where a terminal state lands:
+/// `StoreCtx` reports through Postgres or the ingest endpoint and never writes
+/// back to `run.json`. The run this was found on still said `resolving` on disk
+/// an hour after the row said `failed`, so reading the file first would state
+/// the opposite of the truth with full confidence. The file remains the
+/// fallback because a compose deployment has no store, and there it is the only
+/// record there is.
+async fn run_disposition(st: &AppState, id: &str) -> (Option<String>, Option<String>) {
+    if let Some(store) = &st.store {
+        if let Ok(Some(row)) = store.get_run(id).await {
+            let failure = row
+                .failure
+                .as_ref()
+                .and_then(|f| f.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            return (Some(row.state), failure);
+        }
+    }
+    match runs::get(&st.root, id) {
+        Ok(run) => (
+            serde_json::to_value(run.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned)),
+            run.failure_reason,
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// Why a scorecard that judged nothing is empty, said in the run's own terms.
+///
+/// [`divergence::detect`] is handed the artifacts and nothing else, so the most
+/// it can say is that none arrived. WHY none arrived is a property of the run,
+/// and the three answers are different news that must not arrive as one
+/// sentence:
+///
+///  - the run is still going, so artifacts may genuinely still appear;
+///  - the run is over and FAILED, so they never will — and the failure says why;
+///  - the run is over and COMPLETED yet ingested nothing, which is an anomaly in
+///    its own right and the loudest of the three, because a run that succeeded
+///    without comparing anything is a hole in the pipeline rather than a result.
+///
+/// The standing rule this serves: an empty result names which of its possible
+/// causes applies. This one previously named none of them, and said "yet" —
+/// which told a reader the artifacts were on their way for runs that had died
+/// an hour before.
+fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String {
+    let base = divergence::NO_ARTIFACTS_REASON;
+    match state {
+        Some("failed") => format!(
+            "{base}: the run FAILED before producing any — {}. Nothing was compared, so \
+             nothing here is evidence about the candidate",
+            failure.unwrap_or("no failure message was recorded against the run")
+        ),
+        Some("completed") => format!(
+            "{base}, yet the run reports COMPLETED — a run that finished without ingesting \
+             anything has not scored the candidate, and this scorecard must not be read as \
+             though it had"
+        ),
+        Some(other) => format!(
+            "{base}: the run is still {other}, so this is a snapshot of a run in progress \
+             rather than a verdict on it"
+        ),
+        None => format!(
+            "{base}, and the run itself could not be read — whether more are coming is \
+             therefore unknown, not \"not yet\""
+        ),
     }
 }
 
@@ -2129,5 +2213,104 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    // -- an empty scorecard names WHICH of its causes applies -----------------
+    //
+    // The rule these serve is the repo's standing one: an empty result names
+    // which of its possible causes applies. A run that failed at step 1 of 6
+    // used to answer "no artifacts ingested for this run yet" — true about the
+    // artifacts, silent about the run, and the "yet" told the reader more were
+    // coming when the run had been dead for an hour.
+
+    /// THE SEAM. `detect` writes this reason and the scorecard endpoint matches
+    /// on it to decide whether to name the run's disposition. If the scorer's
+    /// wording drifts, the endpoint stops matching and the naming silently stops
+    /// happening — the exact producer/consumer split that keeps costing this
+    /// repo. Nothing else in the suite would notice, so this is the thing that
+    /// notices.
+    #[test]
+    fn the_scorer_emits_exactly_the_reason_the_endpoint_matches_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        // No artifacts of any kind: the `nothing` arm of `detect`.
+        let card = deja_orchestrator::divergence::scorecard(&root, "run-with-nothing").unwrap();
+        assert!(
+            card.verdict.inconclusive,
+            "an artifact-less run is not judgeable"
+        );
+        assert!(!card.verdict.pass, "and it certainly does not pass");
+        assert_eq!(
+            card.verdict.reason,
+            deja_orchestrator::divergence::NO_ARTIFACTS_REASON,
+            "the endpoint keys off this exact string; if the scorer's wording moved, \
+             `v1_scorecard` has silently stopped naming why runs are empty"
+        );
+    }
+
+    /// A run that FAILED says so, and carries the failure that explains it.
+    #[test]
+    fn a_failed_run_says_the_run_failed_and_why() {
+        let reason = empty_scorecard_reason(
+            Some("failed"),
+            Some("job did not reach a terminal state within the watch deadline"),
+        );
+        assert!(reason.contains("FAILED"), "{reason}");
+        assert!(
+            reason.contains("job did not reach a terminal state within the watch deadline"),
+            "the run's own failure is the answer to \"why is this empty\": {reason}"
+        );
+        // The precise regression: no claim that anything is still on its way.
+        assert!(
+            !reason.contains(" yet"),
+            "a finished run's scorecard must not imply artifacts are still coming: {reason}"
+        );
+    }
+
+    /// A failed run with no recorded message still says the run failed. The
+    /// missing message is named as missing rather than papered over with the
+    /// in-progress wording, which would be the wrong answer entirely.
+    #[test]
+    fn a_failed_run_without_a_message_still_says_it_failed() {
+        let reason = empty_scorecard_reason(Some("failed"), None);
+        assert!(reason.contains("FAILED"), "{reason}");
+        assert!(reason.contains("no failure message"), "{reason}");
+        assert!(!reason.contains(" yet"), "{reason}");
+    }
+
+    /// A run still in flight keeps the honest in-progress reading — this is the
+    /// one case where "more may arrive" is true, and it must not be lost to the
+    /// fix for the case where it is false.
+    #[test]
+    fn a_running_run_is_not_reported_as_finished() {
+        let reason = empty_scorecard_reason(Some("resolving"), None);
+        assert!(reason.contains("still resolving"), "{reason}");
+        assert!(!reason.contains("FAILED"), "{reason}");
+    }
+
+    /// COMPLETED with nothing ingested is the loudest of the three: the run did
+    /// not fail, so nothing else will flag it, and a reader skimming for red has
+    /// no other cue that the pipeline dropped the whole comparison.
+    #[test]
+    fn a_completed_run_that_ingested_nothing_is_called_out() {
+        let reason = empty_scorecard_reason(Some("completed"), None);
+        assert!(reason.contains("COMPLETED"), "{reason}");
+        assert!(reason.contains("has not scored the candidate"), "{reason}");
+    }
+
+    /// Every arm names a cause. A bare restatement of the base reason would be
+    /// the old behaviour wearing the new code's clothes, and this is what would
+    /// catch a future arm added without one.
+    #[test]
+    fn no_arm_leaves_the_cause_unnamed() {
+        let base = deja_orchestrator::divergence::NO_ARTIFACTS_REASON;
+        for state in [Some("failed"), Some("completed"), Some("running"), None] {
+            let reason = empty_scorecard_reason(state, None);
+            assert!(
+                reason.len() > base.len(),
+                "state {state:?} added nothing to the bare reason: {reason}"
+            );
+            assert!(reason.starts_with(base), "state {state:?}: {reason}");
+        }
     }
 }
