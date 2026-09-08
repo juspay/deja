@@ -15,6 +15,7 @@ import {
   transportFailure,
 } from "../lib/spine";
 import { diffArgs, LeafDiff } from "../lib/argdiff";
+import { useSystems } from "../lib/systems";
 import { JsonView, ValuePair } from "./JsonView";
 import { JsonDiff } from "./JsonDiff";
 import { ConfidenceBadge, levelForRank } from "./Confidence";
@@ -256,6 +257,122 @@ function Environmental({ e, note }: { e: CallEntry; note: string | null }) {
 }
 
 /** NOVEL — a call the candidate made that the recording did not. */
+/* ---- HTTP-shaped args, projected to comparable facts ----
+ *
+ * The facts the retired `ucs::connector_call` scored span used to capture at
+ * record time — method, url split into origin/path/query KEYS (values dropped:
+ * some connectors carry credentials there), header NAMES, body shape — derived
+ * here at render time from the boundary records both sides already carry.
+ * Values are never shown: the tape args are full-fidelity, the projection is
+ * the safe view of them. Works on any args object shaped {method, url, …},
+ * whichever system recorded it. */
+type HttpFacts = {
+  method?: string;
+  origin?: string;
+  path?: string;
+  queryKeys?: string;
+  headerNames?: string[];
+  body?: string;
+};
+
+function httpFactsOf(args: unknown): HttpFacts | null {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const a = args as Record<string, unknown>;
+  if (typeof a.url !== "string" || typeof a.method !== "string") return null;
+  const out: HttpFacts = { method: a.method };
+  try {
+    const u = new URL(a.url);
+    out.origin = u.origin;
+    out.path = u.pathname;
+    out.queryKeys = Array.from(new Set(Array.from(u.searchParams.keys()))).sort().join(",");
+  } catch {
+    out.path = a.url;
+  }
+  // Headers arrive as [name, value] pairs, an array of one-key objects, or a
+  // plain object, depending on which system's codec wrote the record.
+  const names = new Set<string>();
+  const h = a.headers;
+  if (Array.isArray(h)) {
+    for (const entry of h) {
+      if (Array.isArray(entry) && typeof entry[0] === "string") names.add(entry[0].toLowerCase());
+      else if (entry && typeof entry === "object")
+        for (const k of Object.keys(entry)) names.add(k.toLowerCase());
+    }
+  } else if (h && typeof h === "object") {
+    for (const k of Object.keys(h)) names.add(k.toLowerCase());
+  }
+  if (names.size > 0) out.headerNames = Array.from(names).sort();
+  const b = a.body;
+  if (typeof b === "string") {
+    const kind = b.trimStart().startsWith("{")
+      ? "json"
+      : b.includes("=") && !b.includes(" ")
+        ? "form-urlencoded"
+        : "text";
+    out.body = `${kind} · ${b.length} chars`;
+  } else if (b != null) {
+    out.body = "structured";
+  }
+  return out;
+}
+
+function HttpCallFacts({ e }: { e: CallEntry }) {
+  const rec = httpFactsOf(e.call.recorded?.args);
+  const obs = httpFactsOf(e.call.observed?.args);
+  if (!rec && !obs) return null;
+  const names = (f?: HttpFacts | null) => f?.headerNames?.join(",");
+  const facts: [string, string | undefined, string | undefined][] = [
+    ["method", rec?.method, obs?.method],
+    ["url.origin", rec?.origin, obs?.origin],
+    ["url.path", rec?.path, obs?.path],
+    ["url.query_keys", rec?.queryKeys, obs?.queryKeys],
+    ["headers.names", names(rec), names(obs)],
+    ["body", rec?.body, obs?.body],
+  ];
+  // Name the drifted facet — the diagnosis the retired scored span provided.
+  const extra = (obs?.headerNames ?? []).filter((n) => !(rec?.headerNames ?? []).includes(n));
+  const missing = (rec?.headerNames ?? []).filter((n) => !(obs?.headerNames ?? []).includes(n));
+  return (
+    <div className="scoredfields">
+      <div className="hint">connector-call facts — derived from the boundary record, values never shown</div>
+      <table className="fieldtbl">
+        <thead>
+          <tr>
+            <th>fact</th>
+            <th>record</th>
+            <th>replay</th>
+          </tr>
+        </thead>
+        <tbody>
+          {facts
+            .filter(([, r, o]) => r !== undefined || o !== undefined)
+            .map(([k, r, o]) => (
+              <tr key={k} className={r !== undefined && o !== undefined && r !== o ? "fdiff" : undefined}>
+                <td className="mono">{k}</td>
+                <td className="mono val">{r ?? "—"}</td>
+                <td className="mono val">{o ?? "—"}</td>
+              </tr>
+            ))}
+        </tbody>
+      </table>
+      {rec && obs && (extra.length > 0 || missing.length > 0) && (
+        <p className="hint">
+          {extra.length > 0 && (
+            <>
+              replay adds: <code>{extra.join(", ")}</code>{" "}
+            </>
+          )}
+          {missing.length > 0 && (
+            <>
+              replay lacks: <code>{missing.join(", ")}</code>
+            </>
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function Novel({ e }: { e: CallEntry }) {
   const c = e.call;
   return (
@@ -263,6 +380,7 @@ function Novel({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">The candidate made this call; the recording has none to pair with it.</p>
+      <HttpCallFacts e={e} />
       <h4>arguments the candidate sent</h4>
       <JsonView value={c.observed?.args} />
     </div>
@@ -368,6 +486,13 @@ function Matched({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">Reconciled: this call was found on both sides and its values agree.</p>
+      <HttpCallFacts e={e} />
+      {c.recorded?.args !== undefined && (
+        <details className="evraw">
+          <summary>recorded arguments</summary>
+          <JsonView value={c.recorded.args} />
+        </details>
+      )}
       <details className="evraw">
         <summary>recorded value</summary>
         <JsonView value={c.recorded?.result} />
@@ -516,11 +641,33 @@ function HiddenList({ label, groups }: { label: string; groups: SpineNode["hidde
 /** Node-id → node lookup per side, for reading a scored span's captured fields. */
 type GraphIndex = { rec: Map<number, GraphNode>; rep: Map<number, GraphNode> };
 
-function ScoredFields({ scored, graphIndex }: { scored: SpanShapeOutcome; graphIndex: GraphIndex }) {
-  const recNode =
-    scored.record_node_id != null ? graphIndex.rec.get(scored.record_node_id) : undefined;
-  const repNode =
-    scored.replay_node_id != null ? graphIndex.rep.get(scored.replay_node_id) : undefined;
+/**
+ * Captured span fields for ANY row, straight from the execution graph — the
+ * scored-fields table, generalized. On a scored row the span-shape check's own
+ * field verdicts drive the highlighting; on an unscored row every field still
+ * shows (whatever `#[instrument]` captured), with cross-side differences marked
+ * as volatile because no check compared them.
+ */
+function SpanFields({
+  node,
+  graphIndex,
+  selected,
+}: {
+  node: SpineNode;
+  graphIndex: GraphIndex;
+  selected: { nodeId: number | null; side: Side };
+}) {
+  const scored = node.scored;
+  const pick = (ids: number[], side: Side) =>
+    selected.nodeId != null && selected.side === side && ids.includes(selected.nodeId)
+      ? selected.nodeId
+      : ids.length > 0
+        ? ids[0]
+        : undefined;
+  const recId = scored?.record_node_id ?? pick(node.recNodes, "rec");
+  const repId = scored?.replay_node_id ?? pick(node.repNodes, "rep");
+  const recNode = recId != null ? graphIndex.rec.get(recId) : undefined;
+  const repNode = repId != null ? graphIndex.rep.get(repId) : undefined;
 
   const keys = Array.from(
     new Set([...Object.keys(recNode?.fields ?? {}), ...Object.keys(repNode?.fields ?? {})]),
@@ -529,12 +676,14 @@ function ScoredFields({ scored, graphIndex }: { scored: SpanShapeOutcome; graphI
 
   const show = (v: unknown) =>
     v === undefined ? "—" : typeof v === "string" ? v : JSON.stringify(v);
-  const diffKeys = new Set((scored.field_diffs ?? []).map((d) => d.key));
+  const diffKeys = new Set((scored?.field_diffs ?? []).map((d) => d.key));
 
   return (
     <div className="scoredfields">
       <div className="hint">
-        scored span fields — captured on each side, compared by the span-shape check
+        {scored
+          ? "scored span fields — captured on each side, compared by the span-shape check"
+          : "span fields — captured on each side from the execution graph; no check compares them"}
       </div>
       <table className="fieldtbl">
         <thead>
@@ -566,10 +715,10 @@ function ScoredFields({ scored, graphIndex }: { scored: SpanShapeOutcome; graphI
           })}
         </tbody>
       </table>
-      {scored.status === "missing" && (
+      {scored?.status === "missing" && (
         <p className="hint">replay never executed this span — nothing to compare against.</p>
       )}
-      {scored.status === "novel" && (
+      {scored?.status === "novel" && (
         <p className="hint">
           the tape has no such span — the replay side carries instrumentation the recording
           predates.
@@ -642,7 +791,7 @@ function SpanDetail({
       )}
 
       <div className="uvdbody">
-        {node.scored && <ScoredFields scored={node.scored} graphIndex={graphIndex} />}
+        <SpanFields node={node} graphIndex={graphIndex} selected={selected} />
         {empty && <NoEvidence n={node} />}
         {node.http.map((d, i) => (
           <Response key={`h${i}`} d={d} />
@@ -732,14 +881,30 @@ function Row({
 export default function UnifiedView({
   runId,
   scorecard,
+  systemName,
 }: {
   runId: string;
   scorecard: Scorecard | null;
+  /** The system the run drove (`params.system_under_test`); null means the
+   *  deployment's default system. Decides the lattice toggle's DEFAULT — a
+   *  system that declares an instrumentation contract wants its lattice
+   *  visible, one that declares none keeps today's compact tree. */
+  systemName?: string | null;
 }) {
   const [params, setParams] = useSearchParams();
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
   const [onlyMarked, setOnlyMarked] = React.useState(false);
   const [showHidden, setShowHidden] = React.useState(false);
+
+  // The lattice default comes from the DECLARATION, never from a hard-coded
+  // system name (see lib/systems.ts for why the browser must not know names).
+  const systems = useSystems();
+  const sysRow = systemName
+    ? systems.all.find((s) => s.name === systemName)
+    : systems.defaultSystem;
+  const latticeDefault = (sysRow?.scored_span_namespaces?.length ?? 0) > 0;
+  const [latticeOverride, setLatticeOverride] = React.useState<boolean | null>(null);
+  const showLattice = latticeOverride ?? latticeDefault;
 
   const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId) });
   const https = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId) });
@@ -764,8 +929,11 @@ export default function UnifiedView({
   }, [scorecard]);
 
   const model = React.useMemo(
-    () => buildSpine(calls.data ?? [], graph.data, https.data ?? [], spanShapes),
-    [calls.data, graph.data, https.data, spanShapes],
+    () =>
+      buildSpine(calls.data ?? [], graph.data, https.data ?? [], spanShapes, {
+        promoteInternal: showLattice,
+      }),
+    [calls.data, graph.data, https.data, spanShapes, showLattice],
   );
 
   const boundaryNotes = React.useMemo(() => {
@@ -913,6 +1081,17 @@ export default function UnifiedView({
             onChange={(e) => setShowHidden(e.target.checked)}
           />
           reveal framing &amp; transport spans
+        </label>
+        <label
+          className="toggle"
+          title="internal application spans from the execution graph, as rows with durations and captured fields — defaults on for a system that declares an instrumentation contract"
+        >
+          <input
+            type="checkbox"
+            checked={showLattice}
+            onChange={(e) => setLatticeOverride(e.target.checked)}
+          />
+          show instrumented lattice
         </label>
         <span className="hint">
           {rows.length} of {active.rows} spans shown
