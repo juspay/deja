@@ -44,6 +44,9 @@ export type Mark =
   | "novel"
   | "novel-span"
   | "environmental"
+  | "identity-skew"
+  | "unknown"
+  | "non-blocking"
   | "matched";
 
 export const MARK_ORDER: Mark[] = [
@@ -56,6 +59,9 @@ export const MARK_ORDER: Mark[] = [
   "novel",
   "novel-span",
   "environmental",
+  "identity-skew",
+  "unknown",
+  "non-blocking",
   "matched",
 ];
 
@@ -189,12 +195,37 @@ function markOf(c: CallRecord): Mark | null {
       return "novel";
     case "environmental":
       return "environmental";
+    case "pruned_subtree":
+      // The recording made this call; the replay's subtree was pruned above it,
+      // so nothing on the replay side pairs with it. That is an absence, and it
+      // is the same absence `omitted` names.
+      return "omitted";
+    case "novel_subtree":
+      // The mirror: a subtree the candidate produced with no recorded
+      // counterpart.
+      return "novel";
+    case "identity_skew":
+      return "identity-skew";
     case "matched":
     case "recovered":
     case "deterministic":
       return "matched";
     default:
-      return null;
+      // Anything the scorer emits that this build does not know about. It must
+      // NOT return null: a null mark drops the node from the "only paths with a
+      // finding" filter, so an unrecognised kind would be unreachable in the
+      // tree as well as unlabelled in the panel.
+      //
+      // Which of the two it gets is decided by the ROW, not by a list here. A
+      // second hard-coded list of kinds — this time the ones believed harmless —
+      // would drift from the scorer exactly as the four-kind dispatch did, and
+      // that drift is this bug. `blocking` comes down on every row and the
+      // scorer is its author, so ask it: a kind that counts against the verdict
+      // is `unknown` and loud, one that does not is `non-blocking` and quiet but
+      // still present. That also keeps `unknown` meaningful — it fires only on
+      // something genuinely new AND consequential, rather than on four kinds we
+      // understand, which is how a reader learns to ignore it.
+      return c.blocking ? "unknown" : "non-blocking";
   }
 }
 

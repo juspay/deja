@@ -41,6 +41,9 @@ const MARK_LABEL: Record<Mark, string> = {
   novel: "novel",
   "novel-span": "novel span",
   environmental: "environmental",
+  "identity-skew": "identity skew",
+  unknown: "unrecognised kind",
+  "non-blocking": "non-blocking",
   matched: "matched",
 };
 
@@ -267,6 +270,97 @@ function Novel({ e }: { e: CallEntry }) {
 }
 
 /** MATCHED — reconciled. Shown so that clicking any span answers something. */
+function PrunedSubtree({ e }: { e: CallEntry }) {
+  const c = e.call;
+  return (
+    <div className="evidence ev-omitted">
+      <CallHead c={c} />
+      <SplitSpans e={e} />
+      <p className="evwhat">
+        The recording made this call. On the replay side the subtree above it was pruned, so there
+        is nothing to pair it with{c.blocking ? " — and the scorer counts this toward the verdict" : ""}.
+      </p>
+      <p className="evlimit">
+        Pruning is a statement about the <i>tree</i>, not about this call: the candidate diverged
+        somewhere above and everything beneath went with it. The cause is the pruning point, not
+        this row.
+      </p>
+      <h4>recorded arguments</h4>
+      <JsonView value={c.recorded?.args} />
+      <h4>recorded result</h4>
+      <JsonView value={c.recorded?.result} />
+    </div>
+  );
+}
+
+function NovelSubtree({ e }: { e: CallEntry }) {
+  const c = e.call;
+  return (
+    <div className="evidence ev-novel">
+      <CallHead c={c} />
+      <SplitSpans e={e} />
+      <p className="evwhat">
+        The candidate produced this call inside a subtree the recording has no counterpart for
+        {c.blocking ? ", and the scorer counts it toward the verdict" : ""}.
+      </p>
+      <p className="evlimit">
+        As with a pruned subtree, the cause is where the trees parted, not this row.
+      </p>
+      <h4>observed arguments</h4>
+      <JsonView value={c.observed?.args} />
+      <h4>observed result</h4>
+      <JsonView value={c.observed?.result} />
+    </div>
+  );
+}
+
+function IdentitySkew({ e }: { e: CallEntry }) {
+  const c = e.call;
+  return (
+    <div className="evidence ev-identity-skew">
+      <CallHead c={c} />
+      <SplitSpans e={e} />
+      <p className="evwhat">
+        Both sides made this call, but they do not agree on which recorded call it is. The replay
+        lookup served one event while structural alignment picked another
+        {c.blocking ? "; the scorer counts this toward the verdict" : ""}.
+      </p>
+      <p className="evlimit">
+        The values below may well match. That is not reassurance — a skew means the address is
+        ambiguous, so a later call can be served the wrong recorded value without anything here
+        looking wrong.
+      </p>
+      <h4>recorded</h4>
+      <JsonView value={c.recorded?.result} />
+      <h4>observed</h4>
+      <JsonView value={c.observed?.result} />
+    </div>
+  );
+}
+
+function UnrecognisedKind({ e }: { e: CallEntry }) {
+  const c = e.call;
+  return (
+    <div className="evidence ev-unknown">
+      <CallHead c={c} />
+      <SplitSpans e={e} />
+      <p className="evwhat">
+        This dashboard has no panel for kind <code>{c.kind}</code>. The scorer marks it{" "}
+        {c.blocking ? "BLOCKING — it counts against the verdict" : "non-blocking"}. Both sides are
+        shown raw below.
+      </p>
+      <p className="evlimit">
+        This is not a verdict. The scorer knows what this kind means and this build does not — read
+        the row as unreviewed, not as agreement.
+      </p>
+      <h4>recorded</h4>
+      <JsonView value={c.recorded?.result} />
+      <h4>observed</h4>
+      <JsonView value={c.observed?.result} />
+    </div>
+  );
+}
+
 function Matched({ e }: { e: CallEntry }) {
   const c = e.call;
   return (
@@ -560,7 +654,18 @@ function SpanDetail({
           if (k === "environmental")
             return <Environmental key={i} e={e} note={boundaryNotes[e.call.boundary] ?? null} />;
           if (k === "novel") return <Novel key={i} e={e} />;
-          return <Matched key={i} e={e} />;
+          if (k === "pruned_subtree") return <PrunedSubtree key={i} e={e} />;
+          if (k === "novel_subtree") return <NovelSubtree key={i} e={e} />;
+          if (k === "identity_skew") return <IdentitySkew key={i} e={e} />;
+          // Agreement is an ALLOW-LIST. Falling through to `Matched` told the
+          // reader that any kind this build did not recognise was reconciled and
+          // its values agreed — including `pruned_subtree`, `novel_subtree` and
+          // `identity_skew`, which the scorer marks blocking. A kind added to the
+          // scorer tomorrow must degrade to "no panel yet, here are the values",
+          // never to a claim of agreement.
+          if (k === "matched" || k === "recovered" || k === "deterministic")
+            return <Matched key={i} e={e} />;
+          return <UnrecognisedKind key={i} e={e} />;
         })}
         <HiddenList label="record-side framing/internal" groups={node.hiddenRec} />
         <HiddenList label="replay-side framing/internal" groups={node.hiddenRep} />
