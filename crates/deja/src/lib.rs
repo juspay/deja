@@ -64,6 +64,10 @@ pub use deja_runtime::DejaCorrelationLayer;
 pub use deja_runtime::DejaHook;
 /// Re-export the execution graph tracing layer for framework logger setup.
 pub use deja_runtime::ExecutionGraphLayer;
+/// What a boundary does when its `Substitute` lookup misses. The boundary macro
+/// emits `Absorb` for a site that declares `on_miss`, so the emitted observation
+/// records that the request survived the miss rather than being stopped by it.
+pub use deja_runtime::MissPolicy;
 /// What a `Substitute` boundary missed — the value a boundary's `on_miss`
 /// expression turns into the host's own error. Deja names the miss; the host
 /// decides which of its types can represent one.

@@ -114,6 +114,11 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// The observations the hook emitted, so a test can read what was stamped on the
+/// wire rather than infer it from the value the boundary returned.
+static OBSERVED: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<deja::ObservedCall>>>> =
+    std::sync::OnceLock::new();
+
 /// Install an EMPTY lookup table as the replay hook — every lookup misses.
 /// `set_global_runtime_hook` is one-shot, so this runs once per binary and the
 /// tests below share it.
@@ -128,11 +133,10 @@ fn install_replay_hook() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lookup.json");
         std::fs::write(&path, serde_json::to_vec(&table).expect("serialize")).expect("write table");
-        let hook = deja::LookupTableHook::from_source(
-            deja::LocalFileLookupSource::new(path),
-            deja::InMemoryObservedSink::new(),
-        )
-        .expect("hook");
+        let sink = deja::InMemoryObservedSink::new();
+        let _ = OBSERVED.set(sink.handle());
+        let hook = deja::LookupTableHook::from_source(deja::LocalFileLookupSource::new(path), sink)
+            .expect("hook");
         deja::set_global_runtime_hook(Some(deja::RuntimeHook::LookupReplay(hook)))
             .expect("install runtime hook");
         // The table was read at install; the tempdir may go now.
@@ -206,5 +210,73 @@ fn a_boundary_without_on_miss_still_fail_stops() {
         BODY_RUNS.load(Ordering::SeqCst),
         before,
         "the real boundary body must NOT run on a replay miss"
+    );
+}
+
+/// Read the observation the hook emitted for `operation`.
+fn observation_for(operation: &str) -> deja::ObservedCall {
+    let calls = OBSERVED
+        .get()
+        .expect("the sink handle is installed with the hook")
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    calls
+        .iter()
+        .find(|call| call.method_name == operation)
+        .cloned()
+        .unwrap_or_else(|| panic!("no observation emitted for {operation}"))
+}
+
+/// THE ACCOUNTING. A miss the request SURVIVED must say so on the wire.
+///
+/// This is the half nothing downstream can reconstruct. The observation is
+/// written by the hook BEFORE the seam reaches its miss branch, so an absorbed
+/// miss and one that killed the request are otherwise identical — both
+/// `resolved: false`, both `Provenance::Recorded`. Without the stamp a scorer can
+/// say a call was novel but not whether the correlation carried on using a value
+/// the recording never held, and every call after it is conditioned on an answer
+/// nobody recorded.
+#[test]
+fn an_absorbed_miss_is_stamped_on_the_observation() {
+    install_replay_hook();
+
+    let value = block_on(graceful_get("novel-key-for-accounting"));
+    assert_eq!(value, None, "precondition: the miss was absorbed");
+
+    let observed = observation_for("graceful_get");
+    assert!(
+        !observed.resolved,
+        "precondition: this must be a MISS, or `absorbed` is describing a hit"
+    );
+    assert!(
+        observed.absorbed,
+        "a boundary declaring `on_miss` must stamp the miss as absorbed, or the \
+         scorer cannot tell a request that survived from one that died"
+    );
+}
+
+/// And a boundary that declares NOTHING must not claim absorption.
+///
+/// The pair is the point: if both stamped the same value, the field would carry
+/// no information and every test above it would pass vacuously.
+#[test]
+fn a_fail_stopping_miss_is_not_stamped_absorbed() {
+    install_replay_hook();
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(strict_get("novel-key-for-accounting"))
+    }));
+    std::panic::set_hook(previous);
+    outcome.expect_err("precondition: this boundary fail-stops");
+
+    let observed = observation_for("strict_get");
+    assert!(!observed.resolved, "precondition: a miss");
+    assert!(
+        !observed.absorbed,
+        "a boundary with no declared continuation did NOT absorb its miss — the \
+         request died on it, and recording otherwise would launder a stop into a \
+         survival"
     );
 }

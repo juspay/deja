@@ -11,6 +11,7 @@
 //!   - resolved hit                         → matched (recorded per address rank)
 //!   - resolved only at rank 6 (sequence)   → Recovered (fragility flag)
 //!   - candidate call with no table hit     → NovelCall (blocking)
+//!     …absorbed by a declared `on_miss`     → NovelCallAbsorbed (request survived)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!     …after a truncated recording tail    → InconclusiveTailGap (inconclusive)
@@ -198,6 +199,15 @@ pub struct Summary {
     /// Every blocking side-effect divergence:
     /// `omitted_calls + novel_calls + value_divergences + identity_skews`.
     pub side_effect_divergences: u64,
+    /// Misses the REQUEST SURVIVED: a boundary declared `on_miss`, the declared
+    /// value was returned, and the correlation continued on an answer the
+    /// recording never held.
+    ///
+    /// Projection of `per_boundary[*].kinds["NovelCallAbsorbed"]`, and it has to
+    /// be a projection: a kind with no folded summary field never reaches the
+    /// headline and is invisible in practice however carefully it is counted.
+    #[serde(default)]
+    pub absorbed_misses: u64,
     pub matched_side_effect_calls: u64,
     /// BLOCKING omissions: recorded calls the candidate never made, on a
     /// correlated, blocking boundary. These are what the verdict acts on.
@@ -387,6 +397,11 @@ pub struct CorrelationOutcome {
     /// one. `passed` is false whenever this is true.
     #[serde(default)]
     pub inconclusive: bool,
+    /// How many misses this correlation ABSORBED. Everything it did after the
+    /// first one ran on a value the recording never held, which is a fact about
+    /// how much this correlation's verdict is worth and belongs beside it.
+    #[serde(default)]
+    pub absorbed_misses: u64,
     pub passed: bool,
 }
 
@@ -460,6 +475,7 @@ impl Scorecard {
             &["OmittedCallTolerated"],
         );
         folds("novel_calls", s.novel_calls, &["NovelCall", "NovelSubtree"]);
+        folds("absorbed_misses", s.absorbed_misses, &["NovelCallAbsorbed"]);
         folds(
             "novel_calls_tolerated",
             s.novel_calls_tolerated,
@@ -535,10 +551,14 @@ impl Scorecard {
         // The headline number: every blocking side-effect divergence, and
         // nothing else. A demotion that stopped excluding itself here would show
         // up as a verdict nobody could account for from the breakdown.
-        let blocking = s.omitted_calls + s.novel_calls + s.value_divergences + s.identity_skews;
+        let blocking = s.omitted_calls
+            + s.novel_calls
+            + s.absorbed_misses
+            + s.value_divergences
+            + s.identity_skews;
         if s.side_effect_divergences != blocking {
             out.push(format!(
-                "summary.side_effect_divergences = {}, but omitted + novel + value + identity = {blocking}",
+                "summary.side_effect_divergences = {}, but omitted + novel + absorbed + value + identity = {blocking}",
                 s.side_effect_divergences
             ));
         }
@@ -4126,6 +4146,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut environmental_misses = 0u64;
     let mut blocking_side_effect = 0u64;
     let mut corr_side_effect: BTreeMap<String, u64> = BTreeMap::new();
+    // Absorbed misses, per correlation. Held apart from `corr_side_effect`
+    // because it answers a different question: not "did this correlation
+    // diverge" but "how much of what it did ran on values the recording never
+    // held".
+    let mut corr_absorbed: BTreeMap<String, u64> = BTreeMap::new();
 
     // PASS 1 — resolved calls claim their recorded events. The verdict must be
     // a function of the two SETS (recorded events × observed calls), never of
@@ -4453,6 +4478,28 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             if let Some(corr) = &obs.correlation_id {
                 tail_gap_correlations.insert(corr.clone());
             }
+        } else if obs.absorbed {
+            // A miss the REQUEST SURVIVED: the boundary declared `on_miss`, the
+            // declared value was returned, and everything after it in this
+            // correlation ran on an answer the recording never held.
+            //
+            // Named apart from `NovelCall` for the reason `NovelCallTolerated`
+            // is: it is a different thing, not a different count of the same
+            // thing. A reader deciding whether to trust a clean-looking body diff
+            // has to be able to see that the run continued on a supplied value —
+            // and it is invisible everywhere else, because the observation is
+            // written before the seam reaches its miss branch and carries
+            // `resolved: false` and `Provenance::Recorded` either way.
+            //
+            // Blocking treatment is deliberately UNCHANGED here: this change
+            // makes absorption visible, it does not decide what a novel call
+            // costs. That question is its own change.
+            stats.bump_kind("NovelCallAbsorbed");
+            blocking_side_effect += 1;
+            if let Some(corr) = &obs.correlation_id {
+                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+                *corr_absorbed.entry(corr.clone()).or_insert(0) += 1;
+            }
         } else {
             stats.bump_kind("NovelCall");
             blocking_side_effect += 1;
@@ -4521,6 +4568,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let novel_calls =
         kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
+    let absorbed_misses = kind_total(&per_boundary, "NovelCallAbsorbed");
     let inconclusive_tail_gaps = kind_total(&per_boundary, "InconclusiveTailGap");
 
     // --- post-finalization correlated work warnings --------------------------
@@ -4714,6 +4762,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             alignment: graph_plan.scored_alignment(corr, graph_value_nodes.get(corr)),
             span_shape: span_shapes.remove(corr),
             inconclusive,
+            absorbed_misses: corr_absorbed.get(corr).copied().unwrap_or(0),
             passed,
         });
     }
@@ -4758,6 +4807,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     if span_field_divergences > 0 {
         reasons.push(format!(
             "{span_field_divergences} scored-span field divergence(s)"
+        ));
+    }
+    // Absorbed misses are REPORTED here whatever the blocking policy is, because
+    // the alternative is a run that got quieter without saying why. Everything
+    // after an absorbed miss ran on a value the recording never held.
+    if absorbed_misses > 0 {
+        reasons.push(format!(
+            "{absorbed_misses} absorbed miss(es): the request continued on a \
+             declared value the recording did not hold"
         ));
     }
     // Seed gaps are reported but do NOT by themselves fail the verdict — a
@@ -4957,6 +5015,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             omitted_calls,
             omitted_calls_tolerated,
             novel_calls,
+            absorbed_misses,
             novel_calls_tolerated,
             value_divergences,
             identity_skews,
@@ -5798,6 +5857,7 @@ mod tests {
             observed_result: None,
             provenance: deja::Provenance::default(),
             seed_gap: false,
+            absorbed: false,
         }
     }
 
@@ -8396,6 +8456,101 @@ mod tests {
             card.summary.side_effect_divergences, 1,
             "background work does not fail a candidate"
         );
+    }
+
+    /// An observed call that MISSED and was absorbed by a declared `on_miss`.
+    fn absorbed_obs(boundary: &str, corr: &str) -> ObservedCall {
+        let mut o = obs(boundary, Some(corr), false, None, None);
+        o.absorbed = true;
+        o
+    }
+
+    /// An absorbed miss is named APART from an ordinary novel call, counted in
+    /// its own summary field, and carried on the correlation.
+    ///
+    /// Everything after it in that correlation ran on a value the recording never
+    /// held. Before this it was indistinguishable from a miss that killed the
+    /// request — same `resolved: false`, same `Provenance::Recorded` — so a run
+    /// could get quieter without anything saying why.
+    #[test]
+    fn an_absorbed_miss_is_named_apart_and_counted() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1")],
+            vec![http("c1", true, vec![])],
+        ));
+
+        assert_eq!(
+            kind_count(&card, "redis", "NovelCallAbsorbed"),
+            1,
+            "the absorbed miss must carry its own kind"
+        );
+        assert_eq!(
+            kind_count(&card, "redis", "NovelCall"),
+            0,
+            "and must NOT also be counted as an ordinary novel call — one call, \
+             one classification"
+        );
+        assert_eq!(card.summary.absorbed_misses, 1);
+        assert_eq!(
+            card.summary.novel_calls, 0,
+            "novel_calls counts the misses that were not absorbed"
+        );
+
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert_eq!(
+            c1.absorbed_misses, 1,
+            "the correlation must carry how much of it ran on supplied values"
+        );
+        assert!(
+            card.verdict.reason.contains("absorbed miss"),
+            "and the verdict must SAY so rather than leaving it to a breakdown \
+             nobody reads: {}",
+            card.verdict.reason
+        );
+    }
+
+    /// The summary field must be a PROJECTION of the ledger, not a tally kept
+    /// beside it.
+    ///
+    /// This is the failure mode `ReplyCanonAbsorbed` already has: a kind with no
+    /// folded summary field never reaches the headline, so it is invisible in
+    /// practice however carefully it is counted. Breaking the number here must be
+    /// caught by the self-consistency guard.
+    #[test]
+    fn absorbed_misses_is_a_fold_of_the_ledger() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1"), absorbed_obs("db", "c1")],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(card.summary.absorbed_misses, 2);
+
+        let mut tampered = card.clone();
+        tampered.summary.absorbed_misses = 0;
+        assert!(
+            !tampered.counter_disagreements().is_empty(),
+            "a summary that disagrees with its per-boundary ledger must be \
+             reported as a scorer bug"
+        );
+    }
+
+    /// An ordinary miss is untouched: absorption is opt-in at the boundary, so a
+    /// boundary that declares nothing must not start reporting absorbed misses.
+    #[test]
+    fn a_miss_that_was_not_absorbed_stays_an_ordinary_novel_call() {
+        let card = detect(&art(
+            vec![],
+            vec![obs("redis", Some("c1"), false, None, None)],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "redis", "NovelCallAbsorbed"), 0);
+        assert_eq!(card.summary.absorbed_misses, 0);
     }
 
     #[test]

@@ -904,6 +904,7 @@ mod tests {
             observed_result: None,
             provenance: deja::Provenance::default(),
             seed_gap: false,
+            absorbed: false,
         }
     }
 

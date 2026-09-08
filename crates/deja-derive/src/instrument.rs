@@ -454,11 +454,16 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
             } else {
                 (TokenStream::new(), quote!(#expr))
             };
+            // `MissPolicy::Absorb` rides alongside the thunk so the OBSERVATION
+            // can say the miss was absorbed. The hook writes that observation
+            // before the seam ever reaches its miss branch, so without this a
+            // miss the request survived and a miss that killed it are identical
+            // on the wire, and a run gets quieter and less trustworthy at once.
             (
                 quote!(dispatch_or_miss),
                 quote!(dispatch_async_or_miss),
                 prelude,
-                quote!(move || { #thunk_body },),
+                quote!(::deja::MissPolicy::Absorb, move || { #thunk_body },),
             )
         }
     };

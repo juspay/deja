@@ -800,6 +800,14 @@ where
 /// Hooks that opt into context-aware replay implement
 /// [`DejaHook::try_replay_with_context`].
 pub struct ReplayLookup<'a> {
+    /// What this boundary does when the lookup MISSES.
+    ///
+    /// Carried on the query rather than derived later because it is only knowable
+    /// here: the observation is written by the hook BEFORE the seam reaches its
+    /// miss branch, so nothing downstream can tell a miss the process absorbed
+    /// from one that killed the request. Both leave `resolved: false` and
+    /// `Provenance::Recorded`. See [`MissPolicy`].
+    pub miss_policy: MissPolicy,
     /// Boundary tag (e.g. `"storage"`, `"redis"`, `"http_client"`).
     pub boundary: &'a str,
     /// Trait name at the boundary.
@@ -814,9 +822,30 @@ pub struct ReplayLookup<'a> {
     pub caller_location: Option<&'a std::panic::Location<'a>>,
 }
 
-// ---------------------------------------------------------------------------
-// Call-site helper
-// ---------------------------------------------------------------------------
+/// What a `Substitute` boundary does when its replay lookup MISSES.
+///
+/// This is a property of the DECLARATION, not of the call: a boundary either has
+/// a caller with an honest degraded path (and declares `on_miss`, so a miss is
+/// absorbed and the request continues) or it does not (and a miss stops the
+/// request). It rides the [`ReplayLookup`] so the emitted observation can say
+/// which of the two happened.
+///
+/// Why it has to be carried rather than worked out afterwards: the miss is
+/// recorded before the seam decides. A run whose absorbed misses are
+/// indistinguishable from its fatal ones gets quieter and less trustworthy at the
+/// same time, which is the failure this exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissPolicy {
+    /// A miss stops the request. The default, and right wherever no value is
+    /// honest — egress, and anything whose absence would silently condition the
+    /// rest of the correlation on a value the recording never held.
+    #[default]
+    FailStop,
+    /// A miss returns the declared value and the request continues. The miss is
+    /// still scored; only the continuation changes.
+    Absorb,
+}
 
 // ---------------------------------------------------------------------------
 // Hook trait
@@ -2848,12 +2877,14 @@ pub fn replay_boundary(
     spec: &BoundarySpec,
     args: &serde_json::Value,
     identity: Option<&CallsiteIdentity>,
+    miss_policy: MissPolicy,
 ) -> Option<serde_json::Value> {
     let hook = global_runtime_hook_from_env()?;
     if !hook.is_active() {
         return None;
     }
     hook.try_replay_with_context(ReplayLookup {
+        miss_policy,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -2906,6 +2937,7 @@ pub fn execute_shadow_peek_boundary(
         return None;
     }
     hook.execute_shadow_peek(ReplayLookup {
+        miss_policy: crate::MissPolicy::FailStop,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -3586,9 +3618,15 @@ where
     // deterministic degraded path declares `on_miss` and routes through
     // `dispatch_or_miss` instead. Mirrors `dispatch` / `dispatch_async_or_miss`.
     let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_or_miss(obs, args, run, reconstruct, extract, move || {
-        fail_stop_substitute_miss(boundary, method)
-    })
+    dispatch_or_miss(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        MissPolicy::FailStop,
+        move || fail_stop_substitute_miss(boundary, method),
+    )
 }
 
 /// [`dispatch`] with a caller-supplied `on_miss` value for the Substitute-miss
@@ -3601,6 +3639,7 @@ pub fn dispatch_or_miss<T, A, F, C, R, O, M>(
     run: F,
     reconstruct: C,
     extract: R,
+    miss_policy: MissPolicy,
     on_miss: M,
 ) -> T
 where
@@ -3650,6 +3689,7 @@ where
                         &obs.spec,
                         &boundary_args,
                         Some(&obs.identity),
+                        miss_policy,
                     ) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
@@ -3748,9 +3788,15 @@ where
     // unsafe, so STOP (see `fail_stop_substitute_miss`). A boundary whose caller
     // has a deterministic degraded path uses `dispatch_async_or_miss` instead.
     let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_async_or_miss(obs, args, run, reconstruct, extract, move || {
-        fail_stop_substitute_miss(boundary, method)
-    })
+    dispatch_async_or_miss(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        MissPolicy::FailStop,
+        move || fail_stop_substitute_miss(boundary, method),
+    )
     .await
 }
 
@@ -3770,6 +3816,7 @@ pub async fn dispatch_async_or_miss<T, A, Fut, F, C, R, O, M>(
     run: F,
     reconstruct: C,
     extract: R,
+    miss_policy: MissPolicy,
     on_miss: M,
 ) -> T
 where
@@ -3816,6 +3863,7 @@ where
                         &obs.spec,
                         &boundary_args,
                         Some(&obs.identity),
+                        miss_policy,
                     ) {
                         Some(recorded) => match reconstruct(recorded) {
                             Reconstructed::Value(replayed) => replayed,
@@ -3909,6 +3957,7 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -3931,6 +3980,7 @@ where
                 }
                 ExecuteMode::Lookup => {
                     match obs.hook.try_replay_with_context(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -3992,6 +4042,7 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -4014,6 +4065,7 @@ where
                 }
                 ExecuteMode::Lookup => {
                     match obs.hook.try_replay_with_context(ReplayLookup {
+                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -5507,6 +5559,7 @@ mod tests {
                 observed_result: None,
                 provenance: crate::Provenance::Shadow,
                 seed_gap: false,
+                absorbed: false,
             }))
         }
         fn execute_shadow_observe(
