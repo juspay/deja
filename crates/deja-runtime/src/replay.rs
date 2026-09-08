@@ -1279,6 +1279,21 @@ pub struct ObservedCall {
     /// rather than a false positive. Always false in M1 lookup mode.
     #[serde(default)]
     pub seed_gap: bool,
+    /// This call MISSED and the boundary absorbed it: the declared `on_miss`
+    /// value was returned and the request carried on, rather than the miss
+    /// stopping it.
+    ///
+    /// Stamped here because it cannot be recovered later. The observation is
+    /// written before the seam reaches its miss branch, so an absorbed miss and a
+    /// fatal one are otherwise identical on the wire — both `resolved: false`,
+    /// both `Provenance::Recorded`. Without this the scorer can say a call was
+    /// novel but not whether the run continued on a value the recording never
+    /// held, and every downstream call in that correlation is conditioned on an
+    /// answer nobody recorded.
+    ///
+    /// Only ever true together with `resolved == false`.
+    #[serde(default)]
+    pub absorbed: bool,
 }
 
 #[derive(Deserialize)]
@@ -1331,6 +1346,8 @@ struct ObservedCallWire {
     provenance: crate::Provenance,
     #[serde(default)]
     seed_gap: bool,
+    #[serde(default)]
+    absorbed: bool,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1365,6 +1382,7 @@ impl From<ObservedCallWire> for ObservedCall {
             observed_result: wire.observed_result,
             provenance: wire.provenance,
             seed_gap: wire.seed_gap,
+            absorbed: wire.absorbed,
         }
     }
 }
@@ -2011,6 +2029,11 @@ impl Resolution {
         observed_result: Option<serde_json::Value>,
         provenance: crate::Provenance,
     ) -> ObservedCall {
+        // Read before `self` is destructured below: this is the last point that
+        // knows both the lookup outcome and what the declaration said to do
+        // about it.
+        let absorbed =
+            self.recorded_result.is_none() && query.miss_policy == crate::MissPolicy::Absorb;
         ObservedCall {
             correlation_id: self.correlation_id,
             boundary: query.boundary.to_owned(),
@@ -2043,6 +2066,7 @@ impl Resolution {
             observed_result,
             provenance,
             seed_gap: false,
+            absorbed,
         }
     }
 }
@@ -2133,6 +2157,7 @@ impl DejaHook for LookupTableHook {
         // Delegate to try_replay_with_context with a stub query so legacy
         // call paths still get a lookup attempt.
         self.try_replay_with_context(ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary,
             trait_name,
             method_name,
@@ -2199,6 +2224,9 @@ impl DejaHook for LookupTableHook {
             observed_result: Some(event.result),
             provenance: crate::Provenance::Recorded,
             seed_gap: false,
+            // The ingress finalizer marker, not a lookup — there was no miss to
+            // absorb.
+            absorbed: false,
         });
     }
 
@@ -3580,6 +3608,7 @@ mod tests {
         let identity = explicit_identity("site");
         let call = |args: serde_json::Value| {
             hook.try_replay_with_context(ReplayLookup {
+                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "redis",
                 trait_name: "RedisStore",
                 method_name: "get_key",
@@ -3665,6 +3694,7 @@ mod tests {
         // (rank-4 lexical path + args_hash), proving order independence.
         let call = |connector: u64| {
             hook.try_replay_with_context(ReplayLookup {
+                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "redis",
                 trait_name: "RedisStore",
                 method_name: "get_key",
@@ -3793,6 +3823,7 @@ mod tests {
             threads.push(std::thread::spawn(move || {
                 let _guard = deja_context::enter_correlation_id(correlation_id);
                 let result = hook.try_replay_with_context(ReplayLookup {
+                    miss_policy: crate::MissPolicy::FailStop,
                     boundary: "redis",
                     trait_name: "RedisStore",
                     method_name: "get_key",
@@ -3906,6 +3937,7 @@ mod tests {
 
         let _guard = deja_context::enter_correlation_id("corr-1");
         let result = hook.try_replay_with_context(ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
             method_name: "get_key",
@@ -3953,6 +3985,7 @@ mod tests {
 
         let _guard = deja_context::enter_correlation_id("corr-1");
         let result = hook.try_replay_with_context(ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
             method_name: "get_key",
@@ -4025,6 +4058,7 @@ mod tests {
         let _guard = deja_context::enter_correlation_id("c1");
         let replay = |id: &CallsiteIdentity| {
             hook.try_replay_with_context(ReplayLookup {
+                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "db",
                 trait_name: "Store",
                 method_name: "update",
@@ -4172,6 +4206,7 @@ mod tests {
             );
             let identity = boundary_identity(scope, occurrence);
             let result = hook.try_replay_with_context(ReplayLookup {
+                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "redis",
                 trait_name: "RedisStore",
                 method_name: "get_key",
@@ -4333,6 +4368,7 @@ mod tests {
             );
             let identity = identity_for(occurrence);
             let result = hook.try_replay_with_context(ReplayLookup {
+                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "time",
                 trait_name: "Time",
                 method_name: "date_time::now",
@@ -4402,6 +4438,7 @@ mod tests {
 
         let identity = explicit_identity("stable-X");
         let value = hook.try_replay_with_context(ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "S",
             method_name: "m",
@@ -4446,6 +4483,7 @@ mod tests {
         let rekeyed_args = serde_json::json!({ "id": "pi_doubled" });
         let identity = explicit_identity("find_pi");
         let value = hook.try_replay_with_context(ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary: "storage",
             trait_name: "PaymentIntentInterface",
             method_name: "find_payment_intent_by_id",
@@ -5975,6 +6013,7 @@ redis\tcurrency\tusd
 
         let args = serde_json::json!(["counter"]);
         let query = ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
             method_name: "incr",
@@ -6020,6 +6059,7 @@ redis\tcurrency\tusd
 
         let args = serde_json::json!(["extra_key"]);
         let query = ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
             boundary: "db",
             trait_name: "PI",
             method_name: "generic_find_one_core",

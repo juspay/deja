@@ -82,6 +82,12 @@ async fn read_config(operation: &'static str, key: &str) -> Result<u64, String> 
             Ok(n) => (json!({ "Ok": n }), false),
             Err(e) => (json!({ "Err": e }), true),
         },
+        // This boundary ABSORBS a miss, and says so, so the emitted observation
+        // records that the request survived rather than being stopped. A
+        // hand-built seam that passes an `on_miss` and leaves this `FailStop`
+        // would degrade silently: the miss would be scored as though it had
+        // killed the request while the request in fact carried on.
+        deja::MissPolicy::Absorb,
         // on_miss: the graceful degrade — a recoverable Err, NOT a panic.
         || Err(MISS_SENTINEL.to_string()),
     )

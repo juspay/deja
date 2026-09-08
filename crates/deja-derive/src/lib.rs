@@ -62,6 +62,39 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `correlation` must evaluate to `Option<String>`. `args` must evaluate to
 /// `serde_json::Value`. `result` receives `__deja_result` as `&Output` and must
 /// return `(serde_json::Value, bool)`, where the bool marks errors.
+///
+/// # `on_miss` — a declared Substitute-miss value
+///
+/// By default a `Substitute` boundary whose replay lookup MISSES fail-stops: it
+/// panics, the host's request guard contains the unwind, and the correlation is
+/// scored as a stop. `on_miss = <expr>` replaces that continuation with a value
+/// the DECLARATION SITE supplies:
+///
+/// ```ignore
+/// #[deja::boundary(boundary = "imc", replay = Substitute, on_miss = None)]
+/// async fn get_val<T>(&self, key: CacheKey) -> Option<T> { … }
+/// ```
+///
+/// The expression is evaluated ONLY on a genuine lookup miss, has the
+/// boundary's return type, and — like `result = …` naming `__deja_result` — may
+/// name `__deja_miss`, a [`deja::SubstituteMiss`] carrying the boundary,
+/// component, method and args image that found no recorded answer, so a host
+/// error enum can take it with `#[from]` and stay attributable. Deja never
+/// constructs the host's error: it cannot name an `E` a `replay_ok` site never
+/// declares. The site can, which is the whole inversion.
+///
+/// This does NOT hide the miss. The blocking NovelCall divergence is emitted by
+/// the lookup before `on_miss` is reached; only the continuation changes, so the
+/// subtree that needed the value diverges and the graph tier localises it
+/// instead of the request dying with no response at all.
+///
+/// Legality is the declaration's burden. `None` from a cache read is honest —
+/// it means "not in cache", which is TRUE on replay, and the caller's fallback
+/// is separately instrumented. A fabricated egress response is not: it claims a
+/// third party answered when none did, and launders the divergence into a false
+/// pass. Egress (http/grpc) keeps the fail-stop default. `on_miss` on a site
+/// that resolves to `replay = Execute` is rejected at build: that branch never
+/// reaches the Substitute-miss arm, so the declaration would be dead.
 #[proc_macro_attribute]
 pub fn boundary(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as boundary::BoundaryArgs);
