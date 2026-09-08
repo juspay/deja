@@ -952,6 +952,48 @@ mod tests {
         }
     }
 
+    /// The scorecard tolerates an ABSORBED novel call (`NovelCallAbsorbed`,
+    /// charged to nothing) and an inconclusive seed gap; the ledger reads
+    /// neither `obs.absorbed` nor `obs.seed_gap`, so both fall through to
+    /// `("novel", blocking = true)` and the viewer shows a blocking finding
+    /// for a call the scorer forgave. The invalid state is written into the
+    /// cell directly, not produced by any path that maintains the invariant.
+    #[test]
+    fn an_absorbed_novel_call_and_a_seed_gap_are_not_blocking_ledger_rows() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let mut absorbed = obs("db", Some("c1"), false, None, None);
+        absorbed.absorbed = true;
+        let mut seed_gap = obs("redis", Some("c1"), false, None, None);
+        seed_gap.seed_gap = true;
+
+        let rows = build(&events, &[absorbed, seed_gap], &table, &HashSet::new());
+        assert_eq!(rows.len(), 2, "precondition: both calls produce a row");
+
+        let absorbed_row = rows.iter().find(|r| r.boundary == "db").expect("db row");
+        assert!(
+            !absorbed_row.blocking,
+            "an absorbed miss is a novel call the process survived; the scorecard \
+             charges it to nothing, so its ledger row must not block: {absorbed_row:?}"
+        );
+        assert_ne!(
+            absorbed_row.kind, "novel",
+            "and it must be NAMED as absorbed, not filed with the unabsorbed novel calls"
+        );
+
+        let gap_row = rows
+            .iter()
+            .find(|r| r.boundary == "redis")
+            .expect("redis row");
+        assert!(
+            !gap_row.blocking,
+            "a seed gap is inconclusive on the scorecard; the ledger must not call it \
+             blocking: {gap_row:?}"
+        );
+        assert_ne!(gap_row.kind, "novel");
+    }
+
     #[test]
     fn ledger_classifies_and_carries_both_sides() {
         // recorded events: seq 1 (db, matched), seq 2 (redis, omitted)
