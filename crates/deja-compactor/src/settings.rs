@@ -94,6 +94,15 @@ pub struct SystemDeclaration {
     /// A substring of its pod names, for attributing a recording whose bucket
     /// does not say which system minted it.
     pub instance_pattern: Option<String>,
+    /// The prefix its PRIMARY deployment's pod names carry, matched anchored at
+    /// the start. Deliberately not reusing `instance_pattern`: that one answers
+    /// "which system minted this" and matches as a SUBSTRING, which cannot
+    /// separate the primary deployment from a custom one — the custom pod
+    /// `sbx-custom-cug-hyperswitch-server` contains `hyperswitch-server`, so a
+    /// substring test admits exactly what selection is trying to exclude.
+    /// `None` means the deployment has not said which pods are primary, and a
+    /// caller that asks to be restricted to them is refused by name.
+    pub main_instance_prefix: Option<String>,
     /// Span prefixes its instrumentation declares as scored.
     #[serde(default, deserialize_with = "list_or_csv")]
     pub scored_span_namespaces: Option<Vec<String>>,

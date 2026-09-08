@@ -714,8 +714,16 @@ impl LandedRecording {
     }
 }
 
-/// Enumerate the recordings present under `root` (default `landing/v1`),
-/// newest first.
+/// Enumerate the recordings present under `root` (default `landing/v1`), by
+/// write date descending and then by session id descending.
+///
+/// Deliberately NOT documented as "newest first": within one date the tiebreak
+/// is the raw session id, and `rec-<revision>-<time>-<instance>` sorts on the
+/// revision hex before the time — so with two revisions live this order does
+/// not track time, and a caller that needs it to must re-order. This crate
+/// cannot do better itself; it carries no deja dependency and so cannot parse
+/// an id. The orchestrator does it in `selection_order_key`, where the parser
+/// is in scope.
 ///
 /// The deployed aggregator writes `landing/v1/dt=<date>/session=<id>/…` while
 /// the session layout writes `landing/v1/session=<id>/…`; both are read here,

@@ -748,6 +748,7 @@ async fn v1_systems() -> Response {
                 "job_template_key": s.job_template_key,
                 "candidate_image_repo": s.candidate_image_repo,
                 "instance_pattern": s.instance_pattern,
+                "main_instance_prefix": s.main_instance_prefix,
                 "scored_span_namespaces": s.scored_span_namespaces,
                 // Reported so a deployment can see the canon the scorer will
                 // apply, rather than inferring it from a verdict that stopped
@@ -789,7 +790,7 @@ async fn v1_available_recordings(
         Err(message) => return error_resp(400, &message),
     };
     let scan_bucket = cfg.bucket.clone();
-    let found = match tokio::task::spawn_blocking(move || {
+    let mut found = match tokio::task::spawn_blocking(move || {
         deja_compactor::list_landed_recordings(&cfg, &root)
     })
     .await
@@ -810,6 +811,53 @@ async fn v1_available_recordings(
             .unwrap_or_default(),
         Err(_) => Default::default(),
     };
+
+    // Selection filters. Both default OFF, so every existing caller sees exactly
+    // what it saw before. A caller that wants a recording it can actually drive
+    // asks for it, and is refused BY NAME when the deployment has not declared
+    // enough to answer — never served the unfiltered list as if the question had
+    // been honoured.
+    if q.require_revision.unwrap_or(false) {
+        found.retain(|r| {
+            matches!(
+                deja_orchestrator::parse_recording_id(&r.session_id),
+                deja_orchestrator::RecordingIdentity::Described { .. }
+            )
+        });
+    }
+    if q.main_instances.unwrap_or(false) {
+        // Matched rather than `unwrap_or_else`: that unifies this borrow of
+        // `q.system` with the `&'static str` the default returns, which asks the
+        // query string to live forever. A match lets the static coerce down
+        // instead.
+        let scoped: &str = match system_scope {
+            Some(s) => s,
+            None => deja_orchestrator::default_system(),
+        };
+        let Some(prefix) = deja_orchestrator::system::system_config(scoped).main_instance_prefix
+        else {
+            return error_resp(
+                400,
+                &format!(
+                    "system `{scoped}` declares no `main_instance_prefix`, so which pods are its \
+                     primary deployment is not knowable here: declare \
+                     `systems.{scoped}.main_instance_prefix` or drop `main_instances`"
+                ),
+            );
+        };
+        // Non-emptiness is asserted separately and first. `all` over an empty
+        // list is TRUE, so a recording whose `inst=` partitions the scan could
+        // not read would otherwise pass a test it was never measured against —
+        // and pass it precisely when we know least about it.
+        found.retain(|r| from_main_deployment(r, &prefix));
+    }
+
+    // Re-order now that ids can be parsed here. This must happen BEFORE the page
+    // is cut: a page taken from the wrong order does not merely mis-sort, it can
+    // drop the newest recording off the end of the page entirely, which is what
+    // it did in sandbox.
+    found.sort_by_cached_key(selection_order_key);
+    found.reverse();
 
     let total = found.len();
     let offset = q.offset.unwrap_or(0);
@@ -969,10 +1017,74 @@ async fn v1_available_recordings(
     }))
 }
 
+/// The order a caller means by "newest first".
+///
+/// The compactor's listing sorts by write DATE and then by session id, and it
+/// cannot do better: it carries no deja dependency, so it cannot parse an id.
+/// That tiebreak sorts `rec-<revision>-<time>-<instance>` on the REVISION hex,
+/// so the moment two revisions are live the order stops tracking time — sandbox
+/// had `rec-72b65cb-…0800` sorted above `rec-4157177-…1400`, six hours newer,
+/// and the pipeline replayed the older tape without anything reporting a fault.
+///
+/// A total key rather than a hand-written comparator. The shapes here
+/// (`Described`, `BootDerived`, `Opaque`) make a pairwise rule easy to write
+/// non-transitively, and an inconsistent comparator does not fail loudly: it
+/// yields a wrong order at some list lengths and not others.
+///
+/// `None` sorts below `Some`, so within one date a recording that names its
+/// time comes before one that does not. For a system whose ids are ALL
+/// boot-derived — prism mints `run-<nanos>` for every recording — every middle
+/// element is `None` and the session id decides, and a fixed-width nanosecond
+/// epoch sorts lexically exactly as it sorts numerically. That case was already
+/// correct and stays correct.
+/// Whether every instance that wrote this recording belongs to the system's
+/// primary deployment.
+///
+/// Non-emptiness is asserted separately and FIRST, because `all` over an empty
+/// list is true: a recording whose `inst=` partitions the scan could not read
+/// would otherwise pass a test it was never measured against, and pass it
+/// exactly when we know least about it.
+///
+/// The match is anchored with `starts_with` rather than `contains` for a reason
+/// that is not stylistic: the custom deployments are named
+/// `sbx-custom-cug-hyperswitch-server-…`, which CONTAINS the main deployment's
+/// name `sbx-hyperswitch-server`. A substring test — which is what the
+/// neighbouring `instance_pattern` does, for a different question — admits
+/// precisely the pods this one exists to exclude.
+fn from_main_deployment(r: &deja_compactor::LandedRecording, prefix: &str) -> bool {
+    !r.instances.is_empty() && r.instances.iter().all(|i| i.starts_with(prefix))
+}
+
+fn selection_order_key(
+    r: &deja_compactor::LandedRecording,
+) -> (Option<String>, Option<String>, String) {
+    let recorded_at = match deja_orchestrator::parse_recording_id(&r.session_id) {
+        deja_orchestrator::RecordingIdentity::Described { recorded_at, .. } => Some(recorded_at),
+        _ => None,
+    };
+    (
+        r.latest_date().map(str::to_owned),
+        recorded_at,
+        r.session_id.clone(),
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct AvailableQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Keep only recordings whose id names the revision that produced them.
+    ///
+    /// `run-<nanos>` is NOT merely a legacy spelling — it is what the prism
+    /// recorder mints for every recording it makes — so this is a per-caller
+    /// question rather than something the endpoint may decide. A router replay
+    /// needs the revision (it is what makes a candidate comparable and what the
+    /// candidate-migrations fetch resolves against) and asks for it; a prism
+    /// caller must not, or it would filter away everything prism records.
+    require_revision: Option<bool>,
+    /// Keep only recordings written entirely by the system's primary
+    /// deployment, per its declared `main_instance_prefix`.
+    main_instances: Option<bool>,
     /// Which system's recordings to list. Absent = the default bucket
     /// (`DEJA_S3_BUCKET`). A named system scans ITS bucket
     /// (`DEJA_<SYSTEM>_S3_BUCKET`, root `DEJA_<SYSTEM>_RECORDING_ROOT`
@@ -2312,5 +2424,129 @@ mod tests {
             );
             assert!(reason.starts_with(base), "state {state:?}: {reason}");
         }
+    }
+    // ---- recording selection: order, and which pods count ----
+
+    fn landed(session_id: &str, date: &str, instances: &[&str]) -> deja_compactor::LandedRecording {
+        deja_compactor::LandedRecording {
+            session_id: session_id.to_owned(),
+            dates: vec![date.to_owned()],
+            prefix: format!("landing/v1/dt={date}/session={session_id}"),
+            objects: 1,
+            instances: instances.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn newest_first(mut rows: Vec<deja_compactor::LandedRecording>) -> Vec<String> {
+        rows.sort_by_cached_key(super::selection_order_key);
+        rows.reverse();
+        rows.into_iter().map(|r| r.session_id).collect()
+    }
+
+    /// The sandbox failure written as a test. Two revisions recorded on the same
+    /// day, and the raw session-id tiebreak preferred the OLDER tape because it
+    /// compares the revision hex before the timestamp.
+    #[test]
+    fn ordering_tracks_time_not_the_revision_hex() {
+        let older = landed("rec-72b65cb-09070800-y1", "2026-09-07", &["pod"]);
+        let newer = landed("rec-4157177-09071400-xc", "2026-09-07", &["pod"]);
+
+        // The precondition that makes this test about the fix rather than about
+        // nothing: the order being replaced really does prefer the older tape.
+        assert!(
+            older.session_id > newer.session_id,
+            "precondition: raw id order puts the 08:00 tape above the 14:00 one"
+        );
+
+        assert_eq!(
+            newest_first(vec![older, newer])[0],
+            "rec-4157177-09071400-xc",
+            "the 14:00 recording is newer than the 08:00 one whatever its revision"
+        );
+    }
+
+    /// A session that straddles midnight is ordered by the date it last wrote
+    /// into, so yesterday's 23:50 tape does not outrank this morning's.
+    #[test]
+    fn a_later_write_date_outranks_an_earlier_one() {
+        let yesterday = landed("rec-4157177-09062350-aa", "2026-09-06", &["pod"]);
+        let today = landed("rec-4157177-09070100-bb", "2026-09-07", &["pod"]);
+        assert_eq!(
+            newest_first(vec![yesterday, today])[0],
+            "rec-4157177-09070100-bb"
+        );
+    }
+
+    /// prism mints `run-<nanos>` for every recording it makes, so its ids carry
+    /// no parsed time and fall through to the session id — where a fixed-width
+    /// nanosecond epoch sorts lexically exactly as it sorts numerically. That
+    /// order was already correct; this change must leave it alone.
+    #[test]
+    fn boot_derived_ids_keep_their_nanosecond_order() {
+        let older = landed("run-1788539093442862902", "2026-09-07", &["pod"]);
+        let newer = landed("run-1788680145151199733", "2026-09-07", &["pod"]);
+        assert_eq!(
+            newest_first(vec![older, newer])[0],
+            "run-1788680145151199733"
+        );
+    }
+
+    /// The substring trap, and why the predicate anchors. The custom
+    /// deployment's pod name CONTAINS the main deployment's name, so the
+    /// `contains` rule its neighbour `instance_pattern` uses would admit exactly
+    /// what this filter exists to exclude.
+    #[test]
+    fn main_deployment_match_is_anchored_not_a_substring() {
+        const MAIN: &str = "sbx-hyperswitch-server-";
+        let custom = landed(
+            "run-1788680145151199733",
+            "2026-09-07",
+            &["sbx-custom-cug-hyperswitch-server-54d4746479-d2qr7"],
+        );
+        let main = landed(
+            "rec-4157177-09071400-xc",
+            "2026-09-07",
+            &["sbx-hyperswitch-server-66d5b699fc-xx5tg"],
+        );
+
+        // The trap, stated exactly. A custom pod is NOT named
+        // `sbx-hyperswitch-server-…` — so the anchored prefix rejects it on the
+        // `sbx-` boundary. What it does contain is the bare service name
+        // `hyperswitch-server`, and a bare service name is precisely the shape
+        // `instance_pattern` takes elsewhere in this document (prism declares
+        // `"ucs"`). So the substring rule that answers "which system minted
+        // this" would answer "yes, main" here, and the anchor is what keeps the
+        // two questions apart.
+        assert!(
+            custom.instances[0].contains("hyperswitch-server"),
+            "precondition: a bare service-name pattern really does match a custom pod"
+        );
+        assert!(
+            !custom.instances[0].starts_with(MAIN),
+            "precondition: and the anchored prefix really does not"
+        );
+
+        assert!(super::from_main_deployment(&main, MAIN));
+        assert!(
+            !super::from_main_deployment(&custom, MAIN),
+            "a custom deployment is not the main one however its name reads"
+        );
+    }
+
+    /// `all` over an empty list is TRUE, so emptiness has to be its own
+    /// assertion and has to come first. Without it, a recording whose `inst=`
+    /// partitions the scan could not read passes the main-deployment filter —
+    /// admitted precisely because nothing is known about it.
+    #[test]
+    fn a_recording_with_no_instances_is_not_from_the_main_deployment() {
+        const MAIN: &str = "sbx-hyperswitch-server-";
+        let unknown = landed("rec-4157177-09071400-xc", "2026-09-07", &[]);
+
+        assert!(
+            unknown.instances.iter().all(|i| i.starts_with(MAIN)),
+            "precondition: the vacuous `all` really does pass on an empty list"
+        );
+
+        assert!(!super::from_main_deployment(&unknown, MAIN));
     }
 }
