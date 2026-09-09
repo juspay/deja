@@ -369,6 +369,16 @@ impl BoundaryStats {
         *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
         self.diverged += 1;
     }
+
+    /// Name a kind WITHOUT counting a divergence: for a call the same-multiset
+    /// rule says is not a difference — an order-only absorption, whose call is
+    /// matched and stays matched. Naming it through `bump_kind` counted one call
+    /// as both matched and diverged, so it read as a red divergence everywhere
+    /// `diverged` is summed while its name reached only the warnings.
+    /// `matched + diverged` over a boundary is the number of calls scored on it.
+    fn note_kind(&mut self, kind: &str) {
+        *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
+    }
 }
 
 /// How many calls across every boundary were classified `kind`.
@@ -4490,7 +4500,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
             if let Some(ValueVerdict::Absorbed(ValueAbsorption::Canon(source))) = verdict {
-                stats.bump_kind("ValueCanonAbsorbed");
+                stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
@@ -4669,7 +4679,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 obs.args.get("sql").and_then(serde_json::Value::as_str),
             );
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
-                stats.bump_kind("ValueCanonAbsorbed");
+                stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
@@ -4944,7 +4954,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
             }
             for (path, source) in body_classification.canon_absorbed {
-                stats.bump_kind("ReplyCanonAbsorbed");
+                stats.note_kind("ReplyCanonAbsorbed");
                 *canon_absorbed_seen
                     .entry((path, source.label()))
                     .or_insert(0) += 1;
@@ -7312,6 +7322,37 @@ mod tests {
             vec![],
             vec![event],
         ))
+    }
+
+    /// ACCOUNTING THAT MUST BALANCE. One observed call is either matched or
+    /// diverged, never both, so `matched + diverged` over a boundary equals the
+    /// calls scored on it. An order-only absorption is recorded through
+    /// `bump_kind`, which also increments `diverged`, and the absorbed branch
+    /// then falls through to `matched += 1` — the one call is counted twice,
+    /// and reads as a red divergence in every bar and chip that sums
+    /// `diverged`, while its name appears only in the warnings. Asserted on
+    /// the raw counters, not through any helper that would restate the sum.
+    #[test]
+    fn an_absorbed_ordering_is_counted_once_so_matched_plus_diverged_equals_calls() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            rows(&["b", "a"]),
+            rows(&["a", "b"]),
+        );
+        // PRECONDITION: the absorption happened, or the sum below is trivially
+        // right for the wrong reason.
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+
+        let db = &card.per_boundary["db"];
+        assert_eq!(
+            db.matched + db.diverged,
+            1,
+            "exactly ONE call was observed on db, so it cannot be both matched \
+             ({}) and diverged ({}) — a named-not-scored kind must not bump \
+             `diverged`",
+            db.matched,
+            db.diverged
+        );
     }
 
     fn value_canon_warning(card: &Scorecard) -> Option<&String> {
@@ -12124,6 +12165,97 @@ mod tests {
         );
         assert!(card.counter_disagreements().is_empty());
     }
+    /// #124 taught the SCORECARD that an identity skew is order, not a
+    /// difference: charged to nothing, reported on the verdict line. The
+    /// LEDGER is what the viewer routes on, and it was not taught — it still
+    /// writes the skew row with `blocking = true`, so one skew is tolerated on
+    /// the scorecard and a blocking finding in the viewer. The agreement test
+    /// above this one exercises matched rows only; a skew row is the case it
+    /// was always missing. Same fixture as the tolerated-skew test, read from
+    /// the ledger side.
+    #[test]
+    fn the_ledger_agrees_a_tolerated_identity_skew_is_not_blocking() {
+        let corr = "identity-swap-ledger";
+        let result = serde_json::json!({"result": "Ok", "value": []});
+        let events = vec![
+            graph_event(
+                corr,
+                501,
+                51,
+                "same_statement",
+                serde_json::json!({"bind": "a"}),
+                result.clone(),
+            ),
+            graph_event(
+                corr,
+                502,
+                52,
+                "same_statement",
+                serde_json::json!({"bind": "b"}),
+                result.clone(),
+            ),
+        ];
+        let observed = vec![
+            graph_observed(
+                corr,
+                61,
+                502,
+                "same_statement",
+                serde_json::json!({"bind": "b"}),
+                result.clone(),
+            ),
+            graph_observed(
+                corr,
+                62,
+                501,
+                "same_statement",
+                serde_json::json!({"bind": "a"}),
+                result.clone(),
+            ),
+        ];
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(corr), "db", "same_statement", 501, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "same_statement", 502, result),
+                ],
+                observed,
+                vec![http(corr, true, vec![])],
+                events,
+            ),
+            vec![
+                graph_span(50, corr, None, 0, "request"),
+                graph_span(51, corr, Some(50), 1, "same-span"),
+                graph_span(52, corr, Some(50), 2, "same-span"),
+            ],
+            vec![
+                graph_span(60, corr, None, 0, "request"),
+                graph_span(61, corr, Some(60), 1, "same-span"),
+                graph_span(62, corr, Some(60), 2, "same-span"),
+            ],
+        );
+        let card = detect(&artifacts);
+        // PRECONDITION: the scorecard half tolerates it, or there is nothing
+        // for the ledger to agree with.
+        assert_eq!(kind_count(&card, "db", "IdentitySkew"), 2);
+        assert_eq!(card.summary.side_effect_divergences, 0);
+
+        let rows = build_ledger(&artifacts).expect("shared graph plan builds a ledger");
+        let skews: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == "identity_skew")
+            .collect();
+        assert_eq!(skews.len(), 2, "the ledger must still NAME the skew");
+        for row in skews {
+            assert!(
+                !row.blocking,
+                "the scorecard charges an identity skew to nothing, so the ledger row \
+                 the viewer routes on must not be blocking either — one fact, two \
+                 answers, and the viewer shows the wrong one: {row:?}"
+            );
+        }
+    }
+
     #[test]
     fn scorecard_and_ledger_classifications_agree_in_graph_and_flat_tiers() {
         let graph_corr = "agreement-graph";

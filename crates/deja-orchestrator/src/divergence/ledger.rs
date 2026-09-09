@@ -101,10 +101,16 @@ pub struct CallRecord {
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | novel | inconclusive_tail_gap | omitted |
-    /// environmental | deterministic |
+    /// matched | recovered | novel | novel_absorbed | inconclusive_seed_gap |
+    /// inconclusive_tail_gap | omitted | environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
     /// identity_skew | pruned_subtree | novel_subtree
+    ///
+    /// Every kind the scorecard tolerates is non-blocking HERE too: this row is
+    /// what the viewer routes on, and the scorecard and the ledger are two
+    /// answers to one question. `identity_skew`, `novel_absorbed` and
+    /// `inconclusive_seed_gap` were once blocking here while charged to nothing
+    /// there, and the viewer showed the wrong answer.
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
@@ -394,11 +400,22 @@ pub(crate) fn build_with_inconclusive(
         } else if obs.correlation_id.is_none() {
             // uncorrelated background-task novel call — tolerated in V1
             ("novel", false)
+        } else if obs.seed_gap {
+            // No baseline for the container this call read, so nothing to be
+            // novel against. Mirrors the scorecard's `InconclusiveSeedGap`, in
+            // the scorecard's own precedence: seed gap before tail gap before
+            // an absorbed miss.
+            ("inconclusive_seed_gap", false)
         } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
             // The recording for this correlation stops at request teardown and
             // this call comes after it: no baseline, so neither matched nor
             // novel. Mirrors the scorecard's `InconclusiveTailGap`.
             ("inconclusive_tail_gap", false)
+        } else if obs.absorbed {
+            // A novel call the process survived on a declared `on_miss` value.
+            // Named apart from the unabsorbed novel calls and charged to
+            // nothing, as the scorecard's `NovelCallAbsorbed` is.
+            ("novel_absorbed", false)
         } else {
             ("novel", true)
         };
@@ -691,7 +708,12 @@ pub(crate) fn build_with_plan(
                     let mut observed = observed_side(call);
                     let (kind, blocking, origin) =
                         if matches!(outcome, NodeOutcome::IdentitySkew { .. }) {
-                            ("identity_skew".to_owned(), true, false)
+                            // Order, and only order: both sides made the call and
+                            // each resolved to its own recorded event; the two
+                            // pairing methods disagree about which goes with
+                            // which. The scorecard charges it to nothing, and so
+                            // does this row.
+                            ("identity_skew".to_owned(), false, false)
                         } else if computed_divergence == Some(true) {
                             let schema_default =
                                 observed_schema_default_divergence(call, aligned_event);
@@ -950,6 +972,48 @@ mod tests {
             policy_version: 1,
             entries,
         }
+    }
+
+    /// The scorecard tolerates an ABSORBED novel call (`NovelCallAbsorbed`,
+    /// charged to nothing) and an inconclusive seed gap; the ledger reads
+    /// neither `obs.absorbed` nor `obs.seed_gap`, so both fall through to
+    /// `("novel", blocking = true)` and the viewer shows a blocking finding
+    /// for a call the scorer forgave. The invalid state is written into the
+    /// cell directly, not produced by any path that maintains the invariant.
+    #[test]
+    fn an_absorbed_novel_call_and_a_seed_gap_are_not_blocking_ledger_rows() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let mut absorbed = obs("db", Some("c1"), false, None, None);
+        absorbed.absorbed = true;
+        let mut seed_gap = obs("redis", Some("c1"), false, None, None);
+        seed_gap.seed_gap = true;
+
+        let rows = build(&events, &[absorbed, seed_gap], &table, &HashSet::new());
+        assert_eq!(rows.len(), 2, "precondition: both calls produce a row");
+
+        let absorbed_row = rows.iter().find(|r| r.boundary == "db").expect("db row");
+        assert!(
+            !absorbed_row.blocking,
+            "an absorbed miss is a novel call the process survived; the scorecard \
+             charges it to nothing, so its ledger row must not block: {absorbed_row:?}"
+        );
+        assert_ne!(
+            absorbed_row.kind, "novel",
+            "and it must be NAMED as absorbed, not filed with the unabsorbed novel calls"
+        );
+
+        let gap_row = rows
+            .iter()
+            .find(|r| r.boundary == "redis")
+            .expect("redis row");
+        assert!(
+            !gap_row.blocking,
+            "a seed gap is inconclusive on the scorecard; the ledger must not call it \
+             blocking: {gap_row:?}"
+        );
+        assert_ne!(gap_row.kind, "novel");
     }
 
     #[test]

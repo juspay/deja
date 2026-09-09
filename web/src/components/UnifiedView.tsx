@@ -809,7 +809,9 @@ function SpanDetail({
           // Agreement is an ALLOW-LIST. Falling through to `Matched` told the
           // reader that any kind this build did not recognise was reconciled and
           // its values agreed — including `pruned_subtree`, `novel_subtree` and
-          // `identity_skew`, which the scorer marks blocking. A kind added to the
+          // `identity_skew`, which the scorer emitted as blocking at the time
+          // (a skew has been non-blocking order since #124; its panel keys the
+          // verdict sentence on the row's own flag). A kind added to the
           // scorer tomorrow must degrade to "no panel yet, here are the values",
           // never to a claim of agreement.
           if (k === "matched" || k === "recovered" || k === "deterministic")
