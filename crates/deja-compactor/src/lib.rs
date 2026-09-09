@@ -1140,6 +1140,12 @@ async fn readiness_of(
     // decide arbitrarily. Scanning the whole tied group instead is one object in
     // the ordinary case, a few in the rare one, and needs no rule that could
     // only be wrong.
+    //
+    // Residual, bounded to a warning: `last_modified` is when S3 STORED the
+    // object, not when the aggregator began the batch. If an earlier batch is
+    // retried and lands after the batch carrying the marker, the retry is the
+    // newest and the marker is missed. No sealing decision depends on it, so
+    // this is recorded rather than defended against.
     let by_instance: Vec<(&str, i64, &object_store::ObjectMeta)> = if keyed {
         mine.iter()
             .filter_map(|m| {
@@ -1151,25 +1157,33 @@ async fn readiness_of(
         Vec::new()
     };
     let newest_per_instance = newest_tied(&by_instance);
-    let to_scan: Vec<&object_store::ObjectMeta> = if keyed {
+    // Each object carries the instance ITS KEY named, so an end-of-stream marker
+    // found in it is credited to the same vocabulary the producer set came from.
+    //
+    // This is the whole requirement and it is narrower than "do not union the
+    // two spellings". `without` is `instances` minus `with_eof`; if one side is
+    // key-derived and the other content-derived, they still meet — just across
+    // the subtraction instead of inside one set. A key segment `X` and an
+    // envelope `instance_id: Y` would put `X` in `instances`, `Y` in
+    // `with_eof`, and the eof credit would cancel nothing: `X` sits in
+    // `without` for ever and `Complete` is unreachable the moment markers start
+    // working. Both sides have to speak the same language, not merely avoid
+    // being merged.
+    let to_scan: Vec<(Option<&str>, &object_store::ObjectMeta)> = if keyed {
         newest_per_instance
-            .values()
-            .flat_map(|group| group.iter().copied())
+            .iter()
+            .flat_map(|(inst, group)| group.iter().map(move |m| (Some(inst.as_str()), *m)))
             .collect()
     } else {
-        mine.clone()
+        mine.iter().map(|m| (None, *m)).collect()
     };
 
-    // When the keys name instances they are the SINGLE source of the producer
-    // set, and the scan below must not add to it. A union of the two spellings
-    // would let a key segment and an `instance_id` that disagree both appear,
-    // and only the content one could ever reach `with_eof` — so the key-derived
-    // name would sit in `without` for ever and `Complete` would be unreachable
-    // for every recording the moment end-of-stream markers start working. That
-    // is the capability this narrowing kept the scan for, lost by accident.
+    // Key-sourced when the keys name instances, and then the scan does not add
+    // to it. Content fills it only in the fallback layout, where content is
+    // also what credits `with_eof`, so the two agree there too.
     let mut instances: BTreeSet<String> = newest_per_instance.keys().cloned().collect();
     let mut with_eof: BTreeSet<String> = BTreeSet::new();
-    for meta in &to_scan {
+    for (key_instance, meta) in &to_scan {
         let data = get_decoded(store, &meta.location).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -1187,12 +1201,20 @@ async fn readiness_of(
                     continue;
                 }
             }
-            let Some(instance) = probe.instance_id.clone() else {
-                continue;
+            // The key names the instance when the layout provides it, and the
+            // envelope only otherwise. A keyed object therefore does not need
+            // `instance_id` at all — and must not be skipped for lacking it,
+            // which would drop a marker the key could have credited.
+            let instance = match key_instance {
+                Some(inst) => (*inst).to_owned(),
+                None => {
+                    let Some(from_content) = probe.instance_id.clone() else {
+                        continue;
+                    };
+                    instances.insert(from_content.clone());
+                    from_content
+                }
             };
-            if !keyed {
-                instances.insert(instance.clone());
-            }
             if probe.artifact_type.as_deref() == Some(ARTIFACT_TYPE_MARKER)
                 && probe.marker.map(|m| m.kind).as_deref() == Some(MARKER_KIND_EOF)
             {
@@ -3154,6 +3176,40 @@ mod tests {
                 objects: 2
             },
             "objects tied at the newest second are all scanned; got {readiness:?}"
+        );
+    }
+
+    /// THE VOCABULARY AGREEMENT, which is the actual requirement and is narrower
+    /// than "do not union the two spellings". `without` is `instances` minus
+    /// `with_eof`. If the producer set is key-derived and the eof credit is
+    /// content-derived, they still meet — across the subtraction rather than
+    /// inside one set — and an eof credited to a name that is not in the
+    /// producer set cancels nothing.
+    ///
+    /// Here the key says `x9` and the envelope says `y4`. Before both sides
+    /// spoke the key's language this yielded `Quiesced { without: ["x9"] }`
+    /// for ever, and `Complete` was unreachable the moment markers began
+    /// working — the exact capability the narrowed scan was kept for.
+    #[test]
+    fn an_eof_is_credited_to_the_key_instance_not_the_envelopes() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=x9/0.json",
+            &[
+                envelope_for("s1", "y4", 0, Some("c1")),
+                eof_marker("s1", "y4"),
+            ],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(
+            readiness,
+            SealReadiness::Complete {
+                instances: 1,
+                objects: 1
+            },
+            "the marker is the key instance's, whatever the envelope spells; got {readiness:?}"
         );
     }
 
