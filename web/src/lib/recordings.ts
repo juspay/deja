@@ -122,8 +122,12 @@ export function catalogById(rows: RecordingRow[] | undefined): Map<string, Recor
  */
 export function scaleText(rec: AvailableRecording, catalog: RecordingRow | undefined): string {
   const objects = `${rec.objects.toLocaleString()} landing object${rec.objects === 1 ? "" : "s"}`;
-  const corrs = catalog?.correlation_count;
-  if (corrs == null) return `${objects} · correlation count not known until it is pulled`;
+  // The catalog answers first — a pulled recording was counted event by event —
+  // and the SEAL answers when it has not been pulled, which is most of the time.
+  // Only when neither knows is the count unknown, and the sentence says SEALED
+  // rather than PULLED because sealing is what now makes it knowable.
+  const corrs = catalog?.correlation_count ?? rec.correlations;
+  if (corrs == null) return `${objects} · correlation count not known until it is sealed`;
   return `${objects} · ${corrs.toLocaleString()} correlation${corrs === 1 ? "" : "s"}`;
 }
 

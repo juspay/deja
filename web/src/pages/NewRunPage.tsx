@@ -95,13 +95,27 @@ export default function NewRunPage() {
   const chosen = rows.find((r) => r.recording_id === recordingId.trim());
   const picked = recordings.data?.find((r) => r.recording_id === recordingId.trim());
 
-  // Latest preselected. The server returns newest first (last partition, then
-  // id), so the head of the list IS the latest — no client-side re-sort, which
-  // could only disagree with it. Runs once: a refetch must not overwrite a
-  // choice the caller has since made, and `?recording=` arrives already set.
+  // Latest SEALED preselected, not latest outright. The server returns newest
+  // first, so the head of the list is the newest recording — and the newest
+  // recording is always UNSEALED, because sealing waits for the pod to stop
+  // writing plus a quiescence window plus a sealer tick. Preselecting it left
+  // the form in its least useful state: the correlation filter below lists
+  // candidates only for a sealed recording, so the default selection could
+  // never populate it. On the live catalog the first sealed row sat SIXTEEN
+  // rows down, so reaching a usable filter meant scrolling past every
+  // recording still being written.
+  //
+  // Falls back to the head of the list when nothing is sealed, so a fresh
+  // bucket still preselects something rather than nothing. No client-side
+  // re-sort either way: the order is the server's and a local sort could only
+  // disagree with it.
+  //
+  // Runs once — a refetch must not overwrite a choice the caller has since
+  // made, and `?recording=` arrives already set.
   React.useEffect(() => {
     if (recordingId.trim() || rows.length === 0) return;
-    setRecordingId(rows[0].recording_id);
+    const sealed = rows.find((r) => r.sealed === true && (r.correlations ?? 0) > 0);
+    setRecordingId((sealed ?? rows[0]).recording_id);
   }, [rows, recordingId]);
 
   // THE ONE PLACE candidate correlations come from. Swapping in the sealed
