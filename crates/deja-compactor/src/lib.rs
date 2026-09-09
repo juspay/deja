@@ -998,6 +998,16 @@ fn key_names_session(key: &str, session_id: &str) -> bool {
     !named
 }
 
+/// The `inst=` segment of a landing key, when the layout carries one.
+///
+/// The deployed aggregator partitions below the session by instance, so the
+/// producer set is already in the keys the listing returns.
+/// `LandedRecording::instances` says the same of the same segments: "it costs
+/// nothing: the segments are already in the keys the scan lists."
+fn key_instance(key: &str) -> Option<&str> {
+    key.split('/').find_map(|s| s.strip_prefix("inst="))
+}
+
 /// Judge whether a session is finished, from the landing alone.
 ///
 /// Cheap first: quiescence comes from the LISTING (no object is fetched), so a
@@ -1065,11 +1075,66 @@ async fn readiness_of(
         });
     }
 
-    // Quiet. Now it is worth reading the objects to tell a finished recording
-    // from one whose producer was killed.
-    let mut instances: BTreeSet<String> = BTreeSet::new();
+    // Quiet. Now it is worth reading, to tell a finished recording from one
+    // whose producer was killed — but reading far less than every object.
+    //
+    // Two facts narrow it. The producer set is in the KEYS: `inst=` is a path
+    // segment, so the listing already carries it and no object need be fetched
+    // to learn who wrote this recording. And an end-of-stream marker can only
+    // be in an instance's NEWEST object: `emit_eof_marker` runs in the writer's
+    // Shutdown arm AFTER the final write and flush, so it is the last record
+    // that instance ever produces.
+    //
+    // So the scan is one object per instance rather than all of them. That is
+    // the difference between reading a recording's whole landing on every pass
+    // and reading a handful of objects — on 2026-09-09 the sealer was reading
+    // 47 objects per pass, per candidate, to populate a set that is always
+    // empty in production, because the marker is emitted from `impl Drop for
+    // AsyncRecordWriter` and the recorder lives in a process-global static
+    // whose destructor Rust never runs.
+    //
+    // The full scan remains for a layout whose keys do NOT name an instance.
+    // Attribution then has to come from content, exactly as before, and this
+    // must not guess: a partial key layout would otherwise report a producer
+    // set missing whoever the keys failed to name.
+    let keyed = mine
+        .iter()
+        .all(|m| key_instance(m.location.as_ref()).is_some());
+    let mut newest_per_instance: BTreeMap<String, &object_store::ObjectMeta> = BTreeMap::new();
+    if keyed {
+        for meta in &mine {
+            let Some(inst) = key_instance(meta.location.as_ref()) else {
+                continue;
+            };
+            // Ties on `last_modified` are broken by the key, so "newest" is a
+            // total order rather than whichever the listing happened to yield
+            // first. Landing objects within one instance are named in write
+            // order, so the greater key is the later object — and when even
+            // that is wrong the cost is a warning naming an instance that did
+            // sign off, which changes no sealing decision.
+            newest_per_instance
+                .entry(inst.to_owned())
+                .and_modify(|cur| {
+                    let newer = (meta.last_modified, meta.location.as_ref())
+                        > (cur.last_modified, cur.location.as_ref());
+                    if newer {
+                        *cur = meta;
+                    }
+                })
+                .or_insert(meta);
+        }
+    }
+    let to_scan: Vec<&object_store::ObjectMeta> = if keyed {
+        newest_per_instance.values().copied().collect()
+    } else {
+        mine.clone()
+    };
+
+    // Seeded from the keys when they carry the answer; otherwise filled by the
+    // scan below, as it always was.
+    let mut instances: BTreeSet<String> = newest_per_instance.keys().cloned().collect();
     let mut with_eof: BTreeSet<String> = BTreeSet::new();
-    for meta in &mine {
+    for meta in &to_scan {
         let data = get_decoded(store, &meta.location).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -2971,6 +3036,116 @@ mod tests {
             "expected Active, got {readiness:?}"
         );
         assert!(!readiness.should_seal());
+    }
+
+    /// THE DELIBERATE NARROWING, stated as a test so it is a decision rather
+    /// than a regression. An end-of-stream marker is emitted from the writer's
+    /// Shutdown arm after its final write and flush, so it is the last record an
+    /// instance produces and can only be in that instance's newest object.
+    /// Readiness therefore reads one object per instance instead of all of them.
+    ///
+    /// The cost is exactly this: a marker in an OLDER object is not found. That
+    /// cannot happen from a recorder that emits markers at shutdown, and if it
+    /// did the consequence is bounded — `should_seal()` matches Complete and
+    /// Quiesced identically and `objects()` comes from the listing, so no
+    /// sealing decision changes. Only the warning's wording does.
+    #[test]
+    fn only_an_instances_newest_object_is_read_for_its_marker() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/1.json",
+            &[envelope_for("s1", "i1", 1, Some("c1"))],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+
+        // The precondition that makes this a test of the narrowing rather than
+        // of nothing: the marker really is present in the landing.
+        assert!(
+            matches!(readiness, SealReadiness::Quiesced { .. }),
+            "a marker in an older object must not be found; got {readiness:?}"
+        );
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                objects,
+                ..
+            } => {
+                assert_eq!(instances_without_eof, vec!["i1".to_owned()]);
+                assert_eq!(objects, 2, "both objects are still COUNTED, from the list");
+            }
+            other => panic!("expected Quiesced, got {other:?}"),
+        }
+    }
+
+    /// The producer set comes from the KEYS, not from reading objects. Proven by
+    /// giving the content no `instance_id` at all: if the scan were the source,
+    /// the instance would be missing and the recording would report Complete on
+    /// an empty set.
+    #[test]
+    fn instances_are_read_from_the_keys_not_the_content() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i7/0.json",
+            &[r#"{"schema_version":2,"artifact_type":"deja_artifact_record","capture":{"mode":"session","session_id":"s1"},"event":{"recording_run_id":"s1","global_sequence":0,"correlation_id":"c1","boundary":"http_incoming","event_schema_version":1}}"#.to_owned()],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(
+                instances_without_eof,
+                vec!["i7".to_owned()],
+                "the instance is named by the key alone"
+            ),
+            other => panic!("expected Quiesced naming i7, got {other:?}"),
+        }
+    }
+
+    /// A layout whose keys do NOT name an instance falls back to the full
+    /// content scan. Attribution must not be guessed: reporting a producer set
+    /// missing whoever the keys failed to name would be worse than reading.
+    #[test]
+    fn a_layout_without_inst_keys_still_scans_every_object() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/1.json",
+            &[
+                envelope_for("s1", "i2", 1, Some("c1")),
+                eof_marker("s1", "i2"),
+            ],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(
+                instances_without_eof,
+                vec!["i1".to_owned()],
+                "both objects were read: i2 signed off, i1 did not"
+            ),
+            other => panic!("expected Quiesced naming only i1, got {other:?}"),
+        }
     }
 
     #[test]
