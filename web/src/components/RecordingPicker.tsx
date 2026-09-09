@@ -170,6 +170,12 @@ export function RecordingPicker({
                       <span className={r.pulled ? "chip pass" : "chip muted"}>
                         {r.pulled ? "pulled" : "in bucket"}
                       </span>
+                      {/* Sealed is the fact that decides whether the correlation
+                          filter below can list anything, so it belongs on the row
+                          rather than being discoverable only by picking one. */}
+                      <span className={r.sealed ? "chip pass" : "chip muted"}>
+                        {r.sealed ? "sealed" : "unsealed"}
+                      </span>
                     </span>
                   </div>
                   <div className="recpick-row-sub">
