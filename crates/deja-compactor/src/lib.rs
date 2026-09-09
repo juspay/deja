@@ -998,6 +998,43 @@ fn key_names_session(key: &str, session_id: &str) -> bool {
     !named
 }
 
+/// The `inst=` segment of a landing key, when the layout carries one.
+///
+/// The deployed aggregator partitions below the session by instance, so the
+/// producer set is already in the keys the listing returns.
+/// `LandedRecording::instances` says the same of the same segments: "it costs
+/// nothing: the segments are already in the keys the scan lists."
+fn key_instance(key: &str) -> Option<&str> {
+    key.split('/').find_map(|s| s.strip_prefix("inst="))
+}
+
+/// Every item tied at each group's newest timestamp.
+///
+/// Pure so the rule can be tested directly: an in-memory store stamps objects
+/// written in one test with the same second, which is exactly the tie this
+/// exists to handle, so a store-backed test cannot distinguish "newest" from
+/// "all of them".
+fn newest_tied<T: Copy>(items: &[(&str, i64, T)]) -> BTreeMap<String, Vec<T>> {
+    let mut out: BTreeMap<String, (i64, Vec<T>)> = BTreeMap::new();
+    for (group, ts, item) in items {
+        match out.get_mut(*group) {
+            Some((best, held)) => {
+                if ts > best {
+                    *best = *ts;
+                    held.clear();
+                    held.push(*item);
+                } else if ts == best {
+                    held.push(*item);
+                }
+            }
+            None => {
+                out.insert((*group).to_owned(), (*ts, vec![*item]));
+            }
+        }
+    }
+    out.into_iter().map(|(k, (_, v))| (k, v)).collect()
+}
+
 /// Judge whether a session is finished, from the landing alone.
 ///
 /// Cheap first: quiescence comes from the LISTING (no object is fetched), so a
@@ -1065,11 +1102,74 @@ async fn readiness_of(
         });
     }
 
-    // Quiet. Now it is worth reading the objects to tell a finished recording
-    // from one whose producer was killed.
-    let mut instances: BTreeSet<String> = BTreeSet::new();
+    // Quiet. Now it is worth reading, to tell a finished recording from one
+    // whose producer was killed — but reading far less than every object.
+    //
+    // Two facts narrow it. The producer set is in the KEYS: `inst=` is a path
+    // segment, so the listing already carries it and no object need be fetched
+    // to learn who wrote this recording. And an end-of-stream marker can only
+    // be in an instance's NEWEST object: `emit_eof_marker` runs in the writer's
+    // Shutdown arm AFTER the final write and flush, so it is the last record
+    // that instance ever produces.
+    //
+    // So the scan is one object per instance rather than all of them. That is
+    // the difference between reading a recording's whole landing on every pass
+    // and reading a handful of objects — on 2026-09-09 the sealer was reading
+    // 47 objects per pass, per candidate, to populate a set that is always
+    // empty in production, because the marker is emitted from `impl Drop for
+    // AsyncRecordWriter` and the recorder lives in a process-global static
+    // whose destructor Rust never runs.
+    //
+    // The full scan remains for a layout whose keys do NOT name an instance.
+    // Attribution then has to come from content, exactly as before, and this
+    // must not guess: a partial key layout would otherwise report a producer
+    // set missing whoever the keys failed to name.
+    let keyed = mine
+        .iter()
+        .all(|m| key_instance(m.location.as_ref()).is_some());
+
+    // The newest objects of each instance — plural, because every object that
+    // TIES on the newest timestamp is kept.
+    //
+    // No tie-break, deliberately. `last_modified` is second-granularity, and the
+    // aggregator names objects `<unix-seconds>-<uuid>`
+    // (infra `vector/sandbox-hyperswitch-art-s3.yaml`: no `filename_time_format`,
+    // so Vector's `%s` default, plus `filename_append_uuid: true`). So two
+    // objects of one instance can share a second, and within that second the
+    // key order is a random uuid — a tie-break on the key would look total and
+    // decide arbitrarily. Scanning the whole tied group instead is one object in
+    // the ordinary case, a few in the rare one, and needs no rule that could
+    // only be wrong.
+    let by_instance: Vec<(&str, i64, &object_store::ObjectMeta)> = if keyed {
+        mine.iter()
+            .filter_map(|m| {
+                key_instance(m.location.as_ref())
+                    .map(|inst| (inst, m.last_modified.timestamp(), *m))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let newest_per_instance = newest_tied(&by_instance);
+    let to_scan: Vec<&object_store::ObjectMeta> = if keyed {
+        newest_per_instance
+            .values()
+            .flat_map(|group| group.iter().copied())
+            .collect()
+    } else {
+        mine.clone()
+    };
+
+    // When the keys name instances they are the SINGLE source of the producer
+    // set, and the scan below must not add to it. A union of the two spellings
+    // would let a key segment and an `instance_id` that disagree both appear,
+    // and only the content one could ever reach `with_eof` — so the key-derived
+    // name would sit in `without` for ever and `Complete` would be unreachable
+    // for every recording the moment end-of-stream markers start working. That
+    // is the capability this narrowing kept the scan for, lost by accident.
+    let mut instances: BTreeSet<String> = newest_per_instance.keys().cloned().collect();
     let mut with_eof: BTreeSet<String> = BTreeSet::new();
-    for meta in &mine {
+    for meta in &to_scan {
         let data = get_decoded(store, &meta.location).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -1090,7 +1190,9 @@ async fn readiness_of(
             let Some(instance) = probe.instance_id.clone() else {
                 continue;
             };
-            instances.insert(instance.clone());
+            if !keyed {
+                instances.insert(instance.clone());
+            }
             if probe.artifact_type.as_deref() == Some(ARTIFACT_TYPE_MARKER)
                 && probe.marker.map(|m| m.kind).as_deref() == Some(MARKER_KIND_EOF)
             {
@@ -2971,6 +3073,149 @@ mod tests {
             "expected Active, got {readiness:?}"
         );
         assert!(!readiness.should_seal());
+    }
+
+    /// The selection rule, tested where it can actually be seen. An in-memory
+    /// store stamps every object a test writes with the same second, which is
+    /// precisely the tie the rule exists to handle — so a store-backed test
+    /// cannot tell "newest" from "all of them" and would pass either way.
+    #[test]
+    fn only_the_newest_tied_group_of_each_instance_is_selected() {
+        let items = [
+            ("i1", 100, "i1-old"),
+            ("i1", 200, "i1-new-a"),
+            ("i1", 200, "i1-new-b"),
+            ("i2", 50, "i2-only"),
+        ];
+        let got = newest_tied(&items);
+
+        assert_eq!(
+            got.get("i1").map(Vec::as_slice),
+            Some(["i1-new-a", "i1-new-b"].as_slice()),
+            "every object tied at the newest second is kept, and the older one dropped"
+        );
+        assert_eq!(
+            got.get("i2").map(Vec::as_slice),
+            Some(["i2-only"].as_slice())
+        );
+    }
+
+    /// No tie-break, deliberately, and this pins it. `last_modified` is
+    /// second-granularity and the aggregator names objects `<seconds>-<uuid>`,
+    /// so within one second the key order is random. A rule that picked ONE of
+    /// a tied pair would look total and decide arbitrarily; keeping both is
+    /// what makes the outcome independent of the uuid.
+    #[test]
+    fn a_tie_keeps_both_rather_than_picking_by_key() {
+        let ordered = [("i1", 7, "aaa"), ("i1", 7, "zzz")];
+        let reversed = [("i1", 7, "zzz"), ("i1", 7, "aaa")];
+
+        let a = newest_tied(&ordered);
+        let b = newest_tied(&reversed);
+
+        assert_eq!(a.get("i1").map(Vec::len), Some(2), "both are kept");
+        assert_eq!(
+            a.get("i1").map(|v| v.len()),
+            b.get("i1").map(|v| v.len()),
+            "and the count does not depend on which the listing yielded first"
+        );
+    }
+
+    /// THE DELIBERATE NARROWING, end to end. An end-of-stream marker is emitted
+    /// from the writer's Shutdown arm after its final write and flush, so it is
+    /// the last record an instance produces and can only be at that instance's
+    /// newest timestamp. Readiness reads that group rather than every object.
+    ///
+    /// Here both objects share a second — an in-memory store gives them the
+    /// same stamp — so both are in the tied group and the marker IS found. That
+    /// is the rule working, not an exception to it: a tie is scanned whole.
+    #[test]
+    fn a_marker_in_a_tied_object_is_still_found() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/1.json",
+            &[envelope_for("s1", "i1", 1, Some("c1"))],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(
+            readiness,
+            SealReadiness::Complete {
+                instances: 1,
+                objects: 2
+            },
+            "objects tied at the newest second are all scanned; got {readiness:?}"
+        );
+    }
+
+    /// The producer set comes from the KEYS, not from reading objects. Proven by
+    /// giving the content no `instance_id` at all: if the scan were the source,
+    /// the instance would be missing and the recording would report Complete on
+    /// an empty set.
+    #[test]
+    fn instances_are_read_from_the_keys_not_the_content() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i7/0.json",
+            &[r#"{"schema_version":2,"artifact_type":"deja_artifact_record","capture":{"mode":"session","session_id":"s1"},"event":{"recording_run_id":"s1","global_sequence":0,"correlation_id":"c1","boundary":"http_incoming","event_schema_version":1}}"#.to_owned()],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(
+                instances_without_eof,
+                vec!["i7".to_owned()],
+                "the instance is named by the key alone"
+            ),
+            other => panic!("expected Quiesced naming i7, got {other:?}"),
+        }
+    }
+
+    /// A layout whose keys do NOT name an instance falls back to the full
+    /// content scan. Attribution must not be guessed: reporting a producer set
+    /// missing whoever the keys failed to name would be worse than reading.
+    #[test]
+    fn a_layout_without_inst_keys_still_scans_every_object() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/1.json",
+            &[
+                envelope_for("s1", "i2", 1, Some("c1")),
+                eof_marker("s1", "i2"),
+            ],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(
+                instances_without_eof,
+                vec!["i1".to_owned()],
+                "both objects were read: i2 signed off, i1 did not"
+            ),
+            other => panic!("expected Quiesced naming only i1, got {other:?}"),
+        }
     }
 
     #[test]
