@@ -67,7 +67,8 @@ pub enum Outcome {
         /// the ledger rather than left in a log line because it changes what
         /// the seal MEANS — the recording is whatever reached the bucket.
         ///
-        /// Precisely: producers whose NEWEST landing object carried no marker.
+        /// Precisely: producers whose NEWEST landing object(s) carried no marker
+        /// — plural, because objects tied at that timestamp are all scanned.
         /// Readiness reads one object per instance rather than all of them,
         /// because a marker is emitted from the writer's Shutdown arm after its
         /// final write and flush and so can only be in the last object that
