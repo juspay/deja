@@ -46,6 +46,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub mod pass;
 pub mod settings;
 
 /// One lock for every test that touches the declared configuration.
@@ -1313,7 +1314,88 @@ pub fn compact_session(
 ) -> Result<SessionManifest, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(compact_session_inner(&store, session_id, root))
+    match rt.block_on(compact_session_inner(&store, session_id, root, None))? {
+        Compaction::Sealed { manifest, .. } => Ok(*manifest),
+        // Unreachable: an absent budget refuses nothing. Returned rather than
+        // panicked because the caller is a sealer, and a process that aborts
+        // is the exact failure this module exists to stop producing.
+        Compaction::RefusedTooLarge { .. } => Err(format!(
+            "internal: unbudgeted compaction of {session_id} reported a size refusal"
+        )),
+    }
+}
+
+/// What one compaction attempt did.
+///
+/// A refusal is NOT an error. The recording is intact, the landing is intact,
+/// nothing has been written, and the pass can go on to the next recording. It
+/// is the difference between a named drop and the container being killed with
+/// the shell inside it, which leaves no line saying which recording did it.
+#[derive(Debug)]
+pub enum Compaction {
+    Sealed {
+        /// Boxed only to keep the two variants comparable in size: a manifest
+        /// is an order of magnitude larger than a refusal, and this is
+        /// returned once per recording, so the allocation is free and the lint
+        /// is real.
+        manifest: Box<SessionManifest>,
+        /// Decompressed bytes this compaction actually held.
+        ///
+        /// Reported on SUCCESS, not only on refusal, because this number is
+        /// what sizes every later decision about this pass — the memory
+        /// budget, and the spill an external merge sort would need. Nobody
+        /// knows the distribution of recording sizes today, and a pass that
+        /// reports bytes only when it refuses can never supply it: the
+        /// recordings that seal ARE the distribution.
+        landing_bytes_read: u64,
+        /// See `RefusedTooLarge::shared_prefix`. Carried here for the same
+        /// reason: without it `landing_bytes_read` for a straddling session
+        /// reads as that recording's size when it is the whole partition's.
+        shared_prefix: bool,
+    },
+    /// The decompressed landing passed `budget_bytes` while it was being read.
+    ///
+    /// The numbers are what was known AT the refusal: `read_bytes` is a lower
+    /// bound on the landing's true size, never its size, and reporting it as
+    /// the size would understate every recording this refuses.
+    RefusedTooLarge {
+        budget_bytes: u64,
+        read_bytes: u64,
+        objects_read: usize,
+        objects_total: usize,
+        /// Whether the bytes read belong to this recording ALONE.
+        ///
+        /// False is the ordinary case. True means the landing was addressed at
+        /// a shared partition parent, so the objects counted here include every
+        /// other session under it — the refusal is then about the prefix, not
+        /// about this recording, and reading it as this recording's size would
+        /// overstate it by however much its neighbours weigh.
+        shared_prefix: bool,
+    },
+}
+
+/// [`compact_session`] with a ceiling on the decompressed landing it may hold.
+///
+/// The ceiling is MEASURED as objects are read, not predicted from their
+/// compressed size. A prediction needs a compression ratio, and a ratio safe
+/// enough to never let an OOM through is conservative enough to refuse
+/// recordings that would have sealed fine — it would trade a loud failure for
+/// a quiet one. Measuring costs a refused recording up to `max_landing_bytes`
+/// of fetching before it is refused, which is bounded and happens once a pass.
+pub fn compact_session_within(
+    cfg: &S3Config,
+    session_id: &str,
+    root: &str,
+    max_landing_bytes: Option<u64>,
+) -> Result<Compaction, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(compact_session_inner(
+        &store,
+        session_id,
+        root,
+        max_landing_bytes,
+    ))
 }
 
 /// Where a session's landing objects actually are, and whether the prefix that
@@ -1404,7 +1486,8 @@ async fn compact_session_inner(
     store: &DynStore,
     session_id: &str,
     root: &str,
-) -> Result<SessionManifest, String> {
+    max_landing_bytes: Option<u64>,
+) -> Result<Compaction, String> {
     let Some(location) = locate_landing(store, session_id, root).await? else {
         return Err(format!(
             "no landing objects for session {session_id} under {root} — it was \
@@ -1413,8 +1496,31 @@ async fn compact_session_inner(
     };
     let keys = list_keys(store, &location.prefix).await?;
     let mut chunks = Vec::with_capacity(keys.len());
-    for key in &keys {
-        chunks.push(get_decoded(store, key).await?);
+    // No budget is `u64::MAX` rather than a branch, so the loop below has one
+    // shape and the unbudgeted path is the same code the budgeted path takes.
+    let budget = max_landing_bytes.unwrap_or(u64::MAX);
+    let mut read_bytes = 0u64;
+    for (read, key) in keys.iter().enumerate() {
+        let chunk = get_decoded(store, key).await?;
+        read_bytes += chunk.len() as u64;
+        chunks.push(chunk);
+        // Checked after the push, so `read_bytes` is what is actually held
+        // rather than what is about to be.
+        //
+        // A SHARED prefix is why this is more than a guard on one recording's
+        // size: a session straddling two date partitions is addressed at the
+        // root, so this loop decompresses every other session under it as well
+        // and only filters them out below. That landing is the one that grows
+        // without anyone recording anything larger.
+        if read_bytes > budget {
+            return Ok(Compaction::RefusedTooLarge {
+                budget_bytes: budget,
+                read_bytes,
+                objects_read: read + 1,
+                objects_total: keys.len(),
+                shared_prefix: location.shared,
+            });
+        }
     }
 
     let (lines, landing_objects) = if location.shared {
@@ -1430,7 +1536,11 @@ async fn compact_session_inner(
     }
 
     let collated = collate(lines.into_iter());
-    write_seal(store, session_id, collated, landing_objects).await
+    Ok(Compaction::Sealed {
+        manifest: Box::new(write_seal(store, session_id, collated, landing_objects).await?),
+        landing_bytes_read: read_bytes,
+        shared_prefix: location.shared,
+    })
 }
 
 /// Seal a recording from envelope lines a caller has ALREADY read.
@@ -2690,6 +2800,16 @@ mod tests {
         block(put(store, key, lines.join("\n").into_bytes())).unwrap();
     }
 
+    /// The manifest a compaction produced. A test that passes no budget cannot
+    /// be refused, so a refusal here is a defect in the test rather than an
+    /// outcome the test should be handling.
+    fn sealed(compaction: Compaction) -> SessionManifest {
+        match compaction {
+            Compaction::Sealed { manifest, .. } => *manifest,
+            other => panic!("expected a seal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn the_landing_prefix_follows_the_configured_root() {
         // The orchestrator has resolved DEJA_RECORDING_ROOT for a while and the
@@ -2773,7 +2893,15 @@ mod tests {
             ],
         );
 
-        let manifest = block(compact_session_inner(&store, "s1", DEFAULT_RECORDING_ROOT)).unwrap();
+        let manifest = sealed(
+            block(compact_session_inner(
+                &store,
+                "s1",
+                DEFAULT_RECORDING_ROOT,
+                None,
+            ))
+            .unwrap(),
+        );
         assert_eq!(manifest.session_id, "s1");
         assert_eq!(manifest.counts.events, 2);
         assert_eq!(manifest.counts.correlations, 1);
@@ -2803,7 +2931,15 @@ mod tests {
             ],
         );
 
-        let manifest = block(compact_session_inner(&store, "s1", DEFAULT_RECORDING_ROOT)).unwrap();
+        let manifest = sealed(
+            block(compact_session_inner(
+                &store,
+                "s1",
+                DEFAULT_RECORDING_ROOT,
+                None,
+            ))
+            .unwrap(),
+        );
         assert_eq!(
             manifest.counts.events, 2,
             "s2's events are a different recording"
