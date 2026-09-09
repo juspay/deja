@@ -466,8 +466,8 @@ where
         restore_correlation(id.into_u64());
     }
 
-    /// Discard the correlation's fork sequences when the span that owns the
-    /// correlation closes.
+    /// Discard the correlation's per-correlation state — fork sequences and
+    /// memoized hash keys — when the span that owns the correlation closes.
     ///
     /// Span lifetime is the right clock. A span closes when the last handle to it
     /// is dropped, which is after every task that carried it has finished, so it
@@ -485,6 +485,10 @@ where
         };
         if cx.owns_correlation {
             crate::clear_fork_counters_for_correlation(cx.correlation.as_deref());
+            // Same clock, same reason: the memoized hash keys are per-correlation
+            // state, and without this the memo grows by one entry per request for
+            // the life of the process.
+            crate::hash_seed::clear_hash_keys_for_correlation(cx.correlation.as_deref());
         }
     }
 }
