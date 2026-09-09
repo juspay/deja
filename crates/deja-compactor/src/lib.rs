@@ -1065,13 +1065,19 @@ async fn readiness_of(
         return Ok(SealReadiness::Absent);
     };
 
-    let prefix_path = object_store::path::Path::from(location.prefix.as_str());
-    let metas: Vec<object_store::ObjectMeta> =
-        store
+    let mut metas: Vec<object_store::ObjectMeta> = Vec::new();
+    for prefix in &location.prefixes {
+        let prefix_path = object_store::path::Path::from(prefix.as_str());
+        let page: Vec<object_store::ObjectMeta> = store
             .list(Some(&prefix_path))
             .try_collect()
             .await
-            .map_err(|e| format!("s3 list {}: {e}", location.prefix))?;
+            .map_err(|e| format!("s3 list {prefix}: {e}"))?;
+        metas.extend(page);
+    }
+    // Prefixes cannot overlap — they differ by date partition — but the filter
+    // stays because a prefix match is not a segment match: listing
+    // `…/session=s1` also returns `…/session=s10`.
     let mine: Vec<&object_store::ObjectMeta> = metas
         .iter()
         .filter(|m| key_names_session(m.location.as_ref(), session_id))
@@ -1525,12 +1531,27 @@ pub fn compact_session_within(
 /// Where a session's landing objects actually are, and whether the prefix that
 /// holds them holds anything else.
 struct LandingLocation {
-    prefix: String,
-    /// True when the prefix is a shared partition parent. Attribution then has
-    /// to come from each envelope's `capture.session_id`, never from the key —
-    /// a session that runs across midnight is addressed from the parent of two
-    /// date partitions, and every other session that landed in that window is
-    /// under it too.
+    /// Every prefix that holds part of this session, each naming the session.
+    ///
+    /// More than one when the session spans date partitions: one prefix PER
+    /// partition rather than their shared parent. Addressing the parent meant
+    /// listing and decompressing every other session that landed in that
+    /// window — in sandbox, 32,519 objects for a recording of three — so the
+    /// memory a straddling session cost was created by how it was addressed
+    /// and not by anything about the recording.
+    prefixes: Vec<String>,
+    /// True when a prefix can hold objects belonging to other sessions, so
+    /// attribution has to come from each envelope's `capture.session_id`
+    /// rather than from the key.
+    ///
+    /// **Currently unreachable, and kept deliberately.** Every prefix this
+    /// function builds names the session, because `index_landed_keys` can only
+    /// find a session whose keys carry `session=` in the first place — so
+    /// there is no layout the deployment writes that reaches the content
+    /// filter. It stays because the alternative is deleting
+    /// `select_session_lines` and a field the deployed ledger already carries,
+    /// to buy nothing; but it should be read as a capability with no caller
+    /// rather than as a live branch, and it must not be cited as tested.
     shared: bool,
 }
 
@@ -1550,7 +1571,7 @@ async fn locate_landing(
     let flat = layout::landing_prefix_in(root, session_id);
     if !list_keys(store, &flat).await?.is_empty() {
         return Ok(Some(LandingLocation {
-            prefix: flat,
+            prefixes: vec![flat],
             shared: false,
         }));
     }
@@ -1559,15 +1580,29 @@ async fn locate_landing(
         .into_iter()
         .map(|p| p.as_ref().to_owned())
         .collect();
+    let root = root.trim_end_matches('/');
     Ok(index_landed_keys(root, &keys)
         .into_iter()
         .find(|found| found.session_id == session_id)
-        .map(|found| LandingLocation {
-            // A session under exactly one partition is addressed at
-            // `{root}/dt=…/session={id}`, which names it; one that straddles is
-            // addressed at the root, which does not.
-            shared: found.dates.len() > 1,
-            prefix: found.prefix,
+        .map(|found| {
+            // One prefix per date partition, each naming the session. The
+            // listing already knows which partitions a session appears under,
+            // so the parent never has to be read: `dates` is exactly the set
+            // of `dt=` segments its keys carried.
+            let prefixes: Vec<String> = if found.dates.len() > 1 {
+                found
+                    .dates
+                    .iter()
+                    .map(|date| format!("{root}/dt={date}/session={session_id}"))
+                    .collect()
+            } else {
+                vec![found.prefix]
+            };
+            // Derived from the prefixes rather than from the partition count,
+            // because it is a question about the KEYS: a prefix that names the
+            // session cannot hold another one's objects.
+            let shared = prefixes.iter().any(|p| !p.contains("session="));
+            LandingLocation { prefixes, shared }
         }))
 }
 
@@ -1618,7 +1653,16 @@ async fn compact_session_inner(
              never landed, or it landed under a different root"
         ));
     };
-    let keys = list_keys(store, &location.prefix).await?;
+    // Every prefix the session appears under, and only keys that NAME it: a
+    // prefix match is not a segment match, so listing `…/session=s1` also
+    // returns `…/session=s10`.
+    let mut keys: Vec<object_store::path::Path> = Vec::new();
+    for prefix in &location.prefixes {
+        keys.extend(list_keys(store, prefix).await?);
+    }
+    keys.retain(|k| key_names_session(k.as_ref(), session_id));
+    keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    keys.dedup();
     let mut chunks = Vec::with_capacity(keys.len());
     // No budget is `u64::MAX` rather than a branch, so the loop below has one
     // shape and the unbudgeted path is the same code the budgeted path takes.
@@ -1631,11 +1675,11 @@ async fn compact_session_inner(
         // Checked after the push, so `read_bytes` is what is actually held
         // rather than what is about to be.
         //
-        // A SHARED prefix is why this is more than a guard on one recording's
-        // size: a session straddling two date partitions is addressed at the
-        // root, so this loop decompresses every other session under it as well
-        // and only filters them out below. That landing is the one that grows
-        // without anyone recording anything larger.
+        // The guard is on THIS recording's landing now. It used to also be
+        // the only thing standing between a straddling session and the whole
+        // day's traffic, because such a session was addressed at the partition
+        // parent; `locate_landing` now addresses one prefix per partition, so
+        // what is read here is the session's own objects and nothing else.
         if read_bytes > budget {
             return Ok(Compaction::RefusedTooLarge {
                 budget_bytes: budget,
@@ -1655,7 +1699,7 @@ async fn compact_session_inner(
     if lines.is_empty() {
         return Err(format!(
             "no envelope lines for session {session_id} under {}",
-            location.prefix
+            location.prefixes.join(", ")
         ));
     }
 
@@ -3420,6 +3464,67 @@ mod tests {
         let mut m = seal(&store, "s1", &[envelope_for("s1", "i1", 0, Some("c1"))]);
         m.counts.landing_objects = landing_objects;
         m
+    }
+
+    #[test]
+    fn a_session_across_two_dates_reads_only_its_own_partitions() {
+        // The straddle case, which sandbox showed is the real cost. A session
+        // that ran across midnight used to be addressed at the PARENT of its
+        // two date partitions, so compaction listed and decompressed every
+        // other session that landed in that window — 32,519 objects for a
+        // recording of two — and was refused for a size that had nothing to do
+        // with it.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-08/session=s1/inst=i1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-09/session=s1/inst=i1/1.json",
+            &[envelope_for("s1", "i1", 1, Some("c1"))],
+        );
+        // A neighbour under the same root, big enough that reading the parent
+        // would pass the budget below. It sorts BETWEEN the two partitions of
+        // s1, so a root-addressed read reaches it before finishing s1.
+        for n in 0..40 {
+            put_object_at(
+                &store,
+                &format!("landing/v1/dt=2026-09-09/session=other/inst=i9/{n:02}.json"),
+                &[envelope_for("other", "i9", n, Some("c9"))],
+            );
+        }
+
+        let compaction = block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            Some(5_000),
+        ))
+        .unwrap();
+        match compaction {
+            Compaction::Sealed {
+                manifest,
+                landing_bytes_read,
+                shared_prefix,
+            } => {
+                assert_eq!(
+                    manifest.counts.landing_objects, 2,
+                    "its own two objects, not the root's forty-two"
+                );
+                assert_eq!(manifest.counts.events, 2);
+                assert!(
+                    !shared_prefix,
+                    "a per-partition prefix names the session, so nothing else can be under it"
+                );
+                assert!(
+                    landing_bytes_read < 5_000,
+                    "read {landing_bytes_read} bytes; the neighbour was not touched"
+                );
+            }
+            other => panic!("expected a seal, got {other:?}"),
+        }
     }
 
     #[test]
