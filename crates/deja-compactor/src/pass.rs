@@ -66,6 +66,15 @@ pub enum Outcome {
         /// Producers that never wrote an end-of-stream marker. Carried into
         /// the ledger rather than left in a log line because it changes what
         /// the seal MEANS — the recording is whatever reached the bucket.
+        ///
+        /// Precisely: producers whose NEWEST landing object carried no marker.
+        /// Readiness reads one object per instance rather than all of them,
+        /// because a marker is emitted from the writer's Shutdown arm after its
+        /// final write and flush and so can only be in the last object that
+        /// instance wrote. The value is the same today — no deployed recorder
+        /// emits a marker at all — but the sentence is narrower than "never
+        /// wrote one anywhere", and a reader deciding how much to trust a seal
+        /// should have the narrower one.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         instances_without_eof: Vec<String>,
     },
