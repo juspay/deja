@@ -55,6 +55,13 @@ pub enum Outcome {
     Sealed {
         correlations: usize,
         landing_objects: usize,
+        /// Decompressed bytes compaction held for this recording. Reported on
+        /// success so the ledger supplies the size distribution that sizes the
+        /// budget and, later, an external merge sort's spill.
+        landing_bytes_read: u64,
+        /// Whether those bytes are this recording's alone — see
+        /// [`Outcome::TooLarge`].
+        shared_prefix: bool,
         resealed: bool,
         /// Producers that never wrote an end-of-stream marker. Carried into
         /// the ledger rather than left in a log line because it changes what
@@ -125,13 +132,21 @@ impl std::fmt::Display for Row {
             Outcome::Sealed {
                 correlations,
                 landing_objects,
+                landing_bytes_read,
+                shared_prefix,
                 resealed,
                 instances_without_eof,
             } => {
                 let verb = if *resealed { "re-sealed" } else { "sealed" };
+                let whose = if *shared_prefix {
+                    " read from a SHARED partition parent, so not this recording's alone"
+                } else {
+                    ""
+                };
                 write!(
                     f,
-                    "{verb} ({correlations} correlation(s), {landing_objects} landing object(s))"
+                    "{verb} ({correlations} correlation(s), {landing_objects} landing object(s), \
+                     {landing_bytes_read} decompressed byte(s){whose})"
                 )?;
                 if !instances_without_eof.is_empty() {
                     write!(
@@ -429,7 +444,17 @@ async fn seal_outcome_in(
         SealDecision::Seal { resealing } => resealing,
     };
     match crate::compact_session_inner(store, recording_id, root, max_landing_bytes).await? {
-        Compaction::Sealed(manifest) => Ok(sealed_outcome(&manifest, resealed, &readiness)),
+        Compaction::Sealed {
+            manifest,
+            landing_bytes_read,
+            shared_prefix,
+        } => Ok(sealed_outcome(
+            &manifest,
+            resealed,
+            &readiness,
+            landing_bytes_read,
+            shared_prefix,
+        )),
         Compaction::RefusedTooLarge {
             budget_bytes,
             read_bytes,
@@ -450,10 +475,14 @@ fn sealed_outcome(
     manifest: &SessionManifest,
     resealed: bool,
     readiness: &SealReadiness,
+    landing_bytes_read: u64,
+    shared_prefix: bool,
 ) -> Outcome {
     Outcome::Sealed {
         correlations: manifest.counts.correlations,
         landing_objects: manifest.counts.landing_objects,
+        landing_bytes_read,
+        shared_prefix,
         resealed,
         instances_without_eof: match readiness {
             SealReadiness::Quiesced {
@@ -686,6 +715,8 @@ mod tests {
             Outcome::Sealed {
                 correlations: 1,
                 landing_objects: 1,
+                landing_bytes_read: 0,
+                shared_prefix: false,
                 resealed: false,
                 instances_without_eof: Vec::new(),
             },
@@ -999,10 +1030,21 @@ mod tests {
             Outcome::Sealed {
                 correlations,
                 landing_objects,
+                landing_bytes_read,
+                shared_prefix,
                 ..
             } => {
                 assert_eq!(correlations, 1);
                 assert_eq!(landing_objects, 3);
+                // The size the ledger has to report for a recording that
+                // SEALED — three ~4 KiB objects. Without it the pass could
+                // only ever report bytes for recordings it refused, which is
+                // the tail and not the distribution.
+                assert!(
+                    (12_000..14_000).contains(&landing_bytes_read),
+                    "three padded objects, got {landing_bytes_read}"
+                );
+                assert!(!shared_prefix);
             }
             other => panic!("expected a seal, got {other:?}"),
         }

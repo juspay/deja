@@ -1315,7 +1315,7 @@ pub fn compact_session(
     let store = cfg.build()?;
     let rt = runtime()?;
     match rt.block_on(compact_session_inner(&store, session_id, root, None))? {
-        Compaction::Sealed(manifest) => Ok(*manifest),
+        Compaction::Sealed { manifest, .. } => Ok(*manifest),
         // Unreachable: an absent budget refuses nothing. Returned rather than
         // panicked because the caller is a sealer, and a process that aborts
         // is the exact failure this module exists to stop producing.
@@ -1333,10 +1333,26 @@ pub fn compact_session(
 /// the shell inside it, which leaves no line saying which recording did it.
 #[derive(Debug)]
 pub enum Compaction {
-    /// Boxed only to keep the two variants comparable in size: a manifest is
-    /// an order of magnitude larger than a refusal, and this is returned once
-    /// per recording, so the allocation is free and the lint is real.
-    Sealed(Box<SessionManifest>),
+    Sealed {
+        /// Boxed only to keep the two variants comparable in size: a manifest
+        /// is an order of magnitude larger than a refusal, and this is
+        /// returned once per recording, so the allocation is free and the lint
+        /// is real.
+        manifest: Box<SessionManifest>,
+        /// Decompressed bytes this compaction actually held.
+        ///
+        /// Reported on SUCCESS, not only on refusal, because this number is
+        /// what sizes every later decision about this pass — the memory
+        /// budget, and the spill an external merge sort would need. Nobody
+        /// knows the distribution of recording sizes today, and a pass that
+        /// reports bytes only when it refuses can never supply it: the
+        /// recordings that seal ARE the distribution.
+        landing_bytes_read: u64,
+        /// See `RefusedTooLarge::shared_prefix`. Carried here for the same
+        /// reason: without it `landing_bytes_read` for a straddling session
+        /// reads as that recording's size when it is the whole partition's.
+        shared_prefix: bool,
+    },
     /// The decompressed landing passed `budget_bytes` while it was being read.
     ///
     /// The numbers are what was known AT the refusal: `read_bytes` is a lower
@@ -1520,9 +1536,11 @@ async fn compact_session_inner(
     }
 
     let collated = collate(lines.into_iter());
-    Ok(Compaction::Sealed(Box::new(
-        write_seal(store, session_id, collated, landing_objects).await?,
-    )))
+    Ok(Compaction::Sealed {
+        manifest: Box::new(write_seal(store, session_id, collated, landing_objects).await?),
+        landing_bytes_read: read_bytes,
+        shared_prefix: location.shared,
+    })
 }
 
 /// Seal a recording from envelope lines a caller has ALREADY read.
@@ -2787,7 +2805,7 @@ mod tests {
     /// outcome the test should be handling.
     fn sealed(compaction: Compaction) -> SessionManifest {
         match compaction {
-            Compaction::Sealed(manifest) => *manifest,
+            Compaction::Sealed { manifest, .. } => *manifest,
             other => panic!("expected a seal, got {other:?}"),
         }
     }
