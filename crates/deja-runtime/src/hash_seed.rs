@@ -14,10 +14,39 @@
 //! type, records the keys through a boundary, and serves the recorded pair on
 //! replay.
 //!
-//! # One seed per correlation
+//! # One seed per correlation, sampled or not
 //!
 //! Every collection inside one correlation shares one key pair, drawn once and
-//! memoized. The alternative — a per-collection counter, seed+N — is NOT
+//! memoized — for EVERY correlation, recorded or not. A recorded request must
+//! run the hashing regime production runs, or the recording is evidence about
+//! a regime only recorded requests see: an order-dependent behaviour anywhere in
+//! the service would show on the ~2% that is sampled and not on the rest, or
+//! the reverse. So the draw is unconditional, and every correlation draws
+//! through the same boundary. Whether the crossing is WRITTEN is the
+//! recorder's verdict, the one every other boundary already goes through: for
+//! a correlation the sampler skipped it answers no-op before any sequence or
+//! occurrence is allocated, so a sampled-out request's draw leaves nothing on
+//! the tape and nothing in the hook. The seam has no gate of its own.
+//!
+//! Outside record and replay the seam is inert, and structurally so rather
+//! than by a check: the cell lives on `SpanContext`, only
+//! `DejaCorrelationLayer` creates one, and the host installs that layer only
+//! while recording or replaying. A correlation made current by any other
+//! door — `deja_context::enter` alone, say — has no span context, no cell,
+//! and takes the std arm; `a_correlation_entered_without_a_span_is_not_seeded`
+//! is that case, asserted. The memo is a cell on the correlation's SPAN context
+//! (`correlation_layer::SpanContext`): the span that carries the `request_id`
+//! mints it, every span created beneath clones the handle, and the innermost
+//! entered span's handle rides on the thread's span cursor for this module to
+//! read. So the cell lives exactly as long as the request's span tree — a
+//! `spawn_fork` tail holds its `fork_span()`, a child of the request span, so it
+//! holds the cell — and there is no registry, no eviction, and no clock to get
+//! wrong. A correlation entered into deja-context WITHOUT a span
+//! (`deja_context::enter` alone) is deliberately not seeded: per-correlation
+//! state has one home, and a correlation-keyed map beside it is the shape #100
+//! removed.
+//!
+//! The alternative — a per-collection counter, seed+N — is NOT
 //! replayable: hyperswitch polls N connector futures inside a single task
 //! (`join_all`), so a counter advances in network-completion order and a
 //! collection that recorded `k0+3` replays as `k0+7`.
@@ -46,9 +75,8 @@
 //! the only thing that changes versus stock `RandomState` is where the keys come
 //! from.
 
-use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher, RandomState};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use siphasher::sip::SipHasher13;
 
@@ -105,21 +133,20 @@ impl std::fmt::Debug for HashKeys {
     }
 }
 
-/// Per-correlation memo cell.
+/// A correlation's memo cell: the one place its key pair lives.
 ///
-/// `OnceLock` rather than a plain map entry because the draw must happen exactly
-/// once per correlation even when several threads inside the correlation race to
+/// `OnceLock` rather than a plain slot because the draw must happen exactly once
+/// per correlation even when several threads inside the correlation race to
 /// build their first collection: `get_or_init` runs its closure once and blocks
-/// the losers until it returns. A plain check-then-insert would record N events
-/// for N racing threads, and the ordering nondeterminism would be back.
+/// the losers until it returns. A check-then-set would record N events for N
+/// racing threads, and the ordering nondeterminism would be back.
 ///
-/// It is an `Arc` so the global lock is released BEFORE the draw runs. Holding it
-/// across a recording dispatch would serialize every collection construction in
-/// the process behind one boundary write.
-type Cell = Arc<OnceLock<HashKeys>>;
-
-static HASH_KEYS: LazyLock<Mutex<HashMap<String, Cell>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// `Arc` because the cell is shared BY HANDLE, not found by lookup. The span
+/// that owns the correlation mints it and every span beneath clones the handle
+/// (`correlation_layer::on_new_span`), so the cell is reachable from whichever
+/// thread is polling any part of the request and is dropped with the last span
+/// that holds it.
+pub(crate) type HashKeyCell = Arc<OnceLock<HashKeys>>;
 
 /// `BuildHasher` that serves recorded keys inside a correlation and std outside.
 ///
@@ -135,7 +162,9 @@ pub enum DejaRandomState {
 }
 
 impl Default for DejaRandomState {
-    /// Branches on whether a correlation is engaged on this thread.
+    /// Branches on whether a span carrying a correlation is entered on this
+    /// thread — not on whether the request is being recorded. A sampled-out
+    /// request is seeded like a recorded one, so the two run one regime.
     ///
     /// Outside a correlation this must be std EXACTLY — same type, same draw,
     /// same increment — because a process that is not recording should not pay
@@ -239,63 +268,50 @@ impl Hasher for DejaHasher {
 
 /// The correlation's keys, drawing and recording them on first use.
 ///
-/// # The hot path allocates nothing
+/// # The hot path allocates nothing and takes no lock
 ///
 /// This runs on EVERY collection construction in an instrumented process —
 /// `HashMap::new`, `with_capacity`, and every serde-deserialised map — on 100%
-/// of traffic, sampled or not. So the two common answers are both allocation
-/// free: outside a correlation it is one fallible thread-local read; inside an
-/// established one it is that read plus a lock and a lookup by `&str`. Only the
-/// FIRST collection in a correlation allocates, and only to own the map key.
+/// of traffic, sampled or not. Outside a span it is one fallible thread-local
+/// read; inside one it is that read plus an `OnceLock::get`. Only the FIRST
+/// collection in a correlation pays more, and what it pays is the draw itself:
+/// the cell was allocated when the span was created, not here.
 ///
-/// `current_correlation_id()` is deliberately not used here — it clones a
-/// `String` per call, which on this path is an allocation added to traffic that
-/// currently has none.
+/// The draw runs OUTSIDE the cursor read. The cursor stack is a `RefCell`; a
+/// span entered while the read's shared borrow is held — nothing stops the
+/// recording hook from entering one — would `borrow_mut` it on the way in and
+/// panic, inside a collection's `Default::default()`. Cloning the two handles
+/// out and returning first costs one `Arc` clone each, once per correlation.
 fn keys_for_current_correlation() -> Option<HashKeys> {
     enum Step {
-        /// Established correlation, keys already drawn — nothing more to do.
+        /// Keys already drawn — nothing more to do.
         Known(HashKeys),
-        /// First collection in this correlation: draw OUTSIDE the thread-local
-        /// borrow, so the boundary dispatch never runs under it.
-        Draw(String, Cell),
-        /// No correlation, or the context could not be read at all.
-        None,
+        /// First collection in this correlation: the handles, cloned out so the
+        /// draw runs with the cursor released.
+        Draw(Arc<str>, HashKeyCell),
     }
 
-    let step = deja_context::with_current_correlation_id(|correlation| {
-        let Some(correlation) = correlation else {
-            return Step::None;
-        };
-        let cell = cell_for(correlation);
-        match cell.get() {
+    let step =
+        crate::correlation_layer::with_current_hash_keys(|correlation, cell| match cell.get() {
             Some(keys) => Step::Known(*keys),
-            None => Step::Draw(correlation.to_owned(), cell),
-        }
-    });
+            None => Step::Draw(Arc::clone(correlation), Arc::clone(cell)),
+        })?;
 
-    match step {
-        Step::Known(keys) => Some(keys),
-        Step::Draw(correlation, cell) => Some(*cell.get_or_init(|| draw_and_record(&correlation))),
-        Step::None => None,
-    }
-}
-
-/// Get or create this correlation's memo cell, holding the global lock only for
-/// the map operation itself.
-fn cell_for(correlation: &str) -> Cell {
-    let mut memo = HASH_KEYS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(cell) = memo.get(correlation) {
-        return Arc::clone(cell);
-    }
-    let cell: Cell = Arc::new(OnceLock::new());
-    memo.insert(correlation.to_owned(), Arc::clone(&cell));
-    cell
+    Some(match step {
+        Step::Known(keys) => keys,
+        Step::Draw(correlation, cell) => *cell.get_or_init(|| draw_and_record(&correlation)),
+    })
 }
 
 /// Draw a fresh key pair, or serve the recorded one, through a `Substitute`
 /// boundary.
+///
+/// Called for every correlation, sampled in or out. There is deliberately no
+/// \"is this request recorded?\" check here: the recorder's capture verdict
+/// answers that for every boundary, and for a skipped correlation it is a
+/// no-op before a sequence or an occurrence is allocated. A second gate in the
+/// seam would have no observable effect, and an unobservable guarantee is the
+/// kind that later reads as tested when it never was.
 ///
 /// # This boundary FAIL-STOPS on a replay miss, deliberately
 ///
@@ -401,45 +417,19 @@ fn draw_keys() -> HashKeys {
     }
 }
 
-/// Discard the memoized keys for `correlation_id`.
-///
-/// Called from the correlation layer when the span owning the correlation
-/// closes — the same clock, and for the same reason, as
-/// [`crate::clear_fork_counters_for_correlation`]: a span closes after every
-/// task carrying it has finished, and it closes for sampled-out requests too.
-/// Without this the memo grows by one entry per request forever.
-///
-/// Any `Arc` already handed out stays valid; only the map's own reference goes.
-pub(crate) fn clear_hash_keys_for_correlation(correlation_id: Option<&str>) {
-    let Some(correlation_id) = correlation_id else {
-        return;
-    };
-    if let Ok(mut memo) = HASH_KEYS.lock() {
-        memo.remove(correlation_id);
-    }
-}
-
-/// Whether the memo currently holds a cell for `correlation_id`. Tests only:
-/// eviction is otherwise unobservable, and an eviction nobody can see is an
-/// eviction nobody can prove.
-#[cfg(test)]
-pub(crate) fn memo_holds(correlation_id: &str) -> bool {
-    HASH_KEYS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(correlation_id)
-}
-
-/// Install `keys` for `correlation_id` WITHOUT going through the boundary.
+/// Install `keys` in the CURRENT span's cell WITHOUT going through the boundary.
 ///
 /// Tests only, and the reason is the point: a test that probed this seam through
 /// `DejaRandomState::default()` would be asking the constructor to confirm what
 /// the constructor just did, and could not tell a real check from a tautology.
 /// Writing the cell raw lets a test assert on keys it chose.
+///
+/// Returns whether there was an empty cell to write. A test that ignores a
+/// `false` here goes on to assert against a fresh draw.
 #[cfg(test)]
-pub(crate) fn install_keys_for_test(correlation_id: &str, keys: HashKeys) {
-    let cell = cell_for(correlation_id);
-    let _ = cell.set(keys);
+pub(crate) fn install_keys_for_test(keys: HashKeys) -> bool {
+    crate::correlation_layer::with_current_hash_keys(|_, cell| cell.set(keys).is_ok())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -447,10 +437,24 @@ pub(crate) fn install_keys_for_test(correlation_id: &str, keys: HashKeys) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
-    /// Enter `correlation` for the duration of the returned guard.
-    fn in_correlation(correlation: &str) -> deja_context::ContextGuard {
-        deja_context::enter(deja_context::ContextSnapshot::new(correlation))
+    use tracing::Instrument;
+    use tracing_subscriber::prelude::*;
+
+    /// Run `f` with the correlation layer installed on this thread. Every span
+    /// created inside gets a `SpanContext`, which is where a correlation's cell
+    /// lives; a span created outside one is inert and seeds nothing.
+    fn under_the_layer<T>(f: impl FnOnce() -> T) -> T {
+        let subscriber = tracing_subscriber::registry().with(crate::DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, f)
+    }
+
+    /// The ingress span carrying `correlation`, the shape `router_env::root_span`
+    /// mints. Create it under the layer; it can then be entered from ANY thread,
+    /// because a span handle carries its own subscriber.
+    fn request_span(correlation: &str) -> tracing::Span {
+        tracing::info_span!("deja::http_incoming", request_id = %correlation)
     }
 
     /// The keys `DejaRandomState::default()` would install, or `None` if it took
@@ -470,28 +474,44 @@ mod tests {
     /// wire is reproducible.
     #[test]
     fn one_correlation_shares_one_key_pair() {
-        let _guard = in_correlation("corr-shared-pair");
+        under_the_layer(|| {
+            let request = request_span("corr-shared-pair");
+            let _entered = request.enter();
 
-        let first = keys_now().expect("inside a correlation the seeded arm must be taken");
-        let second = keys_now().expect("inside a correlation the seeded arm must be taken");
+            let first = keys_now().expect("inside a correlation the seeded arm must be taken");
+            let second = keys_now().expect("inside a correlation the seeded arm must be taken");
 
-        assert_eq!(
-            first, second,
-            "two collections in ONE correlation must share a key pair — if they \
-             differ, iteration order is per-collection again and the divergence \
-             this seam exists to close is back"
-        );
+            assert_eq!(
+                first, second,
+                "two collections in ONE correlation must share a key pair — if they \
+                 differ, iteration order is per-collection again and the divergence \
+                 this seam exists to close is back"
+            );
+        });
     }
 
-    /// Property 1, across an await point. The memo must not be tied to a
-    /// contiguous stretch of synchronous execution.
-    #[tokio::test]
-    async fn keys_survive_an_await() {
-        let _guard = in_correlation("corr-across-await");
+    /// Property 1 across an await point, with the span entered and exited per
+    /// poll the way `.instrument()` does in production.
+    ///
+    /// The cell must belong to the SPAN, not to an enter: a cell minted in
+    /// `on_enter` would pass the test above and hand every poll a fresh pair.
+    #[test]
+    fn keys_survive_an_await() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
 
-        let before = keys_now().expect("seeded");
-        tokio::task::yield_now().await;
-        let after = keys_now().expect("seeded");
+        let (before, after) = under_the_layer(|| {
+            runtime.block_on(
+                async {
+                    let before = keys_now().expect("seeded");
+                    tokio::task::yield_now().await;
+                    (before, keys_now().expect("seeded"))
+                }
+                .instrument(request_span("corr-across-await")),
+            )
+        });
 
         assert_eq!(
             before, after,
@@ -499,63 +519,105 @@ mod tests {
         );
     }
 
-    /// Property 1, across `tokio::spawn` — its own test, because this is where
-    /// the memo would silently degrade.
+    /// Property 1 across `tokio::spawn` onto ANOTHER THREAD — its own test,
+    /// because this is where a memo would silently degrade.
     ///
-    /// The failure this catches is a THREAD-LOCAL memo: it would pass every test
-    /// above and still hand a spawned task its own key pair, so a response
-    /// assembled partly on a worker thread would iterate two ways. A
-    /// multi-threaded runtime is required or the spawned task may land back on
-    /// the same thread and the bug hides.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn keys_are_shared_across_tokio_spawn() {
-        const CORRELATION: &str = "corr-across-spawn";
-        let _guard = in_correlation(CORRELATION);
+    /// The spawned task enters the request span for the first time on a worker
+    /// thread. Two wrong shapes pass every test above and fail this one: a cell
+    /// kept per thread, and a cell minted per enter. The thread ids are asserted
+    /// distinct so the test cannot pass by the task landing on the spawning
+    /// thread.
+    #[test]
+    fn keys_are_shared_across_tokio_spawn() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
 
-        let on_this_thread = keys_now().expect("seeded");
+        let (here, there) = under_the_layer(|| {
+            runtime.block_on(async {
+                let request = request_span("corr-across-spawn");
+                let here = request.in_scope(|| (std::thread::current().id(), keys_now()));
+                let there = tokio::spawn(
+                    async { (std::thread::current().id(), keys_now()) }.instrument(request.clone()),
+                )
+                .await
+                .expect("spawned task panicked");
+                (here, there)
+            })
+        });
 
-        let on_worker = tokio::spawn(async move {
-            // The spawned task re-enters the SAME correlation; the memo it finds
-            // must be the process-wide one, not a fresh per-thread cell.
-            let _guard = in_correlation(CORRELATION);
-            keys_now()
-        })
-        .await
-        .expect("spawned task panicked")
-        .expect("seeded");
-
-        assert_eq!(
-            on_this_thread, on_worker,
-            "a spawned task in the same correlation must reuse the memoized keys \
-             — a thread-local memo would draw again here and reintroduce the \
-             per-collection ordering this seam removes"
+        assert_ne!(
+            here.0, there.0,
+            "precondition: the task must be polled on a worker thread, or this \
+             cannot tell a per-thread cell from a shared one"
         );
+        assert_eq!(
+            here.1.expect("seeded"),
+            there.1.expect("seeded on the worker"),
+            "a spawned task in the same correlation must reuse the memoized keys \
+             — a per-thread or per-enter cell would draw again here and \
+             reintroduce the per-collection ordering this seam removes"
+        );
+    }
+
+    /// Every span beneath the owner reads the owner's cell: a plain child, and a
+    /// child that re-stamps the SAME `request_id`. An inner span carrying the
+    /// field again is one request, not two; minting fresh on every stamped span
+    /// would give one correlation two pairs and two `hash_seed` events.
+    #[test]
+    fn descendant_spans_share_the_owners_cell() {
+        const CORRELATION: &str = "corr-descendants";
+        under_the_layer(|| {
+            let request = request_span(CORRELATION);
+            let _entered = request.enter();
+            let owner = keys_now().expect("seeded");
+
+            let child = tracing::info_span!("child");
+            assert_eq!(
+                child
+                    .in_scope(keys_now)
+                    .expect("a child inherits the correlation"),
+                owner,
+                "a child span must read its parent's cell, not a fresh one"
+            );
+
+            let restamped = tracing::info_span!("inner", request_id = %CORRELATION);
+            assert_eq!(
+                restamped.in_scope(keys_now).expect("seeded"),
+                owner,
+                "a span re-stamping the same request_id is the same request and \
+                 must not draw a second pair"
+            );
+        });
     }
 
     /// Property 2. Two correlations must NOT share keys.
     ///
-    /// Both sides go through the real draw path rather than an installed pair,
-    /// because the implementation this is guarding against is a fixed constant
-    /// seed — which would satisfy property 1 perfectly and is a far worse
-    /// regression than dropping std's per-draw increment. A test that installed
-    /// its own keys would bless it.
+    /// Both sides go through the real draw rather than an installed pair,
+    /// because the shape this guards against is ONE cell for everyone — a
+    /// `static OnceLock`, or a single cell cloned into every owner — which
+    /// satisfies property 1 perfectly and is a constant seed for the life of the
+    /// process, a far worse regression than dropping std's per-draw increment.
+    /// A test that installed its own keys would bless it.
     #[test]
     fn two_correlations_get_different_keys() {
-        let first = {
-            let _guard = in_correlation("corr-distinct-a");
-            keys_now().expect("seeded")
-        };
-        let second = {
-            let _guard = in_correlation("corr-distinct-b");
-            keys_now().expect("seeded")
-        };
+        under_the_layer(|| {
+            let first = request_span("corr-distinct-a")
+                .in_scope(keys_now)
+                .expect("seeded");
+            let second = request_span("corr-distinct-b")
+                .in_scope(keys_now)
+                .expect("seeded");
 
-        assert_ne!(
-            first, second,
-            "two correlations sharing a key pair means the seed is effectively a \
-             constant, which hands every request the same iteration order and is \
-             a worse regression than the one this seam accepts within a request"
-        );
+            assert_ne!(
+                first, second,
+                "two correlations sharing a key pair means the seed is effectively a \
+                 constant, which hands every request the same iteration order and is \
+                 a worse regression than the one this seam accepts within a request"
+            );
+        });
     }
 
     /// Property 3. Outside a correlation, std runs verbatim — including the
@@ -566,7 +628,7 @@ mod tests {
     /// property 3 alone passes if nothing is.
     #[test]
     fn outside_a_correlation_std_runs_verbatim() {
-        // No guard: no correlation on this thread.
+        // No span: no correlation on this thread.
         let first = DejaRandomState::default();
         let second = DejaRandomState::default();
 
@@ -591,23 +653,108 @@ mod tests {
         );
     }
 
-    /// The memo feeds the hasher. Probed with a pair chosen HERE and written
-    /// straight into the cell, so a fresh draw cannot pass by coincidence.
+    /// A correlation entered into deja-context WITHOUT a span is not seeded.
+    ///
+    /// Per-correlation state lives on the span, and only there. A
+    /// correlation-keyed registry beside it is the shape #100 removed: it needed
+    /// its own eviction clock and got it wrong for every path that carried a
+    /// correlation past the response. A bare `deja_context::enter` has no span
+    /// to hold a cell, so the std arm is the right answer, not a fresh draw.
+    #[test]
+    fn a_correlation_entered_without_a_span_is_not_seeded() {
+        let _guard = deja_context::enter(deja_context::ContextSnapshot::new("corr-no-span"));
+
+        assert!(
+            matches!(DejaRandomState::default(), DejaRandomState::Std(_)),
+            "a correlation with no span has nowhere to keep a key pair; seeding it \
+             means a second, correlation-keyed home for per-correlation state"
+        );
+    }
+
+    /// A request the ingress sampled OUT is seeded like a recorded one.
+    ///
+    /// Recorded and unrecorded traffic must run ONE hashing regime, or a
+    /// recording is evidence about a regime only recorded requests see. The
+    /// sampler's decision gates the EVENT, not the seed — the integration test
+    /// in `hash_seed_one_event_per_correlation.rs` asserts the "no event" half.
+    /// The span path is asserted first so the test cannot pass by the span
+    /// never having been live under the layer.
+    #[test]
+    fn a_sampled_out_request_is_seeded() {
+        const CORRELATION: &str = "corr-sampled-out";
+        deja_context::set_recording_decision(CORRELATION, deja_context::RecordDecision::Skip);
+        let (path, seeded) = under_the_layer(|| {
+            request_span(CORRELATION).in_scope(|| (crate::current_span_path(), keys_now()))
+        });
+        deja_context::clear_recording_decision(CORRELATION);
+
+        assert_eq!(
+            path.as_deref(),
+            Some("deja::http_incoming"),
+            "precondition: the request span must be live under the layer"
+        );
+        assert!(
+            seeded.is_some(),
+            "a sampled-out request must be seeded — on the std arm it would run a \
+             different hashing regime from the requests that are recorded, and \
+             the recording would stop being a witness of production"
+        );
+    }
+
+    /// A nested span carrying a DIFFERENT `request_id` mints its own cell, and
+    /// the parent's is untouched when it is left.
+    ///
+    /// This is the seam between "inherits" and "mints", and the one a later
+    /// refactor of `on_new_span`'s match gets wrong: collapse the re-stamp arm
+    /// into "always inherit" and a second request nested under a first would
+    /// silently share its pair — and its `hash_seed` event.
+    #[test]
+    fn a_nested_span_with_a_different_request_id_mints_its_own_cell() {
+        under_the_layer(|| {
+            let outer = request_span("corr-nested-outer");
+            let _entered = outer.enter();
+            let outer_keys = keys_now().expect("seeded");
+
+            let inner = tracing::info_span!("inner", request_id = "corr-nested-inner");
+            let inner_keys = inner.in_scope(keys_now).expect("seeded");
+            assert_ne!(
+                inner_keys, outer_keys,
+                "a different request_id is a different correlation and must draw \
+                 its own pair"
+            );
+
+            assert_eq!(
+                keys_now().expect("seeded"),
+                outer_keys,
+                "leaving the inner span must restore the outer correlation's pair"
+            );
+        });
+    }
+
+    /// The cell feeds the hasher. Probed with a pair chosen HERE and written
+    /// straight into the current span's cell, so a fresh draw cannot pass by
+    /// coincidence.
     #[test]
     fn the_installed_pair_is_the_pair_the_hasher_uses() {
-        const CORRELATION: &str = "corr-installed-pair";
         let chosen = HashKeys {
             k0: 0x0123_4567_89AB_CDEF,
             k1: 0xFEDC_BA98_7654_3210,
         };
-        install_keys_for_test(CORRELATION, chosen);
+        under_the_layer(|| {
+            let request = request_span("corr-installed-pair");
+            let _entered = request.enter();
 
-        let _guard = in_correlation(CORRELATION);
-        assert_eq!(
-            keys_now().expect("seeded"),
-            chosen,
-            "the correlation's memoized pair must be served verbatim"
-        );
+            assert!(
+                install_keys_for_test(chosen),
+                "precondition: the span must hold an empty cell to write, or the \
+                 assertion below is against a fresh draw"
+            );
+            assert_eq!(
+                keys_now().expect("seeded"),
+                chosen,
+                "the correlation's memoized pair must be served verbatim"
+            );
+        });
     }
 
     /// A recorded image is rebuilt into the pair it holds, and a malformed one
@@ -635,29 +782,6 @@ mod tests {
         );
     }
 
-    /// The memo is evicted when the correlation's span closes, or it grows by one
-    /// entry per request for the life of the process.
-    #[test]
-    fn eviction_forgets_the_correlation() {
-        const CORRELATION: &str = "corr-evicted";
-        {
-            let _guard = in_correlation(CORRELATION);
-            let _ = keys_now();
-        }
-        assert!(
-            memo_holds(CORRELATION),
-            "precondition: the draw must have populated the memo, or the eviction \
-             assertion below would pass against an empty map"
-        );
-
-        clear_hash_keys_for_correlation(Some(CORRELATION));
-
-        assert!(
-            !memo_holds(CORRELATION),
-            "a closed correlation must leave nothing behind"
-        );
-    }
-
     /// `Debug` must not print the keys.
     #[test]
     fn debug_masks_the_keys() {
@@ -682,16 +806,18 @@ mod tests {
     /// take the process down.
     ///
     /// This is the hardest rule deja has: recording never fails the service. The
-    /// context cell holds a `String`, so it HAS a destructor, and `LocalKey::with`
+    /// span cursor stack is a thread-local with a destructor, and `LocalKey::with`
     /// panics once that has run — a panic inside a `Drop` during teardown is a
     /// double panic and an abort, which no `catch_unwind` can contain.
     ///
     /// The ordering is deliberate. TLS destructors run in reverse registration
-    /// order, so the bomb is registered FIRST and the context cell SECOND; the
-    /// context is therefore destroyed while the bomb still has to run. Swap
-    /// `try_with` back to `with` in `deja_context` and this test aborts the whole
-    /// test binary rather than failing — which is precisely the production
-    /// failure it stands for.
+    /// order, so the bomb is registered FIRST and the cursor stack SECOND; the
+    /// stack is therefore destroyed while the bomb still has to run. Swap
+    /// `try_with` back to `with` in `with_current_cursor` and this test aborts
+    /// the whole test binary rather than failing — which is precisely the
+    /// production failure it stands for. `correlation_layer` has the same test
+    /// against the door itself; this one reaches it the way production does,
+    /// through `Default::default()`.
     #[test]
     fn a_collection_built_during_tls_teardown_does_not_abort() {
         struct BuildsAMapWhileDying;
@@ -711,110 +837,86 @@ mod tests {
         std::thread::spawn(|| {
             // Register the bomb first so it is dropped LAST...
             BOMB.with(|_| {});
-            // ...and the context cell second, so it is already gone by then.
-            let _guard = in_correlation("corr-tls-teardown");
-            let _ = keys_now();
+            // ...and the cursor stack second, so it is already gone by then.
+            under_the_layer(|| {
+                let request = request_span("corr-tls-teardown");
+                let _entered = request.enter();
+                let _ = keys_now();
+            });
         })
         .join()
         .expect("the thread must exit cleanly; a panic in a TLS destructor aborts");
     }
 
-    /// A `spawn_fork` tail reuses its request's key pair, and the memo is still
-    /// there when it runs.
+    /// A `spawn_fork` tail reuses its request's key pair.
     ///
     /// `spawn_fork` is the one detached path here that carries a correlation by
     /// CONTEXT SNAPSHOT rather than by a held span handle — `capture_current()` +
     /// `scope_snapshot`, instrumented with a fresh `fork_span()` rather than
-    /// `in_current_span()`. That made it the candidate for a real defect: if the
-    /// request's span could close before the tail ran, eviction would fire, the
-    /// tail would draw again, and one correlation would end up with two key pairs
-    /// and two `hash_seed` events.
-    ///
-    /// It does not happen, and the assertion below records WHY rather than just
-    /// that: `fork_span()` is created while the request span is current, so it is
-    /// that span's CHILD, and tracing's registry keeps a parent open until its
-    /// children close. The request span therefore cannot close while the tail is
-    /// outstanding — the same structural protection `.in_current_span()` gives,
-    /// reached by a different route. This test is the lock on that property; if a
-    /// future change makes the fork span parentless, this fails rather than the
-    /// tape quietly gaining a second event.
+    /// `in_current_span()`. With the cell on the span, the question is whether
+    /// that fork span holds it: it does, because `fork_span()` is created while
+    /// the request span is current and is therefore that span's CHILD, so
+    /// `on_new_span` hands it the parent's handle. If a future change makes the
+    /// fork span parentless, the tail takes the std arm and this fails, rather
+    /// than the tape quietly gaining a second `hash_seed` event.
     ///
     /// Current-thread runtime and a thread-local subscriber, so the tail is polled
-    /// on this thread and `on_close` can actually run — the ordering
+    /// on this thread after the request span's guard is gone — the ordering
     /// `fork_retains_request_context.rs` pins for the same reason.
     #[test]
     fn a_spawn_fork_tail_reuses_the_requests_keys() {
-        use tracing_subscriber::prelude::*;
-
         const CORRELATION: &str = "corr-fork-tail";
         let tail_saw: Arc<Mutex<Option<HashKeys>>> = Arc::new(Mutex::new(None));
-        let memo_held_when_tail_ran: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let tail_ran_under: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current-thread runtime");
 
-        let subscriber = tracing_subscriber::registry().with(crate::DejaCorrelationLayer::new());
-        let request_keys = tracing::subscriber::with_default(subscriber, || {
+        let request_keys = under_the_layer(|| {
             runtime.block_on(async {
                 let request_keys = {
-                    let request = tracing::info_span!(
-                        "deja::http_incoming",
-                        request_id = %CORRELATION
-                    );
+                    let request = request_span(CORRELATION);
                     let _entered = request.enter();
 
                     let drawn = keys_now().expect("the request itself must be seeded");
 
                     let saw = Arc::clone(&tail_saw);
-                    let held = Arc::clone(&memo_held_when_tail_ran);
+                    let under = Arc::clone(&tail_ran_under);
                     crate::spawn_fork(async move {
-                        // Record whether the memo was STILL populated at the
-                        // moment the tail ran. That is the fact that decides
-                        // which mechanism is protecting us.
-                        *held.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(memo_holds(CORRELATION));
+                        *under.lock().unwrap_or_else(|p| p.into_inner()) =
+                            crate::current_span_path();
                         *saw.lock().unwrap_or_else(|p| p.into_inner()) = keys_now();
                     });
 
                     drawn
                 };
-                // The request span is dropped; let teardown win the race before
-                // the tail is polled, which is what makes this a defect and not
-                // a theory.
+                // The request span's guard is dropped; let the tail be polled
+                // only after that, which is what makes this a real question.
                 tokio::task::yield_now().await;
                 tokio::task::yield_now().await;
                 request_keys
             })
         });
 
-        // VACUITY GUARD. Eviction must be live in this setup, or "the tail
-        // matched" would prove nothing — it could just mean nothing is ever
-        // cleared. The span has closed by now, so the memo must be gone.
-        assert!(
-            !memo_holds(CORRELATION),
-            "precondition: the request span must CLOSE and evict once the tail is \
-             done, or this setup cannot tell a reused pair from a memo that is \
-             simply never cleared"
-        );
-
-        let held = memo_held_when_tail_ran
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .expect("the tail must have run");
-        assert!(
-            held,
-            "the memo must still be populated when the tail runs — that is the \
-             span-lifetime guarantee this seam leans on. If this flips to false, \
-             `fork_span()` has stopped being a child of the request span, and the \
-             tail is now drawing its own pair"
+        // VACUITY GUARD. The tail must have run under its OWN fork span, as a
+        // child of the request span — the path says both. Polled under the
+        // request span's enter instead, "the tail matched" would prove nothing.
+        assert_eq!(
+            tail_ran_under
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_deref(),
+            Some("deja::http_incoming>deja.fork"),
+            "precondition: the tail must run under a fork span that is a child of \
+             the request span"
         );
 
         let tail_keys = tail_saw
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .expect("the tail must have run and been inside the correlation");
+            .expect("the tail must have run and taken the seeded arm");
 
         assert_eq!(
             tail_keys, request_keys,

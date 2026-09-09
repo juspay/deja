@@ -175,11 +175,8 @@ pub fn current_correlation_id() -> Option<String> {
 /// Read the current thread-visible correlation ID **without cloning it**.
 ///
 /// [`current_correlation_id`] allocates on every call, which is the right price
-/// for a caller that keeps the id. It is the wrong price for a caller on a hot
-/// path that only needs to know whether a correlation is engaged: the hash-seed
-/// `BuildHasher` runs on every `HashMap::new()` in an instrumented service, and
-/// a `String` allocation there would be paid by the overwhelming majority of
-/// constructions that are outside any correlation and answer `None`.
+/// for a caller that keeps the id and the wrong one for a caller that only needs
+/// to look at it.
 ///
 /// # This CANNOT panic, and that is the point
 ///
