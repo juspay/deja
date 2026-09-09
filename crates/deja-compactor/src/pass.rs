@@ -75,6 +75,9 @@ pub enum Outcome {
         read_bytes: u64,
         objects_read: usize,
         objects_total: usize,
+        /// False means the bytes are this recording's. True means they are the
+        /// whole shared partition parent's, and this recording may be small.
+        shared_prefix: bool,
     },
     /// A clean failure — the store, the layout, or the recording's contents. A
     /// DROP, and the message is the whole point of the row.
@@ -151,12 +154,25 @@ impl std::fmt::Display for Row {
                 read_bytes,
                 objects_read,
                 objects_total,
-            } => write!(
-                f,
-                "DROPPED too_large — {read_bytes} decompressed byte(s) past a {budget_bytes} byte \
-                 budget at object {objects_read} of {objects_total}; nothing was written and it \
-                 will not seal in this container until compaction stops holding the whole landing"
-            ),
+                shared_prefix,
+            } => {
+                write!(
+                    f,
+                    "DROPPED too_large — {read_bytes} decompressed byte(s) past a {budget_bytes} \
+                     byte budget at object {objects_read} of {objects_total}; nothing was written \
+                     and it will not seal in this container until compaction stops holding the \
+                     whole landing"
+                )?;
+                if *shared_prefix {
+                    write!(
+                        f,
+                        ". Those objects are a SHARED partition parent's, not this recording's — \
+                         it spans more than one date partition, so the bytes above include every \
+                         other session under the root and say nothing about how large this one is"
+                    )?;
+                }
+                Ok(())
+            }
             Outcome::Failed { error } => write!(f, "DROPPED failed — {error}"),
         }
     }
@@ -419,11 +435,13 @@ async fn seal_outcome_in(
             read_bytes,
             objects_read,
             objects_total,
+            shared_prefix,
         } => Ok(Outcome::TooLarge {
             budget_bytes,
             read_bytes,
             objects_read,
             objects_total,
+            shared_prefix,
         }),
     }
 }
@@ -644,6 +662,13 @@ mod tests {
 
     fn land(store: &DynStore, session: &str, object: usize, lines: &[String]) {
         let key = format!("{ROOT}/session={session}/inst=i1/part-{object}.json");
+        block(crate::put(store, &key, lines.join("\n").into_bytes())).unwrap();
+    }
+
+    /// Land under a DATE partition, the layout the deployed Vector aggregator
+    /// actually writes. A session under two of them is addressed at the root.
+    fn land_dated(store: &DynStore, date: &str, session: &str, object: usize, lines: &[String]) {
+        let key = format!("{ROOT}/dt={date}/session={session}/inst=i1/part-{object}.json");
         block(crate::put(store, &key, lines.join("\n").into_bytes())).unwrap();
     }
 
@@ -937,11 +962,13 @@ mod tests {
                 read_bytes,
                 objects_read,
                 objects_total,
+                shared_prefix,
             } => {
                 assert_eq!(budget_bytes, 6000);
                 assert!(read_bytes > 6000, "refused on the object that passed it");
                 assert_eq!(objects_read, 2);
                 assert_eq!(objects_total, 3);
+                assert!(!shared_prefix, "one session, one prefix");
             }
             other => panic!("expected a size refusal, got {other:?}"),
         }
@@ -980,6 +1007,62 @@ mod tests {
             other => panic!("expected a seal, got {other:?}"),
         }
         assert!(block(crate::manifest_of(&store, "big")).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_refusal_says_when_the_bytes_are_not_this_recordings() {
+        // A session that ran across midnight lands under two date partitions
+        // and is addressed at their PARENT, so compaction reads every other
+        // session under the root as well. Without the flag, its refusal reads
+        // as "this recording is enormous" when it is two small objects, and
+        // the wrong recording gets investigated.
+        let store = store();
+        land_dated(
+            &store,
+            "2026-09-08",
+            "straddle",
+            0,
+            &[envelope("straddle", 1, 0)],
+        );
+        land_dated(
+            &store,
+            "2026-09-09",
+            "straddle",
+            1,
+            &[envelope("straddle", 2, 0)],
+        );
+        for object in 0..3 {
+            land_dated(
+                &store,
+                "2026-09-09",
+                "neighbour",
+                object,
+                &[envelope("neighbour", object as u64, 4000)],
+            );
+        }
+
+        let row = block(seal_one_in(&store, "sys", "straddle", ROOT, 0, Some(6000)));
+        match &row.outcome {
+            Outcome::TooLarge {
+                shared_prefix,
+                objects_total,
+                ..
+            } => {
+                assert!(
+                    shared_prefix,
+                    "the bytes belong to the whole partition parent"
+                );
+                assert_eq!(
+                    *objects_total, 5,
+                    "and the object count is the root's, not this recording's two"
+                );
+            }
+            other => panic!("expected a size refusal, got {other:?}"),
+        }
+        assert!(
+            format!("{row}").contains("SHARED partition parent"),
+            "the human line has to carry it too, or the JSON is the only place it is said: {row}"
+        );
     }
 
     // -- extract ---------------------------------------------------------------

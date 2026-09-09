@@ -1347,6 +1347,14 @@ pub enum Compaction {
         read_bytes: u64,
         objects_read: usize,
         objects_total: usize,
+        /// Whether the bytes read belong to this recording ALONE.
+        ///
+        /// False is the ordinary case. True means the landing was addressed at
+        /// a shared partition parent, so the objects counted here include every
+        /// other session under it — the refusal is then about the prefix, not
+        /// about this recording, and reading it as this recording's size would
+        /// overstate it by however much its neighbours weigh.
+        shared_prefix: bool,
     },
 }
 
@@ -1494,6 +1502,7 @@ async fn compact_session_inner(
                 read_bytes,
                 objects_read: read + 1,
                 objects_total: keys.len(),
+                shared_prefix: location.shared,
             });
         }
     }
