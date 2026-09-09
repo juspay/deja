@@ -486,6 +486,20 @@ export type AvailableRecording = {
    *  reproduced by hand, NOT so a caller has to supply it. Bucket-relative: a
    *  `s3_source.path` needs `bucket/` in front of it. */
   prefix: string;
+  /** Whether the compactor has sealed this session. */
+  sealed?: boolean;
+  /** Correlations the seal counted — test cases in the recording.
+   *
+   *  NULL WHEN UNSEALED, and that is not zero. "Not counted yet" and "counted,
+   *  and there are none" are different answers, and a client that renders the
+   *  first as `0` tells a reader a live recording is worthless. Render null as
+   *  unknown. */
+  correlations?: number | null;
+  /** Boundary events the seal counted. Null when unsealed, same rule. */
+  events?: number | null;
+  /** Capture gaps the seal found — `global_sequence` ranges the recorder
+   *  allocated and the tape never received. Null when unsealed. */
+  gaps?: number | null;
 };
 
 export type AvailableRecordingsPage = {
