@@ -26,6 +26,28 @@ function CoverageBadges({ r }: { r: RecordingRow }) {
   );
 }
 
+/* The same coverage statement for a recording that has NOT been pulled.
+   Until the seal existed this cell could only say "—", because the manifest
+   above is read from the catalog and the catalog holds only what some previous
+   replay ingested. The seal knows the same facts without an ingest, so a
+   recording in the bucket can now say whether it is replay-grade.
+
+   `gaps == null` on a sealed row is treated as UNKNOWN, not as zero: claiming
+   "0 gaps" from a field that never arrived would be the one badge a reader
+   most needs to trust. */
+function SealBadges({ r }: { r: AvailableRecording }) {
+  if (!r.sealed) return <span className="chip">unsealed</span>;
+  if (r.gaps == null) return <span className="chip pass">sealed</span>;
+  return (
+    <>
+      <span className="chip pass">sealed</span>{" "}
+      <span className={`chip ${r.gaps === 0 ? "pass" : "fail"}`}>
+        {r.gaps === 0 ? "0 gaps" : `${r.gaps} gaps`}
+      </span>
+    </>
+  );
+}
+
 function Span({ dates }: { dates: string[] }) {
   const span = spanOf(dates);
   return (
@@ -214,14 +236,23 @@ export default function RecordingsPage() {
                     </span>
                   </td>
                   <td className="num">{r.objects.toLocaleString()}</td>
-                  {/* Unknown until ingest, and left unknown rather than
-                      approximated from the object count. */}
-                  <td className="num">{cat?.correlation_count?.toLocaleString() ?? "—"}</td>
-                  <td className="num">{cat?.event_count?.toLocaleString() ?? "—"}</td>
+                  {/* The catalog answers first because a pulled recording has
+                      been counted event by event. Failing that the SEAL
+                      answers, which it can do for anything sealed and costs no
+                      ingest. Only when neither knows is this unknown — and it
+                      stays a dash rather than being approximated from the
+                      object count, which is not proportional to either number.
+                      `??` and not `||`: a genuine zero is an answer. */}
+                  <td className="num">
+                    {(cat?.correlation_count ?? r.correlations)?.toLocaleString() ?? "—"}
+                  </td>
+                  <td className="num">
+                    {(cat?.event_count ?? r.events)?.toLocaleString() ?? "—"}
+                  </td>
                   <td className="num">
                     {cat?.byte_size ? `${(cat.byte_size / 1048576).toFixed(0)} MB` : "—"}
                   </td>
-                  <td>{cat ? <CoverageBadges r={cat} /> : <span className="recdash">—</span>}</td>
+                  <td>{cat ? <CoverageBadges r={cat} /> : <SealBadges r={r} />}</td>
                   <td>
                     <Identity rec={r} />
                   </td>
