@@ -1062,12 +1062,14 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_says_when_the_bytes_are_not_this_recordings() {
-        // A session that ran across midnight lands under two date partitions
-        // and is addressed at their PARENT, so compaction reads every other
-        // session under the root as well. Without the flag, its refusal reads
-        // as "this recording is enormous" when it is two small objects, and
-        // the wrong recording gets investigated.
+    fn a_session_across_midnight_is_not_charged_for_its_neighbours() {
+        // This exact fixture used to produce a `too_large` DROP. A session
+        // under two date partitions was addressed at their PARENT, so
+        // compaction listed and decompressed every other session that landed
+        // in that window and refused on bytes that were never its own —
+        // 32,519 objects for a two-object recording, in sandbox.
+        //
+        // Addressing each partition separately makes it what it always was.
         let store = store();
         land_dated(
             &store,
@@ -1083,6 +1085,9 @@ mod tests {
             1,
             &[envelope("straddle", 2, 0)],
         );
+        // Large enough that reading the parent passes the budget, and it sorts
+        // BETWEEN the two partitions, so a root-addressed read reaches it
+        // before it finishes the session.
         for object in 0..3 {
             land_dated(
                 &store,
@@ -1095,26 +1100,27 @@ mod tests {
 
         let row = block(seal_one_in(&store, "sys", "straddle", ROOT, 0, Some(6000)));
         match &row.outcome {
-            Outcome::TooLarge {
+            Outcome::Sealed {
+                landing_objects,
+                landing_bytes_read,
                 shared_prefix,
-                objects_total,
                 ..
             } => {
-                assert!(
-                    shared_prefix,
-                    "the bytes belong to the whole partition parent"
-                );
                 assert_eq!(
-                    *objects_total, 5,
-                    "and the object count is the root's, not this recording's two"
+                    *landing_objects, 2,
+                    "its own two objects, not the partition parent's five"
+                );
+                assert!(
+                    !shared_prefix,
+                    "a per-partition prefix names the session, so nothing else is under it"
+                );
+                assert!(
+                    *landing_bytes_read < 6000,
+                    "read {landing_bytes_read} bytes; the neighbour was never fetched"
                 );
             }
-            other => panic!("expected a size refusal, got {other:?}"),
+            other => panic!("expected a seal, got {other:?}"),
         }
-        assert!(
-            format!("{row}").contains("SHARED partition parent"),
-            "the human line has to carry it too, or the JSON is the only place it is said: {row}"
-        );
     }
 
     // -- extract ---------------------------------------------------------------
