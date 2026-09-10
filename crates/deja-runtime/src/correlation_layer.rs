@@ -191,8 +191,35 @@ fn pop_span_cursor(span_id: u64) {
 /// Read the innermost entered span's cursor. The only read path, and it hands out
 /// no value when no span is entered — a caller cannot take a path or a bucket
 /// without that question having been answered.
+///
+/// Fallible on both accesses, and neither is defensive padding.
+///
+/// `try_with` because a thread-local is DESTROYED during thread teardown, and a
+/// plain `with` panics once it is. This reader runs from arbitrary code — any
+/// boundary crossing, including one reached from a destructor — so a thread
+/// unwinding through a boundary would panic here, inside a drop, and a panic in a
+/// destructor aborts the process rather than failing the request. Recording must
+/// never take the service down.
+///
+/// `try_borrow` because a plain `borrow` panics on a cell that is merely BUSY.
+/// Today both writers hold their mutable borrow for a single statement and neither
+/// can re-enter this reader inside it, so this arm is not reachable on the current
+/// shape — it is the guard against a writer that later holds the borrow across a
+/// call, which would turn a busy cell into a panic rather than a `None`.
+///
+/// `None` is the honest answer to both. A destroyed cell and a busy cell both mean
+/// this thread has no cursor to hand out, which is the same thing an empty stack
+/// means, and every caller already handles it.
 fn with_current_cursor<T>(read: impl FnOnce(&SpanCursor) -> T) -> Option<T> {
-    ENTERED_SPANS.with(|stack| stack.borrow().last().map(read))
+    ENTERED_SPANS
+        .try_with(|stack| {
+            stack
+                .try_borrow()
+                .ok()
+                .and_then(|stack| stack.last().map(read))
+        })
+        .ok()
+        .flatten()
 }
 
 /// Enter `target` into deja-context only when it differs from what this layer last
