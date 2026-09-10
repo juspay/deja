@@ -50,6 +50,13 @@ pub fn runtime_mode_is_disabled() -> bool {
     deja_runtime::runtime_mode().is_disabled()
 }
 
+/// Explicit, per-collection hash seeding: draw a `BuildHasher` whose keys are
+/// recorded and replayed, so a `HashMap`/`HashSet` iterates the same way on
+/// replay as it did when recorded. There is deliberately no `Default` — a
+/// collection cannot become seeded by accident.
+pub use deja_runtime::hash_seed::{
+    hash_seed, DejaBuildHasher, DejaHasher, HashKeys, SeededHashMap, SeededHashSet,
+};
 /// Row identity is read from the schema that owns it, never listed here: the
 /// statement, the registry it feeds, and the lookup consumers use.
 pub use deja_runtime::replay::{
