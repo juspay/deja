@@ -412,7 +412,7 @@ pub(crate) fn build_with_inconclusive(
             // novel. Mirrors the scorecard's `InconclusiveTailGap`.
             ("inconclusive_tail_gap", false)
         } else if obs.absorbed {
-            // A novel call the process survived on a declared `on_miss` value.
+            // A novel call the process survived on a synthesized value.
             // Named apart from the unabsorbed novel calls and charged to
             // nothing, as the scorecard's `NovelCallAbsorbed` is.
             ("novel_absorbed", false)
@@ -921,6 +921,7 @@ mod tests {
             span_path: Some("root>handler".to_owned()),
             graph_node_id: Some(42),
             synthesized: false,
+            outcome: deja::SubstituteOutcome::default(),
             real_impl_will_fail: false,
             recorded_result: None,
             observed_result: None,

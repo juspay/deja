@@ -715,6 +715,48 @@ pub struct ExecuteShadowToken {
     observed: crate::replay::ObservedCall,
 }
 
+/// A resolved-but-unemitted `Substitute` lookup, carried across the seam's
+/// decision. The lookup twin of [`ExecuteShadowToken`].
+///
+/// The Substitute path used to emit its observation inside the lookup, before
+/// the seam had decided anything, which is why the miss policy had to be
+/// DECLARED on the query and carried forward — the outcome was not yet
+/// knowable. Deferring the emission the way the execute path always has makes
+/// the outcome observable instead.
+///
+/// Deferral is safe here specifically because the seam owns the fail-stop: a
+/// [`Reconstructed::NoValue`] or [`Reconstructed::Failed`] causes the SEAM to
+/// emit and then panic, in that order. Nothing relies on an emission surviving
+/// an unwind, so this needs no `Drop` guard.
+pub struct SubstituteToken {
+    observed: crate::replay::ObservedCall,
+}
+
+impl SubstituteToken {
+    /// Build a token from a resolved [`ObservedCall`](crate::replay::ObservedCall)
+    /// whose outcome fields are not yet stamped.
+    pub fn new(observed: crate::replay::ObservedCall) -> Self {
+        Self { observed }
+    }
+
+    /// Consume the token, stamping what the seam ACTUALLY did, and return the
+    /// completed observation ready to emit.
+    pub fn into_observed(mut self, outcome: SubstituteOutcome) -> crate::replay::ObservedCall {
+        self.observed.stamp_outcome(outcome);
+        self.observed
+    }
+}
+
+/// Result of [`DejaHook::substitute_peek`]: the recorded value if the lookup
+/// hit, plus the observation still waiting on the seam's decision.
+pub struct SubstitutePeek {
+    /// The recorded baseline, `None` on a miss.
+    pub recorded: Option<serde_json::Value>,
+    /// The pending observation, or `None` when the hook does not implement the
+    /// two-phase lifecycle and has already emitted eagerly.
+    pub token: Option<SubstituteToken>,
+}
+
 impl ExecuteShadowToken {
     /// Build a token from a pre-resolved [`ObservedCall`]. The call should carry
     /// `provenance = Provenance::Shadow`, the resolved `recorded_result`
@@ -823,14 +865,6 @@ where
 /// Hooks that opt into context-aware replay implement
 /// [`DejaHook::try_replay_with_context`].
 pub struct ReplayLookup<'a> {
-    /// What this boundary does when the lookup MISSES.
-    ///
-    /// Carried on the query rather than derived later because it is only knowable
-    /// here: the observation is written by the hook BEFORE the seam reaches its
-    /// miss branch, so nothing downstream can tell a miss the process absorbed
-    /// from one that killed the request. Both leave `resolved: false` and
-    /// `Provenance::Recorded`. See [`MissPolicy`].
-    pub miss_policy: MissPolicy,
     /// Boundary tag (e.g. `"storage"`, `"redis"`, `"http_client"`).
     pub boundary: &'a str,
     /// Trait name at the boundary.
@@ -845,29 +879,34 @@ pub struct ReplayLookup<'a> {
     pub caller_location: Option<&'a std::panic::Location<'a>>,
 }
 
-/// What a `Substitute` boundary does when its replay lookup MISSES.
+/// How a `Substitute` lookup actually ended — the OBSERVED outcome, decided by
+/// the site's reconstruct closure and stamped onto the observation afterwards.
 ///
-/// This is a property of the DECLARATION, not of the call: a boundary either has
-/// a caller with an honest degraded path (and declares `on_miss`, so a miss is
-/// absorbed and the request continues) or it does not (and a miss stops the
-/// request). It rides the [`ReplayLookup`] so the emitted observation can say
-/// which of the two happened.
-///
-/// Why it has to be carried rather than worked out afterwards: the miss is
-/// recorded before the seam decides. A run whose absorbed misses are
-/// indistinguishable from its fatal ones gets quieter and less trustworthy at the
-/// same time, which is the failure this exists to prevent.
+/// This replaces the declared `MissPolicy` that shipped in #84. That flag rode
+/// the query because the observation was emitted BEFORE the seam reached its
+/// miss branch, so the only thing available to stamp was what the boundary had
+/// DECLARED it would do. That was tolerable only while a declared `on_miss`
+/// always produced a value: declaration and outcome could not disagree.
+/// [`Reconstructed::NoValue`] makes them disagree — a site may inspect the query
+/// and decline — so the outcome has to be observed. The Substitute lookup is now
+/// two-phase (resolve, decide, then emit), mirroring the execute-shadow
+/// lifecycle that has always worked this way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MissPolicy {
-    /// A miss stops the request. The default, and right wherever no value is
-    /// honest — egress, and anything whose absence would silently condition the
-    /// rest of the correlation on a value the recording never held.
+pub enum SubstituteOutcome {
+    /// The lookup HIT and the recorded value was rebuilt and returned.
     #[default]
-    FailStop,
-    /// A miss returns the declared value and the request continues. The miss is
-    /// still scored; only the continuation changes.
-    Absorb,
+    Substituted,
+    /// The lookup MISSED and the site derived a value from the query alone. The
+    /// request continued on a value the recording never held; the miss is still
+    /// scored, only the continuation changes.
+    Synthesized,
+    /// The request STOPPED here — either a miss the site declined to answer
+    /// ([`Reconstructed::NoValue`]) or a hit whose payload would not rebuild
+    /// ([`Reconstructed::Failed`]). The second case used to be invisible: the
+    /// observation said `resolved: true` and the seam then panicked, so the
+    /// ledger showed a cleanly-served call for a request that died.
+    Stopped,
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1056,29 @@ pub trait DejaHook: Send + Sync {
     fn execute_shadow_peek(&self, _query: ReplayLookup<'_>) -> Option<ExecuteShadowToken> {
         None
     }
+
+    /// First half of a `Substitute` lookup: resolve the recorded baseline
+    /// WITHOUT emitting, returning it alongside the observation the seam will
+    /// complete once it knows what it did with the result.
+    ///
+    /// The default keeps the one-phase behaviour by delegating to
+    /// [`DejaHook::try_replay_with_context`], which emits eagerly. Such a hook
+    /// returns no token and therefore cannot report the outcome — its
+    /// observations carry the default [`SubstituteOutcome::Substituted`]. Hooks
+    /// that emit `ObservedCall`s should override BOTH halves.
+    fn substitute_peek(&self, query: ReplayLookup<'_>) -> SubstitutePeek {
+        SubstitutePeek {
+            recorded: self.try_replay_with_context(query),
+            token: None,
+        }
+    }
+
+    /// Second half of a `Substitute` lookup: stamp the observed outcome onto the
+    /// pending observation and emit it. Called by the seam after the site's
+    /// reconstruct closure has run — including on the paths that then fail-stop,
+    /// which is why a stopped request still reports its blocking divergence.
+    /// The default is a no-op, matching the default `substitute_peek`.
+    fn substitute_observe(&self, _token: SubstituteToken, _outcome: SubstituteOutcome) {}
 
     /// Second half of an execute-mode dispatch: stamp the REAL boundary's
     /// `observed_result` onto the token's carried observation and emit it
@@ -1538,6 +1600,24 @@ impl DejaHook for RuntimeHook {
             RuntimeHook::Replay(h) => h.try_replay_with_context(query),
             RuntimeHook::LookupReplay(h) => h.try_replay_with_context(query),
             RuntimeHook::Disabled(h) => h.try_replay_with_context(query),
+        }
+    }
+
+    fn substitute_peek(&self, query: ReplayLookup<'_>) -> SubstitutePeek {
+        match self {
+            RuntimeHook::Recording(h) => h.substitute_peek(query),
+            RuntimeHook::Replay(h) => h.substitute_peek(query),
+            RuntimeHook::LookupReplay(h) => h.substitute_peek(query),
+            RuntimeHook::Disabled(h) => h.substitute_peek(query),
+        }
+    }
+
+    fn substitute_observe(&self, token: SubstituteToken, outcome: SubstituteOutcome) {
+        match self {
+            RuntimeHook::Recording(h) => h.substitute_observe(token, outcome),
+            RuntimeHook::Replay(h) => h.substitute_observe(token, outcome),
+            RuntimeHook::LookupReplay(h) => h.substitute_observe(token, outcome),
+            RuntimeHook::Disabled(h) => h.substitute_observe(token, outcome),
         }
     }
 
@@ -2951,14 +3031,12 @@ pub fn replay_boundary(
     spec: &BoundarySpec,
     args: &serde_json::Value,
     identity: Option<&CallsiteIdentity>,
-    miss_policy: MissPolicy,
 ) -> Option<serde_json::Value> {
     let hook = global_runtime_hook_from_env()?;
     if !hook.is_active() {
         return None;
     }
     hook.try_replay_with_context(ReplayLookup {
-        miss_policy,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -3011,7 +3089,6 @@ pub fn execute_shadow_peek_boundary(
         return None;
     }
     hook.execute_shadow_peek(ReplayLookup {
-        miss_policy: crate::MissPolicy::FailStop,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -3019,6 +3096,49 @@ pub fn execute_shadow_peek_boundary(
         callsite_identity: identity,
         caller_location: Some(caller),
     })
+}
+
+/// First half of a `Substitute` lookup for an instrumented boundary: resolve the
+/// recorded baseline WITHOUT emitting the observation, so the seam can stamp
+/// what it actually did before the observation goes out.
+///
+/// With no hook configured, or an inactive one, this reports a MISS with no
+/// pending observation — the same continuation the one-phase seam produced when
+/// `replay_boundary` returned `None`.
+#[track_caller]
+pub fn substitute_peek_boundary(
+    caller: &'static Location<'static>,
+    spec: &BoundarySpec,
+    args: &serde_json::Value,
+    identity: Option<&CallsiteIdentity>,
+) -> SubstitutePeek {
+    let inactive = SubstitutePeek {
+        recorded: None,
+        token: None,
+    };
+    let Some(hook) = global_runtime_hook_from_env() else {
+        return inactive;
+    };
+    if !hook.is_active() {
+        return inactive;
+    }
+    hook.substitute_peek(ReplayLookup {
+        boundary: spec.boundary,
+        trait_name: spec.trait_name,
+        method_name: spec.method_name,
+        args,
+        callsite_identity: identity,
+        caller_location: Some(caller),
+    })
+}
+
+/// Second half of a `Substitute` lookup: stamp the seam's outcome onto the
+/// pending observation and emit it. Called on EVERY outcome, including the two
+/// that then fail-stop.
+pub fn substitute_observe_boundary(token: SubstituteToken, outcome: SubstituteOutcome) {
+    if let Some(hook) = global_runtime_hook_from_env() {
+        hook.substitute_observe(token, outcome);
+    }
 }
 
 /// Second half of an execute-mode dispatch for an instrumented boundary: emit
@@ -3248,45 +3368,6 @@ impl CrossingObservation {
     }
 }
 
-/// The ONE replay-facing seam the boundary macro calls.
-///
-/// Recording captures raw observations; replay performs all interpretation
-/// (design §1). This function owns ALL of the run/skip/shadow/record control
-/// flow internally, so the macro emits a single mode-agnostic shape and names
-/// ZERO replay-only operations. Removing every replay hook would leave this a
-/// plain "run + (maybe) record" function and change the macro's emitted tokens
-/// by zero.
-///
-/// The four closures the macro supplies:
-/// - `args` — LAZY structured-args serialization. NOT evaluated when the hook
-///   is inactive, preserving the zero-overhead fast path
-///   (`start_boundary_event_lazy`'s laziness, design §3 / major #5).
-/// - `run` — the real boundary block.
-/// - `reconstruct` — turns a recorded JSON value back into `T` on a lookup hit.
-///   It returns [`Reconstructed::Value`] when the payload rebuilds cleanly and
-///   [`Reconstructed::Failed`] when the payload is malformed or incompatible; a
-///   failed reconstruction fail-stops before live execution.
-/// - `extract` — the lossless result image AND the `is_error` flag, as the
-///   existing record/shadow seams expect. Fidelity is fixed by the macro, not
-///   chosen by a replay flag.
-///
-/// Internally this is implemented in terms of the recording event seam plus the
-/// deprecated replay/shadow seams [`replay_boundary`] and `execute_shadow_*`.
-/// The outer branch is always the explicit [`RuntimeMode`], so record/no-op never
-/// ask replay helpers for a verdict.
-///
-/// Control flow (all owned here, never named by the macro):
-/// - **NoOp** → call the lazy record-only path, which runs `run()` and evaluates
-///   `args` only if a standalone recorder is actually active.
-/// - **Record** → call the same lazy record-only path; no replay lookup and no
-///   execute-shadow lookup run in record mode.
-/// - **Replay + Execute** → run `run()` only after an execute-shadow token is
-///   returned, shadow-observe `extract(&out)`, and suppress the normal record.
-/// - **Replay + Substitute hit** → reconstruct the recorded value WITHOUT
-///   calling `run()`; `Failed` fail-stops. Live replay execution is reserved for
-///   declared `Execute`.
-/// - **Replay + Substitute miss** → fail-stop; there is no recorded value to
-///   serve and live execution would be unsafe.
 // NOTE: no `#[track_caller]` — the authoritative invocation address is
 // `obs.caller`, captured by the macro at its own `#[track_caller]` entry and
 // threaded through `CrossingObservation`. The internal seams receive it
@@ -3302,10 +3383,74 @@ impl CrossingObservation {
 /// three debugging cycles (`DirValue::Connector`'s `skip_deserializing`, twice,
 /// then `Encryptable`'s two-halves change). The reason is built only on the
 /// failure path, which is cold and terminal.
+///
+/// The four variants are the product of two independent questions: did the
+/// lookup HIT, and does the site have a usable value? A hit that rebuilds is
+/// `Value`; a hit that will not rebuild is `Failed`. A miss the site can answer
+/// deterministically is `Synthesized`; a miss it cannot is `NoValue`. Only the
+/// first two were reachable before per-site synthesis existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconstructed<T> {
+    /// Lookup HIT; the recorded payload rebuilt cleanly. Provenance: recorded.
     Value(T),
+    /// Lookup MISSED; the site derived this value from the query ALONE.
+    ///
+    /// The value must be a pure function of the [`SubstituteMiss`] handed to the
+    /// closure. That is the load-bearing property and it is not honesty — it is
+    /// determinism. Two replays of one candidate against one tape must agree
+    /// with each other, or "the candidate changed" cannot be separated from
+    /// "the fabrication changed" and self-replay never comes out clean. It is
+    /// also what keeps two DIFFERENT candidates comparable past the edge of the
+    /// tape: same query, same synthesized value, so the region the recording
+    /// does not cover still compares.
+    ///
+    /// Answering a miss by running the real computation is the most honest
+    /// option available and the worst one: a fresh uuid at a `deja::id` seam
+    /// reintroduces exactly the nondeterminism the seam exists to remove, on
+    /// precisely the calls the seam failed to cover.
+    Synthesized(T),
+    /// Lookup HIT but the recorded payload could not be rebuilt. Carries WHY.
+    ///
+    /// The reason used to be discarded at the codec seam, leaving an operator
+    /// with only `server closed the connection without writing a response` — a
+    /// codec incompatibility that reads exactly like a network fault. That
+    /// anonymity cost three debugging cycles (`DirValue::Connector`'s
+    /// `skip_deserializing`, twice, then `Encryptable`'s two-halves change).
+    /// Built only on the failure path, which is cold and terminal.
     Failed(String),
+    /// Lookup MISSED and the site has nothing deterministic to offer, so the
+    /// request stops.
+    ///
+    /// The right answer wherever no value is honest AND none is derivable:
+    /// egress (no function of the query yields a plausible gateway reply), and
+    /// anything whose fabrication would be a lie with consequences — the
+    /// enumeration's standing example being `get_temp_password`, where a
+    /// content-addressed value is by construction a value anyone who knows the
+    /// query can predict.
+    NoValue,
+}
+
+/// What a `Substitute` lookup handed the site's reconstruct closure.
+///
+/// One closure now answers both halves of the lookup. The two arms are made
+/// exclusive BY TYPE rather than by convention: a `(Option<Value>, &Miss)` pair
+/// would let a miss arm read a recorded value that is not there and a hit arm
+/// consult a query it should not need, and neither mistake would be caught.
+///
+/// It is also what keeps the marker off the hot path — `Miss` borrows a
+/// [`SubstituteMiss`] the seam builds only when the lookup actually missed.
+pub enum ReconstructInput<'a> {
+    /// The lookup HIT; here is the recorded payload to rebuild.
+    Hit(serde_json::Value),
+    /// The lookup MISSED; here are the facts about the call that missed.
+    ///
+    /// Anything returned from this arm must be a function of THIS value and
+    /// nothing else. The signature is the whole enforcement — reaching past it
+    /// for a clock or an RNG is easy to write and meant to look wrong — but it
+    /// is not a proof: a closure can still capture its environment. See
+    /// [`Reconstructed::Synthesized`] for why determinism is the property that
+    /// matters more than honesty.
+    Miss(&'a SubstituteMiss),
 }
 
 /// Replay fail-stop on a Substitute-miss (the partial-function model).
@@ -3673,6 +3818,160 @@ fn shadow_observe_loud<F: FnOnce()>(boundary: &str, method: &str, observe: F) {
     }
 }
 
+/// The ONE Substitute-lookup arm, shared by [`dispatch`] and [`dispatch_async`].
+///
+/// Sequenced as resolve → decide → EMIT → (maybe) stop. The emit must precede
+/// the stop: both `Stopped` arms below diverge, and an observation that never
+/// reached the sink would make a request the miss killed indistinguishable from
+/// one that never made the call at all.
+///
+/// That ordering is what removed the declared `MissPolicy`. The lookup used to
+/// emit its own observation, so the seam's decision arrived too late to be
+/// recorded and the boundary's DECLARATION had to stand in for it. Holding the
+/// observation across the decision — which the execute-shadow path has always
+/// done — makes the outcome an observed fact. Deferral is safe because the seam
+/// owns both fail-stops, so no emission has to survive an unwind.
+fn substitute_lookup<T, C>(
+    caller: &'static Location<'static>,
+    spec: &BoundarySpec,
+    identity: &CallsiteIdentity,
+    boundary_args: serde_json::Value,
+    reconstruct: C,
+) -> T
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+{
+    let peek = substitute_peek_boundary(caller, spec, &boundary_args, Some(identity));
+    substitute_decide(
+        spec,
+        peek,
+        boundary_args,
+        reconstruct,
+        substitute_observe_boundary,
+    )
+}
+
+/// The decision half of a `Substitute` lookup, parameterized on how to emit.
+///
+/// The delegate seams replay through a hook INJECTED into the wrapper rather
+/// than the process-global one, so they cannot share
+/// [`substitute_observe_boundary`]. They share this instead — which is the
+/// point: the emit-before-stop ordering lives in exactly ONE place, and a seam
+/// that forgot it would have to be written by hand to do so.
+fn substitute_decide<T, C, E>(
+    spec: &BoundarySpec,
+    peek: SubstitutePeek,
+    boundary_args: serde_json::Value,
+    reconstruct: C,
+    observe: E,
+) -> T
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    E: FnOnce(SubstituteToken, SubstituteOutcome),
+{
+    let SubstitutePeek { recorded, token } = peek;
+
+    // Built ONLY on the miss branch. `SubstituteMiss` owns its args image, so
+    // constructing it eagerly costs a clone on every active call at every
+    // boundary with a miss arm — which is what the previous shape paid, because
+    // the macro had to hand the marker to a thunk before the outcome was known.
+    // The seam can build it from the spec alone (`trait_name` IS the declared
+    // component), so the cold path pays and the hot path does not.
+    let miss;
+    let rebuilt = match recorded {
+        Some(value) => reconstruct(ReconstructInput::Hit(value)),
+        None => {
+            miss = SubstituteMiss::new(
+                spec.boundary,
+                spec.trait_name,
+                spec.method_name,
+                boundary_args,
+            );
+            reconstruct(ReconstructInput::Miss(&miss))
+        }
+    };
+
+    let outcome = match &rebuilt {
+        Reconstructed::Value(_) => SubstituteOutcome::Substituted,
+        Reconstructed::Synthesized(_) => SubstituteOutcome::Synthesized,
+        Reconstructed::Failed(_) | Reconstructed::NoValue => SubstituteOutcome::Stopped,
+    };
+    if let Some(token) = token {
+        observe(token, outcome);
+    }
+
+    match rebuilt {
+        Reconstructed::Value(replayed) | Reconstructed::Synthesized(replayed) => replayed,
+        // A hit whose payload will not rebuild is a capture/codec incompatibility,
+        // not graceful degradation: running the live boundary here would convert
+        // it into production I/O. Stop. Unlike before, the observation this
+        // request leaves behind now says it stopped, rather than reporting a
+        // cleanly-served call for a request that died.
+        Reconstructed::Failed(reason) => {
+            fail_stop_substitute_unreconstructable(spec.boundary, spec.method_name, &reason)
+        }
+        Reconstructed::NoValue => fail_stop_substitute_miss(spec.boundary, spec.method_name),
+    }
+}
+
+/// The ONE replay-facing seam the boundary macro calls.
+///
+/// Recording captures raw observations; replay performs all interpretation
+/// (design §1). This function owns ALL of the run/skip/shadow/record control
+/// flow internally, so the macro emits a single mode-agnostic shape and names
+/// ZERO replay-only operations. Removing every replay hook would leave this a
+/// plain "run + (maybe) record" function and change the macro's emitted tokens
+/// by zero.
+///
+/// The four closures the macro supplies:
+/// - `args` — LAZY structured-args serialization. NOT evaluated when the hook
+///   is inactive, preserving the zero-overhead fast path
+///   (`start_boundary_event_lazy`'s laziness, design §3 / major #5).
+/// - `run` — the real boundary block.
+/// - `reconstruct` — answers BOTH halves of a Substitute lookup, taking a
+///   [`ReconstructInput`]. On a HIT it rebuilds `T` from the recorded JSON,
+///   returning [`Reconstructed::Value`] or [`Reconstructed::Failed`]. On a MISS
+///   it either derives a value from the query ([`Reconstructed::Synthesized`])
+///   or declines ([`Reconstructed::NoValue`]). Both `Failed` and `NoValue`
+///   fail-stop, AFTER the observation is emitted.
+/// - `extract` — the lossless result image AND the `is_error` flag, as the
+///   existing record/shadow seams expect. Fidelity is fixed by the macro, not
+///   chosen by a replay flag.
+///
+/// There is no separate `on_miss` parameter and no `_or_miss` twin. The miss
+/// continuation is something the site RETURNS rather than a policy it declares
+/// alongside, which is what lets the emitted observation record what actually
+/// happened — see [`SubstituteOutcome`].
+///
+/// Internally this is implemented in terms of the recording event seam, the
+/// two-phase substitute lifecycle, and the deprecated `execute_shadow_*` seams.
+/// The outer branch is always the explicit [`RuntimeMode`], so record/no-op never
+/// ask replay helpers for a verdict.
+///
+/// Control flow (all owned here, never named by the macro):
+/// - **NoOp** → call the lazy record-only path, which runs `run()` and evaluates
+///   `args` only if a standalone recorder is actually active.
+/// - **Record** → call the same lazy record-only path; no replay lookup and no
+///   execute-shadow lookup run in record mode.
+/// - **Replay + Execute** → run `run()` only after an execute-shadow token is
+///   returned, shadow-observe `extract(&out)`, and suppress the normal record.
+/// - **Replay + Substitute** → resolve the baseline WITHOUT emitting, ask
+///   `reconstruct`, emit the observation stamped with what it said, and only
+///   then return the value or stop. `run()` is never called: live replay
+///   execution is reserved for declared `Execute`.
+///
+/// This doc block used to sit two items away from the function it describes — a
+/// plain `//` note between it and the code left it attached to
+/// [`Reconstructed`], so `dispatch` rendered undocumented and the enum rendered
+/// with the seam's control flow on top of its own.
+/// The ONE replay-facing seam for sync boundaries.
+///
+/// `reconstruct` answers BOTH halves of a Substitute lookup — see
+/// [`ReconstructInput`]. There is no separate `on_miss` parameter and no
+/// `dispatch_or_miss` twin: a boundary that declares a miss value returns
+/// [`Reconstructed::Synthesized`] from the miss arm, one that does not returns
+/// [`Reconstructed::NoValue`], and the seam stops on the latter exactly as the
+/// old default did.
 pub fn dispatch<T, A, F, C, R, O>(
     obs: CrossingObservation,
     args: A,
@@ -3683,54 +3982,16 @@ pub fn dispatch<T, A, F, C, R, O>(
 where
     A: FnOnce() -> serde_json::Value,
     F: FnOnce() -> T,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
-{
-    // Default: a Substitute-miss has no honest value and re-running is unsafe,
-    // so STOP (see `fail_stop_substitute_miss`). A boundary whose caller has a
-    // deterministic degraded path declares `on_miss` and routes through
-    // `dispatch_or_miss` instead. Mirrors `dispatch` / `dispatch_async_or_miss`.
-    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_or_miss(
-        obs,
-        args,
-        run,
-        reconstruct,
-        extract,
-        MissPolicy::FailStop,
-        move || fail_stop_substitute_miss(boundary, method),
-    )
-}
-
-/// [`dispatch`] with a caller-supplied `on_miss` value for the Substitute-miss
-/// branch — the sync twin of [`dispatch_async_or_miss`]. See it for the full
-/// contract: the blocking NovelCall divergence is still emitted before `on_miss`
-/// runs, and a HIT whose recorded value cannot be reconstructed still fail-stops.
-pub fn dispatch_or_miss<T, A, F, C, R, O, M>(
-    obs: CrossingObservation,
-    args: A,
-    run: F,
-    reconstruct: C,
-    extract: R,
-    miss_policy: MissPolicy,
-    on_miss: M,
-) -> T
-where
-    A: FnOnce() -> serde_json::Value,
-    F: FnOnce() -> T,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
-    R: Fn(&T) -> O,
-    O: Into<RecordedOutput>,
-    M: FnOnce() -> T,
 {
     match runtime_mode() {
         RuntimeMode::Disabled => record_only_path(obs, args, run, extract),
         RuntimeMode::Record => record_only_path(obs, args, run, extract),
         RuntimeMode::Replay => {
             // Bind the structured args ONCE in replay mode. The same value feeds
-            // the execute peek, the substitute lookup, and the deferred live
-            // record path used only for explicit recorded-skip fall-throughs.
+            // the execute peek and the substitute lookup.
             let boundary_args: serde_json::Value = args();
 
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
@@ -3756,28 +4017,13 @@ where
                     }
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
-                ExecuteMode::Lookup => {
-                    #[allow(deprecated)]
-                    match replay_boundary(
-                        obs.caller,
-                        &obs.spec,
-                        &boundary_args,
-                        Some(&obs.identity),
-                        miss_policy,
-                    ) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => on_miss(),
-                    }
-                }
+                ExecuteMode::Lookup => substitute_lookup(
+                    obs.caller,
+                    &obs.spec,
+                    &obs.identity,
+                    boundary_args,
+                    reconstruct,
+                ),
             }
         }
     }
@@ -3843,6 +4089,11 @@ where
 /// observation happens AFTER the real future resolves. The boundary macro emits
 /// this for `async fn` bodies and for `future = "boxed"` bodies (wrapping the
 /// returned `T` in `Box::pin`). See [`dispatch`] for the full rationale.
+///
+/// The Substitute arm is shared verbatim with the sync seam
+/// (`substitute_lookup`): it never awaits, so there is exactly ONE copy of the
+/// emit-before-stop ordering the observation's honesty depends on.
+#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
 pub async fn dispatch_async<T, A, Fut, F, C, R, O>(
     obs: CrossingObservation,
     args: A,
@@ -3854,53 +4105,9 @@ where
     A: FnOnce() -> serde_json::Value,
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
-{
-    // Egress default: a Substitute-miss has no honest value and re-running is
-    // unsafe, so STOP (see `fail_stop_substitute_miss`). A boundary whose caller
-    // has a deterministic degraded path uses `dispatch_async_or_miss` instead.
-    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_async_or_miss(
-        obs,
-        args,
-        run,
-        reconstruct,
-        extract,
-        MissPolicy::FailStop,
-        move || fail_stop_substitute_miss(boundary, method),
-    )
-    .await
-}
-
-/// [`dispatch_async`] with a caller-supplied `on_miss` closure for the
-/// Substitute-miss branch. The blocking NovelCall divergence is STILL emitted by
-/// `replay_boundary` before this point — the miss is always surfaced on the
-/// scorecard; `on_miss` only decides the continuation. Use this for a read whose
-/// caller has a deterministic degraded path: a Superposition config read returns
-/// `Err(SuperpositionError)` so the app's DB→default fallback runs and replay
-/// progresses, instead of the egress fail-stop. `on_miss` fires ONLY on a genuine
-/// lookup miss — a HIT whose recorded value cannot be reconstructed still
-/// fail-stops (a codec incompatibility is a bug, not graceful degradation).
-#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
-pub async fn dispatch_async_or_miss<T, A, Fut, F, C, R, O, M>(
-    obs: CrossingObservation,
-    args: A,
-    run: F,
-    reconstruct: C,
-    extract: R,
-    miss_policy: MissPolicy,
-    on_miss: M,
-) -> T
-where
-    A: FnOnce() -> serde_json::Value,
-    Fut: Future<Output = T>,
-    F: FnOnce() -> Fut,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
-    R: Fn(&T) -> O,
-    O: Into<RecordedOutput>,
-    M: FnOnce() -> T,
 {
     match runtime_mode() {
         RuntimeMode::Disabled => record_only_path_async(obs, args, run, extract).await,
@@ -3930,28 +4137,13 @@ where
                     }
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
-                ExecuteMode::Lookup => {
-                    #[allow(deprecated)]
-                    match replay_boundary(
-                        obs.caller,
-                        &obs.spec,
-                        &boundary_args,
-                        Some(&obs.identity),
-                        miss_policy,
-                    ) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => on_miss(),
-                    }
-                }
+                ExecuteMode::Lookup => substitute_lookup(
+                    obs.caller,
+                    &obs.spec,
+                    &obs.identity,
+                    boundary_args,
+                    reconstruct,
+                ),
             }
         }
     }
@@ -4010,7 +4202,7 @@ pub fn dispatch_with_hook<T, F, C, R, O>(
 ) -> T
 where
     F: FnOnce() -> T,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
@@ -4031,7 +4223,6 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -4053,29 +4244,24 @@ where
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
                 ExecuteMode::Lookup => {
-                    match obs.hook.try_replay_with_context(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
+                    // Two-phase against the INJECTED hook, then the shared
+                    // decision: the delegate path gets the same observed outcome
+                    // and the same emit-before-stop ordering as the global seam.
+                    let peek = obs.hook.substitute_peek(ReplayLookup {
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
                         args: &boundary_args,
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
-                    }) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
-                    }
+                    });
+                    substitute_decide(
+                        &obs.spec,
+                        peek,
+                        boundary_args,
+                        reconstruct,
+                        |token, outcome| obs.hook.substitute_observe(token, outcome),
+                    )
                 }
             }
         }
@@ -4097,7 +4283,7 @@ pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O>(
 where
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
@@ -4116,7 +4302,6 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -4138,29 +4323,24 @@ where
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
                 ExecuteMode::Lookup => {
-                    match obs.hook.try_replay_with_context(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
+                    // Two-phase against the INJECTED hook, then the shared
+                    // decision: the delegate path gets the same observed outcome
+                    // and the same emit-before-stop ordering as the global seam.
+                    let peek = obs.hook.substitute_peek(ReplayLookup {
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
                         args: &boundary_args,
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
-                    }) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
-                    }
+                    });
+                    substitute_decide(
+                        &obs.spec,
+                        peek,
+                        boundary_args,
+                        reconstruct,
+                        |token, outcome| obs.hook.substitute_observe(token, outcome),
+                    )
                 }
             }
         }
@@ -5545,6 +5725,274 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// In-memory fake hook with knobs to drive each `dispatch` case.
+    /// Adapt a HIT-only reconstruct closure to the two-armed seam signature.
+    ///
+    /// `NoValue` on a miss reproduces the pre-synthesis default exactly (the
+    /// seam fail-stops), so a fixture written before the miss arm existed keeps
+    /// asserting what it always asserted.
+    fn hit_only<T>(
+        f: impl FnOnce(serde_json::Value) -> Reconstructed<T>,
+    ) -> impl FnOnce(ReconstructInput<'_>) -> Reconstructed<T> {
+        move |input| match input {
+            ReconstructInput::Hit(recorded) => f(recorded),
+            ReconstructInput::Miss(_) => Reconstructed::NoValue,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The Substitute outcome is OBSERVED, not declared
+    //
+    // These are the assertions the pre-synthesis tests structurally could not
+    // make. While a declared `on_miss` always produced a value, declaration and
+    // outcome could not disagree, so "the miss was stamped absorbed" passed
+    // whichever of the two the seam read. `Reconstructed::NoValue` makes them
+    // disagree, and every test below turns on that difference.
+    // -----------------------------------------------------------------------
+
+    /// A minimal pending observation, so a test can drive the decision half
+    /// without a lookup table behind it.
+    fn pending_observation(resolved: bool) -> crate::replay::ObservedCall {
+        crate::replay::ObservedCall {
+            correlation_id: None,
+            boundary: "imc".to_string(),
+            role: None,
+            trait_name: "Comp".to_string(),
+            method_name: "op".to_string(),
+            args: serde_json::json!({"k": 1}),
+            resolved,
+            resolved_rank: None,
+            source_event_global_sequence: None,
+            timestamp_ns: now_ns(),
+            end_timestamp_ns: None,
+            task_id: None,
+            parent_task_id: None,
+            task_bucket: None,
+            bucket_id: None,
+            fork_seq: 0,
+            call_file: None,
+            call_line: None,
+            call_column: None,
+            span_path: None,
+            graph_node_id: None,
+            synthesized: false,
+            real_impl_will_fail: false,
+            recorded_result: None,
+            observed_result: None,
+            provenance: Provenance::Recorded,
+            seed_gap: false,
+            absorbed: false,
+            outcome: SubstituteOutcome::default(),
+        }
+    }
+
+    /// Run one Substitute decision and report what was emitted and what the
+    /// seam returned. `None` for the value means the seam fail-stopped.
+    fn drive(
+        recorded: Option<serde_json::Value>,
+        produce: impl FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>,
+    ) -> (Option<crate::replay::ObservedCall>, Option<u64>) {
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&emitted);
+        let spec = BoundarySpec::new("imc", "Comp", "op");
+        let peek = SubstitutePeek {
+            token: Some(SubstituteToken::new(pending_observation(
+                recorded.is_some(),
+            ))),
+            recorded,
+        };
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            substitute_decide(
+                &spec,
+                peek,
+                serde_json::json!({"k": 1}),
+                produce,
+                move |token, outcome| {
+                    *sink.lock().expect("emit lock") = Some(token.into_observed(outcome));
+                },
+            )
+        }))
+        .ok();
+        std::panic::set_hook(previous);
+
+        let observed = emitted.lock().expect("emit lock").clone();
+        (observed, returned)
+    }
+
+    /// The stamped outcome is whatever the site's closure RETURNED.
+    #[test]
+    fn the_stamped_outcome_follows_the_reconstruct_return() {
+        let hit = Some(serde_json::json!(7u64));
+
+        let (observed, value) = drive(hit.clone(), |_| Reconstructed::Value(7));
+        assert_eq!(value, Some(7), "a clean hit must return its rebuilt value");
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Substituted
+        );
+
+        let (observed, value) = drive(None, |_| Reconstructed::Synthesized(42));
+        assert_eq!(value, Some(42), "a synthesized miss must return its value");
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Synthesized
+        );
+
+        let (observed, value) = drive(None, |_| Reconstructed::NoValue);
+        assert_eq!(value, None, "a declined miss must stop the request");
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Stopped
+        );
+
+        let (observed, value) = drive(hit, |_| Reconstructed::Failed("bad codec".into()));
+        assert_eq!(
+            value, None,
+            "an unreconstructable hit must stop the request"
+        );
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Stopped
+        );
+    }
+
+    /// THE ORDERING. A lookup that stops the request still emits its
+    /// observation.
+    ///
+    /// This is the property that made it safe to defer the emission at all. The
+    /// old seam emitted inside the lookup precisely because the two stopping
+    /// arms below diverge, and an observation lost to the unwind would leave a
+    /// killed request looking like one that never made the call — under-reporting
+    /// divergence, which fail-stop replay must never do. Deferral is safe only
+    /// because the SEAM owns both fail-stops and can emit before it panics; if
+    /// anyone reorders those two statements, this test is what catches it.
+    #[test]
+    fn a_stopped_lookup_still_emits_its_observation() {
+        for (label, recorded, produce) in [
+            (
+                "declined miss",
+                None,
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::<u64>::NoValue)
+                    as Box<dyn FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>>,
+            ),
+            (
+                "unreconstructable hit",
+                Some(serde_json::json!(7u64)),
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::Failed("bad codec".into())),
+            ),
+        ] {
+            let (observed, value) = drive(recorded, produce);
+            assert_eq!(value, None, "{label}: precondition — this must fail-stop");
+            let observed = observed.unwrap_or_else(|| {
+                panic!(
+                    "{label}: the observation must reach the sink BEFORE the seam \
+                     panics, or a request the miss killed is indistinguishable from \
+                     one that never made the call"
+                )
+            });
+            assert_eq!(observed.outcome, SubstituteOutcome::Stopped, "{label}");
+        }
+    }
+
+    /// A hit that stopped the request is now distinguishable from one that
+    /// served it — which the two booleans structurally cannot say.
+    ///
+    /// Before this change the seam emitted `resolved: true, Provenance::Recorded`
+    /// and only THEN panicked on `Failed`, so the ledger showed a cleanly-served
+    /// call for a request that died. Both bools are false here (nothing was
+    /// absorbed, nothing was synthesized) and both are RIGHT; only `outcome`
+    /// carries the fact.
+    #[test]
+    fn an_unreconstructable_hit_is_recorded_as_resolved_and_stopped() {
+        let (observed, value) = drive(Some(serde_json::json!(7u64)), |_| {
+            Reconstructed::<u64>::Failed("bad codec".into())
+        });
+        assert_eq!(value, None, "precondition: this must fail-stop");
+
+        let observed = observed.expect("emitted");
+        assert!(
+            observed.resolved,
+            "precondition: the lookup HIT — this is not a novel call"
+        );
+        assert_eq!(
+            observed.outcome,
+            SubstituteOutcome::Stopped,
+            "a hit whose payload would not rebuild must be recorded as having \
+             stopped the request, not as a call that was served"
+        );
+        assert!(!observed.absorbed && !observed.synthesized);
+    }
+
+    /// The three representations of one fact must never disagree.
+    ///
+    /// `absorbed` (what the scorer reads), `synthesized` (the V2 scaffold field)
+    /// and `outcome` are all stamped in one place for exactly this reason. Two
+    /// of them are derived views kept for the wire; a record where they drifted
+    /// apart would tell two different stories about the same call.
+    #[test]
+    fn the_derived_flags_never_disagree_with_the_outcome() {
+        for (label, recorded, produce) in [
+            (
+                "substituted",
+                Some(serde_json::json!(7u64)),
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::Value(7u64))
+                    as Box<dyn FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>>,
+            ),
+            (
+                "synthesized",
+                None,
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::Synthesized(42u64)),
+            ),
+            (
+                "stopped",
+                None,
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::NoValue),
+            ),
+        ] {
+            let (observed, _) = drive(recorded, produce);
+            let observed = observed.expect("emitted");
+            let synthesized = observed.outcome == SubstituteOutcome::Synthesized;
+            assert_eq!(observed.absorbed, synthesized, "{label}: absorbed drifted");
+            assert_eq!(
+                observed.synthesized, synthesized,
+                "{label}: synthesized drifted"
+            );
+        }
+    }
+
+    /// The miss marker is built ONLY on the miss branch, and carries the call.
+    ///
+    /// Two facts in one: a hit never constructs it (the args clone stays off the
+    /// hot path, which is what moving construction into the seam bought), and a
+    /// miss gets one describing the call that actually missed.
+    #[test]
+    fn the_miss_marker_is_built_only_on_the_miss_branch() {
+        let (_, value) = drive(Some(serde_json::json!(7u64)), |input| match input {
+            ReconstructInput::Hit(v) => Reconstructed::Value(v.as_u64().unwrap_or(0)),
+            ReconstructInput::Miss(_) => panic!("a HIT must never reach the miss arm"),
+        });
+        assert_eq!(value, Some(7));
+
+        let (_, value) = drive(None, |input| match input {
+            ReconstructInput::Hit(_) => panic!("a MISS must never reach the hit arm"),
+            ReconstructInput::Miss(miss) => {
+                assert_eq!(miss.boundary, "imc");
+                assert_eq!(miss.component, "Comp");
+                assert_eq!(miss.method, "op");
+                assert_eq!(
+                    miss.args,
+                    serde_json::json!({"k": 1}),
+                    "the marker must carry the args the lookup was keyed on, so a \
+                     miss can be matched back against the tape"
+                );
+                Reconstructed::Synthesized(1)
+            }
+        });
+        assert_eq!(value, Some(1));
+    }
+
     struct FakeHook {
         active: bool,
         /// When `Some`, `try_replay_with_context` returns it (a lookup hit).
@@ -5606,6 +6054,7 @@ mod tests {
             }
             // Minimal observation; `execute_shadow_observe` fills the result.
             Some(ExecuteShadowToken::new(crate::replay::ObservedCall {
+                outcome: crate::SubstituteOutcome::default(),
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
                 role: None,
@@ -5811,12 +6260,12 @@ mod tests {
                 ran.set(true);
                 7u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
         );
         assert_eq!(out, 99, "returned the reconstructed recorded value");
@@ -5840,7 +6289,7 @@ mod tests {
                     ran.set(true);
                     5u64
                 },
-                |v| {
+                hit_only(|v| {
                     if v.as_object()
                         .is_some_and(|map| map.contains_key("deja_err"))
                     {
@@ -5854,7 +6303,7 @@ mod tests {
                             "test fixture: no replay representation",
                         )),
                     }
-                },
+                }),
                 |r: &u64| (serde_json::json!(*r), false),
             )
         }));
@@ -5931,12 +6380,12 @@ mod tests {
                 ran.set(true);
                 7u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
         );
 
@@ -6034,12 +6483,12 @@ mod tests {
                 ran.set(true);
                 7u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
         );
 
@@ -6082,12 +6531,12 @@ mod tests {
             delegate_obs(&hook),
             serde_json::json!({"k": "v"}),
             || async { 0u64 },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
         )
         .await;
@@ -6121,12 +6570,12 @@ mod tests {
                 ran.set(true);
                 11u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
         )
         .await;
