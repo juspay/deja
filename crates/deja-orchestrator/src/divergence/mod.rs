@@ -11,7 +11,7 @@
 //!   - resolved hit                         → matched (recorded per address rank)
 //!   - resolved only at rank 6 (sequence)   → Recovered (fragility flag)
 //!   - candidate call with no table hit     → NovelCall (reported, not scored)
-//!     …absorbed by a declared `on_miss`     → NovelCallAbsorbed (request survived)
+//!     …answered by a synthesized value     → NovelCallAbsorbed (request survived)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!     …after a truncated recording tail    → InconclusiveTailGap (inconclusive)
@@ -209,9 +209,13 @@ pub struct Summary {
     ///   methods that both resolved every call; a content difference is counted
     ///   under `value_divergences` instead.
     pub side_effect_divergences: u64,
-    /// Misses the REQUEST SURVIVED: a boundary declared `on_miss`, the declared
-    /// value was returned, and the correlation continued on an answer the
-    /// recording never held.
+    /// Misses the REQUEST SURVIVED: the boundary's miss arm SYNTHESIZED a value,
+    /// it was returned, and the correlation continued on an answer the recording
+    /// never held.
+    ///
+    /// Read off what the site returned, not off what it declared. The two used
+    /// to be the same thing — a declared `on_miss` always produced a value — but
+    /// a miss arm can now decline, so the observation carries the outcome.
     ///
     /// Projection of `per_boundary[*].kinds["NovelCallAbsorbed"]`, and it has to
     /// be a projection: a kind with no folded summary field never reaches the
@@ -4768,17 +4772,17 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 tail_gap_correlations.insert(corr.clone());
             }
         } else if obs.absorbed {
-            // A miss the REQUEST SURVIVED: the boundary declared `on_miss`, the
-            // declared value was returned, and everything after it in this
+            // A miss the REQUEST SURVIVED: the boundary's miss arm SYNTHESIZED
+            // a value, it was returned, and everything after it in this
             // correlation ran on an answer the recording never held.
             //
             // Named apart from `NovelCall` for the reason `NovelCallTolerated`
             // is: it is a different thing, not a different count of the same
             // thing. A reader deciding whether to trust a clean-looking body diff
             // has to be able to see that the run continued on a supplied value —
-            // and it is invisible everywhere else, because the observation is
-            // written before the seam reaches its miss branch and carries
-            // `resolved: false` and `Provenance::Recorded` either way.
+            // and it is invisible everywhere else, because a miss carries
+            // `resolved: false` and `Provenance::Recorded` whether the request
+            // survived it or died on it.
             //
             // Blocking treatment is deliberately UNCHANGED here: this change
             // makes absorption visible, it does not decide what a novel call
@@ -6189,6 +6193,7 @@ mod tests {
             span_path: None,
             graph_node_id: None,
             synthesized: false,
+            outcome: deja::SubstituteOutcome::default(),
             real_impl_will_fail: false,
             recorded_result: None,
             observed_result: None,
@@ -9234,7 +9239,7 @@ mod tests {
         );
     }
 
-    /// An observed call that MISSED and was absorbed by a declared `on_miss`.
+    /// An observed call that MISSED and was answered by a synthesized value.
     fn absorbed_obs(boundary: &str, corr: &str) -> ObservedCall {
         let mut o = obs(boundary, Some(corr), false, None, None);
         o.absorbed = true;

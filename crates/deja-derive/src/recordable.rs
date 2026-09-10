@@ -402,6 +402,27 @@ fn generate_async_method(
             }
         }
     };
+
+    // ONE closure answers both halves of the lookup. The delegate path declares
+    // no miss value, so its miss arm is `NoValue` — the same fail-stop the seam
+    // performed before, now expressed as the value the site returns rather than
+    // as the seam's fallback.
+    let reconstruct_closure = {
+        let __deja_hit = reconstruct_closure;
+        quote! {
+            |__deja_input: ::deja_runtime::ReconstructInput<'_>|
+                -> ::deja_runtime::Reconstructed<#return_type>
+            {
+                match __deja_input {
+                    ::deja_runtime::ReconstructInput::Hit(__deja_recorded) => {
+                        (#__deja_hit)(__deja_recorded)
+                    }
+                    ::deja_runtime::ReconstructInput::Miss(_) =>
+                        ::deja_runtime::Reconstructed::NoValue,
+                }
+            }
+        }
+    };
     let spec_expr = match semantics {
         Some(semantics) => quote! {
             ::deja_runtime::BoundarySpec::with_semantics(
@@ -577,6 +598,25 @@ fn generate_sync_method(
                         ::std::stringify!(#return_type_for_replay)
                     )
                 )
+            }
+        }
+    };
+
+    // See the async arm: one closure, `NoValue` on a miss.
+    let reconstruct_closure = {
+        let __deja_hit = reconstruct_closure;
+        let return_type_for_replay = output_type_tokens(return_type);
+        quote! {
+            |__deja_input: ::deja_runtime::ReconstructInput<'_>|
+                -> ::deja_runtime::Reconstructed<#return_type_for_replay>
+            {
+                match __deja_input {
+                    ::deja_runtime::ReconstructInput::Hit(__deja_recorded) => {
+                        (#__deja_hit)(__deja_recorded)
+                    }
+                    ::deja_runtime::ReconstructInput::Miss(_) =>
+                        ::deja_runtime::Reconstructed::NoValue,
+                }
             }
         }
     };

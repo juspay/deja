@@ -1284,21 +1284,33 @@ pub struct ObservedCall {
     /// rather than a false positive. Always false in M1 lookup mode.
     #[serde(default)]
     pub seed_gap: bool,
-    /// This call MISSED and the boundary absorbed it: the declared `on_miss`
-    /// value was returned and the request carried on, rather than the miss
-    /// stopping it.
+    /// This call MISSED and the request carried on anyway, because the site
+    /// synthesized a value from the query.
     ///
-    /// Stamped here because it cannot be recovered later. The observation is
-    /// written before the seam reaches its miss branch, so an absorbed miss and a
-    /// fatal one are otherwise identical on the wire — both `resolved: false`,
-    /// both `Provenance::Recorded`. Without this the scorer can say a call was
-    /// novel but not whether the run continued on a value the recording never
-    /// held, and every downstream call in that correlation is conditioned on an
-    /// answer nobody recorded.
+    /// A derived view of [`Self::outcome`] — true exactly when the outcome is
+    /// [`SubstituteOutcome::Synthesized`](crate::SubstituteOutcome::Synthesized).
+    /// Kept as its own field because it is what the scorer reads and what every
+    /// existing tape carries; collapsing it (and `synthesized`, which is the
+    /// same fact under a different name) onto `outcome` is a follow-up that
+    /// touches the orchestrator, not the runtime.
+    ///
+    /// It used to be computed from the DECLARATION — `recorded.is_none() &&
+    /// miss_policy == Absorb` — because the observation was emitted before the
+    /// seam reached its miss branch. That was sound only while a declared
+    /// `on_miss` could not decline; `Reconstructed::NoValue` ends that, so the
+    /// value is now read off what the site actually returned.
     ///
     /// Only ever true together with `resolved == false`.
     #[serde(default)]
     pub absorbed: bool,
+    /// What the seam actually did with this lookup.
+    ///
+    /// Additive and not yet read by the scorer; `absorbed` and `synthesized` are
+    /// derived from it. Present so the record is self-describing — in particular
+    /// so a HIT that stopped the request (an unreconstructable payload) is
+    /// distinguishable from one that served it, which the two bools cannot say.
+    #[serde(default)]
+    pub outcome: crate::SubstituteOutcome,
 }
 
 #[derive(Deserialize)]
@@ -1353,6 +1365,8 @@ struct ObservedCallWire {
     seed_gap: bool,
     #[serde(default)]
     absorbed: bool,
+    #[serde(default)]
+    outcome: crate::SubstituteOutcome,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1388,6 +1402,7 @@ impl From<ObservedCallWire> for ObservedCall {
             provenance: wire.provenance,
             seed_gap: wire.seed_gap,
             absorbed: wire.absorbed,
+            outcome: wire.outcome,
         }
     }
 }
@@ -2034,11 +2049,6 @@ impl Resolution {
         observed_result: Option<serde_json::Value>,
         provenance: crate::Provenance,
     ) -> ObservedCall {
-        // Read before `self` is destructured below: this is the last point that
-        // knows both the lookup outcome and what the declaration said to do
-        // about it.
-        let absorbed =
-            self.recorded_result.is_none() && query.miss_policy == crate::MissPolicy::Absorb;
         ObservedCall {
             correlation_id: self.correlation_id,
             boundary: query.boundary.to_owned(),
@@ -2063,16 +2073,32 @@ impl Resolution {
             call_column: self.location.as_ref().map(|(_, _, c)| *c),
             span_path: crate::current_span_path(),
             graph_node_id: self.graph_node_id,
-            // V1 full mock never synthesizes and never relies on the real impl;
-            // these stay false until the V2 tiered-miss work lands.
+            // Outcome fields are stamped by `stamp_outcome` once the seam has
+            // decided; a hook that emits eagerly leaves them at these defaults.
             synthesized: false,
             real_impl_will_fail: false,
             recorded_result: self.recorded_result,
             observed_result,
             provenance,
             seed_gap: false,
-            absorbed,
+            absorbed: false,
+            outcome: crate::SubstituteOutcome::default(),
         }
+    }
+}
+
+impl ObservedCall {
+    /// Stamp what the seam actually did with this lookup.
+    ///
+    /// Called from [`SubstituteToken::into_observed`](crate::SubstituteToken::into_observed)
+    /// after the site's reconstruct closure has run, which is the first moment
+    /// the outcome exists. `absorbed` and `synthesized` are kept in step here so
+    /// there is exactly one place the three representations can agree.
+    pub(crate) fn stamp_outcome(&mut self, outcome: crate::SubstituteOutcome) {
+        let synthesized = outcome == crate::SubstituteOutcome::Synthesized;
+        self.outcome = outcome;
+        self.absorbed = synthesized;
+        self.synthesized = synthesized;
     }
 }
 
@@ -2103,6 +2129,29 @@ impl DejaHook for LookupTableHook {
             crate::Provenance::Recorded,
         ));
         recorded
+    }
+
+    fn substitute_peek(&self, query: ReplayLookup<'_>) -> crate::SubstitutePeek {
+        // Same resolution as `try_replay_with_context` — the stamper / sequence
+        // / occurrence counters advance EXACTLY ONCE, identically — but the
+        // observation is held back rather than emitted, so the seam can stamp
+        // what it actually did before it goes out.
+        let resolution = self.resolve(&query);
+        let recorded = resolution.recorded_result();
+        let observed = resolution.into_observed_call(
+            &query,
+            // Lookup mode: observed == recorded (the substituted value).
+            recorded.clone(),
+            crate::Provenance::Recorded,
+        );
+        crate::SubstitutePeek {
+            recorded,
+            token: Some(crate::SubstituteToken::new(observed)),
+        }
+    }
+
+    fn substitute_observe(&self, token: crate::SubstituteToken, outcome: crate::SubstituteOutcome) {
+        self.observed_sink.observed(token.into_observed(outcome));
     }
 
     fn flush(&self) -> std::io::Result<()> {
@@ -2162,7 +2211,6 @@ impl DejaHook for LookupTableHook {
         // Delegate to try_replay_with_context with a stub query so legacy
         // call paths still get a lookup attempt.
         self.try_replay_with_context(ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary,
             trait_name,
             method_name,
@@ -2230,8 +2278,9 @@ impl DejaHook for LookupTableHook {
             provenance: crate::Provenance::Recorded,
             seed_gap: false,
             // The ingress finalizer marker, not a lookup — there was no miss to
-            // absorb.
+            // absorb and no substitution to describe.
             absorbed: false,
+            outcome: crate::SubstituteOutcome::default(),
         });
     }
 
@@ -3613,7 +3662,6 @@ mod tests {
         let identity = explicit_identity("site");
         let call = |args: serde_json::Value| {
             hook.try_replay_with_context(ReplayLookup {
-                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "redis",
                 trait_name: "RedisStore",
                 method_name: "get_key",
@@ -3699,7 +3747,6 @@ mod tests {
         // (rank-4 lexical path + args_hash), proving order independence.
         let call = |connector: u64| {
             hook.try_replay_with_context(ReplayLookup {
-                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "redis",
                 trait_name: "RedisStore",
                 method_name: "get_key",
@@ -3828,7 +3875,6 @@ mod tests {
             threads.push(std::thread::spawn(move || {
                 let _guard = deja_context::enter_correlation_id(correlation_id);
                 let result = hook.try_replay_with_context(ReplayLookup {
-                    miss_policy: crate::MissPolicy::FailStop,
                     boundary: "redis",
                     trait_name: "RedisStore",
                     method_name: "get_key",
@@ -3942,7 +3988,6 @@ mod tests {
 
         let _guard = deja_context::enter_correlation_id("corr-1");
         let result = hook.try_replay_with_context(ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
             method_name: "get_key",
@@ -3990,7 +4035,6 @@ mod tests {
 
         let _guard = deja_context::enter_correlation_id("corr-1");
         let result = hook.try_replay_with_context(ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
             method_name: "get_key",
@@ -4063,7 +4107,6 @@ mod tests {
         let _guard = deja_context::enter_correlation_id("c1");
         let replay = |id: &CallsiteIdentity| {
             hook.try_replay_with_context(ReplayLookup {
-                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "db",
                 trait_name: "Store",
                 method_name: "update",
@@ -4211,7 +4254,6 @@ mod tests {
             );
             let identity = boundary_identity(scope, occurrence);
             let result = hook.try_replay_with_context(ReplayLookup {
-                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "redis",
                 trait_name: "RedisStore",
                 method_name: "get_key",
@@ -4373,7 +4415,6 @@ mod tests {
             );
             let identity = identity_for(occurrence);
             let result = hook.try_replay_with_context(ReplayLookup {
-                miss_policy: crate::MissPolicy::FailStop,
                 boundary: "time",
                 trait_name: "Time",
                 method_name: "date_time::now",
@@ -4443,7 +4484,6 @@ mod tests {
 
         let identity = explicit_identity("stable-X");
         let value = hook.try_replay_with_context(ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "S",
             method_name: "m",
@@ -4488,7 +4528,6 @@ mod tests {
         let rekeyed_args = serde_json::json!({ "id": "pi_doubled" });
         let identity = explicit_identity("find_pi");
         let value = hook.try_replay_with_context(ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary: "storage",
             trait_name: "PaymentIntentInterface",
             method_name: "find_payment_intent_by_id",
@@ -6018,7 +6057,6 @@ redis\tcurrency\tusd
 
         let args = serde_json::json!(["counter"]);
         let query = ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
             method_name: "incr",
@@ -6064,7 +6102,6 @@ redis\tcurrency\tusd
 
         let args = serde_json::json!(["extra_key"]);
         let query = ReplayLookup {
-            miss_policy: crate::MissPolicy::FailStop,
             boundary: "db",
             trait_name: "PI",
             method_name: "generic_find_one_core",
