@@ -43,6 +43,7 @@ pub mod canonical;
 pub mod correlation_layer;
 pub mod graph;
 pub mod replay;
+pub mod synth;
 pub mod wire_capture;
 pub mod writer;
 pub use correlation_layer::{current_span_path, DejaCorrelationLayer};
@@ -3522,6 +3523,21 @@ pub struct SubstituteMiss {
     /// The structured args image that found no recorded answer — the same value
     /// the lookup was keyed on, so a miss can be matched against the tape.
     pub args: serde_json::Value,
+    /// Which call to this site within the correlation this was (0 for the first).
+    ///
+    /// Carried so [`crate::synth`] can separate two misses that are otherwise
+    /// identical — same site, same args — and so a site with an advancing value
+    /// (a clock, a sequence) has something to advance ON. Zero when the seam had
+    /// no identity to read it from.
+    pub occurrence: u32,
+    /// The correlation the call fired under, when there was one.
+    ///
+    /// Part of the synthesis digest, and safe to be: the orchestrator replays the
+    /// SAME correlation ids to every candidate, so including it separates two
+    /// requests from each other without separating two candidates from each other
+    /// — which is the property that keeps them comparable past the edge of the
+    /// tape.
+    pub correlation_id: Option<String>,
 }
 
 impl SubstituteMiss {
@@ -3538,7 +3554,17 @@ impl SubstituteMiss {
             component,
             method,
             args,
+            occurrence: 0,
+            correlation_id: None,
         }
+    }
+
+    /// Attach the call context synthesis needs. Kept off [`Self::new`] so a
+    /// hand-written seam that only wants attribution is unaffected.
+    pub fn with_call_context(mut self, occurrence: u32, correlation_id: Option<String>) -> Self {
+        self.occurrence = occurrence;
+        self.correlation_id = correlation_id;
+        self
     }
 }
 
@@ -3835,6 +3861,7 @@ fn substitute_lookup<T, C>(
     caller: &'static Location<'static>,
     spec: &BoundarySpec,
     identity: &CallsiteIdentity,
+    correlation: Option<&str>,
     boundary_args: serde_json::Value,
     reconstruct: C,
 ) -> T
@@ -3844,6 +3871,8 @@ where
     let peek = substitute_peek_boundary(caller, spec, &boundary_args, Some(identity));
     substitute_decide(
         spec,
+        identity,
+        correlation,
         peek,
         boundary_args,
         reconstruct,
@@ -3860,6 +3889,8 @@ where
 /// that forgot it would have to be written by hand to do so.
 fn substitute_decide<T, C, E>(
     spec: &BoundarySpec,
+    identity: &CallsiteIdentity,
+    correlation: Option<&str>,
     peek: SubstitutePeek,
     boundary_args: serde_json::Value,
     reconstruct: C,
@@ -3886,6 +3917,15 @@ where
                 spec.trait_name,
                 spec.method_name,
                 boundary_args,
+            )
+            .with_call_context(
+                identity.occurrence,
+                // Same fallback the record seam uses: explicit if the site set
+                // one, else ambient. Read HERE and not earlier, so an active call
+                // that hits pays nothing for it.
+                correlation
+                    .map(ToOwned::to_owned)
+                    .or_else(deja_context::current_correlation_id),
             );
             reconstruct(ReconstructInput::Miss(&miss))
         }
@@ -4021,6 +4061,7 @@ where
                     obs.caller,
                     &obs.spec,
                     &obs.identity,
+                    obs.correlation_id.as_deref(),
                     boundary_args,
                     reconstruct,
                 ),
@@ -4141,6 +4182,7 @@ where
                     obs.caller,
                     &obs.spec,
                     &obs.identity,
+                    obs.correlation_id.as_deref(),
                     boundary_args,
                     reconstruct,
                 ),
@@ -4257,6 +4299,10 @@ where
                     });
                     substitute_decide(
                         &obs.spec,
+                        &obs.identity,
+                        // The delegate observation carries no explicit
+                        // correlation; the ambient fallback inside applies.
+                        None,
                         peek,
                         boundary_args,
                         reconstruct,
@@ -4336,6 +4382,10 @@ where
                     });
                     substitute_decide(
                         &obs.spec,
+                        &obs.identity,
+                        // The delegate observation carries no explicit
+                        // correlation; the ambient fallback inside applies.
+                        None,
                         peek,
                         boundary_args,
                         reconstruct,
@@ -4693,10 +4743,10 @@ fn correlation_matches(event: &BoundaryEvent, correlation_id: Option<&str>) -> b
     }
 }
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -4704,7 +4754,7 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-fn fnv1a_str(hash: u64, value: &str) -> u64 {
+pub(crate) fn fnv1a_str(hash: u64, value: &str) -> u64 {
     let hash = fnv1a_bytes(hash, value.as_bytes());
     fnv1a_bytes(hash, &[0xff])
 }
@@ -5794,6 +5844,17 @@ mod tests {
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = std::sync::Arc::clone(&emitted);
         let spec = BoundarySpec::new("imc", "Comp", "op");
+        let identity = CallsiteIdentity {
+            version: 1,
+            source: CallsiteSource::SyntacticHash,
+            id: None,
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: None,
+        };
         let peek = SubstitutePeek {
             token: Some(SubstituteToken::new(pending_observation(
                 recorded.is_some(),
@@ -5806,6 +5867,8 @@ mod tests {
         let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             substitute_decide(
                 &spec,
+                &identity,
+                None,
                 peek,
                 serde_json::json!({"k": 1}),
                 produce,

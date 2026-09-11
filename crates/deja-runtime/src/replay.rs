@@ -1530,7 +1530,7 @@ fn request_body_text(map: &serde_json::Map<String, serde_json::Value>) -> Option
     String::from_utf8(bytes).ok()
 }
 
-fn hash_value(hash: u64, value: &serde_json::Value) -> u64 {
+pub(crate) fn hash_value(hash: u64, value: &serde_json::Value) -> u64 {
     use serde_json::Value;
     match value {
         Value::Null => crate::fnv1a_bytes(hash, b"n"),
