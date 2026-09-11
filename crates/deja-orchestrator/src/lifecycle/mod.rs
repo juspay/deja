@@ -6045,6 +6045,7 @@ mod tests {
         excluded: &[(&str, crate::s3::AdmissionTest)],
     ) {
         let report = crate::s3::IngestReport {
+            members: vec!["rec-fixture".to_owned()],
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 16258,
