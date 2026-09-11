@@ -63,6 +63,29 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `serde_json::Value`. `result` receives `__deja_result` as `&Output` and must
 /// return `(serde_json::Value, bool)`, where the bool marks errors.
 ///
+/// # `site` — naming a call site yourself
+///
+/// ```ignore
+/// #[deja::boundary(boundary = "imc", site = "routing::eligible_connectors")]
+/// async fn get_val<T>(&self, key: CacheKey) -> Option<T> { … }
+/// ```
+///
+/// Every locus deja uses is normally DERIVED — it works out where a call is
+/// from the span stack, the module path, the source location. Derivation is
+/// right almost always: span paths resolve 99.99% of calls across 155,419
+/// measured resolutions. `site` is the escape hatch for the cases where it is
+/// not, such as a call reached from many spans that should be treated as one
+/// site.
+///
+/// A declared site is the STRONGEST locus (rank 1) and purely ADDITIVE: every
+/// derived locus is still emitted behind it, so a name present on only one side
+/// — because someone added or renamed it — misses at rank 1 and falls through
+/// rather than invalidating the tape.
+///
+/// The cost is that the name must be kept stable by hand, which is why it is
+/// opt-in and expected to stay rare. Prefer letting deja derive the locus; reach
+/// for this when you have evidence derivation is addressing a site wrongly.
+///
 /// # `on_miss` — a declared Substitute-miss value
 ///
 /// By default a `Substitute` boundary whose replay lookup MISSES fail-stops: it

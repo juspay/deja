@@ -1099,8 +1099,27 @@ pub struct LookupEntry {
 /// which the divergence detector surfaces via per-rank counts.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Locus {
-    /// Rank 1 — user-supplied explicit annotation (`CallsiteSource::Explicit`).
-    Explicit(String),
+    /// A name the AUTHOR gave this call site, used as its locus.
+    ///
+    /// Not really a rank, and it reads badly as one. The other variants are
+    /// DERIVED — deja works out where a call is from the span stack, the module
+    /// path, the source location. This one is the author telling it directly,
+    /// which makes it the most deterministic locus there is and the only one
+    /// that survives any refactor the author does not choose to break.
+    ///
+    /// It is the ESCAPE HATCH, and it exists because a derived locus can be
+    /// wrong for a particular site: a call made from many spans that should
+    /// nonetheless be treated as one site, or a site whose span path moves for
+    /// reasons unrelated to the call. Nothing emits it by default and nothing
+    /// should — it costs a name that then has to be kept stable by hand, which
+    /// is why it is ugly and why it is opt-in.
+    ///
+    /// It is still ordered first in the cascade (`rank() == 1`) because when an
+    /// author has said which site this is, no derived guess should outrank the
+    /// answer. But a tag present on only one side misses and falls through to
+    /// the derived loci rather than failing — adding a tag to a site must not
+    /// invalidate the tape.
+    DeclaredSite(String),
     /// Rank 2 — logical span-path: the root→leaf chain of `tracing` span NAMES
     /// the call fired within. The most version-independent locus — it survives
     /// source-line shifts and benign signature edits, and is DISTINCT for
@@ -1173,7 +1192,7 @@ impl Locus {
     /// written.
     pub fn rank(&self) -> u8 {
         match self {
-            Locus::Explicit(_) => 1,
+            Locus::DeclaredSite(_) => 1,
             Locus::SpanPath { .. } => 2,
             Locus::Unlocated => 3,
             Locus::LexicalPath { .. } => 4,
@@ -1631,7 +1650,7 @@ pub fn loci_for(
     if let Some(id) = identity {
         if matches!(id.source, crate::CallsiteSource::Explicit) {
             if let Some(tag) = &id.id {
-                out.push(Locus::Explicit(tag.clone()));
+                out.push(Locus::DeclaredSite(tag.clone()));
             }
         }
         // Rank 2 — logical span-path. Strongest non-explicit locus: stable
@@ -3643,7 +3662,7 @@ mod tests {
     }
 
     fn explicit(tag: &str) -> Locus {
-        Locus::Explicit(tag.to_owned())
+        Locus::DeclaredSite(tag.to_owned())
     }
 
     fn lexical_identity(path: &str) -> CallsiteIdentity {
@@ -3869,6 +3888,65 @@ mod tests {
             (0, 0),
             "each operation gets its own occurrence counter; sharing one is \
              what made the FIFO serve the wrong row"
+        );
+    }
+
+    #[test]
+    fn a_declared_site_resolves_at_rank_one_and_still_has_its_fallbacks() {
+        // The macro test proves the identity is EMITTED. This proves the
+        // runtime does something with it — emission without resolution is the
+        // state rank 1 was already in.
+        let declared = CallsiteIdentity {
+            version: 1,
+            source: CallsiteSource::Explicit,
+            id: Some("routing::eligible_connectors".to_owned()),
+            scope: Some("router::routing::pick".to_owned()),
+            occurrence: 0,
+            caller_function: Some("router::routing".to_owned()),
+            lexical_path: Some("router::routing".to_owned()),
+            syntax_hash: Some(99),
+            span_path: Some("http>pay".to_owned()),
+        };
+        let loci = loci_for(Some(&declared), Some(("routing.rs", 10, 3)), 0);
+
+        assert_eq!(
+            loci.first().map(Locus::rank),
+            Some(1),
+            "a declared site must be tried FIRST — when the author has said \
+             which site this is, no derived guess should outrank the answer"
+        );
+        assert_eq!(
+            loci.first(),
+            Some(&Locus::DeclaredSite(
+                "routing::eligible_connectors".to_owned()
+            ))
+        );
+
+        // And it is ADDITIVE. Every derived locus is still there, so a tag
+        // present on only one side (someone added or renamed it) misses at rank
+        // 1 and falls through rather than invalidating the tape.
+        let ranks: Vec<u8> = loci.iter().map(Locus::rank).collect();
+        assert!(
+            ranks.contains(&2) && ranks.contains(&3) && ranks.contains(&6),
+            "declaring a site must not cost the derived loci: {ranks:?}"
+        );
+
+        // The same call WITHOUT the declaration keeps everything but rank 1 —
+        // otherwise the assertion above would pass for an unrelated reason.
+        let derived = CallsiteIdentity {
+            source: CallsiteSource::SyntacticHash,
+            id: None,
+            ..declared.clone()
+        };
+        let derived_ranks: Vec<u8> = loci_for(Some(&derived), Some(("routing.rs", 10, 3)), 0)
+            .iter()
+            .map(Locus::rank)
+            .collect();
+        assert!(!derived_ranks.contains(&1), "{derived_ranks:?}");
+        assert_eq!(
+            derived_ranks,
+            ranks[1..].to_vec(),
+            "declaring a site adds rank 1 and changes nothing else"
         );
     }
 
