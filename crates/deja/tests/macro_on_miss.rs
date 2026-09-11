@@ -1,17 +1,23 @@
 //! `#[deja::boundary(on_miss = ...)]` — the declared graceful Substitute-miss.
 //!
-//! `graceful_miss.rs` proves the RUNTIME seam (`dispatch_async_or_miss`) returns
-//! the caller's value on a miss. This proves the MACRO reaches it: a boundary
-//! that declares `on_miss` returns that value, a boundary that does not still
-//! fail-stops, and the declared expression can name the `deja::SubstituteMiss`
-//! marker so a degraded continuation stays attributable.
+//! `graceful_miss.rs` proves the RUNTIME seam returns the caller's value on a
+//! miss. This proves the MACRO reaches it: a boundary that declares `on_miss`
+//! returns that value, a boundary that does not still fail-stops, and the
+//! declared expression can name the `deja::SubstituteMiss` marker so a degraded
+//! continuation stays attributable.
+//!
+//! `on_miss = <expr>` is sugar for the MISS ARM of the reconstruct closure —
+//! it expands to `Reconstructed::Synthesized(<expr>)`, and its absence expands
+//! to `Reconstructed::NoValue`. Both shapes call the same seam; there is no
+//! separate graceful seam to route to any more.
 //!
 //! Why the default is wrong for the boundaries that get one: a candidate under
 //! review adds boundary calls the recording never made — that is what a change
 //! IS — and unwinding the request at the first one answers nothing, so the whole
 //! correlation scores as a 500 and censors every other signal in the run. The
-//! miss is still emitted as a blocking divergence before `on_miss` runs; only
-//! the continuation changes.
+//! miss is still emitted as a blocking divergence — the seam emits before it
+//! stops, and before it returns a synthesized value — so only the continuation
+//! changes.
 //!
 //! Own test binary: `set_global_runtime_hook` is a one-shot `OnceLock`, so only
 //! one install per process.

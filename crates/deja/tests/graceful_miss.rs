@@ -1,7 +1,8 @@
 //! Graceful-miss counterpart to `fail_stop.rs`.
 //!
-//! A `Substitute` boundary built with `dispatch_async_or_miss` returns the
-//! caller's `on_miss` value on a replay MISS instead of fail-stopping. This is
+//! A `Substitute` boundary whose reconstruct closure answers a MISS with
+//! `Reconstructed::Synthesized` returns that value instead of fail-stopping,
+//! and the observation records that it did. This is
 //! the Superposition read boundary's contract: in replay there is NO
 //! Superposition service, so a config read that was never recorded (a novel
 //! read) must degrade to a recoverable `Err` and let the caller fall back to
@@ -65,31 +66,36 @@ async fn read_config(operation: &'static str, key: &str) -> Result<u64, String> 
         deja::__private::CrossingObservation::with_correlation(spec, identity, caller, correlation);
 
     let args = json!({ "key": key });
-    deja::__private::dispatch_async_or_miss(
+    deja::__private::dispatch_async(
         observation,
         move || args,
         // The "real" run: under a replay MISS this must NOT execute.
         || async { Ok::<u64, String>(REAL_BODY) },
-        // reconstruct: rebuild the result from a recorded value (HIT path only).
-        |v: serde_json::Value| match v.get("Ok").and_then(serde_json::Value::as_u64) {
-            Some(n) => deja::__private::Reconstructed::Value(Ok(n)),
-            None => deja::__private::Reconstructed::Failed(String::from(
-                "test codec: recorded payload carried no value",
-            )),
+        // ONE closure answers both halves of the lookup. The absorbing
+        // behaviour is no longer declared alongside it — the miss arm RETURNS
+        // `Synthesized`, so the observation records what the site actually did
+        // rather than what the seam was told to expect. A hand-built seam can
+        // no longer degrade gracefully while being scored as though the miss
+        // had killed the request, because there is no second place to say so.
+        |input| match input {
+            deja::__private::ReconstructInput::Hit(v) => {
+                match v.get("Ok").and_then(serde_json::Value::as_u64) {
+                    Some(n) => deja::__private::Reconstructed::Value(Ok(n)),
+                    None => deja::__private::Reconstructed::Failed(String::from(
+                        "test codec: recorded payload carried no value",
+                    )),
+                }
+            }
+            // The graceful degrade — a recoverable Err, NOT a panic.
+            deja::__private::ReconstructInput::Miss(_) => {
+                deja::__private::Reconstructed::Synthesized(Err(MISS_SENTINEL.to_string()))
+            }
         },
         // extract: (Value, is_error) image of a live result (record/execute path).
         |r: &Result<u64, String>| match r {
             Ok(n) => (json!({ "Ok": n }), false),
             Err(e) => (json!({ "Err": e }), true),
         },
-        // This boundary ABSORBS a miss, and says so, so the emitted observation
-        // records that the request survived rather than being stopped. A
-        // hand-built seam that passes an `on_miss` and leaves this `FailStop`
-        // would degrade silently: the miss would be scored as though it had
-        // killed the request while the request in fact carried on.
-        deja::MissPolicy::Absorb,
-        // on_miss: the graceful degrade — a recoverable Err, NOT a panic.
-        || Err(MISS_SENTINEL.to_string()),
     )
     .await
 }
@@ -146,8 +152,8 @@ fn substitute_miss_returns_on_miss_value_in_replay() {
     assert_eq!(
         result,
         Err(MISS_SENTINEL.to_string()),
-        "a Substitute MISS built with dispatch_async_or_miss must return the on_miss \
-         value (a recoverable Err) — NOT fail-stop, NOT serve a stale value"
+        "a Substitute MISS whose miss arm synthesizes must return that value (a \
+         recoverable Err) — NOT fail-stop, NOT serve a stale value"
     );
     assert_ne!(
         result,

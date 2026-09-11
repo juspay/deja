@@ -432,53 +432,47 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         }))
     };
 
-    // Which dispatch seam the shape below names, and the extra argument it takes.
-    // With no `on_miss` this is `dispatch` / `dispatch_async` and an EMPTY extra
-    // argument — byte-identical tokens to before, so no existing boundary changes
-    // behaviour. With `on_miss` it is the `_or_miss` twin plus the miss thunk.
+    // The MISS arm of the same closure. `on_miss = <expr>` is sugar for
+    // "synthesize this"; declaring nothing is sugar for "there is nothing
+    // deterministic to give here, stop" — the pre-existing default, now spelled
+    // as a value the site returns instead of a policy the seam infers.
     //
-    // The marker is built INSIDE the thunk (cold path) but its args image has to
-    // be cloned outside it, because the args value is moved into the lazy args
-    // thunk the seam consumes. That clone is paid per active-path call, so it is
-    // emitted ONLY when the miss expression actually names `__deja_miss`: a miss
-    // value that needs no attribution (`on_miss = None`) costs nothing.
-    let (sync_seam, async_seam, miss_prelude, miss_arg) = match &on_miss_expr {
-        None => (
-            quote!(dispatch),
-            quote!(dispatch_async),
-            TokenStream::new(),
-            TokenStream::new(),
-        ),
-        Some(expr) => {
-            let (prelude, thunk_body) = if mentions_miss_marker(expr) {
-                (
-                    quote! {
-                        let __deja_miss_args = ::std::clone::Clone::clone(&__deja_boundary_args);
-                    },
-                    quote! {
-                        let __deja_miss = ::deja::SubstituteMiss::new(
-                            #boundary,
-                            #component,
-                            #operation,
-                            __deja_miss_args,
-                        );
-                        #expr
-                    },
-                )
-            } else {
-                (TokenStream::new(), quote!(#expr))
-            };
-            // `MissPolicy::Absorb` rides alongside the thunk so the OBSERVATION
-            // can say the miss was absorbed. The hook writes that observation
-            // before the seam ever reaches its miss branch, so without this a
-            // miss the request survived and a miss that killed it are identical
-            // on the wire, and a run gets quieter and less trustworthy at once.
-            (
-                quote!(dispatch_or_miss),
-                quote!(dispatch_async_or_miss),
-                prelude,
-                quote!(::deja::MissPolicy::Absorb, move || { #thunk_body },),
-            )
+    // The seam builds the marker itself and only on the miss branch, so the
+    // args clone that used to be paid on EVERY active call at a boundary with
+    // an `on_miss` is now paid only when a call actually misses. The
+    // `mentions_miss_marker` gate is kept so an `on_miss` that needs no
+    // attribution still costs nothing at all.
+    let miss_arm: TokenStream = match &on_miss_expr {
+        None => quote! {
+            let _ = __deja_miss;
+            ::deja::__private::Reconstructed::NoValue
+        },
+        Some(expr) if mentions_miss_marker(expr) => quote! {
+            let __deja_miss = ::std::clone::Clone::clone(__deja_miss);
+            ::deja::__private::Reconstructed::Synthesized({ #expr })
+        },
+        Some(expr) => quote! {
+            let _ = __deja_miss;
+            ::deja::__private::Reconstructed::Synthesized({ #expr })
+        },
+    };
+
+    // ONE closure answers both halves of the lookup. The four capture-mode
+    // closures above stay exactly as they were — they are the HIT arm — and are
+    // wrapped here rather than each growing a miss branch of its own.
+    let reconstruct_closure: TokenStream = {
+        let hit_arm = reconstruct_closure;
+        quote! {
+            |__deja_input: ::deja::__private::ReconstructInput<'_>|
+                -> ::deja::__private::Reconstructed<#recon_ty>
+            {
+                match __deja_input {
+                    ::deja::__private::ReconstructInput::Hit(__deja_recorded) => {
+                        (#hit_arm)(__deja_recorded)
+                    }
+                    ::deja::__private::ReconstructInput::Miss(__deja_miss) => { #miss_arm }
+                }
+            }
         }
     };
 
@@ -514,14 +508,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
-                            #miss_prelude
-                            ::deja::__private::#async_seam(
+
+                            ::deja::__private::dispatch_async(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-                                #miss_arg
+
                             ).await
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -549,14 +543,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
-                            #miss_prelude
-                            ::std::boxed::Box::pin(::deja::__private::#async_seam(
+
+                            ::std::boxed::Box::pin(::deja::__private::dispatch_async(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move { #block.await },
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-                                #miss_arg
+
                             ))
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -581,14 +575,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
-                            #miss_prelude
-                            ::deja::__private::#sync_seam(
+
+                            ::deja::__private::dispatch(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 || #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-                                #miss_arg
+
                             )
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -1441,11 +1435,16 @@ mod tests {
         syn::parse2(src).expect("parse fn")
     }
 
-    /// `on_miss` routes to the `_or_miss` seam; its absence must leave the
-    /// emitted seam name exactly as it was, so no existing boundary's
-    /// continuation changes.
+    /// `on_miss` decides the miss arm's VALUE, not which seam is called.
+    ///
+    /// This replaces an assertion that a declared `on_miss` reached a
+    /// `dispatch_async_or_miss` twin. There is no twin any more: both shapes
+    /// call the same seam and differ only in what the reconstruct closure
+    /// returns for a miss. That is the point of the change — a site's
+    /// continuation is now something it RETURNS, so the observation can record
+    /// what actually happened instead of what the declaration promised.
     #[test]
-    fn on_miss_routes_to_the_or_miss_seam_and_its_absence_does_not() {
+    fn on_miss_decides_the_miss_arm_not_the_seam() {
         let declared = generate(
             parse_args(quote!(
                 boundary = "imc",
@@ -1460,8 +1459,12 @@ mod tests {
         )
         .to_string();
         assert!(
-            declared.contains("dispatch_async_or_miss"),
-            "a declared `on_miss` must reach the graceful seam: {declared}"
+            declared.contains("Synthesized"),
+            "a declared `on_miss` must make the miss arm synthesize: {declared}"
+        );
+        assert!(
+            !declared.contains("NoValue"),
+            "and must NOT also emit the stopping arm: {declared}"
         );
 
         let undeclared = generate(
@@ -1474,15 +1477,32 @@ mod tests {
         )
         .to_string();
         assert!(
-            !undeclared.contains("or_miss"),
-            "an undeclared site must keep the fail-stop seam: {undeclared}"
+            undeclared.contains("NoValue"),
+            "an undeclared site must keep stopping on a miss: {undeclared}"
         );
+        assert!(
+            !undeclared.contains("Synthesized"),
+            "an undeclared site must never synthesize: {undeclared}"
+        );
+
+        for (label, expanded) in [("declared", &declared), ("undeclared", &undeclared)] {
+            assert!(
+                !expanded.contains("or_miss"),
+                "{label}: the `_or_miss` seam is gone; both shapes call one seam: {expanded}"
+            );
+        }
     }
 
-    /// The marker costs an args clone, so it is built ONLY when the miss
-    /// expression asks for it.
+    /// The marker costs a clone, so it is bound ONLY when the miss expression
+    /// asks for it — and that clone is now on the COLD path.
+    ///
+    /// It used to be paid per active call: the seam knew nothing about the
+    /// marker, so the macro had to clone the args image outside the miss thunk,
+    /// before anyone knew whether the call would miss. The seam builds the
+    /// marker itself now, from the spec it already holds, so `__deja_miss_args`
+    /// is gone entirely and only a genuine miss pays anything.
     #[test]
-    fn the_miss_marker_is_built_only_when_the_expression_names_it() {
+    fn the_miss_marker_is_bound_only_when_the_expression_names_it() {
         let plain = generate(
             parse_args(quote!(
                 boundary = "imc",
@@ -1497,8 +1517,8 @@ mod tests {
         )
         .to_string();
         assert!(
-            !plain.contains("SubstituteMiss"),
-            "a miss value that needs no attribution must not pay for the marker: {plain}"
+            !plain.contains("clone (__deja_miss)"),
+            "a miss value that needs no attribution must not clone the marker: {plain}"
         );
 
         let attributed = generate(
@@ -1515,9 +1535,18 @@ mod tests {
         )
         .to_string();
         assert!(
-            attributed.contains("SubstituteMiss"),
-            "an expression naming `__deja_miss` must get the marker: {attributed}"
+            attributed.contains("clone (__deja_miss)"),
+            "an expression naming `__deja_miss` must get an owned marker, so the \
+             expression it was written against still compiles: {attributed}"
         );
+
+        for (label, expanded) in [("plain", &plain), ("attributed", &attributed)] {
+            assert!(
+                !expanded.contains("__deja_miss_args"),
+                "{label}: the per-active-call args clone must be gone — the seam \
+                 builds the marker on the miss branch now: {expanded}"
+            );
+        }
     }
 
     /// `on_miss` under Execute would never fire. A declaration that does nothing

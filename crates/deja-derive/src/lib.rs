@@ -68,7 +68,21 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// By default a `Substitute` boundary whose replay lookup MISSES fail-stops: it
 /// panics, the host's request guard contains the unwind, and the correlation is
 /// scored as a stop. `on_miss = <expr>` replaces that continuation with a value
-/// the DECLARATION SITE supplies:
+/// the DECLARATION SITE supplies.
+///
+/// Mechanically it is sugar for the MISS ARM of the reconstruct closure the
+/// macro already emits: `on_miss = <expr>` becomes
+/// `Reconstructed::Synthesized(<expr>)`, and declaring nothing becomes
+/// `Reconstructed::NoValue`, which is the fail-stop. Both go through one seam.
+///
+/// The value must be a function of the miss — see `__deja_miss` below — and not
+/// of anything ambient. Determinism is the property that matters, ahead of
+/// honesty: replay needs `same query -> same value, every run`, or two replays
+/// of one candidate against one tape disagree with each other and "the candidate
+/// changed" cannot be told apart from "the fabrication changed". Answering a
+/// miss by running the real computation is the most honest option and the worst
+/// one — at a `deja::id` seam it reintroduces exactly the entropy the seam
+/// exists to remove, on the calls the seam failed to cover.
 ///
 /// ```ignore
 /// #[deja::boundary(boundary = "imc", replay = Substitute, on_miss = None)]
@@ -83,8 +97,8 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// constructs the host's error: it cannot name an `E` a `replay_ok` site never
 /// declares. The site can, which is the whole inversion.
 ///
-/// This does NOT hide the miss. The blocking NovelCall divergence is emitted by
-/// the lookup before `on_miss` is reached; only the continuation changes, so the
+/// This does NOT hide the miss. The seam emits the blocking NovelCall divergence
+/// before it returns the value; only the continuation changes, so the
 /// subtree that needed the value diverges and the graph tier localises it
 /// instead of the request dying with no response at all.
 ///
