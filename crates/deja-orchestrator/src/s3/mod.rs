@@ -32,11 +32,34 @@ pub use deja_compactor::S3Config;
 /// answering costs one manifest GET (plus one sidecar GET for the rows).
 pub use deja_compactor::{correlation_count, read_correlation_index, CorrelationSummary};
 
+/// The prefix every sealed session lives under. Named here rather than spelled
+/// inline so the one place a selection's `prefix` is derived cannot drift from
+/// the layout that produces the per-session roots.
+const SESSIONS_ROOT: &str = "sessions/v1";
+
 /// What `pull_recording` reports back (persisted next to the events file,
 /// registered as a run artifact, folded into the catalog row).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IngestReport {
+    /// Where the events came from, as a KEY PREFIX and always a path. For one
+    /// recording that is its session root; for a selection it is the root they
+    /// share, because no single session root describes a selection and naming
+    /// one of them would name a fraction of it.
+    ///
+    /// Deliberately never prose. This is a serialised field persisted beside
+    /// the events file and folded into the catalog row, so a consumer outside
+    /// this repo may be doing something with it that a grep here cannot find.
+    /// "82 recordings" would read as fine in the log line it currently feeds
+    /// and break anything treating it as a path — a value-shape change hiding
+    /// inside an unchanged type.
     pub prefix: String,
+    /// The recordings this pull actually drew from, in the order they were
+    /// read.
+    ///
+    /// This is what tells a reader one session from a selection, STRUCTURALLY
+    /// rather than by parsing `prefix`. One entry is a single recording; many
+    /// is a deployment's day pulled as one tape.
+    pub members: Vec<String>,
     pub landing_objects: usize,
     pub lines_in: usize,
     pub duplicates_dropped: usize,
@@ -721,9 +744,16 @@ impl PullTally {
         }
     }
 
-    fn finish(self, prefix: String) -> IngestReport {
+    fn finish(self, members: Vec<String>) -> IngestReport {
         IngestReport {
-            prefix,
+            // One member names its own session root. Several share only the
+            // prefix every session lives under, and saying that is both true
+            // and still a path — `members` carries which ones.
+            prefix: match members.as_slice() {
+                [only] => deja_compactor::layout::session_root(only),
+                _ => SESSIONS_ROOT.to_owned(),
+            },
+            members,
             landing_objects: self.landing_objects,
             lines_in: self.lines_in,
             duplicates_dropped: self.duplicates_dropped,
@@ -830,13 +860,7 @@ pub fn pull_recordings(
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
 
-    // One member names its own session root; several name the selection,
-    // because no single session root describes what was pulled and reporting
-    // one of them would name a fraction of it.
-    let report = tally.finish(match recording_ids {
-        [only] => deja_compactor::layout::session_root(only),
-        many => format!("{} recordings", many.len()),
-    });
+    let report = tally.finish(recording_ids.iter().map(|id| (*id).to_owned()).collect());
     report.report();
     Ok((report, manifests))
 }
@@ -992,7 +1016,12 @@ pub fn pull_recording_from_prefix(
         .unwrap_or_default();
 
     let report = IngestReport {
+        // This path names an ARBITRARY landing prefix rather than a session
+        // root — it is the deployed-aggregator rescan, not a sealed pull — so
+        // the prefix is that bucket URI and `members` still names the one
+        // session the scan resolved out of it.
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
+        members: vec![resolved.clone()],
         landing_objects: session_objects,
         lines_in: collated.lines_in,
         duplicates_dropped: collated.drops.duplicates,
@@ -1272,6 +1301,40 @@ mod tests {
     /// selection, not the last member folded in — a pull of a deployment's day
     /// that reported one pod's numbers would understate it by eighty-one
     /// eighty-seconds and look entirely plausible doing it.
+    /// `prefix` stays a PATH whatever the member count, and `members` is what
+    /// says one session from a selection.
+    ///
+    /// This field is serialised beside the events file and folded into the
+    /// catalog row, so it has readers outside this repo that a grep here cannot
+    /// enumerate. Putting a count in it — "82 recordings" — would have read as
+    /// fine in the log line it currently feeds and broken anything treating it
+    /// as a path: a value-shape change hiding inside an unchanged type.
+    #[test]
+    fn the_prefix_stays_a_path_and_members_says_how_many() {
+        let one = PullTally::default().finish(vec!["rec-a".to_owned()]);
+        assert_eq!(one.prefix, "sessions/v1/rec-a", "one member names its root");
+        assert_eq!(one.members, vec!["rec-a".to_owned()]);
+
+        let many = PullTally::default().finish(vec!["rec-a".to_owned(), "rec-b".to_owned()]);
+        assert_eq!(
+            many.prefix, "sessions/v1",
+            "a selection names the root they share, not a count"
+        );
+        // The property, stated properly. "not a count" cannot be checked by
+        // looking for digits — `sessions/v1` has one — so check the thing that
+        // actually matters: the reported prefix really is a PREFIX of where
+        // every member lives. A count could never satisfy that.
+        for m in &many.members {
+            let root = deja_compactor::layout::session_root(m);
+            assert!(
+                root.starts_with(&many.prefix),
+                "{root} does not live under the reported prefix {}",
+                many.prefix
+            );
+        }
+        assert_eq!(many.members.len(), 2, "the member list carries the truth");
+    }
+
     #[test]
     fn a_multi_member_pull_sums_its_members() {
         let mut tally = PullTally::default();
@@ -1287,7 +1350,7 @@ mod tests {
             a_member(&[at_boundary("i2", 0, "c2", 0, "http_incoming")]),
         );
 
-        let report = tally.finish("2 recordings".to_owned());
+        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()]);
         assert_eq!(report.landing_objects, 8, "3 + 5");
         assert_eq!(report.correlations, 6, "2 + 4");
         assert_eq!(report.events_out, 3, "2 + 1");
@@ -1318,7 +1381,7 @@ mod tests {
         // union rather than a single member surviving.
         assert_eq!(tally.per_correlation.len(), 2, "both correlations held");
 
-        let report = tally.finish("2 recordings".to_owned());
+        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()]);
         assert_eq!(
             report.delivery.correlations_checked, 2,
             "admission saw both members' correlations, not just the last"
@@ -1427,6 +1490,7 @@ mod tests {
         assert_eq!(drops.non_envelope, 2); // the junk line and the payload-less envelope
 
         let report = IngestReport {
+            members: vec!["rec-test".to_owned()],
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in,
@@ -1447,6 +1511,7 @@ mod tests {
     fn an_unbalanced_report_says_so() {
         // The assertion has to be able to fail, or it is decoration.
         let report = IngestReport {
+            members: vec!["rec-test".to_owned()],
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 139_916,
