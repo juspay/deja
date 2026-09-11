@@ -768,10 +768,22 @@ fn stage_resolve_recording(
     ctx: &StoreCtx,
     total: u32,
 ) -> Result<String, String> {
+    // A GROUP wins over a single id when both are set, and says so rather than
+    // resolving one silently. Naming both is a caller that has not decided, and
+    // discovering which won by reading the tape afterwards is the failure this
+    // whole area keeps producing.
+    if run.spec.recording_group.is_some() && run.spec.recording_id.is_some() {
+        return Err(
+            "both recording_group and recording_id are set; name a deployment's day or one \
+             recording, not both"
+                .to_owned(),
+        );
+    }
     let wanted = run
         .spec
-        .recording_id
+        .recording_group
         .clone()
+        .or_else(|| run.spec.recording_id.clone())
         .or_else(|| run.recording_id.clone());
     let s3_source = run.spec.s3_source.clone();
     let recording_id = match &s3_source {
@@ -4953,6 +4965,17 @@ fn wait_s3_objects(recording_id: &str, system: &str, timeout: Duration) -> Resul
 /// streams the data parts (see `deja-compactor`). The ingest report and the
 /// sealing manifest are persisted next to the events file and registered as
 /// artifacts; the recording catalog row upserts from the manifest.
+/// Whether a name is a GROUP — a deployment and a day — rather than one
+/// recording.
+///
+/// A group is `<revision>-<MMDD>` and a recording is `rec-…` or `run-…`, so the
+/// prefix settles it without a lookup. Deliberately not "does it parse as a
+/// recording id", which would call an unparseable typo a group and then fail
+/// with "names no recordings" instead of saying the id is malformed.
+fn is_group(name: &str) -> bool {
+    !name.starts_with("rec-") && !name.starts_with("run-")
+}
+
 fn pull_recording(
     root: &HarnessRoot,
     ctx: &StoreCtx,
@@ -4998,9 +5021,60 @@ fn pull_recording(
         resolve_recording_from_source(root, ctx, &source, Some(recording_id))?;
         return Ok(());
     }
+    // A GROUP names a deployment's day; a plain id names one pod's slice of it.
+    // The members are resolved HERE rather than by the caller so a run records
+    // what it actually drove: a group that has grown since it was chosen
+    // resolves to more members, and the ingest report names every one.
+    let members: Vec<String> = match crate::group_of(&crate::parse_recording_id(recording_id)) {
+        // The id parses as a member of a group, so it IS one recording — the
+        // caller named a pod, not a day. Left alone.
+        _ if !is_group(recording_id) => vec![recording_id.to_owned()],
+        _ => {
+            let found = deja_compactor::list_landed_recordings(&cfg, &landing_root)?;
+            let mut ids: Vec<String> = found
+                .into_iter()
+                .filter(|r| {
+                    crate::group_of(&crate::parse_recording_id(&r.session_id)).as_deref()
+                        == Some(recording_id)
+                })
+                .map(|r| r.session_id)
+                .collect();
+            // Stable order so two runs of the same group produce the same tape,
+            // and so a diff between them is about the recording rather than
+            // about which order the listing happened to return.
+            ids.sort();
+            if ids.is_empty() {
+                return Err(format!(
+                    "group {recording_id} names no recordings in {}/{landing_root} — it may be \
+                     a day nothing has sealed yet, or a revision that never ran here",
+                    cfg.bucket
+                ));
+            }
+            let line = format!(
+                "group {recording_id} resolves to {} recording(s)",
+                ids.len()
+            );
+            eprintln!("lifecycle: {line}");
+            ctx.log("ingest", &line);
+            ids
+        }
+    };
+
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
-    let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &landing_root, &dest)?;
-    let gaps: usize = manifest.instances.iter().map(|i| i.gaps.len()).sum();
+    let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+    let (report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &landing_root, &dest)?;
+    // Gaps are per instance and instances do not span members, so the sum over
+    // every member's manifest is the selection's gap count rather than a
+    // double-count.
+    let gaps: usize = manifests
+        .iter()
+        .flat_map(|m| m.instances.iter())
+        .map(|i| i.gaps.len())
+        .sum();
+    let manifest = manifests
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no manifest for {recording_id}"))?;
     let line = format!(
         "ingested {recording_id}: {} landing object(s), {} line(s), {} duplicate(s) dropped → \
          {} event(s), {} correlation(s), {} gap(s), sealed",
@@ -5154,6 +5228,20 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+    /// A group name and a recording id are told apart by their PREFIX, not by
+    /// whether they parse. A malformed id must report itself malformed rather
+    /// than be mistaken for a group and fail later with "names no recordings",
+    /// which sends a reader looking for a day that was never the question.
+    #[test]
+    fn a_group_is_told_from_a_recording_by_its_prefix() {
+        assert!(super::is_group("4157177-0910"), "a deployment's day");
+        assert!(!super::is_group("rec-4157177-09101430-xc"), "one pod");
+        assert!(!super::is_group("run-1788907613122648573"), "boot-derived");
+        assert!(
+            !super::is_group("rec-typo"),
+            "a malformed recording id is a recording, not a group"
+        );
+    }
 
     /// The refusal reaches the PULL PATH, not just the resolver.
     ///
@@ -5884,6 +5972,7 @@ mod tests {
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: None,
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: None,
                 workload,
@@ -5956,6 +6045,7 @@ mod tests {
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: Some(recording_id.to_owned()),
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: filter,
                 workload: serde_json::Value::Null,
@@ -6687,6 +6777,7 @@ mod tests {
                 },
                 candidate_repo: None,
                 recording_id: Some(recording_id.to_owned()),
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: Some(vec!["c-driven-1".to_owned(), "c-driven-2".to_owned()]),
                 workload: serde_json::Value::Null,

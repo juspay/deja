@@ -138,6 +138,7 @@ fn write_run(root: &HarnessRoot, run_id: &str, recording_id: &str, filter: Optio
             },
             candidate_repo: None,
             recording_id: Some(recording_id.to_owned()),
+            recording_group: None,
             s3_source: None,
             correlation_filter: filter,
             workload: serde_json::Value::Null,

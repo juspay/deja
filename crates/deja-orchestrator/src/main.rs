@@ -2242,6 +2242,7 @@ mod tests {
                 },
                 candidate_repo: None,
                 recording_id: Some("rec-1".to_owned()),
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: None,
                 workload: serde_json::Value::Null,

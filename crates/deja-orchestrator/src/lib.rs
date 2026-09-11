@@ -263,6 +263,20 @@ pub struct RunSpec {
     /// the SESSION FILTER (the envelope's `capture.session_id`); leave unset
     /// to auto-resolve when the scanned prefix holds exactly one session.
     pub recording_id: Option<String>,
+    /// For mode=replay: drive a DEPLOYMENT'S DAY rather than one pod's slice.
+    ///
+    /// `<revision>-<MMDD>`, the value a recording reports as its `group`. The
+    /// recordings of one deployment on one day are spread across however many
+    /// pods served it — seventy-five on the day this was measured, because pods
+    /// are replaced every thirty minutes — so naming one of them replays a
+    /// fraction for no reason a caller could state.
+    ///
+    /// Resolved to its members when the tape is pulled, and the members are
+    /// recorded in the ingest report, so what a run actually drove is
+    /// answerable afterwards rather than inferred from a group name that may
+    /// have grown since. Mutually exclusive with `recording_id`: naming both
+    /// would leave which one won to be discovered.
+    pub recording_group: Option<String>,
     /// For mode=replay: pull the recording from an arbitrary S3 prefix in the
     /// deployed aggregator layout (date-partitioned gzip envelope NDJSON)
     /// instead of the demo MinIO session layout.
@@ -610,6 +624,47 @@ pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
         revision: revision.to_owned(),
         recorded_at: recorded_at.to_owned(),
         instance: instance.to_owned(),
+    }
+}
+
+/// The deployment-and-day a recording belongs to, or `None` when its id does not
+/// name BOTH a revision and a start date.
+///
+/// Both, and the distinction is live rather than theoretical. A row's
+/// `identity.revision` can come from the MANIFEST when the id does not carry
+/// one (`revision_source: "manifest"`), so a boot-derived recording can report
+/// a revision and still have no group — `run-1789076520165195354` does exactly
+/// that today, with revision `28d8299` and 59 correlations. The manifest
+/// supplies the revision; nothing supplies the day, because the id has no start
+/// date and the recording's own `latest_date` is the day it last WROTE, which
+/// for a session straddling midnight is not the day it belongs to.
+///
+/// Grouping it by the wrong day would put a recording in a selection whose
+/// scope nobody named, which is worse than leaving it ungroupable: the pipeline
+/// already excludes these on the main-deployment test, so nothing is lost by
+/// declining to guess.
+///
+/// `<revision>-<MMDD>`, derived rather than stored. The id ALREADY carries the
+/// minute a recording started, so the day is a prefix of something every
+/// recording has had all along — no new id shape, nothing to mint, and every
+/// recording ever sealed is groupable the moment this ships.
+///
+/// This is the unit a replay actually wants. A pod's recording is an arbitrary
+/// slice: pods are replaced every thirty minutes, so "the traffic this
+/// deployment served that day" is spread across dozens of them — 82 on the day
+/// this was measured — and picking one is picking a fraction for no reason a
+/// caller could state.
+pub fn group_of(identity: &RecordingIdentity) -> Option<String> {
+    match identity {
+        RecordingIdentity::Described {
+            revision,
+            recorded_at,
+            ..
+        } => Some(format!(
+            "{revision}-{}",
+            &recorded_at[..4.min(recorded_at.len())]
+        )),
+        _ => None,
     }
 }
 
@@ -1160,6 +1215,7 @@ mod run_params_tests {
             },
             candidate_repo: None,
             recording_id: None,
+            recording_group: None,
             s3_source: Some(S3Source {
                 path: "s3://deja/recordings/2026-08-05".to_owned(),
                 region: None,
