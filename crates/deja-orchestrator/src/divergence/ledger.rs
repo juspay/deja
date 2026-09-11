@@ -963,6 +963,7 @@ mod tests {
                 entries.push(deja::LookupEntry {
                     key: key(Address::SpanPath {
                         path: path.clone(),
+                        boundary: String::new(),
                         operation: String::new(),
                     }),
                     result: ev.result.clone(),
@@ -972,7 +973,7 @@ mod tests {
         }
         deja::LookupTable {
             recording_id: "rec".to_owned(),
-            policy_version: 1,
+            policy_version: deja::KEY_POLICY_VERSION,
             entries,
         }
     }

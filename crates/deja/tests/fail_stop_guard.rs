@@ -90,7 +90,7 @@ fn fail_stop_is_contained_at_the_guard_and_never_runs_the_boundary() {
     // Empty lookup table → every lookup misses.
     let table = deja::LookupTable {
         recording_id: "fail-stop-guard-test".to_string(),
-        policy_version: 1,
+        policy_version: deja::KEY_POLICY_VERSION,
         entries: vec![],
     };
     let dir = tempfile::tempdir().expect("tempdir");

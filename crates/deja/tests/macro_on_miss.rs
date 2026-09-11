@@ -127,7 +127,7 @@ fn install_replay_hook() {
     ONCE.call_once(|| {
         let table = deja::LookupTable {
             recording_id: "macro-on-miss-test".to_string(),
-            policy_version: 1,
+            policy_version: deja::KEY_POLICY_VERSION,
             entries: vec![],
         };
         let dir = tempfile::tempdir().expect("tempdir");

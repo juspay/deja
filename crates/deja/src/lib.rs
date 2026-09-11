@@ -35,6 +35,7 @@ pub use deja_runtime::replay::{
     addresses_for, canonical_args_hash, Address, FileObservedSink, InMemoryObservedSink,
     KeyStamper, LocalFileLookupSource, LookupEntry, LookupKey, LookupTable, LookupTableHook,
     LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
+    KEY_POLICY_VERSION,
 };
 pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_execute_mode};
 pub use deja_runtime::replay::{
