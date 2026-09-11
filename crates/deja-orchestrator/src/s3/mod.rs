@@ -658,19 +658,142 @@ pub fn count_session_objects(
 /// Pull a session recording into `dest` (the canonical
 /// `{root}/recordings/{id}/events.jsonl` slot), compacting first if the
 /// session isn't sealed yet. Returns the ingest report plus the manifest.
+/// What several members add up to, kept apart from the IO that produces them.
+///
+/// Separated so the arithmetic is testable without a store: `pull_recordings`
+/// needs a real `S3Config` and has never had a unit test, while THIS is where a
+/// multi-member pull can actually be wrong — a count that fails to sum, a
+/// correlation lost to a collision, an instance's dropped ranges overwritten.
+#[derive(Default)]
+struct PullTally {
+    per_correlation: std::collections::BTreeMap<String, CorrelationTrace>,
+    markers: MarkerLedger,
+    landing_objects: usize,
+    lines_in: usize,
+    duplicates_dropped: usize,
+    events_out: usize,
+    correlations: usize,
+    drops: DropCounts,
+}
+
+impl PullTally {
+    /// Fold one member in. Consumes its `Collated` so the events it carries are
+    /// released here rather than held until the pull ends — which is the bound
+    /// the member-at-a-time loop exists for.
+    fn absorb(&mut self, counts: &deja_compactor::Counts, collated: Collated) {
+        self.landing_objects += counts.landing_objects;
+        self.correlations += counts.correlations;
+        self.lines_in += collated.lines_in;
+        self.events_out += collated.events.len();
+        // The member's own duplicates were dropped when it was sealed, so they
+        // are outside this pass's line accounting and are added separately from
+        // what collate saw.
+        self.duplicates_dropped += counts.duplicates_dropped + collated.drops.duplicates;
+        self.drops.duplicates += collated.drops.duplicates;
+        self.drops.markers += collated.drops.markers;
+        self.drops.non_envelope += collated.drops.non_envelope;
+        self.drops.unparseable += collated.drops.unparseable;
+        // Correlations cannot span members — one is allocated inside one
+        // process for one request — so these keys cannot collide and extending
+        // is a union rather than a merge that has to resolve anything.
+        self.per_correlation.extend(collated.per_correlation);
+        self.markers.seen += collated.markers.seen;
+        self.markers.unreadable += collated.markers.unreadable;
+        self.markers.checkpoints += collated.markers.checkpoints;
+        // An instance writes one session for its life, so a key here cannot
+        // collide across members in practice — and a sealed session carries no
+        // markers at all, because the compactor drops them when it builds one.
+        // Merged rather than overwritten anyway: if that ever stops holding,
+        // losing an instance's dropped ranges would UNDERSTATE loss, which is
+        // the direction that reads healthier than the truth.
+        for (instance, delivery) in collated.markers.by_instance {
+            match self.markers.by_instance.entry(instance) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(delivery);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    let held = o.get_mut();
+                    held.eof |= delivery.eof;
+                    held.last_seq = held.last_seq.max(delivery.last_seq);
+                    held.dropped_ranges.extend(delivery.dropped_ranges);
+                }
+            }
+        }
+    }
+
+    fn finish(self, prefix: String) -> IngestReport {
+        IngestReport {
+            prefix,
+            landing_objects: self.landing_objects,
+            lines_in: self.lines_in,
+            duplicates_dropped: self.duplicates_dropped,
+            events_out: self.events_out,
+            correlations: self.correlations,
+            sealed: true,
+            markers_dropped: self.drops.markers,
+            non_envelope_dropped: self.drops.non_envelope,
+            unparseable_dropped: self.drops.unparseable,
+            // The compactor skips marker lines when it builds a session, so a
+            // sealed session carries no producer audit trail and the
+            // certificate rests on the event stream alone. Admission does not
+            // need the markers — they only tell an admitted gap from an
+            // admitted loss.
+            delivery: certify(self.per_correlation, self.markers),
+        }
+    }
+}
+
 pub fn pull_recording(
     cfg: &S3Config,
     recording_id: &str,
     root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, deja_compactor::SessionManifest), String> {
-    let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
-        Some(m) => m,
-        None => deja_compactor::compact_session(cfg, recording_id, root)?,
-    };
-    let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
-    let chunk = lines.join("\n").into_bytes();
-    let collated = collate(&[chunk]);
+    let (report, mut manifests) = pull_recordings(cfg, &[recording_id], root, dest)?;
+    // One member in, one manifest out. Delegating rather than keeping a second
+    // implementation is the point: the single-recording path IS the many-member
+    // path with one member, so it cannot drift from it.
+    let manifest = manifests
+        .pop()
+        .ok_or_else(|| format!("no manifest for {recording_id}"))?;
+    Ok((report, manifest))
+}
+
+/// Pull SEVERAL sealed recordings into one local tape, for replaying a
+/// deployment's day as a single run instead of one run per pod.
+///
+/// MEMBER AT A TIME, and that is the whole design. Each member is read,
+/// collated, written out and dropped before the next is touched, so the peak
+/// is bounded by the LARGEST SINGLE MEMBER rather than by their sum.
+/// `pull_recording` holds a tape three times over — the owned lines, the joined
+/// bytes, and the parsed events — so reading a whole selection at once costs
+/// roughly three times its total: a measured 82-member day is 1.46 GB of parts
+/// and would be ~4.4 GB resident against a 4 GiB runner. Member at a time, the
+/// same day peaks at the largest member seen, about 69 MB, so ~200 MB.
+///
+/// CONCATENATION, NOT MERGING, and it is worth saying why that is sound rather
+/// than convenient. Members are separate recorder processes:
+/// `global_sequence` comes from a per-process counter, so there is no ordering
+/// ACROSS members to preserve — the question does not exist. A correlation is
+/// allocated inside one process for one request, so it cannot span members
+/// either. The scorer works per correlation. So appending each member's already
+/// sorted lines is not an approximation of a merge; a merge would be answering
+/// a question nothing asks, and would carry an ordering assumption of exactly
+/// the kind that has been wrong twice in this codebase.
+///
+/// What DOES accumulate across members is the per-correlation trace and the
+/// marker ledger, because admission is judged over the whole selection. Those
+/// are small — sequence pairs per correlation, not events — so accumulating
+/// them does not reintroduce the bound this avoids.
+pub fn pull_recordings(
+    cfg: &S3Config,
+    recording_ids: &[&str],
+    root: &str,
+    dest: &Path,
+) -> Result<(IngestReport, Vec<deja_compactor::SessionManifest>), String> {
+    if recording_ids.is_empty() {
+        return Err("no recordings named for this pull".to_owned());
+    }
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -678,35 +801,44 @@ pub fn pull_recording(
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
-    for (_, _, _, line) in &collated.events {
-        out.write_all(line.as_bytes())
-            .and_then(|_| out.write_all(b"\n"))
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+
+    let mut manifests: Vec<deja_compactor::SessionManifest> =
+        Vec::with_capacity(recording_ids.len());
+    let mut tally = PullTally::default();
+
+    for recording_id in recording_ids {
+        let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
+            Some(m) => m,
+            None => deja_compactor::compact_session(cfg, recording_id, root)?,
+        };
+        // Scoped so the lines, the joined bytes and the parsed events are all
+        // released before the next member is read. Without this the peak is the
+        // sum again and the bound above is a comment rather than a property.
+        {
+            let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
+            let chunk = lines.join("\n").into_bytes();
+            drop(lines);
+            let collated = collate(&[chunk]);
+            for (_, _, _, line) in &collated.events {
+                out.write_all(line.as_bytes())
+                    .and_then(|_| out.write_all(b"\n"))
+                    .map_err(|e| format!("write {}: {e}", dest.display()))?;
+            }
+            tally.absorb(&manifest.counts, collated);
+        }
+        manifests.push(manifest);
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
 
-    let report = IngestReport {
-        prefix: deja_compactor::layout::session_root(recording_id),
-        landing_objects: manifest.counts.landing_objects,
-        lines_in: collated.lines_in,
-        // The manifest's own duplicates were dropped when the session was
-        // sealed, so they are outside this pass's line accounting and are
-        // reported separately from what collate saw.
-        duplicates_dropped: manifest.counts.duplicates_dropped + collated.drops.duplicates,
-        events_out: collated.events.len(),
-        correlations: manifest.counts.correlations,
-        sealed: true,
-        markers_dropped: collated.drops.markers,
-        non_envelope_dropped: collated.drops.non_envelope,
-        unparseable_dropped: collated.drops.unparseable,
-        // The compactor skips marker lines when it builds a session, so a
-        // sealed session carries no producer audit trail and the certificate
-        // below rests on the event stream alone. Admission does not need the
-        // markers — they only tell an admitted gap from an admitted loss.
-        delivery: certify(collated.per_correlation, collated.markers),
-    };
+    // One member names its own session root; several name the selection,
+    // because no single session root describes what was pulled and reporting
+    // one of them would name a fraction of it.
+    let report = tally.finish(match recording_ids {
+        [only] => deja_compactor::layout::session_root(only),
+        many => format!("{} recordings", many.len()),
+    });
     report.report();
-    Ok((report, manifest))
+    Ok((report, manifests))
 }
 
 /// Sessions discovered in a prefix scan: `(session_id, envelope line count)`,
@@ -1118,6 +1250,79 @@ mod tests {
             instance,
             &format!(r#"{{"kind":"dropped","ranges":[[{from},{to}]]}}"#),
         )
+    }
+
+    fn a_member(lines: &[String]) -> Collated {
+        let chunk = lines.join("\n").into_bytes();
+        collate(&[chunk])
+    }
+
+    fn counts_of(objects: usize, correlations: usize, dupes: usize) -> deja_compactor::Counts {
+        deja_compactor::Counts {
+            landing_objects: objects,
+            lines_in: 0,
+            events: 0,
+            duplicates_dropped: dupes,
+            correlations,
+            graph_nodes: 0,
+        }
+    }
+
+    /// Several members add up. The counts a caller reads must describe the whole
+    /// selection, not the last member folded in — a pull of a deployment's day
+    /// that reported one pod's numbers would understate it by eighty-one
+    /// eighty-seconds and look entirely plausible doing it.
+    #[test]
+    fn a_multi_member_pull_sums_its_members() {
+        let mut tally = PullTally::default();
+        tally.absorb(
+            &counts_of(3, 2, 1),
+            a_member(&[
+                at_boundary("i1", 0, "c1", 0, "http_incoming"),
+                at_boundary("i1", 1, "c1", 1, "db"),
+            ]),
+        );
+        tally.absorb(
+            &counts_of(5, 4, 2),
+            a_member(&[at_boundary("i2", 0, "c2", 0, "http_incoming")]),
+        );
+
+        let report = tally.finish("2 recordings".to_owned());
+        assert_eq!(report.landing_objects, 8, "3 + 5");
+        assert_eq!(report.correlations, 6, "2 + 4");
+        assert_eq!(report.events_out, 3, "2 + 1");
+        assert_eq!(report.lines_in, 3);
+        assert_eq!(
+            report.duplicates_dropped, 3,
+            "the members' own sealed duplicates, 1 + 2, carried through"
+        );
+    }
+
+    /// Correlations from different members both survive into admission. They
+    /// cannot collide — one is allocated inside one process for one request —
+    /// so the union must keep both, and admission is judged over the whole
+    /// selection rather than over whichever member happened to be last.
+    #[test]
+    fn correlations_from_every_member_reach_admission() {
+        let mut tally = PullTally::default();
+        tally.absorb(
+            &counts_of(1, 1, 0),
+            a_member(&[at_boundary("i1", 0, "c1", 0, "http_incoming")]),
+        );
+        tally.absorb(
+            &counts_of(1, 1, 0),
+            a_member(&[at_boundary("i2", 0, "c2", 0, "http_incoming")]),
+        );
+
+        // The precondition: two DISTINCT correlations went in, so this tests the
+        // union rather than a single member surviving.
+        assert_eq!(tally.per_correlation.len(), 2, "both correlations held");
+
+        let report = tally.finish("2 recordings".to_owned());
+        assert_eq!(
+            report.delivery.correlations_checked, 2,
+            "admission saw both members' correlations, not just the last"
+        );
     }
 
     #[test]
