@@ -531,6 +531,29 @@ mod tests {
         assert_eq!(p.s3_bucket.as_deref(), Some("ucs-deja"));
         assert!(!p.manages_stores && !p.has_code_bundle);
         assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
+        // Declared, so a caller asking to be restricted to main instances is
+        // served rather than refused. Asserted as the SELECTION it performs and
+        // not as a string, because the string alone cannot fail usefully: the
+        // prefix has to admit the pods UCS actually deploys and reject a tape
+        // written outside that deployment, and both of those are live today.
+        let main_pods = p
+            .main_instance_prefix
+            .as_deref()
+            .expect("prism declares its primary deployment");
+        assert!(
+            "sbx-custom-hyperswitch-ucs-5dd9b6457d-tbvn6".starts_with(main_pods),
+            "the prefix must admit a UCS deployment pod"
+        );
+        assert!(
+            !"pi-1-1787741712798221595".starts_with(main_pods),
+            "a tape from outside the deployment must not pass as a main instance"
+        );
+        // Anchored, not a substring — the distinction that keeps this from
+        // behaving like `instance_pattern` above.
+        assert!(
+            !"prod-sbx-custom-hyperswitch-ucs-1".starts_with(main_pods),
+            "the prefix is anchored at the start of the pod name"
+        );
         assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
         assert!(
             p.reply_canons.is_empty(),
@@ -613,6 +636,16 @@ manages_stores = false
 has_code_bundle = false
 job_template_key = "job.prism.json"
 instance_pattern = "ucs"
+# Which pods are the PRIMARY deployment. Note this is a `sbx-custom-` name,
+# which for hyperswitch above marks a pod to EXCLUDE: there, custom pods carry
+# their own code and the main deployment is `sbx-hyperswitch-server-`. UCS has
+# no such pair — every pod it records from is `sbx-custom-hyperswitch-ucs-`, so
+# for this system that prefix IS the primary deployment rather than the thing
+# selection avoids. Do not "correct" it to match hyperswitch's shape.
+# What it excludes is the other kind of stray: recordings written outside the
+# deployment entirely, like `pi-1-<nanos>`, which is a boot-derived local tape
+# no pull-request replay wants to be compared against.
+main_instance_prefix = "sbx-custom-hyperswitch-ucs-"
 scored_span_namespaces = ["ucs::", "connector::"]"#;
 
     #[test]

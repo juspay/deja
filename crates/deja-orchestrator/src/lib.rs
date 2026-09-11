@@ -563,11 +563,19 @@ pub enum RecordingIdentity {
         instance: String,
     },
     /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
-    /// boot. The prism recorder always mints these — but so did the router
-    /// recorder before ids carried a revision, so the SHAPE alone does not
-    /// name the system; a router tape wearing this id was once badged "prism"
-    /// and replayed against a prism candidate, which reset every connection.
-    /// The `inst=` pod names captured by the scan are the discriminator.
+    /// boot. Both recorders once minted these — prism until it moved to the
+    /// described form, and the router before ids carried a revision — so the
+    /// SHAPE alone does not name the system; a router tape wearing this id was
+    /// once badged "prism" and replayed against a prism candidate, which reset
+    /// every connection. The `inst=` pod names captured by the scan are the
+    /// discriminator.
+    ///
+    /// It is a legacy shape now rather than anyone's default: of the sixteen
+    /// prism recordings live when this was written, fifteen were `rec-` and the
+    /// one boot-derived tape was from a `pi-1-<nanos>` instance outside the
+    /// deployment. Both systems mint described ids today, which is why grouping
+    /// works for both — see `group_of`, which cannot group this variant because
+    /// a boot id carries no day.
     BootDerived {
         /// Nanoseconds since the epoch at recorder boot, as recorded.
         booted_at_nanos: String,
