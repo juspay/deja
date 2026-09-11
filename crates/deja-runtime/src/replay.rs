@@ -1070,6 +1070,21 @@ impl DejaHook for ReplayHook {
 // by the application (same pattern as the JSONL → KafkaSink split for
 // recording).
 
+/// The version of the KEY FORMAT this build constructs and can read.
+///
+/// Bumped whenever what identifies a call changes shape — a new field on an
+/// `Address`, a change to how one is derived. A table rendered under a
+/// different version is REFUSED at load ([`LookupTableHook::from_source`]),
+/// because the alternative is worse than an error: its keys would simply never
+/// match, every call would fall to a weaker rank, and the run would look
+/// healthy. Old recordings are re-recorded, not accommodated.
+///
+/// 2: `Address::SpanPath` and `Address::LexicalPath` carry the boundary and the
+/// operation. Before that, rank 2 was addressed by span path alone, so two
+/// operations in one span shared a key and the occurrence tiebreak handed out
+/// whichever landed first.
+pub const KEY_POLICY_VERSION: u32 = 2;
+
 /// A frozen lookup table produced by the orchestrator and consumed by the
 /// candidate's `LookupTableHook`. Serialized as a single JSON document or
 /// JSONL stream (one `LookupEntry` per line).
@@ -1140,16 +1155,17 @@ pub enum Address {
         /// had the gap: it hashes `boundary::operation`. Rank 2 being less
         /// qualified than rank 3 is the inversion that caused the outage.
         ///
-        /// `#[serde(default)]` for the same load-bearing reason as below.
+        /// `#[serde(default)]` for the same reason as below: it is what lets a
+        /// stale table LOAD far enough to be refused by name.
         #[serde(default)]
         boundary: String,
-        /// `#[serde(default)]` is load-bearing, not tidiness: without it a
-        /// table rendered before this field existed fails to DESERIALIZE and
-        /// does not load at all. With it, such a table yields an empty
-        /// operation that simply never matches, so the call demotes to rank 3
-        /// and resolves. This is the single thing that makes a split deploy —
-        /// new orchestrator, old router pin, or the reverse — degrade instead
-        /// of break.
+        /// `#[serde(default)]` is load-bearing, and its purpose CHANGED when
+        /// old tapes stopped having to work. It is no longer a compatibility
+        /// story — it is what lets a stale table deserialize far enough for
+        /// [`KEY_POLICY_VERSION`] to refuse it BY NAME, instead of failing with
+        /// a serde complaint about a missing field that says nothing about
+        /// re-recording. Remove it and the refusal below becomes unreachable
+        /// for exactly the tables it exists to catch.
         #[serde(default)]
         operation: String,
     },
@@ -1775,7 +1791,7 @@ impl LookupTableSource for LocalFileLookupSource {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(LookupTable {
             recording_id: String::new(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries,
         })
     }
@@ -1934,6 +1950,24 @@ impl LookupTableHook {
         K: ObservedCallSink + 'static,
     {
         let table = source.load()?;
+        // A table rendered under a different KEY format is refused, by name,
+        // rather than being allowed to degrade quietly. Before this, a stale
+        // table's rank-2 entries simply never matched and every call fell to
+        // rank 3 — correct behaviour reached for the wrong reason, and
+        // indistinguishable from a run where nothing was stale. An empty result
+        // has to name which of its possible causes applies.
+        if table.policy_version != KEY_POLICY_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "lookup table for {} was rendered under key policy version {}, but this \
+                     build constructs keys at version {KEY_POLICY_VERSION} — the recording \
+                     predates a change to what identifies a call, so re-record it rather than \
+                     replaying against a table whose keys this build cannot reproduce",
+                    table.recording_id, table.policy_version,
+                ),
+            ));
+        }
         let mut map = HashMap::with_capacity(table.entries.len());
         for entry in table.entries {
             map.insert(entry.key.clone(), entry);
@@ -3653,7 +3687,7 @@ mod tests {
         // differ — so resolution is keyed by *what* was called, not *when*.
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![
                 entry_with(
                     None,
@@ -3816,30 +3850,44 @@ mod tests {
     }
 
     #[test]
-    fn an_older_candidate_ignores_a_field_it_does_not_know() {
-        // The OTHER split-deploy direction, and the property it rests on.
-        // Nothing on the `Address`/`LookupKey` path sets `deny_unknown_fields`,
-        // so a table carrying a field an older candidate never heard of LOADS,
-        // with the field dropped. That candidate then matches on what it does
-        // know and gets the behaviour it had before this change — ambiguous,
-        // but neither a fail-stop nor a table that refuses to load.
+    fn a_table_from_an_older_key_policy_is_refused_by_name() {
+        // Old tapes do not have to work — every recording is remade against the
+        // new router. So the question is not whether a stale table can be made
+        // to resolve, it is what happens when one is used by mistake.
         //
-        // So the honest claim is that NEITHER direction fail-stops: new
-        // candidate against an old table demotes to rank 3, old candidate
-        // against a new table returns to the status quo ante. Adding
-        // `deny_unknown_fields` to this path would turn the second into a total
-        // outage, which is why this test exists rather than a comment.
-        let from_the_future: Address = serde_json::from_str(
-            r#"{"SpanPath":{"path":"http>pay","boundary":"time","operation":"date_time::now","not_yet_invented":7}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            from_the_future,
-            Address::SpanPath {
-                path: "http>pay".to_owned(),
-                boundary: "time".to_owned(),
-                operation: "date_time::now".to_owned(),
-            }
+        // It used to degrade SILENTLY: the missing fields defaulted to empty,
+        // rank 2 never matched, every call fell to rank 3, and the run looked
+        // healthy. Correct behaviour reached for the wrong reason, and
+        // indistinguishable from a run where nothing was stale. Now it is
+        // refused, and the refusal says which cause applies and what to do.
+        let stale = LookupTable {
+            recording_id: "rec-old".to_owned(),
+            policy_version: KEY_POLICY_VERSION - 1,
+            entries: Vec::new(),
+        };
+        let refused =
+            LookupTableHook::from_source(VecSource(Some(stale)), InMemoryObservedSink::new());
+        let message = match refused {
+            Ok(_) => panic!("a table from an older key policy must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("rec-old") && message.contains("re-record"),
+            "the refusal must name the recording and say what to do: {message}"
+        );
+
+        // The vacuity guard: a current table must still load, or this test
+        // passes against a hook that refuses everything.
+        let current = LookupTable {
+            recording_id: "rec-new".to_owned(),
+            policy_version: KEY_POLICY_VERSION,
+            entries: Vec::new(),
+        };
+        assert!(
+            LookupTableHook::from_source(VecSource(Some(current)), InMemoryObservedSink::new())
+                .is_ok(),
+            "a current table must still load, or this refusal test passes against \
+             a hook that refuses everything"
         );
     }
 
@@ -3866,6 +3914,12 @@ mod tests {
         );
         assert_ne!(at_rank(&now, 4), at_rank(&millis, 4));
 
+        // STRUCTURAL ON PURPOSE, and do not "improve" it into an end-to-end
+        // test: rank 3 hashes `boundary::operation` and always resolves first,
+        // so rank 4 is genuinely unreachable through the hook. An end-to-end
+        // version of this would pass for the wrong reason — rank 3 catching it
+        // — and would stop testing rank 4 at all.
+        //
         // And the boundary, for the same reason it is in rank 2: rank 4's
         // `path` is a `module_path!()`, which says even less about which
         // boundary was crossed than a span name does. Two boundaries sharing an
@@ -3940,7 +3994,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries,
         }
     }
@@ -4080,7 +4134,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries,
         }
     }
@@ -4366,7 +4420,7 @@ mod tests {
             .collect();
         let (hook, handle) = hook_over(LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries,
         });
         assert_eq!(
@@ -4449,7 +4503,7 @@ mod tests {
         }
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries,
         };
         let observed = InMemoryObservedSink::new();
@@ -4549,7 +4603,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-boundary".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries,
         }
     }
@@ -5175,7 +5229,7 @@ mod tests {
         let args = serde_json::json!({});
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![
                 entry_with(
                     None,
@@ -5232,7 +5286,7 @@ mod tests {
         let recorded_args = serde_json::json!({ "id": "pi_recorded" });
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![entry_with(
                 None,
                 explicit("find_pi"),
@@ -5272,7 +5326,7 @@ mod tests {
     fn lookup_table_hook_record_emits_observed_http_finalizer_only() {
         let empty = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();
@@ -5473,7 +5527,7 @@ mod tests {
     fn declared_execute_is_honored_on_any_replay_hook() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![],
         };
         let hook =
@@ -5506,7 +5560,7 @@ mod tests {
     fn declared_knob_drives_routing() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![],
         };
         let hook =
@@ -5561,7 +5615,7 @@ mod tests {
     fn declared_execute_routes_through_runtime_hook_wrapper() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![],
         };
         let inner =
@@ -5594,7 +5648,7 @@ mod tests {
         let inner_default = LookupTableHook::from_source(
             VecSource(Some(LookupTable {
                 recording_id: "r".to_owned(),
-                policy_version: 1,
+                policy_version: KEY_POLICY_VERSION,
                 entries: vec![],
             })),
             InMemoryObservedSink::new(),
@@ -6759,7 +6813,7 @@ redis\tcurrency\tusd
     fn hook_execute_shadow_emits_observation_with_real_result() {
         let table = LookupTable {
             recording_id: "rec-shadow".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![entry_with(
                 None,
                 Address::Sequence {
@@ -6816,7 +6870,7 @@ redis\tcurrency\tusd
         // Empty table → NO recorded baseline for the candidate's extra call.
         let table = LookupTable {
             recording_id: "rec-novel".to_owned(),
-            policy_version: 1,
+            policy_version: KEY_POLICY_VERSION,
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();

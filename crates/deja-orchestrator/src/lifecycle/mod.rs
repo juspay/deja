@@ -646,8 +646,9 @@ fn drive_replay(
     // Render the lookup table (whole-document JSON; round-trips through both the
     // candidate's LocalFileLookupSource and the divergence detector).
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording, &recording_id, 1)
-        .map_err(|e| format!("render lookup table: {e}"))?;
+    let table =
+        crate::lookup::render_lookup_table(&recording, &recording_id, deja::KEY_POLICY_VERSION)
+            .map_err(|e| format!("render lookup table: {e}"))?;
     write_json(&root.lookup_table_path(&run.run_id), &table)
         .map_err(|e| format!("write lookup table: {e}"))?;
     if table.entries.is_empty() {
@@ -1607,8 +1608,9 @@ pub fn drive_replay_in_pod(
         .map_err(|e| format!("open recording {recording_id}: {e}"))?;
 
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording, &recording_id, 1)
-        .map_err(|e| format!("render lookup table: {e}"))?;
+    let table =
+        crate::lookup::render_lookup_table(&recording, &recording_id, deja::KEY_POLICY_VERSION)
+            .map_err(|e| format!("render lookup table: {e}"))?;
     write_json(&root.lookup_table_path(&run.run_id), &table)
         .map_err(|e| format!("write lookup table: {e}"))?;
     if table.entries.is_empty() {

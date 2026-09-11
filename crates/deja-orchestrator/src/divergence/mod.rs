@@ -6265,7 +6265,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: "rec-scope".to_owned(),
-                policy_version: 1,
+                policy_version: deja::KEY_POLICY_VERSION,
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -6385,7 +6385,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: recording_id.to_owned(),
-                policy_version: 1,
+                policy_version: deja::KEY_POLICY_VERSION,
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -6785,7 +6785,7 @@ mod tests {
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: 1,
+                policy_version: deja::KEY_POLICY_VERSION,
                 entries,
             },
             observed,
@@ -8171,7 +8171,7 @@ mod tests {
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: 1,
+                policy_version: deja::KEY_POLICY_VERSION,
                 entries,
             },
             observed,
@@ -9830,7 +9830,7 @@ mod tests {
 
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
-            policy_version: 1,
+            policy_version: deja::KEY_POLICY_VERSION,
             entries: vec![
                 seq_entry_method_res(
                     Some(corr),
