@@ -111,6 +111,10 @@ pub use deja_runtime::{
     BoundaryDeclaration, BoundarySemantics, CanonRef, CodecRef, EffectKind, OperationKind,
     Reconstructed, ReplayStrategy, ReturnSemantics,
 };
+/// Re-export the recorded-key `BuildHasher`. A service types its collections
+/// `HashMap<K, V, DejaRandomState>` so their iteration order — which reaches the
+/// wire — is drawn once per correlation, recorded, and served back on replay.
+pub use deja_runtime::{DejaHasher, DejaRandomState, HashKeys};
 
 /// Re-export the diesel connection wrapper that captures result rows' binary
 /// wire values for wire-faithful DB seeding (issue #35). The vendor swap is
