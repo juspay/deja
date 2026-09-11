@@ -963,6 +963,7 @@ mod tests {
                 entries.push(deja::LookupEntry {
                     key: key(Address::SpanPath {
                         path: path.clone(),
+                        boundary: String::new(),
                         operation: String::new(),
                     }),
                     result: ev.result.clone(),

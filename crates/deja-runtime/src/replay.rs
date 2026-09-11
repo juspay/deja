@@ -1129,6 +1129,20 @@ pub enum Address {
     /// hashes `boundary::operation`, catches.
     SpanPath {
         path: String,
+        /// The boundary the call crossed. Absent for the same reason
+        /// `operation` was, and closing the same gap one level up: two
+        /// DIFFERENT boundaries sharing an operation name and firing in one
+        /// span would collide exactly as `date_time::now` and
+        /// `now_unix_timestamp_millis` did. Preventive, not observed —
+        /// hyperswitch has 89 distinct (boundary, operation) pairs today and no
+        /// operation name is used by more than one boundary. That is a property
+        /// of the current NAMING and not of the scheme, and rank 3 has never
+        /// had the gap: it hashes `boundary::operation`. Rank 2 being less
+        /// qualified than rank 3 is the inversion that caused the outage.
+        ///
+        /// `#[serde(default)]` for the same load-bearing reason as below.
+        #[serde(default)]
+        boundary: String,
         /// `#[serde(default)]` is load-bearing, not tidiness: without it a
         /// table rendered before this field existed fails to DESERIALIZE and
         /// does not load at all. With it, such a table yields an empty
@@ -1154,6 +1168,11 @@ pub enum Address {
     LexicalPath {
         path: String,
         scope_occurrence: u32,
+        /// See [`Address::SpanPath::boundary`]. Rank 4's `path` is the caller's
+        /// `module_path!()`, which says even less about which boundary was
+        /// crossed than a span name does.
+        #[serde(default)]
+        boundary: String,
         #[serde(default)]
         operation: String,
     },
@@ -1621,6 +1640,7 @@ pub fn addresses_for(
         if let Some(path) = &id.span_path {
             out.push(Address::SpanPath {
                 path: path.clone(),
+                boundary: boundary.to_owned(),
                 operation: method_name.to_owned(),
             });
         }
@@ -1631,6 +1651,7 @@ pub fn addresses_for(
             out.push(Address::LexicalPath {
                 path: path.clone(),
                 scope_occurrence: id.occurrence,
+                boundary: boundary.to_owned(),
                 operation: method_name.to_owned(),
             });
         }
@@ -3778,6 +3799,7 @@ mod tests {
             legacy,
             Address::SpanPath {
                 path: "http>pay".to_owned(),
+                boundary: String::new(),
                 operation: String::new(),
             }
         );
@@ -3787,6 +3809,7 @@ mod tests {
             legacy,
             Address::SpanPath {
                 path: "http>pay".to_owned(),
+                boundary: "time".to_owned(),
                 operation: "date_time::now".to_owned(),
             }
         );
@@ -3807,13 +3830,14 @@ mod tests {
         // `deny_unknown_fields` to this path would turn the second into a total
         // outage, which is why this test exists rather than a comment.
         let from_the_future: Address = serde_json::from_str(
-            r#"{"SpanPath":{"path":"http>pay","operation":"date_time::now","not_yet_invented":7}}"#,
+            r#"{"SpanPath":{"path":"http>pay","boundary":"time","operation":"date_time::now","not_yet_invented":7}}"#,
         )
         .unwrap();
         assert_eq!(
             from_the_future,
             Address::SpanPath {
                 path: "http>pay".to_owned(),
+                boundary: "time".to_owned(),
                 operation: "date_time::now".to_owned(),
             }
         );
@@ -3842,6 +3866,33 @@ mod tests {
         );
         assert_ne!(at_rank(&now, 4), at_rank(&millis, 4));
 
+        // And the boundary, for the same reason it is in rank 2: rank 4's
+        // `path` is a `module_path!()`, which says even less about which
+        // boundary was crossed than a span name does. Two boundaries sharing an
+        // operation name and called from one module would otherwise be one
+        // address. Asserted here rather than end to end because rank 3 always
+        // resolves first, so rank 4 cannot be reached through the hook — which
+        // is exactly why it needs asserting somewhere.
+        let redis = addresses_for(
+            "redis",
+            "get_key",
+            Some(&clock_identity("http>pay", 555)),
+            None,
+            2,
+        );
+        let other = addresses_for(
+            "boundary",
+            "get_key",
+            Some(&clock_identity("http>pay", 555)),
+            None,
+            3,
+        );
+        assert_ne!(
+            at_rank(&redis, 4),
+            at_rank(&other, 4),
+            "one operation name, two boundaries, one module — not one address"
+        );
+
         let legacy: Address =
             serde_json::from_str(r#"{"LexicalPath":{"path":"router::core","scope_occurrence":0}}"#)
                 .unwrap();
@@ -3850,6 +3901,7 @@ mod tests {
             Address::LexicalPath {
                 path: "router::core".to_owned(),
                 scope_occurrence: 0,
+                boundary: String::new(),
                 operation: String::new(),
             }
         );
@@ -3999,6 +4051,101 @@ mod tests {
             vec![Some(2), Some(2)],
             "both at rank 2, not demoted"
         );
+    }
+
+    /// Like [`rendered_table`], but each row names its OWN boundary. A
+    /// cross-boundary collision cannot be expressed otherwise, and expressing
+    /// it is the point.
+    fn rendered_table_across_boundaries(
+        rows: &[(&str, &str, &str, u64, serde_json::Value, serde_json::Value)],
+    ) -> LookupTable {
+        let mut stamper = KeyStamper::new();
+        let mut entries = Vec::new();
+        for (i, (boundary, method, span, hash, args, value)) in rows.iter().enumerate() {
+            let identity = clock_identity(span, *hash);
+            let addresses = addresses_for(boundary, method, Some(&identity), None, i as u64);
+            for key in stamper.stamp(
+                None,
+                Some(crate::ROOT_TASK_ID),
+                0,
+                &addresses,
+                canonical_args_hash(args),
+            ) {
+                entries.push(LookupEntry {
+                    key,
+                    result: value.clone(),
+                    source_event_global_sequence: i as u64,
+                });
+            }
+        }
+        LookupTable {
+            recording_id: "rec-1".to_owned(),
+            policy_version: 1,
+            entries,
+        }
+    }
+
+    #[test]
+    fn two_boundaries_sharing_an_operation_name_resolve_separately() {
+        // PREVENTIVE, and deliberately its own test rather than bolted onto the
+        // two above: it is a different scenario, and a case that has never
+        // fired reads more honestly under a name that says so.
+        //
+        // Nothing in hyperswitch reaches this today — 89 distinct
+        // (boundary, operation) pairs and no operation name used by more than
+        // one boundary. That is a property of the current NAMING, not of the
+        // scheme: `deja::redis(operation = "get_key")` beside a
+        // `deja::boundary(operation = "get_key")` would collide at rank 2
+        // exactly as the two clock operations did, and silently if their return
+        // types agreed. Rank 3 has never had the gap — it hashes
+        // `boundary::operation` — and rank 2 being less qualified than rank 3
+        // is the inversion that caused the outage this all started with.
+        let none = serde_json::json!({});
+        let table = rendered_table_across_boundaries(&[
+            (
+                "redis",
+                "get_key",
+                "http>pay",
+                555,
+                none.clone(),
+                serde_json::json!("from-redis"),
+            ),
+            (
+                "boundary",
+                "get_key",
+                "http>pay",
+                666,
+                none.clone(),
+                serde_json::json!("from-boundary"),
+            ),
+        ]);
+        let (hook, handle) = hook_over(table);
+
+        // Opposite order to the recording, for the reason the other end-to-end
+        // tests spell out: in recorded order a shared key hands out the right
+        // rows by accident.
+        assert_eq!(
+            ask(
+                &hook,
+                "boundary",
+                "get_key",
+                &clock_identity("http>pay", 666),
+                &none
+            ),
+            Some(serde_json::json!("from-boundary"))
+        );
+        assert_eq!(
+            ask(
+                &hook,
+                "redis",
+                "get_key",
+                &clock_identity("http>pay", 555),
+                &none
+            ),
+            Some(serde_json::json!("from-redis")),
+            "one operation NAME, two boundaries — these must not share a key"
+        );
+        assert_eq!(ranks(&handle), vec![Some(2), Some(2)]);
     }
 
     #[test]

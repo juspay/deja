@@ -6212,6 +6212,7 @@ mod tests {
         let mut entry = seq_entry(corr, "span", src);
         entry.key.address = Address::SpanPath {
             path: path.to_owned(),
+            boundary: String::new(),
             operation: String::new(),
         };
         entry
@@ -6465,6 +6466,7 @@ mod tests {
                 fork_seq: 0,
                 address: Address::SpanPath {
                     path: path.to_owned(),
+                    boundary: String::new(),
                     operation: String::new(),
                 },
                 args_hash: 0,
