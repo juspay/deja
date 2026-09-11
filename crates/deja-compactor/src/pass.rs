@@ -124,6 +124,35 @@ impl Outcome {
     pub fn is_drop(&self) -> bool {
         matches!(self, Outcome::TooLarge { .. } | Outcome::Failed { .. })
     }
+
+    /// Whether this drop is a REFUSAL: a determination the pass made about a
+    /// recording, rather than something that went wrong while handling it.
+    ///
+    /// The distinction decides the exit code, and it is the same argument that
+    /// already excludes `not_ready` from [`Outcome::is_drop`] one step further
+    /// on. A refusal is deterministic: the same recording against the same
+    /// budget refuses identically every pass, forever, until a human changes
+    /// the budget or the recording goes away. So it is news exactly once, and
+    /// after that a pass that fails on it reports "the sealer is broken" on
+    /// every tick while the sealer is in fact working — which is how a sealer
+    /// trains its readers to ignore it, the very outcome that comment guards
+    /// against.
+    ///
+    /// It cost us the ability to read the sealer at all. Eight August
+    /// recordings, 0.8-2.6 GB each against a 512 MiB budget, made
+    /// `lastSuccessfulTime` null permanently; the pass that sealed three
+    /// recordings and the pass that ran on a stale image and sealed nothing
+    /// both read as `BackoffLimitExceeded`, and telling them apart needed the
+    /// container logs.
+    ///
+    /// A refusal stays a drop, stays printed by name, and stays counted — this
+    /// is NOT a swallow. What changes is only whether it alone fails the pass.
+    /// `Failed` is the opposite case and still does: it says the store, the
+    /// layout or the contents surprised us, which is not deterministic, may
+    /// clear on its own, and is worth waking up for.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Outcome::TooLarge { .. })
+    }
 }
 
 /// One recording's line in the ledger.
@@ -299,7 +328,15 @@ pub struct Totals {
     pub sealed: usize,
     pub already_current: usize,
     pub not_ready: usize,
+    /// Refusals plus failures. Kept as the total it always was, so a reader of
+    /// the JSON that predates the split still sees every unsealed recording in
+    /// the field it already reads.
     pub dropped: usize,
+    /// Drops that are determinations: deterministic, permanent until something
+    /// changes, and on their own not a failed pass.
+    pub refused: usize,
+    /// Drops that say something went wrong. These fail the pass.
+    pub failed: usize,
 }
 
 impl PassLedger {
@@ -318,7 +355,14 @@ impl PassLedger {
                     Outcome::Sealed { .. } => t.sealed += 1,
                     Outcome::AlreadyCurrent { .. } => t.already_current += 1,
                     Outcome::NotReady { .. } => t.not_ready += 1,
-                    Outcome::TooLarge { .. } | Outcome::Failed { .. } => t.dropped += 1,
+                    Outcome::TooLarge { .. } => {
+                        t.dropped += 1;
+                        t.refused += 1;
+                    }
+                    Outcome::Failed { .. } => {
+                        t.dropped += 1;
+                        t.failed += 1;
+                    }
                 }
             }
         }
@@ -342,15 +386,42 @@ impl PassLedger {
             .collect()
     }
 
+    /// The drops that are determinations rather than malfunctions — see
+    /// [`Outcome::is_refusal`]. A subset of [`PassLedger::drops`], never
+    /// removed from it.
+    pub fn refusals(&self) -> Vec<&Row> {
+        self.drops()
+            .into_iter()
+            .filter(|r| r.outcome.is_refusal())
+            .collect()
+    }
+
+    /// The drops that say something went wrong: the store, the layout or a
+    /// recording's contents surprised us. The complement of
+    /// [`PassLedger::refusals`] within [`PassLedger::drops`].
+    pub fn failures(&self) -> Vec<&Row> {
+        self.drops()
+            .into_iter()
+            .filter(|r| !r.outcome.is_refusal())
+            .collect()
+    }
+
     /// Whether the pass may report success.
     ///
     /// A pass that swallows a drop stops sealing something forever with only an
-    /// unread log line as evidence, so a drop, an unreachable system, a missing
-    /// roster and an accounting disagreement all fail it.
+    /// unread log line as evidence, so a failure, an unreachable system, a
+    /// missing roster and an accounting disagreement all fail it.
+    ///
+    /// A REFUSAL does not, and that is the one asymmetry here. It is still a
+    /// drop, still named in the summary and still in the JSON; what it no
+    /// longer does is make every subsequent pass indistinguishable from a
+    /// broken one. See [`Outcome::is_refusal`] for why deterministic and
+    /// permanent is the property that earns the exemption — and note the
+    /// exemption is about the VERDICT only, never about visibility.
     pub fn clean(&self) -> bool {
         self.roster_error.is_none()
             && self.systems.iter().all(|s| s.unreachable.is_none())
-            && self.drops().is_empty()
+            && self.failures().is_empty()
             && self.disagreements().is_empty()
     }
 }
@@ -829,6 +900,67 @@ mod tests {
         assert!(ledger.disagreements().is_empty());
         assert!(!ledger.clean(), "an unreachable system is not a clean pass");
         assert_eq!(ledger.totals().systems_unreachable, 1);
+    }
+
+    /// A refusal does not fail the pass, and is not hidden by that.
+    ///
+    /// The two halves are one test on purpose. Exempting a refusal from the
+    /// verdict is only safe while it stays visible, so a change that made the
+    /// pass green by dropping the row would satisfy the first half and has to
+    /// be caught by the second.
+    ///
+    /// Concretely: eight August recordings past the budget made every sealer
+    /// pass exit non-zero forever, so `lastSuccessfulTime` was permanently null
+    /// and a genuinely broken pass looked exactly like a working one.
+    #[test]
+    fn a_refusal_does_not_fail_the_pass_but_is_still_reported() {
+        let refused = PassLedger {
+            systems: vec![SystemLedger {
+                system: "sys".to_owned(),
+                planned: vec!["r1".to_owned()],
+                rows: vec![row(
+                    "r1",
+                    Outcome::TooLarge {
+                        budget_bytes: 536_870_912,
+                        read_bytes: 561_616_085,
+                        objects_read: 18,
+                        objects_total: 67,
+                        shared_prefix: false,
+                    },
+                )],
+                unreachable: None,
+            }],
+            roster_error: None,
+        };
+        assert!(
+            refused.clean(),
+            "a determination the pass made is not a broken pass"
+        );
+        // Still a drop, still enumerable, still counted. This is the half that
+        // keeps the exemption from becoming a swallow.
+        assert_eq!(refused.drops().len(), 1, "a refusal remains a drop");
+        assert_eq!(refused.refusals().len(), 1);
+        assert!(refused.failures().is_empty());
+        let t = refused.totals();
+        assert_eq!(
+            (t.dropped, t.refused, t.failed),
+            (1, 1, 0),
+            "dropped stays the total so an old reader loses nothing"
+        );
+
+        // A real failure alongside a refusal still fails, and the two are
+        // counted apart so the message cannot report one as the other.
+        let mut both = refused.clone();
+        both.systems[0].planned.push("r2".to_owned());
+        both.systems[0].rows.push(row(
+            "r2",
+            Outcome::Failed {
+                error: "s3 list: refused".to_owned(),
+            },
+        ));
+        assert!(!both.clean(), "a failure still fails the pass");
+        let t = both.totals();
+        assert_eq!((t.dropped, t.refused, t.failed), (2, 1, 1));
     }
 
     #[test]

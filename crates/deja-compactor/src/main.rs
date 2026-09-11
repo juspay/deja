@@ -329,17 +329,42 @@ fn run_sealing_pass() -> Result<(), String> {
     }));
 
     if ledger.clean() {
+        // Refusals are named on the SUCCESS path too, and named rather than
+        // counted. A pass that seals everything it can while permanently
+        // refusing eight recordings is a working sealer, but "working" must not
+        // be allowed to read as "nothing to see": the exit code stops carrying
+        // that news, so this line has to.
+        let refused = if totals.refused == 0 {
+            String::new()
+        } else {
+            format!(
+                ", {} refused ({})",
+                totals.refused,
+                ledger
+                    .refusals()
+                    .iter()
+                    .map(|r| format!("{}/{}", r.system, r.recording_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         eprintln!(
-            "sealer: pass complete — {} sealed, {} already current, {} not ready",
+            "sealer: pass complete — {} sealed, {} already current, {} not ready{refused}",
             totals.sealed, totals.already_current, totals.not_ready
         );
         return Ok(());
     }
+    // Only failures, unreachable systems, a missing roster and accounting
+    // disagreements reach here. Refusals are reported in the same breath
+    // because a reader looking at a failed pass wants the whole account, but
+    // they are counted separately so the sentence cannot be read as claiming
+    // eight things broke when eight things were declined and one broke.
     Err(format!(
-        "pass incomplete — {} recording(s) dropped, {} system(s) unreachable, {} accounting \
-         disagreement(s); the rows above name every one",
-        totals.dropped,
+        "pass incomplete — {} recording(s) failed, {} system(s) unreachable, {} accounting \
+         disagreement(s), {} recording(s) refused; the rows above name every one",
+        totals.failed,
         totals.systems_unreachable,
-        disagreements.len()
+        disagreements.len(),
+        totals.refused
     ))
 }
