@@ -542,11 +542,18 @@ pub enum RecordingIdentity {
     Described {
         /// Short git sha of the recorded system.
         revision: String,
-        /// `MMDDhhmm` UTC, when recording began.
+        /// `MMDDhhmm` for a per-process recording, `MMDD` for a deployment's
+        /// day. The length says which: eight digits is a minute, four a date.
         recorded_at: String,
         /// Discriminator for the instance, so two pods starting in the same
         /// minute stay distinct.
-        instance: String,
+        ///
+        /// `None` for a recording whose unit is a DEPLOYMENT AND A DAY rather
+        /// than a process — it has no single instance because it has many, and
+        /// they are accounted individually in the manifest's `instances`.
+        /// Naming one of them here would pick a pod arbitrarily and read as
+        /// though the recording were that pod's.
+        instance: Option<String>,
     },
     /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
     /// boot. The prism recorder always mints these — but so did the router
@@ -594,22 +601,36 @@ pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
     let Some(body) = recording_id.strip_prefix("rec-") else {
         return RecordingIdentity::Opaque;
     };
+    // Two shapes, and the arity is what separates them rather than a flag:
+    // `rec-<revision>-<MMDDhhmm>-<instance>` is one process's recording, and
+    // `rec-<revision>-<MMDD>` is a DEPLOYMENT's day — every instance of one
+    // revision on one date, grouped. The second has no instance because it has
+    // many; they are accounted separately in the manifest.
+    //
+    // Still deliberately strict. Anything that is not exactly one of these two
+    // is Opaque rather than half-parsed, for the reason the doc above gives:
+    // an id is a convenience and the envelopes carry the same facts
+    // authoritatively, so guessing here trades a small convenience for a wrong
+    // answer.
     let parts: Vec<&str> = body.split('-').collect();
-    let [revision, recorded_at, instance] = parts[..] else {
-        return RecordingIdentity::Opaque;
-    };
-    let shaped = !revision.is_empty()
-        && revision.chars().all(|c| c.is_ascii_hexdigit())
-        && recorded_at.len() == 8
-        && recorded_at.chars().all(|c| c.is_ascii_digit())
-        && !instance.is_empty();
-    if !shaped {
-        return RecordingIdentity::Opaque;
-    }
-    RecordingIdentity::Described {
-        revision: revision.to_owned(),
-        recorded_at: recorded_at.to_owned(),
-        instance: instance.to_owned(),
+    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+    let digits = |s: &str, n: usize| s.len() == n && s.chars().all(|c| c.is_ascii_digit());
+    match parts[..] {
+        [revision, recorded_at, instance]
+            if hex(revision) && digits(recorded_at, 8) && !instance.is_empty() =>
+        {
+            RecordingIdentity::Described {
+                revision: revision.to_owned(),
+                recorded_at: recorded_at.to_owned(),
+                instance: Some(instance.to_owned()),
+            }
+        }
+        [revision, date] if hex(revision) && digits(date, 4) => RecordingIdentity::Described {
+            revision: revision.to_owned(),
+            recorded_at: date.to_owned(),
+            instance: None,
+        },
+        _ => RecordingIdentity::Opaque,
     }
 }
 
@@ -1283,6 +1304,57 @@ mod run_identity_tests {
         assert!(ids.iter().all(|id| id.len() <= RUN_ID_MAX));
     }
 
+    /// The DEPLOYMENT shape: `rec-<revision>-<MMDD>`, one revision's whole day.
+    /// Arity is the discriminator — three segments is a process, two is a
+    /// deployment — so nothing has to be flagged and an id still says what it
+    /// is without a lookup.
+    #[test]
+    fn a_two_part_id_names_a_deployment_and_a_date() {
+        assert_eq!(
+            parse_recording_id("rec-4157177-0910"),
+            RecordingIdentity::Described {
+                revision: "4157177".into(),
+                recorded_at: "0910".into(),
+                instance: None,
+            }
+        );
+    }
+
+    /// And it stays strict. A two-part id whose second segment is not a
+    /// four-digit date is Opaque, not a deployment with a strange date — the
+    /// same rule that keeps `run-foo` from masquerading as a boot id.
+    #[test]
+    fn a_two_part_id_with_a_bad_date_is_opaque() {
+        for id in [
+            "rec-4157177-091",   // three digits
+            "rec-4157177-09100", // five
+            "rec-4157177-ab12",  // not digits
+            "rec-zzzzzzz-0910",  // revision not hex
+            "rec-4157177-",      // empty
+        ] {
+            assert_eq!(
+                parse_recording_id(id),
+                RecordingIdentity::Opaque,
+                "{id} must not parse as a deployment"
+            );
+        }
+    }
+
+    /// The per-process shape is unchanged, including its instance, so the two
+    /// arities cannot be confused: eight digits and a segment after it is still
+    /// one pod's recording.
+    #[test]
+    fn a_three_part_id_still_names_one_process() {
+        assert_eq!(
+            parse_recording_id("rec-4157177-09101430-xc"),
+            RecordingIdentity::Described {
+                revision: "4157177".into(),
+                recorded_at: "09101430".into(),
+                instance: Some("xc".into()),
+            }
+        );
+    }
+
     #[test]
     fn a_recording_id_is_read_in_both_shapes_and_neither_is_guessed_at() {
         // A recorder that knows its revision names it.
@@ -1291,7 +1363,7 @@ mod run_identity_tests {
             RecordingIdentity::Described {
                 revision: "dcb9f9e".into(),
                 recorded_at: "07291352".into(),
-                instance: "a3".into(),
+                instance: Some("a3".into()),
             }
         );
 

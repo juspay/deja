@@ -447,10 +447,16 @@ export const api = {
 export type RecordingIdentity = {
   /** Short git sha of the recorded system. (hyperswitch `rec-…` shape) */
   revision?: string;
-  /** `MMDDhhmm` UTC — when recording began. No year. */
+  /** `MMDDhhmm` UTC for one process's recording, `MMDD` for a deployment's
+   *  day. The LENGTH says which — eight digits is a minute, four a date. No
+   *  year in either. */
   recorded_at?: string;
-  /** Discriminator, so two pods starting in the same minute stay distinct. */
-  instance?: string;
+  /** Discriminator, so two pods starting in the same minute stay distinct.
+   *
+   *  NULL for a recording whose unit is a deployment and a day: it has no
+   *  single instance because it has many, and they are accounted separately in
+   *  the manifest. Absent is not the same as unknown here. */
+  instance?: string | null;
   /** Nanoseconds since epoch at recorder boot (the UCS `run-<nanos>` shape). */
   booted_at_nanos?: string;
 };

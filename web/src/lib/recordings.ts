@@ -94,16 +94,27 @@ export function identityText(identity: RecordingIdentity | null): string | null 
       : identity.booted_at_nanos;
     return `recorder booted ${when}`;
   }
-  if (!identity.revision || !identity.recorded_at || !identity.instance) return null;
+  if (!identity.revision || !identity.recorded_at) return null;
   const { revision, recorded_at, instance } = identity;
+  // Eight digits is one process's start MINUTE; four is a deployment's DATE.
+  // The length is the discriminator because the id's arity already was — a
+  // deployment recording has no instance segment to carry.
   const when =
     recorded_at.length === 8
       ? `${recorded_at.slice(0, 2)}-${recorded_at.slice(2, 4)} ${recorded_at.slice(
           4,
           6,
         )}:${recorded_at.slice(6, 8)} UTC`
-      : recorded_at;
-  return `rev ${revision} · recorded ${when} · instance ${instance}`;
+      : recorded_at.length === 4
+        ? `${recorded_at.slice(0, 2)}-${recorded_at.slice(2, 4)}`
+        : recorded_at;
+  // No instance means the unit is the DEPLOYMENT's day, not a pod's life. Say
+  // that rather than falling through to null, which is what a reader sees when
+  // the shape is unrecognised — and an unrecognised shape and a deliberate one
+  // should not look the same.
+  return instance
+    ? `rev ${revision} · recorded ${when} · instance ${instance}`
+    : `rev ${revision} · all instances on ${when}`;
 }
 
 /** Catalog rows by recording id, for joining onto the bucket index. */
