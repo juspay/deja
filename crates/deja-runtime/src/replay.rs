@@ -1147,8 +1147,7 @@ pub enum Locus {
     /// `boundary::operation`, which the key carries), but its PRESENCE was the
     /// licence for unlocated matching and still is.
     Unlocated,
-    /// Rank 4 — stable lexical path plus its per-scope occurrence index.
-    LexicalPath { path: String, scope_occurrence: u32 },
+
     /// Rank 5 — `#[track_caller]` source location. Identity-bearing by accident
     /// (a file:line names one call site and therefore one operation), which is
     /// why it never collided — but by accident is not by construction.
@@ -1157,10 +1156,6 @@ pub enum Locus {
         line: u32,
         column: u32,
     },
-    /// Rank 6 — positional last resort: the per-correlation request sequence.
-    /// Fragile to any upstream edit that shifts positions, which the divergence
-    /// detector surfaces via per-rank counts.
-    Sequence { request_sequence: u64 },
 }
 
 /// The IDENTITY half of a lookup key: what the call IS, independent of where it
@@ -1195,9 +1190,7 @@ impl Locus {
             Locus::DeclaredSite(_) => 1,
             Locus::SpanPath { .. } => 2,
             Locus::Unlocated => 3,
-            Locus::LexicalPath { .. } => 4,
             Locus::SourceLocation { .. } => 5,
-            Locus::Sequence { .. } => 6,
         }
     }
 }
@@ -1644,9 +1637,8 @@ fn hash_value(hash: u64, value: &serde_json::Value) -> u64 {
 pub fn loci_for(
     identity: Option<&crate::CallsiteIdentity>,
     location: Option<(&str, u32, u32)>,
-    request_sequence: u64,
 ) -> Vec<Locus> {
-    let mut out = Vec::with_capacity(5);
+    let mut out = Vec::with_capacity(4);
     if let Some(id) = identity {
         if matches!(id.source, crate::CallsiteSource::Explicit) {
             if let Some(tag) = &id.id {
@@ -1659,18 +1651,6 @@ pub fn loci_for(
         if let Some(path) = &id.span_path {
             out.push(Locus::SpanPath { path: path.clone() });
         }
-        // Rank 3 — the unlocated mode. The syntactic hash's CONTENT moved to the
-        // key's identity fields; its presence still gates whether this call may
-        // be matched without claiming a location at all.
-        if id.syntax_hash.is_some() {
-            out.push(Locus::Unlocated);
-        }
-        if let Some(path) = &id.lexical_path {
-            out.push(Locus::LexicalPath {
-                path: path.clone(),
-                scope_occurrence: id.occurrence,
-            });
-        }
     }
     if let Some((file, line, column)) = location {
         out.push(Locus::SourceLocation {
@@ -1679,10 +1659,24 @@ pub fn loci_for(
             column,
         });
     }
-    // Rank 6 — positional last resort. `boundary` and `method` used to ride here
-    // too; they are identity and moved to the key, leaving the ordinal that was
-    // the only locus-like thing about it.
-    out.push(Locus::Sequence { request_sequence });
+    // Rank 3 — the unlocated mode, and the FLOOR.
+    //
+    // Unconditional, which is a deliberate widening of the syntactic-hash gate
+    // it replaces, and the reason is a guarantee that would otherwise be lost
+    // silently. `Locus::Sequence` used to be pushed here on every call, so every
+    // call was guaranteed at least one address; six `loci_for` callers pass
+    // `identity: None`, and with no identity and no location they would now
+    // produce an EMPTY locus list — no keys, so the call could never resolve,
+    // silently, forever.
+    //
+    // `Unlocated` is the honest floor for that: it claims no location, which is
+    // exactly true of a call deja knows nothing about, and unlike `Sequence` it
+    // claims no POSITION either. The gate it replaces (`syntax_hash.is_some()`)
+    // was a proxy for "this is a real seam", which having a `BoundarySpec`
+    // already establishes.
+    //
+    // `no_call_is_left_without_an_address` pins the guarantee.
+    out.push(Locus::Unlocated);
     out
 }
 
@@ -1973,7 +1967,6 @@ pub struct LookupTableHook {
     /// Per-correlation request_sequence counter; bumps on each lookup. Feeds
     /// the rank-6 `Locus::Sequence` and mirrors the recorder's own
     /// per-correlation sequence (both start at 0 and step by one per call).
-    next_sequence: Mutex<HashMap<Option<String>, u64>>,
     /// Shared occurrence assigner; advanced for every rank on every call so its
     /// numbering stays in lockstep with the renderer's.
     stamper: Mutex<KeyStamper>,
@@ -1985,7 +1978,7 @@ pub struct LookupTableHook {
     /// `next_callsite_occurrence` on this hook (the same hook that does the
     /// lookup). It MUST advance in lock-step with recording — one bump per call
     /// per scope and lineage bucket — so that the `CallsiteIdentity::occurrence`
-    /// the macro stamps into the rank-4 `Locus::LexicalPath { scope_occurrence }` matches the
+    /// the macro stamps into the rank-4 `Locus::Unlocated` matches the
     /// occurrence the renderer read off the recorded event. Without this the
     /// macro would receive the default `0` for every call and only the first
     /// (occurrence-0) call at each callsite would resolve.
@@ -2014,7 +2007,6 @@ impl LookupTableHook {
         }
         Ok(Self {
             table: map,
-            next_sequence: Mutex::new(HashMap::new()),
             stamper: Mutex::new(KeyStamper::new()),
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
@@ -2040,18 +2032,6 @@ impl LookupTableHook {
             .graph_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.observed_sink.graph_node(node);
-    }
-
-    fn bump_request_sequence(&self, correlation_id: Option<&str>) -> u64 {
-        let key = correlation_id.map(str::to_owned);
-        if let Ok(mut map) = self.next_sequence.lock() {
-            let counter = map.entry(key).or_insert(0);
-            let seq = *counter;
-            *counter += 1;
-            seq
-        } else {
-            0
-        }
     }
 
     /// Resolve one replay call to its recorded baseline.
@@ -2080,15 +2060,12 @@ impl LookupTableHook {
             .or_else(|| task_bucket.clone())
             .or_else(|| Some(crate::ROOT_TASK_ID.to_string()));
         let fork_seq = fork_seq.unwrap_or(0);
-        // Bumped once per call for the rank-6 positional address; mirrors the
-        // recorder's per-correlation request_sequence.
-        let request_sequence = self.bump_request_sequence(correlation_id.as_deref());
         let args_hash = canonical_args_hash(query.args);
 
         let location = query
             .caller_location
             .map(|loc| (loc.file(), loc.line(), loc.column()));
-        let loci = loci_for(query.callsite_identity, location, request_sequence);
+        let loci = loci_for(query.callsite_identity, location);
         let identity = CallIdentity {
             boundary: query.boundary,
             component: query.trait_name,
@@ -3710,9 +3687,7 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("create");
         let entry = entry_with(
             Some("c-1"),
-            Locus::Sequence {
-                request_sequence: 0,
-            },
+            Locus::Unlocated,
             &serde_json::json!({}),
             0,
             serde_json::json!("hello"),
@@ -3843,8 +3818,8 @@ mod tests {
         // and returned HTTP 500 on every correlation. Ranks 1, 5 and 6 were not
         // given the field. The scheme therefore still depended on every locus
         // variant remembering to carry a fact that was never a location.
-        let here = loci_for(Some(&clock_identity("http>pay", 111)), None, 0);
-        let there = loci_for(Some(&clock_identity("http>pay", 111)), None, 1);
+        let here = loci_for(Some(&clock_identity("http>pay", 111)), None);
+        let there = loci_for(Some(&clock_identity("http>pay", 111)), None);
         assert_eq!(
             at_rank(&here, 2),
             at_rank(&there, 2),
@@ -3907,7 +3882,7 @@ mod tests {
             syntax_hash: Some(99),
             span_path: Some("http>pay".to_owned()),
         };
-        let loci = loci_for(Some(&declared), Some(("routing.rs", 10, 3)), 0);
+        let loci = loci_for(Some(&declared), Some(("routing.rs", 10, 3)));
 
         assert_eq!(
             loci.first().map(Locus::rank),
@@ -3927,7 +3902,7 @@ mod tests {
         // 1 and falls through rather than invalidating the tape.
         let ranks: Vec<u8> = loci.iter().map(Locus::rank).collect();
         assert!(
-            ranks.contains(&2) && ranks.contains(&3) && ranks.contains(&6),
+            ranks.contains(&2) && ranks.contains(&3) && ranks.contains(&5),
             "declaring a site must not cost the derived loci: {ranks:?}"
         );
 
@@ -3938,7 +3913,7 @@ mod tests {
             id: None,
             ..declared.clone()
         };
-        let derived_ranks: Vec<u8> = loci_for(Some(&derived), Some(("routing.rs", 10, 3)), 0)
+        let derived_ranks: Vec<u8> = loci_for(Some(&derived), Some(("routing.rs", 10, 3)))
             .iter()
             .map(Locus::rank)
             .collect();
@@ -3947,6 +3922,77 @@ mod tests {
             derived_ranks,
             ranks[1..].to_vec(),
             "declaring a site adds rank 1 and changes nothing else"
+        );
+    }
+
+    #[test]
+    fn no_call_is_left_without_an_address() {
+        // The guarantee `Locus::Sequence` used to provide by being pushed
+        // unconditionally. Six `loci_for` callers pass `identity: None`, so an
+        // empty locus list is reachable input, not a hypothetical — and it would
+        // fail SILENTLY: no keys means the call never resolves, forever, with
+        // nothing to observe but a permanent miss at a boundary that looks fine.
+        //
+        // Every combination of "deja knows nothing" must still yield an address.
+        let nothing = loci_for(None, None);
+        assert!(
+            !nothing.is_empty(),
+            "no identity and no location must still address"
+        );
+        assert_eq!(nothing, vec![Locus::Unlocated]);
+
+        let only_location = loci_for(None, Some(("f.rs", 1, 2)));
+        assert!(!only_location.is_empty());
+
+        let bare_identity = CallsiteIdentity {
+            version: 1,
+            source: CallsiteSource::SyntacticHash,
+            id: None,
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: None,
+        };
+        assert!(
+            !loci_for(Some(&bare_identity), None).is_empty(),
+            "an identity carrying nothing usable must still address — note \
+             `syntax_hash: None`, which used to gate the unlocated locus"
+        );
+    }
+
+    #[test]
+    fn the_deleted_ranks_are_gone_and_the_kept_ones_keep_their_numbers() {
+        // Rank numbers are load-bearing beyond this crate: `resolved_by_rank`
+        // is reported per rank in every scorecard, and the TUI builds its
+        // histogram from those keys. Surviving ranks keep the numbers they had
+        // so already-written reports keep their meaning; 4 and 6 simply never
+        // occur again.
+        let full = CallsiteIdentity {
+            version: 1,
+            source: CallsiteSource::Explicit,
+            id: Some("site".to_owned()),
+            scope: None,
+            occurrence: 3,
+            caller_function: None,
+            lexical_path: Some("router::core".to_owned()),
+            syntax_hash: Some(7),
+            span_path: Some("http>pay".to_owned()),
+        };
+        let ranks: Vec<u8> = loci_for(Some(&full), Some(("f.rs", 1, 2)))
+            .iter()
+            .map(Locus::rank)
+            .collect();
+        assert_eq!(
+            ranks,
+            vec![1, 2, 5, 3],
+            "declared site, span path, source location, then the floor"
+        );
+        assert!(
+            !ranks.contains(&4) && !ranks.contains(&6),
+            "a lexical_path is present on this identity and must no longer \
+             produce a rank — otherwise the deletion did not happen: {ranks:?}"
         );
     }
 
@@ -3961,12 +4007,10 @@ mod tests {
         let a = loci_for(
             Some(&clock_identity("http>pay", 111)),
             Some(("f.rs", 10, 3)),
-            0,
         );
         let b = loci_for(
             Some(&clock_identity("http>pay", 111)),
             Some(("f.rs", 10, 3)),
-            0,
         );
         assert_eq!(a, b);
         assert!(
@@ -4043,7 +4087,7 @@ mod tests {
         let mut entries = Vec::new();
         for (i, (method, span, hash, args, value)) in rows.iter().enumerate() {
             let identity = clock_identity(span, *hash);
-            let loci = loci_for(Some(&identity), None, i as u64);
+            let loci = loci_for(Some(&identity), None);
             // The per-row `method` is the whole point of these fixtures — it is
             // what separates `date_time::now` from
             // `now_unix_timestamp_millis`. Stamping a constant here would make
@@ -4354,7 +4398,7 @@ mod tests {
         let mut identity = clock_identity("unused", 111);
         identity.span_path = None;
         let mut stamper = KeyStamper::new();
-        let addresses = loci_for(Some(&identity), None, 0);
+        let addresses = loci_for(Some(&identity), None);
         assert!(
             !addresses.iter().any(|a| a.rank() == 2),
             "no span means no rank-2 address"
@@ -4411,7 +4455,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let addresses = loci_for(Some(&id), None, i as u64);
+            let addresses = loci_for(Some(&id), None);
             for key in stamper.stamp(
                 None,
                 Some(crate::ROOT_TASK_ID),
@@ -4452,7 +4496,7 @@ mod tests {
         let mut entries = Vec::new();
         for (i, connector) in [1u64, 2, 3].into_iter().enumerate() {
             let args = serde_json::json!({ "connector": connector });
-            let addresses = loci_for(Some(&identity), None, i as u64);
+            let addresses = loci_for(Some(&identity), None);
             for key in stamper.stamp(
                 None,
                 Some(crate::ROOT_TASK_ID),
@@ -4504,8 +4548,9 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .all(|c| c.resolved && c.resolved_rank == Some(4)),
-            "every call resolves at rank 4 regardless of iteration order"
+                .all(|c| c.resolved && c.resolved_rank == Some(3)),
+            "every call resolves regardless of iteration order — at rank 3 since \
+             rank 4 was deleted; resolution is the property, not the rank"
         );
     }
 
@@ -4537,14 +4582,10 @@ mod tests {
     /// build a lookup table via the SHARED `loci_for` + `KeyStamper`.
     fn render_table(events: &[BoundaryEvent]) -> LookupTable {
         let mut stamper = KeyStamper::new();
-        let mut request_seq: HashMap<Option<String>, u64> = HashMap::new();
         let mut entries = Vec::new();
         for event in events {
-            let slot = request_seq.entry(event.correlation_id.clone()).or_insert(0);
-            let request_sequence = *slot;
-            *slot += 1;
             let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-            let addresses = loci_for(event.callsite_identity.as_ref(), location, request_sequence);
+            let addresses = loci_for(event.callsite_identity.as_ref(), location);
             let args_hash = canonical_args_hash(&event.args);
             let bucket_id = event
                 .bucket_id
@@ -4753,13 +4794,21 @@ mod tests {
     }
 
     #[test]
-    fn boundary_path_resolves_at_rank_four_when_only_lexical_path_present() {
-        // When syntax_hash is absent but lexical_path is present (e.g. a
-        // recording produced before rank-3 emission), the SAME boundary call
-        // still resolves — at rank 4 — proving the lexical path is an additive
-        // fallback below SyntacticHash.
+    fn a_boundary_with_only_a_lexical_path_falls_to_the_unlocated_floor() {
+        // This used to force `syntax_hash = None` to make rank 3 absent, then
+        // assert rank 4 caught the call — proving the lexical path was an
+        // additive fallback.
+        //
+        // Neither half survives, and both changes are the point. Rank 4 is
+        // deleted (zero resolutions in 155,419). And rank 3 can no longer BE
+        // forced absent: `Unlocated` is the unconditional floor precisely so
+        // that no identity, however impoverished, leaves a call unaddressable.
+        //
+        // So the property is now stronger than the one this test was written
+        // for: the call resolves not because a weaker locus happened to be
+        // emitted, but because one always is.
         let mut identity = boundary_identity("redis::RedisStore::get_key", 0);
-        identity.syntax_hash = None; // force the rank-3 SyntacticHash address absent
+        identity.syntax_hash = None; // no longer suppresses anything — see above
         identity.source = CallsiteSource::LexicalPath;
 
         let mut event = make_event(
@@ -4793,8 +4842,9 @@ mod tests {
         assert_eq!(result, Some(serde_json::json!({ "Ok": "v1" })));
         assert_eq!(
             handle.lock().unwrap()[0].resolved_rank,
-            Some(4),
-            "lexical-path-only identity must resolve at rank 4"
+            Some(3),
+            "an identity with nothing but a lexical path must resolve at the \
+             unlocated floor — the lexical path itself no longer earns a rank"
         );
     }
 
@@ -5182,7 +5232,10 @@ mod tests {
             assert_eq!(
                 result,
                 Some(serde_json::json!({ "Ok": format!("t{occurrence}") })),
-                "repeated argless call (occurrence {occurrence}) must resolve at rank 4"
+                "repeated argless call (occurrence {occurrence}) must still resolve — \
+                 at rank 3 now that rank 4 is deleted; the PROPERTY (all repeats \
+                 resolve, order-independently) is what this test guards, not the \
+                 rank that happens to serve it"
             );
         }
 
@@ -5191,7 +5244,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .all(|c| c.resolved && c.resolved_rank == Some(4)),
+                .all(|c| c.resolved && c.resolved_rank == Some(3)),
             "all repeated argless calls must resolve at rank 4 (order-independent); \
              got resolved/rank = {:?}",
             calls
@@ -5212,9 +5265,7 @@ mod tests {
             entries: vec![
                 entry_with(
                     None,
-                    Locus::Sequence {
-                        request_sequence: 0,
-                    },
+                    Locus::Unlocated,
                     &args,
                     0,
                     serde_json::json!("by_sequence"),
@@ -6795,9 +6846,7 @@ redis\tcurrency\tusd
             policy_version: POLICY_VERSION,
             entries: vec![entry_with(
                 None,
-                Locus::Sequence {
-                    request_sequence: 0,
-                },
+                Locus::Unlocated,
                 &serde_json::json!(["counter"]),
                 0,
                 serde_json::json!(2), // recorded baseline result

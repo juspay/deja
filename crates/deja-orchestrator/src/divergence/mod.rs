@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 
-use deja::{LocalFileLookupSource, Locus, LookupTable, LookupTableSource, ObservedCall};
+use deja::{LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
 use deja_kernel::{HttpDiff, JsonFieldDiff};
 use serde::{Deserialize, Serialize};
 
@@ -2584,8 +2584,8 @@ impl<'a> ArgsFreePairing<'a> {
         // has no boundary/method and does not pair.
         struct Addressed {
             correlation: Option<String>,
-            boundary: Option<String>,
-            method: Option<String>,
+            boundary: String,
+            method: String,
         }
         let mut addressed: BTreeMap<u64, Addressed> = BTreeMap::new();
         for entry in &table.entries {
@@ -2593,20 +2593,10 @@ impl<'a> ArgsFreePairing<'a> {
                 .entry(entry.source_event_global_sequence)
                 .or_insert(Addressed {
                     correlation: entry.key.correlation_id.clone(),
-                    boundary: None,
-                    method: None,
+                    boundary: entry.key.boundary.clone(),
+                    method: entry.key.operation.clone(),
                 });
-            // Identity is read off the KEY now, but the GATE is unchanged and
-            // deliberate: only a rank-6 entry supplies it. `None` here is not an
-            // absence, it is a refusal — "a sequence the table covers only at a
-            // weaker rank does not pair" (see the struct doc above). Making this
-            // unconditional because identity is always available conflates two
-            // questions: whether identity is KNOWN, and whether this entry is
-            // the positional one that licenses args-free pairing.
-            if matches!(entry.key.locus, Locus::Sequence { .. }) {
-                slot.boundary = Some(entry.key.boundary.clone());
-                slot.method = Some(entry.key.operation.clone());
-            }
+            let _ = slot;
         }
 
         // `addressed` is ordered by sequence, so each queue comes out in source
@@ -2615,9 +2605,21 @@ impl<'a> ArgsFreePairing<'a> {
         // never select that later occurrence.
         let mut queues: BTreeMap<_, std::collections::VecDeque<ArgsFreeTwin<'a>>> = BTreeMap::new();
         for (seq, entry) in &addressed {
-            let (Some(boundary), Some(method)) = (&entry.boundary, &entry.method) else {
-                continue;
-            };
+            // Identity is no longer optional here. It used to be gated on the
+            // entry being the rank-6 positional one, which was the only variant
+            // carrying the boundary — so `None` meant "this event is covered
+            // only at a weaker rank" and the event did not pair.
+            //
+            // That gate was vacuous. Measured on a real rendered table
+            // (`rec-215423c-09111036-3q`, 16,815 entries): every one of the
+            // 3,363 events had an entry at EVERY rank, five apiece, no
+            // exceptions — so the filter never excluded anything in production
+            // and only ever discriminated in hand-built partial test tables.
+            //
+            // Identity is now on every key and is IDENTICAL across an event's
+            // entries, so `or_insert` taking it from whichever comes first is
+            // exactly-once and order-independent, not arbitrary.
+            let (boundary, method) = (&entry.boundary, &entry.method);
             let Some(span) = span_paths.get(seq) else {
                 continue;
             };
@@ -4266,14 +4268,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut per_boundary: BTreeMap<String, BoundaryStats> = BTreeMap::new();
 
     // --- expected side-effect calls, deduped by source event -----------------
-    // Each recorded event yields up to one entry per address rank; we collapse
-    // them by `source_event_global_sequence`. The boundary AND method live on the
-    // rank-6 `Sequence` address, which every event always emits. We also carry the
-    // recorded `result` here — the recorded operand the args-free pairing compares
-    // an execute-shadow `observed_result` against to classify ValueDiverged.
+    // Each recorded event yields one entry per LOCUS; we collapse them by
+    // `source_event_global_sequence`. Boundary and method are IDENTITY and now
+    // live on every key, so they are read from whichever entry lands first —
+    // exactly-once via `or_insert`, and order-independent because every entry
+    // for one event carries the same identity. They used to live only on the
+    // rank-6 `Sequence` address, which is why they were `Option` and why this
+    // comment used to have to explain that every event always emits one.
+    // We also carry the recorded `result` — the operand the args-free pairing
+    // compares an execute-shadow `observed_result` against for ValueDiverged.
     struct Expected {
-        boundary: Option<String>,
-        method: Option<String>,
+        boundary: String,
+        // NOTE: `method` was here and is gone — it was written and never read,
+        // on main too. It was invisible while the write was conditional on the
+        // rank-6 locus (dead stores behind a branch do not warn); making
+        // identity unconditional surfaced it.
         correlation: Option<String>,
         result: serde_json::Value,
     }
@@ -4282,16 +4291,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         let slot = expected
             .entry(entry.source_event_global_sequence)
             .or_insert(Expected {
-                boundary: None,
-                method: None,
+                boundary: entry.key.boundary.clone(),
                 correlation: entry.key.correlation_id.clone(),
                 result: entry.result.clone(),
             });
-        // See the twin above: the rank-6 gate is load-bearing and preserved.
-        if matches!(entry.key.locus, Locus::Sequence { .. }) {
-            slot.boundary = Some(entry.key.boundary.clone());
-            slot.method = Some(entry.key.operation.clone());
-        }
+        let _ = slot;
     }
     let uncorrelated_events_seen = expected
         .values()
@@ -4829,7 +4833,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if !pruned && (consumed.contains(seq) || paired_consumed.contains(seq)) {
             continue;
         }
-        let boundary = exp.boundary.clone().unwrap_or_else(|| "unknown".to_owned());
+        // No `"unknown"` fallback any more. That string existed because the
+        // boundary was only recoverable from the rank-6 locus, so an event
+        // covered at a weaker rank got filed under a placeholder that then had
+        // to be scored like a boundary. Identity is on every key, so every
+        // omission is attributable to the boundary that actually made it.
+        let boundary = exp.boundary.clone();
         // One classification, named for what it counts. Lumping the tolerated
         // omissions — uncorrelated background work, and non-blocking boundaries
         // — under the same name as the blocking ones is what let this table and
@@ -5837,7 +5846,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use deja::{LookupEntry, LookupKey};
+    use deja::{Locus, LookupEntry, LookupKey};
     use deja_kernel::JsonFieldDiff;
 
     /// Row identity is read from the schema at run time (see
@@ -6451,9 +6460,7 @@ mod tests {
                 // pairing test built on this helper.
                 operation: "m".to_owned(),
                 fork_seq: 0,
-                locus: Locus::Sequence {
-                    request_sequence: 0,
-                },
+                locus: Locus::Unlocated,
                 args_hash: 0,
                 occurrence: 0,
             },

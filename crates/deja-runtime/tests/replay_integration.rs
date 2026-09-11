@@ -233,9 +233,7 @@ async fn replay_lookup_hit_with_unreconstructable_result_fail_stops_before_real_
                 component: "CounterService".to_owned(),
                 operation: "get_value".to_owned(),
                 fork_seq: 0,
-                locus: Locus::Sequence {
-                    request_sequence: 0,
-                },
+                locus: Locus::Unlocated,
                 args_hash: canonical_args_hash(&args),
                 occurrence: 0,
             },
@@ -357,9 +355,7 @@ async fn replay_execute_delegate_runs_real_impl_and_emits_shadow_observation() {
                 component: "CounterService".to_owned(),
                 operation: "get_value".to_owned(),
                 fork_seq: 0,
-                locus: Locus::Sequence {
-                    request_sequence: 0,
-                },
+                locus: Locus::Unlocated,
                 args_hash: canonical_args_hash(&args),
                 occurrence: 0,
             },

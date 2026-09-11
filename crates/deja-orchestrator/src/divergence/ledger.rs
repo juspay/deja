@@ -954,9 +954,7 @@ mod tests {
                 occurrence: 0,
             };
             entries.push(deja::LookupEntry {
-                key: key(Locus::Sequence {
-                    request_sequence: 0,
-                }),
+                key: key(Locus::Unlocated),
                 result: ev.result.clone(),
                 source_event_global_sequence: ev.global_sequence,
             });

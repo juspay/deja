@@ -248,13 +248,11 @@ fn by_corr<'a>(events: &'a [BoundaryEvent], corr: &str) -> Vec<&'a BoundaryEvent
 /// rank it can construct.
 fn build_table(events: &[&BoundaryEvent], corr: &str) -> HashMap<LookupKey, serde_json::Value> {
     let mut stamper = KeyStamper::new();
-    let mut request_sequence: u64 = 0;
     let mut table = HashMap::new();
     for event in events {
         let args_hash = canonical_args_hash(&event.args);
         let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-        let addresses = loci_for(event.callsite_identity.as_ref(), location, request_sequence);
-        request_sequence += 1;
+        let addresses = loci_for(event.callsite_identity.as_ref(), location);
         for key in stamper.stamp(
             Some(corr),
             event.bucket_id.as_deref(),
@@ -283,13 +281,11 @@ fn resolve_stream(
     table: &HashMap<LookupKey, serde_json::Value>,
 ) -> Vec<Option<(u8, serde_json::Value)>> {
     let mut stamper = KeyStamper::new();
-    let mut request_sequence: u64 = 0;
     let mut resolved = Vec::new();
     for event in events {
         let args_hash = canonical_args_hash(&event.args);
         let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-        let addresses = loci_for(event.callsite_identity.as_ref(), location, request_sequence);
-        request_sequence += 1;
+        let addresses = loci_for(event.callsite_identity.as_ref(), location);
         // `loci_for` yields strongest-rank first and `stamp` preserves that
         // order, so the first key that hits is the strongest available match —
         // the exact policy `LookupTableHook::try_replay_with_context` applies.
