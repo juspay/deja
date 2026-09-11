@@ -992,7 +992,7 @@ impl DejaHook for ReplayHook {
 
     fn try_replay_with_context(&self, query: ReplayLookup<'_>) -> Option<serde_json::Value> {
         // Identity-first cascade for this legacy in-process hook. (Its stages
-        // are independent of the 6-rank `Address` ladder used by lookup-table
+        // are independent of the 6-rank `Locus` ladder used by lookup-table
         // replay.) A stable callsite-identity match is tried first; the
         // positional strategies in `try_replay` (location-exact /
         // sequence-method-args / sliding-window) are the fallback.
@@ -1098,91 +1098,87 @@ pub struct LookupEntry {
 /// Rank 6 is the positional last resort; a run that leans on it is fragile,
 /// which the divergence detector surfaces via per-rank counts.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Address {
+pub enum Locus {
     /// Rank 1 — user-supplied explicit annotation (`CallsiteSource::Explicit`).
     Explicit(String),
-    /// Rank 2 — logical span-path plus the operation: the root→leaf chain of
-    /// `tracing` span NAMES the call fired within (from
-    /// [`crate::current_span_path`]), qualified by the operation that fired.
-    /// The most version-independent address: it survives source-line shifts and
-    /// benign signature edits, and — crucially — is DISTINCT for concurrent
-    /// same-callsite calls in different spans, so the per-key `occurrence` is
-    /// scoped to the span and cannot swap under async task interleaving. No
-    /// embedded occurrence: the pair IS the disambiguator, and genuine repeats
-    /// of one operation are tiebroken by [`LookupKey::occurrence`].
+    /// Rank 2 — logical span-path: the root→leaf chain of `tracing` span NAMES
+    /// the call fired within. The most version-independent locus — it survives
+    /// source-line shifts and benign signature edits, and is DISTINCT for
+    /// concurrent same-callsite calls in different spans, so the per-key
+    /// `occurrence` is span-scoped and cannot swap under async interleaving.
     ///
-    /// `operation` was not always here, and its absence was a live outage. The
-    /// path alone disambiguates one operation repeating and says nothing about
-    /// two DIFFERENT operations firing inside one span; the occurrence tiebreak
-    /// then hands out whichever landed first. `date_time::now` was given
-    /// `now_unix_timestamp_millis`'s integer and fail-stopped on the type, at
-    /// 100% of rank-2 resolutions — the lookup never degraded, it was
-    /// confidently wrong. Only the zero-argument families can reach it: every
-    /// other boundary sharing a span differs in `args_hash`, while a clock read
-    /// takes no arguments so the whole key collapses to path plus occurrence.
+    /// It carried an `operation` field for exactly one commit (#145), added
+    /// because without it two operations sharing a span path shared a FIFO
+    /// occurrence counter. That was identity wearing a locus's clothes; the
+    /// identity now lives on [`LookupKey`] and this is a path again.
+    SpanPath { path: String },
+    /// Rank 3 — NO location claimed: match on identity, args and occurrence
+    /// alone, wherever the call is made from.
     ///
-    /// It lives in the ADDRESS and not in [`LookupKey`] deliberately. A key
-    /// field applies to every rank at once, so an old table — whose entries
-    /// would deserialize with the field defaulted — would mismatch a new
-    /// candidate at ALL SIX ranks, and a total miss at a `time` boundary
-    /// fail-stops. Inside the address it breaks rank 2 alone and rank 3, which
-    /// hashes `boundary::operation`, catches.
-    SpanPath {
-        path: String,
-        /// `#[serde(default)]` is load-bearing, not tidiness: without it a
-        /// table rendered before this field existed fails to DESERIALIZE and
-        /// does not load at all. With it, such a table yields an empty
-        /// operation that simply never matches, so the call demotes to rank 3
-        /// and resolves. This is the single thing that makes a split deploy —
-        /// new orchestrator, old router pin, or the reverse — degrade instead
-        /// of break.
-        #[serde(default)]
-        operation: String,
-    },
-    /// Rank 3 — hash of the surrounding syntax tokens (`boundary::operation`).
-    SyntacticHash(u64),
-    /// Rank 4 — stable lexical path plus its per-scope occurrence index,
-    /// qualified by the operation.
+    /// This is what `SyntacticHash(hash(boundary::operation))` actually
+    /// provided. Half of it was identity and dissolves into the key's identity
+    /// fields — but the other half was a matching MODE, "resolve this call
+    /// regardless of where it is", and that does not dissolve. Dropping the
+    /// variant outright made an undeclared call fall from rank 3 to rank 6,
+    /// trading an identity match for a positional one; `v2_regression` caught
+    /// it, which is the whole reason that test exists.
     ///
-    /// `path` is the caller's `module_path!()`, which two different operations
-    /// in one module share, and `scope_occurrence` is counted PER METHOD — so
-    /// the first call of each operation is occurrence 0 and their keys were
-    /// identical. The same defect as rank 2's, one rank down, and unreachable
-    /// today only because both seam macros emit `syntax_hash` unconditionally
-    /// so rank 3 always resolves first. That is a property of today's macros,
-    /// not of the scheme, which is why it is fixed here rather than filed.
-    LexicalPath {
-        path: String,
-        scope_occurrence: u32,
-        #[serde(default)]
-        operation: String,
-    },
-    /// Rank 5 — `#[track_caller]` source location.
+    /// Emitted under the same condition the syntactic hash was — a seam with a
+    /// stable syntactic identity. The hash itself is redundant now (it is
+    /// `boundary::operation`, which the key carries), but its PRESENCE was the
+    /// licence for unlocated matching and still is.
+    Unlocated,
+    /// Rank 4 — stable lexical path plus its per-scope occurrence index.
+    LexicalPath { path: String, scope_occurrence: u32 },
+    /// Rank 5 — `#[track_caller]` source location. Identity-bearing by accident
+    /// (a file:line names one call site and therefore one operation), which is
+    /// why it never collided — but by accident is not by construction.
     SourceLocation {
         file: String,
         line: u32,
         column: u32,
     },
-    /// Rank 6 — positional last resort: boundary + method + per-correlation
-    /// request sequence. Fragile to any upstream edit that shifts positions.
-    Sequence {
-        boundary: String,
-        method: String,
-        request_sequence: u64,
-    },
+    /// Rank 6 — positional last resort: the per-correlation request sequence.
+    /// Fragile to any upstream edit that shifts positions, which the divergence
+    /// detector surfaces via per-rank counts.
+    Sequence { request_sequence: u64 },
 }
 
-impl Address {
+/// The IDENTITY half of a lookup key: what the call IS, independent of where it
+/// was made. Borrowed at the two construction sites so neither has to allocate
+/// on the hot path before it knows a key is needed.
+#[derive(Debug, Clone, Copy)]
+pub struct CallIdentity<'a> {
+    pub boundary: &'a str,
+    pub component: &'a str,
+    pub operation: &'a str,
+}
+
+impl CallIdentity<'_> {
+    fn owned(&self) -> (String, String, String) {
+        (
+            self.boundary.to_owned(),
+            self.component.to_owned(),
+            self.operation.to_owned(),
+        )
+    }
+}
+
+impl Locus {
     /// Stability rank: 1 (strongest) … 6 (weakest). Used by the hook to query
     /// strongest-first and by the divergence detector to score fragility.
+    ///
+    /// Rank numbers are unchanged from the `Address` ladder they replace, so
+    /// "rank 4" means what it meant in every scorecard and dashboard already
+    /// written.
     pub fn rank(&self) -> u8 {
         match self {
-            Address::Explicit(_) => 1,
-            Address::SpanPath { .. } => 2,
-            Address::SyntacticHash(_) => 3,
-            Address::LexicalPath { .. } => 4,
-            Address::SourceLocation { .. } => 5,
-            Address::Sequence { .. } => 6,
+            Locus::Explicit(_) => 1,
+            Locus::SpanPath { .. } => 2,
+            Locus::Unlocated => 3,
+            Locus::LexicalPath { .. } => 4,
+            Locus::SourceLocation { .. } => 5,
+            Locus::Sequence { .. } => 6,
         }
     }
 }
@@ -1204,16 +1200,30 @@ pub struct LookupKey {
     /// Monotonic fork sequence for the task lineage that made this call.
     #[serde(default)]
     pub fork_seq: u64,
-    /// Rank-specific call-site address (see [`Address`]).
-    pub address: Address,
+    /// WHAT this call is — the boundary tag. Part of the key's IDENTITY half,
+    /// never inside a locus.
+    pub boundary: String,
+    /// WHAT this call is — the declaring component (`trait_name` on the wire).
+    ///
+    /// New in policy version 2. Rank 3 hashed `boundary::operation` and rank 6
+    /// used boundary + method, both dropping the component — so two components
+    /// declaring the same operation name collided by the same mechanism that
+    /// served `now_unix_timestamp_millis`'s value to `date_time::now`.
+    pub component: String,
+    /// WHAT this call is — the operation / method name.
+    pub operation: String,
+    /// WHERE this call is (see [`Locus`]). Location only: the identity fields
+    /// above are siblings, not members, so no locus CAN omit them.
+    pub locus: Locus,
     /// Canonical hash of the call's serialized args: order-INDEPENDENT for
     /// object keys (they are sorted before hashing) and order-DEPENDENT for
     /// array elements (they are hashed in position). Both halves matter and the
     /// distinction is load-bearing — this field sits on the key itself rather
-    /// than inside [`Address`], so it is part of EVERY rank, and a permuted
+    /// than inside [`Locus`], so it is part of EVERY rank, and a permuted
     /// array therefore misses at all of them at once. See [`hash_value`].
     pub args_hash: u64,
-    /// Nth call to `(correlation_id, bucket_id, address, args_hash)`; 0 for a unique call.
+    /// Nth call to `(correlation_id, bucket_id, identity, locus, args_hash)`;
+    /// 0 for a unique call.
     pub occurrence: u32,
 }
 
@@ -1224,7 +1234,7 @@ pub struct LookupKey {
 /// `boundary`/`trait_name`/`method_name` are carried explicitly (rather than
 /// being read off the resolved key) because ranks 1–5 don't encode the
 /// boundary — yet the detector must attribute every call, hit or miss, to a
-/// boundary. `resolved_rank` records which [`Address`] rank won, so the
+/// boundary. `resolved_rank` records which [`Locus`] rank won, so the
 /// detector can report how much of a run leans on fragile rank-6 matches.
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -1601,52 +1611,59 @@ fn hash_value(hash: u64, value: &serde_json::Value) -> u64 {
 /// caller location, and rank 6 (sequence) is always present as the last
 /// resort. The renderer feeds this from a recorded `BoundaryEvent`; the hook
 /// feeds it from a live `ReplayLookup`. Identical inputs → identical output.
-pub fn addresses_for(
-    boundary: &str,
-    method_name: &str,
+/// Build the rank-ordered loci a call site supports, strongest first.
+///
+/// **This function cannot see the boundary, component or operation, and that is
+/// the point.** Identity lives on [`LookupKey`] as sibling fields, so a locus
+/// physically cannot carry it and no future variant can forget to. The previous
+/// shape took `boundary` and `method_name` and threaded them into two of the six
+/// variants; the two that were missed collided, the lookup SUCCEEDED, and
+/// `date_time::now` was served `now_unix_timestamp_millis`'s recorded value.
+/// Patching the remaining variants would have left the same fault available to
+/// the next variant anyone adds. Removing the parameters closes it by
+/// construction — the enforcement is the signature, not a rule to remember.
+pub fn loci_for(
     identity: Option<&crate::CallsiteIdentity>,
     location: Option<(&str, u32, u32)>,
     request_sequence: u64,
-) -> Vec<Address> {
-    let mut out = Vec::with_capacity(6);
+) -> Vec<Locus> {
+    let mut out = Vec::with_capacity(5);
     if let Some(id) = identity {
         if matches!(id.source, crate::CallsiteSource::Explicit) {
             if let Some(tag) = &id.id {
-                out.push(Address::Explicit(tag.clone()));
+                out.push(Locus::Explicit(tag.clone()));
             }
         }
-        // Rank 2 — logical span-path. Strongest non-explicit address: stable
+        // Rank 2 — logical span-path. Strongest non-explicit locus: stable
         // across line/signature edits AND distinct per concurrent span, so the
         // occurrence tiebreak is span-scoped (no positional swap).
         if let Some(path) = &id.span_path {
-            out.push(Address::SpanPath {
-                path: path.clone(),
-                operation: method_name.to_owned(),
-            });
+            out.push(Locus::SpanPath { path: path.clone() });
         }
-        if let Some(hash) = id.syntax_hash {
-            out.push(Address::SyntacticHash(hash));
+        // Rank 3 — the unlocated mode. The syntactic hash's CONTENT moved to the
+        // key's identity fields; its presence still gates whether this call may
+        // be matched without claiming a location at all.
+        if id.syntax_hash.is_some() {
+            out.push(Locus::Unlocated);
         }
         if let Some(path) = &id.lexical_path {
-            out.push(Address::LexicalPath {
+            out.push(Locus::LexicalPath {
                 path: path.clone(),
                 scope_occurrence: id.occurrence,
-                operation: method_name.to_owned(),
             });
         }
     }
     if let Some((file, line, column)) = location {
-        out.push(Address::SourceLocation {
+        out.push(Locus::SourceLocation {
             file: file.to_owned(),
             line,
             column,
         });
     }
-    out.push(Address::Sequence {
-        boundary: boundary.to_owned(),
-        method: method_name.to_owned(),
-        request_sequence,
-    });
+    // Rank 6 — positional last resort. `boundary` and `method` used to ride here
+    // too; they are identity and moved to the key, leaving the ordinal that was
+    // the only locus-like thing about it.
+    out.push(Locus::Sequence { request_sequence });
     out
 }
 
@@ -1656,9 +1673,21 @@ pub fn addresses_for(
 /// MUST be advanced on every call/event — for **all** ranks, not just the one
 /// that resolves — so the renderer and hook keep identical occurrence
 /// numbering even when a stronger rank is absent from some events.
+/// What an occurrence counter is scoped to: the partition, the call's IDENTITY,
+/// its locus, and its args. Identity is in here as well as on the key — without
+/// it two operations sharing a locus would share a counter, which is how a FIFO
+/// over one bucket handed a clock read another operation's recorded row.
+type OccurrenceScope = (
+    Option<String>,
+    Option<String>,
+    (String, String, String),
+    Locus,
+    u64,
+);
+
 #[derive(Default)]
 pub struct KeyStamper {
-    occurrences: std::collections::HashMap<(Option<String>, Option<String>, Address, u64), u32>,
+    occurrences: std::collections::HashMap<OccurrenceScope, u32>,
 }
 
 impl KeyStamper {
@@ -1666,34 +1695,42 @@ impl KeyStamper {
         Self::default()
     }
 
-    /// Stamp occurrence indices onto each address, returning rank-ordered keys.
+    /// Stamp occurrence indices onto each locus, returning rank-ordered keys.
     pub fn stamp(
         &mut self,
         correlation_id: Option<&str>,
         bucket_id: Option<&str>,
         fork_seq: u64,
-        addresses: &[Address],
+        identity: CallIdentity<'_>,
+        loci: &[Locus],
         args_hash: u64,
     ) -> Vec<LookupKey> {
         let correlation_id = correlation_id.map(str::to_owned);
         let bucket_id = bucket_id.map(str::to_owned);
-        addresses
-            .iter()
-            .map(|address| {
-                let bucket = (
+        loci.iter()
+            .map(|locus| {
+                // Identity participates in the occurrence scope as well as the
+                // key. Without it two operations sharing a locus would share a
+                // counter, which is how the FIFO over one bucket handed a clock
+                // read the wrong row.
+                let scope = (
                     correlation_id.clone(),
                     bucket_id.clone(),
-                    address.clone(),
+                    identity.owned(),
+                    locus.clone(),
                     args_hash,
                 );
-                let counter = self.occurrences.entry(bucket).or_insert(0);
+                let counter = self.occurrences.entry(scope).or_insert(0);
                 let occurrence = *counter;
                 *counter += 1;
                 LookupKey {
                     correlation_id: correlation_id.clone(),
                     bucket_id: bucket_id.clone(),
                     fork_seq,
-                    address: address.clone(),
+                    boundary: identity.boundary.to_owned(),
+                    component: identity.component.to_owned(),
+                    operation: identity.operation.to_owned(),
+                    locus: locus.clone(),
                     args_hash,
                     occurrence,
                 }
@@ -1735,6 +1772,42 @@ impl LocalFileLookupSource {
     }
 }
 
+/// The matching policy this build implements.
+///
+/// Bumped to 2 by the identity/locus split: a version-1 table addresses calls by
+/// an `Locus` carrying identity inside some of its variants, and its keys
+/// cannot be compared against the ones this build stamps.
+pub const POLICY_VERSION: u32 = 2;
+
+/// Refuse a table this build cannot match against, naming both versions.
+///
+/// This runs ONCE, at candidate boot, and the placement is the point. A
+/// version-1 table loaded by a version-2 build does not fail loudly on its own:
+/// every key simply fails to compare, so every call misses, every Substitute
+/// miss fail-stops, and the run presents as a total behavioural regression in
+/// the candidate — indistinguishable by inspection from a real one, and the
+/// exact shape of the outage this change exists to prevent, reached from the
+/// other direction. One refusal at load costs a line of logs and saves the
+/// diagnosis.
+///
+/// Keyed on the DECLARED version, never on sniffing the shape: a table whose
+/// entries happen to deserialize is not thereby matchable.
+fn check_policy_version(table: LookupTable) -> std::io::Result<LookupTable> {
+    if table.policy_version == POLICY_VERSION {
+        return Ok(table);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "lookup table declares matching policy version {} but this build \
+             implements {POLICY_VERSION}; the recording must be re-rendered. \
+             Refusing at load rather than mismatching every key, which would \
+             present as a total candidate regression.",
+            table.policy_version
+        ),
+    ))
+}
+
 impl LookupTableSource for LocalFileLookupSource {
     fn load(&mut self) -> std::io::Result<LookupTable> {
         let bytes = std::fs::read(&self.path)?;
@@ -1744,7 +1817,7 @@ impl LookupTableSource for LocalFileLookupSource {
         // (one LookupEntry per line) if that fails. Robust against either
         // shape without needing a magic byte or extension.
         if let Ok(table) = serde_json::from_str::<LookupTable>(text) {
-            return Ok(table);
+            return check_policy_version(table);
         }
         let entries = text
             .lines()
@@ -1752,9 +1825,12 @@ impl LookupTableSource for LocalFileLookupSource {
             .map(serde_json::from_str::<LookupEntry>)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // A bare JSONL stream carries no envelope and therefore no declared
+        // version. It is produced by this build's renderer or not at all, so it
+        // is taken at the current version rather than refused.
         Ok(LookupTable {
             recording_id: String::new(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries,
         })
     }
@@ -1876,7 +1952,7 @@ impl ObservedCallSink for FileObservedSink {
 pub struct LookupTableHook {
     table: HashMap<LookupKey, LookupEntry>,
     /// Per-correlation request_sequence counter; bumps on each lookup. Feeds
-    /// the rank-6 `Address::Sequence` and mirrors the recorder's own
+    /// the rank-6 `Locus::Sequence` and mirrors the recorder's own
     /// per-correlation sequence (both start at 0 and step by one per call).
     next_sequence: Mutex<HashMap<Option<String>, u64>>,
     /// Shared occurrence assigner; advanced for every rank on every call so its
@@ -1890,7 +1966,7 @@ pub struct LookupTableHook {
     /// `next_callsite_occurrence` on this hook (the same hook that does the
     /// lookup). It MUST advance in lock-step with recording — one bump per call
     /// per scope and lineage bucket — so that the `CallsiteIdentity::occurrence`
-    /// the macro stamps into the rank-4 `Address::LexicalPath { scope_occurrence }` matches the
+    /// the macro stamps into the rank-4 `Locus::LexicalPath { scope_occurrence }` matches the
     /// occurrence the renderer read off the recorded event. Without this the
     /// macro would receive the default `0` for every call and only the first
     /// (occurrence-0) call at each callsite would resolve.
@@ -1993,13 +2069,12 @@ impl LookupTableHook {
         let location = query
             .caller_location
             .map(|loc| (loc.file(), loc.line(), loc.column()));
-        let addresses = addresses_for(
-            query.boundary,
-            query.method_name,
-            query.callsite_identity,
-            location,
-            request_sequence,
-        );
+        let loci = loci_for(query.callsite_identity, location, request_sequence);
+        let identity = CallIdentity {
+            boundary: query.boundary,
+            component: query.trait_name,
+            operation: query.method_name,
+        };
 
         // Stamp occurrences for EVERY rank (not just the one that resolves) so
         // the numbering stays aligned with the renderer, then query
@@ -2009,7 +2084,8 @@ impl LookupTableHook {
                 correlation_id.as_deref(),
                 bucket_id.as_deref(),
                 fork_seq,
-                &addresses,
+                identity,
+                &loci,
                 args_hash,
             ),
             Err(_) => Vec::new(),
@@ -2017,7 +2093,7 @@ impl LookupTableHook {
         let mut hit: Option<(&LookupEntry, u8)> = None;
         for key in &keys {
             if let Some(entry) = self.table.get(key) {
-                hit = Some((entry, key.address.rank()));
+                hit = Some((entry, key.locus.rank()));
                 break;
             }
         }
@@ -3509,7 +3585,7 @@ mod tests {
 
     fn entry_with(
         correlation_id: Option<&str>,
-        address: Address,
+        locus: Locus,
         args: &serde_json::Value,
         occurrence: u32,
         result: serde_json::Value,
@@ -3520,7 +3596,13 @@ mod tests {
                 correlation_id: correlation_id.map(str::to_owned),
                 bucket_id: Some(crate::ROOT_TASK_ID.to_string()),
                 fork_seq: 0,
-                address,
+                // Identity must equal what the querying test asks for or nothing
+                // resolves. These fixtures exercise locus/args resolution, so
+                // identity is held constant at the tuple most of them query.
+                boundary: "redis".to_owned(),
+                component: "RedisStore".to_owned(),
+                operation: "get_key".to_owned(),
+                locus,
                 args_hash: canonical_args_hash(args),
                 occurrence,
             },
@@ -3536,7 +3618,10 @@ mod tests {
                 correlation_id: Some("corr-legacy".to_owned()),
                 bucket_id: Some("bucket-ignored-before-removal".to_owned()),
                 fork_seq: 42,
-                address: explicit("legacy-site"),
+                boundary: "test".to_owned(),
+                component: "tests".to_owned(),
+                operation: "op".to_owned(),
+                locus: explicit("legacy-site"),
                 args_hash: 7,
                 occurrence: 0,
             },
@@ -3557,8 +3642,8 @@ mod tests {
         assert_eq!(entry.key.fork_seq, 0);
     }
 
-    fn explicit(tag: &str) -> Address {
-        Address::Explicit(tag.to_owned())
+    fn explicit(tag: &str) -> Locus {
+        Locus::Explicit(tag.to_owned())
     }
 
     fn lexical_identity(path: &str) -> CallsiteIdentity {
@@ -3606,9 +3691,7 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("create");
         let entry = entry_with(
             Some("c-1"),
-            Address::Sequence {
-                boundary: "redis".to_owned(),
-                method: "get_key".to_owned(),
+            Locus::Sequence {
                 request_sequence: 0,
             },
             &serde_json::json!({}),
@@ -3632,7 +3715,7 @@ mod tests {
         // differ — so resolution is keyed by *what* was called, not *when*.
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![
                 entry_with(
                     None,
@@ -3717,7 +3800,7 @@ mod tests {
         id
     }
 
-    fn at_rank(addresses: &[Address], rank: u8) -> Address {
+    fn at_rank(addresses: &[Locus], rank: u8) -> Locus {
         addresses
             .iter()
             .find(|a| a.rank() == rank)
@@ -3726,144 +3809,155 @@ mod tests {
     }
 
     #[test]
-    fn two_operations_in_one_span_address_differently_at_rank_2() {
-        // The bug at its source. `date_time::now` and
-        // `now_unix_timestamp_millis` fire inside one span and take NO
-        // arguments, so with the path alone their rank-2 keys were identical
-        // and the occurrence tiebreak handed out whichever landed first — a
-        // millisecond integer where a `PrimitiveDateTime` was expected, which
-        // fail-stopped every request in the run that found this.
-        let now = addresses_for(
-            "time",
-            "date_time::now",
-            Some(&clock_identity("http>pay", 111)),
-            None,
-            0,
-        );
-        let millis = addresses_for(
-            "time",
-            "date_time::now_unix_timestamp_millis",
-            Some(&clock_identity("http>pay", 222)),
-            None,
-            1,
-        );
-        assert_ne!(
-            at_rank(&now, 2),
-            at_rank(&millis, 2),
-            "one span, two operations — these must not be one key"
-        );
-
-        // The vacuity guard: the span still LOCALIZES. Repeats of one operation
-        // in one span must keep addressing identically, or the change has
-        // thrown away what rank 2 is for and every such call falls to rank 3.
-        let now_again = addresses_for(
-            "time",
-            "date_time::now",
-            Some(&clock_identity("http>pay", 111)),
-            None,
-            2,
-        );
-        assert_eq!(at_rank(&now, 2), at_rank(&now_again, 2));
-    }
-
-    #[test]
-    fn a_rank_2_key_from_before_the_operation_existed_still_loads() {
-        // The condition that makes a split deploy degrade instead of break. A
-        // table rendered by an older orchestrator carries no `operation`;
-        // without `#[serde(default)]` it fails to DESERIALIZE and the table
-        // does not load at all, which is a total replay outage rather than a
-        // demotion. This test is what stops that default being tidied away.
-        let legacy: Address = serde_json::from_str(r#"{"SpanPath":{"path":"http>pay"}}"#).unwrap();
-        assert_eq!(
-            legacy,
-            Address::SpanPath {
-                path: "http>pay".to_owned(),
-                operation: String::new(),
-            }
-        );
-        // And it does NOT match a current query, so such a call misses rank 2
-        // and demotes to rank 3 rather than resolving to something wrong.
-        assert_ne!(
-            legacy,
-            Address::SpanPath {
-                path: "http>pay".to_owned(),
-                operation: "date_time::now".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn an_older_candidate_ignores_a_field_it_does_not_know() {
-        // The OTHER split-deploy direction, and the property it rests on.
-        // Nothing on the `Address`/`LookupKey` path sets `deny_unknown_fields`,
-        // so a table carrying a field an older candidate never heard of LOADS,
-        // with the field dropped. That candidate then matches on what it does
-        // know and gets the behaviour it had before this change — ambiguous,
-        // but neither a fail-stop nor a table that refuses to load.
+    fn two_operations_in_one_span_share_a_locus_and_still_address_differently() {
+        // THE INVARIANT, stated where it now lives.
         //
-        // So the honest claim is that NEITHER direction fail-stops: new
-        // candidate against an old table demotes to rank 3, old candidate
-        // against a new table returns to the status quo ante. Adding
-        // `deny_unknown_fields` to this path would turn the second into a total
-        // outage, which is why this test exists rather than a comment.
-        let from_the_future: Address = serde_json::from_str(
-            r#"{"SpanPath":{"path":"http>pay","operation":"date_time::now","not_yet_invented":7}}"#,
-        )
-        .unwrap();
+        // These two clock reads are made from the SAME span, so their loci are
+        // byte-identical — and that is correct, because a locus answers WHERE
+        // and they are in the same place. What separates them is identity,
+        // which is a sibling of the locus on the key rather than a field inside
+        // it.
+        //
+        // Before this split the separation lived in the locus, added to rank 2
+        // and rank 4 by #145 after a FIFO over one shared bucket served
+        // `now_unix_timestamp_millis`'s recorded integer to `date_time::now`
+        // and returned HTTP 500 on every correlation. Ranks 1, 5 and 6 were not
+        // given the field. The scheme therefore still depended on every locus
+        // variant remembering to carry a fact that was never a location.
+        let here = loci_for(Some(&clock_identity("http>pay", 111)), None, 0);
+        let there = loci_for(Some(&clock_identity("http>pay", 111)), None, 1);
         assert_eq!(
-            from_the_future,
-            Address::SpanPath {
-                path: "http>pay".to_owned(),
-                operation: "date_time::now".to_owned(),
-            }
+            at_rank(&here, 2),
+            at_rank(&there, 2),
+            "same span, same locus — a locus must not be able to express identity"
+        );
+
+        let mut stamper = KeyStamper::new();
+        let args = serde_json::json!({});
+        let key_of = |stamper: &mut KeyStamper, operation: &str, loci: &[Locus]| {
+            stamper
+                .stamp(
+                    Some("corr-1"),
+                    Some(crate::ROOT_TASK_ID),
+                    0,
+                    CallIdentity {
+                        boundary: "time",
+                        component: "common_utils",
+                        operation,
+                    },
+                    loci,
+                    canonical_args_hash(&args),
+                )
+                .into_iter()
+                .find(|k| k.locus.rank() == 2)
+                .expect("rank-2 key")
+        };
+        let now = key_of(&mut stamper, "date_time::now", &here);
+        let millis = key_of(&mut stamper, "date_time::now_unix_timestamp_millis", &there);
+
+        assert_ne!(
+            now, millis,
+            "two operations sharing a locus must not share a key"
+        );
+        assert_eq!(
+            now.locus, millis.locus,
+            "and they must differ ONLY in identity, not in locus — otherwise \
+             this is passing for the wrong reason"
+        );
+        assert_eq!(
+            (now.occurrence, millis.occurrence),
+            (0, 0),
+            "each operation gets its own occurrence counter; sharing one is \
+             what made the FIFO serve the wrong row"
         );
     }
 
     #[test]
-    fn rank_4_carries_the_operation_too() {
-        // The same defect one rank down: `path` is the caller's `module_path!()`
-        // and `scope_occurrence` is counted PER METHOD, so the first call of
-        // each operation was occurrence 0 under one path. Unreachable today
-        // only because both seam macros emit `syntax_hash` unconditionally and
-        // rank 3 resolves first — a property of the macros, not of the scheme.
-        let now = addresses_for(
-            "time",
-            "date_time::now",
+    fn no_locus_can_carry_identity() {
+        // The by-construction claim, asserted rather than asserted-about.
+        //
+        // `loci_for` cannot see the boundary, component or operation — they are
+        // not parameters — so no variant it produces can embed them, today or
+        // when someone adds a seventh. Two calls that differ ONLY in operation
+        // must therefore produce identical loci at every rank.
+        let a = loci_for(
             Some(&clock_identity("http>pay", 111)),
-            None,
+            Some(("f.rs", 10, 3)),
             0,
         );
-        let millis = addresses_for(
-            "time",
-            "date_time::now_unix_timestamp_millis",
-            Some(&clock_identity("http>pay", 222)),
-            None,
-            1,
+        let b = loci_for(
+            Some(&clock_identity("http>pay", 111)),
+            Some(("f.rs", 10, 3)),
+            0,
         );
-        assert_ne!(at_rank(&now, 4), at_rank(&millis, 4));
+        assert_eq!(a, b);
+        assert!(
+            !a.is_empty(),
+            "precondition: an empty locus list would pass this vacuously"
+        );
+        for locus in &a {
+            let rendered = serde_json::to_string(locus).expect("serialize");
+            assert!(
+                !rendered.contains("date_time")
+                    && !rendered.contains("\"time\"")
+                    && !rendered.contains("common_utils"),
+                "a locus leaked identity into its serialized form: {rendered}"
+            );
+        }
+    }
 
-        let legacy: Address =
-            serde_json::from_str(r#"{"LexicalPath":{"path":"router::core","scope_occurrence":0}}"#)
-                .unwrap();
-        assert_eq!(
-            legacy,
-            Address::LexicalPath {
-                path: "router::core".to_owned(),
-                scope_occurrence: 0,
-                operation: String::new(),
-            }
+    #[test]
+    fn a_table_from_an_older_matching_policy_is_refused_at_load() {
+        // Replaces three serde back-compat tests that kept a v1 `Address`
+        // loadable. Old tapes are no longer matched at all, so the property
+        // worth pinning is the REFUSAL — and that it happens at load.
+        //
+        // A v1 table read by this build does not fail on its own: every key
+        // fails to compare, every call misses, every Substitute miss
+        // fail-stops, and the run presents as a total candidate regression.
+        // That is indistinguishable from a real one by inspection, which is the
+        // shape of the outage this whole change exists to prevent.
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("table.json");
+        let mut file = std::fs::File::create(&path).expect("create");
+        write!(
+            file,
+            r#"{{"recording_id":"rec-1","policy_version":1,"entries":[]}}"#
+        )
+        .expect("write");
+
+        let err = LocalFileLookupSource::new(&path)
+            .load()
+            .expect_err("a v1 table must be refused, not loaded");
+        let message = err.to_string();
+        assert!(
+            message.contains("policy version 1") && message.contains(&POLICY_VERSION.to_string()),
+            "the refusal must name BOTH versions so the fix is obvious: {message}"
         );
+
+        // And the current version still loads, or the guard is just a wall.
+        let ok_path = dir.path().join("ok.json");
+        let mut ok = std::fs::File::create(&ok_path).expect("create");
+        write!(
+            ok,
+            r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"entries":[]}}"#
+        )
+        .expect("write");
+        LocalFileLookupSource::new(&ok_path)
+            .load()
+            .expect("a current-version table must still load");
     }
 
     /// One recorded call: the operation, the span it fired in, its
     /// operation-specific syntax hash, its arguments, and what it returned.
     type ClockRow<'a> = (&'a str, &'a str, u64, serde_json::Value, serde_json::Value);
 
-    /// Render a table the way the ORCHESTRATOR does — same `addresses_for`,
+    /// Render a table the way the ORCHESTRATOR does — same `loci_for`,
     /// same `KeyStamper` — so that a divergence between renderer and hook shows
     /// up here. `render_table` below does the same from full `BoundaryEvent`s;
     /// this takes the minimum a rank-2 question needs, so a case reads as the
-    /// call it describes rather than as event construction. A unit test on `addresses_for` alone cannot catch that: both
+    /// call it describes rather than as event construction. A unit test on `loci_for` alone cannot catch that: both
     /// sides have to agree, and only building one and querying the other proves
     /// they do.
     fn rendered_table(boundary: &str, rows: &[ClockRow<'_>]) -> LookupTable {
@@ -3871,12 +3965,23 @@ mod tests {
         let mut entries = Vec::new();
         for (i, (method, span, hash, args, value)) in rows.iter().enumerate() {
             let identity = clock_identity(span, *hash);
-            let addresses = addresses_for(boundary, method, Some(&identity), None, i as u64);
+            let loci = loci_for(Some(&identity), None, i as u64);
+            // The per-row `method` is the whole point of these fixtures — it is
+            // what separates `date_time::now` from
+            // `now_unix_timestamp_millis`. Stamping a constant here would make
+            // every row share identity, which is precisely the collision these
+            // tests exist to detect, and they would pass by agreeing with the
+            // bug.
             for key in stamper.stamp(
                 None,
                 Some(crate::ROOT_TASK_ID),
                 0,
-                &addresses,
+                CallIdentity {
+                    boundary,
+                    component: "common_utils",
+                    operation: method,
+                },
+                &loci,
                 canonical_args_hash(args),
             ) {
                 entries.push(LookupEntry {
@@ -3888,7 +3993,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries,
         }
     }
@@ -3915,7 +4020,10 @@ mod tests {
         hook.try_replay_with_context(ReplayLookup {
             miss_policy: crate::MissPolicy::FailStop,
             boundary,
-            trait_name: "T",
+            // Must equal what `rendered_table` stamps, or nothing resolves and
+            // every clock test passes/fails for a reason unrelated to what it
+            // is about.
+            trait_name: "common_utils",
             method_name: method,
             args,
             callsite_identity: Some(identity),
@@ -4148,46 +4256,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_new_candidate_against_an_old_table_demotes_to_rank_3_and_resolves() {
-        // Split deploy, direction one. An old table's rank-2 entries carry no
-        // operation; deserialization defaults it to empty, so it cannot match a
-        // current query. The call must DEMOTE and resolve, not fail-stop —
-        // asserting the resolved value and the rank, not merely the absence of
-        // a panic.
-        let none = serde_json::json!({});
-        let mut table = rendered_table(
-            "time",
-            &[(
-                "date_time::now",
-                "http>pay",
-                111,
-                none.clone(),
-                serde_json::json!("recorded"),
-            )],
-        );
-        for entry in &mut table.entries {
-            if let Address::SpanPath { operation, .. } = &mut entry.key.address {
-                operation.clear();
-            }
-        }
-        let (hook, handle) = hook_over(table);
-        assert_eq!(
-            ask(
-                &hook,
-                "time",
-                "date_time::now",
-                &clock_identity("http>pay", 111),
-                &none
-            ),
-            Some(serde_json::json!("recorded"))
-        );
-        assert_eq!(
-            ranks(&handle),
-            vec![Some(3)],
-            "rank 2 missed and rank 3 — which hashes boundary::operation — caught it"
-        );
-    }
+    // REMOVED: `a_new_candidate_against_an_old_table_demotes_to_rank_3_and_resolves`.
+    //
+    // It pinned split-deploy tolerance — an old table whose rank-2 entries
+    // carried no operation would DEMOTE to rank 3 and still resolve. Both of its
+    // premises are gone on purpose: rank 3 was pure identity and is now the key's
+    // identity fields, and a table from an older matching policy is refused at
+    // load rather than partially matched. Tolerating it would mean answering
+    // some calls from a table whose keys this build cannot construct, which is
+    // how a stale tape gets mistaken for a candidate regression.
+    // `a_table_from_an_older_matching_policy_is_refused_at_load` is the property
+    // that replaces it.
 
     #[test]
     fn a_call_with_no_span_still_resolves_at_a_weaker_rank() {
@@ -4197,7 +4276,7 @@ mod tests {
         let mut identity = clock_identity("unused", 111);
         identity.span_path = None;
         let mut stamper = KeyStamper::new();
-        let addresses = addresses_for("time", "date_time::now", Some(&identity), None, 0);
+        let addresses = loci_for(Some(&identity), None, 0);
         assert!(
             !addresses.iter().any(|a| a.rank() == 2),
             "no span means no rank-2 address"
@@ -4207,6 +4286,11 @@ mod tests {
                 None,
                 Some(crate::ROOT_TASK_ID),
                 0,
+                CallIdentity {
+                    boundary: "time",
+                    component: "common_utils",
+                    operation: "date_time::now",
+                },
                 &addresses,
                 canonical_args_hash(&none),
             )
@@ -4219,7 +4303,7 @@ mod tests {
             .collect();
         let (hook, handle) = hook_over(LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries,
         });
         assert_eq!(
@@ -4249,11 +4333,16 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let addresses = addresses_for("time", "date_time::now", Some(&id), None, i as u64);
+            let addresses = loci_for(Some(&id), None, i as u64);
             for key in stamper.stamp(
                 None,
                 Some(crate::ROOT_TASK_ID),
                 0,
+                CallIdentity {
+                    boundary: "redis",
+                    component: "RedisStore",
+                    operation: "get_key",
+                },
                 &addresses,
                 canonical_args_hash(&none),
             ) {
@@ -4266,7 +4355,7 @@ mod tests {
         }
         let spanned: Vec<u32> = entries
             .iter()
-            .filter(|e| matches!(e.key.address, Address::SpanPath { .. }))
+            .filter(|e| matches!(e.key.locus, Locus::SpanPath { .. }))
             .map(|e| e.key.occurrence)
             .collect();
         assert_eq!(
@@ -4285,11 +4374,16 @@ mod tests {
         let mut entries = Vec::new();
         for (i, connector) in [1u64, 2, 3].into_iter().enumerate() {
             let args = serde_json::json!({ "connector": connector });
-            let addresses = addresses_for("redis", "get_key", Some(&identity), None, i as u64);
+            let addresses = loci_for(Some(&identity), None, i as u64);
             for key in stamper.stamp(
                 None,
                 Some(crate::ROOT_TASK_ID),
                 0,
+                CallIdentity {
+                    boundary: "redis",
+                    component: "RedisStore",
+                    operation: "get_key",
+                },
                 &addresses,
                 canonical_args_hash(&args),
             ) {
@@ -4302,7 +4396,7 @@ mod tests {
         }
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries,
         };
         let observed = InMemoryObservedSink::new();
@@ -4362,7 +4456,7 @@ mod tests {
     }
 
     /// Mirror the renderer (`deja-orchestrator`): walk recorded events and
-    /// build a lookup table via the SHARED `addresses_for` + `KeyStamper`.
+    /// build a lookup table via the SHARED `loci_for` + `KeyStamper`.
     fn render_table(events: &[BoundaryEvent]) -> LookupTable {
         let mut stamper = KeyStamper::new();
         let mut request_seq: HashMap<Option<String>, u64> = HashMap::new();
@@ -4372,13 +4466,7 @@ mod tests {
             let request_sequence = *slot;
             *slot += 1;
             let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-            let addresses = addresses_for(
-                &event.boundary,
-                &event.method_name,
-                event.callsite_identity.as_ref(),
-                location,
-                request_sequence,
-            );
+            let addresses = loci_for(event.callsite_identity.as_ref(), location, request_sequence);
             let args_hash = canonical_args_hash(&event.args);
             let bucket_id = event
                 .bucket_id
@@ -4386,10 +4474,19 @@ mod tests {
                 .or(event.task_bucket.as_deref())
                 .unwrap_or(crate::ROOT_TASK_ID);
             let fork_seq = event.fork_seq.unwrap_or(0);
+            // Mirrors the production renderer: identity comes off the EVENT.
+            // A constant here would give every fixture row the same identity,
+            // which is the collision these tests exist to detect — they would
+            // pass by agreeing with the bug.
             for key in stamper.stamp(
                 event.correlation_id.as_deref(),
                 Some(bucket_id),
                 fork_seq,
+                CallIdentity {
+                    boundary: &event.boundary,
+                    component: &event.trait_name,
+                    operation: &event.method_name,
+                },
                 &addresses,
                 args_hash,
             ) {
@@ -4402,7 +4499,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-boundary".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries,
         }
     }
@@ -4543,6 +4640,7 @@ mod tests {
             false,
         );
         event.boundary = "redis".into();
+        event.trait_name = "RedisStore".into();
         event.callsite_identity = Some(identity.clone());
         assert!(
             event.callsite_identity.is_some(),
@@ -4595,6 +4693,7 @@ mod tests {
             false,
         );
         event.boundary = "redis".into();
+        event.trait_name = "RedisStore".into();
         event.callsite_identity = Some(identity.clone());
 
         let table = render_table(&[event]);
@@ -4662,6 +4761,7 @@ mod tests {
                 false,
             );
             e.boundary = "db".into();
+            e.trait_name = "Store".into();
             e.callsite_identity = Some(id.clone());
             e
         };
@@ -4796,6 +4896,7 @@ mod tests {
                 false,
             );
             event.boundary = "redis".into();
+            event.trait_name = "RedisStore".into();
             event.callsite_identity = Some(boundary_identity(scope, occurrence));
             events.push(event);
         }
@@ -4890,7 +4991,7 @@ mod tests {
     ///
     /// This drives the EXACT dockerized-replay path:
     ///   recorded events (macro-style identity)
-    ///     -> `render_table` (the real `addresses_for` + `KeyStamper` renderer)
+    ///     -> `render_table` (the real `loci_for` + `KeyStamper` renderer)
     ///     -> `LookupTableHook::try_replay_with_context`
     /// where the boundary macro RE-DERIVES the per-callsite `occurrence` at
     /// replay through the SAME hook that performs the lookup (exactly as
@@ -4952,6 +5053,7 @@ mod tests {
                 false,
             );
             event.boundary = "time".into();
+            event.trait_name = "Time".into();
             event.callsite_identity = Some(identity_for(occurrence));
             events.push(event);
         }
@@ -5028,13 +5130,11 @@ mod tests {
         let args = serde_json::json!({});
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![
                 entry_with(
                     None,
-                    Address::Sequence {
-                        boundary: "redis".to_owned(),
-                        method: "m".to_owned(),
+                    Locus::Sequence {
                         request_sequence: 0,
                     },
                     &args,
@@ -5060,8 +5160,10 @@ mod tests {
         let value = hook.try_replay_with_context(ReplayLookup {
             miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
-            trait_name: "S",
-            method_name: "m",
+            // See above: identity is incidental here (this test is about rank
+            // preference) and must match `entry_with`.
+            trait_name: "RedisStore",
+            method_name: "get_key",
             args: &args,
             callsite_identity: Some(&identity),
             caller_location: None,
@@ -5085,7 +5187,7 @@ mod tests {
         let recorded_args = serde_json::json!({ "id": "pi_recorded" });
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![entry_with(
                 None,
                 explicit("find_pi"),
@@ -5125,7 +5227,7 @@ mod tests {
     fn lookup_table_hook_record_emits_observed_http_finalizer_only() {
         let empty = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();
@@ -5326,7 +5428,7 @@ mod tests {
     fn declared_execute_is_honored_on_any_replay_hook() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![],
         };
         let hook =
@@ -5359,7 +5461,7 @@ mod tests {
     fn declared_knob_drives_routing() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![],
         };
         let hook =
@@ -5414,7 +5516,7 @@ mod tests {
     fn declared_execute_routes_through_runtime_hook_wrapper() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![],
         };
         let inner =
@@ -5447,7 +5549,7 @@ mod tests {
         let inner_default = LookupTableHook::from_source(
             VecSource(Some(LookupTable {
                 recording_id: "r".to_owned(),
-                policy_version: 1,
+                policy_version: POLICY_VERSION,
                 entries: vec![],
             })),
             InMemoryObservedSink::new(),
@@ -6612,12 +6714,10 @@ redis\tcurrency\tusd
     fn hook_execute_shadow_emits_observation_with_real_result() {
         let table = LookupTable {
             recording_id: "rec-shadow".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![entry_with(
                 None,
-                Address::Sequence {
-                    boundary: "redis".to_owned(),
-                    method: "incr".to_owned(),
+                Locus::Sequence {
                     request_sequence: 0,
                 },
                 &serde_json::json!(["counter"]),
@@ -6636,7 +6736,11 @@ redis\tcurrency\tusd
             miss_policy: crate::MissPolicy::FailStop,
             boundary: "redis",
             trait_name: "RedisStore",
-            method_name: "incr",
+            // Identity is incidental to what this test asserts (shadow
+            // observation), but it must AGREE with `entry_with`'s fixture or
+            // the lookup never resolves and the test would pass or fail for an
+            // unrelated reason.
+            method_name: "get_key",
             args: &args,
             callsite_identity: None,
             caller_location: None,
@@ -6669,7 +6773,7 @@ redis\tcurrency\tusd
         // Empty table → NO recorded baseline for the candidate's extra call.
         let table = LookupTable {
             recording_id: "rec-novel".to_owned(),
-            policy_version: 1,
+            policy_version: POLICY_VERSION,
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();

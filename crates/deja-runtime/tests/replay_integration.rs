@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use deja_runtime::replay::{
-    canonical_args_hash, Address, InMemoryObservedSink, LookupEntry, LookupKey, LookupTable,
+    canonical_args_hash, InMemoryObservedSink, Locus, LookupEntry, LookupKey, LookupTable,
     LookupTableHook, LookupTableSource,
 };
 use deja_runtime::{read_events, Provenance, RecordingHook, ReplayHook};
@@ -221,15 +221,19 @@ async fn replay_lookup_hit_with_unreconstructable_result_fail_stops_before_real_
     let args = serde_json::json!({});
     let table = LookupTable {
         recording_id: "malformed-substitute-hit".to_owned(),
-        policy_version: 1,
+        policy_version: deja_runtime::replay::POLICY_VERSION,
         entries: vec![LookupEntry {
             key: LookupKey {
                 correlation_id: None,
                 bucket_id: Some("root".to_owned()),
+                // Must equal what the delegate macro declares
+                // (`delegate_counter_service_with_replay!(.., "service")` on
+                // `CounterService`) or the key never compares.
+                boundary: "service".to_owned(),
+                component: "CounterService".to_owned(),
+                operation: "get_value".to_owned(),
                 fork_seq: 0,
-                address: Address::Sequence {
-                    boundary: "service".to_owned(),
-                    method: "get_value".to_owned(),
+                locus: Locus::Sequence {
                     request_sequence: 0,
                 },
                 args_hash: canonical_args_hash(&args),
@@ -341,15 +345,19 @@ async fn replay_execute_delegate_runs_real_impl_and_emits_shadow_observation() {
     let args = serde_json::json!({});
     let table = LookupTable {
         recording_id: "execute-delegate-recording".to_owned(),
-        policy_version: 1,
+        policy_version: deja_runtime::replay::POLICY_VERSION,
         entries: vec![LookupEntry {
             key: LookupKey {
                 correlation_id: None,
                 bucket_id: Some("root".to_owned()),
+                // Must equal what the delegate macro declares
+                // (`delegate_counter_service_with_replay!(.., "service")` on
+                // `CounterService`) or the key never compares.
+                boundary: "service".to_owned(),
+                component: "CounterService".to_owned(),
+                operation: "get_value".to_owned(),
                 fork_seq: 0,
-                address: Address::Sequence {
-                    boundary: "service".to_owned(),
-                    method: "get_value".to_owned(),
+                locus: Locus::Sequence {
                     request_sequence: 0,
                 },
                 args_hash: canonical_args_hash(&args),

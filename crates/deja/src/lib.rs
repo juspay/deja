@@ -29,17 +29,18 @@ pub use deja_context::{
     clear_recording_decision, recording_decision, recording_decision_for_current,
     set_recording_decision, RecordDecision,
 };
-/// Re-export lookup-table replay primitives (hybrid architecture: in-process
-/// lookup with per-site ReplayStrategy selecting Execute vs Substitute).
-pub use deja_runtime::replay::{
-    addresses_for, canonical_args_hash, Address, FileObservedSink, InMemoryObservedSink,
-    KeyStamper, LocalFileLookupSource, LookupEntry, LookupKey, LookupTable, LookupTableHook,
-    LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
-};
 pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_execute_mode};
 pub use deja_runtime::replay::{
     build_seed_plan, build_write_target_tables, AmbientTemplate, NotPreconditionReason,
     ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
+};
+/// Re-export lookup-table replay primitives (hybrid architecture: in-process
+/// lookup with per-site ReplayStrategy selecting Execute vs Substitute).
+pub use deja_runtime::replay::{
+    canonical_args_hash, loci_for, CallIdentity, FileObservedSink, InMemoryObservedSink,
+    KeyStamper, LocalFileLookupSource, Locus, LookupEntry, LookupKey, LookupTable, LookupTableHook,
+    LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
+    POLICY_VERSION,
 };
 /// Re-export the generic seed-plan pipeline (pure builder, diverged-read
 /// classification, ambient template) so the harness materializes seeds from
