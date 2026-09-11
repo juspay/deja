@@ -1101,19 +1101,62 @@ pub struct LookupEntry {
 pub enum Address {
     /// Rank 1 — user-supplied explicit annotation (`CallsiteSource::Explicit`).
     Explicit(String),
-    /// Rank 2 — logical span-path: the root→leaf chain of `tracing` span NAMES
-    /// the call fired within (from [`crate::current_span_path`]). The
-    /// most version-independent address: it survives source-line shifts and
+    /// Rank 2 — logical span-path plus the operation: the root→leaf chain of
+    /// `tracing` span NAMES the call fired within (from
+    /// [`crate::current_span_path`]), qualified by the operation that fired.
+    /// The most version-independent address: it survives source-line shifts and
     /// benign signature edits, and — crucially — is DISTINCT for concurrent
     /// same-callsite calls in different spans, so the per-key `occurrence` is
     /// scoped to the span and cannot swap under async task interleaving. No
-    /// embedded occurrence: the path IS the disambiguator, and genuine same-path
-    /// repeats are tiebroken by [`LookupKey::occurrence`] (sequential, stable).
-    SpanPath { path: String },
+    /// embedded occurrence: the pair IS the disambiguator, and genuine repeats
+    /// of one operation are tiebroken by [`LookupKey::occurrence`].
+    ///
+    /// `operation` was not always here, and its absence was a live outage. The
+    /// path alone disambiguates one operation repeating and says nothing about
+    /// two DIFFERENT operations firing inside one span; the occurrence tiebreak
+    /// then hands out whichever landed first. `date_time::now` was given
+    /// `now_unix_timestamp_millis`'s integer and fail-stopped on the type, at
+    /// 100% of rank-2 resolutions — the lookup never degraded, it was
+    /// confidently wrong. Only the zero-argument families can reach it: every
+    /// other boundary sharing a span differs in `args_hash`, while a clock read
+    /// takes no arguments so the whole key collapses to path plus occurrence.
+    ///
+    /// It lives in the ADDRESS and not in [`LookupKey`] deliberately. A key
+    /// field applies to every rank at once, so an old table — whose entries
+    /// would deserialize with the field defaulted — would mismatch a new
+    /// candidate at ALL SIX ranks, and a total miss at a `time` boundary
+    /// fail-stops. Inside the address it breaks rank 2 alone and rank 3, which
+    /// hashes `boundary::operation`, catches.
+    SpanPath {
+        path: String,
+        /// `#[serde(default)]` is load-bearing, not tidiness: without it a
+        /// table rendered before this field existed fails to DESERIALIZE and
+        /// does not load at all. With it, such a table yields an empty
+        /// operation that simply never matches, so the call demotes to rank 3
+        /// and resolves. This is the single thing that makes a split deploy —
+        /// new orchestrator, old router pin, or the reverse — degrade instead
+        /// of break.
+        #[serde(default)]
+        operation: String,
+    },
     /// Rank 3 — hash of the surrounding syntax tokens (`boundary::operation`).
     SyntacticHash(u64),
-    /// Rank 4 — stable lexical path plus its per-scope occurrence index.
-    LexicalPath { path: String, scope_occurrence: u32 },
+    /// Rank 4 — stable lexical path plus its per-scope occurrence index,
+    /// qualified by the operation.
+    ///
+    /// `path` is the caller's `module_path!()`, which two different operations
+    /// in one module share, and `scope_occurrence` is counted PER METHOD — so
+    /// the first call of each operation is occurrence 0 and their keys were
+    /// identical. The same defect as rank 2's, one rank down, and unreachable
+    /// today only because both seam macros emit `syntax_hash` unconditionally
+    /// so rank 3 always resolves first. That is a property of today's macros,
+    /// not of the scheme, which is why it is fixed here rather than filed.
+    LexicalPath {
+        path: String,
+        scope_occurrence: u32,
+        #[serde(default)]
+        operation: String,
+    },
     /// Rank 5 — `#[track_caller]` source location.
     SourceLocation {
         file: String,
@@ -1576,7 +1619,10 @@ pub fn addresses_for(
         // across line/signature edits AND distinct per concurrent span, so the
         // occurrence tiebreak is span-scoped (no positional swap).
         if let Some(path) = &id.span_path {
-            out.push(Address::SpanPath { path: path.clone() });
+            out.push(Address::SpanPath {
+                path: path.clone(),
+                operation: method_name.to_owned(),
+            });
         }
         if let Some(hash) = id.syntax_hash {
             out.push(Address::SyntacticHash(hash));
@@ -1585,6 +1631,7 @@ pub fn addresses_for(
             out.push(Address::LexicalPath {
                 path: path.clone(),
                 scope_occurrence: id.occurrence,
+                operation: method_name.to_owned(),
             });
         }
     }
@@ -3658,6 +3705,574 @@ mod tests {
         assert_eq!(
             calls[0].boundary, "redis",
             "boundary carried on the observation"
+        );
+    }
+
+    /// A clock call site: a span path, an operation-specific syntax hash, and
+    /// no arguments — the shape that made rank 2 ambiguous.
+    fn clock_identity(span: &str, syntax_hash: u64) -> crate::CallsiteIdentity {
+        let mut id = lexical_identity("router::core");
+        id.syntax_hash = Some(syntax_hash);
+        id.span_path = Some(span.to_owned());
+        id
+    }
+
+    fn at_rank(addresses: &[Address], rank: u8) -> Address {
+        addresses
+            .iter()
+            .find(|a| a.rank() == rank)
+            .unwrap_or_else(|| panic!("no rank-{rank} address in {addresses:?}"))
+            .clone()
+    }
+
+    #[test]
+    fn two_operations_in_one_span_address_differently_at_rank_2() {
+        // The bug at its source. `date_time::now` and
+        // `now_unix_timestamp_millis` fire inside one span and take NO
+        // arguments, so with the path alone their rank-2 keys were identical
+        // and the occurrence tiebreak handed out whichever landed first — a
+        // millisecond integer where a `PrimitiveDateTime` was expected, which
+        // fail-stopped every request in the run that found this.
+        let now = addresses_for(
+            "time",
+            "date_time::now",
+            Some(&clock_identity("http>pay", 111)),
+            None,
+            0,
+        );
+        let millis = addresses_for(
+            "time",
+            "date_time::now_unix_timestamp_millis",
+            Some(&clock_identity("http>pay", 222)),
+            None,
+            1,
+        );
+        assert_ne!(
+            at_rank(&now, 2),
+            at_rank(&millis, 2),
+            "one span, two operations — these must not be one key"
+        );
+
+        // The vacuity guard: the span still LOCALIZES. Repeats of one operation
+        // in one span must keep addressing identically, or the change has
+        // thrown away what rank 2 is for and every such call falls to rank 3.
+        let now_again = addresses_for(
+            "time",
+            "date_time::now",
+            Some(&clock_identity("http>pay", 111)),
+            None,
+            2,
+        );
+        assert_eq!(at_rank(&now, 2), at_rank(&now_again, 2));
+    }
+
+    #[test]
+    fn a_rank_2_key_from_before_the_operation_existed_still_loads() {
+        // The condition that makes a split deploy degrade instead of break. A
+        // table rendered by an older orchestrator carries no `operation`;
+        // without `#[serde(default)]` it fails to DESERIALIZE and the table
+        // does not load at all, which is a total replay outage rather than a
+        // demotion. This test is what stops that default being tidied away.
+        let legacy: Address = serde_json::from_str(r#"{"SpanPath":{"path":"http>pay"}}"#).unwrap();
+        assert_eq!(
+            legacy,
+            Address::SpanPath {
+                path: "http>pay".to_owned(),
+                operation: String::new(),
+            }
+        );
+        // And it does NOT match a current query, so such a call misses rank 2
+        // and demotes to rank 3 rather than resolving to something wrong.
+        assert_ne!(
+            legacy,
+            Address::SpanPath {
+                path: "http>pay".to_owned(),
+                operation: "date_time::now".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_older_candidate_ignores_a_field_it_does_not_know() {
+        // The OTHER split-deploy direction, and the property it rests on.
+        // Nothing on the `Address`/`LookupKey` path sets `deny_unknown_fields`,
+        // so a table carrying a field an older candidate never heard of LOADS,
+        // with the field dropped. That candidate then matches on what it does
+        // know and gets the behaviour it had before this change — ambiguous,
+        // but neither a fail-stop nor a table that refuses to load.
+        //
+        // So the honest claim is that NEITHER direction fail-stops: new
+        // candidate against an old table demotes to rank 3, old candidate
+        // against a new table returns to the status quo ante. Adding
+        // `deny_unknown_fields` to this path would turn the second into a total
+        // outage, which is why this test exists rather than a comment.
+        let from_the_future: Address = serde_json::from_str(
+            r#"{"SpanPath":{"path":"http>pay","operation":"date_time::now","not_yet_invented":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            from_the_future,
+            Address::SpanPath {
+                path: "http>pay".to_owned(),
+                operation: "date_time::now".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rank_4_carries_the_operation_too() {
+        // The same defect one rank down: `path` is the caller's `module_path!()`
+        // and `scope_occurrence` is counted PER METHOD, so the first call of
+        // each operation was occurrence 0 under one path. Unreachable today
+        // only because both seam macros emit `syntax_hash` unconditionally and
+        // rank 3 resolves first — a property of the macros, not of the scheme.
+        let now = addresses_for(
+            "time",
+            "date_time::now",
+            Some(&clock_identity("http>pay", 111)),
+            None,
+            0,
+        );
+        let millis = addresses_for(
+            "time",
+            "date_time::now_unix_timestamp_millis",
+            Some(&clock_identity("http>pay", 222)),
+            None,
+            1,
+        );
+        assert_ne!(at_rank(&now, 4), at_rank(&millis, 4));
+
+        let legacy: Address =
+            serde_json::from_str(r#"{"LexicalPath":{"path":"router::core","scope_occurrence":0}}"#)
+                .unwrap();
+        assert_eq!(
+            legacy,
+            Address::LexicalPath {
+                path: "router::core".to_owned(),
+                scope_occurrence: 0,
+                operation: String::new(),
+            }
+        );
+    }
+
+    /// One recorded call: the operation, the span it fired in, its
+    /// operation-specific syntax hash, its arguments, and what it returned.
+    type ClockRow<'a> = (&'a str, &'a str, u64, serde_json::Value, serde_json::Value);
+
+    /// Render a table the way the ORCHESTRATOR does — same `addresses_for`,
+    /// same `KeyStamper` — so that a divergence between renderer and hook shows
+    /// up here. `render_table` below does the same from full `BoundaryEvent`s;
+    /// this takes the minimum a rank-2 question needs, so a case reads as the
+    /// call it describes rather than as event construction. A unit test on `addresses_for` alone cannot catch that: both
+    /// sides have to agree, and only building one and querying the other proves
+    /// they do.
+    fn rendered_table(boundary: &str, rows: &[ClockRow<'_>]) -> LookupTable {
+        let mut stamper = KeyStamper::new();
+        let mut entries = Vec::new();
+        for (i, (method, span, hash, args, value)) in rows.iter().enumerate() {
+            let identity = clock_identity(span, *hash);
+            let addresses = addresses_for(boundary, method, Some(&identity), None, i as u64);
+            for key in stamper.stamp(
+                None,
+                Some(crate::ROOT_TASK_ID),
+                0,
+                &addresses,
+                canonical_args_hash(args),
+            ) {
+                entries.push(LookupEntry {
+                    key,
+                    result: value.clone(),
+                    source_event_global_sequence: i as u64,
+                });
+            }
+        }
+        LookupTable {
+            recording_id: "rec-1".to_owned(),
+            policy_version: 1,
+            entries,
+        }
+    }
+
+    type ObservedHandle = std::sync::Arc<Mutex<Vec<ObservedCall>>>;
+
+    fn hook_over(table: LookupTable) -> (LookupTableHook, ObservedHandle) {
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        (
+            LookupTableHook::from_source(VecSource(Some(table)), observed).expect("from_source"),
+            handle,
+        )
+    }
+
+    /// Ask the hook for one call, the way a candidate does.
+    fn ask(
+        hook: &LookupTableHook,
+        boundary: &str,
+        method: &str,
+        identity: &crate::CallsiteIdentity,
+        args: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        hook.try_replay_with_context(ReplayLookup {
+            miss_policy: crate::MissPolicy::FailStop,
+            boundary,
+            trait_name: "T",
+            method_name: method,
+            args,
+            callsite_identity: Some(identity),
+            caller_location: None,
+        })
+    }
+
+    fn ranks(handle: &ObservedHandle) -> Vec<Option<u8>> {
+        handle
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.resolved_rank)
+            .collect()
+    }
+
+    #[test]
+    fn each_clock_operation_in_one_span_resolves_to_its_own_value() {
+        // THE BUG, end to end and in its production shape. `date_time::now` and
+        // `now_unix_timestamp_millis` fire in one span and take no arguments,
+        // so before the fix their rank-2 keys were identical and the occurrence
+        // tiebreak gave `now` the millisecond integer — which will not build a
+        // `PrimitiveDateTime`, so every request fail-stopped.
+        //
+        // NOTE THE QUERY ORDER, which is what makes this test able to fail.
+        // Under one shared key the FIFO tiebreak happens to hand out the right
+        // rows when the replay's calls line up one-for-one with the recording's
+        // — so a test that asks in recorded order passes even with the bug
+        // present, which mine did until the mutation said so. Production does
+        // not line up: a substituted parent's body never runs, so the clock
+        // reads inside a span drift in count and order, and every occurrence
+        // after the drift is mis-assigned. Asking in the opposite order is the
+        // smallest faithful version of that drift.
+        let none = serde_json::json!({});
+        let table = rendered_table(
+            "time",
+            &[
+                (
+                    "date_time::now",
+                    "http>pay",
+                    111,
+                    none.clone(),
+                    serde_json::json!("2026-09-11T10:36:00Z"),
+                ),
+                (
+                    "date_time::now_unix_timestamp_millis",
+                    "http>pay",
+                    222,
+                    none.clone(),
+                    serde_json::json!(1789123423342u64),
+                ),
+            ],
+        );
+        let (hook, handle) = hook_over(table);
+
+        assert_eq!(
+            ask(
+                &hook,
+                "time",
+                "date_time::now_unix_timestamp_millis",
+                &clock_identity("http>pay", 222),
+                &none
+            ),
+            Some(serde_json::json!(1789123423342u64)),
+            "asked second, recorded second — but asked FIRST here"
+        );
+        assert_eq!(
+            ask(
+                &hook,
+                "time",
+                "date_time::now",
+                &clock_identity("http>pay", 111),
+                &none
+            ),
+            Some(serde_json::json!("2026-09-11T10:36:00Z")),
+            "`now` must get the timestamp it recorded, not the millis row that a \
+             shared key would have handed it"
+        );
+        assert_eq!(
+            ranks(&handle),
+            vec![Some(2), Some(2)],
+            "both at rank 2, not demoted"
+        );
+    }
+
+    #[test]
+    fn the_id_family_is_fixed_too() {
+        // `id` is the other zero-argument family, and its collision is WORSE
+        // than the clock's — which is the strongest thing this change has to
+        // say. The clock bug was caught by the TYPE SYSTEM and not by the
+        // addressing scheme: `PrimitiveDateTime` happened to refuse an integer.
+        // The id family has no such accident available. `common_utils` carries
+        // eleven `deja::id` operations under one `module_path!()`, FOUR of them
+        // returning `String` — these two among them — so the recorded values
+        // deserialize into each other perfectly. The candidate gets a nanoid
+        // where it asked for a generated id, with no panic, no divergence and
+        // nothing in the report. The loud bug we found was the lucky instance;
+        // the quiet one has been reachable the whole time.
+        let none = serde_json::json!({});
+        let table = rendered_table(
+            "id",
+            &[
+                (
+                    "generate_nanoid_with_default_alphabet",
+                    "http>pay",
+                    333,
+                    none.clone(),
+                    serde_json::json!("V1StGXR8Z5jdHi6B"),
+                ),
+                (
+                    "generate_id",
+                    "http>pay",
+                    444,
+                    none.clone(),
+                    serde_json::json!("pay_9KqR2mVt"),
+                ),
+            ],
+        );
+        let (hook, _h) = hook_over(table);
+        // Asked in the OPPOSITE order to the recording, for the same reason as
+        // the clock test: in recorded order the FIFO tiebreak hands out the
+        // right rows by accident even with one shared key, so the test cannot
+        // fail. Both values are strings, so nothing but the assertion itself
+        // would notice them swapping.
+        assert_eq!(
+            ask(
+                &hook,
+                "id",
+                "generate_id",
+                &clock_identity("http>pay", 444),
+                &none
+            ),
+            Some(serde_json::json!("pay_9KqR2mVt"))
+        );
+        assert_eq!(
+            ask(
+                &hook,
+                "id",
+                "generate_nanoid_with_default_alphabet",
+                &clock_identity("http>pay", 333),
+                &none
+            ),
+            Some(serde_json::json!("V1StGXR8Z5jdHi6B"))
+        );
+    }
+
+    #[test]
+    fn repeats_of_one_operation_in_a_span_still_resolve_in_order() {
+        // The regression rank 2 exists to prevent. If putting the operation in
+        // the address broke occurrence scoping, this trades one bug for a worse
+        // one — every repeated seam call resolving to the first row.
+        let none = serde_json::json!({});
+        let table = rendered_table(
+            "time",
+            &[
+                (
+                    "date_time::now",
+                    "http>pay",
+                    111,
+                    none.clone(),
+                    serde_json::json!("first"),
+                ),
+                (
+                    "date_time::now",
+                    "http>pay",
+                    111,
+                    none.clone(),
+                    serde_json::json!("second"),
+                ),
+            ],
+        );
+        let (hook, handle) = hook_over(table);
+        let id = clock_identity("http>pay", 111);
+        assert_eq!(
+            ask(&hook, "time", "date_time::now", &id, &none),
+            Some(serde_json::json!("first"))
+        );
+        assert_eq!(
+            ask(&hook, "time", "date_time::now", &id, &none),
+            Some(serde_json::json!("second"))
+        );
+        assert_eq!(ranks(&handle), vec![Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn one_operation_in_two_spans_stays_distinct() {
+        // The async-interleaving case rank 2 was built for: the same call site
+        // in two concurrent spans must not share an occurrence counter.
+        let none = serde_json::json!({});
+        let table = rendered_table(
+            "time",
+            &[
+                (
+                    "date_time::now",
+                    "http>pay",
+                    111,
+                    none.clone(),
+                    serde_json::json!("pay"),
+                ),
+                (
+                    "date_time::now",
+                    "http>refund",
+                    111,
+                    none.clone(),
+                    serde_json::json!("refund"),
+                ),
+            ],
+        );
+        let (hook, _h) = hook_over(table);
+        // Queried in the OPPOSITE order to the recording, which is the point.
+        assert_eq!(
+            ask(
+                &hook,
+                "time",
+                "date_time::now",
+                &clock_identity("http>refund", 111),
+                &none
+            ),
+            Some(serde_json::json!("refund"))
+        );
+        assert_eq!(
+            ask(
+                &hook,
+                "time",
+                "date_time::now",
+                &clock_identity("http>pay", 111),
+                &none
+            ),
+            Some(serde_json::json!("pay"))
+        );
+    }
+
+    #[test]
+    fn a_new_candidate_against_an_old_table_demotes_to_rank_3_and_resolves() {
+        // Split deploy, direction one. An old table's rank-2 entries carry no
+        // operation; deserialization defaults it to empty, so it cannot match a
+        // current query. The call must DEMOTE and resolve, not fail-stop —
+        // asserting the resolved value and the rank, not merely the absence of
+        // a panic.
+        let none = serde_json::json!({});
+        let mut table = rendered_table(
+            "time",
+            &[(
+                "date_time::now",
+                "http>pay",
+                111,
+                none.clone(),
+                serde_json::json!("recorded"),
+            )],
+        );
+        for entry in &mut table.entries {
+            if let Address::SpanPath { operation, .. } = &mut entry.key.address {
+                operation.clear();
+            }
+        }
+        let (hook, handle) = hook_over(table);
+        assert_eq!(
+            ask(
+                &hook,
+                "time",
+                "date_time::now",
+                &clock_identity("http>pay", 111),
+                &none
+            ),
+            Some(serde_json::json!("recorded"))
+        );
+        assert_eq!(
+            ranks(&handle),
+            vec![Some(3)],
+            "rank 2 missed and rank 3 — which hashes boundary::operation — caught it"
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_span_still_resolves_at_a_weaker_rank() {
+        // Degradation, so an absent rank never means a WRONG value. No span
+        // entered at all: rank 2 is not constructed, and the call still lands.
+        let none = serde_json::json!({});
+        let mut identity = clock_identity("unused", 111);
+        identity.span_path = None;
+        let mut stamper = KeyStamper::new();
+        let addresses = addresses_for("time", "date_time::now", Some(&identity), None, 0);
+        assert!(
+            !addresses.iter().any(|a| a.rank() == 2),
+            "no span means no rank-2 address"
+        );
+        let entries: Vec<LookupEntry> = stamper
+            .stamp(
+                None,
+                Some(crate::ROOT_TASK_ID),
+                0,
+                &addresses,
+                canonical_args_hash(&none),
+            )
+            .into_iter()
+            .map(|key| LookupEntry {
+                key,
+                result: serde_json::json!("spanless"),
+                source_event_global_sequence: 0,
+            })
+            .collect();
+        let (hook, handle) = hook_over(LookupTable {
+            recording_id: "rec-1".to_owned(),
+            policy_version: 1,
+            entries,
+        });
+        assert_eq!(
+            ask(&hook, "time", "date_time::now", &identity, &none),
+            Some(serde_json::json!("spanless"))
+        );
+        assert_eq!(ranks(&handle), vec![Some(3)]);
+    }
+
+    #[test]
+    fn occurrence_stays_aligned_when_a_stronger_rank_is_absent_from_some_events() {
+        // `KeyStamper`'s stated contract: advance for EVERY rank on every event
+        // "even when a stronger rank is absent from some events". Here the
+        // middle call has no span, so rank 2 skips it — and the two that do
+        // have spans must still number 0 and 1 between themselves, or renderer
+        // and hook disagree and every lookup silently misses.
+        let none = serde_json::json!({});
+        let mut spanless = clock_identity("http>pay", 111);
+        spanless.span_path = None;
+        let mut stamper = KeyStamper::new();
+        let mut entries = Vec::new();
+        for (i, (id, value)) in [
+            (clock_identity("http>pay", 111), "first"),
+            (spanless.clone(), "middle"),
+            (clock_identity("http>pay", 111), "third"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let addresses = addresses_for("time", "date_time::now", Some(&id), None, i as u64);
+            for key in stamper.stamp(
+                None,
+                Some(crate::ROOT_TASK_ID),
+                0,
+                &addresses,
+                canonical_args_hash(&none),
+            ) {
+                entries.push(LookupEntry {
+                    key,
+                    result: serde_json::json!(value),
+                    source_event_global_sequence: i as u64,
+                });
+            }
+        }
+        let spanned: Vec<u32> = entries
+            .iter()
+            .filter(|e| matches!(e.key.address, Address::SpanPath { .. }))
+            .map(|e| e.key.occurrence)
+            .collect();
+        assert_eq!(
+            spanned,
+            vec![0, 1],
+            "the spanned calls number between themselves; the spanless one does not shift them"
         );
     }
 

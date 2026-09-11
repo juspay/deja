@@ -832,7 +832,7 @@ pub fn expected_sequences(table: &deja::LookupTable) -> HashSet<u64> {
 pub fn recorded_span_paths(table: &deja::LookupTable) -> HashMap<u64, String> {
     let mut out = HashMap::new();
     for entry in &table.entries {
-        if let Address::SpanPath { path } = &entry.key.address {
+        if let Address::SpanPath { path, .. } = &entry.key.address {
             out.entry(entry.source_event_global_sequence)
                 .or_insert_with(|| path.clone());
         }
@@ -961,7 +961,10 @@ mod tests {
             });
             if let Some(path) = spans.get(&ev.global_sequence) {
                 entries.push(deja::LookupEntry {
-                    key: key(Address::SpanPath { path: path.clone() }),
+                    key: key(Address::SpanPath {
+                        path: path.clone(),
+                        operation: String::new(),
+                    }),
                     result: ev.result.clone(),
                     source_event_global_sequence: ev.global_sequence,
                 });
