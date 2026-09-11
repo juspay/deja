@@ -220,6 +220,28 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // The correlation id used for the occurrence bucket is the explicit
     // correlation (if any) falling back to the ambient one — the same value the
     // recorded event carries — so the renderer and hook bucket identically.
+    // `site = "name"` makes the author's name the call site's identity: source
+    // becomes Explicit and `id` carries the name, which is what lets
+    // `loci_for` emit `Locus::DeclaredSite`. Everything else is unchanged and
+    // still emitted, so a declared site GAINS rank 1 and keeps every derived
+    // locus as fallback — a tag present on only one side degrades to the
+    // derived loci instead of failing.
+    //
+    // The occurrence source moves with it. `next_boundary_occurrence` buckets on
+    // (correlation, source, scope), so leaving the source as `SyntacticHash`
+    // while the identity says `Explicit` would count this site's occurrences in
+    // a bucket nothing else reads. Record and replay both run this same macro,
+    // so they move together.
+    let (identity_source, identity_id) = match &args.site {
+        Some(site) => (
+            quote!(::deja::__private::CallsiteSource::Explicit),
+            quote!(::std::option::Option::Some(#site.to_string())),
+        ),
+        None => (
+            quote!(::deja::__private::CallsiteSource::SyntacticHash),
+            quote!(::std::option::Option::None),
+        ),
+    };
     let identity_build: TokenStream = quote! {
         let __deja_identity_scope: ::std::string::String = { #identity_scope_expr };
         let __deja_identity_correlation: ::std::option::Option<::std::string::String> =
@@ -229,12 +251,12 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
             };
         let __deja_identity = ::deja::__private::CallsiteIdentity {
             version: 1,
-            source: ::deja::__private::CallsiteSource::SyntacticHash,
-            id: ::std::option::Option::None,
+            source: #identity_source,
+            id: #identity_id,
             scope: ::std::option::Option::Some(__deja_identity_scope.clone()),
             occurrence: ::deja::__private::next_boundary_occurrence(
                 __deja_identity_correlation.as_deref(),
-                ::deja::__private::CallsiteSource::SyntacticHash,
+                #identity_source,
                 ::std::option::Option::Some(__deja_identity_scope.as_str()),
             ),
             caller_function: ::std::option::Option::Some(::std::module_path!().to_string()),
@@ -1147,6 +1169,27 @@ pub struct InstrumentArgs {
     pub boundary: Option<LitStr>,
     pub component: Option<LitStr>,
     pub operation: Option<LitStr>,
+    /// `site = "name"` — the author NAMES this call site, and that name becomes
+    /// its strongest locus (`Locus::DeclaredSite`, rank 1).
+    ///
+    /// Opt-in and expected to stay rare. Every other locus is DERIVED — deja
+    /// works out where a call is from the span stack, the module path, the
+    /// source location — and derivation is right almost always: span paths
+    /// resolve 99.99% of calls across 155,419 measured resolutions. This is the
+    /// escape hatch for the sites where derivation is wrong, such as a call
+    /// reached from many spans that should be treated as one site.
+    ///
+    /// Before this existed the runtime had the variant and nothing could emit
+    /// it: the macro hardcoded `CallsiteSource::SyntacticHash` with `id: None`,
+    /// so rank 1 was unreachable from any `#[deja::boundary]` and had never
+    /// resolved a single call. A capability nobody can reach is not a
+    /// capability.
+    ///
+    /// The name must be STABLE by hand — that is its cost, and the reason it is
+    /// not the default. Changing it addresses the site somewhere new, so an
+    /// existing tape stops matching it at rank 1 and falls through to the
+    /// derived loci; it degrades rather than breaking.
+    pub site: Option<LitStr>,
     pub args: Option<Expr>,
     pub result: Option<Expr>,
     pub correlation: Option<Expr>,
@@ -1247,6 +1290,7 @@ impl Parse for InstrumentArgs {
                     input.parse::<Token![=]>()?;
                     match key_string.as_str() {
                         "boundary" => args.boundary = Some(input.parse()?),
+                        "site" => args.site = Some(input.parse()?),
                         "component" => args.component = Some(input.parse()?),
                         "operation" => args.operation = Some(input.parse()?),
                         "args" => args.args = Some(input.parse()?),
@@ -1517,6 +1561,67 @@ mod tests {
         assert!(
             attributed.contains("SubstituteMiss"),
             "an expression naming `__deja_miss` must get the marker: {attributed}"
+        );
+    }
+
+    /// `site = "name"` is what makes rank 1 reachable at all.
+    ///
+    /// Before it existed the runtime had `Locus::DeclaredSite` and the macro
+    /// could not emit it — `CallsiteSource::SyntacticHash` and `id: None` were
+    /// hardcoded — so no `#[deja::boundary]` site could ever address at rank 1.
+    /// That is why rank 1 has resolved zero calls in 155,419 measured
+    /// resolutions: not because it is weak, because it was unreachable.
+    #[test]
+    fn a_declared_site_makes_rank_one_reachable() {
+        let undeclared = generate(
+            parse_args(quote!(boundary = "imc", replay = Substitute)),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            undeclared.contains("SyntacticHash")
+                && !undeclared.contains("CallsiteSource :: Explicit"),
+            "an undeclared site must keep deriving its locus: {undeclared}"
+        );
+
+        let declared = generate(
+            parse_args(quote!(
+                boundary = "imc",
+                replay = Substitute,
+                site = "routing::eligible_connectors"
+            )),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            declared.contains("CallsiteSource :: Explicit"),
+            "a declared site must emit an Explicit identity, or the runtime \
+             cannot build a DeclaredSite locus: {declared}"
+        );
+        assert!(
+            declared.contains(r#""routing::eligible_connectors""#),
+            "and must carry the author's name as the id, verbatim — it is a \
+             string literal, so it stays one token: {declared}"
+        );
+        assert!(
+            !declared.contains("SyntacticHash"),
+            "the occurrence source must move with the identity — bucketing on \
+             SyntacticHash while the identity says Explicit counts this site's \
+             occurrences where nothing reads them: {declared}"
+        );
+        assert!(
+            declared.contains("span_path") && declared.contains("lexical_path"),
+            "a declared site GAINS rank 1 and keeps every derived locus as \
+             fallback, so a tag present on one side only degrades rather than \
+             failing: {declared}"
         );
     }
 

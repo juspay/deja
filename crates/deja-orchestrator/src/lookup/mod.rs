@@ -3,7 +3,7 @@
 //!
 //! The renderer and the candidate's `LookupTableHook` MUST construct keys
 //! identically, or every lookup silently misses. That shared logic lives in
-//! `deja-runtime` (`addresses_for`, `canonical_args_hash`, `KeyStamper`); this
+//! `deja-runtime` (`loci_for`, `canonical_args_hash`, `KeyStamper`); this
 //! renderer is just the recording-side driver that feeds it.
 //!
 //! For each non-`http_incoming` event the renderer emits ONE `LookupEntry` per
@@ -12,10 +12,9 @@
 //! the first hit, so registering all ranks lets a single recording satisfy a
 //! candidate however much call-site metadata it carries.
 
-use std::collections::HashMap;
 use std::io;
 
-use deja::{addresses_for, canonical_args_hash, KeyStamper, LookupEntry, LookupTable};
+use deja::{canonical_args_hash, loci_for, CallIdentity, KeyStamper, LookupEntry, LookupTable};
 
 use crate::scope::{ScopedRecording, TapeItem};
 
@@ -58,18 +57,22 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// the scorer classifies those as environmental misses instead of resolving
 /// them. The day the record side starts emitting uncorrelated events, this
 /// paragraph is what stops being true — not the scoping guarantee above.
+/// The rendered table is stamped with [`deja::POLICY_VERSION`] — the version
+/// THIS BUILD implements — rather than a version the caller chooses.
+///
+/// It used to be a parameter, and every caller passed a literal `1`. That makes
+/// the declared version a claim about the caller's intent instead of a fact
+/// about the keys in the table, so a build whose matching policy had moved on
+/// would still stamp `1` and the load-time guard would wave it through. The
+/// version has to come from the same place the keys do.
 pub fn render_lookup_table(
     recording: &ScopedRecording,
     recording_id: &str,
-    policy_version: u32,
 ) -> io::Result<LookupTable> {
+    let policy_version = deja::POLICY_VERSION;
     // Shared occurrence assigner — advanced for every rank on every event, in
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();
-    // Per-correlation sequence over the SAME event subset the hook sees (it
-    // never looks up the kernel-driven `http_incoming` event), so the rank-6
-    // `Address::Sequence` aligns instead of being offset by the incoming hop.
-    let mut request_seq: HashMap<Option<String>, u64> = HashMap::new();
     let mut entries = Vec::new();
     let (mut dbg_ok, mut dbg_skip): (u64, u64) = (0, 0);
     let mut dbg_first_err: Option<String> = None;
@@ -101,19 +104,17 @@ pub fn render_lookup_table(
             continue;
         }
 
-        let seq_slot = request_seq.entry(event.correlation_id.clone()).or_insert(0);
-        let request_sequence = *seq_slot;
-        *seq_slot += 1;
-
         let args_hash = canonical_args_hash(&event.args);
         let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-        let addresses = addresses_for(
-            &event.boundary,
-            &event.method_name,
-            event.callsite_identity.as_ref(),
-            location,
-            request_sequence,
-        );
+        let loci = loci_for(event.callsite_identity.as_ref(), location);
+        // The renderer and the hook must derive identity from the same three
+        // fields or no key ever compares. Both read them off the boundary spec
+        // the macro emitted, so they agree by construction.
+        let identity = CallIdentity {
+            boundary: &event.boundary,
+            component: &event.trait_name,
+            operation: &event.method_name,
+        };
 
         let bucket_id = event
             .bucket_id
@@ -125,7 +126,8 @@ pub fn render_lookup_table(
             event.correlation_id.as_deref(),
             Some(bucket_id),
             fork_seq,
-            &addresses,
+            identity,
+            &loci,
             args_hash,
         ) {
             entries.push(LookupEntry {
@@ -240,7 +242,7 @@ mod tests {
             &[driven, foreign],
             crate::scope::RunScope::from_filter(Some(&["c-driven".to_owned()])),
         );
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert!(
             table
                 .entries
@@ -287,7 +289,7 @@ mod tests {
 
         let keys_of_driven = |scope: crate::scope::RunScope| {
             let (_dir, recording) = write_events_scoped(&build(), scope);
-            let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+            let table = render_lookup_table(&recording, "rec-1").unwrap();
             table
                 .entries
                 .iter()
@@ -338,7 +340,7 @@ mod tests {
         };
         let ambient_keys = |scope: crate::scope::RunScope| {
             let (_dir, recording) = write_events_scoped(&build(), scope);
-            let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+            let table = render_lookup_table(&recording, "rec-1").unwrap();
             table
                 .entries
                 .iter()
@@ -360,32 +362,46 @@ mod tests {
     }
 
     #[test]
-    fn renderer_skips_http_incoming_and_emits_one_entry_per_rank() {
-        // http_incoming (skipped) + one redis event with no callsite identity,
-        // so the redis event addresses at rank 5 (location) and rank 6 (sequence).
+    fn an_event_with_no_identity_at_all_is_still_addressable() {
+        // THE GUARANTEE deleting `Locus::Sequence` could have removed silently.
+        //
+        // Sequence was pushed unconditionally, so every call was certain to have
+        // at least one address. With it gone, an event carrying NO callsite
+        // identity would produce an empty locus list — no keys, so the call
+        // could never resolve, with nothing to observe but a permanent miss.
+        // `Locus::Unlocated` is now the unconditional floor, which is why this
+        // event still addresses.
+        //
+        // http_incoming is skipped (the kernel drives it); the redis event has
+        // no identity, so it addresses at rank 5 (location) and rank 3 (floor).
         let (_dir, recording) = write_events(&[
             event("http_incoming", 0, serde_json::Value::Null),
             event("redis", 1, serde_json::Value::Null),
         ]);
 
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert_eq!(
             table.entries.len(),
             2,
-            "redis event yields rank-5 + rank-6 entries"
+            "an identity-less event yields the location and the floor"
         );
         assert!(table
             .entries
             .iter()
             .all(|e| e.source_event_global_sequence == 1));
-        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.address.rank()).collect();
-        assert!(ranks.contains(&5) && ranks.contains(&6));
+        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.locus.rank()).collect();
         assert!(
-            table.entries.iter().any(|e| matches!(
-                &e.key.address,
-                deja::Address::Sequence { boundary, .. } if boundary == "redis"
-            )),
-            "rank-6 sequence address names the boundary"
+            !ranks.is_empty(),
+            "an event with no identity must NEVER end up unaddressable"
+        );
+        assert!(ranks.contains(&3) && ranks.contains(&5), "{ranks:?}");
+        // The boundary is on the KEY now, not inside the rank-6 locus. Asserted
+        // across EVERY entry rather than `any`: identity used to be recoverable
+        // only from the one variant that happened to carry it, and the point of
+        // moving it is that every key has it.
+        assert!(
+            table.entries.iter().all(|e| e.key.boundary == "redis"),
+            "every key carries the boundary as identity, whatever its locus"
         );
     }
 
@@ -401,27 +417,24 @@ mod tests {
         let (_dir, recording) =
             write_events(&[ingress, event("redis", 1, serde_json::Value::Null)]);
 
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert_eq!(table.entries.len(), 2, "only the redis event renders");
         assert!(table
             .entries
             .iter()
             .all(|e| e.source_event_global_sequence == 1));
         assert!(
-            table.entries.iter().any(|e| matches!(
-                &e.key.address,
-                deja::Address::Sequence {
-                    request_sequence: 0,
-                    ..
-                }
-            )),
+            table
+                .entries
+                .iter()
+                .any(|e| matches!(&e.key.locus, deja::Locus::Unlocated)),
             "the egress event is sequence 0 of the hook-visible subset"
         );
         // Without the role, an unrecognized boundary is NOT skipped — the
         // legacy behavior for every non-ingress event.
         let (_dir2, recording2) =
             write_events(&[event("grpc_incoming", 0, serde_json::Value::Null)]);
-        let table2 = render_lookup_table(&recording2, "rec-1", 1).unwrap();
+        let table2 = render_lookup_table(&recording2, "rec-1").unwrap();
         assert!(
             !table2.entries.is_empty(),
             "role-less unknown boundary renders like any egress event"
@@ -440,7 +453,7 @@ mod tests {
         ev["value_digest"] = serde_json::json!("12345678901234567890");
         let (_dir, recording) = write_events(&[ev]);
         // Must NOT drop the event -> render succeeds and yields entries.
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert!(
             !table.entries.is_empty(),
             "a stringified-u64 event must render, not drop"
@@ -457,7 +470,7 @@ mod tests {
             "global_sequence": "not-a-number"
         });
         let (_dir, recording) = write_events(&[good, bad]);
-        let err = render_lookup_table(&recording, "rec-1", 1).unwrap_err();
+        let err = render_lookup_table(&recording, "rec-1").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("INCOMPLETE"),
@@ -466,8 +479,14 @@ mod tests {
     }
 
     #[test]
-    fn renderer_emits_lexical_rank_when_identity_present() {
-        // A redis event carrying a lexical path also gets a rank-3 entry.
+    fn a_lexical_path_no_longer_earns_its_own_rank() {
+        // Rank 4 (`LexicalPath`) is GONE. It resolved zero calls in 155,419
+        // measured resolutions, and its module path is a coarser restatement of
+        // the span path that already resolves 99.99% of them.
+        //
+        // The event still addresses — at rank 5 from its location and rank 3
+        // from the unlocated floor — so removing the variant costs reach only
+        // where nothing was reaching.
         let identity = serde_json::json!({
             "version": 1,
             "source": "LexicalPath",
@@ -480,13 +499,17 @@ mod tests {
         });
         let (_dir, recording) = write_events(&[event("redis", 0, identity)]);
 
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
-        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.address.rank()).collect();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.locus.rank()).collect();
         assert!(
-            ranks.contains(&4),
-            "lexical path yields a rank-4 entry: {ranks:?}"
+            !ranks.contains(&4) && !ranks.contains(&6),
+            "ranks 4 and 6 are deleted: {ranks:?}"
         );
-        assert!(ranks.contains(&5) && ranks.contains(&6));
+        assert!(
+            ranks.contains(&3) && ranks.contains(&5),
+            "the event must still address, at the unlocated floor and its \
+             location: {ranks:?}"
+        );
     }
 
     #[test]
@@ -510,11 +533,11 @@ mod tests {
         detached["fork_seq"] = serde_json::json!(1);
 
         let (_dir, recording) = write_events(&[root, detached]);
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         let location_keys = table
             .entries
             .iter()
-            .filter(|entry| entry.key.address.rank() == 5)
+            .filter(|entry| entry.key.locus.rank() == 5)
             .map(|entry| serde_json::to_value(&entry.key).unwrap())
             .collect::<Vec<_>>();
 

@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 
-use deja::{Address, LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
+use deja::{LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
 use deja_kernel::{HttpDiff, JsonFieldDiff};
 use serde::{Deserialize, Serialize};
 
@@ -148,10 +148,10 @@ fn rank_label(rank: u8) -> String {
     format!("rank_{rank}")
 }
 
-/// The weakest, positional `Address` rank (`Address::Sequence`) — a match here
+/// The weakest, positional `Locus` rank (`Locus::Sequence`) — a match here
 /// means the call resolved only by its boundary+method+request-sequence position,
 /// which is fragile to any upstream reorder. Tracked as "Recovered" (a fragility
-/// signal), not a divergence. MUST equal `Address::Sequence`'s `rank()`; bump this
+/// signal), not a divergence. MUST equal `Locus::Sequence`'s `rank()`; bump this
 /// in lock-step if the rank ladder is renumbered again.
 const POSITIONAL_FALLBACK_RANK: u8 = 6;
 
@@ -2584,8 +2584,8 @@ impl<'a> ArgsFreePairing<'a> {
         // has no boundary/method and does not pair.
         struct Addressed {
             correlation: Option<String>,
-            boundary: Option<String>,
-            method: Option<String>,
+            boundary: String,
+            method: String,
         }
         let mut addressed: BTreeMap<u64, Addressed> = BTreeMap::new();
         for entry in &table.entries {
@@ -2593,16 +2593,10 @@ impl<'a> ArgsFreePairing<'a> {
                 .entry(entry.source_event_global_sequence)
                 .or_insert(Addressed {
                     correlation: entry.key.correlation_id.clone(),
-                    boundary: None,
-                    method: None,
+                    boundary: entry.key.boundary.clone(),
+                    method: entry.key.operation.clone(),
                 });
-            if let Address::Sequence {
-                boundary, method, ..
-            } = &entry.key.address
-            {
-                slot.boundary = Some(boundary.clone());
-                slot.method = Some(method.clone());
-            }
+            let _ = slot;
         }
 
         // `addressed` is ordered by sequence, so each queue comes out in source
@@ -2611,9 +2605,21 @@ impl<'a> ArgsFreePairing<'a> {
         // never select that later occurrence.
         let mut queues: BTreeMap<_, std::collections::VecDeque<ArgsFreeTwin<'a>>> = BTreeMap::new();
         for (seq, entry) in &addressed {
-            let (Some(boundary), Some(method)) = (&entry.boundary, &entry.method) else {
-                continue;
-            };
+            // Identity is no longer optional here. It used to be gated on the
+            // entry being the rank-6 positional one, which was the only variant
+            // carrying the boundary — so `None` meant "this event is covered
+            // only at a weaker rank" and the event did not pair.
+            //
+            // That gate was vacuous. Measured on a real rendered table
+            // (`rec-215423c-09111036-3q`, 16,815 entries): every one of the
+            // 3,363 events had an entry at EVERY rank, five apiece, no
+            // exceptions — so the filter never excluded anything in production
+            // and only ever discriminated in hand-built partial test tables.
+            //
+            // Identity is now on every key and is IDENTICAL across an event's
+            // entries, so `or_insert` taking it from whichever comes first is
+            // exactly-once and order-independent, not arbitrary.
+            let (boundary, method) = (&entry.boundary, &entry.method);
             let Some(span) = span_paths.get(seq) else {
                 continue;
             };
@@ -4262,14 +4268,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut per_boundary: BTreeMap<String, BoundaryStats> = BTreeMap::new();
 
     // --- expected side-effect calls, deduped by source event -----------------
-    // Each recorded event yields up to one entry per address rank; we collapse
-    // them by `source_event_global_sequence`. The boundary AND method live on the
-    // rank-6 `Sequence` address, which every event always emits. We also carry the
-    // recorded `result` here — the recorded operand the args-free pairing compares
-    // an execute-shadow `observed_result` against to classify ValueDiverged.
+    // Each recorded event yields one entry per LOCUS; we collapse them by
+    // `source_event_global_sequence`. Boundary and method are IDENTITY and now
+    // live on every key, so they are read from whichever entry lands first —
+    // exactly-once via `or_insert`, and order-independent because every entry
+    // for one event carries the same identity. They used to live only on the
+    // rank-6 `Sequence` address, which is why they were `Option` and why this
+    // comment used to have to explain that every event always emits one.
+    // We also carry the recorded `result` — the operand the args-free pairing
+    // compares an execute-shadow `observed_result` against for ValueDiverged.
     struct Expected {
-        boundary: Option<String>,
-        method: Option<String>,
+        boundary: String,
+        // NOTE: `method` was here and is gone — it was written and never read,
+        // on main too. It was invisible while the write was conditional on the
+        // rank-6 locus (dead stores behind a branch do not warn); making
+        // identity unconditional surfaced it.
         correlation: Option<String>,
         result: serde_json::Value,
     }
@@ -4278,18 +4291,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         let slot = expected
             .entry(entry.source_event_global_sequence)
             .or_insert(Expected {
-                boundary: None,
-                method: None,
+                boundary: entry.key.boundary.clone(),
                 correlation: entry.key.correlation_id.clone(),
                 result: entry.result.clone(),
             });
-        if let Address::Sequence {
-            boundary, method, ..
-        } = &entry.key.address
-        {
-            slot.boundary = Some(boundary.clone());
-            slot.method = Some(method.clone());
-        }
+        let _ = slot;
     }
     let uncorrelated_events_seen = expected
         .values()
@@ -4827,7 +4833,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if !pruned && (consumed.contains(seq) || paired_consumed.contains(seq)) {
             continue;
         }
-        let boundary = exp.boundary.clone().unwrap_or_else(|| "unknown".to_owned());
+        // No `"unknown"` fallback any more. That string existed because the
+        // boundary was only recoverable from the rank-6 locus, so an event
+        // covered at a weaker rank got filed under a placeholder that then had
+        // to be scored like a boundary. Identity is on every key, so every
+        // omission is attributable to the boundary that actually made it.
+        let boundary = exp.boundary.clone();
         // One classification, named for what it counts. Lumping the tolerated
         // omissions — uncorrelated background work, and non-blocking boundaries
         // — under the same name as the blocking ones is what let this table and
@@ -5835,7 +5846,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use deja::{LookupEntry, LookupKey};
+    use deja::{Locus, LookupEntry, LookupKey};
     use deja_kernel::JsonFieldDiff;
 
     /// Row identity is read from the schema at run time (see
@@ -6210,9 +6221,8 @@ mod tests {
     /// entry's result per source sequence.
     fn span_entry(corr: Option<&str>, src: u64, path: &str) -> LookupEntry {
         let mut entry = seq_entry(corr, "span", src);
-        entry.key.address = Address::SpanPath {
+        entry.key.locus = Locus::SpanPath {
             path: path.to_owned(),
-            operation: String::new(),
         };
         entry
     }
@@ -6264,7 +6274,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: "rec-scope".to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -6384,7 +6394,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: recording_id.to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -6438,12 +6448,19 @@ mod tests {
             key: LookupKey {
                 correlation_id: corr.map(str::to_owned),
                 bucket_id: Some("root".to_owned()),
+                // The caller's `boundary` belongs here. It used to ride inside
+                // the rank-6 locus; stamping a constant instead would make
+                // every fixture share identity and the pairing tests would
+                // agree with a collision rather than detect one.
+                boundary: boundary.to_owned(),
+                component: "tests".to_owned(),
+                // "m" is the method the pre-split fixture put inside
+                // `Address::Sequence`; the orchestrator's args-free pairing
+                // joins on it, so changing it silently re-partitions every
+                // pairing test built on this helper.
+                operation: "m".to_owned(),
                 fork_seq: 0,
-                address: Address::Sequence {
-                    boundary: boundary.to_owned(),
-                    method: "m".to_owned(),
-                    request_sequence: 0,
-                },
+                locus: Locus::Unlocated,
                 args_hash: 0,
                 occurrence: 0,
             },
@@ -6462,10 +6479,12 @@ mod tests {
             key: LookupKey {
                 correlation_id: corr.map(str::to_owned),
                 bucket_id: Some("root".to_owned()),
+                boundary: "test".to_owned(),
+                component: "tests".to_owned(),
+                operation: "op".to_owned(),
                 fork_seq: 0,
-                address: Address::SpanPath {
+                locus: Locus::SpanPath {
                     path: path.to_owned(),
-                    operation: String::new(),
                 },
                 args_hash: 0,
                 occurrence: 0,
@@ -6713,10 +6732,11 @@ mod tests {
         src: u64,
         result: serde_json::Value,
     ) -> LookupEntry {
+        // The method is identity and lives on the key; it used to be reachable
+        // only by matching the rank-6 locus, which is why this helper existed in
+        // this shape.
         let mut entry = seq_entry_res(corr, boundary, src, result);
-        if let Address::Sequence { method: m, .. } = &mut entry.key.address {
-            *m = method.to_owned();
-        }
+        entry.key.operation = method.to_owned();
         entry
     }
 
@@ -6783,7 +6803,7 @@ mod tests {
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
                 entries,
             },
             observed,
@@ -8169,7 +8189,7 @@ mod tests {
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
                 entries,
             },
             observed,
@@ -9828,7 +9848,7 @@ mod tests {
 
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
-            policy_version: 1,
+            policy_version: deja::POLICY_VERSION,
             entries: vec![
                 seq_entry_method_res(
                     Some(corr),
