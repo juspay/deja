@@ -825,6 +825,12 @@ async fn v1_available_recordings(
             )
         });
     }
+    if let Some(wanted) = q.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        found.retain(|r| {
+            group_of(&deja_orchestrator::parse_recording_id(&r.session_id)).as_deref()
+                == Some(wanted)
+        });
+    }
     if q.main_instances.unwrap_or(false) {
         // Matched rather than `unwrap_or_else`: that unifies this borrow of
         // `q.system` with the `&'static str` the default returns, which asks the
@@ -985,6 +991,12 @@ async fn v1_available_recordings(
             };
             serde_json::json!({
                 "recording_id": r.session_id,
+                // The deployment-and-day this belongs to, from the ID. Null
+                // when the id does not carry both a revision and a start date —
+                // which is NOT the same condition as `identity.revision` being
+                // null, because that field can be answered from the manifest
+                // and the manifest does not supply a day. See `group_of`.
+                "group": group_of(&identity),
                 "dates": r.dates,
                 "latest_date": r.latest_date(),
                 "objects": r.objects,
@@ -1099,6 +1111,47 @@ fn manifest_revision(manifest: &deja_compactor::SessionManifest) -> Option<Strin
     }
 }
 
+/// The deployment-and-day a recording belongs to, or `None` when its id does not
+/// name BOTH a revision and a start date.
+///
+/// Both, and the distinction is live rather than theoretical. A row's
+/// `identity.revision` can come from the MANIFEST when the id does not carry
+/// one (`revision_source: "manifest"`), so a boot-derived recording can report
+/// a revision and still have no group — `run-1789076520165195354` does exactly
+/// that today, with revision `28d8299` and 59 correlations. The manifest
+/// supplies the revision; nothing supplies the day, because the id has no start
+/// date and the recording's own `latest_date` is the day it last WROTE, which
+/// for a session straddling midnight is not the day it belongs to.
+///
+/// Grouping it by the wrong day would put a recording in a selection whose
+/// scope nobody named, which is worse than leaving it ungroupable: the pipeline
+/// already excludes these on the main-deployment test, so nothing is lost by
+/// declining to guess.
+///
+/// `<revision>-<MMDD>`, derived rather than stored. The id ALREADY carries the
+/// minute a recording started, so the day is a prefix of something every
+/// recording has had all along — no new id shape, nothing to mint, and every
+/// recording ever sealed is groupable the moment this ships.
+///
+/// This is the unit a replay actually wants. A pod's recording is an arbitrary
+/// slice: pods are replaced every thirty minutes, so "the traffic this
+/// deployment served that day" is spread across dozens of them — 82 on the day
+/// this was measured — and picking one is picking a fraction for no reason a
+/// caller could state.
+fn group_of(identity: &deja_orchestrator::RecordingIdentity) -> Option<String> {
+    match identity {
+        deja_orchestrator::RecordingIdentity::Described {
+            revision,
+            recorded_at,
+            ..
+        } => Some(format!(
+            "{revision}-{}",
+            &recorded_at[..4.min(recorded_at.len())]
+        )),
+        _ => None,
+    }
+}
+
 fn from_main_deployment(r: &deja_compactor::LandedRecording, prefix: &str) -> bool {
     !r.instances.is_empty() && r.instances.iter().all(|i| i.starts_with(prefix))
 }
@@ -1133,6 +1186,13 @@ struct AvailableQuery {
     /// Keep only recordings written entirely by the system's primary
     /// deployment, per its declared `main_instance_prefix`.
     main_instances: Option<bool>,
+    /// Keep only the members of one deployment-and-day, `<revision>-<MMDD>`.
+    ///
+    /// The members ARE the recording: replaying a deployment's day means
+    /// driving all of them as one run rather than picking one pod's slice. So
+    /// this is how a caller turns a group it has chosen into the list it needs,
+    /// having chosen it from the `group` field on the rows.
+    group: Option<String>,
     /// Which system's recordings to list. Absent = the default bucket
     /// (`DEJA_S3_BUCKET`). A named system scans ITS bucket
     /// (`DEJA_<SYSTEM>_S3_BUCKET`, root `DEJA_<SYSTEM>_RECORDING_ROOT`
@@ -2473,6 +2533,88 @@ mod tests {
             assert!(reason.starts_with(base), "state {state:?}: {reason}");
         }
     }
+    // ---- grouping: a deployment and a day ----
+
+    /// The group is derived from an id that already exists. Every recording ever
+    /// sealed is groupable the moment this ships — nothing to mint, no new id
+    /// shape, no migration.
+    #[test]
+    fn a_group_is_the_revision_and_the_day_of_an_existing_id() {
+        let id = deja_orchestrator::parse_recording_id("rec-4157177-09101430-xc");
+        assert_eq!(super::group_of(&id).as_deref(), Some("4157177-0910"));
+    }
+
+    /// Two pods, two half-hour windows, ONE group. This is the whole point: the
+    /// recordings of a deployment's day are spread across dozens of pods because
+    /// pods are replaced every thirty minutes, and picking one is picking a
+    /// fraction for no reason a caller could state.
+    #[test]
+    fn every_pod_of_a_deployments_day_lands_in_one_group() {
+        let a = deja_orchestrator::parse_recording_id("rec-4157177-09100030-aa");
+        let b = deja_orchestrator::parse_recording_id("rec-4157177-09102330-zz");
+        assert_eq!(super::group_of(&a), super::group_of(&b));
+
+        // The precondition that makes this a test of grouping rather than of
+        // two identical inputs: they really are different recordings.
+        assert_ne!(
+            "rec-4157177-09100030-aa", "rec-4157177-09102330-zz",
+            "precondition: distinct recordings"
+        );
+    }
+
+    /// A different day and a different revision are both different groups. A
+    /// grouping that collapsed either would replay one deployment's traffic
+    /// against another's candidate, or mix two days into a run whose scope
+    /// nobody named.
+    #[test]
+    fn the_day_and_the_revision_both_separate_groups() {
+        let base = deja_orchestrator::parse_recording_id("rec-4157177-09101430-xc");
+        let other_day = deja_orchestrator::parse_recording_id("rec-4157177-09111430-xc");
+        let other_rev = deja_orchestrator::parse_recording_id("rec-72b65cb-09101430-xc");
+        assert_ne!(super::group_of(&base), super::group_of(&other_day));
+        assert_ne!(super::group_of(&base), super::group_of(&other_rev));
+    }
+
+    /// A recording whose id names no revision has no group. Null rather than a
+    /// bucket for the unidentifiable, which would be a group a replay could
+    /// select and then have no candidate to compare against.
+    #[test]
+    fn a_recording_without_a_revision_has_no_group() {
+        for id in ["run-1788907613122648573", "rec-nonsense", "whatever"] {
+            assert_eq!(
+                super::group_of(&deja_orchestrator::parse_recording_id(id)),
+                None,
+                "{id} must not be grouped"
+            );
+        }
+    }
+
+    /// A REVISION IS NOT ENOUGH — the day has to come from the id too.
+    ///
+    /// This is the case live data produced rather than one I imagined:
+    /// `run-1789076520165195354` reports revision `28d8299` on its row, because
+    /// the manifest answered when the id could not, and it holds 59
+    /// correlations. The manifest supplies no DAY, so grouping it would mean
+    /// guessing one — and a recording placed in the wrong day is a member of a
+    /// selection whose scope nobody named.
+    ///
+    /// So a row can have `identity.revision` set and `group` null, and that is
+    /// the intended answer rather than an oversight.
+    #[test]
+    fn a_manifest_supplied_revision_does_not_make_a_group() {
+        let boot = deja_orchestrator::parse_recording_id("run-1789076520165195354");
+        // The precondition: this really is the boot-derived shape, so the test
+        // is about a revision arriving from elsewhere and not about a bad id.
+        assert!(
+            matches!(
+                boot,
+                deja_orchestrator::RecordingIdentity::BootDerived { .. }
+            ),
+            "precondition: boot-derived"
+        );
+        assert_eq!(super::group_of(&boot), None);
+    }
+
     // ---- identity: the revision the envelopes claim ----
 
     fn manifest_with_codes(shas: &[Option<&str>]) -> deja_compactor::SessionManifest {
