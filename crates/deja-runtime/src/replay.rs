@@ -3926,6 +3926,84 @@ mod tests {
     }
 
     #[test]
+    fn two_boundaries_sharing_an_operation_name_resolve_separately() {
+        // Salvaged from #146 (deja-normalize-b9), retargeted at this shape.
+        //
+        // The mirror of `two_operations_in_one_span_…`: there, one boundary and
+        // two operations. Here, one operation NAME and two boundaries, in the
+        // same span, with the same (empty) args. Everything a locus can see is
+        // identical; only `boundary` separates them.
+        //
+        // Under the pre-split scheme this was reachable by the same mechanism as
+        // the outage: rank 3 hashed `boundary::operation` and rank 6 carried
+        // boundary + method, but rank 2 carried neither, so two boundaries
+        // sharing a span path and an operation name shared a FIFO bucket. #146
+        // fixed it by adding the fields to the rank-2 address; here it is
+        // correct BY CONSTRUCTION, because identity is a sibling of the locus
+        // and no locus can omit it. That makes this a regression test rather
+        // than a fix's proof, which is the reason to keep it.
+        let mut stamper = KeyStamper::new();
+        let args = serde_json::json!({});
+        let loci = loci_for(Some(&clock_identity("http>pay", 1)), None);
+
+        let key_for = |stamper: &mut KeyStamper, boundary: &str| {
+            stamper
+                .stamp(
+                    Some("corr-1"),
+                    Some(crate::ROOT_TASK_ID),
+                    0,
+                    CallIdentity {
+                        boundary,
+                        component: "shared::component",
+                        operation: "flush",
+                    },
+                    &loci,
+                    canonical_args_hash(&args),
+                )
+                .into_iter()
+                .find(|k| k.locus.rank() == 2)
+                .expect("rank-2 key")
+        };
+        let redis = key_for(&mut stamper, "redis");
+        let imc = key_for(&mut stamper, "imc");
+
+        assert_eq!(
+            redis.locus, imc.locus,
+            "precondition: the loci must be IDENTICAL, or this passes because \
+             the calls were distinguishable some other way"
+        );
+        assert_ne!(redis, imc, "two boundaries must not share a key");
+        assert_eq!(
+            (redis.occurrence, imc.occurrence),
+            (0, 0),
+            "and each boundary gets its own occurrence counter — sharing one is \
+             what served a clock read another operation's row"
+        );
+
+        // The same holds one level down: same boundary and operation, different
+        // COMPONENT. Rank 3 and rank 6 both dropped the component, so this pair
+        // collided by the identical mechanism and nobody had noticed.
+        let a = key_for(&mut stamper, "redis");
+        let b = stamper
+            .stamp(
+                Some("corr-1"),
+                Some(crate::ROOT_TASK_ID),
+                0,
+                CallIdentity {
+                    boundary: "redis",
+                    component: "other::component",
+                    operation: "flush",
+                },
+                &loci,
+                canonical_args_hash(&args),
+            )
+            .into_iter()
+            .find(|k| k.locus.rank() == 2)
+            .expect("rank-2 key");
+        assert_ne!(a, b, "two components must not share a key either");
+    }
+
+    #[test]
     fn no_call_is_left_without_an_address() {
         // The guarantee `Locus::Sequence` used to provide by being pushed
         // unconditionally. Six `loci_for` callers pass `identity: None`, so an
