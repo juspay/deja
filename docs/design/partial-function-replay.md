@@ -101,9 +101,12 @@ Fail-stop = **panic-unwind at the dispatch seam**, not a synthesized error:
 The type-erasure argument above says deja cannot build an `Err` for an `E` a
 `replay_ok` site never names. That is true of *deja*; it is not true of the
 site. `on_miss = <expr>` on `#[deja::boundary]` inverts the construction: the
-declaration, which knows its own return type, supplies the value; the seam
-(`dispatch_or_miss` / `dispatch_async_or_miss`) just returns it instead of
-panicking. Deja contributes `deja::SubstituteMiss` — boundary, component,
+declaration, which knows its own return type, supplies the value; the seam just
+returns it instead of panicking. `on_miss = <expr>` is sugar for the miss arm of
+the reconstruct closure — `Reconstructed::Synthesized(<expr>)`, against
+`Reconstructed::NoValue` for a site that declares nothing — so there is one seam
+and the continuation is a value the site RETURNS rather than a policy it
+declares. Deja contributes `deja::SubstituteMiss` — boundary, component,
 method, args image — which the expression may name as `__deja_miss` so a host
 error enum takes it with `#[from]` and the degraded path stays attributable. No
 host error type appears in deja.
@@ -113,8 +116,8 @@ review adds boundary calls the recording never made — that is what a change is
 Answering the first one with an unwind means actix writes nothing, the kernel
 reads a 500, and one added cache read censors every other signal in the run (a
 measured sandbox run: 45 of 52 correlations at `500 vs 200`, 1/52 matched). The
-miss is still scored either way — the blocking NovelCall divergence is emitted
-by the lookup *before* `on_miss` runs — so the choice is only about the
+miss is still scored either way — the seam emits the blocking NovelCall
+divergence *before* it returns the value or stops — so the choice is only about the
 continuation, and a returned miss lets the divergence localise to the subtree
 that actually needed the value.
 
