@@ -199,7 +199,7 @@ fn every_artifact_a_scoped_run_produces_stays_inside_its_scope() {
 
     // 1. The lookup table: the substitution material the candidate replays
     //    against, and the artifact with the worst blast radius of the three.
-    let table = lookup::render_lookup_table(&recording, recording_id, 1).expect("render");
+    let table = lookup::render_lookup_table(&recording, recording_id).expect("render");
     deja_orchestrator::write_json(&root.lookup_table_path(run_id), &table).expect("write table");
 
     // 2. The record graph: published to S3 and served by an unauthenticated
@@ -324,7 +324,7 @@ fn a_run_without_a_filter_still_covers_the_entire_session() {
     assert!(scope.is_entire_session());
 
     let recording = ScopedRecording::open(&root, recording_id, scope).expect("open recording");
-    let table = lookup::render_lookup_table(&recording, recording_id, 1).expect("render");
+    let table = lookup::render_lookup_table(&recording, recording_id).expect("render");
     let seen: BTreeSet<Option<String>> = table
         .entries
         .iter()

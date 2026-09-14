@@ -29,9 +29,9 @@
 //!
 //! The lookup table and the candidate-side resolution are rebuilt here with the
 //! SAME public primitives the production renderer (`deja-orchestrator`) and the
-//! candidate hook (`LookupTableHook`) call — `addresses_for` +
+//! candidate hook (`LookupTableHook`) call — `loci_for` +
 //! `canonical_args_hash` + `KeyStamper`. So the gate tracks the real matching
-//! policy rather than a mock of it; when P3 inserts an `Address::SpanPath`
+//! policy rather than a mock of it; when P3 inserts an `Locus::SpanPath`
 //! rank, the `resolved_rank` asserted below shifts on its own.
 //!
 //! # The contract under test
@@ -44,7 +44,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use deja::{addresses_for, canonical_args_hash, BoundaryEvent, KeyStamper, LookupKey};
+use deja::{canonical_args_hash, loci_for, BoundaryEvent, KeyStamper, LookupKey};
 use serde_json::json;
 
 /// Recording is opt-in and a decision only counts for the request it belongs to,
@@ -248,23 +248,20 @@ fn by_corr<'a>(events: &'a [BoundaryEvent], corr: &str) -> Vec<&'a BoundaryEvent
 /// rank it can construct.
 fn build_table(events: &[&BoundaryEvent], corr: &str) -> HashMap<LookupKey, serde_json::Value> {
     let mut stamper = KeyStamper::new();
-    let mut request_sequence: u64 = 0;
     let mut table = HashMap::new();
     for event in events {
         let args_hash = canonical_args_hash(&event.args);
         let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-        let addresses = addresses_for(
-            &event.boundary,
-            &event.method_name,
-            event.callsite_identity.as_ref(),
-            location,
-            request_sequence,
-        );
-        request_sequence += 1;
+        let addresses = loci_for(event.callsite_identity.as_ref(), location);
         for key in stamper.stamp(
             Some(corr),
             event.bucket_id.as_deref(),
             event.fork_seq.unwrap_or(0),
+            deja::CallIdentity {
+                boundary: "test",
+                component: "tests",
+                operation: "op",
+            },
             &addresses,
             args_hash,
         ) {
@@ -284,33 +281,30 @@ fn resolve_stream(
     table: &HashMap<LookupKey, serde_json::Value>,
 ) -> Vec<Option<(u8, serde_json::Value)>> {
     let mut stamper = KeyStamper::new();
-    let mut request_sequence: u64 = 0;
     let mut resolved = Vec::new();
     for event in events {
         let args_hash = canonical_args_hash(&event.args);
         let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-        let addresses = addresses_for(
-            &event.boundary,
-            &event.method_name,
-            event.callsite_identity.as_ref(),
-            location,
-            request_sequence,
-        );
-        request_sequence += 1;
-        // `addresses_for` yields strongest-rank first and `stamp` preserves that
+        let addresses = loci_for(event.callsite_identity.as_ref(), location);
+        // `loci_for` yields strongest-rank first and `stamp` preserves that
         // order, so the first key that hits is the strongest available match —
         // the exact policy `LookupTableHook::try_replay_with_context` applies.
         let keys = stamper.stamp(
             Some(corr),
             event.bucket_id.as_deref(),
             event.fork_seq.unwrap_or(0),
+            deja::CallIdentity {
+                boundary: "test",
+                component: "tests",
+                operation: "op",
+            },
             &addresses,
             args_hash,
         );
         let hit = keys.iter().find_map(|key| {
             table
                 .get(key)
-                .map(|result| (key.address.rank(), result.clone()))
+                .map(|result| (key.locus.rank(), result.clone()))
         });
         resolved.push(hit);
     }

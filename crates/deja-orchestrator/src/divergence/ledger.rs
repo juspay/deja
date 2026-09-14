@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use deja::{Address, BoundaryEvent, ObservedCall};
+use deja::{BoundaryEvent, Locus, ObservedCall};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -832,7 +832,7 @@ pub fn expected_sequences(table: &deja::LookupTable) -> HashSet<u64> {
 pub fn recorded_span_paths(table: &deja::LookupTable) -> HashMap<u64, String> {
     let mut out = HashMap::new();
     for entry in &table.entries {
-        if let Address::SpanPath { path, .. } = &entry.key.address {
+        if let Locus::SpanPath { path } = &entry.key.locus {
             out.entry(entry.source_event_global_sequence)
                 .or_insert_with(|| path.clone());
         }
@@ -942,29 +942,25 @@ mod tests {
     fn table_for(events: &[BoundaryEvent], spans: &HashMap<u64, String>) -> deja::LookupTable {
         let mut entries = Vec::new();
         for ev in events {
-            let key = |address| deja::LookupKey {
+            let key = |locus| deja::LookupKey {
                 correlation_id: ev.correlation_id.clone(),
                 bucket_id: ev.bucket_id.clone(),
+                boundary: ev.boundary.clone(),
+                component: ev.trait_name.clone(),
+                operation: ev.method_name.clone(),
                 fork_seq: 0,
-                address,
+                locus,
                 args_hash: 0,
                 occurrence: 0,
             };
             entries.push(deja::LookupEntry {
-                key: key(Address::Sequence {
-                    boundary: ev.boundary.clone(),
-                    method: ev.method_name.clone(),
-                    request_sequence: 0,
-                }),
+                key: key(Locus::Unlocated),
                 result: ev.result.clone(),
                 source_event_global_sequence: ev.global_sequence,
             });
             if let Some(path) = spans.get(&ev.global_sequence) {
                 entries.push(deja::LookupEntry {
-                    key: key(Address::SpanPath {
-                        path: path.clone(),
-                        operation: String::new(),
-                    }),
+                    key: key(Locus::SpanPath { path: path.clone() }),
                     result: ev.result.clone(),
                     source_event_global_sequence: ev.global_sequence,
                 });
@@ -972,7 +968,7 @@ mod tests {
         }
         deja::LookupTable {
             recording_id: "rec".to_owned(),
-            policy_version: 1,
+            policy_version: deja::POLICY_VERSION,
             entries,
         }
     }
