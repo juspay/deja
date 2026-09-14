@@ -57,6 +57,24 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// the scorer classifies those as environmental misses instead of resolving
 /// them. The day the record side starts emitting uncorrelated events, this
 /// paragraph is what stops being true — not the scoping guarantee above.
+/// # The enveloped form is the ONLY output, and that is load-bearing
+///
+/// This returns a whole `LookupTable` — `{recording_id, policy_version,
+/// entries}` — and the orchestrator serializes it as one document. There is no
+/// JSONL writer anywhere in this crate, and there must not be one.
+///
+/// The reason is [`deja::replay::check_policy_version`]. It refuses a table
+/// whose declared policy differs from the one this build implements, which is
+/// what stops a stale table degrading into a mass miss that presents as a total
+/// candidate regression. But the loader's JSONL fallback carries no envelope and
+/// therefore no declared version, so it TAKES the current version rather than
+/// refusing — sound only while nothing emits JSONL.
+///
+/// Adding a JSONL writer here would silently remove the version guard from that
+/// path, and the failure mode is precisely the one the refusal exists to
+/// prevent. If a streaming form is ever needed, give it an envelope carrying
+/// `policy_version` first.
+///
 /// The rendered table is stamped with [`deja::POLICY_VERSION`] — the version
 /// THIS BUILD implements — rather than a version the caller chooses.
 ///

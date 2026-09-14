@@ -1839,8 +1839,15 @@ impl LookupTableSource for LocalFileLookupSource {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // A bare JSONL stream carries no envelope and therefore no declared
-        // version. It is produced by this build's renderer or not at all, so it
-        // is taken at the current version rather than refused.
+        // version, so it is taken at the current version rather than refused.
+        //
+        // That is sound only while nothing emits JSONL, which is a property of
+        // the RENDERER rather than of this function: `render_lookup_table`
+        // returns an enveloped table and the orchestrator has no JSONL writer.
+        // The assumption is stated at that end too, because this is where it
+        // would fail and there is where it would be broken — anyone adding a
+        // JSONL writer removes the version guard from this path without
+        // touching this file.
         Ok(LookupTable {
             recording_id: String::new(),
             policy_version: POLICY_VERSION,
@@ -4071,6 +4078,63 @@ mod tests {
             !ranks.contains(&4) && !ranks.contains(&6),
             "a lexical_path is present on this identity and must no longer \
              produce a rank — otherwise the deletion did not happen: {ranks:?}"
+        );
+    }
+
+    #[test]
+    fn a_locus_is_invariant_under_the_identity_fields_it_must_not_read() {
+        // The signature enforcement is strong but NOT total, and this closes
+        // the gap more cheaply than a refactor would.
+        //
+        // `loci_for` cannot reach identity through its PARAMETERS — it takes no
+        // boundary and no method — which is the good part and is why a locus
+        // cannot carry identity by construction. But `CallsiteIdentity` still
+        // travels in whole, and it carries two fields that ARE identity in
+        // disguise: `scope` is `format!("{component}::{operation}")` and
+        // `syntax_hash` is a hash of `boundary::operation`. A future edit could
+        // read either inside `loci_for` without touching the signature, and
+        // nothing would fail.
+        //
+        // So pin the invariance as BEHAVIOUR rather than as a signature someone
+        // has to keep re-reading. Two identities differing ONLY in those two
+        // fields must produce byte-identical loci. Raised by deja-mainchk-b5's
+        // review of #147.
+        let base = CallsiteIdentity {
+            version: 1,
+            source: CallsiteSource::SyntacticHash,
+            id: None,
+            scope: Some("redis::RedisStore::get_key".to_owned()),
+            occurrence: 2,
+            caller_function: Some("caller".to_owned()),
+            lexical_path: Some("router::core".to_owned()),
+            syntax_hash: Some(0xAAAA),
+            span_path: Some("http>pay".to_owned()),
+        };
+        let disguised_identity = CallsiteIdentity {
+            scope: Some("time::common_utils::date_time::now".to_owned()),
+            syntax_hash: Some(0xBBBB),
+            ..base.clone()
+        };
+
+        let location = Some(("f.rs", 10, 3));
+        assert_eq!(
+            loci_for(Some(&base), location),
+            loci_for(Some(&disguised_identity), location),
+            "`scope` and `syntax_hash` are identity wearing a locus's clothes — \
+             a locus must not vary with either, or the separation this whole \
+             design rests on is only a convention"
+        );
+
+        // And the guard is not vacuous: a field a locus IS allowed to read must
+        // still change the answer, or this would pass on an empty comparison.
+        let moved = CallsiteIdentity {
+            span_path: Some("http>refund".to_owned()),
+            ..base.clone()
+        };
+        assert_ne!(
+            loci_for(Some(&base), location),
+            loci_for(Some(&moved), location),
+            "the span path is a location and MUST still move the locus"
         );
     }
 
