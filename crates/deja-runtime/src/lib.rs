@@ -42,6 +42,7 @@ use tracing::Instrument;
 pub mod canonical;
 pub mod correlation_layer;
 pub mod graph;
+pub mod hash_seed;
 pub mod replay;
 pub mod wire_capture;
 pub mod writer;
@@ -50,6 +51,7 @@ pub use graph::{
     current_execution_graph_context, read_execution_graph_records, ExecutionGraphLayer,
     GraphNodeSink,
 };
+pub use hash_seed::{DejaHasher, DejaRandomState, HashKeys};
 pub use replay::{
     ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
 };
