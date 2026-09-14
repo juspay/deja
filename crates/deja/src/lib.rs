@@ -169,6 +169,15 @@ pub fn current_correlation_id() -> Option<String> {
     deja_context::current_correlation_id()
 }
 
+/// The current correlation ID, or `None` if this thread cannot answer.
+///
+/// The teardown-safe twin of [`current_correlation_id`]. Use this one from any
+/// path that can run inside a destructor; see
+/// [`deja_context::try_current_correlation_id`] for why.
+pub fn try_current_correlation_id() -> Option<String> {
+    deja_context::try_current_correlation_id()
+}
+
 /// The per-correlation **pg schema** name used for DB isolation during replay
 /// (R1: schema-per-correlation + per-checkout `SET search_path`). A pure,
 /// deterministic transform of a correlation id into a valid Postgres identifier:
