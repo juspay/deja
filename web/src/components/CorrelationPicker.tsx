@@ -212,8 +212,11 @@ export function CorrelationPicker({
         <span className="hint corrcap">hard limit {cap} correlations per run</span>
       </div>
 
-      {/* PROVENANCE. What this list is, said before it is offered. */}
-      {source.state === "sealed" && (
+      {/* PROVENANCE. What this list is, said before it is offered — and NOT
+          said when the look failed, because "All 0 correlations in this
+          recording" is a confident claim this page is in no position to make
+          when it could not read the rows it was handed. */}
+      {source.state === "sealed" && !source.error && (
         <p className="hint corrsrc">
           {source.complete
             ? `All ${source.candidates.length.toLocaleString()} correlation${source.candidates.length === 1 ? "" : "s"} in this recording, earliest request first.`

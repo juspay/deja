@@ -135,7 +135,24 @@ export function useCorrelationCandidates(recordingId: string): CorrelationSource
     () =>
       // The index's order is arrival order and is not re-sorted here: a client
       // sort could only disagree with the index it is displaying.
-      (sealed ? (listed ?? []) : []).map((cid, i) => ({ id: cid, ordinal: i + 1 })),
+      //
+      // ROWS, NOT IDS. The endpoint sends `CorrelationRow` objects, so the id
+      // has to be read out of each row. Taking the row itself as the id put an
+      // object everywhere a string was expected — `{c.id}` in the picker, which
+      // React refuses to render, taking the whole page down rather than the one
+      // list; `c.id.toLowerCase()` in its search; and, silently, `defaultScope`,
+      // which is the set of ids a run gets bounded to.
+      //
+      // A row with no `correlation_id` accounts for UNCORRELATED events: ambient
+      // traffic shared across cases, not a test case, and nothing can drive it.
+      // The server already withholds it. Dropping it again here is what keeps
+      // `ordinal` a contiguous 1..n over rows that can actually be selected, so
+      // the number beside a row still means "the Nth request".
+      (sealed ? (listed ?? []) : []).reduce<CorrelationCandidate[]>((acc, row) => {
+        const id = row?.correlation_id;
+        if (typeof id === "string") acc.push({ id, ordinal: acc.length + 1 });
+        return acc;
+      }, []),
     [listed, sealed],
   );
 
@@ -149,6 +166,25 @@ export function useCorrelationCandidates(recordingId: string): CorrelationSource
           ? "unsealed"
           : "pending";
 
+  /**
+   * DECODED NOTHING OUT OF A NON-EMPTY INDEX.
+   *
+   * `total` is the server's own count of selectable rows in the very same
+   * response, so a sealed answer that counts rows while this module derives
+   * none of them is not a recording without correlations — it is this client
+   * failing to read what it was sent. That is a failure to LOOK, and it is
+   * reported as one, because the alternative is the picker stating "All 0
+   * correlations in this recording" about a recording holding hundreds.
+   *
+   * It exists because the shape drift above was invisible until it crashed: had
+   * the picker merely dropped the rows instead of dying on them, nothing on the
+   * page would have said anything was wrong.
+   */
+  const undecoded =
+    state === "sealed" && (data?.total ?? 0) > 0 && candidates.length === 0
+      ? `the index reports ${data?.total?.toLocaleString()} correlations and none of its rows could be read`
+      : null;
+
   // Exact even when `candidates` is only a page: the page starts at offset 0 in
   // the index's own order, so its first N are the index's first N.
   const defaultScope = candidates.slice(0, CORRELATION_CAP).map((c) => c.id);
@@ -161,7 +197,7 @@ export function useCorrelationCandidates(recordingId: string): CorrelationSource
     state,
     loading: !!id && q.isLoading,
     // A 404 is an answer, not a failure to look, so it is not reported here.
-    error: q.error && !notFound ? String(q.error) : null,
+    error: q.error && !notFound ? String(q.error) : undecoded,
     defaultScope,
     defaultIsServerSide: defaultScope.length === 0,
   };

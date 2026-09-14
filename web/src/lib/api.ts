@@ -535,12 +535,46 @@ export const availableRecordings = (limit = 200, offset = 0, system?: string) =>
 // ===========================================================================
 
 /**
- * The recording's correlation ids, in the recording's own order.
+ * One row of the sealed correlations index, as the endpoint actually sends it.
+ *
+ * MIRRORS `deja_compactor::CorrelationSummary`, because the handler serialises
+ * those rows straight into `correlations` — it does not project them down to
+ * ids. This field was typed `string[]` here and TypeScript raised nothing,
+ * which is the point worth keeping: a hand-written wire type checks the client
+ * against its own guess, never against the server. The guess reached the
+ * picker, which rendered a row object as a React child, and the page died with
+ * "Objects are not valid as a React child" listing exactly these keys.
+ */
+export type CorrelationRow = {
+  /** Null on the row that accounts for UNCORRELATED events — ambient traffic
+   *  shared across cases, which is not a test case and cannot be driven. The
+   *  server withholds that row from this endpoint; the type still admits null
+   *  because the sidecar carries it and the field is `Option<String>`. */
+  correlation_id: string | null;
+  /** Boundary events on this correlation. */
+  events: number;
+  /** The correlation's span in the recording's global sequence. */
+  gseq_min: number;
+  gseq_max: number;
+  /** Distinct `boundary` values observed, sorted. EVIDENCE, not a verdict:
+   *  drivability is decided by matching these against the ingress boundary of
+   *  the system that produced the recording. */
+  boundaries: string[];
+  /** Distinct `role` values observed, sorted. Empty on recorders that do not
+   *  stamp roles — which is not the same as "no ingress". */
+  roles: string[];
+  /** `boundaries` is truncated, so a boundary's ABSENCE from it proves
+   *  nothing. Said out loud so a reader never reads a capped set as a "no". */
+  boundaries_truncated: boolean;
+};
+
+/**
+ * The recording's correlation index rows, in the recording's own order.
  *
  * THREE ANSWERS, and they must stay three. A recording can be sealed (the index
  * is final and `correlations` is authoritative), present but not yet sealed (the
  * manifest is written last, so its absence IS "not sealed" — the ids are not
- * knowable cheaply and `correlations` is empty), or unknown (404). The middle
+ * knowable cheaply and `correlations` is null), or unknown (404). The middle
  * one is not "no correlations" and must never be rendered as one.
  *
  * `status` mirrors `SessionManifest.status`, whose sealed value is the literal
@@ -559,8 +593,15 @@ export type RecordingCorrelations = {
   sealed?: boolean;
   /** How many the recording holds. Null when that is not known yet. */
   total: number | null;
-  /** A PAGE of the index, earliest first. Empty when the recording is unsealed. */
-  correlations: string[];
+  /**
+   * A PAGE of the index, earliest first — ROWS, not ids.
+   *
+   * Null when the recording has only landed (the server sends an explicit
+   * `null` there), and ABSENT on a seal written before the index sidecar
+   * existed. Neither is a recording without correlations, so neither may be
+   * rendered as an empty list.
+   */
+  correlations?: CorrelationRow[] | null;
 };
 
 /**
