@@ -42,6 +42,7 @@ use tracing::Instrument;
 pub mod canonical;
 pub mod correlation_layer;
 pub mod graph;
+pub mod hash_seed;
 pub mod replay;
 pub mod synth;
 pub mod wire_capture;
@@ -6054,6 +6055,44 @@ mod tests {
             }
         });
         assert_eq!(value, Some(1));
+    }
+
+    /// The security argument for synthesized values, asserted structurally.
+    ///
+    /// A seed (or any other value) synthesized on a miss is derived from the
+    /// query, so anyone holding the query can predict it. That is safe only
+    /// because the miss arm is UNREACHABLE outside replay: record and disabled
+    /// modes never perform a lookup, so they never miss. The claim is worth a
+    /// test rather than a doc sentence, because it is the whole reason
+    /// predictable values are acceptable at all — if a future mode change let
+    /// record-mode traffic reach this arm, predictable hash seeds would be
+    /// serving real requests.
+    #[test]
+    fn record_and_disabled_modes_never_reach_the_miss_arm() {
+        for (label, active) in [("record", true), ("disabled", false)] {
+            let hook = FakeHook::new(active);
+            assert_ne!(
+                hook.process_mode(),
+                RuntimeMode::Replay,
+                "{label}: precondition — this hook must not be in replay mode"
+            );
+            let out = dispatch_with_hook(
+                delegate_obs(&hook),
+                serde_json::json!({"k": "v"}),
+                || 5u64,
+                |input| match input {
+                    ReconstructInput::Hit(_) => {
+                        panic!("{label}: a non-replay mode must not reconstruct a hit")
+                    }
+                    ReconstructInput::Miss(_) => panic!(
+                        "{label}: a non-replay mode reached the MISS arm — synthesized \
+                         values are only safe because this cannot happen"
+                    ),
+                },
+                |v: &u64| (serde_json::json!(v), false),
+            );
+            assert_eq!(out, 5, "{label}: the real block must have run");
+        }
     }
 
     struct FakeHook {
