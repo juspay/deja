@@ -73,6 +73,97 @@ pub(crate) fn current_recording_run_id() -> Option<String> {
 // Core event type
 // ---------------------------------------------------------------------------
 
+/// A JSON payload kept as the text it was recorded as, parsed only when a
+/// caller needs its structure.
+///
+/// Memory is the reason this type exists. Scoring holds every recorded event
+/// and every observed call of a run at once, and a parsed `serde_json::Value`
+/// costs many times the text it came from: one measured run spent 764 MiB on
+/// 15,195 events' payloads and a further 604 MiB on 9,076 observed calls,
+/// reached 2.4 GiB, and was killed by the OOM killer partway through
+/// classifying them. Most of those payloads are never looked inside — they are
+/// carried so that the few which ARE compared can be.
+///
+/// Equality is STRUCTURAL, not textual, and that is the whole care of this
+/// type. Comparing two `Value`s — what every call site did before — normalizes
+/// things the raw bytes do not: the order of an object's keys, insignificant
+/// whitespace, and the spelling of a float (`1.0` against `1.00`). Those
+/// distinctions do not survive parsing, so they have never reached a verdict.
+/// Comparing text instead would turn each of them into a divergence, which is a
+/// change to what this harness reports dressed up as a memory optimization. So
+/// `PartialEq` parses.
+///
+/// What parsing does NOT normalize is worth stating, because it is easy to
+/// assume otherwise: `serde_json` keeps an integer and a float apart, so `1`
+/// and `1.0` are not equal, and neither are `1` and `1e0`. This type inherits
+/// that exactly, which is the point — it is defined to agree with the `Value`
+/// comparison it replaces, including where that comparison is strict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Payload(Box<serde_json::value::RawValue>);
+
+impl Payload {
+    /// The payload's raw JSON text, exactly as recorded.
+    pub fn get(&self) -> &str {
+        self.0.get()
+    }
+
+    /// Parse the payload into a `Value`.
+    ///
+    /// Infallible in practice: a `RawValue` holds only valid JSON — it is built
+    /// either from a `Value` or captured by a JSON deserializer — so no path
+    /// stores text this cannot read back. The impossible branch yields
+    /// `Value::Null` rather than panicking, because a payload must never be
+    /// able to kill a scoring run.
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::from_str(self.0.get()).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The JSON `null` payload, which is also [`Default`].
+    pub fn null() -> Self {
+        Self(serde_json::value::RawValue::from_string("null".to_owned()).expect("`null` is JSON"))
+    }
+
+    /// Whether the payload is JSON `null`, without paying a full parse.
+    pub fn is_null(&self) -> bool {
+        self.0.get().trim() == "null"
+    }
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
+impl From<serde_json::Value> for Payload {
+    fn from(value: serde_json::Value) -> Self {
+        match serde_json::value::to_raw_value(&value) {
+            Ok(raw) => Self(raw),
+            // `to_raw_value` fails only where the value cannot be serialized,
+            // which a `Value` always can.
+            Err(_) => Self::null(),
+        }
+    }
+}
+
+impl From<Payload> for serde_json::Value {
+    fn from(payload: Payload) -> Self {
+        payload.to_value()
+    }
+}
+
+impl PartialEq for Payload {
+    fn eq(&self, other: &Self) -> bool {
+        // Identical text is identical structure, so the common case skips two
+        // parses. Differing text still has to be compared as JSON — see the
+        // type's documentation for why textual equality is the wrong answer.
+        self.0.get() == other.0.get() || self.to_value() == other.to_value()
+    }
+}
+
+impl Eq for Payload {}
+
 /// A single semantic operation captured at the trait boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryEvent {
@@ -6961,5 +7052,70 @@ mod reply_canon_merge_tests {
         );
         // Marked, never sorted.
         assert_eq!(events[0].result, serde_json::json!({ "value": [2, 1] }));
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::Payload;
+
+    fn payload(text: &str) -> Payload {
+        serde_json::from_str::<Payload>(text).expect("test payload is valid JSON")
+    }
+
+    /// The property the type exists to preserve: it must compare the way the
+    /// `serde_json::Value` it replaced compared, or swapping the representation
+    /// silently changes what this harness calls a divergence.
+    #[test]
+    fn payload_equality_matches_value_equality() {
+        let cases = [
+            (r#"{"a":1,"b":2}"#, r#"{"b":2,"a":1}"#, true, "key order"),
+            (
+                r#"{"a": 1}"#,
+                r#"{"a":1}"#,
+                true,
+                "insignificant whitespace",
+            ),
+            ("1.0", "1.00", true, "float spelling"),
+            ("1", "1.0", false, "integer is not a float"),
+            ("1", "1e0", false, "integer is not an exponent"),
+            (r#"{"a":1}"#, r#"{"a":2}"#, false, "different values"),
+            (r#"{"a":1}"#, r#"{"a":1,"b":2}"#, false, "different shape"),
+        ];
+        for (left, right, expected, what) in cases {
+            assert_eq!(
+                payload(left) == payload(right),
+                expected,
+                "Payload disagreed with expectation on {what}: {left} vs {right}"
+            );
+            // And it agrees with the comparison it replaced, so the two can
+            // never drift apart without this failing.
+            let (lv, rv) = (payload(left).to_value(), payload(right).to_value());
+            assert_eq!(
+                lv == rv,
+                expected,
+                "serde_json::Value disagreed on {what}: {left} vs {right}"
+            );
+        }
+    }
+
+    /// The wire format must not move: the recorder writes these payloads and a
+    /// reader parses them, and a representation change that altered the bytes
+    /// would strand every tape already on disk.
+    #[test]
+    fn payload_round_trips_its_text_unchanged() {
+        let text = r#"{"b":2,"a":[1,{"c":null}],"d":"x"}"#;
+        let carried = serde_json::to_string(&payload(text)).expect("payload serializes");
+        assert_eq!(
+            carried, text,
+            "payload is carried verbatim, not re-rendered"
+        );
+    }
+
+    #[test]
+    fn null_is_the_default_and_reads_as_null() {
+        assert!(Payload::default().is_null());
+        assert_eq!(Payload::default().to_value(), serde_json::Value::Null);
+        assert!(!payload(r#"{"a":1}"#).is_null());
     }
 }
