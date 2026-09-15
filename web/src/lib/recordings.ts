@@ -135,3 +135,120 @@ export function scaleText(rec: AvailableRecording, catalog: RecordingRow | undef
 export function rowSummary(rec: AvailableRecording, catalog: RecordingRow | undefined): string {
   return `${spanOf(rec.dates).text} · ${scaleText(rec, catalog)}`;
 }
+
+// -- DEPLOYMENT DAYS ---------------------------------------------------------
+//
+// The answer to the problem this module's header states. A recording id is
+// minted once per router process, so "pick a recording" offers one pod's
+// arbitrary slice of a deployment's traffic — and until now the only honest
+// thing a client could do was SAY so on the row. It can now do better: the
+// server reports which deployment-day each session belongs to, so the client
+// can offer the day.
+
+/** A deployment's day: every session `<revision>` wrote on `<MMDD>`. */
+export type DeploymentDay = {
+  /** `<revision>-<MMDD>`, exactly as the server reports it and as a run's
+   *  `recording_group` must name it. Never reconstructed here. */
+  group: string;
+  revision: string;
+  /** `MMDD`, with no year — the same amount the id carries. */
+  day: string;
+  /** Newest first, in the order the caller supplied. */
+  members: AvailableRecording[];
+  sealed: number;
+  unsealed: number;
+  /** Distinct pods that wrote it. */
+  instances: number;
+  /** Correlations across sealed members. NULL when nothing is sealed yet —
+   *  not zero, by the same rule `scaleText` follows for one recording. */
+  correlations: number | null;
+  /** The partitions the day's objects actually landed in. Usually one; two
+   *  when a member straddled midnight, which is why this is derived from the
+   *  members' dates rather than assumed from the group name. */
+  span: Span;
+  /**
+   * Every member is sealed, so replaying this day costs no compaction.
+   *
+   * THE RULE THE PIPELINE USES, and for the same reason: resolving a group
+   * hands all its members to one pull, and a member without a manifest is
+   * compacted INLINE inside the replay run. A day still being written always
+   * has unsealed members, so offering it would make the run pay for sealing
+   * the sealer has already scheduled.
+   */
+  complete: boolean;
+};
+
+export type GroupedRecordings = {
+  /** Newest first. */
+  days: DeploymentDay[];
+  /** Sessions the server declined to group — a boot-derived id has no day.
+   *  Kept as themselves rather than bundled into a synthetic group. */
+  ungrouped: AvailableRecording[];
+};
+
+/**
+ * Club sessions into the deployment-days they belong to.
+ *
+ * ORDER IS TAKEN FROM THE INPUT, never from the group name. `3093f22-0910`
+ * sorts before `3093f22-0911`, so ordering days by their name reads the
+ * second-newest as the newest — the same trap that makes `group_by` the wrong
+ * tool in the pipeline's own selection. The server already returns sessions
+ * newest-first; distinct days come out in first-appearance order, which
+ * preserves that.
+ */
+export function groupRecordings(recordings: AvailableRecording[]): GroupedRecordings {
+  const byGroup = new Map<string, AvailableRecording[]>();
+  const ungrouped: AvailableRecording[] = [];
+  for (const rec of recordings) {
+    const g = rec.group;
+    if (!g) {
+      ungrouped.push(rec);
+      continue;
+    }
+    const bucket = byGroup.get(g);
+    if (bucket) bucket.push(rec);
+    else byGroup.set(g, [rec]);
+  }
+  // Map preserves insertion order, which is first-appearance order.
+  const days = [...byGroup.entries()].map(([group, members]) => {
+    const sealed = members.filter((m) => m.sealed === true);
+    // Summed over SEALED members only. An unsealed member contributes null,
+    // and adding null as zero would report a day as smaller than it is.
+    const correlations = sealed.length
+      ? sealed.reduce((n, m) => n + (m.correlations ?? 0), 0)
+      : null;
+    const dash = group.lastIndexOf("-");
+    return {
+      group,
+      revision: dash > 0 ? group.slice(0, dash) : group,
+      day: dash > 0 ? group.slice(dash + 1) : "",
+      members,
+      sealed: sealed.length,
+      unsealed: members.length - sealed.length,
+      instances: new Set(members.flatMap((m) => m.instances ?? [])).size,
+      correlations,
+      span: spanOf([...new Set(members.flatMap((m) => m.dates))].sort()),
+      complete: members.length > 0 && sealed.length === members.length,
+    };
+  });
+  return { days, ungrouped };
+}
+
+/** `09-11 · 68 pods · 735 correlations`, or what is known instead. */
+export function daySummary(day: DeploymentDay): string {
+  const when = day.day.length === 4 ? `${day.day.slice(0, 2)}-${day.day.slice(2)}` : day.day;
+  const pods = `${day.instances || day.members.length} pod${
+    (day.instances || day.members.length) === 1 ? "" : "s"
+  }`;
+  // Same rule as one recording: unknown is not zero. A day with nothing sealed
+  // has a correlation count nobody has counted, not a count of none.
+  const scale =
+    day.correlations == null
+      ? "correlation count not known until it is sealed"
+      : `${day.correlations.toLocaleString()} correlation${day.correlations === 1 ? "" : "s"}`;
+  // Deliberately not the words the caller's own badge uses. A band that reads
+  // "still sealing · 4 still sealing" has said one thing twice and counted
+  // nothing; the badge carries the state, this carries the number.
+  const pending = day.unsealed ? ` · ${day.unsealed} not sealed yet` : "";
+  return `${when} · ${pods} · ${scale}${pending}`;
+}

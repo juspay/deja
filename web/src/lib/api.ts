@@ -500,6 +500,22 @@ export type AvailableRecording = {
   /** Capture gaps the seal found — `global_sequence` ranges the recorder
    *  allocated and the tape never received. Null when unsealed. */
   gaps?: number | null;
+  /**
+   * The deployment-day this session belongs to: `<revision>-<MMDD>`.
+   *
+   * Derived by the server from the id, which has always carried the minute the
+   * recording started — so this mints nothing and every described recording has
+   * one. It is the unit a replay actually wants: a pod's recording is an
+   * arbitrary slice, because pods are replaced every thirty minutes and the
+   * traffic a deployment served in a day is spread across dozens of them.
+   *
+   * NULL IS A REAL ANSWER and not a gap in the data. A boot-derived id
+   * (`run-<nanos>`) carries no day, so the server declines to group it rather
+   * than guessing one from when it last wrote — which for a session straddling
+   * midnight is not the day it belongs to. Render those as themselves; do not
+   * invent a group for them.
+   */
+  group?: string | null;
 };
 
 export type AvailableRecordingsPage = {
