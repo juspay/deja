@@ -3976,6 +3976,27 @@ pub(crate) fn inconclusive_race_evidence(
     }
     let events_by_seq: HashMap<u64, &deja::BoundaryEvent> =
         events.iter().map(|ev| (ev.global_sequence, ev)).collect();
+    // The conflict search below used to scan EVERY event for every diverged
+    // observation — O(observed x events), and the only term in this pipeline
+    // that multiplies two quantities a dense recording grows at once. It is
+    // gated on `diverged`, so a near-clean run never paid it; the first
+    // cross-build run with real divergence volume did, and a 100-correlation
+    // scope at ~134 events each went from ~100s to over 49 minutes.
+    //
+    // The predicate's correlation check is a plain equality, so index on it and
+    // the scan narrows to one correlation's own events. The predicate itself is
+    // left byte-identical (the correlation test stays, now redundant) so this is
+    // visibly a narrowing of the CANDIDATE SET and not a change of meaning.
+    let mut events_by_correlation: HashMap<&str, Vec<&deja::BoundaryEvent>> = HashMap::new();
+    for ev in events {
+        if let Some(correlation) = ev.correlation_id.as_deref() {
+            events_by_correlation
+                .entry(correlation)
+                .or_default()
+                .push(ev);
+        }
+    }
+    const NO_EVENTS: &[&deja::BoundaryEvent] = &[];
     let mut evidence = InconclusiveRaceEvidence::default();
     for obs in observed {
         let event = obs
@@ -3997,7 +4018,10 @@ pub(crate) fn inconclusive_race_evidence(
         let Some(read_key) = single_db_row_key(&read_event.read_set) else {
             continue;
         };
-        let conflict = events.iter().any(|write_event| {
+        let candidates = events_by_correlation
+            .get(correlation_id)
+            .map_or(NO_EVENTS, |v| v.as_slice());
+        let conflict = candidates.iter().any(|write_event| {
             write_event.global_sequence != read_event.global_sequence
                 && write_event.correlation_id.as_deref() == Some(correlation_id)
                 && unordered_distinct_lineage(read_event, write_event, span_paths)
