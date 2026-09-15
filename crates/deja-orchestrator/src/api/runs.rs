@@ -302,17 +302,17 @@ pub fn spawn_k8s_run(
         ) {
             Ok(Some(true)) => ctx.finish(true, None),
             Ok(Some(false)) => {
-                capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
-                ctx.finish(
-                    false,
-                    Some("job failed (see pod diagnostics in the run log)"),
-                )
+                let cause = capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
+                ctx.finish(false, Some(&failure_line("job failed", cause.as_deref())))
             }
             Ok(None) => {
-                capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
+                let cause = capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
                 ctx.finish(
                     false,
-                    Some("job did not reach a terminal state within the watch deadline"),
+                    Some(&failure_line(
+                        "job did not reach a terminal state within the watch deadline",
+                        cause.as_deref(),
+                    )),
                 )
             }
             Err(e) => ctx.finish(false, Some(&format!("watch job: {e}"))),
@@ -328,11 +328,50 @@ fn capture_diagnostics<T: crate::executor::KubeTransport>(
     cfg: &K8sExecutorConfig,
     run_id: &str,
     ctx: &StoreCtx,
-) {
+) -> Option<String> {
+    let mut cause = None;
     for (label, body) in
         collect_pod_diagnostics(api, &cfg.jobs_namespace, run_id, cfg.diagnostics_tail_lines)
     {
+        // The container-state lines already say WHY — `terminated(OOMKilled,
+        // exit 137)` and the like. They were written to the log and nowhere
+        // else, so `failure_reason` said "job failed (see pod diagnostics)" and
+        // an operator had to go read the log to learn the run was OOMKilled.
+        // Lift the first terminal cause into the failure itself.
+        if cause.is_none() && !label.ends_with(" log") {
+            if let Some(reason) = terminal_cause(&label, &body) {
+                cause = Some(reason);
+            }
+        }
         ctx.log("diagnostics", &format!("{label}: {body}"));
+    }
+    cause
+}
+
+/// A container-state line that names a FAILURE, reduced to `container: state`.
+///
+/// `describe_container_state` renders every container, healthy ones included, so
+/// this picks out the ones that actually explain a failed run: a non-zero exit,
+/// or a wait reason like `CrashLoopBackOff`/`ImagePullBackOff`. A clean
+/// `terminated(Completed, exit 0)` is not a cause and must not be reported as
+/// one — the runner exits 0 on a healthy run while its sidecars keep running.
+fn terminal_cause(label: &str, body: &str) -> Option<String> {
+    let interesting = body.contains("OOMKilled")
+        || body.contains("Error")
+        || body.contains("BackOff")
+        || body.contains("Evicted")
+        || (body.contains("exit ") && !body.contains("exit 0"));
+    interesting.then(|| {
+        let container = label.rsplit('/').next().unwrap_or(label);
+        format!("{container}: {}", body.trim())
+    })
+}
+
+/// Prefix the generic outcome with the cause when one was found.
+fn failure_line(outcome: &str, cause: Option<&str>) -> String {
+    match cause {
+        Some(cause) => format!("{outcome} — {cause}"),
+        None => format!("{outcome} (see pod diagnostics in the run log)"),
     }
 }
 
@@ -351,7 +390,75 @@ pub fn get(root: &HarnessRoot, run_id: &str) -> std::io::Result<Run> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_tarball_url;
+    use super::{failure_line, resolve_tarball_url, terminal_cause};
+
+    /// The case this exists for: a run whose runner was OOMKilled reported only
+    /// "job failed (see pod diagnostics in the run log)", so an operator had to
+    /// open the log to learn the cause. It cost a 26-minute run being diagnosed
+    /// five different wrong ways before anyone read the container state.
+    #[test]
+    fn an_oomkilled_container_becomes_the_failure_reason() {
+        let cause = terminal_cause(
+            "pod/deja-replay-abc container/runner",
+            "terminated(OOMKilled, exit 137), ready=false, restarts=0",
+        );
+        let cause = cause.expect("an OOMKill is a cause");
+        assert!(
+            cause.starts_with("runner:"),
+            "must name the container: {cause}"
+        );
+        assert!(cause.contains("OOMKilled"), "must name the reason: {cause}");
+        assert!(
+            failure_line("job failed", Some(&cause)).contains("OOMKilled"),
+            "the reason must reach the run's failure line"
+        );
+    }
+
+    /// A HEALTHY container must never be reported as the cause.
+    ///
+    /// Without this the first line rendered wins, and on these Jobs that is
+    /// routinely `migrations: terminated(Completed, exit 0)` — which would
+    /// replace a generic-but-honest message with a confident wrong one. That is
+    /// a worse failure than the one being fixed.
+    #[test]
+    fn a_clean_exit_is_not_mistaken_for_a_cause() {
+        assert!(
+            terminal_cause(
+                "pod/deja-replay-abc init/migrations",
+                "terminated(Completed, exit 0), ready=true, restarts=0",
+            )
+            .is_none(),
+            "exit 0 is not a failure"
+        );
+        assert!(
+            terminal_cause(
+                "pod/deja-replay-abc container/postgres",
+                "running, ready=true, restarts=0",
+            )
+            .is_none(),
+            "a running container is not a failure"
+        );
+    }
+
+    /// With no identifiable cause the old message is kept rather than inventing one.
+    #[test]
+    fn no_cause_falls_back_to_the_generic_line() {
+        let line = failure_line("job failed", None);
+        assert!(line.contains("see pod diagnostics"), "{line}");
+    }
+
+    #[test]
+    fn a_crashloop_or_image_pull_failure_also_counts() {
+        for body in [
+            "waiting(CrashLoopBackOff), ready=false, restarts=5",
+            "waiting(ImagePullBackOff), ready=false, restarts=0",
+        ] {
+            assert!(
+                terminal_cause("pod/x container/candidate", body).is_some(),
+                "must be treated as a cause: {body}"
+            );
+        }
+    }
 
     #[test]
     fn tarball_url_substitutes_sha_only_when_no_repo_hole() {
