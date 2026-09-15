@@ -68,10 +68,12 @@ pub fn reconstruct_grpc_request(
     events: &[BoundaryEvent],
     pool: Option<&prost_reflect::DescriptorPool>,
 ) -> Option<GrpcDriverRequest> {
+    // Parsed once and held for the whole read: a payload stores text, so each
+    // `to_value()` would otherwise build a fresh `Value` per field lookup.
     let event = events
         .iter()
-        .find(|e| e.is_ingress() && e.request.get("rpc").is_some())?;
-    let req = &event.request;
+        .find(|e| e.is_ingress() && e.request.to_value().get("rpc").is_some())?;
+    let req = event.request.to_value();
     let rpc = req.get("rpc")?.as_str()?.to_string();
     let metadata = metadata_pairs(req.get("metadata"));
 
@@ -524,7 +526,11 @@ mod tests {
         let mut event = grpc_ingress_event(Some(&raw));
         // The recorder saw the rpc FAIL (grpc-status 13) even though the
         // ingress layer's own is_error flag stayed false.
-        event.response["grpc_status"] = serde_json::json!(13);
+        // A payload stores text, so it is edited by parsing, changing the value
+        // and putting it back — there is no `Value` inside to mutate in place.
+        let mut response = event.response.to_value();
+        response["grpc_status"] = serde_json::json!(13);
+        event.response = response.into();
         let driver =
             reconstruct_grpc_request(std::slice::from_ref(&event), None).expect("reconstructs");
         assert!(driver.baseline_is_error, "grpc_status 13 = failed baseline");

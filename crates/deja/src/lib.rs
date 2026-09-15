@@ -99,8 +99,8 @@ pub use deja_runtime::{catch_fail_stop, catch_fail_stop_async, FailStop, FAIL_ST
 pub use deja_runtime::{
     flush_global_hook, fork_span, global_hook_from_env, installed_runtime_hook, spawn_fork,
     AsyncRecordWriter, BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder,
-    Fidelity, GraphNodeSink, JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink,
-    RecordedOutput, RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot,
+    Fidelity, GraphNodeSink, JsonlSink, LazyEventFinalizer, MarkerKind, Payload, Provenance,
+    RecordSink, RecordedOutput, RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot,
     CURRENT_EVENT_SCHEMA_VERSION, ROLE_INGRESS,
 };
 /// Re-export callsite identity and runtime hook primitives for the

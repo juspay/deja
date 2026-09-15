@@ -265,7 +265,7 @@ fn build_table(events: &[&BoundaryEvent], corr: &str) -> HashMap<LookupKey, serd
             &addresses,
             args_hash,
         ) {
-            table.insert(key, event.result.clone());
+            table.insert(key, event.result.to_value());
         }
     }
     table
