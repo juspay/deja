@@ -5632,13 +5632,11 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     crate::write_json(&path, &card)?;
 
     // Ledger: the per-call detail the scorecard summary drops. Best-effort.
-    match build_ledger_with_plan(&art, &graph_plan) {
-        Ok(rows) => {
-            if let Err(e) = write_ledger(&root.call_ledger_path(run_id), &rows) {
-                eprintln!("divergence: ledger write failed for {run_id}: {e}");
-            }
-        }
-        Err(e) => eprintln!("divergence: ledger build failed for {run_id}: {e}"),
+    // Streamed straight to the file. Collecting first held every resolved row —
+    // each carrying the recorded side's full `args` and `result` — alongside the
+    // parsed table and graph, which is what OOMKilled the runner on a dense tape.
+    if let Err(e) = stream_ledger(&root.call_ledger_path(run_id), &art, &graph_plan) {
+        eprintln!("divergence: ledger stream failed for {run_id}: {e}");
     }
     Ok(card)
 }
@@ -5654,13 +5652,19 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 /// drove attached to its ledger rows.
 pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     let graph_plan = GraphScoringPlan::build(art);
-    build_ledger_with_plan(art, &graph_plan)
+    let mut rows = Vec::new();
+    build_ledger_into(art, &graph_plan, &mut |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
 }
 
-pub(crate) fn build_ledger_with_plan(
+pub(crate) fn build_ledger_into(
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
-) -> io::Result<Vec<CallRecord>> {
+    sink: &mut dyn FnMut(CallRecord) -> io::Result<()>,
+) -> io::Result<()> {
     let events = &art.events;
     let span_paths = ledger::recorded_span_paths(&art.table);
     // Mirror scorecard classification: discover race evidence under status-clean
@@ -5705,7 +5709,7 @@ pub(crate) fn build_ledger_with_plan(
             &document_clauses_for(&art.reply_canons, "http_incoming"),
         ),
     );
-    Ok(ledger::build_with_plan(
+    ledger::build_with_plan_into(
         events,
         &art.observed,
         &art.table,
@@ -5713,7 +5717,8 @@ pub(crate) fn build_ledger_with_plan(
         &inconclusive_race,
         &tail_gap,
         graph_plan,
-    ))
+        sink,
+    )
 }
 
 /// Read-through ledger for `GET /runs/{id}/calls` (recomputes from artifacts;
@@ -5723,17 +5728,22 @@ pub fn call_ledger(root: &HarnessRoot, run_id: &str) -> io::Result<Vec<CallRecor
     build_ledger(&art)
 }
 
-fn write_ledger(path: &std::path::Path, rows: &[CallRecord]) -> io::Result<()> {
+/// Build and write the ledger without ever holding it whole.
+fn stream_ledger(
+    path: &std::path::Path,
+    art: &RunArtifacts,
+    graph_plan: &GraphScoringPlan,
+) -> io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    for row in rows {
-        let line = serde_json::to_vec(row).map_err(io::Error::other)?;
+    build_ledger_into(art, graph_plan, &mut |row| {
+        let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
         out.write_all(&line)?;
-        out.write_all(b"\n")?;
-    }
+        out.write_all(b"\n")
+    })?;
     out.flush()
 }
 

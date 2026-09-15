@@ -199,6 +199,8 @@ pub fn build(
     )
 }
 
+/// Collecting wrapper over [`build_with_inconclusive_into`], for callers that genuinely
+/// want every row in memory (the `/calls` API).
 pub(crate) fn build_with_inconclusive(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
@@ -207,6 +209,39 @@ pub(crate) fn build_with_inconclusive(
     inconclusive_race: &InconclusiveRaceEvidence,
     tail_gap: &TailGapEvidence,
 ) -> Vec<CallRecord> {
+    let mut rows = Vec::new();
+    let _ = build_with_inconclusive_into(
+        events,
+        observed,
+        table,
+        idempotent_delete_demote,
+        inconclusive_race,
+        tail_gap,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+    );
+    rows
+}
+
+/// Emit each ledger row to `sink` as it is produced.
+///
+/// Streaming rather than returning a `Vec<CallRecord>`: every resolved row
+/// carries the recorded side's full `args` and `result`, so a run with
+/// thousands of resolved calls held a second copy of its own recording in
+/// memory before a byte reached disk. That OOMKilled the runner at 16 GiB on a
+/// 287-correlation tape, while the SAME tape scored fine for a candidate whose
+/// rows were overwhelmingly payload-free — 82 resolved calls against thousands.
+pub(crate) fn build_with_inconclusive_into(
+    events: &[BoundaryEvent],
+    observed: &[ObservedCall],
+    table: &deja::LookupTable,
+    idempotent_delete_demote: &HashSet<u64>,
+    inconclusive_race: &InconclusiveRaceEvidence,
+    tail_gap: &TailGapEvidence,
+    sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let expected_seqs = &expected_sequences(table);
     let span_paths = &recorded_span_paths(table);
     let by_seq: HashMap<u64, &BoundaryEvent> =
@@ -222,7 +257,6 @@ pub(crate) fn build_with_inconclusive(
         })
     };
 
-    let mut rows: Vec<CallRecord> = Vec::new();
     let mut consumed: HashSet<u64> = HashSet::new();
 
     // Args-free pairing of recorded twins for execute-mode write consequences:
@@ -274,7 +308,7 @@ pub(crate) fn build_with_inconclusive(
             } else {
                 ("value_diverged".to_owned(), true)
             };
-            rows.push(CallRecord {
+            sink(CallRecord {
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: obs.source_event_global_sequence,
                 served_event_global_sequence: None,
@@ -287,7 +321,7 @@ pub(crate) fn build_with_inconclusive(
                 resolved_rank: obs.resolved_rank,
                 recorded,
                 observed: observed_side(obs).or_none(),
-            });
+            })?;
             continue;
         }
 
@@ -366,7 +400,7 @@ pub(crate) fn build_with_inconclusive(
                         }
                         _ => None,
                     });
-                rows.push(CallRecord {
+                sink(CallRecord {
                     correlation_id: obs.correlation_id.clone(),
                     source_event_global_sequence: Some(twin_seq),
                     served_event_global_sequence: None,
@@ -384,7 +418,7 @@ pub(crate) fn build_with_inconclusive(
                     resolved_rank: obs.resolved_rank,
                     recorded,
                     observed: observed.or_none(),
-                });
+                })?;
                 continue;
             }
         }
@@ -423,7 +457,7 @@ pub(crate) fn build_with_inconclusive(
             .source_event_global_sequence
             .and_then(recorded_for)
             .and_then(CallSide::or_none);
-        rows.push(CallRecord {
+        sink(CallRecord {
             correlation_id: obs.correlation_id.clone(),
             source_event_global_sequence: obs.source_event_global_sequence,
             served_event_global_sequence: None,
@@ -436,7 +470,7 @@ pub(crate) fn build_with_inconclusive(
             resolved_rank: obs.resolved_rank,
             recorded,
             observed: observed_side(obs).or_none(),
-        });
+        })?;
     }
 
     // --- omitted: expected (table-covered) recorded events never consumed ----
@@ -452,7 +486,7 @@ pub(crate) fn build_with_inconclusive(
             &ev.boundary,
             ev.role.as_deref(),
         );
-        rows.push(CallRecord {
+        sink(CallRecord {
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
             served_event_global_sequence: None,
@@ -465,17 +499,29 @@ pub(crate) fn build_with_inconclusive(
             resolved_rank: None,
             recorded: recorded_for(ev.global_sequence),
             observed: None,
-        });
+        })?;
     }
 
-    rows
+    Ok(())
 }
 
 /// Build a ledger through the same per-correlation graph/flat seam as the
 /// scorecard. The all-flat arm delegates directly to the legacy builder; mixed
 /// runs remove graph correlations before doing so, so args-free pairing cannot
 /// claim an event owned by graph alignment.
-pub(crate) fn build_with_plan(
+/// Emit each ledger row to `sink` as it is produced.
+///
+/// Streaming rather than returning a `Vec<CallRecord>`: every resolved row
+/// carries the recorded side's full `args` and `result`, so a run with
+/// thousands of resolved calls held a second copy of its own recording in
+/// memory before a byte reached disk. That OOMKilled the runner at 16 GiB on a
+/// 287-correlation tape, while the SAME tape scored fine for a candidate whose
+/// rows were overwhelmingly payload-free — 82 resolved calls against thousands.
+// Eight because the sink is an eighth parameter on a function that already took
+// seven; bundling them into a struct would be a larger change than the one being
+// made and would obscure that this is the same function, streaming.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_plan_into(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
     table: &deja::LookupTable,
@@ -483,7 +529,8 @@ pub(crate) fn build_with_plan(
     inconclusive_race: &InconclusiveRaceEvidence,
     tail_gap: &TailGapEvidence,
     plan: &GraphScoringPlan,
-) -> Vec<CallRecord> {
+    sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let graph_correlations: BTreeSet<&str> = events
         .iter()
         .filter_map(|event| event.correlation_id.as_deref())
@@ -496,13 +543,14 @@ pub(crate) fn build_with_plan(
         .collect();
 
     if graph_correlations.is_empty() {
-        return build_with_inconclusive(
+        return build_with_inconclusive_into(
             events,
             observed,
             table,
             idempotent_delete_demote,
             inconclusive_race,
             tail_gap,
+            sink,
         );
     }
     let by_seq: HashMap<u64, &BoundaryEvent> = events
@@ -581,14 +629,17 @@ pub(crate) fn build_with_plan(
         .entries
         .retain(|entry| !graph_sequence.contains(&entry.source_event_global_sequence));
 
-    let mut rows = build_with_inconclusive(
+    // Flat-tier rows stream through the same sink, and FIRST — preserving the
+    // order the collecting version produced (flat rows, then graph rows).
+    build_with_inconclusive_into(
         &flat_events,
         &flat_observed,
         &flat_table,
         idempotent_delete_demote,
         inconclusive_race,
         &flat_tail_gap,
-    );
+        sink,
+    )?;
     let span_paths = recorded_span_paths(table);
 
     for correlation_id in graph_correlations {
@@ -607,7 +658,7 @@ pub(crate) fn build_with_plan(
                         let event = by_seq[&sequence];
                         let mut side = recorded_side(event);
                         side.span_path = span_paths.get(&sequence).cloned();
-                        rows.push(CallRecord {
+                        sink(CallRecord {
                             correlation_id: event.correlation_id.clone(),
                             source_event_global_sequence: Some(sequence),
                             served_event_global_sequence: None,
@@ -624,7 +675,7 @@ pub(crate) fn build_with_plan(
                             resolved_rank: None,
                             recorded: side.or_none(),
                             observed: None,
-                        });
+                        })?;
                     }
                 }
                 NodeOutcome::NovelSubtree { events_below } => {
@@ -636,7 +687,7 @@ pub(crate) fn build_with_plan(
                         // space the evidence was measured in — no remap here.
                         let unrecorded_tail =
                             tail_gap.covers(call.correlation_id.as_deref(), index);
-                        rows.push(CallRecord {
+                        sink(CallRecord {
                             correlation_id: call.correlation_id.clone(),
                             source_event_global_sequence: None,
                             served_event_global_sequence: None,
@@ -655,7 +706,7 @@ pub(crate) fn build_with_plan(
                             resolved_rank: call.resolved_rank,
                             recorded: None,
                             observed: observed_side(call).or_none(),
-                        });
+                        })?;
                     }
                 }
                 outcome => {
@@ -792,7 +843,7 @@ pub(crate) fn build_with_plan(
                             )
                         };
 
-                    rows.push(CallRecord {
+                    sink(CallRecord {
                         correlation_id: call.correlation_id.clone(),
                         source_event_global_sequence: aligned_sequence,
                         served_event_global_sequence: served_sequence,
@@ -805,13 +856,13 @@ pub(crate) fn build_with_plan(
                         resolved_rank: call.resolved_rank,
                         recorded: recorded.and_then(CallSide::or_none),
                         observed: observed.or_none(),
-                    });
+                    })?;
                 }
             }
         }
     }
 
-    rows
+    Ok(())
 }
 
 /// The set of `global_sequence`s the lookup table covers (so http_incoming and
