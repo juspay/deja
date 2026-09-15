@@ -384,10 +384,14 @@ fn set_status(root: &HarnessRoot, run: &mut Run, status: RunStatus, failure: Opt
     if matches!(status, RunStatus::Completed | RunStatus::Failed) {
         if let Some(last) = run.stage.clone().filter(|_| run.stage_updated_ms > 0) {
             let elapsed_ms = crate::now_ms().saturating_sub(run.stage_updated_ms);
-            eprintln!(
-                "lifecycle: run {} {:?} — final stage `{last}` took {elapsed_ms} ms",
-                run.run_id, status
+            let mut line = format!(
+                "run {} {status:?} — final stage `{last}` took {elapsed_ms} ms",
+                run.run_id
             );
+            if let Some(memory) = resident_fact() {
+                line = format!("{line}; {memory}");
+            }
+            eprintln!("lifecycle: {line}");
         }
     }
     run.status = status;
@@ -397,6 +401,84 @@ fn set_status(root: &HarnessRoot, run: &mut Run, status: RunStatus, failure: Opt
             "lifecycle: failed to persist status for {}: {e}",
             run.run_id
         );
+    }
+}
+
+/// This process's current and peak resident set, in MiB, from
+/// `/proc/self/status`. `None` where that file cannot be read.
+///
+/// `VmHWM` is the kernel's own high-water mark, which is the whole reason to
+/// read it here rather than trust the cluster's metrics. A replay runner that
+/// dies in scoring allocates its peak inside about fourteen seconds, and
+/// cadvisor scrapes every fifteen to thirty, so the external series reports the
+/// plateau the run sat at for minutes and never the spike that killed it. Five
+/// separate investigations read that plateau and concluded memory was not the
+/// problem. A process that reads its own counter cannot miss it.
+fn resident_mib() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    };
+    Some((field("VmRSS:")?, field("VmHWM:")?))
+}
+
+/// The resident-set reading as one log-line fact, or `None` when unavailable —
+/// a missing measurement never changes what a line says about the run itself.
+fn resident_fact() -> Option<String> {
+    let (rss, peak) = resident_mib()?;
+    Some(format!("rss {rss} MiB, peak {peak} MiB"))
+}
+
+/// Reports this process's resident set every two seconds until dropped.
+///
+/// Stage boundaries bracket a stage; they cannot describe what happens inside
+/// one. Scoring allocates its entire input set in a single burst and, when that
+/// burst is fatal, the stage has no closing boundary at all — the last line the
+/// run ever writes is the one announcing the stage it died in. This leaves a
+/// curve behind instead, so a run that is killed still says how far it got and
+/// how fast it got there.
+struct ResidentTrace {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ResidentTrace {
+    fn start(label: &'static str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("deja-resident-trace".to_owned())
+            .spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(fact) = resident_fact() {
+                        eprintln!("lifecycle: {label} {fact}");
+                    }
+                    // Sliced so dropping the trace is prompt rather than
+                    // costing a full sampling interval on every run.
+                    for _ in 0..20 {
+                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for ResidentTrace {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -428,13 +510,21 @@ fn set_stage(
     run.steps_total = total;
     run.stage = Some(label.to_owned());
     run.stage_updated_ms = crate::now_ms();
+    let mut facts: Vec<String> = Vec::new();
     if let Some((prev_label, elapsed_ms)) = previous {
-        let line =
-            format!("[{step}/{total}] {label} (previous `{prev_label}` took {elapsed_ms} ms)");
+        facts.push(format!("previous `{prev_label}` took {elapsed_ms} ms"));
+    }
+    // The baseline belongs on stage 1's line too, even though it has no
+    // predecessor to time: every later peak is read against it.
+    if let Some(memory) = resident_fact() {
+        facts.push(memory);
+    }
+    if facts.is_empty() {
+        eprintln!("lifecycle: [{step}/{total}] {label}");
+    } else {
+        let line = format!("[{step}/{total}] {label} ({})", facts.join("; "));
         eprintln!("lifecycle: {line}");
         ctx.log("timing", &line);
-    } else {
-        eprintln!("lifecycle: [{step}/{total}] {label}");
     }
     ctx.stage(label, step, total);
     if let Err(e) = write_json(&root.run_path(&run.run_id), run) {
@@ -1416,6 +1506,11 @@ fn score_and_register(
         total,
         "scoring divergence (byte-exact)",
     );
+    // Scoring is the stage replay runs die in, and it is the one stage whose
+    // closing boundary never gets written when they do. Trace it from the
+    // inside so a killed run still leaves the shape of its allocation behind.
+    let _trace = ResidentTrace::start("scoring");
+
     // BEFORE the verdict, deliberately. This step can refuse the run, and a run
     // that is going to be refused must not first write a scorecard and push a
     // result the caller then marks failed. `set_stage` above is a label, not a
@@ -5280,6 +5375,49 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+    /// The probe is the instrument every memory measurement here is read
+    /// through, so a silent `None` would turn each later reading into an
+    /// absence nobody notices. On Linux it has to produce a reading.
+    #[test]
+    fn the_resident_probe_reads_this_process() {
+        let Some((rss, peak)) = super::resident_mib() else {
+            assert!(
+                !cfg!(target_os = "linux"),
+                "/proc/self/status is readable on linux; a None here is the probe failing, \
+                 not the platform lacking it"
+            );
+            return;
+        };
+        assert!(rss > 0, "a running process has a non-zero resident set");
+        assert!(
+            peak >= rss,
+            "peak {peak} MiB cannot be below the current {rss} MiB"
+        );
+        let fact = super::resident_fact().expect("a reading carries its fact");
+        assert!(
+            fact.contains("rss ") && fact.contains("peak "),
+            "the fact names both readings: {fact}"
+        );
+    }
+
+    /// Dropping the trace has to stop its thread and return. It samples on a
+    /// two-second period, so a drop that waited for the current period would
+    /// add that to every run; and one that never joined would let a sample
+    /// interleave with whatever the next stage prints.
+    #[test]
+    fn the_resident_trace_stops_when_dropped() {
+        let started = std::time::Instant::now();
+        {
+            let _trace = super::ResidentTrace::start("test");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "drop returned in {:?}, so it waited out a sampling period",
+            started.elapsed()
+        );
+    }
+
     /// A group name and a recording id are told apart by their PREFIX, not by
     /// whether they parse. A malformed id must report itself malformed rather
     /// than be mistaken for a group and fail later with "names no recordings",
