@@ -1842,17 +1842,43 @@ impl LookupTableSource for LocalFileLookupSource {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // Try the whole-document LookupTable form first; fall back to JSONL
-        // (one LookupEntry per line) if that fails. Robust against either
-        // shape without needing a magic byte or extension.
-        if let Ok(table) = serde_json::from_str::<LookupTable>(text) {
-            return check_policy_version(table);
-        }
+        // (one LookupEntry per line) if that fails. Robust against either shape
+        // without needing a magic byte or extension.
+        //
+        // The enveloped error is KEPT rather than discarded, and that is the
+        // whole point of this shape. Discarding it turns a SCHEMA MISMATCH into
+        // a JSONL parse failure reported at line 1 of a pretty-printed document
+        // — which is `{` — so the operator is told "EOF while parsing an object
+        // at line 1 column 1" about a file that parsed perfectly well as a
+        // table this build cannot read. That message reads as "the table is
+        // empty" and sends the reader to the renderer, which is not where the
+        // fault is. It cost two separate investigations before anyone read this
+        // function.
+        let enveloped_error = match serde_json::from_str::<LookupTable>(text) {
+            Ok(table) => return check_policy_version(table),
+            Err(error) => error,
+        };
         let entries = text
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(serde_json::from_str::<LookupEntry>)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|jsonl_error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "lookup table at {path} is neither an enveloped `LookupTable` nor \
+                         JSONL.\n  as an enveloped table: {enveloped_error}\n  as JSONL: \
+                         {jsonl_error}\nAn enveloped table that fails to parse here is \
+                         usually VERSION SKEW: the renderer and this build disagree about \
+                         `LookupKey`'s shape. This build is POLICY_VERSION {version}. Compare \
+                         the deja revision this candidate was compiled against with the one \
+                         the orchestrator rendered from.",
+                        path = self.path.display(),
+                        version = POLICY_VERSION,
+                    ),
+                )
+            })?;
         // A bare JSONL stream carries no envelope and therefore no declared
         // version, so it is taken at the current version rather than refused.
         //
@@ -7292,5 +7318,78 @@ redis\tcurrency\tusd
             Vec::<String>::new(),
             "c1 has no writes → empty write-target set"
         );
+    }
+}
+
+#[cfg(test)]
+mod lookup_load_names_the_mismatch {
+    use super::{LocalFileLookupSource, LookupTableSource, POLICY_VERSION};
+
+    fn load_text(name: &str, text: &str) -> std::io::Result<super::LookupTable> {
+        let dir = std::env::temp_dir().join(format!("deja-lookup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, text).expect("write");
+        LocalFileLookupSource::new(path).load()
+    }
+
+    /// A table this build cannot READ must say so, not claim the file is empty.
+    ///
+    /// This is the case that bit twice. A pretty-printed enveloped table whose
+    /// `LookupKey` shape belongs to another revision used to have its schema
+    /// error DISCARDED, fall through to the JSONL branch, and report "EOF while
+    /// parsing an object at line 1 column 1" — line 1 being `{`. That reads as
+    /// an empty table and sends the reader to the renderer, which is not where
+    /// the fault is.
+    #[test]
+    fn a_version_skewed_table_names_the_skew_rather_than_reporting_eof() {
+        let skewed = "{\n  \"recording_id\": \"rec-test\",\n  \"policy_version\": 1,\n  \"entries\": [\n    { \"key\": { \"address\": { \"Sequence\": 7 }, \"args_hash\": \"x\", \"occurrence\": 0 },\n      \"result\": null,\n      \"source_event_global_sequence\": 1 }\n  ]\n}";
+        let err =
+            load_text("skewed", skewed).expect_err("a shape this build cannot read must fail");
+        let msg = err.to_string();
+        // The JSONL error may still appear — it is one of two attempts and is
+        // reported as such. What must not happen is the EOF standing ALONE and
+        // unattributed, which is what read as "the table is empty".
+        assert!(
+            msg.contains("as JSONL: EOF while parsing"),
+            "the EOF must be attributed to the JSONL attempt, not left bare: {msg}"
+        );
+        assert!(
+            msg.contains("expected u64"),
+            "the real schema error must be surfaced, not discarded: {msg}"
+        );
+        assert!(
+            msg.contains("VERSION SKEW"),
+            "must name version skew: {msg}"
+        );
+        assert!(
+            msg.contains(&POLICY_VERSION.to_string()),
+            "must state the version this build requires: {msg}"
+        );
+        assert!(
+            msg.contains("as an enveloped table:"),
+            "must surface the error that used to be discarded: {msg}"
+        );
+    }
+
+    /// The JSONL fallback still works, so the fix trades nothing away.
+    #[test]
+    fn a_bare_jsonl_stream_still_loads() {
+        let line = "{\"key\":{\"correlation_id\":null,\"fork_seq\":0,\"boundary\":\"time\",\"component\":\"c\",\"operation\":\"now\",\"locus\":\"Unlocated\",\"args_hash\":0,\"occurrence\":0},\"result\":null,\"source_event_global_sequence\":1}";
+        let table = load_text("jsonl", line).expect("JSONL must still load");
+        assert_eq!(
+            table.entries.len(),
+            1,
+            "the entry must survive the fallback"
+        );
+        assert_eq!(table.policy_version, POLICY_VERSION);
+    }
+
+    /// A genuinely empty file must still report emptiness — so the new message
+    /// has not simply replaced one wrong diagnosis with another.
+    #[test]
+    fn an_empty_file_is_not_reported_as_version_skew() {
+        let table = load_text("empty", "").expect("an empty file yields an empty table");
+        assert!(table.entries.is_empty());
     }
 }
