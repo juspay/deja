@@ -569,6 +569,21 @@ main:has(.runlist), main:has(.verdict) { max-width: 1440px; }
 .recdash { color: var(--text-faint); }
 .recorphan td { color: var(--text-subtle); }
 
+/* The deployment-day band. A heading INSIDE the table rather than a separate
+   list, so a day and the pods that make it up are read in one pass and the
+   relationship between them is positional rather than asserted in prose. */
+.recdayband td {
+  background: var(--surface-2, rgba(127, 127, 127, 0.08));
+  border-top: 2px solid var(--border, rgba(127, 127, 127, 0.28));
+  padding-top: var(--s2);
+  padding-bottom: var(--s2);
+}
+.recdayband td b { font-size: var(--fs-13); }
+/* Indent the members so the band reads as a heading over them rather than as
+   another row beside them. */
+.recdayband + tr td:first-child,
+.recdayband ~ tr:not(.recdayband):not(.recorphan) td:first-child { padding-left: var(--s4); }
+
 main:has(.recintro) { max-width: 1440px; }
 
 /* ==========================================================================

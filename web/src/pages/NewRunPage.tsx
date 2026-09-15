@@ -59,6 +59,12 @@ export default function NewRunPage() {
   const [params] = useSearchParams();
   const debug = useDebug();
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
+  // A DEPLOYMENT DAY, arriving from the recordings page's day band. It names
+  // `<revision>-<MMDD>` and the orchestrator resolves it to every recording that
+  // revision wrote that day, driving them as one run. Mutually exclusive with a
+  // recording id — the orchestrator REFUSES a payload naming both rather than
+  // resolving one silently, so exactly one leaves this form.
+  const [recordingGroup, setRecordingGroup] = React.useState(params.get("group") ?? "");
   // A recordings-page link from a scoped (per-system bucket) listing arrives
   // with `?system=` + `?s3=` already resolved — the row knows its own source,
   // and retyping either is how the wrong-bucket replay happened.
@@ -150,10 +156,18 @@ export default function NewRunPage() {
       // Replay is the only mode this dashboard can produce.
       mode: "replay",
       candidate_spec: candidate,
+    };
+    if (recordingGroup.trim()) {
+      // A day, not a pod's slice of one. Sent INSTEAD of `recording_id`: naming
+      // both is refused by the orchestrator, which is the behaviour we want —
+      // a caller that sent both has not decided, and picking one silently
+      // leaves which one won to be discovered from the tape afterwards.
+      spec.recording_group = recordingGroup.trim();
+    } else {
       // With an S3 source the id is the session filter and may be empty
       // (auto-resolved when the prefix holds exactly one session).
-      recording_id: recordingId.trim() || (s3Path ? null : "<recording_id>"),
-    };
+      spec.recording_id = recordingId.trim() || (s3Path ? null : "<recording_id>");
+    }
     // Only a non-default system is sent, so existing curl recipes and stored
     // rows keep meaning what they meant. Which name that is comes from the
     // orchestrator rather than from a literal here.
@@ -177,7 +191,7 @@ export default function NewRunPage() {
     if (scope.length) spec.correlation_filter = scope;
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [candidateRepo, expectation, imageRef, recordingId, s3Path, scope, systemUnderTest]);
+  }, [candidateRepo, expectation, imageRef, recordingGroup, recordingId, s3Path, scope, systemUnderTest]);
 
   const curlCommand = React.useMemo(
     () =>
@@ -211,6 +225,31 @@ export default function NewRunPage() {
             recording{" "}
             <span className="hint">(what is in the bucket — newest first)</span>
           </span>
+
+          {/* A DEPLOYMENT DAY was chosen on the recordings page, so the picker
+              below is not what this run will drive and says so rather than
+              sitting there looking authoritative. Clearing the day is the only
+              way back to picking one recording, because the two are mutually
+              exclusive on the wire and a form offering both would be offering
+              a payload the orchestrator refuses. */}
+          {recordingGroup.trim() && (
+            <div className="recfail">
+              <p>
+                Replaying the deployment day <b className="mono">{recordingGroup.trim()}</b> — every
+                recording that revision wrote that day, driven as one run.
+              </p>
+              <p className="hint">
+                Which recordings that resolves to is decided when the run pulls, not now: a day that
+                has sealed more since you chose it has more members. The run reports the ones it
+                actually drove.
+              </p>
+              <p>
+                <button type="button" className="btn" onClick={() => setRecordingGroup("")}>
+                  replay a single recording instead
+                </button>
+              </p>
+            </div>
+          )}
 
           {available.isLoading && (
             <p className="hint">listing the bucket… (this reads S3 and takes a moment)</p>

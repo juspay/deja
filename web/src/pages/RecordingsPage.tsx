@@ -2,7 +2,14 @@ import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, availableRecordings, AvailableRecording, RecordingRow } from "../lib/api";
-import { catalogById, identityText, spanOf } from "../lib/recordings";
+import {
+  catalogById,
+  daySummary,
+  groupRecordings,
+  identityText,
+  spanOf,
+  type DeploymentDay,
+} from "../lib/recordings";
 import { useSystems } from "../lib/systems";
 
 /* The seal/coverage badges read the compactor's manifest: a sealed session
@@ -76,6 +83,45 @@ function Identity({ rec }: { rec: AvailableRecording }) {
   return <span className="recident">{parts.join(" · ")}</span>;
 }
 
+/* THE DAY a set of recordings belongs to, as a band across the table.
+
+   A recording id is minted once per router process, so a row below the band is
+   one pod's arbitrary slice: pods are replaced roughly every thirty minutes,
+   and the traffic a deployment served in a day is spread across dozens of them
+   — 140 on the day this was written. The band is the unit a replay actually
+   wants, and its link sends the GROUP rather than any one member.
+
+   `complete` decides whether that link is offered at all. Resolving a group
+   hands every member to one pull, and a member without a manifest is compacted
+   INLINE inside the replay run, so offering a day still being written would
+   make the run pay for sealing the sealer has already scheduled. A partial day
+   says what it is waiting on instead of offering a slow replay. */
+function DayBand({ day, cols }: { day: DeploymentDay; cols: number }) {
+  return (
+    <tr className="recdayband">
+      <td className="mono" colSpan={cols - 1}>
+        <b>{day.group}</b>{" "}
+        <span className={day.complete ? "chip pass" : "chip muted"}>
+          {day.complete ? "fully sealed" : "still sealing"}
+        </span>{" "}
+        <span className="hint">{daySummary(day)}</span>
+      </td>
+      <td>
+        {day.complete ? (
+          <Link to={`/?group=${encodeURIComponent(day.group)}`}>replay this day &rarr;</Link>
+        ) : (
+          <span
+            className="hint"
+            title="every recording in a day must be sealed before the day can be replayed without re-compacting inside the run"
+          >
+            &mdash;
+          </span>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 /**
  * RECORDINGS = WHAT IS IN THE BUCKET.
  *
@@ -113,6 +159,72 @@ export default function RecordingsPage() {
 
   const rows = available.data?.recordings ?? [];
   const byId = catalogById(recs.data);
+
+  // The table is CLUBBED BY DEPLOYMENT DAY. One row renderer serves both a
+  // day's members and the ungrouped tail, so a recording looks the same
+  // wherever it appears and the two renderings cannot drift apart.
+  const COLS = 10;
+  const grouped = groupRecordings(rows);
+  const bucketRow = (r: AvailableRecording) => {
+    const cat = byId.get(r.recording_id);
+    return (
+      <tr key={r.recording_id}>
+        <td className="mono">
+          {r.recording_id}
+          {/* Only a non-default system is worth a badge — same rule
+              as the runs list. Which name is default comes from the
+              orchestrator, so a third system badges itself. */}
+          {r.system && !systems.isDefault(r.system) && (
+            <span className="chip muted" style={{ marginLeft: 6 }}>{r.system}</span>
+          )}
+        </td>
+        <td className="recspan">
+          <Span dates={r.dates} />
+        </td>
+        <td>
+          <span className={r.pulled ? "chip pass" : "chip muted"}>
+            {r.pulled ? "pulled" : "in bucket"}
+          </span>
+        </td>
+        <td className="num">{r.objects.toLocaleString()}</td>
+        {/* The catalog answers first because a pulled recording has
+            been counted event by event. Failing that the SEAL
+            answers, which it can do for anything sealed and costs no
+            ingest. Only when neither knows is this unknown — and it
+            stays a dash rather than being approximated from the
+            object count, which is not proportional to either number.
+            `??` and not `||`: a genuine zero is an answer. */}
+        <td className="num">
+          {(cat?.correlation_count ?? r.correlations)?.toLocaleString() ?? "—"}
+        </td>
+        <td className="num">
+          {(cat?.event_count ?? r.events)?.toLocaleString() ?? "—"}
+        </td>
+        <td className="num">
+          {cat?.byte_size ? `${(cat.byte_size / 1048576).toFixed(0)} MB` : "—"}
+        </td>
+        <td>{cat ? <CoverageBadges r={cat} /> : <SealBadges r={r} />}</td>
+        <td>
+          <Identity rec={r} />
+        </td>
+        <td>
+          {/* A scoped row replays from ITS bucket: the link carries
+              the system + s3 source so the form needs no retyping. */}
+          <Link
+            to={
+              system
+                ? `/?recording=${r.recording_id}&system=${system}&s3=${encodeURIComponent(
+                    `s3://${r.bucket}/${r.prefix}`,
+                  )}`
+                : `/?recording=${r.recording_id}`
+            }
+          >
+            replay →
+          </Link>
+        </td>
+      </tr>
+    );
+  };
   const inBucket = new Set(rows.map((r) => r.recording_id));
   const orphans = (recs.data ?? []).filter((r) => !inBucket.has(r.recording_id));
 
@@ -189,7 +301,11 @@ export default function RecordingsPage() {
         What is in the bucket. <b>pulled</b> marks the ones the catalog has already ingested —
         which is a record of what has been replayed, not of what exists. Every id here is one
         router process's whole lifetime, so a row spanning several days is several days of that
-        pod's traffic under a single name.
+        pod's traffic under a single name.{" "}
+        <b>Rows are clubbed under the deployment day they belong to</b> — one revision's traffic
+        for one day, across every pod that served it — because that, and not any single pod's
+        slice, is the unit a replay wants. A day becomes replayable as one run once every
+        recording in it is sealed.
       </p>
 
       {rows.length === 0 && orphans.length === 0 ? (
@@ -214,66 +330,14 @@ export default function RecordingsPage() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => {
-              const cat = byId.get(r.recording_id);
-              return (
-                <tr key={r.recording_id}>
-                  <td className="mono">
-                    {r.recording_id}
-                    {/* Only a non-default system is worth a badge — same rule
-                        as the runs list. Which name is default comes from the
-                        orchestrator, so a third system badges itself. */}
-                    {r.system && !systems.isDefault(r.system) && (
-                      <span className="chip muted" style={{ marginLeft: 6 }}>{r.system}</span>
-                    )}
-                  </td>
-                  <td className="recspan">
-                    <Span dates={r.dates} />
-                  </td>
-                  <td>
-                    <span className={r.pulled ? "chip pass" : "chip muted"}>
-                      {r.pulled ? "pulled" : "in bucket"}
-                    </span>
-                  </td>
-                  <td className="num">{r.objects.toLocaleString()}</td>
-                  {/* The catalog answers first because a pulled recording has
-                      been counted event by event. Failing that the SEAL
-                      answers, which it can do for anything sealed and costs no
-                      ingest. Only when neither knows is this unknown — and it
-                      stays a dash rather than being approximated from the
-                      object count, which is not proportional to either number.
-                      `??` and not `||`: a genuine zero is an answer. */}
-                  <td className="num">
-                    {(cat?.correlation_count ?? r.correlations)?.toLocaleString() ?? "—"}
-                  </td>
-                  <td className="num">
-                    {(cat?.event_count ?? r.events)?.toLocaleString() ?? "—"}
-                  </td>
-                  <td className="num">
-                    {cat?.byte_size ? `${(cat.byte_size / 1048576).toFixed(0)} MB` : "—"}
-                  </td>
-                  <td>{cat ? <CoverageBadges r={cat} /> : <SealBadges r={r} />}</td>
-                  <td>
-                    <Identity rec={r} />
-                  </td>
-                  <td>
-                    {/* A scoped row replays from ITS bucket: the link carries
-                        the system + s3 source so the form needs no retyping. */}
-                    <Link
-                      to={
-                        system
-                          ? `/?recording=${r.recording_id}&system=${system}&s3=${encodeURIComponent(
-                              `s3://${r.bucket}/${r.prefix}`,
-                            )}`
-                          : `/?recording=${r.recording_id}`
-                      }
-                    >
-                      replay →
-                    </Link>
-                  </td>
-                </tr>
-              );
-            })}
+            {grouped.days.flatMap((day) => [
+              <DayBand key={`band-${day.group}`} day={day} cols={COLS} />,
+              ...day.members.map(bucketRow),
+            ])}
+            {/* Sessions the server declined to group: a boot-derived id
+                carries no day, so it is shown as itself rather than bundled
+                into a day it may not belong to. */}
+            {grouped.ungrouped.map(bucketRow)}
 
             {/* In the catalog, absent from the bucket: ingested earlier and
                 since expired or moved out of the recording root. Still
