@@ -377,6 +377,19 @@ CMD ["-f", "/local/config/docker_compose.toml"]
 "#;
 
 fn set_status(root: &HarnessRoot, run: &mut Run, status: RunStatus, failure: Option<String>) {
+    // The FINAL stage has no successor to report it, and it is the one that
+    // matters: a run that spends its time in `[6/6] scoring` looks identical
+    // from the outside to one that spends it in `[5/6] driving`. Report it here,
+    // where every terminal transition passes, so no stage goes unmeasured.
+    if matches!(status, RunStatus::Completed | RunStatus::Failed) {
+        if let Some(last) = run.stage.clone().filter(|_| run.stage_updated_ms > 0) {
+            let elapsed_ms = crate::now_ms().saturating_sub(run.stage_updated_ms);
+            eprintln!(
+                "lifecycle: run {} {:?} — final stage `{last}` took {elapsed_ms} ms",
+                run.run_id, status
+            );
+        }
+    }
     run.status = status;
     run.failure_reason = failure;
     if let Err(e) = write_json(&root.run_path(&run.run_id), run) {
@@ -397,11 +410,32 @@ fn set_stage(
     total: u32,
     label: &str,
 ) {
+    // How long the PREVIOUS stage took, reported as this one begins.
+    //
+    // Without it a run that takes 49 minutes says only which stage it is in, and
+    // nobody can tell a slow render from a slow seed from a slow drive without
+    // reading pod logs that carry no timestamps and pool every pod in the app.
+    // That cost this project a day of hypotheses about where the time went, and
+    // the answer was always one subtraction away. `stage_updated_ms` was already
+    // being written; only the arithmetic was missing.
+    let previous = run
+        .stage
+        .clone()
+        .filter(|_| run.stage_updated_ms > 0)
+        .map(|prev| (prev, crate::now_ms().saturating_sub(run.stage_updated_ms)));
+
     run.step = step;
     run.steps_total = total;
     run.stage = Some(label.to_owned());
     run.stage_updated_ms = crate::now_ms();
-    eprintln!("lifecycle: [{step}/{total}] {label}");
+    if let Some((prev_label, elapsed_ms)) = previous {
+        let line =
+            format!("[{step}/{total}] {label} (previous `{prev_label}` took {elapsed_ms} ms)");
+        eprintln!("lifecycle: {line}");
+        ctx.log("timing", &line);
+    } else {
+        eprintln!("lifecycle: [{step}/{total}] {label}");
+    }
     ctx.stage(label, step, total);
     if let Err(e) = write_json(&root.run_path(&run.run_id), run) {
         eprintln!("lifecycle: failed to persist stage for {}: {e}", run.run_id);
@@ -8608,6 +8642,66 @@ mod tests {
                 "\\copy _deja_wire_seed from pstdin with (format binary)".to_string(),
                 "INSERT INTO \"corr_1\".\"payment_attempt\" (\"attempt_id\", \"connector_transaction_id\") SELECT \"attempt_id\", \"connector_transaction_id\" FROM _deja_wire_seed ON CONFLICT DO NOTHING".to_string(),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage_timing {
+    use super::*;
+    use crate::{CandidateSpec, Run, RunMode, RunSpec, RunStatus};
+
+    /// Every stage transition must carry the PREVIOUS stage's duration.
+    ///
+    /// The value cannot be asserted (it is wall-clock), so the assertion is on
+    /// the shape: a second `set_stage` reports the first stage by name, and the
+    /// first reports nothing because it has no predecessor. Without this a
+    /// regression that drops the arithmetic is invisible — which is exactly the
+    /// state this change is fixing.
+    #[test]
+    fn a_stage_transition_reports_the_previous_stage() {
+        let dir = std::env::temp_dir().join(format!("deja-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let root = HarnessRoot { root: dir };
+        let mut run = Run {
+            run_id: "run-timing".into(),
+            spec: RunSpec {
+                scored_span_namespaces: Vec::new(),
+                mode: RunMode::Replay,
+                system_under_test: None,
+                candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
+                candidate_repo: None,
+                recording_id: Some("rec".to_owned()),
+                recording_group: None,
+                s3_source: None,
+                correlation_filter: None,
+                workload: serde_json::Value::Null,
+            },
+            status: RunStatus::Pending,
+            recording_id: Some("rec".to_owned()),
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        let ctx = StoreCtx::disabled("timing");
+
+        assert_eq!(
+            run.stage_updated_ms, 0,
+            "a fresh run has no stage to report"
+        );
+        set_stage(&root, &mut run, &ctx, 1, 2, "first");
+        assert_eq!(run.stage.as_deref(), Some("first"));
+        let after_first = run.stage_updated_ms;
+        assert!(after_first > 0, "the stage clock must start");
+
+        set_stage(&root, &mut run, &ctx, 2, 2, "second");
+        assert_eq!(run.stage.as_deref(), Some("second"));
+        assert!(
+            run.stage_updated_ms >= after_first,
+            "the clock must advance so the next duration is measurable"
         );
     }
 }
