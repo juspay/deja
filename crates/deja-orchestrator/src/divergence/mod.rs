@@ -2586,19 +2586,22 @@ impl<'a> ArgsFreePairing<'a> {
         // entry, boundary and method off the rank-6 `Sequence` address (which
         // every event emits). A sequence the table covers only at a weaker rank
         // has no boundary/method and does not pair.
-        struct Addressed {
-            correlation: Option<String>,
-            boundary: String,
-            method: String,
+        // Borrowed for the same reason as `Expected` above: one entry per
+        // lookup-table entry, and three owned Strings each is a second copy of
+        // the table's identity columns for no benefit.
+        struct Addressed<'a> {
+            correlation: Option<&'a str>,
+            boundary: &'a str,
+            method: &'a str,
         }
-        let mut addressed: BTreeMap<u64, Addressed> = BTreeMap::new();
+        let mut addressed: BTreeMap<u64, Addressed<'_>> = BTreeMap::new();
         for entry in &table.entries {
             let slot = addressed
                 .entry(entry.source_event_global_sequence)
                 .or_insert(Addressed {
-                    correlation: entry.key.correlation_id.clone(),
-                    boundary: entry.key.boundary.clone(),
-                    method: entry.key.operation.clone(),
+                    correlation: entry.key.correlation_id.as_deref(),
+                    boundary: entry.key.boundary.as_str(),
+                    method: entry.key.operation.as_str(),
                 });
             let _ = slot;
         }
@@ -2628,14 +2631,13 @@ impl<'a> ArgsFreePairing<'a> {
                 continue;
             };
             let event = events_by_seq.get(seq).copied();
-            let shape =
-                event.map(|ev| pairing_shape(&ev.args, entry.correlation.as_deref(), provenance));
+            let shape = event.map(|ev| pairing_shape(&ev.args, entry.correlation, provenance));
             queues
                 .entry((
-                    entry.correlation.clone(),
+                    entry.correlation.map(str::to_owned),
                     span.clone(),
-                    boundary.clone(),
-                    method.clone(),
+                    (*boundary).to_owned(),
+                    (*method).to_owned(),
                     shape,
                 ))
                 .or_default()
@@ -4281,23 +4283,29 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // comment used to have to explain that every event always emits one.
     // We also carry the recorded `result` — the operand the args-free pairing
     // compares an execute-shadow `observed_result` against for ValueDiverged.
-    struct Expected {
-        boundary: String,
+    // BORROWED, not cloned. This map has one entry per lookup-table entry, and
+    // cloning `result` here duplicated every recorded result in memory — a full
+    // second copy of the table's heaviest field, built and then mostly unread.
+    // On a 214 MB table that is what put the runner over its limit and OOMKilled
+    // it in this phase. The table is borrowed for the whole function, so the map
+    // can point into it and the copy simply stops existing.
+    struct Expected<'a> {
+        boundary: &'a str,
         // NOTE: `method` was here and is gone — it was written and never read,
         // on main too. It was invisible while the write was conditional on the
         // rank-6 locus (dead stores behind a branch do not warn); making
         // identity unconditional surfaced it.
-        correlation: Option<String>,
-        result: serde_json::Value,
+        correlation: Option<&'a str>,
+        result: &'a serde_json::Value,
     }
-    let mut expected: BTreeMap<u64, Expected> = BTreeMap::new();
+    let mut expected: BTreeMap<u64, Expected<'_>> = BTreeMap::new();
     for entry in &art.table.entries {
         let slot = expected
             .entry(entry.source_event_global_sequence)
             .or_insert(Expected {
-                boundary: entry.key.boundary.clone(),
-                correlation: entry.key.correlation_id.clone(),
-                result: entry.result.clone(),
+                boundary: entry.key.boundary.as_str(),
+                correlation: entry.key.correlation_id.as_deref(),
+                result: &entry.result,
             });
         let _ = slot;
     }
@@ -4831,7 +4839,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // here is what collapses a re-keyed write's Omitted+Novel split into ONE
     // ValueDiverged instead of double-counting.
     for (seq, exp) in &expected {
-        let pruned = exp.correlation.as_deref().is_some_and(|correlation_id| {
+        let pruned = exp.correlation.is_some_and(|correlation_id| {
             graph_recorded_event_is_pruned(graph_plan, correlation_id, *seq)
         });
         if !pruned && (consumed.contains(seq) || paired_consumed.contains(seq)) {
@@ -4842,13 +4850,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // covered at a weaker rank got filed under a placeholder that then had
         // to be scored like a boundary. Identity is on every key, so every
         // omission is attributable to the boundary that actually made it.
-        let boundary = exp.boundary.clone();
+        let boundary = exp.boundary;
         // One classification, named for what it counts. Lumping the tolerated
         // omissions — uncorrelated background work, and non-blocking boundaries
         // — under the same name as the blocking ones is what let this table and
         // the summary give a report two answers for one set of calls.
-        let blocking = omission_is_blocking(exp.correlation.as_deref(), &boundary, None);
-        let stats = boundary_entry(&mut per_boundary, &boundary);
+        let blocking = omission_is_blocking(exp.correlation, boundary, None);
+        let stats = boundary_entry(&mut per_boundary, boundary);
         stats.bump_kind(if blocking && pruned {
             "PrunedSubtree"
         } else if blocking {
@@ -4858,8 +4866,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         });
         if blocking {
             blocking_side_effect += 1;
-            if let Some(corr) = &exp.correlation {
-                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+            if let Some(corr) = exp.correlation {
+                *corr_side_effect.entry(corr.to_owned()).or_insert(0) += 1;
             }
         }
     }
