@@ -5024,6 +5024,19 @@ fn pull_recording(
     let (bucket, landing_root) = crate::system::recording_scope(system)?;
     let mut cfg = crate::s3::S3Config::from_env();
     cfg.bucket = bucket;
+    // WHICH KIND OF NAME IS THIS — asked FIRST, before anything tries to find a
+    // session by it.
+    //
+    // A group names a deployment's day and is not a session, so it has no
+    // manifest: `manifest_key` is `sessions/v1/<id>/manifest.json` and there is
+    // no `sessions/v1/<revision>-<MMDD>`. Asking the manifest first therefore
+    // answered "absent" for EVERY group and sent it down the single-recording
+    // path below, where the prefix scan looks for envelopes carrying that
+    // session id, finds none, and fails with "it was never landed". The group
+    // resolution further down was unreachable for the only input it exists to
+    // serve — dead code that read as live, and the failure named the recording
+    // rather than the dispatch, so it looked like a missing tape.
+    let is_group_name = is_group(recording_id);
     // A recording named by id alone still has to be FOUND. The compactor looks
     // under its own flat layout; the deployed aggregator partitions by date
     // first, so a session it wrote is not there and the pull failed with "no
@@ -5034,7 +5047,7 @@ fn pull_recording(
     // by the session id carried in each envelope. That matters beyond finding
     // it: a session spanning two dates is addressed from the shared parent, so
     // the prefix holds other sessions too, and only content can separate them.
-    if deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
+    if !is_group_name && deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
         // Where this system's recordings land is declared per system, so the
         // root comes from the run's system rather than from one global: a
         // deployment replaying two systems has two answers and a global would
@@ -5059,11 +5072,16 @@ fn pull_recording(
     // The members are resolved HERE rather than by the caller so a run records
     // what it actually drove: a group that has grown since it was chosen
     // resolves to more members, and the ingest report names every one.
-    let members: Vec<String> = match crate::group_of(&crate::parse_recording_id(recording_id)) {
-        // The id parses as a member of a group, so it IS one recording — the
-        // caller named a pod, not a day. Left alone.
-        _ if !is_group(recording_id) => vec![recording_id.to_owned()],
-        _ => {
+    // ONE dispatch on ONE value. The single-recording lookup above is guarded by
+    // the same `is_group_name`, so a group cannot reach it — which is the bug
+    // this shape exists to make unrepresentable. `is_group` was already tested
+    // and already correct when group replay was broken for every group: the
+    // predicate was never the defect, the routing that ignored it was, and a
+    // test of the predicate cannot catch that.
+    let members: Vec<String> = match is_group_name {
+        // Not a group: the caller named one pod's slice, not a day. Left alone.
+        false => vec![recording_id.to_owned()],
+        true => {
             let found = deja_compactor::list_landed_recordings(&cfg, &landing_root)?;
             let mut ids: Vec<String> = found
                 .into_iter()
