@@ -770,13 +770,12 @@ fn drive_replay(
     // Render the lookup table (whole-document JSON; round-trips through both the
     // candidate's LocalFileLookupSource and the divergence detector).
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording, &recording_id)
-        .map_err(|e| format!("render lookup table: {e}"))?;
-    write_json(&root.lookup_table_path(&run.run_id), &table)
-        .map_err(|e| format!("write lookup table: {e}"))?;
-    if table.entries.is_empty() {
-        return Err("rendered lookup table is empty".to_string());
-    }
+    let table_entries =
+        render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
+    ctx.log(
+        "rendering lookup table",
+        &format!("{table_entries} entries rendered"),
+    );
 
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
@@ -1489,6 +1488,38 @@ pub fn extract_record_graph(
     Ok(Some(node_count))
 }
 
+/// Render the run's lookup table, persist it where the candidate reads it, and
+/// return how many entries it carries.
+///
+/// The table itself is deliberately not returned, and that is the whole point
+/// of this function existing rather than the four lines sitting inline. It is
+/// the largest allocation this process makes — a 200 MB table on disk is over a
+/// gigabyte of owned structures once parsed — and it is wanted only long enough
+/// to be written to that file.
+///
+/// Bound in the caller, it was a local of a function that does not return until
+/// the run is over, so Rust kept it alive through seeding, through driving, and
+/// through scoring. Scoring then re-reads the very file written here into a
+/// second, independent copy, because `load_artifacts` takes a path and knows
+/// nothing about a caller that already has one. Both copies were resident at
+/// the same time, for the whole run, to no purpose. Returning a count means the
+/// caller cannot hold the first one even by accident.
+fn render_and_persist_lookup_table(
+    root: &HarnessRoot,
+    run_id: &str,
+    recording: &crate::scope::ScopedRecording,
+    recording_id: &str,
+) -> Result<usize, String> {
+    let table = crate::lookup::render_lookup_table(recording, recording_id)
+        .map_err(|e| format!("render lookup table: {e}"))?;
+    write_json(&root.lookup_table_path(run_id), &table)
+        .map_err(|e| format!("write lookup table: {e}"))?;
+    if table.entries.is_empty() {
+        return Err("rendered lookup table is empty".to_string());
+    }
+    Ok(table.entries.len())
+}
+
 /// replay artifacts (best-effort; absent files are skipped).
 fn score_and_register(
     root: &HarnessRoot,
@@ -1736,13 +1767,12 @@ pub fn drive_replay_in_pod(
         .map_err(|e| format!("open recording {recording_id}: {e}"))?;
 
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording, &recording_id)
-        .map_err(|e| format!("render lookup table: {e}"))?;
-    write_json(&root.lookup_table_path(&run.run_id), &table)
-        .map_err(|e| format!("write lookup table: {e}"))?;
-    if table.entries.is_empty() {
-        return Err("rendered lookup table is empty".to_string());
-    }
+    let table_entries =
+        render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
+    ctx.log(
+        "rendering lookup table",
+        &format!("{table_entries} entries rendered"),
+    );
 
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
@@ -5375,19 +5405,42 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+    /// The rendered lookup table must not outlive the stage that writes it.
+    ///
+    /// It is over a gigabyte of owned structures, and the stage bodies that
+    /// used to bind it do not return until scoring has finished — scoring
+    /// being the step that re-reads the same file into a second, independent
+    /// copy. Nothing in the type system stops the next caller from binding it
+    /// again, and no behavioural test would fail if they did: the run stays
+    /// correct, it just costs twice the memory, which is invisible until a
+    /// runner is killed on a node that cannot hold both. So the seam is
+    /// enforced where it can be, against the source.
+    ///
+    /// The needle is assembled rather than written out, so that this test does
+    /// not count itself.
+    #[test]
+    fn only_one_place_in_the_lifecycle_renders_the_lookup_table() {
+        let lifecycle_source = include_str!("mod.rs");
+        let needle = format!("crate::lookup::{}(", "render_lookup_table");
+        let calls = lifecycle_source.matches(&needle).count();
+        assert_eq!(
+            calls, 1,
+            "the renderer is reached from exactly one place in this module, the body of \
+             `render_and_persist_lookup_table`, which returns a count so that no caller can \
+             hold the table; {calls} call sites means a stage body is binding it again"
+        );
+    }
+
     /// The probe is the instrument every memory measurement here is read
     /// through, so a silent `None` would turn each later reading into an
     /// absence nobody notices. On Linux it has to produce a reading.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_resident_probe_reads_this_process() {
-        let Some((rss, peak)) = super::resident_mib() else {
-            assert!(
-                !cfg!(target_os = "linux"),
-                "/proc/self/status is readable on linux; a None here is the probe failing, \
-                 not the platform lacking it"
-            );
-            return;
-        };
+        let (rss, peak) = super::resident_mib().expect(
+            "/proc/self/status is readable on linux; a None here is the probe failing, not the \
+             platform lacking it",
+        );
         assert!(rss > 0, "a running process has a non-zero resident set");
         assert!(
             peak >= rss,
