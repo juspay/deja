@@ -150,7 +150,7 @@ pub fn render_lookup_table(
         ) {
             entries.push(LookupEntry {
                 key,
-                result: event.result.clone(),
+                result: event.result.to_value(),
                 source_event_global_sequence: event.global_sequence,
             });
         }

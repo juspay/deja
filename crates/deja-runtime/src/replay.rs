@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::Payload;
 use crate::{
     correlation_matches, read_events, BoundaryEvent, BoundarySpec, CallsiteIdentity,
     CallsiteSource, DejaHook, EffectKind, ExecuteMode, OperationKind, ReplayLookup, ReplayStrategy,
@@ -760,7 +761,7 @@ impl ReplayHook {
                     // advance the cursor — the recorded event is still on
                     // deck for a future (correctly-argued) call.
                     let recorded_args = candidate.args.clone();
-                    return (None, MatchOutcome::ArgSkipBlocked(recorded_args));
+                    return (None, MatchOutcome::ArgSkipBlocked(recorded_args.to_value()));
                 }
             }
         }
@@ -838,7 +839,7 @@ impl ReplayHook {
             IdentityOutcome::Exact(candidate) => {
                 let mut report = self.report.lock().unwrap_or_else(|p| p.into_inner());
                 report.matched_calls += 1;
-                Some(candidate.result)
+                Some(candidate.result.to_value())
             }
             IdentityOutcome::Mismatch(candidate) => {
                 self.push_divergence(Divergence {
@@ -848,13 +849,13 @@ impl ReplayHook {
                     method_name: candidate.method_name.clone(),
                     detail: "args differed; returned identity-matched recorded result anyway"
                         .to_string(),
-                    baseline: Some(candidate.args.clone()),
+                    baseline: Some(candidate.args.to_value()),
                     candidate: Some(args.clone()),
                     global_sequence: candidate.global_sequence,
                 });
                 let mut report = self.report.lock().unwrap_or_else(|p| p.into_inner());
                 report.matched_calls += 1;
-                Some(candidate.result)
+                Some(candidate.result.to_value())
             }
             IdentityOutcome::Blocked(candidate) => {
                 self.push_divergence(Divergence {
@@ -863,7 +864,7 @@ impl ReplayHook {
                     trait_name: candidate.trait_name.clone(),
                     method_name: candidate.method_name.clone(),
                     detail: "arg mismatch fallback blocked".to_string(),
-                    baseline: Some(candidate.args.clone()),
+                    baseline: Some(candidate.args.to_value()),
                     candidate: Some(args.clone()),
                     global_sequence: candidate.global_sequence,
                 });
@@ -924,7 +925,7 @@ impl DejaHook for ReplayHook {
             (Some(event), MatchOutcome::Exact) => {
                 let mut report = self.report.lock().unwrap_or_else(|p| p.into_inner());
                 report.matched_calls += 1;
-                Some(event.result)
+                Some(event.result.to_value())
             }
             (Some(event), MatchOutcome::RecoveredSkip(skipped)) => {
                 self.push_divergence(Divergence {
@@ -939,7 +940,7 @@ impl DejaHook for ReplayHook {
                 });
                 let mut report = self.report.lock().unwrap_or_else(|p| p.into_inner());
                 report.matched_calls += 1;
-                Some(event.result)
+                Some(event.result.to_value())
             }
             (Some(event), MatchOutcome::RecoveredWithMismatch(skipped)) => {
                 self.push_divergence(Divergence {
@@ -951,13 +952,13 @@ impl DejaHook for ReplayHook {
                         "args differed; skipped {} call(s) and returned recorded result anyway",
                         skipped
                     ),
-                    baseline: Some(event.args.clone()),
+                    baseline: Some(event.args.to_value()),
                     candidate: Some(args.clone()),
                     global_sequence: event.global_sequence,
                 });
                 let mut report = self.report.lock().unwrap_or_else(|p| p.into_inner());
                 report.matched_calls += 1;
-                Some(event.result)
+                Some(event.result.to_value())
             }
             (None, MatchOutcome::Novel) => {
                 self.push_divergence(Divergence {
@@ -2407,7 +2408,7 @@ impl DejaHook for LookupTableHook {
             role: event.role,
             trait_name: event.trait_name,
             method_name: event.method_name,
-            args: event.args,
+            args: event.args.to_value(),
             resolved: false,
             resolved_rank: None,
             source_event_global_sequence: None,
@@ -2426,7 +2427,7 @@ impl DejaHook for LookupTableHook {
             synthesized: false,
             real_impl_will_fail: false,
             recorded_result: None,
-            observed_result: Some(event.result),
+            observed_result: Some(event.result.to_value()),
             provenance: crate::Provenance::Recorded,
             seed_gap: false,
             // The ingress finalizer marker, not a lookup — there was no miss to
@@ -2778,6 +2779,7 @@ fn is_miss_result(event: &BoundaryEvent) -> bool {
 
     event
         .result
+        .to_value()
         .as_object()
         .is_some_and(|object| object.get("Ok").is_some_and(serde_json::Value::is_null))
 }
@@ -2798,22 +2800,26 @@ fn is_declared_redis_null_read(event: &BoundaryEvent) -> bool {
 /// must be the VALUE, not the envelope. DB events are NOT routed through this —
 /// the DB seeder parses its (identically shaped) `DejaDatabaseResult` envelope
 /// itself.
-fn redis_seedable_result(event: &BoundaryEvent) -> &serde_json::Value {
+/// Returns an owned value rather than a borrow: a [`Payload`] holds text, so
+/// the `Value` this reads is produced by the parse here and cannot outlive the
+/// call.
+fn redis_seedable_result(event: &BoundaryEvent) -> serde_json::Value {
+    let result = event.result.to_value();
     let is_redis = event
         .declaration
         .as_ref()
         .is_some_and(|declaration| declaration.effect == Some(EffectKind::Redis));
     if !is_redis {
-        return &event.result;
+        return result;
     }
-    let Some(object) = event.result.as_object() else {
-        return &event.result;
+    let Some(object) = result.as_object() else {
+        return result;
     };
     let is_ok_envelope = object.contains_key("version")
         && object.get("result").and_then(serde_json::Value::as_str) == Some("Ok");
     match (is_ok_envelope, object.get("value")) {
-        (true, Some(value)) => value,
-        _ => &event.result,
+        (true, Some(value)) => value.clone(),
+        _ => result.clone(),
     }
 }
 
@@ -2825,8 +2831,16 @@ fn is_db_create_event(event: &BoundaryEvent) -> bool {
         .is_some_and(|op| op == OperationKind::Create)
 }
 
-fn db_event_table(event: &BoundaryEvent) -> Option<&str> {
-    db_table_from_event_args(&event.args).or_else(|| db_table_from_event_args(&event.request))
+/// Returns an owned table name rather than a borrow: a [`Payload`] holds text,
+/// so the `Value` a name would be sliced out of is created by the parse here
+/// and cannot outlive this call. Both callers already owned the result.
+fn db_event_table(event: &BoundaryEvent) -> Option<String> {
+    let args = event.args.to_value();
+    if let Some(table) = db_table_from_event_args(&args) {
+        return Some(table.to_owned());
+    }
+    let request = event.request.to_value();
+    db_table_from_event_args(&request).map(str::to_owned)
 }
 
 fn db_table_for_state_key(key: &str) -> Option<String> {
@@ -2836,11 +2850,11 @@ fn db_table_for_state_key(key: &str) -> Option<String> {
 }
 
 fn db_read_table(event: &BoundaryEvent, key: &str) -> Option<String> {
-    db_table_for_state_key(key).or_else(|| db_event_table(event).map(str::to_owned))
+    db_table_for_state_key(key).or_else(|| db_event_table(event))
 }
 
 fn db_created_table(event: &BoundaryEvent) -> Option<String> {
-    db_event_table(event).map(str::to_owned).or_else(|| {
+    db_event_table(event).or_else(|| {
         event
             .write_set
             .iter()
@@ -2916,14 +2930,14 @@ fn preferred_seed_image(
             .iter()
             .any(|key| canonical_state_key_wire(key) == canonical_key);
     if !read_write_same_key {
-        return event.result_image.clone();
+        return event.result_image.as_ref().map(Payload::to_value);
     }
     // A DB read+write on the same state key is an RMW precondition: the state
     // to seed is the row as it was BEFORE this event, and this event's
     // `result_image` is the row AFTER. An explicit `pre_image` wins whenever a
     // producer captured one.
     if let Some(pre_image) = event.pre_image.clone() {
-        return Some(pre_image);
+        return Some(pre_image.to_value());
     }
     // No producer captures one, and none can: the pre-state is not in an
     // `UPDATE … RETURNING` response, and postgres before 18 has no
@@ -2939,7 +2953,7 @@ fn preferred_seed_image(
     // NOTHING` kept whichever landed first, and reads of the pre-state
     // returned post-state values (13 payment_methods timestamp divergences
     // and their 13 readback misses on run-0811).
-    let post_image = event.result_image.clone()?;
+    let post_image = event.result_image.as_ref()?.to_value();
     let rows = image_rows(&post_image);
     let mut substituted = 0usize;
     let resolved: Vec<serde_json::Value> = rows
@@ -3035,7 +3049,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     key: canonical_key.clone(),
                     // Redis typed-codec envelopes seed their inner value; every
                     // other boundary seeds the raw recorded result unchanged.
-                    value: redis_seedable_result(event).clone(),
+                    value: redis_seedable_result(event),
                     image: preferred_seed_image(event, &canonical_key, &observed_rows),
                     method: Some(event.method_name.clone()),
                     origin: SeedOrigin::Recording,
@@ -3061,7 +3075,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // whatever the most recent observation says, whoever wrote it.
         if event.boundary == "db" {
             if let Some(image) = &event.result_image {
-                for row in image_rows(image) {
+                for row in image_rows(&image.to_value()) {
                     if let Some(key) = image_row_state_key(row) {
                         observed_rows.insert(key, row.clone());
                     }
@@ -3433,6 +3447,8 @@ mod tests {
         result: serde_json::Value,
         is_error: bool,
     ) -> BoundaryEvent {
+        let args = Payload::from(args);
+        let result = Payload::from(result);
         BoundaryEvent {
             global_sequence: req_seq,
             request_sequence: req_seq,
@@ -4800,7 +4816,7 @@ mod tests {
         for event in events {
             let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
             let addresses = loci_for(event.callsite_identity.as_ref(), location);
-            let args_hash = canonical_args_hash(&event.args);
+            let args_hash = canonical_args_hash(&event.args.to_value());
             let bucket_id = event
                 .bucket_id
                 .as_deref()
@@ -4825,7 +4841,7 @@ mod tests {
             ) {
                 entries.push(LookupEntry {
                     key,
-                    result: event.result.clone(),
+                    result: event.result.to_value(),
                     source_event_global_sequence: event.global_sequence,
                 });
             }
@@ -6127,8 +6143,8 @@ mod tests {
             &[update_key.as_str()],
             false,
         );
-        rmw.pre_image = Some(pre_image.clone());
-        rmw.result_image = Some(post_image);
+        rmw.pre_image = Some(Payload::from(pre_image.clone()));
+        rmw.result_image = Some(Payload::from(post_image));
 
         let mut read_only = state_event(
             1,
@@ -6141,7 +6157,7 @@ mod tests {
             &[],
             false,
         );
-        read_only.result_image = Some(read_image.clone());
+        read_only.result_image = Some(Payload::from(read_image.clone()));
 
         let plan = build_seed_plan(&[rmw, read_only], Some("c1"));
         let update_seed = plan
@@ -6191,7 +6207,7 @@ mod tests {
             &[update_key.as_str()],
             false,
         );
-        rmw.result_image = Some(post_image.clone());
+        rmw.result_image = Some(Payload::from(post_image.clone()));
 
         let plan = build_seed_plan(&[rmw], Some("c1"));
         let update_seed = plan
@@ -6259,7 +6275,7 @@ mod tests {
             &[],
             false,
         );
-        read.result_image = Some(before.clone());
+        read.result_image = Some(Payload::from(before.clone()));
 
         let mut update = state_event(
             20,
@@ -6272,7 +6288,7 @@ mod tests {
             &[row_key.as_str()],
             false,
         );
-        update.result_image = Some(after.clone());
+        update.result_image = Some(Payload::from(after.clone()));
 
         let plan = build_seed_plan(&[read, update], Some("c1"));
         let seed = plan
@@ -6340,7 +6356,7 @@ mod tests {
             &[],
             false,
         );
-        read.result_image = Some(pre.clone());
+        read.result_image = Some(Payload::from(pre.clone()));
         let mut update = state_event(
             20,
             Some("c1"),
@@ -6352,7 +6368,7 @@ mod tests {
             &[update_key.as_str()],
             false,
         );
-        update.result_image = Some(post.clone());
+        update.result_image = Some(Payload::from(post.clone()));
 
         let plan = build_seed_plan(&[read, update], Some("c1"));
         assert_eq!(
@@ -6416,7 +6432,7 @@ mod tests {
             &[query_key.as_str(), row_key.as_str()],
             false,
         );
-        rmw.result_image = Some(post_image.clone());
+        rmw.result_image = Some(Payload::from(post_image.clone()));
 
         let plan = build_seed_plan(&[rmw], Some("c1"));
         for key in [query_key.as_str(), row_key.as_str()] {

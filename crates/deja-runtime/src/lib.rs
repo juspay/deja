@@ -98,35 +98,100 @@ pub(crate) fn current_recording_run_id() -> Option<String> {
 /// and `1.0` are not equal, and neither are `1` and `1e0`. This type inherits
 /// that exactly, which is the point — it is defined to agree with the `Value`
 /// comparison it replaces, including where that comparison is strict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Payload(Box<serde_json::value::RawValue>);
+#[derive(Debug, Clone)]
+pub struct Payload {
+    /// Plain text rather than a `serde_json` `RawValue`. `RawValue`'s whole
+    /// value is its magic serialize/deserialize path, and this type cannot use
+    /// that path — see the note above the serde impls — so it would have bought
+    /// a wrapper, a validation pass over text that came from a `Value` already,
+    /// and a `serde_json` feature flag on a crate the recorded service links.
+    text: std::sync::Arc<str>,
+    /// Populated the first time a caller needs structure, and only then. A
+    /// payload nobody looks inside — `request` and `response` are copies of
+    /// `args` and `result` kept for readability, and scoring reads neither —
+    /// costs its text and nothing more.
+    parsed: std::sync::OnceLock<serde_json::Value>,
+}
+
+impl std::ops::Deref for Payload {
+    type Target = serde_json::Value;
+
+    /// Parses on first use and caches, so every `Value` method a caller already
+    /// writes keeps working. This is what makes the representation change cheap
+    /// at the call sites: the storage moves, the vocabulary does not.
+    fn deref(&self) -> &serde_json::Value {
+        self.parsed
+            .get_or_init(|| serde_json::from_str(&self.text).unwrap_or(serde_json::Value::Null))
+    }
+}
+
+// Both directions go through `Value` rather than through `RawValue`'s own
+// impls, and that is forced rather than chosen. Every event travels inside
+// `DejaRecord`, which is internally tagged (`#[serde(tag = "record_kind")]`),
+// and serde buffers an internally-tagged body through its `Content` type before
+// replaying it into the variant. A `RawValue` cannot survive that buffer — it
+// is captured by a private newtype token that only `serde_json`'s own
+// deserializer emits, so replaying it yields `invalid type: newtype struct,
+// expected any valid JSON value`, and every event fails to parse.
+//
+// So a `Value` is built transiently at the boundary and dropped immediately;
+// what this type STORES is still the text. That is the whole saving: the
+// transient costs one payload at a time, where the old field cost every payload
+// of every event at once, for the life of the run.
+impl Serialize for Payload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Payload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self::from(serde_json::Value::deserialize(deserializer)?))
+    }
+}
 
 impl Payload {
-    /// The payload's raw JSON text, exactly as recorded.
-    pub fn get(&self) -> &str {
-        self.0.get()
+    fn from_text(text: std::sync::Arc<str>) -> Self {
+        Self {
+            text,
+            parsed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The payload's JSON text.
+    ///
+    /// Deliberately not named `get`: a caller reaching for `get` on a payload
+    /// almost always means `Value::get(key)`, and a same-named method taking no
+    /// key would let that compile into something else entirely at any site
+    /// where the argument happened to fit.
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
     /// Parse the payload into a `Value`.
     ///
-    /// Infallible in practice: a `RawValue` holds only valid JSON — it is built
-    /// either from a `Value` or captured by a JSON deserializer — so no path
-    /// stores text this cannot read back. The impossible branch yields
-    /// `Value::Null` rather than panicking, because a payload must never be
-    /// able to kill a scoring run.
+    /// Infallible in practice: the stored text is always rendered from a
+    /// `Value`, so no path stores text this cannot read back. The impossible
+    /// branch yields `Value::Null` rather than panicking, because a payload
+    /// must never be able to kill a scoring run.
     pub fn to_value(&self) -> serde_json::Value {
-        serde_json::from_str(self.0.get()).unwrap_or(serde_json::Value::Null)
+        (**self).clone()
     }
 
     /// The JSON `null` payload, which is also [`Default`].
     pub fn null() -> Self {
-        Self(serde_json::value::RawValue::from_string("null".to_owned()).expect("`null` is JSON"))
+        Self::from_text(std::sync::Arc::from("null"))
     }
 
     /// Whether the payload is JSON `null`, without paying a full parse.
     pub fn is_null(&self) -> bool {
-        self.0.get().trim() == "null"
+        self.text.trim() == "null"
     }
 }
 
@@ -138,9 +203,9 @@ impl Default for Payload {
 
 impl From<serde_json::Value> for Payload {
     fn from(value: serde_json::Value) -> Self {
-        match serde_json::value::to_raw_value(&value) {
-            Ok(raw) => Self(raw),
-            // `to_raw_value` fails only where the value cannot be serialized,
+        match serde_json::to_string(&value) {
+            Ok(text) => Self::from_text(std::sync::Arc::from(text.as_str())),
+            // Serializing fails only where the value cannot be serialized,
             // which a `Value` always can.
             Err(_) => Self::null(),
         }
@@ -155,14 +220,34 @@ impl From<Payload> for serde_json::Value {
 
 impl PartialEq for Payload {
     fn eq(&self, other: &Self) -> bool {
-        // Identical text is identical structure, so the common case skips two
-        // parses. Differing text still has to be compared as JSON — see the
-        // type's documentation for why textual equality is the wrong answer.
-        self.0.get() == other.0.get() || self.to_value() == other.to_value()
+        // Shared storage, then identical text, then structure. The first two
+        // are exact answers rather than approximations: the same allocation and
+        // the same bytes are both the same JSON. Only differing text has to be
+        // parsed — see the type's documentation for why textual equality alone
+        // is the wrong answer.
+        std::sync::Arc::ptr_eq(&self.text, &other.text)
+            || self.text == other.text
+            || **self == **other
     }
 }
 
 impl Eq for Payload {}
+
+/// Comparing a payload against a bare `Value`, which is what a caller holding
+/// one side already parsed does. Structural, exactly as [`Payload`]'s own
+/// equality is — the point of these impls is that moving a field onto this type
+/// changes no call site's MEANING, only where the parse happens.
+impl PartialEq<serde_json::Value> for Payload {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<Payload> for serde_json::Value {
+    fn eq(&self, other: &Payload) -> bool {
+        *self == **other
+    }
+}
 
 /// A single semantic operation captured at the trait boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,15 +313,15 @@ pub struct BoundaryEvent {
     pub call_column: u32,
     /// Receiver/decorator context captured before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receiver: Option<serde_json::Value>,
+    pub receiver: Option<Payload>,
     /// Request-like method input payload. Kept alongside `args` for readability.
-    pub request: serde_json::Value,
+    pub request: Payload,
     /// Serialized key arguments (JSON).
-    pub args: serde_json::Value,
+    pub args: Payload,
     /// Response-like method output payload. Kept alongside `result` for readability.
-    pub response: serde_json::Value,
+    pub response: Payload,
     /// Serialized result (JSON). For errors, contains `{"error": "..."}`.
-    pub result: serde_json::Value,
+    pub result: Payload,
     /// Whether the operation returned an error.
     pub is_error: bool,
     /// Wall-clock duration in microseconds.
@@ -263,11 +348,11 @@ pub struct BoundaryEvent {
     /// Post-image of affected state after this operation, when explicitly
     /// captured by the boundary instrumentation. Omitted for legacy/plain events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_image: Option<serde_json::Value>,
+    pub result_image: Option<Payload>,
     /// Pre-image of affected state before this operation, when explicitly
     /// captured by the boundary instrumentation. Omitted for legacy/plain events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pre_image: Option<serde_json::Value>,
+    pub pre_image: Option<Payload>,
     /// Explicit state keys this crossing READ, when supplied by instrumentation.
     /// Empty means the boundary did not provide read capture; the recorder never
     /// infers keys from boundary or method names.
@@ -327,6 +412,30 @@ pub struct BoundaryEvent {
     /// un-back-fillable, so captured now for latency/interleaving replay modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_timestamp_ns: Option<u64>,
+}
+
+impl BoundaryEvent {
+    /// Collapse the payload pairs this type records as copies of one another
+    /// onto shared storage.
+    ///
+    /// `request` is written as a clone of `args`, and `response` as a clone of
+    /// `result` — one construction site, unconditionally — so every event holds
+    /// each of those payloads twice. Building an event already shares them,
+    /// because a `Payload` clone is a refcount bump. Reading one back does not:
+    /// the two fields are captured independently from the JSON and land in two
+    /// allocations. A bulk reader calls this so that a tape's events cost what
+    /// their DISTINCT payloads cost.
+    ///
+    /// Only an exact byte match is shared, so this can never change what an
+    /// event says, and a tape whose fields genuinely differ keeps both.
+    pub fn share_duplicate_payloads(&mut self) {
+        if self.request.text() == self.args.text() {
+            self.request = self.args.clone();
+        }
+        if self.response.text() == self.result.text() {
+            self.response = self.result.clone();
+        }
+    }
 }
 
 /// One record on the recording stream. The tape carries every record kind
@@ -2333,6 +2442,12 @@ impl EventBuilder {
             fork_seq,
         } = current_task_metadata(correlation_id.as_deref());
 
+        // `request` and `response` are the same payloads as `args` and `result`
+        // under their readable names, so they are built once and shared: a
+        // `Payload` clone is a refcount bump, not a second copy of the text.
+        let args = Payload::from(args);
+        let result = Payload::from(result);
+
         let event = BoundaryEvent {
             global_sequence,
             request_sequence,
@@ -2352,7 +2467,7 @@ impl EventBuilder {
             call_file: call_file.to_string(),
             call_line,
             call_column,
-            receiver,
+            receiver: receiver.map(Payload::from),
             request: args.clone(),
             args,
             response: result.clone(),
@@ -2363,8 +2478,8 @@ impl EventBuilder {
             callsite_identity,
             provenance: Provenance::default(),
             fidelity: Fidelity::default(),
-            result_image: explicit_result_image,
-            pre_image: explicit_pre_image,
+            result_image: (explicit_result_image).map(Payload::from),
+            pre_image: (explicit_pre_image).map(Payload::from),
             read_set,
             write_set,
             value_digest,
@@ -5305,11 +5420,14 @@ mod tests {
             vec![explicit_write],
             "DB-shaped args/result must not add inferred row keys"
         );
-        assert_eq!(event.result_image, Some(result_image));
-        assert_eq!(event.pre_image, Some(pre_image));
+        assert_eq!(event.result_image, Some(Payload::from(result_image)));
+        assert_eq!(event.pre_image, Some(Payload::from(pre_image)));
         assert_eq!(
             event.value_digest,
-            Some(value_digest_of(&event.args, &event.result))
+            Some(value_digest_of(
+                &event.args.to_value(),
+                &event.result.to_value(),
+            ))
         );
     }
 
@@ -5517,10 +5635,10 @@ mod tests {
             call_line: 1,
             call_column: 1,
             receiver: None,
-            request: serde_json::json!({"key": "settlement_rate_default"}),
-            args: serde_json::json!(["settlement_rate_default"]),
-            response: serde_json::json!("0.10"),
-            result: serde_json::json!("0.10"),
+            request: serde_json::json!({"key": "settlement_rate_default"}).into(),
+            args: serde_json::json!(["settlement_rate_default"]).into(),
+            response: serde_json::json!("0.10").into(),
+            result: serde_json::json!("0.10").into(),
             is_error: false,
             duration_us: 1,
             event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5637,10 +5755,10 @@ mod tests {
                 call_line: 42,
                 call_column: 9,
                 receiver: None,
-                request: serde_json::json!({}),
-                args: serde_json::json!({}),
-                response: serde_json::json!({}),
-                result: serde_json::json!({}),
+                request: serde_json::json!({}).into(),
+                args: serde_json::json!({}).into(),
+                response: serde_json::json!({}).into(),
+                result: serde_json::json!({}).into(),
                 is_error: false,
                 duration_us: 100,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5680,10 +5798,10 @@ mod tests {
                 call_line: 10,
                 call_column: 5,
                 receiver: None,
-                request: serde_json::json!({}),
-                args: serde_json::json!({}),
-                response: serde_json::json!({"error": "not found"}),
-                result: serde_json::json!({"error": "not found"}),
+                request: serde_json::json!({}).into(),
+                args: serde_json::json!({}).into(),
+                response: serde_json::json!({"error": "not found"}).into(),
+                result: serde_json::json!({"error": "not found"}).into(),
                 is_error: true,
                 duration_us: 50,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5739,10 +5857,10 @@ mod tests {
                 call_line: 42,
                 call_column: 9,
                 receiver: None,
-                request: serde_json::json!({"address_id": "addr_1"}),
-                args: serde_json::json!({"address_id": "addr_1"}),
-                response: serde_json::json!({"ok": true}),
-                result: serde_json::json!({"ok": true}),
+                request: serde_json::json!({"address_id": "addr_1"}).into(),
+                args: serde_json::json!({"address_id": "addr_1"}).into(),
+                response: serde_json::json!({"ok": true}).into(),
+                result: serde_json::json!({"ok": true}).into(),
                 is_error: false,
                 duration_us: 100,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5782,10 +5900,10 @@ mod tests {
                 call_line: 50,
                 call_column: 9,
                 receiver: None,
-                request: serde_json::json!({"address_id": "addr_2"}),
-                args: serde_json::json!({"address_id": "addr_2"}),
-                response: serde_json::json!({"ok": true}),
-                result: serde_json::json!({"ok": true}),
+                request: serde_json::json!({"address_id": "addr_2"}).into(),
+                args: serde_json::json!({"address_id": "addr_2"}).into(),
+                response: serde_json::json!({"ok": true}).into(),
+                result: serde_json::json!({"ok": true}).into(),
                 is_error: false,
                 duration_us: 100,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -6435,8 +6553,8 @@ mod tests {
             vec![explicit_write],
             "DB-shaped args/result must not infer any write key beyond the extractor payload"
         );
-        assert_eq!(event.pre_image, Some(pre_image));
-        assert_eq!(event.result_image, Some(result_image));
+        assert_eq!(event.pre_image, Some(Payload::from(pre_image)));
+        assert_eq!(event.result_image, Some(Payload::from(result_image)));
     }
 
     /// Case 3a — LOOKUP HIT that reconstructs: `run` is NEVER called, the recorded
@@ -7099,17 +7217,134 @@ mod payload_tests {
         }
     }
 
-    /// The wire format must not move: the recorder writes these payloads and a
-    /// reader parses them, and a representation change that altered the bytes
-    /// would strand every tape already on disk.
+    /// The wire content must not move: the recorder writes these payloads and a
+    /// reader parses them, and a representation change that altered what they
+    /// SAY would strand every tape already on disk.
+    ///
+    /// The assertion is structural rather than textual, and the difference is
+    /// worth stating. This type serializes by rendering its text back through a
+    /// `Value`, so the bytes it emits are whatever `serde_json` renders — which
+    /// is exactly what the `Value` field it replaced emitted, since that field
+    /// was rendered from a `Value` by the same build. Key order therefore
+    /// follows the build's `Map`, as it always has.
+    /// The duplicated pairs must end up on ONE allocation after a bulk read.
+    ///
+    /// `request` is recorded as a clone of `args` and `response` as a clone of
+    /// `result`, so an event read back off a tape holds each of those payloads
+    /// twice — the two fields are captured independently from the JSON. The
+    /// saving is invisible to any assertion about what the event SAYS, which is
+    /// why this reaches for the pointer: content equality would pass just as
+    /// happily with the duplication still there.
+    /// An event parsed from a tape line, which is the only way to get one whose
+    /// duplicated fields sit in separate allocations — constructing one in
+    /// memory shares them already.
+    fn event_from_tape(
+        request: serde_json::Value,
+        args: serde_json::Value,
+        response: serde_json::Value,
+        result: serde_json::Value,
+    ) -> crate::BoundaryEvent {
+        let line = serde_json::to_string(&serde_json::json!({
+            "record_kind": "boundary_event",
+            "global_sequence": 1, "request_sequence": 1, "correlation_id": "c1",
+            "timestamp_ns": 0, "boundary": "redis", "trait_name": "T",
+            "method_name": "m", "call_file": "f.rs", "call_line": 1, "call_column": 1,
+            "request": request, "args": args, "response": response, "result": result,
+            "is_error": false, "duration_us": 1, "event_schema_version": 3,
+            "provenance": "recorded", "recon": "lossless", "replay_strategy": "substitute",
+        }))
+        .expect("fixture serializes");
+        match serde_json::from_str::<crate::DejaRecord>(&line).expect("fixture parses") {
+            crate::DejaRecord::BoundaryEvent(event) => *event,
+            other => panic!("fixture is a boundary event, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn payload_round_trips_its_text_unchanged() {
+    fn sharing_collapses_the_duplicated_pairs_onto_one_allocation() {
+        let mut event = event_from_tape(
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"b": 2}),
+            serde_json::json!({"b": 2}),
+        );
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&event.request.text, &event.args.text),
+            "a freshly parsed event holds the duplicate separately — otherwise \
+             this test cannot show that sharing did anything"
+        );
+
+        event.share_duplicate_payloads();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&event.request.text, &event.args.text),
+            "request must share the allocation it duplicates"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&event.response.text, &event.result.text),
+            "response must share the allocation it duplicates"
+        );
+        assert_eq!(event.request, event.args, "and still say the same thing");
+        assert_eq!(event.response, event.result);
+    }
+
+    /// Sharing is by exact bytes, so a tape whose fields genuinely differ keeps
+    /// both — the optimization must never be able to change what an event says.
+    #[test]
+    fn sharing_leaves_genuinely_different_payloads_alone() {
+        let mut event = event_from_tape(
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"a": 2}),
+            serde_json::json!({"b": 1}),
+            serde_json::json!({"b": 2}),
+        );
+        event.share_duplicate_payloads();
+        assert_ne!(
+            event.request, event.args,
+            "different payloads must survive sharing unchanged"
+        );
+        assert_eq!(event.request, payload(r#"{"a":1}"#));
+        assert_eq!(event.args, payload(r#"{"a":2}"#));
+    }
+
+    #[test]
+    fn payload_round_trips_its_content() {
         let text = r#"{"b":2,"a":[1,{"c":null}],"d":"x"}"#;
         let carried = serde_json::to_string(&payload(text)).expect("payload serializes");
         assert_eq!(
-            carried, text,
-            "payload is carried verbatim, not re-rendered"
+            serde_json::from_str::<serde_json::Value>(&carried).expect("carried is JSON"),
+            serde_json::from_str::<serde_json::Value>(text).expect("source is JSON"),
+            "a payload must come back saying the same thing it was given"
         );
+        assert_eq!(
+            payload(&carried),
+            payload(text),
+            "and must compare equal to what it was built from"
+        );
+    }
+
+    /// A payload has to survive the envelope it actually travels in.
+    ///
+    /// Every event is written inside `DejaRecord`, which is internally tagged,
+    /// and serde replays an internally-tagged body through a buffer a
+    /// `serde_json` `RawValue` cannot be read back out of. An earlier version
+    /// of this type deserialized as a `RawValue`: it passed every direct test
+    /// here while making every recorded event unparseable, because testing the
+    /// type alone never puts it inside the tag. This does.
+    #[test]
+    fn payload_survives_the_internally_tagged_envelope() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        #[serde(tag = "record_kind", rename_all = "snake_case")]
+        enum Envelope {
+            Carrying { payload: Payload },
+        }
+        let original = Envelope::Carrying {
+            payload: payload(r#"{"a":[1,2],"b":{"c":"d"}}"#),
+        };
+        let line = serde_json::to_string(&original).expect("envelope serializes");
+        let back: Envelope = serde_json::from_str(&line).expect("envelope round-trips");
+        assert_eq!(back, original, "the payload came back unchanged");
     }
 
     #[test]
