@@ -414,7 +414,7 @@ fn set_status(root: &HarnessRoot, run: &mut Run, status: RunStatus, failure: Opt
 /// plateau the run sat at for minutes and never the spike that killed it. Five
 /// separate investigations read that plateau and concluded memory was not the
 /// problem. A process that reads its own counter cannot miss it.
-fn resident_mib() -> Option<(u64, u64)> {
+pub(crate) fn resident_mib() -> Option<(u64, u64)> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let field = |name: &str| -> Option<u64> {
         status
