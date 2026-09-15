@@ -2643,7 +2643,7 @@ impl<'a> ArgsFreePairing<'a> {
                 .or_default()
                 .push_back(ArgsFreeTwin {
                     sequence: *seq,
-                    args: event.map(|ev| &ev.args),
+                    args: event.map(|ev| &*ev.args),
                 });
         }
         Self { queues, provenance }
@@ -5605,7 +5605,18 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
                 Ok(stream) => {
                     for item in stream {
                         match item {
-                            crate::scope::TapeItem::Event(event) => events.push(*event),
+                            crate::scope::TapeItem::Event(event) => {
+                                // `request` and `response` arrive as separate
+                                // allocations holding the same bytes as `args`
+                                // and `result`, because the two fields are
+                                // captured independently from the JSON. This is
+                                // the bulk read the sharing exists for: every
+                                // event of the run is held at once from here
+                                // until scoring finishes.
+                                let mut event = *event;
+                                event.share_duplicate_payloads();
+                                events.push(event);
+                            }
                             crate::scope::TapeItem::Malformed { line_no, error, .. } => warnings
                                 .push(format!("recording {rec}:{line_no}: parse error: {error}")),
                         }
@@ -6110,7 +6121,7 @@ mod tests {
             0,
             1,
         );
-        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql}).into();
 
         assert!(
             !values_diverge_under_event("db", &recorded, &observed, Some(&event), Some(sql)),
@@ -6173,7 +6184,7 @@ mod tests {
             0,
             1,
         );
-        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql}).into();
 
         assert!(
             values_diverge_under_event("db", &recorded, &observed, Some(&event), Some(sql)),
@@ -8126,7 +8137,7 @@ mod tests {
         ev.boundary = "http_incoming".to_owned();
         ev.trait_name = "HttpIngress".to_owned();
         ev.method_name = "reply".to_owned();
-        ev.result = recorded_body;
+        ev.result = recorded_body.into();
         ev.read_set.clear();
         ev.write_set.clear();
         ev.declaration = reply_canon.map(|canon| {
@@ -10409,7 +10420,7 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut ev = omitted_ev(seq, boundary, Some(corr));
         ev.method_name = method.to_owned();
-        ev.args = args;
+        ev.args = args.into();
         ev
     }
 
@@ -10953,7 +10964,7 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut ev = db_update_ev(corr, "payment_intent", seq, row, 100, 110);
         ev.method_name = "generic_insert".to_owned();
-        ev.args = serde_json::json!({"table": "payment_intent", "sql": sql});
+        ev.args = serde_json::json!({"table": "payment_intent", "sql": sql}).into();
         ev
     }
 
@@ -11452,7 +11463,7 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut ev = db_update_ev(corr, "payment_attempt", seq, row, 100, 110);
         ev.method_name = "generic_update".to_owned();
-        ev.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        ev.args = serde_json::json!({"table": "payment_attempt", "sql": sql}).into();
         ev
     }
 
@@ -11589,8 +11600,8 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut event = omitted_ev(global_sequence, "db", Some(correlation_id));
         event.method_name = method.to_owned();
-        event.args = args;
-        event.result = result;
+        event.args = args.into();
+        event.result = result.into();
         event.graph_node_id = Some(graph_node_id);
         event
     }
@@ -12364,7 +12375,7 @@ mod tests {
         );
         let mut flat_event = omitted_ev(602, "db", Some(flat_corr));
         flat_event.method_name = "load".to_owned();
-        flat_event.result = result.clone();
+        flat_event.result = result.clone().into();
         let graph_observed = graph_observed(
             graph_corr,
             81,
