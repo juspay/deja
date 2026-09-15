@@ -579,6 +579,29 @@ main:has(.runlist), main:has(.verdict) { max-width: 1440px; }
   padding-bottom: var(--s2);
 }
 .recdayband td b { font-size: var(--fs-13); }
+
+/* THE DAY PICKER on the new-run form. A list rather than a <select> for the
+   same reason the recording picker is one: a day and a pod's slice are wildly
+   different things to replay, and the difference has to be visible at the
+   moment of choosing rather than collapsed into one line of option text. */
+.dayfield { margin-bottom: var(--s4); }
+.daylist { list-style: none; margin: var(--s2) 0 0; padding: 0; }
+.daypick { padding: var(--s1) 0; line-height: 1.9; }
+.daypick.chosen b { color: var(--text); }
+.daypick button[disabled] { opacity: 0.55; cursor: not-allowed; }
+/* Members are scrollable: a day can hold well over a hundred pods, and a list
+   that long pushes the rest of the form off the screen. */
+.daymembers { margin: var(--s2) 0 0; }
+.daymembers > ul {
+  list-style: none;
+  margin: var(--s2) 0 0;
+  padding: 0 0 0 var(--s3);
+  max-height: 16rem;
+  overflow-y: auto;
+  font-size: var(--fs-11);
+}
+.daymembers summary { cursor: pointer; }
+.recinstead { margin: var(--s2) 0 var(--s4); }
 /* Indent the members so the band reads as a heading over them rather than as
    another row beside them. */
 .recdayband + tr td:first-child,
