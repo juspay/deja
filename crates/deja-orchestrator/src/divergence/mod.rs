@@ -5418,6 +5418,41 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
 /// (or unavailable for the optional record graph); parse failures are surfaced
 /// as `warnings` rather than silently dropped, so corruption cannot masquerade
 /// as a clean run.
+/// Reports what each artifact costs to load, as it is loaded.
+///
+/// `load_artifacts` materialises five things before classification begins, and
+/// a replay runner dies right here — the process grows by more than a gigabyte
+/// inside a few seconds. Which of the five did it is not something any external
+/// instrument can answer: the container metric samples far too slowly to see
+/// the climb at all, and a process total says only that it happened. The split
+/// has so far been estimated rather than measured, and an estimate is not a
+/// basis for rewriting the scorer, so it is measured here instead.
+struct LoadCost(u64);
+
+impl LoadCost {
+    fn start() -> Self {
+        Self(
+            crate::lifecycle::resident_mib()
+                .map(|(rss, _peak)| rss)
+                .unwrap_or(0),
+        )
+    }
+
+    /// One artifact: how many items it carries, and the resident growth since
+    /// the previous report. Silent where the probe is unavailable — a missing
+    /// measurement never changes what scoring does.
+    fn report(&mut self, what: &str, count: usize) {
+        let Some((rss, _peak)) = crate::lifecycle::resident_mib() else {
+            return;
+        };
+        eprintln!(
+            "divergence: loaded {what} ({count}) — rss {rss} MiB, +{} MiB",
+            rss.saturating_sub(self.0)
+        );
+        self.0 = rss;
+    }
+}
+
 pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifacts> {
     let run = crate::read_json::<crate::Run>(&root.run_path(run_id)).ok();
     let recording_id = run.as_ref().and_then(|run| {
@@ -5444,11 +5479,20 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .map(|run| crate::system::system_config(run.spec.system()).reply_canons)
         .unwrap_or_default();
     let mut warnings = Vec::new();
+    let mut cost = LoadCost::start();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
+    cost.report("lookup table", table.entries.len());
     let (observed, mut replay_graph) =
         load_replay_stream(&root.observed_path(run_id), &mut warnings);
+    cost.report("observed calls", observed.len());
+    cost.report("replay graph nodes", replay_graph.len());
     let mut record_graph = load_record_graph(&root.record_graph_path(run_id), &mut warnings);
+    cost.report(
+        "record graph nodes",
+        record_graph.as_ref().map_or(0, Vec::len),
+    );
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
+    cost.report("http diffs", http_diffs.len());
 
     // The record graph could not be built for this run: the extract left the
     // reason in a note instead of failing the run, and this is where the note
@@ -5573,6 +5617,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
             Err(e) => warnings.push(format!("open recording {rec} failed: {e}")),
         }
     }
+    cost.report("recorded events", events.len());
 
     if let Some(ids) = scope.ids() {
         // The lookup table on disk is still the whole session's (it is written
