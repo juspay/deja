@@ -3716,9 +3716,10 @@ fn order_canonical_diff(
         (serde_json::Value::String(b), serde_json::Value::String(c)) => {
             if let Some((bv, cv)) = deja_kernel::embedded_json_documents(b, c) {
                 order_canonical_diff(&bv, &cv, path, out);
-            } else if let (Some(bp), Some(cp)) =
-                (deja_kernel::parse_form_pairs(b), deja_kernel::parse_form_pairs(c))
-            {
+            } else if let (Some(bp), Some(cp)) = (
+                deja_kernel::parse_form_pairs(b),
+                deja_kernel::parse_form_pairs(c),
+            ) {
                 out.extend(deja_kernel::diff_form_pairs(&bp, &cp, path, &[]));
             } else {
                 out.push(JsonFieldDiff {
@@ -7935,7 +7936,9 @@ mod tests {
 
     /// HOW a decoded document is compared is this engine's own: an array
     /// reordered inside an embedded string is one ordering fact at its
-    /// collection, exactly as it would be outside one.
+    /// collection, exactly as it would be outside one — absorbed by the default
+    /// rule (a permutation moved nothing but iteration order), named at the
+    /// collection's path inside the document, and not blocking.
     #[test]
     fn an_array_inside_an_embedded_document_uses_the_array_canon() {
         let diff = body_pair(
@@ -7943,8 +7946,35 @@ mod tests {
             serde_json::json!({ "doc": "{\"tags\":[\"c\",\"a\",\"b\"]}" }),
         );
         let classification = classify_body(&diff);
-        assert_eq!(classification.blocking_leaf_count, 1);
-        assert_eq!(classification.order_only_paths, vec!["$.doc.tags"]);
+        assert_eq!(classification.blocking_leaf_count, 0);
+        assert!(classification.order_only_paths.is_empty());
+        assert_eq!(
+            classification.canon_absorbed,
+            vec![("$.doc.tags".to_owned(), ClauseSource::Default)]
+        );
+    }
+
+    /// The incident this arm exists for: a system echoes the connector request
+    /// it built as a serialized document, and the `headers` object inside it is
+    /// iterated from a hash map, so its key order is seeded per process. The
+    /// two strings differ byte for byte and are the same JSON value, which is
+    /// not a difference at all: no rows, nothing to absorb, nothing blocking.
+    #[test]
+    fn object_key_order_inside_an_embedded_document_is_not_a_difference() {
+        let diff = body_pair(
+            serde_json::json!({ "rawConnectorRequest": { "value":
+                "{\"url\":\"https://x/v2/orders\",\"method\":\"POST\",\"headers\":{\"via\":\"HyperSwitch\",\"Authorization\":\"Bearer t\",\"Content-Type\":\"application/json\"},\"body\":\"{}\"}" } }),
+            serde_json::json!({ "rawConnectorRequest": { "value":
+                "{\"url\":\"https://x/v2/orders\",\"method\":\"POST\",\"headers\":{\"Content-Type\":\"application/json\",\"via\":\"HyperSwitch\",\"Authorization\":\"Bearer t\"},\"body\":\"{}\"}" } }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert!(
+            rows.is_empty(),
+            "key order inside a document is serialization, not a value: {rows:?}"
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 0);
+        assert!(classification.canon_absorbed.is_empty());
     }
 
     /// The strict qualifiers hold through the new arm: two strings that carry
