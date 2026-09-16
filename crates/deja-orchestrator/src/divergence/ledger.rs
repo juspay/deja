@@ -120,6 +120,13 @@ pub struct CallRecord {
     /// every other kind. Lets the UI render the origin -> consequence cascade.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin: bool,
+    /// The candidate's request STOPPED at this call: a `Substitute` boundary
+    /// missed the tape (or its hit would not rebuild) and failed closed, so the
+    /// call never ran and there is no replayed result to show. The finding is
+    /// in the ARGUMENTS — what the candidate asked for that the recording does
+    /// not hold. Absent when the call went through.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_rank: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +180,36 @@ fn observed_side(obs: &ObservedCall) -> CallSide {
         span_path: obs.span_path.clone(),
         graph_node_id: obs.graph_node_id,
     }
+}
+
+fn stopped_at(obs: &ObservedCall) -> bool {
+    obs.outcome == deja::SubstituteOutcome::Stopped
+}
+
+/// The correlations in which some executed boundary returned a value that
+/// differs from the recorded baseline — the ORIGINS a downstream re-keyed call
+/// can be a consequence of.
+///
+/// A re-keyed call (one whose arguments miss the tape) is a consequence only
+/// when there is something upstream for it to be a consequence of. Absent
+/// that, the changed arguments are themselves the finding — the candidate built
+/// a different request from the same inputs — and the row is the origin. The
+/// ledger used to label every such call a consequence and the viewer then said
+/// "the cause is at an origin above it" about rows with no origin anywhere.
+fn correlations_with_a_value_origin(
+    observed: &[ObservedCall],
+    by_seq: &HashMap<u64, &BoundaryEvent>,
+) -> HashSet<String> {
+    observed
+        .iter()
+        .filter(|obs| {
+            let source = obs
+                .source_event_global_sequence
+                .and_then(|seq| by_seq.get(&seq).copied());
+            observed_value_diverged(obs, source)
+        })
+        .filter_map(|obs| obs.correlation_id.clone())
+        .collect()
 }
 
 /// Build the per-call ledger from the recording's events (recorded side), the
@@ -258,6 +295,7 @@ pub(crate) fn build_with_inconclusive_into(
     };
 
     let mut consumed: HashSet<u64> = HashSet::new();
+    let value_origins = correlations_with_a_value_origin(observed, &by_seq);
 
     // Args-free pairing of recorded twins for execute-mode write consequences:
     // a re-keyed write misses its baseline by args, so it would otherwise split
@@ -318,6 +356,7 @@ pub(crate) fn build_with_inconclusive_into(
                 kind,
                 blocking,
                 origin: true,
+                stopped: stopped_at(obs),
                 resolved_rank: obs.resolved_rank,
                 recorded,
                 observed: observed_side(obs).or_none(),
@@ -414,7 +453,14 @@ pub(crate) fn build_with_inconclusive_into(
                         None => "value_diverged".to_owned(),
                     },
                     blocking: value_diverged && schema_default.is_none() && !race_downstream,
-                    origin: false,
+                    // A consequence needs an origin. With none in this
+                    // correlation the re-keyed call is the finding itself.
+                    origin: value_diverged
+                        && !obs
+                            .correlation_id
+                            .as_deref()
+                            .is_some_and(|id| value_origins.contains(id)),
+                    stopped: stopped_at(obs),
                     resolved_rank: obs.resolved_rank,
                     recorded,
                     observed: observed.or_none(),
@@ -467,6 +513,7 @@ pub(crate) fn build_with_inconclusive_into(
             kind: kind.to_owned(),
             blocking,
             origin: false,
+            stopped: stopped_at(obs),
             resolved_rank: obs.resolved_rank,
             recorded,
             observed: observed_side(obs).or_none(),
@@ -496,6 +543,7 @@ pub(crate) fn build_with_inconclusive_into(
             kind: "omitted".to_owned(),
             blocking,
             origin: false,
+            stopped: false,
             resolved_rank: None,
             recorded: recorded_for(ev.global_sequence),
             observed: None,
@@ -557,6 +605,7 @@ pub(crate) fn build_with_plan_into(
         .iter()
         .map(|event| (event.global_sequence, event))
         .collect();
+    let value_origins = correlations_with_a_value_origin(observed, &by_seq);
 
     let mut graph_sequence = HashSet::new();
     let mut graph_observed_indices = HashSet::new();
@@ -672,6 +721,7 @@ pub(crate) fn build_with_plan_into(
                                 event.role.as_deref(),
                             ),
                             origin: false,
+                            stopped: false,
                             resolved_rank: None,
                             recorded: side.or_none(),
                             observed: None,
@@ -703,6 +753,7 @@ pub(crate) fn build_with_plan_into(
                                 && tier_for(&call.boundary) != Tier::Environmental
                                 && !is_nonblocking_boundary(&call.boundary, call.role.as_deref()),
                             origin: false,
+                            stopped: stopped_at(call),
                             resolved_rank: call.resolved_rank,
                             recorded: None,
                             observed: observed_side(call).or_none(),
@@ -833,7 +884,16 @@ pub(crate) fn build_with_plan_into(
                                     "value_diverged".to_owned()
                                 }
                             });
-                            (kind, blocking, false)
+                            // A consequence needs an origin. With none in this
+                            // correlation the re-keyed call is the finding
+                            // itself: the candidate asked for something the
+                            // recording never held.
+                            let origin = kind == "value_diverged"
+                                && !call
+                                    .correlation_id
+                                    .as_deref()
+                                    .is_some_and(|id| value_origins.contains(id));
+                            (kind, blocking, origin)
                         } else {
                             let recovered = call.resolved_rank == Some(POSITIONAL_FALLBACK_RANK);
                             (
@@ -853,6 +913,7 @@ pub(crate) fn build_with_plan_into(
                         kind,
                         blocking,
                         origin,
+                        stopped: stopped_at(call),
                         resolved_rank: call.resolved_rank,
                         recorded: recorded.and_then(CallSide::or_none),
                         observed: observed.or_none(),

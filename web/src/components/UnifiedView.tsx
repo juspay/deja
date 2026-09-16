@@ -174,6 +174,7 @@ function typeNameOf(v: unknown): string | null {
 function ValueDiverged({ e }: { e: CallEntry }) {
   const c = e.call;
   const origin = !!c.origin;
+  const stopped = !!c.stopped;
   const tr = typeNameOf(c.recorded?.result);
   const to = typeNameOf(c.observed?.result);
   return (
@@ -181,7 +182,20 @@ function ValueDiverged({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">
-        {origin ? (
+        {stopped && origin ? (
+          <>
+            <b>Origin.</b> The candidate asked this boundary for something the recording does not
+            hold: its arguments match no call recorded at this span, so replay refused the call and
+            the request stopped here. The argument diff below is the finding — the request the
+            candidate would have sent, against the one the recording made.
+          </>
+        ) : stopped ? (
+          <>
+            <b>Consequence.</b> The candidate's arguments here carried a value that had already
+            changed upstream, so they match no recorded call and replay refused this one. The cause
+            is at an origin above it; the argument diff shows what changed by the time it got here.
+          </>
+        ) : origin ? (
           <>
             <b>Origin.</b> This boundary was declared <code>Execute</code>, so it really ran during
             replay instead of serving the recorded value — and what it returned differs. Everything
@@ -202,12 +216,30 @@ function ValueDiverged({ e }: { e: CallEntry }) {
           finding.
         </p>
       )}
-      <h4>result</h4>
-      <FieldDiff recorded={c.recorded?.result} candidate={c.observed?.result} />
-      <details className="evraw">
-        <summary>arguments</summary>
-        <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
-      </details>
+      {stopped ? (
+        <>
+          <h4>arguments</h4>
+          <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+          <h4>result</h4>
+          <p className="hint">
+            No replayed result: the call was refused before it ran, so there is nothing to set
+            against the recorded one.
+          </p>
+          <details className="evraw">
+            <summary>recorded result</summary>
+            <JsonView value={c.recorded?.result} />
+          </details>
+        </>
+      ) : (
+        <>
+          <h4>result</h4>
+          <FieldDiff recorded={c.recorded?.result} candidate={c.observed?.result} />
+          <details className="evraw">
+            <summary>arguments</summary>
+            <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+          </details>
+        </>
+      )}
     </div>
   );
 }

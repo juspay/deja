@@ -11978,9 +11978,18 @@ mod tests {
         let rows = build_ledger(&art).expect("ledger builds");
         let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
         assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        // Nothing upstream of this write returned a different value, so the
+        // changed operand did not arrive from anywhere — the candidate produced
+        // it. That makes the write the origin. It used to be labelled a
+        // consequence regardless, and the viewer then pointed at "an origin
+        // above it" that did not exist.
         assert!(
-            !diverged[0].origin,
-            "the write is the consequence, not the cause"
+            diverged[0].origin,
+            "a re-keyed write with no origin upstream is itself the origin"
+        );
+        assert!(
+            !diverged[0].stopped,
+            "an execute-mode write ran; it was not refused"
         );
         assert_eq!(
             diverged[0].source_event_global_sequence,
@@ -11990,6 +11999,188 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.kind != "omitted"),
             "the twin is accounted for by the pair, not omitted as well"
+        );
+    }
+
+    /// The same re-keyed write, with an executed read upstream in the same
+    /// correlation that returned a different row. Now the write's changed
+    /// operand has a source, and the write is the consequence of it.
+    #[test]
+    fn a_rekeyed_write_downstream_of_a_diverged_read_stays_a_consequence() {
+        let corr = "c1";
+        let read_seq = 6;
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed_row = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        let mut read_event = omitted_ev(read_seq, "db", Some(corr));
+        read_event.method_name = "generic_find_one".to_owned();
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    read_seq,
+                    envelope(recorded_row.clone()),
+                ),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    7,
+                    envelope(recorded_row.clone()),
+                ),
+                span_entry(Some(corr), 7, "root>update_attempt"),
+            ],
+            vec![
+                exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(read_seq),
+                    Some(envelope(recorded_row.clone())),
+                    envelope(observed_row.clone()),
+                ),
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, observed_row),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                read_event,
+                attempt_update_ev(corr, 7, ATTEMPT_UPDATE_STATUS, recorded_row),
+            ],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let read = rows
+            .iter()
+            .find(|r| r.method_name == "generic_find_one")
+            .expect("the read has a row");
+        assert_eq!(read.kind, "value_diverged");
+        assert!(
+            read.origin,
+            "the executed read that returned a different row is the origin"
+        );
+        let write = rows
+            .iter()
+            .find(|r| r.method_name == "generic_update")
+            .expect("the write has a row");
+        assert_eq!(write.kind, "value_diverged");
+        assert!(
+            !write.origin,
+            "with a diverged read upstream, the re-keyed write is its consequence"
+        );
+    }
+
+    /// A `Substitute` egress boundary (a connector call in UCS) whose arguments
+    /// miss the tape fails closed: the call is refused and the request stops.
+    /// The scorecard tiers the miss environmental and lets the http status
+    /// mismatch carry the verdict; the ledger row is where a reader learns WHAT
+    /// the candidate asked for. It must say the request stopped here, name the
+    /// row the origin (nothing upstream changed — the candidate built a
+    /// different request), and pair it with the recorded call at the same span
+    /// so the argument diff is the recorded request against the attempted one.
+    #[test]
+    fn a_refused_substitute_miss_is_an_origin_that_stopped_the_request() {
+        let corr = "ucs-authorize";
+        let sequence = 801;
+        let recorded_args = serde_json::json!({
+            "url": "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+            "method": "POST",
+            "body": {"Json": {"purchase_units": [{"invoice_id": "pay_1"}]}},
+        });
+        let attempted_args = serde_json::json!({
+            "url": "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+            "method": "POST",
+            "body": {"Json": {"purchase_units": [{"invoice_id": "pay_1-v2"}]}},
+        });
+        let recorded_result = serde_json::json!({"kind": "ok", "status_code": 201});
+        let mut event = omitted_ev(sequence, "http_outgoing", Some(corr));
+        event.method_name = "call_connector_api".to_owned();
+        event.args = recorded_args.into();
+        event.result = recorded_result.clone().into();
+        event.graph_node_id = Some(111);
+        let mut call = obs("http_outgoing", Some(corr), false, None, None);
+        call.method_name = "call_connector_api".to_owned();
+        call.args = attempted_args;
+        call.outcome = deja::SubstituteOutcome::Stopped;
+        call.graph_node_id = Some(211);
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(
+                    Some(corr),
+                    "http_outgoing",
+                    "call_connector_api",
+                    sequence,
+                    recorded_result,
+                )],
+                vec![call],
+                vec![http(corr, false, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(
+                111,
+                corr,
+                None,
+                0,
+                "execute_connector_processing_step",
+            )],
+            vec![graph_span(
+                211,
+                corr,
+                None,
+                0,
+                "execute_connector_processing_step",
+            )],
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+            1,
+            "the scorecard's classification of the miss is unchanged"
+        );
+        assert!(
+            !card.verdict.pass,
+            "the refused request's status mismatch fails the run"
+        );
+
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        let row = diverged[0];
+        assert!(row.stopped, "the request stopped at this call");
+        assert!(
+            row.origin,
+            "nothing upstream changed; the attempted request is the finding"
+        );
+        assert_eq!(
+            row.source_event_global_sequence,
+            Some(sequence),
+            "paired with the recorded call at the same span"
+        );
+        assert_eq!(
+            row.recorded
+                .as_ref()
+                .and_then(|side| side.args.as_ref())
+                .and_then(|args| args.pointer("/body/Json/purchase_units/0/invoice_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("pay_1"),
+            "the recorded side carries the request the tape holds"
+        );
+        assert_eq!(
+            row.observed
+                .as_ref()
+                .and_then(|side| side.args.as_ref())
+                .and_then(|args| args.pointer("/body/Json/purchase_units/0/invoice_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("pay_1-v2"),
+            "the observed side carries the request the candidate attempted"
+        );
+        assert!(
+            row.observed
+                .as_ref()
+                .is_none_or(|side| side.result.is_none()),
+            "a refused call has no replayed result"
         );
     }
     fn graph_span(

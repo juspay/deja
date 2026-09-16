@@ -252,6 +252,10 @@ export type CallRecord = {
   // differed — the cause), false on the CONSEQUENCE (downstream write). Absent
   // on every other kind.
   origin?: boolean;
+  // The candidate's request STOPPED at this call: a Substitute boundary missed
+  // the tape and failed closed, so there is no replayed result — the finding is
+  // in the arguments. Absent when the call went through.
+  stopped?: boolean;
   resolved_rank?: number;
   recorded?: CallSide;
   observed?: CallSide;
