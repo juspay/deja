@@ -3746,9 +3746,9 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
 }
 
 /// The response's body difference, recomputed with array order handled
-/// structurally and held to the kernel's findings. `None` when the kernel's own
-/// rows are to be used unchanged: the run predates full bodies being recorded
-/// alongside the diff, or the re-shaping failed (see below).
+/// structurally and held to the kernel's findings. `None` when the run predates
+/// full bodies being recorded alongside the diff, in which case the kernel's own
+/// rows are used unchanged.
 ///
 /// The recompute RE-SHAPES the kernel's differences; it does not get a second,
 /// independent opinion about whether they exist. See [`reconciled_with_kernel`].
@@ -3756,14 +3756,26 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
     order_canonical_diff(baseline, candidate, "$", &mut rows);
-    let reconciled = reconciled_with_kernel(rows, &diff.body_diff);
+    let mut reconciled = reconciled_with_kernel(rows, &diff.body_diff);
     // The invariant holds in BOTH directions: the recompute may re-shape the
     // kernel's findings and may not invent one — and may not erase one either.
-    // If nothing it produced speaks about any region the kernel reported, the
-    // re-shaping has failed and the kernel's own rows stand.
-    if reconciled.rows.is_empty() && !diff.body_diff.is_empty() {
-        return None;
-    }
+    // A kernel row that no surviving recompute row speaks about was not
+    // re-shaped, it was dropped; it stands as the kernel wrote it. Exact, row by
+    // row: a backed row beside it must not decide its fate. Judged against the
+    // recompute's survivors alone, so that two unspoken-for kernel rows in one
+    // collection cannot speak for each other and lose one.
+    let unspoken_for: Vec<JsonFieldDiff> = diff
+        .body_diff
+        .iter()
+        .filter(|found| {
+            !reconciled
+                .rows
+                .iter()
+                .any(|row| paths_overlap(&row.json_path, &found.json_path))
+        })
+        .cloned()
+        .collect();
+    reconciled.rows.extend(unspoken_for);
     Some(reconciled)
 }
 
@@ -3830,9 +3842,8 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 ///
 /// This engine recurses the same structure the kernel does, so in practice every
 /// region the kernel reports in already carries a row here. That is not what the
-/// safety of setting rows aside rests on: [`reconciled_body_diff`] refuses a
-/// reconciliation that would leave a non-empty kernel set with nothing, and the
-/// kernel's rows stand instead.
+/// safety of setting rows aside rests on: [`reconciled_body_diff`] carries every
+/// kernel row that nothing here speaks about through as the kernel wrote it.
 ///
 /// A kernel row at the root (`$`) backs every recompute row, which is the
 /// conservative direction. Pairwise over the two row sets; bodies are small.
@@ -7895,11 +7906,11 @@ mod tests {
     }
 
     /// The invariant holds in BOTH directions. The recompute may not invent a
-    /// difference, and it may not erase one: if nothing it produced speaks about
-    /// any region the kernel reported, the re-shaping has failed and the kernel's
-    /// own rows stand, blocking as they would have.
+    /// difference, and it may not erase one: a kernel row that nothing the
+    /// recompute produced speaks about stands as the kernel wrote it, blocking
+    /// as it would have.
     #[test]
-    fn a_recompute_that_accounts_for_none_of_the_kernels_findings_yields_to_them() {
+    fn a_kernel_row_nothing_speaks_about_stands_as_the_kernel_wrote_it() {
         let kernel = vec![JsonFieldDiff {
             json_path: "$.beta".to_owned(),
             baseline: serde_json::json!(1),
@@ -7912,22 +7923,57 @@ mod tests {
         let diff = http_with_bodies(
             "erase",
             true,
-            kernel,
+            kernel.clone(),
             serde_json::json!({ "alpha": "x" }),
             serde_json::json!({ "alpha": "y" }),
         );
-        assert!(
-            order_canonical_body_diff(&diff).is_none(),
-            "a reconciliation that would empty a non-empty kernel set is refused"
+        assert_eq!(
+            order_canonical_body_diff(&diff).expect("bodies present"),
+            kernel,
+            "the kernel's row is carried through, at its path and with its values"
         );
         let classification = classify_body(&diff);
         assert_eq!(
             classification.blocking_leaf_count, 1,
             "the kernel's row blocks"
         );
+        // The recompute's own row had no kernel row behind it, so it is set aside
+        // and named — which is the accurate reading of this fixture.
+        assert_eq!(classification.kernel_equivalent_paths, vec!["$.alpha"]);
+    }
+
+    /// Exact, not all-or-nothing: one kernel row the recompute backs must not
+    /// decide the fate of another it does not. And the unspoken-for rows are
+    /// judged against the recompute's survivors alone, so two of them in one
+    /// collection cannot speak for each other and lose one.
+    #[test]
+    fn a_backed_kernel_row_does_not_decide_the_fate_of_an_unbacked_one() {
+        let row = |path: &str| JsonFieldDiff {
+            json_path: path.to_owned(),
+            baseline: serde_json::json!(1),
+            candidate: serde_json::json!(2),
+        };
+        let kernel = vec![row("$.alpha"), row("$.beta[0]"), row("$.beta[1]")];
+        // The bodies differ only at `$.alpha`, so the recompute backs that row
+        // and nothing else.
+        let diff = http_with_bodies(
+            "partial",
+            true,
+            kernel,
+            serde_json::json!({ "alpha": "x" }),
+            serde_json::json!({ "alpha": "y" }),
+        );
+        let paths: Vec<String> = order_canonical_body_diff(&diff)
+            .expect("bodies present")
+            .into_iter()
+            .map(|row| row.json_path)
+            .collect();
+        assert_eq!(paths, vec!["$.alpha", "$.beta[0]", "$.beta[1]"]);
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 3);
         assert!(
             classification.kernel_equivalent_paths.is_empty(),
-            "nothing was judged the same; nothing is named as such"
+            "every recompute row was backed; nothing was set aside"
         );
     }
 

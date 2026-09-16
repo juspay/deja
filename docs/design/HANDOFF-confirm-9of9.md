@@ -45,6 +45,11 @@ deja-orchestrator lib tests pass** (no regression).
 `OrderNondeterministicWarning` (demoted, confirm PASSES). Verdict `pass:false` reason
 "1 value divergence(s); 1 order-nondeterminism warning(s) (non-blocking)".
 
+> Historical. `order_nondeterminism_warnings` no longer carries this meaning: the UPDATE
+> inherited-row demotion was retired, the counter wrote zero on every scorecard after, and it
+> now counts response-body regions the order-canonical recompute reported and the kernel judged
+> the same (see `Summary::order_nondeterminism_warnings`). It feeds no verdict reason.
+
 **Remaining (gate RED): div 1 — redis `delete_key` on `/connectors` (`KeyDeleted`→`KeyNotDeleted`).**
 PARKED per OMP (benign idempotent-delete); Rule B (redis) NOT implemented — awaiting OMP's policy
 decision. This is the sole blocking divergence.
