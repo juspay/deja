@@ -220,6 +220,7 @@ function ValueDiverged({ e }: { e: CallEntry }) {
         <>
           <h4>arguments</h4>
           <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+          <FullArguments c={c} />
           <h4>result</h4>
           <p className="hint">
             No replayed result: the call was refused before it ran, so there is nothing to set
@@ -237,10 +238,26 @@ function ValueDiverged({ e }: { e: CallEntry }) {
           <details className="evraw">
             <summary>arguments</summary>
             <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+            <FullArguments c={c} />
           </details>
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * Both sides' arguments in full, folded away. The leaf diff above names what
+ * changed; this is for reading the whole request around it — the headers that
+ * did not change, the body as sent — when the leaf alone is not enough.
+ */
+function FullArguments({ c }: { c: CallRecord }) {
+  if (c.recorded?.args === undefined && c.observed?.args === undefined) return null;
+  return (
+    <details className="evraw">
+      <summary>full arguments, recorded and replayed</summary>
+      <ValuePair baseline={c.recorded?.args} candidate={c.observed?.args} />
+    </details>
   );
 }
 
