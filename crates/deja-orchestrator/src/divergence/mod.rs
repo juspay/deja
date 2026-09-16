@@ -5661,9 +5661,12 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .map(crate::scope::RunScope::of)
         .unwrap_or_else(crate::scope::RunScope::entire_session);
     let correlation_scope: Option<std::collections::BTreeSet<String>> = scope.ids().cloned();
+    // Resolved the same way the params row was, so what the run's record says
+    // is scored and what the scorer scores cannot differ — see
+    // `RunSpec::effective_scored_span_namespaces`.
     let scored_span_namespaces = run
         .as_ref()
-        .map(|run| run.spec.scored_span_namespaces.clone())
+        .map(|run| run.spec.effective_scored_span_namespaces())
         .unwrap_or_default();
     // The system's own declaration, not the run's: whether an array is a set is
     // a property of the recorded system's contract, so it is read from the
@@ -6504,6 +6507,85 @@ mod tests {
     fn with_span(mut o: ObservedCall, path: &str) -> ObservedCall {
         o.span_path = Some(path.to_owned());
         o
+    }
+
+    fn run_with_namespaces(
+        root: &HarnessRoot,
+        run_id: &str,
+        namespaces: Vec<String>,
+    ) -> crate::RunSpec {
+        let spec = crate::RunSpec {
+            scored_span_namespaces: namespaces,
+            mode: crate::RunMode::Replay,
+            system_under_test: Some("prism".to_owned()),
+            candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                image: "deja-demo".to_owned(),
+            },
+            candidate_repo: None,
+            recording_id: Some("rec-ns".to_owned()),
+            recording_group: None,
+            s3_source: None,
+            correlation_filter: None,
+            workload: serde_json::Value::Null,
+        };
+        crate::write_json(
+            &root.run_path(run_id),
+            &crate::Run {
+                run_id: run_id.to_owned(),
+                spec: spec.clone(),
+                status: crate::RunStatus::Completed,
+                recording_id: Some("rec-ns".to_owned()),
+                candidate_image: None,
+                failure_reason: None,
+                stage: None,
+                step: 0,
+                steps_total: 0,
+                stage_updated_ms: 0,
+            },
+        )
+        .unwrap();
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: "rec-ns".to_owned(),
+                policy_version: deja::POLICY_VERSION,
+                entries: vec![],
+            },
+        )
+        .unwrap();
+        spec
+    }
+
+    /// The namespaces the scorer checks are the ones the run's own params row
+    /// says it checks. The row resolved an empty spec to the system's
+    /// declaration while the scorer read the raw spec: every CI-created prism
+    /// run showed `["ucs::", "connector::"]` and scored no span at all.
+    #[test]
+    fn the_scorer_checks_the_namespaces_the_params_row_says_it_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+
+        let explicit = run_with_namespaces(&root, "run-ns-explicit", vec!["x::".to_owned()]);
+        let art = load_artifacts(&root, "run-ns-explicit").unwrap();
+        assert_eq!(art.scored_span_namespaces, vec!["x::".to_owned()]);
+        assert_eq!(
+            art.scored_span_namespaces,
+            crate::RunParams::resolved(&explicit, None).scored_span_namespaces
+        );
+
+        // An empty spec — what the API and CI send — resolves through the same
+        // seam as the params row, so the two cannot disagree whatever the
+        // system declares in this environment.
+        let empty = run_with_namespaces(&root, "run-ns-empty", Vec::new());
+        let art = load_artifacts(&root, "run-ns-empty").unwrap();
+        assert_eq!(
+            art.scored_span_namespaces,
+            crate::RunParams::resolved(&empty, None).scored_span_namespaces
+        );
+        assert_eq!(
+            art.scored_span_namespaces,
+            empty.effective_scored_span_namespaces()
+        );
     }
 
     /// A correlation filter must scope scoring to the DRIVEN subset: an
