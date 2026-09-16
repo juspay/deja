@@ -447,6 +447,13 @@ struct ResidentTrace {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// How much the resident set must grow before the trace says so again.
+///
+/// Small enough that a fatal climb — better than a gigabyte inside a few
+/// seconds — still prints as a curve rather than two endpoints, and large
+/// enough that a settled process stops repeating itself.
+const TRACE_GROWTH_MIB: u64 = 64;
+
 impl ResidentTrace {
     fn start(label: &'static str) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -454,9 +461,22 @@ impl ResidentTrace {
         let handle = std::thread::Builder::new()
             .name("deja-resident-trace".to_owned())
             .spawn(move || {
+                let mut reported: Option<u64> = None;
                 while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(fact) = resident_fact() {
-                        eprintln!("lifecycle: {label} {fact}");
+                    // Only growth is worth a line. A run that is climbing says
+                    // so on every sample; a run that has settled says it once
+                    // and then stops, which is the difference between a curve
+                    // and a log full of the same number. The threshold is what
+                    // makes this quiet enough to leave on: the scoring stage of
+                    // a healthy run now costs a handful of lines rather than
+                    // one every two seconds for as long as it takes.
+                    if let Some((rss, peak)) = resident_mib() {
+                        let grew = reported
+                            .is_none_or(|last| rss.saturating_sub(last) >= TRACE_GROWTH_MIB);
+                        if grew {
+                            eprintln!("lifecycle: {label} rss {rss} MiB, peak {peak} MiB");
+                            reported = Some(rss);
+                        }
                     }
                     // Sliced so dropping the trace is prompt rather than
                     // costing a full sampling interval on every run.
