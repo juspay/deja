@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use deja::{BoundaryEvent, Locus, ObservedCall};
+use deja::{BoundaryEvent, Locus, ObservedCall, Payload};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -135,8 +135,8 @@ fn schema_default_row_kind(_scorecard_kind: &str) -> String {
 
 fn recorded_side(ev: &BoundaryEvent) -> CallSide {
     CallSide {
-        args: Some(ev.args.clone()),
-        result: Some(ev.result.clone()),
+        args: Some(ev.args.to_value()),
+        result: Some(ev.result.to_value()),
         is_error: Some(ev.is_error),
         call_file: Some(ev.call_file.clone()),
         call_line: Some(ev.call_line),
@@ -362,7 +362,7 @@ pub(crate) fn build_with_inconclusive_into(
                 let recorded_result = by_seq
                     .get(&twin_seq)
                     .map(|ev| ev.result.clone())
-                    .unwrap_or(serde_json::Value::Null);
+                    .unwrap_or(Payload::from(serde_json::Value::Null));
                 let twin_event = by_seq.get(&twin_seq).copied();
                 let (recorded_val, observed_val) =
                     args_free_effective_values(&recorded_result, obs, twin_event);
@@ -917,10 +917,10 @@ mod tests {
             call_line: 1,
             call_column: 1,
             receiver: None,
-            request: serde_json::Value::Null,
-            args: serde_json::json!({"k": seq}),
-            response: serde_json::Value::Null,
-            result: serde_json::json!({"r": seq}),
+            request: Payload::from(serde_json::Value::Null),
+            args: serde_json::json!({"k": seq}).into(),
+            response: Payload::from(serde_json::Value::Null),
+            result: serde_json::json!({"r": seq}).into(),
             is_error: false,
             duration_us: 0,
             event_schema_version: deja::CURRENT_EVENT_SCHEMA_VERSION,
@@ -1007,13 +1007,13 @@ mod tests {
             };
             entries.push(deja::LookupEntry {
                 key: key(Locus::Unlocated),
-                result: ev.result.clone(),
+                result: ev.result.to_value(),
                 source_event_global_sequence: ev.global_sequence,
             });
             if let Some(path) = spans.get(&ev.global_sequence) {
                 entries.push(deja::LookupEntry {
                     key: key(Locus::SpanPath { path: path.clone() }),
-                    result: ev.result.clone(),
+                    result: ev.result.to_value(),
                     source_event_global_sequence: ev.global_sequence,
                 });
             }
