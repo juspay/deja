@@ -3,6 +3,13 @@
 // just "args differ". Handles the common Hyperswitch shape where the meaningful
 // value is buried inside a Rust `Debug` blob string (e.g. PaymentAttemptNew),
 // by windowing the changed region of long strings.
+//
+// Arrays are walked, not treated as one leaf. A header list is `[[name, value],
+// …]` in whatever order the sending process's map iterated, so as one leaf it
+// rendered both whole lists — thirty lines each, bearer token included — for a
+// single changed header, and the reader had to find it by eye. Header pairs are
+// compared by NAME, a string that parses as a JSON document is compared as that
+// document, and equal-length arrays are compared element by element.
 
 export type LeafDiff = {
   path: string;
@@ -43,12 +50,58 @@ export function highlightString(a: string, b: string): StringHighlight {
   };
 }
 
+/** `[[name, value], …]` — the wire shape of an HTTP header list. */
+function isPairList(v: unknown): v is [string, unknown][] {
+  return (
+    Array.isArray(v) &&
+    v.length > 0 &&
+    v.every((e) => Array.isArray(e) && e.length === 2 && typeof e[0] === "string")
+  );
+}
+
+/* A header list keyed by lower-cased name. A name that repeats (set-cookie)
+   keeps every value, in arrival order, so multiplicity still compares. */
+function pairsByName(pairs: [string, unknown][]): Record<string, unknown> {
+  const out: Record<string, unknown[]> = {};
+  for (const [name, value] of pairs) (out[name.toLowerCase()] ??= []).push(value);
+  const flat: Record<string, unknown> = {};
+  for (const [k, vs] of Object.entries(out)) flat[k] = vs.length === 1 ? vs[0] : vs;
+  return flat;
+}
+
+/* A string that carries a JSON document (a body sent as text). Only objects
+   and arrays: a bare number or string is a value, not a document. */
+function parsedDocument(v: unknown): unknown | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.trimStart();
+  if (!(t.startsWith("{") || t.startsWith("["))) return undefined;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return undefined;
+  }
+}
+
 function walk(rec: unknown, cand: unknown, path: string, out: LeafDiff[]) {
   if (JSON.stringify(rec) === JSON.stringify(cand)) return;
   if (isObj(rec) && isObj(cand)) {
     for (const k of new Set([...Object.keys(rec), ...Object.keys(cand)])) {
       walk(rec[k], cand[k], path ? `${path}.${k}` : k, out);
     }
+    return;
+  }
+  if (isPairList(rec) && isPairList(cand)) {
+    walk(pairsByName(rec), pairsByName(cand), path, out);
+    return;
+  }
+  if (Array.isArray(rec) && Array.isArray(cand) && rec.length === cand.length) {
+    for (let i = 0; i < rec.length; i++) walk(rec[i], cand[i], `${path}[${i}]`, out);
+    return;
+  }
+  const recDoc = parsedDocument(rec);
+  const candDoc = parsedDocument(cand);
+  if (recDoc !== undefined && candDoc !== undefined) {
+    walk(recDoc, candDoc, path ? `${path}(json)` : "(json)", out);
     return;
   }
   // a changed leaf (or array, or shape change)
@@ -64,4 +117,28 @@ export function diffArgs(recorded: unknown, candidate: unknown): LeafDiff[] {
   const out: LeafDiff[] = [];
   walk(recorded, candidate, "", out);
   return out;
+}
+
+const SHOWN = 40;
+
+function short(v: unknown): string {
+  const s = typeof v === "string" ? v : v === undefined ? "∅" : JSON.stringify(v);
+  return s.length > SHOWN ? `${s.slice(0, SHOWN - 1)}…` : s;
+}
+
+/** One changed leaf, said in a line: `path: recorded → candidate`. */
+export type LeafSummary = { path: string; recorded: string; candidate: string };
+
+/* The first few changed leaves as one-liners, so a row can say what changed
+   before anyone opens it. `more` is how many it did not fit. */
+export function summarizeLeaves(
+  leaves: LeafDiff[],
+  max = 2,
+): { shown: LeafSummary[]; more: number } {
+  const shown = leaves.slice(0, max).map((d) => ({
+    path: d.path || "(value)",
+    recorded: short(d.recorded),
+    candidate: short(d.candidate),
+  }));
+  return { shown, more: Math.max(0, leaves.length - shown.length) };
 }

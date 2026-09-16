@@ -1,4 +1,5 @@
 import React from "react";
+import { diffArgs, summarizeLeaves } from "../lib/argdiff";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams } from "../lib/api";
@@ -124,6 +125,13 @@ type Finding = {
    */
   nodeId: number | null;
   side: Side;
+  /**
+   * What changed, for a value divergence: the first changed leaves of the
+   * recorded-vs-attempted arguments, so the list says `headers.prefer:
+   * return=representation → return=minimal` and nobody has to open thirty
+   * header lines to find it.
+   */
+  what?: ReturnType<typeof summarizeLeaves>;
 };
 
 // The order a reader should meet them: what changed, what that changed, what the
@@ -214,6 +222,10 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
         ? [[rep, "rep"], [rec, "rec"]]
         : [[rec, "rec"], [rep, "rep"]];
     const [nodeId, side] = order.find(([id]) => id != null) ?? [null, "rec" as Side];
+    const what =
+      c.kind === "value_diverged" && c.recorded?.args !== undefined && c.observed?.args !== undefined
+        ? summarizeLeaves(diffArgs(c.recorded.args, c.observed.args))
+        : undefined;
     out.push({
       rank,
       correlation: c.correlation_id ?? null,
@@ -222,6 +234,7 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
       span: spanOf(c),
       nodeId,
       side,
+      what: what && what.shown.length > 0 ? what : undefined,
     });
   }
   for (const d of https) {
@@ -258,7 +271,24 @@ function FindingRow({ f, onOpen }: { f: Finding; onOpen: (f: Finding) => void })
         <span className="fwhere mono">{f.where}</span>
         {f.correlation && <span className="fcorr mono">{f.correlation.slice(0, 8)}</span>}
       </button>
+      {f.what && <ChangedLeaves what={f.what} />}
     </li>
+  );
+}
+
+/** The changed leaves of a finding, inline under its row. */
+function ChangedLeaves({ what }: { what: NonNullable<Finding["what"]> }) {
+  return (
+    <div className="fwhat mono">
+      {what.shown.map((l) => (
+        <span key={l.path} className="fleaf">
+          <span className="jpath">{l.path}</span>
+          <del>{l.recorded}</del>
+          <ins>{l.candidate}</ins>
+        </span>
+      ))}
+      {what.more > 0 && <span className="fmore">+{what.more} more</span>}
+    </div>
   );
 }
 

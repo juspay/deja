@@ -14,7 +14,7 @@ import {
   SpineNode,
   transportFailure,
 } from "../lib/spine";
-import { diffArgs, LeafDiff } from "../lib/argdiff";
+import { diffArgs, LeafDiff, summarizeLeaves } from "../lib/argdiff";
 import { useSystems } from "../lib/systems";
 import { JsonView, ValuePair } from "./JsonView";
 import { JsonDiff } from "./JsonDiff";
@@ -900,6 +900,7 @@ function Row({
       </span>
       <span className="uvname">{n.name}</span>
       {n.mark && <span className={`mchip m-${n.mark}`}>{MARK_LABEL[n.mark]}</span>}
+      <RowChange n={n} />
       {n.calls.length > 1 && <span className="uvn">×{n.calls.length}</span>}
       {n.presence === "record-only" && <span className="presdot p-rec" title={PRESENCE_LABEL["record-only"]} />}
       {n.presence === "replay-only" && <span className="presdot p-rep" title={PRESENCE_LABEL["replay-only"]} />}
@@ -907,6 +908,35 @@ function Row({
       <span className="uvdur rec">{fmtMs(n.recMs)}</span>
       <span className="uvdur rep">{fmtMs(n.repMs)}</span>
     </div>
+  );
+}
+
+/**
+ * What changed on this row's value-divergence, in one line beside its chip —
+ * the first changed leaf of recorded-vs-attempted arguments — so the tree
+ * already answers "what" and the panel is for "why".
+ */
+function RowChange({ n }: { n: SpineNode }) {
+  const summary = React.useMemo(() => {
+    const e = n.calls.find(
+      (c) =>
+        c.call.kind === "value_diverged" &&
+        c.call.recorded?.args !== undefined &&
+        c.call.observed?.args !== undefined,
+    );
+    if (!e) return null;
+    const s = summarizeLeaves(diffArgs(e.call.recorded!.args, e.call.observed!.args), 1);
+    return s.shown.length > 0 ? s : null;
+  }, [n.calls]);
+  if (!summary) return null;
+  const l = summary.shown[0];
+  return (
+    <span className="uvwhat mono" title={`${l.path}: ${l.recorded} → ${l.candidate}`}>
+      <span className="jpath">{l.path}</span>
+      <del>{l.recorded}</del>
+      <ins>{l.candidate}</ins>
+      {summary.more > 0 && <span className="fmore">+{summary.more}</span>}
+    </span>
   );
 }
 
