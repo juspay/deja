@@ -87,6 +87,11 @@ pub struct IngestReport {
     ///
     /// This is the fact a replay acts on; acting on it is the lifecycle's job.
     pub delivery: DeliveryCertificate,
+    /// How each producer stream was shifted onto the recording-wide sequence
+    /// space — see [`Renumbering`]. Empty when the tape came from one process,
+    /// whose numbering is already the tape's and is written untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renumbered: Vec<StreamRenumbering>,
 }
 
 impl IngestReport {
@@ -138,6 +143,9 @@ impl IngestReport {
     pub fn report(&self) {
         eprintln!("{}", self.accounting());
         eprintln!("{}", self.delivery.describe());
+        if !self.renumbered.is_empty() {
+            eprintln!("{}", describe_renumbering(&self.renumbered));
+        }
         for line in self.delivery.describe_exclusions() {
             eprintln!("ingest: EXCLUDED {line}");
         }
@@ -681,6 +689,199 @@ pub fn count_session_objects(
 /// Pull a session recording into `dest` (the canonical
 /// `{root}/recordings/{id}/events.jsonl` slot), compacting first if the
 /// session isn't sealed yet. Returns the ingest report plus the manifest.
+/// One producer stream's place on the recording-wide sequence space.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StreamRenumbering {
+    /// The stream — the `recording_run_id` one recorder process stamped on
+    /// everything it wrote.
+    pub recording_run_id: String,
+    /// Added to every boundary event's `global_sequence`.
+    pub event_offset: u64,
+    /// Added to every graph node id: the node's own `node_id`, its
+    /// `parent_id`, its `causal_parent_ids`, and the `graph_node_id` boundary
+    /// events anchor to.
+    pub node_offset: u64,
+    pub events: usize,
+    pub graph_nodes: usize,
+}
+
+/// Recording-wide identities for a tape assembled from several producer
+/// processes.
+///
+/// `global_sequence` and the execution graph's `node_id` are PER-PROCESS
+/// counters that start at zero. A multi-member pull concatenates one member per
+/// recorder process, so a four-pod recording puts four streams that all count
+/// from zero onto one tape. The replay lookup is keyed by correlation and never
+/// noticed. Everything that names a recorded event by its bare sequence did:
+/// the ledger's recorded side, the scorecard's consumed and expected sets, the
+/// forest's event refs and the rank-2 span paths are all `HashMap<u64, _>`, and
+/// on such a tape they answer with whichever stream's event was inserted last.
+/// One run showed another pod's PayPal GET as the recorded twin of an Adyen
+/// POST on a third of its matched rows, hid four of eight omitted calls behind
+/// sequences another pod had consumed, and reported thirteen ingress events as
+/// omitted side-effect calls.
+///
+/// So each stream is shifted onto its own range as the tape is written. The
+/// first stream keeps its numbering (offset zero, bytes untouched), so a
+/// single-process tape is byte-identical to what it was; every later stream
+/// starts where the previous one's range ended. Offsets are keyed by
+/// `recording_run_id` rather than by member, because the run id is what the
+/// counter belongs to. The shift is reported in the ingest report so a
+/// sequence on the tape can be traced back to the producer's own numbering,
+/// which is the space the sink markers speak in.
+#[derive(Debug, Default)]
+struct Renumbering {
+    streams: std::collections::BTreeMap<String, StreamRenumbering>,
+    /// One past the highest event sequence handed out so far.
+    next_event: u64,
+    /// One past the highest graph node id (or node-stream sequence) handed
+    /// out so far.
+    next_node: u64,
+}
+
+/// The one identity field the collated key does not already carry: a graph
+/// node's `node_id`. (`global_sequence` rides on the collated tuple.)
+#[derive(serde::Deserialize)]
+struct IdentityProbe {
+    #[serde(default)]
+    node_id: Option<u64>,
+}
+
+impl Renumbering {
+    /// Shift one member's collated records onto the recording-wide space.
+    ///
+    /// Two passes over the member: the first reads each stream's highest event
+    /// sequence and node id, so a stream's range is known before anything in it
+    /// is rewritten; the second rewrites. A stream already placed by an earlier
+    /// member keeps its offsets (the counter it continues is the same one), and
+    /// only widens the high-water marks.
+    fn apply(&mut self, collated: &mut Collated) {
+        let mut high: std::collections::BTreeMap<String, (u64, u64, usize, usize)> =
+            Default::default();
+        for (run, kind, gseq, raw) in &collated.events {
+            let entry = high.entry(run.clone().unwrap_or_default()).or_default();
+            match *kind {
+                "boundary_event" => {
+                    entry.0 = entry.0.max(*gseq + 1);
+                    entry.2 += 1;
+                }
+                _ => {
+                    let node_id = serde_json::from_str::<IdentityProbe>(raw)
+                        .ok()
+                        .and_then(|probe| probe.node_id)
+                        .unwrap_or_default();
+                    entry.1 = entry.1.max(node_id + 1).max(*gseq + 1);
+                    entry.3 += 1;
+                }
+            }
+        }
+        // Streams are placed in the order the sorted member presents them, so
+        // the same members pulled in the same order always produce the same
+        // tape.
+        for (run, (event_hwm, node_hwm, events, nodes)) in &high {
+            let stream = self
+                .streams
+                .entry(run.clone())
+                .or_insert_with(|| StreamRenumbering {
+                    recording_run_id: run.clone(),
+                    event_offset: self.next_event,
+                    node_offset: self.next_node,
+                    events: 0,
+                    graph_nodes: 0,
+                });
+            stream.events += events;
+            stream.graph_nodes += nodes;
+            self.next_event = self.next_event.max(stream.event_offset + event_hwm);
+            self.next_node = self.next_node.max(stream.node_offset + node_hwm);
+        }
+        for (run, kind, gseq, raw) in &mut collated.events {
+            let stream = &self.streams[&run.clone().unwrap_or_default()];
+            if stream.event_offset == 0 && stream.node_offset == 0 {
+                // The first stream keeps the producer's bytes.
+                continue;
+            }
+            if let Some(rewritten) = renumber_record(raw, kind, stream) {
+                *raw = rewritten;
+                *gseq += match *kind {
+                    "boundary_event" => stream.event_offset,
+                    _ => stream.node_offset,
+                };
+            }
+        }
+    }
+
+    /// The streams, for the report — only when there was more than one, so a
+    /// single-process tape's report is unchanged.
+    fn into_report(self) -> Vec<StreamRenumbering> {
+        if self.streams.len() > 1 {
+            self.streams.into_values().collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Rewrite one raw record's identity fields by the stream's offsets. `None`
+/// when the line is not a JSON object — it will fail downstream parsing as it
+/// would have anyway, and it is left as it was so the failure names the
+/// producer's bytes.
+fn renumber_record(raw: &str, kind: &str, stream: &StreamRenumbering) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object_mut()?;
+    let shift = |slot: &mut serde_json::Value, by: u64| {
+        // The Kafka -> Vector -> S3 pipeline stringifies u64s above i64::MAX,
+        // so an id may arrive as a string; it leaves here as the number it is.
+        let current = match &*slot {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            _ => None,
+        };
+        if let Some(current) = current {
+            *slot = serde_json::Value::from(current + by);
+        }
+    };
+    match kind {
+        "boundary_event" => {
+            if let Some(slot) = object.get_mut("global_sequence") {
+                shift(slot, stream.event_offset);
+            }
+            if let Some(slot) = object.get_mut("graph_node_id") {
+                shift(slot, stream.node_offset);
+            }
+        }
+        _ => {
+            for field in ["node_id", "parent_id", "global_sequence"] {
+                if let Some(slot) = object.get_mut(field) {
+                    shift(slot, stream.node_offset);
+                }
+            }
+            if let Some(serde_json::Value::Array(parents)) = object.get_mut("causal_parent_ids") {
+                for slot in parents {
+                    shift(slot, stream.node_offset);
+                }
+            }
+        }
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn describe_renumbering(streams: &[StreamRenumbering]) -> String {
+    let parts: Vec<String> = streams
+        .iter()
+        .map(|s| {
+            format!(
+                "{} events +{} ({}) nodes +{} ({})",
+                s.recording_run_id, s.event_offset, s.events, s.node_offset, s.graph_nodes
+            )
+        })
+        .collect();
+    format!(
+        "ingest: {} producer stream(s) placed on one sequence space: {}",
+        streams.len(),
+        parts.join("; ")
+    )
+}
+
 /// What several members add up to, kept apart from the IO that produces them.
 ///
 /// Separated so the arithmetic is testable without a store: `pull_recordings`
@@ -697,6 +898,7 @@ struct PullTally {
     events_out: usize,
     correlations: usize,
     drops: DropCounts,
+    renumbering: Renumbering,
 }
 
 impl PullTally {
@@ -769,6 +971,7 @@ impl PullTally {
             // need the markers — they only tell an admitted gap from an
             // admitted loss.
             delivery: certify(self.per_correlation, self.markers),
+            renumbered: self.renumbering.into_report(),
         }
     }
 }
@@ -848,7 +1051,11 @@ pub fn pull_recordings(
             let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
             let chunk = lines.join("\n").into_bytes();
             drop(lines);
-            let collated = collate(&[chunk]);
+            let mut collated = collate(&[chunk]);
+            // Concatenation is sound for ORDER — see above — but not for
+            // IDENTITY: each member counts from zero, so the streams are placed
+            // end to end before a byte is written.
+            tally.renumbering.apply(&mut collated);
             for (_, _, _, line) in &collated.events {
                 out.write_all(line.as_bytes())
                     .and_then(|_| out.write_all(b"\n"))
@@ -977,7 +1184,11 @@ pub fn pull_recording_from_prefix(
 
     let lines = by_session.remove(&resolved).unwrap_or_default();
     let chunk = lines.join("\n").into_bytes();
-    let collated = collate(&[chunk]);
+    let mut collated = collate(&[chunk]);
+    // One session is normally one process, so this is a no-op that leaves the
+    // bytes alone; a session two processes wrote into is placed like a pull.
+    let mut renumbering = Renumbering::default();
+    renumbering.apply(&mut collated);
 
     let dest = dest_for(&resolved);
     let dest = dest.as_path();
@@ -1037,6 +1248,7 @@ pub fn pull_recording_from_prefix(
         non_envelope_dropped: collated.drops.non_envelope,
         unparseable_dropped: collated.drops.unparseable,
         delivery: certify(collated.per_correlation, collated.markers),
+        renumbered: renumbering.into_report(),
     };
     report.report();
     Ok((report, resolved, seen))
@@ -1502,6 +1714,7 @@ mod tests {
             non_envelope_dropped: drops.non_envelope,
             unparseable_dropped: drops.unparseable,
             delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
         };
         assert!(report.balances(), "{}", report.accounting());
         assert!(!report.accounting().contains("UNACCOUNTED"));
@@ -1523,6 +1736,7 @@ mod tests {
             non_envelope_dropped: 0,
             unparseable_dropped: 0,
             delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
         };
         assert!(!report.balances());
         assert!(report.accounting().contains("UNACCOUNTED: 97309"));
@@ -1950,6 +2164,125 @@ mod tests {
         };
         assert!(!cert.balances());
         assert!(cert.describe().contains("UNACCOUNTED: 29"));
+    }
+
+    /// A graph node with the id fields a renumbering must move, in the
+    /// producer's envelope shape.
+    fn graph_envelope_with(rid: &str, gseq: u64, node_id: u64, extra: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"artifact_type":"deja_graph_node","instance_id":"router-h-1","recording_run_id":"{rid}","capture":{{"mode":"session","session_id":"{rid}"}},"node":{{"recording_run_id":"{rid}","global_sequence":{gseq},"node_id":{node_id}{extra},"span_name":"payments_create"}}}}"#
+        )
+    }
+
+    fn line_of(collated: &Collated, run: &str, kind: &str, index: usize) -> serde_json::Value {
+        let raw = &collated
+            .events
+            .iter()
+            .filter(|(r, k, _, _)| r.as_deref() == Some(run) && *k == kind)
+            .nth(index)
+            .expect("record present")
+            .3;
+        serde_json::from_str(raw).expect("record is json")
+    }
+
+    /// Two recorder processes both count events and graph nodes from zero. On
+    /// one tape their numbers collide, and everything downstream that keys a
+    /// recorded event by its bare sequence answers with the wrong process's
+    /// event. Placing the second stream after the first keeps every id unique
+    /// and every reference (event -> node, node -> parent) pointing where it did.
+    #[test]
+    fn two_streams_that_both_count_from_zero_are_placed_end_to_end() {
+        let stream = |rid: &str| {
+            a_member(&[
+                envelope(rid, 0, r#","graph_node_id":3"#),
+                envelope(rid, 1, r#","graph_node_id":7"#),
+                graph_envelope_with(rid, 0, 3, r#","parent_id":null,"causal_parent_ids":[]"#),
+                graph_envelope_with(rid, 1, 7, r#","parent_id":3,"causal_parent_ids":[3]"#),
+            ])
+        };
+        let mut first = stream("r1");
+        let mut second = stream("r2");
+        let first_bytes: Vec<String> = first.events.iter().map(|e| e.3.clone()).collect();
+
+        let mut renumbering = Renumbering::default();
+        renumbering.apply(&mut first);
+        renumbering.apply(&mut second);
+
+        let untouched: Vec<String> = first.events.iter().map(|e| e.3.clone()).collect();
+        assert_eq!(
+            untouched, first_bytes,
+            "the first stream keeps the producer's bytes"
+        );
+
+        // r1's events end at 1 and its nodes at 7, so r2 starts at 2 and 8.
+        let event = line_of(&second, "r2", "boundary_event", 1);
+        assert_eq!(event["global_sequence"], 3, "1 + 2");
+        assert_eq!(event["graph_node_id"], 15, "7 + 8");
+        let node = line_of(&second, "r2", "graph_node", 1);
+        assert_eq!(node["node_id"], 15);
+        assert_eq!(node["parent_id"], 11, "the parent moved with its child");
+        assert_eq!(node["causal_parent_ids"], serde_json::json!([11]));
+        assert_eq!(
+            node["global_sequence"], 9,
+            "the node stream shares the node offset"
+        );
+        let root = line_of(&second, "r2", "graph_node", 0);
+        assert!(root["parent_id"].is_null(), "an absent parent stays absent");
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .filter(|(_, k, _, _)| *k == "boundary_event")
+                .map(|e| e.2)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the collated key follows the rewritten record"
+        );
+
+        let report = renumbering.into_report();
+        assert_eq!(report.len(), 2);
+        assert_eq!(
+            (
+                report[1].recording_run_id.as_str(),
+                report[1].event_offset,
+                report[1].node_offset
+            ),
+            ("r2", 2, 8)
+        );
+        assert_eq!((report[1].events, report[1].graph_nodes), (2, 2));
+    }
+
+    /// One process, one stream: nothing to place, nothing rewritten, and the
+    /// report does not mention it — a single-process tape is what it always was.
+    #[test]
+    fn a_single_stream_tape_is_written_byte_for_byte() {
+        let mut member = a_member(&[
+            envelope("r1", 4, r#","graph_node_id":"9225624661302181899""#),
+            graph_envelope("r1", 2),
+        ]);
+        let before: Vec<String> = member.events.iter().map(|e| e.3.clone()).collect();
+        let mut renumbering = Renumbering::default();
+        renumbering.apply(&mut member);
+        let after: Vec<String> = member.events.iter().map(|e| e.3.clone()).collect();
+        assert_eq!(after, before);
+        assert!(renumbering.into_report().is_empty());
+    }
+
+    /// The pipeline stringifies large u64s; a stringified anchor is still an
+    /// anchor and moves with its node.
+    #[test]
+    fn a_stringified_anchor_is_shifted_like_a_number() {
+        let mut first = a_member(&[envelope("r1", 0, ""), graph_envelope("r1", 4)]);
+        let mut second = a_member(&[
+            envelope("r2", 0, r#","graph_node_id":"4""#),
+            graph_envelope("r2", 4),
+        ]);
+        let mut renumbering = Renumbering::default();
+        renumbering.apply(&mut first);
+        renumbering.apply(&mut second);
+        let event = line_of(&second, "r2", "boundary_event", 0);
+        assert_eq!(event["graph_node_id"], 9, "4 + (4 + 1)");
+        assert_eq!(line_of(&second, "r2", "graph_node", 0)["node_id"], 9);
     }
 
     #[test]

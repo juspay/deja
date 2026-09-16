@@ -6496,6 +6496,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             },
+            renumbered: Vec::new(),
         };
         let path = crate::scope::TapeSlot::ingest_report_path(root, recording_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

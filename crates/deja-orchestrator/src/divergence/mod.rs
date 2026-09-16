@@ -1187,6 +1187,48 @@ impl GraphScoringPlan {
     }
 }
 
+/// A tape whose recorded events do not have unique sequence numbers.
+///
+/// `global_sequence` is a per-process counter. A recording pulled from several
+/// recorder processes places each stream on its own range at ingest
+/// (`s3::Renumbering`); a tape materialized before that existed still carries
+/// every stream counting from zero. The lookup is keyed by correlation and
+/// serves correctly either way, but this module keys recorded events by bare
+/// sequence in a dozen places — the ledger's recorded side, the consumed and
+/// expected sets, the forest's event refs, the rank-2 span paths — and each of
+/// them answers with whichever stream's event was inserted last. That is a
+/// wrong recorded twin on a matched row, a hidden omission, an ingress event
+/// reported as an omitted side-effect call. Named here so the scorecard says
+/// which of its rows can be trusted, and what to do: re-ingest.
+fn tape_identity_warning(events: &[deja::BoundaryEvent]) -> Option<String> {
+    let mut streams_by_sequence: HashMap<u64, BTreeSet<Option<&str>>> = HashMap::new();
+    for event in events {
+        streams_by_sequence
+            .entry(event.global_sequence)
+            .or_default()
+            .insert(event.recording_run_id.as_deref());
+    }
+    let colliding = streams_by_sequence
+        .values()
+        .filter(|streams| streams.len() > 1)
+        .count();
+    if colliding == 0 {
+        return None;
+    }
+    let streams: BTreeSet<Option<&str>> = events
+        .iter()
+        .map(|event| event.recording_run_id.as_deref())
+        .collect();
+    Some(format!(
+        "{colliding} recorded sequence number(s) are shared by events from different producer \
+         streams ({} stream(s) on this tape): the tape was materialized before its streams were \
+         placed on one sequence space, so a recorded twin, a recorded span path or an omitted \
+         call may name another request's event — re-ingest the recording; the verdict's \
+         http rows and lookup resolutions are unaffected",
+        streams.len()
+    ))
+}
+
 fn event_bearing_ingress_root(forest: &deja_forest::ActivationForest) -> bool {
     forest.roots.iter().any(|root| {
         let node = &forest.nodes[root];
@@ -5139,6 +5181,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut novel_scored_spans = 0u64;
     let mut span_field_divergences = 0u64;
     let mut warnings_extra: Vec<String> = Vec::new();
+    if let Some(warning) = tape_identity_warning(&art.events) {
+        warnings_extra.push(warning);
+    }
     let mut span_shapes: BTreeMap<String, span_shape::CorrelationSpanShape> = BTreeMap::new();
     if !art.scored_span_namespaces.is_empty() {
         match art.record_graph.as_ref() {
