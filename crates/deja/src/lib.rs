@@ -529,6 +529,42 @@ pub mod value {
         /// maps them to their own write commands instead (#39) — and the
         /// non-value shapes (status replies, attribute/verbatim/push frames,
         /// the unsupported catch), which no `SET` can faithfully reproduce.
+        /// The exact bytes `SET key <value>` must write, for the families that
+        /// are one value.
+        ///
+        /// Prefer this over [`to_redis_string`](Self::to_redis_string) on any
+        /// path that writes to redis. A recorded value is frequently NOT UTF-8:
+        /// the locker holds encrypted payment-method payloads, and one of them
+        /// is what showed this up — `BulkString([171, 143, 136, 250, …])`, which
+        /// `from_utf8_lossy` rewrites into replacement characters before the
+        /// seeder ever sees it. The lossy form is the right answer for a log
+        /// line or a certificate field a human reads; it is the wrong answer for
+        /// the write itself, because the value the candidate reads back is then
+        /// not the value the recording captured.
+        ///
+        /// `None` means the same as it does for the string form: nothing to
+        /// write, or not one value.
+        pub fn to_redis_bytes(&self) -> Option<Vec<u8>> {
+            match self {
+                Self::BulkString(bytes) => Some(bytes.clone()),
+                // The remaining single-value families are textual by
+                // construction, so their byte form is their string form.
+                Self::Int(_) | Self::SimpleString(_) | Self::Double(_) | Self::Boolean(_) => {
+                    self.to_redis_string().map(String::into_bytes)
+                }
+                Self::Null
+                | Self::Array(_)
+                | Self::Map(_)
+                | Self::Set(_)
+                | Self::Okay
+                | Self::Queued
+                | Self::Attribute { .. }
+                | Self::VerbatimString { .. }
+                | Self::Push { .. }
+                | Self::UnsupportedSuccessfulValue { .. } => None,
+            }
+        }
+
         pub fn to_redis_string(&self) -> Option<String> {
             match self {
                 Self::Null => None,
