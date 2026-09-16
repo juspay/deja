@@ -2133,77 +2133,103 @@ fn seed_redis(
         store,
         &RedisSeedImage {
             physical_key: key.to_string(),
-            payload: RedisSeedPayload::String(value.to_string()),
+            payload: RedisSeedPayload::String(value.as_bytes().to_vec()),
             ttl_seconds: None,
         },
     )
 }
 
+/// One command as a RESP array of bulk strings — the wire form `redis-cli
+/// --pipe` reads from stdin.
+///
+/// Length-prefixed rather than delimited, which is the whole point: every
+/// argument is preceded by its byte count, so a value carrying newlines, quotes
+/// or zero bytes arrives exactly as recorded.
+fn encode_resp(argv: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("*{}\r\n", argv.len()).as_bytes());
+    for arg in argv {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
 /// The typed write-shape a redis seed materializes as — the backward half of
 /// the [`deja::value::RedisWireValue`] transform (#39). One variant per value
 /// family the wire type carries; each maps to the native write command whose
-/// type-appropriate read returns the recorded value. Members are already
-/// rendered to the raw strings redis holds (via
-/// [`deja::value::RedisWireValue::to_redis_string`]).
+/// type-appropriate read returns the recorded value.
+///
+/// Members are BYTES, not strings. They used to be rendered through
+/// `to_redis_string`, which decodes lossily — and a recorded locker payload is
+/// encrypted, so that rewrote it before it was ever written. Carrying the bytes
+/// keeps the value the recording captured all the way to the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RedisSeedPayload {
     /// Scalar → `SET`; read back with `GET`.
-    String(String),
+    String(Vec<u8>),
     /// Map → `HSET` field/value pairs in recorded order; read back with
     /// `HGETALL`.
-    Hash(Vec<(String, String)>),
+    Hash(Vec<(Vec<u8>, Vec<u8>)>),
     /// Array → `RPUSH` members in recorded order; read back with `LRANGE`.
-    List(Vec<String>),
+    List(Vec<Vec<u8>>),
     /// Array recorded by a sorted-set method → `ZADD`; read back with
     /// `ZRANGE`. A range read without `WITHSCORES` records member ORDER but no
     /// scores, so each member's index is its score — that reproduces exactly
     /// what the recorded read observed (the order), fabricating nothing the
     /// replay can see.
-    SortedSet(Vec<String>),
+    SortedSet(Vec<Vec<u8>>),
     /// Set → `SADD`; read back with `SMEMBERS` (unordered).
-    Set(Vec<String>),
+    Set(Vec<Vec<u8>>),
 }
 
 impl RedisSeedPayload {
     /// The `redis-cli` argv that writes this payload under `key`.
-    fn write_args(&self, key: &str) -> Vec<String> {
-        let mut args: Vec<String>;
+    /// The write as RESP, ready for `redis-cli --pipe` on stdin.
+    ///
+    /// Not argv. A process argument cannot carry a zero byte — `Command`
+    /// refuses to spawn with "nul byte found in provided data" — and recorded
+    /// locker payloads are encrypted, so they contain zero bytes routinely.
+    /// Every such seed failed, and the reads that depended on it pruned whole
+    /// subtrees. RESP is length-prefixed, so a value is carried by its length
+    /// and never by a delimiter: any byte sequence survives, zero included.
+    fn write_frames(&self, key: &str) -> Vec<u8> {
+        let mut argv: Vec<Vec<u8>> = Vec::new();
         match self {
             Self::String(value) => {
-                args = vec!["SET".into(), key.into(), value.clone()];
+                argv.push(b"SET".to_vec());
+                argv.push(key.as_bytes().to_vec());
+                argv.push(value.clone());
             }
             Self::Hash(pairs) => {
-                args = Vec::with_capacity(2 + pairs.len() * 2);
-                args.push("HSET".into());
-                args.push(key.into());
+                argv.push(b"HSET".to_vec());
+                argv.push(key.as_bytes().to_vec());
                 for (field, value) in pairs {
-                    args.push(field.clone());
-                    args.push(value.clone());
+                    argv.push(field.clone());
+                    argv.push(value.clone());
                 }
             }
             Self::List(items) => {
-                args = Vec::with_capacity(2 + items.len());
-                args.push("RPUSH".into());
-                args.push(key.into());
-                args.extend(items.iter().cloned());
+                argv.push(b"RPUSH".to_vec());
+                argv.push(key.as_bytes().to_vec());
+                argv.extend(items.iter().cloned());
             }
             Self::SortedSet(members) => {
-                args = Vec::with_capacity(2 + members.len() * 2);
-                args.push("ZADD".into());
-                args.push(key.into());
+                argv.push(b"ZADD".to_vec());
+                argv.push(key.as_bytes().to_vec());
                 for (index, member) in members.iter().enumerate() {
-                    args.push(index.to_string());
-                    args.push(member.clone());
+                    argv.push(index.to_string().into_bytes());
+                    argv.push(member.clone());
                 }
             }
             Self::Set(members) => {
-                args = Vec::with_capacity(2 + members.len());
-                args.push("SADD".into());
-                args.push(key.into());
-                args.extend(members.iter().cloned());
+                argv.push(b"SADD".to_vec());
+                argv.push(key.as_bytes().to_vec());
+                argv.extend(members.iter().cloned());
             }
         }
-        args
+        encode_resp(&argv)
     }
 
     /// The `redis-cli` argv of the type-appropriate readback READ for `key`.
@@ -2221,7 +2247,8 @@ impl RedisSeedPayload {
     /// one element per line, in command order (`HGETALL` alternates
     /// field/value). `SMEMBERS` order is not defined — [`Self::compare`]
     /// handles that, not this image.
-    fn expected_readback_lines(&self) -> Vec<String> {
+    /// The elements this payload expects a readback to return, as bytes.
+    fn expected_readback_elements(&self) -> Vec<Vec<u8>> {
         match self {
             Self::String(value) => vec![value.clone()],
             Self::Hash(pairs) => pairs
@@ -2234,27 +2261,49 @@ impl RedisSeedPayload {
         }
     }
 
+    /// The same elements rendered for a human — the certificate field and log
+    /// lines. Lossy on purpose and ONLY here: a reader wants something
+    /// printable, and nothing downstream of this compares it.
+    fn expected_readback_lines(&self) -> Vec<String> {
+        self.expected_readback_elements()
+            .iter()
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect()
+    }
+
     /// Compare a `--raw` readback against this payload. Line-oriented, like the
     /// `redis-cli` transport itself: an element containing a newline cannot be
     /// distinguished from two elements (a pre-existing transport limitation,
     /// #26 owns the transport). `Set` compares order-insensitively; everything
     /// else is order-exact.
+    /// Compared as BYTES, not as text. Both sides used to go through
+    /// `from_utf8_lossy` first, which made this agree with itself for the wrong
+    /// reason: a non-UTF-8 value was mangled identically on the way in and on
+    /// the way back, so a corrupted seed read back as `matched`. Comparing the
+    /// bytes is what lets the readback actually witness the write.
     fn compare(&self, observed: &[u8]) -> Result<(), (Vec<String>, Vec<String>)> {
-        let mut expected = self.expected_readback_lines();
-        let observed_text = String::from_utf8_lossy(observed);
-        let mut observed_lines: Vec<String> = if observed_text.is_empty() {
+        let mut expected = self.expected_readback_elements();
+        let mut observed_elements: Vec<Vec<u8>> = if observed.is_empty() {
             Vec::new()
         } else {
-            observed_text.split('\n').map(str::to_owned).collect()
+            observed
+                .split(|b| *b == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect()
         };
         if matches!(self, Self::Set(_)) {
             expected.sort();
-            observed_lines.sort();
+            observed_elements.sort();
         }
-        if expected == observed_lines {
+        if expected == observed_elements {
             Ok(())
         } else {
-            Err((expected, observed_lines))
+            let render = |v: &Vec<Vec<u8>>| {
+                v.iter()
+                    .map(|e| String::from_utf8_lossy(e).into_owned())
+                    .collect::<Vec<_>>()
+            };
+            Err((render(&expected), render(&observed_elements)))
         }
     }
 
@@ -2279,38 +2328,63 @@ struct RedisSeedImage {
 
 /// Materialize one typed redis seed and read it back. Best-effort: a failure
 /// logs, is recorded on the certificate, and never fails the replay.
+/// Feed one RESP command to `redis-cli --pipe` and report what it said.
+///
+/// `--pipe` exits 0 even when the server rejected a command, so the reply is
+/// inspected rather than the exit status: an `-ERR` in the output is a failed
+/// write however the process exited. Nothing here can fail the replay — a
+/// failure is recorded on the certificate and the run continues.
+fn run_redis_pipe(mut cmd: std::process::Command, frames: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn redis-cli: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "redis-cli stdin unavailable".to_owned())?
+        .write_all(frames)
+        .map_err(|e| format!("write RESP to redis-cli: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for redis-cli: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!("exited {}; stderr='{}'", out.status, stderr.trim()));
+    }
+    if stdout.contains("ERR") || stderr.contains("ERR") {
+        return Err(format!(
+            "server rejected the write: stdout='{}' stderr='{}'",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 fn seed_redis_image(
     store: &StoreExec,
     image: &RedisSeedImage,
 ) -> (SeedMaterializationStatus, SeedReadback) {
-    let write_args = image.payload.write_args(&image.physical_key);
-    let write_refs: Vec<&str> = write_args.iter().map(String::as_str).collect();
-    let mut cmd = store.redis_cli(&write_refs);
+    let frames = image.payload.write_frames(&image.physical_key);
+    let mut cmd = store.redis_cli(&["--pipe"]);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     eprintln!(
-        "lifecycle: {} (redis key {} byte(s), write {}, ttl {:?})",
+        "lifecycle: {} (redis key {} byte(s), write {} as {} RESP byte(s), ttl {:?})",
         store_exec::describe(&cmd),
         image.physical_key.len(),
         image.payload.write_verb(),
+        frames.len(),
         image.ttl_seconds
     );
-    match cmd.status() {
-        Ok(status) if status.success() => (
+    match run_redis_pipe(cmd, &frames) {
+        Ok(()) => (
             SeedMaterializationStatus::Materialized,
             readback_redis(store, image),
         ),
-        Ok(status) => {
-            let message = format!("seed_redis {} exited {status}", image.payload.write_verb());
-            eprintln!("lifecycle: {message}; continuing (best-effort)");
-            (
-                SeedMaterializationStatus::Failed,
-                SeedReadback::error(message),
-            )
-        }
         Err(e) => {
-            let message = format!(
-                "could not run seed_redis {}: {e}",
-                image.payload.write_verb()
-            );
+            let message = format!("seed_redis {} failed: {e}", image.payload.write_verb());
             eprintln!("lifecycle: {message}; continuing (best-effort)");
             (
                 SeedMaterializationStatus::Failed,
@@ -4632,7 +4706,7 @@ fn render_redis_seed_payload(value: &serde_json::Value, method: Option<&str>) ->
     // (e.g. `"0.20"`) is already the raw text redis holds. Preserved
     // byte-for-byte, exactly as before.
     if let serde_json::Value::String(s) = value {
-        return RedisSeedRender::Payload(RedisSeedPayload::String(s.clone()));
+        return RedisSeedRender::Payload(RedisSeedPayload::String(s.as_bytes().to_vec()));
     }
     // A wire shape the canonical type does not model: an explicit, named skip,
     // never a silent stringify of the wrapper.
@@ -4665,12 +4739,12 @@ fn wire_value_seed_render(
         | Wire::BulkString(_)
         | Wire::SimpleString(_)
         | Wire::Double(_)
-        | Wire::Boolean(_) => match value.to_redis_string() {
+        | Wire::Boolean(_) => match value.to_redis_bytes() {
             Some(rendered) => RedisSeedRender::Payload(RedisSeedPayload::String(rendered)),
             // Unreachable for the scalar variants matched above; stated rather
             // than unwrapped so a rendering change cannot panic the seeder.
             None => RedisSeedRender::Unrepresentable(
-                "scalar redis value did not render to a string".to_owned(),
+                "scalar redis value did not render to bytes".to_owned(),
             ),
         },
         Wire::Map(pairs) => {
@@ -4681,7 +4755,7 @@ fn wire_value_seed_render(
             }
             let mut rendered = Vec::with_capacity(pairs.len());
             for (field, field_value) in pairs {
-                match (field.to_redis_string(), field_value.to_redis_string()) {
+                match (field.to_redis_bytes(), field_value.to_redis_bytes()) {
                     (Some(field), Some(field_value)) => rendered.push((field, field_value)),
                     _ => {
                         return RedisSeedRender::Unrepresentable(
@@ -4701,7 +4775,7 @@ fn wire_value_seed_render(
             }
             let mut members = Vec::with_capacity(items.len());
             for item in items {
-                match item.to_redis_string() {
+                match item.to_redis_bytes() {
                     Some(member) => members.push(member),
                     None => {
                         return RedisSeedRender::Unrepresentable(
@@ -4725,7 +4799,7 @@ fn wire_value_seed_render(
             }
             let mut members = Vec::with_capacity(items.len());
             for item in items {
-                match item.to_redis_string() {
+                match item.to_redis_bytes() {
                     Some(member) => members.push(member),
                     None => {
                         return RedisSeedRender::Unrepresentable(
@@ -7255,9 +7329,125 @@ mod tests {
 
     /// Scalar rendering shorthand: the `SET` payload's value, when the render
     /// is one.
+    /// Decode a RESP array of bulk strings back to argv, so a test can assert
+    /// the command rather than the framing. Round-tripping is the point: it
+    /// checks `encode_resp` against an independent reader instead of against a
+    /// byte string someone wrote by hand.
+    fn decode_resp(frames: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        assert_eq!(frames[i], b'*', "a command is a RESP array");
+        let nl = frames[i..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("array header")
+            + i;
+        let count: usize = std::str::from_utf8(&frames[i + 1..nl - 1])
+            .expect("array count is ascii")
+            .parse()
+            .expect("array count parses");
+        i = nl + 1;
+        for _ in 0..count {
+            assert_eq!(frames[i], b'$', "each argument is a bulk string");
+            let nl = frames[i..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .expect("bulk header")
+                + i;
+            let len: usize = std::str::from_utf8(&frames[i + 1..nl - 1])
+                .expect("bulk length is ascii")
+                .parse()
+                .expect("bulk length parses");
+            i = nl + 1;
+            out.push(String::from_utf8_lossy(&frames[i..i + len]).into_owned());
+            i += len + 2; // payload + CRLF
+        }
+        assert_eq!(i, frames.len(), "no trailing bytes after the command");
+        out
+    }
+
+    /// The defect this transport exists for: a recorded value that is not
+    /// UTF-8 and contains a zero byte.
+    ///
+    /// The locker holds encrypted payment-method payloads, and one of them —
+    /// `BulkString([171, 143, 136, 250, 10, 45, 0, 5, …])` — failed to seed at
+    /// all, because a zero byte cannot be carried in a process argument
+    /// (`Command` refuses with "nul byte found in provided data"). Two such
+    /// seeds failed on one run and the reads that depended on them pruned 67
+    /// calls out of the comparison.
+    ///
+    /// Asserted on the bytes rather than on a rendering: a lossy decode would
+    /// make both sides of this test agree while the value on the wire was
+    /// wrong, which is exactly the failure being removed.
+    #[test]
+    fn a_binary_value_survives_the_write_intact() {
+        let binary: Vec<u8> = vec![171, 143, 136, 250, 10, 45, 0, 5, 193, 114, 0, 0, 255];
+        let payload = RedisSeedPayload::String(binary.clone());
+        let frames = payload.write_frames("locker:key");
+
+        // The framing carries the length, so the zero bytes and the embedded
+        // newline are payload rather than delimiters.
+        let header = format!(
+            "*3\r\n$3\r\nSET\r\n$10\r\nlocker:key\r\n${}\r\n",
+            binary.len()
+        );
+        assert!(
+            frames.starts_with(header.as_bytes()),
+            "the command is framed by length"
+        );
+        assert!(
+            frames.ends_with(b"\r\n"),
+            "the bulk string is terminated after its declared length"
+        );
+        assert_eq!(
+            &frames[header.len()..frames.len() - 2],
+            binary.as_slice(),
+            "the recorded bytes reach the wire unchanged"
+        );
+
+        // The readback compares as bytes, so a mangled value can no longer
+        // pass. Checked on a newline-free value deliberately: the READ side is
+        // still `redis-cli --raw`, which is newline-delimited, so an element
+        // containing a newline is indistinguishable from two elements. That is
+        // a separate, pre-existing limitation of the read transport — the write
+        // above carries the newline correctly, and this test does not pretend
+        // the readback can yet verify it.
+        let no_newline: Vec<u8> = binary.iter().copied().filter(|b| *b != b'\n').collect();
+        let payload = RedisSeedPayload::String(no_newline.clone());
+        assert!(
+            payload.compare(&no_newline).is_ok(),
+            "identical bytes match"
+        );
+        let lossy = String::from_utf8_lossy(&no_newline)
+            .into_owned()
+            .into_bytes();
+        assert_ne!(lossy, no_newline, "the fixture is genuinely not UTF-8");
+        assert!(
+            payload.compare(&lossy).is_err(),
+            "a lossily-decoded readback must NOT compare equal — that agreement \
+             is what made a corrupted seed report as matched"
+        );
+    }
+
+    /// `to_redis_bytes` must hand back exactly what the tape holds, where the
+    /// string form cannot.
+    #[test]
+    fn the_wire_value_yields_its_bytes_not_a_lossy_string() {
+        let binary: Vec<u8> = vec![171, 143, 136, 250];
+        let wire = deja::value::RedisWireValue::BulkString(binary.clone());
+        assert_eq!(wire.to_redis_bytes(), Some(binary.clone()));
+        assert_ne!(
+            wire.to_redis_string().map(String::into_bytes),
+            Some(binary),
+            "the string form is lossy here — that is why the byte form exists"
+        );
+    }
+
     fn rendered_string(value: &serde_json::Value) -> Option<String> {
         match render_redis_seed_payload(value, None) {
-            RedisSeedRender::Payload(RedisSeedPayload::String(s)) => Some(s),
+            RedisSeedRender::Payload(RedisSeedPayload::String(s)) => {
+                Some(String::from_utf8_lossy(&s).into_owned())
+            }
             _ => None,
         }
     }
@@ -7351,7 +7541,7 @@ mod tests {
             other => panic!("a Map must render a write payload, got {other:?}"),
         };
         assert_eq!(
-            payload.write_args("k"),
+            decode_resp(&payload.write_frames("k")),
             ["HSET", "k", "f1", "v1", "f2", "7"],
             "HSET carries the pairs in recorded order"
         );
@@ -7378,7 +7568,7 @@ mod tests {
             other => panic!("an Array must render a write payload, got {other:?}"),
         };
         assert_eq!(
-            payload.write_args("k"),
+            decode_resp(&payload.write_frames("k")),
             ["RPUSH", "k", "a", "c", "b"],
             "RPUSH pushes members in recorded order"
         );
@@ -7403,7 +7593,10 @@ mod tests {
             RedisSeedRender::Payload(payload) => payload,
             other => panic!("a zset Array must render a write payload, got {other:?}"),
         };
-        assert_eq!(payload.write_args("k"), ["ZADD", "k", "0", "m1", "1", "m2"]);
+        assert_eq!(
+            decode_resp(&payload.write_frames("k")),
+            ["ZADD", "k", "0", "m1", "1", "m2"]
+        );
         assert_eq!(payload.readback_args("k"), ["ZRANGE", "k", "0", "-1"]);
         assert!(payload.compare(b"m1\nm2").is_ok());
         assert!(
@@ -7423,7 +7616,10 @@ mod tests {
             RedisSeedRender::Payload(payload) => payload,
             other => panic!("a Set must render a write payload, got {other:?}"),
         };
-        assert_eq!(payload.write_args("k"), ["SADD", "k", "b", "a"]);
+        assert_eq!(
+            decode_resp(&payload.write_frames("k")),
+            ["SADD", "k", "b", "a"]
+        );
         assert_eq!(payload.readback_args("k"), ["SMEMBERS", "k"]);
         assert!(
             payload.compare(b"a\nb").is_ok(),
@@ -8368,13 +8564,13 @@ mod tests {
     fn redis_seed_image_keeps_physical_key_typed_payload_and_ttl_advisory() {
         let image = RedisSeedImage {
             physical_key: "corr:settlement_rate_default".to_owned(),
-            payload: RedisSeedPayload::String("0.10".to_owned()),
+            payload: RedisSeedPayload::String(b"0.10".to_vec()),
             ttl_seconds: None,
         };
 
         assert_eq!(image.physical_key, "corr:settlement_rate_default");
         assert_eq!(
-            image.payload.write_args(&image.physical_key),
+            decode_resp(&image.payload.write_frames(&image.physical_key)),
             ["SET", "corr:settlement_rate_default", "0.10"]
         );
         assert_eq!(image.ttl_seconds, None);
