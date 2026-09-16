@@ -3742,11 +3742,73 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
 /// The response's body difference, recomputed with array order handled
 /// structurally. `None` when the run predates full bodies being recorded
 /// alongside the diff, in which case the kernel's own rows are used unchanged.
+///
+/// The recompute RE-SHAPES the kernel's differences; it does not get a second,
+/// independent opinion about whether they exist. See [`reconciled_with_kernel`].
 fn order_canonical_body_diff(diff: &HttpDiff) -> Option<Vec<JsonFieldDiff>> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
     order_canonical_diff(baseline, candidate, "$", &mut rows);
-    Some(rows)
+    Some(reconciled_with_kernel(rows, &diff.body_diff))
+}
+
+/// Is a difference reported at `inner` the same difference as, or part of, one
+/// reported at `outer`? Prefix by PATH SEGMENT, so `$.ab` is never read as
+/// sitting under `$.a`.
+fn path_covers(outer: &str, inner: &str) -> bool {
+    outer == inner
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+}
+
+/// Do two reported paths speak about the same region of the body?
+///
+/// Compared as DECLARATIONS ([`canonical_set_path`]), because the two engines
+/// describe one difference at whatever depth and position their own reading
+/// reached it. Alignment moves a changed member to the position it aligned to,
+/// so the kernel's `$.items[1]` and this engine's `$.items[2]` are the same
+/// collection's difference; decoding moves an encoded document's difference
+/// inward, so `$.echo` and `$.echo.headers.Authorization` are the same field's.
+/// Either direction of containment counts, for the same reason.
+fn paths_overlap(left: &str, right: &str) -> bool {
+    let (left, right) = (canonical_set_path(left), canonical_set_path(right));
+    path_covers(&left, &right) || path_covers(&right, &left)
+}
+
+/// Hold the recompute to the kernel's findings.
+///
+/// Two engines read the same response. The kernel's `diff_json` decides WHETHER
+/// two bodies differ and is the authority on that: it sees through the encodings
+/// a value is carried in, and it alone applies the run's body allowlist. This
+/// recompute exists for one narrower job — to say WHERE a difference belongs
+/// once ordering is resolved, so that a permutation is one difference at its
+/// collection instead of however many positions this run's two orders happened
+/// to scatter it across. Re-describing a difference is its whole remit.
+///
+/// Nothing held it to that. A recompute row over a region where the kernel found
+/// nothing is a difference the authority never saw, manufactured by the
+/// less-informed engine, and it blocked the candidate: prism's
+/// `rawConnectorRequest` echo carries a headers map whose key order is seeded per
+/// process, the kernel read the embedded document and reported nothing, this
+/// engine read the same string as bytes, and a replay of a recording BY THE IMAGE
+/// THAT RECORDED IT failed 99 of its 100 correlations. Dropping those rows costs
+/// no signal: this engine recurses the same structure the kernel does, so every
+/// region the kernel can report in already has a row here, and the only rows
+/// removed are the ones standing over a region the kernel judged the same. No
+/// encoding has to be taught to two engines for them to agree.
+fn reconciled_with_kernel(
+    recomputed: Vec<JsonFieldDiff>,
+    kernel: &[JsonFieldDiff],
+) -> Vec<JsonFieldDiff> {
+    recomputed
+        .into_iter()
+        .filter(|row| {
+            kernel
+                .iter()
+                .any(|found| paths_overlap(&row.json_path, &found.json_path))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7719,6 +7781,116 @@ mod tests {
             counts.push(classify_body(&diff).canon_absorbed.len());
         }
         assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
+    }
+
+    // --- the recompute may re-shape the kernel's findings, never invent one ---
+
+    /// THE INVARIANT, stated directly and without reference to any encoding: if
+    /// the authority on whether two bodies differ found nothing, nothing blocks.
+    /// Whatever the recompute makes of the bytes, it is re-shaping a set of
+    /// differences that is empty.
+    ///
+    /// This is also what makes the run's body allowlist mean what it says. The
+    /// allowlist is applied inside the kernel, and this engine has never seen
+    /// it, so an allowlisted path reaching here is the same shape of bug.
+    #[test]
+    fn a_recompute_row_the_kernel_never_reported_does_not_block() {
+        // Bodies that differ byte for byte, with the kernel reporting nothing —
+        // exactly what an engine that sees through an encoding hands us.
+        let diff = http_with_bodies(
+            "unbacked",
+            true,
+            Vec::new(),
+            serde_json::json!({ "echo": "{\"a\":1,\"b\":2}" }),
+            serde_json::json!({ "echo": "{\"b\":2,\"a\":1}" }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert!(
+            rows.is_empty(),
+            "the recompute may not manufacture a difference the kernel never found: {rows:?}"
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 0);
+        assert!(classification.canon_absorbed.is_empty());
+        assert!(classification.order_only_paths.is_empty());
+    }
+
+    /// The measured incident, as the pipeline really builds it. A system echoes
+    /// the connector request it built as a serialized document; the `headers`
+    /// object inside is iterated from a hash map, so its key order is seeded per
+    /// process and differs between two runs of ONE image. The kernel reads the
+    /// embedded document and reports nothing. Nothing blocks.
+    #[test]
+    fn a_hash_ordered_map_inside_an_echoed_document_does_not_block() {
+        let recorded = "{\"url\":\"https://connector.example/v2/payments/authorizations/abc\",\
+\"method\":\"GET\",\"headers\":{\"Request-Id\":\"pay_1\",\"Prefer\":\"return=representation\",\
+\"Authorization\":\"Bearer token-synthesized\",\"via\":\"HyperSwitch\",\
+\"Content-Type\":\"application/json\"},\"body\":null}";
+        let replayed = "{\"url\":\"https://connector.example/v2/payments/authorizations/abc\",\
+\"method\":\"GET\",\"headers\":{\"via\":\"HyperSwitch\",\"Content-Type\":\"application/json\",\
+\"Authorization\":\"Bearer token-synthesized\",\"Request-Id\":\"pay_1\",\
+\"Prefer\":\"return=representation\"},\"body\":null}";
+        let diff = body_pair(
+            serde_json::json!({ "status": "CHARGED", "rawConnectorRequest": { "value": recorded } }),
+            serde_json::json!({ "status": "CHARGED", "rawConnectorRequest": { "value": replayed } }),
+        );
+        assert!(
+            diff.body_diff.is_empty(),
+            "the kernel judges these the same document; the fixture must reflect that"
+        );
+        assert!(order_canonical_body_diff(&diff)
+            .expect("bodies present")
+            .is_empty());
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 0);
+    }
+
+    /// Holding the recompute to the kernel's findings is not tolerance. A value
+    /// that genuinely changed inside the same echoed document still blocks, and
+    /// the row that survives is the one this engine produced.
+    #[test]
+    fn a_real_change_inside_an_echoed_document_still_blocks() {
+        let diff = body_pair(
+            serde_json::json!({ "echo":
+                "{\"method\":\"POST\",\"headers\":{\"Authorization\":\"Bearer old\"}}" }),
+            serde_json::json!({ "echo":
+                "{\"headers\":{\"Authorization\":\"Bearer new\"},\"method\":\"POST\"}" }),
+        );
+        assert!(
+            !diff.body_diff.is_empty(),
+            "the kernel finds the changed value inside the document"
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].json_path, "$.echo");
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
+    }
+
+    /// One difference, described by two engines that reached it differently:
+    /// deeper (the kernel decoded an encoded document), shallower (this engine
+    /// stopped at the encoding), or at another position of the same collection
+    /// (alignment moved a changed member). All three are the same difference.
+    /// Pinned because reading any of them as unrelated drops a row the sibling
+    /// alignment tests require.
+    #[test]
+    fn a_difference_described_two_ways_is_one_difference() {
+        assert!(paths_overlap("$.echo", "$.echo.headers.Authorization"));
+        assert!(paths_overlap("$.tags[1].id", "$.tags[1]"));
+        assert!(paths_overlap("$.items[1]", "$.items[2]"));
+        assert!(paths_overlap("$.a", "$.a"));
+        assert!(!paths_overlap("$.items", "$.tags"));
+    }
+
+    /// Path coverage is by SEGMENT: a sibling whose name merely starts with
+    /// another's is not part of it, so its difference can never stand in for
+    /// one at an unrelated path.
+    #[test]
+    fn coverage_is_by_path_segment_not_by_string_prefix() {
+        assert!(path_covers("$.a", "$.a"));
+        assert!(path_covers("$.a", "$.a.b"));
+        assert!(path_covers("$.a", "$.a[0]"));
+        assert!(!path_covers("$.a", "$.ab"));
+        assert!(!path_covers("$.a.b", "$.a"));
+        assert!(!paths_overlap("$.a", "$.ab"));
     }
 
     /// THE GUARD on the default. A permutation is absorbed and NAMED, never
