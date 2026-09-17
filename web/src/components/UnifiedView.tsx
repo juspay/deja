@@ -943,16 +943,33 @@ function RowChange({ n }: { n: SpineNode }) {
     );
     if (!e) return null;
     const s = summarizeLeaves(diffArgs(e.call.recorded!.args, e.call.observed!.args), 1);
-    return s.shown.length > 0 ? s : null;
+    // A flagged row whose leaves all compare EQUAL differs only in ORDER — the
+    // two sides serialise differently, `diffArgs` descends, and every key
+    // matches. Returning null here rendered nothing at all, so the commonest
+    // divergence we have (26 of 27 blocking body mismatches on the run this
+    // viewer exists for are `payment_methods_enabled` ordering) showed a
+    // divergence chip beside an empty explanation. Saying "order only" is not a
+    // guess: it is what an empty leaf-diff on a flagged row MEANS.
+    return { leaves: s, orderOnly: s.shown.length === 0 };
   }, [n.calls]);
   if (!summary) return null;
-  const l = summary.shown[0];
+  if (summary.orderOnly) {
+    return (
+      <span
+        className="uvwhat mono"
+        title="the two sides hold the same values in a different order — no leaf differs"
+      >
+        <span className="jpath">order only</span>
+      </span>
+    );
+  }
+  const l = summary.leaves.shown[0];
   return (
     <span className="uvwhat mono" title={`${l.path}: ${l.recorded} → ${l.candidate}`}>
       <span className="jpath">{l.path}</span>
       <del>{l.recorded}</del>
       <ins>{l.candidate}</ins>
-      {summary.more > 0 && <span className="fmore">+{summary.more}</span>}
+      {summary.leaves.more > 0 && <span className="fmore">+{summary.leaves.more}</span>}
     </span>
   );
 }
