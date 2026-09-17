@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, RunRow } from "../lib/api";
+import { api, RunSummaryRow } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import {
   attemptOrdinals,
@@ -28,7 +28,7 @@ function when(iso: string): { short: string; full: string } {
 }
 
 /** Everything a substring search should reach on one row. */
-function haystack(r: RunRow): string {
+function haystack(r: RunSummaryRow): string {
   return [
     r.run_id,
     r.recording_id ?? "",
@@ -36,7 +36,7 @@ function haystack(r: RunRow): string {
     systemUnderTest(r),
     r.created_by,
     r.failure?.message ?? "",
-    r.scorecard?.verdict?.reason ?? "",
+    r.scorecard_digest?.reason ?? "",
     r.expectation ?? "",
   ]
     .join(" ")

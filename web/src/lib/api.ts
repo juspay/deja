@@ -36,8 +36,12 @@ export type RunParams = {
   expectation?: string;
 };
 
-/** The request a row carries, or null when it predates the record. */
-export function runParams(run: RunRow): RunParams | null {
+/** The request a row carries, or null when it predates the record.
+ *
+ * Takes `Pick<RunRow, "params">` rather than a whole row: it reads one field,
+ * and the list's `RunSummaryRow` is deliberately not a `RunRow`. Asking for
+ * only what it reads lets both shapes through without a cast. */
+export function runParams(run: Pick<RunRow, "params">): RunParams | null {
   const p = run.params as Partial<RunParams> | null | undefined;
   return p && p.candidate_spec ? (p as RunParams) : null;
 }
@@ -67,6 +71,40 @@ export type RunRow = {
     failure_reason: string | null;
     candidate_image: { docker_image: string; source_ref: string } | null;
   };
+};
+
+/**
+ * The five scalars a run's RESULT is decided from, without the scorecard.
+ *
+ * Exactly what `resultOf` reads and nothing else, so the list can render a
+ * verdict without the megabytes behind it. `null` for the whole digest means
+ * NO SCORECARD — which `resultOf` reports as "completed but produced no
+ * scorecard", a different and louder thing than a scorecard saying nothing.
+ */
+export type ScorecardDigest = {
+  pass: boolean | null;
+  inconclusive: boolean | null;
+  reason: string | null;
+  total_correlations: number | null;
+  matched_correlations: number | null;
+};
+
+/**
+ * A run as the LIST returns it: every RunRow field except `scorecard`, plus the
+ * digest above.
+ *
+ * `GET /api/v1/runs` does not send scorecards. It used to, and on 2026-09-17
+ * that made the response 46.5 MB — 97.5% of it scorecard, 36.8 MB of that
+ * `per_correlation` — which this page then re-fetched every five seconds from
+ * every open tab on every machine until the orchestrator was OOMKilled ten
+ * times over, two minutes of life apiece.
+ *
+ * If you need a scorecard here, do NOT widen this type: fetch the one run
+ * (`api.run(id)`), which still carries it whole. Widening it is the change that
+ * caused the outage.
+ */
+export type RunSummaryRow = Omit<RunRow, "scorecard"> & {
+  scorecard_digest: ScorecardDigest | null;
 };
 
 export type SessionManifest = {
@@ -379,7 +417,7 @@ export type SystemRow = {
 export const api = {
   systems: () => request<{ systems: SystemRow[] }>("/api/v1/systems"),
   recordings: () => request<RecordingRow[]>("/api/v1/recordings"),
-  runs: () => request<RunRow[]>("/api/v1/runs"),
+  runs: () => request<RunSummaryRow[]>("/api/v1/runs"),
   run: (id: string) => request<RunRow>(`/api/v1/runs/${id}`),
   stages: (id: string) => request<StageRow[]>(`/api/v1/runs/${id}/stages`),
   logs: (id: string, afterSeq = -1) =>

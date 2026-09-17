@@ -1407,14 +1407,32 @@ async fn v1_recording_correlations(
     }
 }
 
+/// How many runs `GET /api/v1/runs` returns.
+///
+/// Unchanged at 200. The 2026-09-17 outage was NOT this number — it was the
+/// bytes PER row: 200 rows weighed 46.5 MB, of which 173,866 bytes were the
+/// rows and the other 97.5% was `scorecard`. Without that column the same 200
+/// rows are ~174 KB, so cutting the count would have bought 10x against the
+/// 267x that dropping the column buys, and would have cost something real —
+/// `RunsPage` derives attempt ordinals ("attempt 3 of 4") over the WHOLE list,
+/// and a page-sized list makes that number silently wrong.
+///
+/// Paginating is still worth doing. It is worth doing with the ordinals moved
+/// server-side first, which is a separate change and not one to make while the
+/// pod is in CrashLoopBackOff.
+const RUN_LIST_LIMIT: i64 = 200;
+
 /// `GET /api/v1/runs` — run list (Postgres-backed; newest first).
+///
+/// Rows are [`RunSummaryRow`], which carries no `scorecard`. A caller that
+/// needs one asks for a single run.
 async fn v1_list_runs(State(st): State<AppState>) -> Response {
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    match store.list_runs(200).await {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
+    match store.list_run_summaries(RUN_LIST_LIMIT).await {
+        Ok(rows) => json_ok_ser(&rows),
         Err(e) => error_resp(500, &format!("list runs: {e}")),
     }
 }
@@ -1857,7 +1875,7 @@ async fn v1_audit(State(st): State<AppState>) -> Response {
         Err(resp) => return resp,
     };
     match store.audit_list(500).await {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
+        Ok(rows) => json_ok_ser(&rows),
         Err(e) => error_resp(500, &format!("audit list: {e}")),
     }
 }
@@ -1910,6 +1928,30 @@ async fn run_stream(
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
+
+/// 200 with a JSON body serialised STRAIGHT from the value, with no
+/// `serde_json::Value` in between.
+///
+/// [`json_ok`] takes an already-built `Value`, so a caller holding typed rows
+/// has to clone them into a second tree first. For small bodies that is
+/// invisible; for a list it is a full deep copy of everything being sent, and
+/// on 2026-09-17 that copy was one of the three materialisations that OOMKilled
+/// the orchestrator ten times. Handlers that hold typed rows should use this
+/// one; handlers that genuinely assemble a `Value` keep [`json_ok`].
+fn json_ok_ser<T: serde::Serialize>(value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        // Serialising our own row types cannot fail on shape; this is here so
+        // the failure is NAMED rather than served as an empty body that reads
+        // to a client as "no runs".
+        Err(e) => error_resp(500, &format!("serialize response: {e}")),
+    }
+}
 
 fn json_ok(value: serde_json::Value) -> Response {
     (

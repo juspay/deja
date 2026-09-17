@@ -1,7 +1,7 @@
 import React from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, RunRow } from "../lib/api";
-import { resultOf } from "../lib/result";
+import { api } from "../lib/api";
+import { resultOf, ScoredRun } from "../lib/result";
 
 /**
  * STOP A RUN. `POST /runs/{id}/kill`.
@@ -30,7 +30,7 @@ import { resultOf } from "../lib/result";
  * `killed by {actor}`, and the queries this invalidates are the ones the list,
  * the report and the launch modal read.
  */
-export function KillRun({ run, compact = false }: { run: RunRow; compact?: boolean }) {
+export function KillRun({ run, compact = false }: { run: ScoredRun; compact?: boolean }) {
   const qc = useQueryClient();
   const [armed, setArmed] = React.useState(false);
   const [dismissed, setDismissed] = React.useState(false);
