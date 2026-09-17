@@ -186,9 +186,9 @@ fn stopped_at(obs: &ObservedCall) -> bool {
     obs.outcome == deja::SubstituteOutcome::Stopped
 }
 
-/// The correlations in which some executed boundary returned a value that
-/// differs from the recorded baseline — the ORIGINS a downstream re-keyed call
-/// can be a consequence of.
+/// Per correlation, the EARLIEST position at which an executed boundary
+/// returned a value differing from the recorded baseline — the origins a later
+/// re-keyed call can be a consequence of.
 ///
 /// A re-keyed call (one whose arguments miss the tape) is a consequence only
 /// when there is something upstream for it to be a consequence of. Absent
@@ -196,20 +196,27 @@ fn stopped_at(obs: &ObservedCall) -> bool {
 /// a different request from the same inputs — and the row is the origin. The
 /// ledger used to label every such call a consequence and the viewer then said
 /// "the cause is at an origin above it" about rows with no origin anywhere.
+/// The POSITION is what makes "upstream" mean upstream. Keyed on the
+/// correlation alone, a divergence occurring AFTER the re-keyed call demotes it
+/// to a consequence of a cause that had not happened yet — the same complaint
+/// this function exists to answer, with the order reversed.
 fn correlations_with_a_value_origin(
     observed: &[ObservedCall],
     by_seq: &HashMap<u64, &BoundaryEvent>,
-) -> HashSet<String> {
-    observed
-        .iter()
-        .filter(|obs| {
-            let source = obs
-                .source_event_global_sequence
-                .and_then(|seq| by_seq.get(&seq).copied());
-            observed_value_diverged(obs, source)
-        })
-        .filter_map(|obs| obs.correlation_id.clone())
-        .collect()
+) -> HashMap<String, usize> {
+    let mut earliest: HashMap<String, usize> = HashMap::new();
+    for (index, obs) in observed.iter().enumerate() {
+        let source = obs
+            .source_event_global_sequence
+            .and_then(|seq| by_seq.get(&seq).copied());
+        if !observed_value_diverged(obs, source) {
+            continue;
+        }
+        if let Some(id) = obs.correlation_id.clone() {
+            earliest.entry(id).or_insert(index);
+        }
+    }
+    earliest
 }
 
 /// Build the per-call ledger from the recording's events (recorded side), the
@@ -442,13 +449,15 @@ pub(crate) fn build_with_inconclusive_into(
                     None => "value_diverged".to_owned(),
                 },
                 blocking: value_diverged && schema_default.is_none() && !race_downstream,
-                // A consequence needs an origin. With none in this
+                // A consequence needs an origin, and the origin has to
+                // come FIRST. With nothing diverged before it in this
                 // correlation the re-keyed call is the finding itself.
                 origin: value_diverged
-                    && !obs
-                        .correlation_id
-                        .as_deref()
-                        .is_some_and(|id| value_origins.contains(id)),
+                    && !obs.correlation_id.as_deref().is_some_and(|id| {
+                        value_origins
+                            .get(id)
+                            .is_some_and(|first| *first < observed_index)
+                    }),
                 stopped: stopped_at(obs),
                 resolved_rank: obs.resolved_rank,
                 recorded,

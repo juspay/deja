@@ -12296,6 +12296,76 @@ mod tests {
         );
     }
 
+    /// "Upstream" must mean upstream, not "anywhere in this correlation".
+    ///
+    /// `correlations_with_a_value_origin` collects the correlation ids in which
+    /// SOME executed boundary diverged and compares nothing else. A divergence
+    /// that happened AFTER the re-keyed call therefore demotes that call from
+    /// origin to consequence, and the viewer sends the reader hunting for a
+    /// cause above a row whose only candidate cause is below it — the same
+    /// complaint this commit set out to fix, with the order reversed.
+    ///
+    /// `observed_index` is already in scope where the flag is set
+    /// (`ledger.rs:317`), so the comparison is available.
+    #[test]
+    fn a_rekeyed_write_is_the_origin_when_the_only_divergence_came_after_it() {
+        let corr = "c1";
+        let write_seq = 6;
+        let read_seq = 7;
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed_row = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        let mut read_event = omitted_ev(read_seq, "db", Some(corr));
+        read_event.method_name = "generic_find_one".to_owned();
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    write_seq,
+                    envelope(recorded_row.clone()),
+                ),
+                span_entry(Some(corr), write_seq, "root>update_attempt"),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    read_seq,
+                    envelope(recorded_row.clone()),
+                ),
+            ],
+            // The candidate WROTE first, and only then read a differing row.
+            vec![
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, observed_row.clone()),
+                exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(read_seq),
+                    Some(envelope(recorded_row.clone())),
+                    envelope(observed_row.clone()),
+                ),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                attempt_update_ev(corr, write_seq, ATTEMPT_UPDATE_STATUS, recorded_row),
+                read_event,
+            ],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let write = rows
+            .iter()
+            .find(|r| r.method_name == "generic_update")
+            .expect("the write has a row");
+        assert_eq!(write.kind, "value_diverged");
+        assert!(
+            write.origin,
+            "nothing diverged before this write, so the write is the finding itself"
+        );
+    }
+
     /// A `Substitute` egress boundary (an outbound call) whose arguments
     /// miss the tape fails closed: the call is refused and the request stops.
     /// The request is the candidate's own output — an input to the boundary — so
