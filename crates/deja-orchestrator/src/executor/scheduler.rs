@@ -330,24 +330,55 @@ async fn start_run<T>(
 ) where
     T: KubeTransport + Send + Sync + 'static,
 {
-    let ctx = StoreCtx::new(
-        run_id,
-        Some((tokio::runtime::Handle::current(), store.clone())),
-    );
     let api_for_resume = api.clone();
     let (ns, job) = (cfg.jobs_namespace.clone(), job_name.to_owned());
     let resumed = tokio::task::spawn_blocking(move || resume_job(&api_for_resume, &ns, &job)).await;
     match resumed {
         Ok(Ok(())) => {
-            ctx.log("scheduler", reason);
+            // The run's own log, written through the ASYNC store api — never
+            // through `StoreCtx`, whose emit blocks on the runtime handle and
+            // therefore PANICS when called from inside the runtime. A panic
+            // here takes the whole scheduler task with it and every queued run
+            // stays suspended forever. Not hypothetical: measured on sbx, on
+            // the first resume that succeeded.
+            log_line(store, run_id, reason).await;
+            // Built only to hand to the watcher, which uses it from a plain
+            // thread, where blocking is what it is designed for.
+            let ctx = StoreCtx::new(
+                run_id,
+                Some((tokio::runtime::Handle::current(), store.clone())),
+            );
             crate::api::runs::watch_k8s_run(run_id, job_name, ctx, incluster.clone(), cfg.clone());
         }
         // A resume that fails is NOT terminal for the run: the Job is still
         // there, still suspended, and the next pass tries again. Only the queue
         // deadline ends it, which is the one bound that must not be bypassed by
-        // a transient apiserver error.
-        Ok(Err(e)) => eprintln!("scheduler: {run_id}: resume {job_name} failed: {e} — will retry"),
+        // a transient apiserver error. Measured on sbx: fifteen runs sat through
+        // ~90s of 403s and then started themselves the moment the permission
+        // landed, having burned no deadline and held no node.
+        Ok(Err(e)) => eprintln!(
+            "scheduler: {run_id}: resume {job_name} failed: {e} — will retry{}",
+            missing_patch_hint(&e)
+        ),
         Err(e) => eprintln!("scheduler: {run_id}: resume task join failed: {e} — will retry"),
+    }
+}
+
+/// Name the permission when a resume is refused.
+///
+/// Creating a Job suspended needs `create`; RESUMING it needs `patch`, which
+/// nothing in this orchestrator required before the scheduler existed — so an
+/// environment upgraded to a scheduling build has a Role that lets it queue
+/// work it can never start. That reads as a bare 403 per run per pass, which
+/// says nothing about the verb that is missing. It cost a diagnosis on sbx
+/// before this line existed; say it in the log instead.
+fn missing_patch_hint(err: &super::launch::ExecutorError) -> &'static str {
+    match err {
+        super::launch::ExecutorError::Kube(super::k8s::KubeError::Api { status: 403, .. }) => {
+            " — the orchestrator's Role is missing `patch` on batch/jobs, which is what resumes \
+             a suspended Job; every queued run will stay queued until it is granted"
+        }
+        _ => "",
     }
 }
 
@@ -370,12 +401,29 @@ async fn expire_run<T>(
     if let Ok(Err(e)) = deleted {
         eprintln!("scheduler: {run_id}: delete expired job {job_name}: {e}");
     }
-    let ctx = StoreCtx::new(
-        run_id,
-        Some((tokio::runtime::Handle::current(), store.clone())),
-    );
-    ctx.log("scheduler", reason);
-    ctx.finish(false, Some(reason));
+    log_line(store, run_id, reason).await;
+    // Same rule: settle through the async store, never a blocking StoreCtx.
+    // `update_run_state` is terminal-guarded, so this is a no-op if the run
+    // somehow reported for itself first.
+    let failure = serde_json::json!({ "message": reason });
+    match store
+        .update_run_state(run_id, "failed", Some(&failure))
+        .await
+    {
+        Ok(()) => eprintln!("scheduler: settled {run_id} -> failed ({reason})"),
+        Err(e) => eprintln!("scheduler: settle {run_id} -> failed: {e}"),
+    }
+}
+
+/// Append one line to a run's log from async code.
+///
+/// Best-effort and never fatal: a scheduler that cannot write a log line must
+/// still start the run. Sequence 0 because this is one line per run, written
+/// before the runner has written any of its own.
+async fn log_line(store: &Arc<Store>, run_id: &str, line: &str) {
+    if let Err(e) = store.append_log(run_id, "scheduler", 0, line).await {
+        eprintln!("scheduler: {run_id}: log write failed: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +580,39 @@ mod tests {
             matches!(&actions[0], SchedulerAction::Expire { .. }),
             "{actions:?}"
         );
+    }
+
+    /// The 403 that cost a diagnosis on sbx: the orchestrator could create a
+    /// suspended Job and could not resume it, because `patch` on batch/jobs is a
+    /// verb nothing needed before the scheduler existed. A bare "403 Forbidden"
+    /// per run per pass does not say which verb is missing, so the log says it.
+    #[test]
+    fn a_refused_resume_names_the_permission_it_needs() {
+        let forbidden =
+            super::super::launch::ExecutorError::Kube(super::super::k8s::KubeError::Api {
+                status: 403,
+                reason: "Forbidden".into(),
+            });
+        let hint = missing_patch_hint(&forbidden);
+        assert!(
+            hint.contains("patch") && hint.contains("batch/jobs"),
+            "a refused resume must name the verb and the resource: {hint}"
+        );
+
+        // Anything else is not a permission problem and must not be reported as
+        // one — a transport blip that claimed the Role was wrong would send the
+        // reader to edit RBAC that is already correct.
+        for other in [
+            super::super::launch::ExecutorError::Kube(super::super::k8s::KubeError::Api {
+                status: 500,
+                reason: "server error".into(),
+            }),
+            super::super::launch::ExecutorError::Kube(super::super::k8s::KubeError::Transport(
+                "connection reset".into(),
+            )),
+        ] {
+            assert_eq!(missing_patch_hint(&other), "", "{other:?}");
+        }
     }
 
     /// Capacity 0 is how scheduling is turned off, so it must start nothing even

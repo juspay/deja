@@ -215,6 +215,18 @@ impl StoreCtx {
 
     /// Ship one event through whichever transport is configured. Best-effort:
     /// failures log to stderr and never propagate.
+    /// Write one event out.
+    ///
+    /// BLOCKING, and therefore callable only from a plain thread. The `Pg`
+    /// variant does `handle.block_on(..)`, which PANICS if the caller is
+    /// already on the tokio runtime ("cannot block the current thread from
+    /// within a runtime") — and in an async task that panic is silent: it kills
+    /// the task and everything it was driving, while the process stays up and
+    /// healthy-looking. The run scheduler hit exactly that on sandbox: one
+    /// `ctx.log` from its async loop ended the loop, and every queued run sat
+    /// suspended with no error anywhere. From async code, use the `Store` API
+    /// directly (it is async), as `executor::reconcile` and
+    /// `executor::scheduler` now do.
     fn emit(&self, ev: RunEvent) {
         match &self.inner {
             None => {}
