@@ -230,6 +230,10 @@ where
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.inner.set_instrumentation(instrumentation)
     }
+
+    fn set_prepared_statement_cache_size(&mut self, cache_size: diesel::connection::CacheSize) {
+        self.inner.set_prepared_statement_cache_size(cache_size);
+    }
 }
 
 impl<C, B> LoadConnection<B> for DejaLoadConnection<C>
