@@ -110,10 +110,26 @@ pub enum ReconcileAction {
 pub struct RunPod {
     pub run_id: String,
     pub pod_name: String,
-    /// Containers that have restarted, with their counts.
-    pub restarts: Vec<(String, u64)>,
+    /// Containers that have restarted.
+    pub restarts: Vec<Restarted>,
     /// An init container that is not going to start on its own.
     pub blocked_init: Option<BlockedInit>,
+}
+
+/// A container that has restarted, and how the previous life ended.
+///
+/// `restartPolicy: Always` restarts a sidecar whatever the exit code, so a clean
+/// exit and an OOM kill both land here — and they send a reader to opposite
+/// places. Carrying the last termination is the difference between "raise the
+/// memory limit" and "the router decided to shut down".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restarted {
+    pub container: String,
+    pub count: u64,
+    /// `lastState.terminated.reason` (e.g. `OOMKilled`, `Error`, `Completed`).
+    pub last_reason: Option<String>,
+    /// `lastState.terminated.exitCode`.
+    pub last_exit_code: Option<i64>,
 }
 
 /// An init container stuck in a waiting state it will not leave by itself.
@@ -128,7 +144,7 @@ pub struct BlockedInit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PodTrouble {
     /// A container restarted mid-run.
-    Restarted { container: String, count: u64 },
+    Restarted(Restarted),
     /// The pod cannot get past its init containers.
     BlockedInit(BlockedInit),
 }
@@ -175,7 +191,17 @@ pub fn run_pods_from_items(items: &[Value], label_key: &str) -> Vec<RunPod> {
                 .chain(apps.iter())
                 .filter_map(|c| {
                     let count = c.get("restartCount").and_then(Value::as_u64).unwrap_or(0);
-                    (count > 0).then(|| (name_of(c), count))
+                    (count > 0).then(|| Restarted {
+                        container: name_of(c),
+                        count,
+                        last_reason: c
+                            .pointer("/lastState/terminated/reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        last_exit_code: c
+                            .pointer("/lastState/terminated/exitCode")
+                            .and_then(Value::as_i64),
+                    })
                 })
                 .collect();
             let blocked_init = inits.iter().find_map(|c| {
@@ -214,11 +240,8 @@ pub fn run_pods_from_items(items: &[Value], label_key: &str) -> Vec<RunPod> {
 /// restarted has already run, so the run is already invalid whatever the pod
 /// does next.
 pub fn pod_trouble(pod: &RunPod) -> Option<PodTrouble> {
-    if let Some((container, count)) = pod.restarts.first() {
-        return Some(PodTrouble::Restarted {
-            container: container.clone(),
-            count: *count,
-        });
+    if let Some(restarted) = pod.restarts.first() {
+        return Some(PodTrouble::Restarted(restarted.clone()));
     }
     pod.blocked_init.clone().map(PodTrouble::BlockedInit)
 }
@@ -228,11 +251,20 @@ pub fn pod_trouble(pod: &RunPod) -> Option<PodTrouble> {
 /// find the pod — which by then is usually gone.
 pub fn pod_trouble_reason(pod_name: &str, trouble: &PodTrouble) -> String {
     match trouble {
-        PodTrouble::Restarted { container, count } => format!(
-            "pod {pod_name}: container '{container}' restarted {count} time(s) during the run. \
-             A restarted sidecar comes back COLD — its in-process state is empty while postgres \
-             and redis keep theirs — so the rest of the replay would diverge at boundaries the \
-             candidate never touched. Failing the run rather than scoring those divergences"
+        PodTrouble::Restarted(r) => format!(
+            "pod {pod_name}: container '{}' restarted {} time(s) during the run{}. A restarted \
+             container comes back COLD — its in-process state is empty, and a restarted store \
+             sidecar loses what the runner seeded into it — so the rest of the replay would \
+             diverge at boundaries the candidate never touched. Failing the run rather than \
+             scoring those divergences",
+            r.container,
+            r.count,
+            match (&r.last_reason, r.last_exit_code) {
+                (Some(reason), Some(code)) => format!(" (last exit: {reason}, code {code})"),
+                (Some(reason), None) => format!(" (last exit: {reason})"),
+                (None, Some(code)) => format!(" (last exit code {code})"),
+                (None, None) => String::new(),
+            }
         ),
         PodTrouble::BlockedInit(b) => format!(
             "pod {pod_name}: init container '{}' cannot start ({}{}). The runner does not start \
@@ -755,13 +787,10 @@ mod tests {
         let pods = run_pods_from_items(&items, "deja.run-id");
         assert_eq!(pods[0].run_id, "r");
         let trouble = pod_trouble(&pods[0]).expect("a restarted container is trouble");
-        assert_eq!(
-            trouble,
-            PodTrouble::Restarted {
-                container: "candidate".into(),
-                count: 2
-            }
-        );
+        let PodTrouble::Restarted(r) = &trouble else {
+            panic!("expected Restarted: {trouble:?}");
+        };
+        assert_eq!((r.container.as_str(), r.count), ("candidate", 2));
         let reason = pod_trouble_reason(&pods[0].pod_name, &trouble);
         assert!(
             reason.contains("deja-replay-r-abc") && reason.to_lowercase().contains("cold"),
@@ -822,6 +851,48 @@ mod tests {
         assert_eq!(pod_trouble(&pods[0]), None, "{:?}", pods[0]);
     }
 
+    /// `restartPolicy: Always` restarts a sidecar whatever the exit code, so the
+    /// two ways a candidate can end its life — killed, or exiting cleanly — both
+    /// arrive here. They point a reader at opposite things (a memory limit
+    /// versus a router that decided to shut down), so the failure has to say
+    /// which one happened, not just that a restart occurred.
+    #[test]
+    fn a_restart_says_how_the_previous_life_ended() {
+        let pod_json = |last: serde_json::Value| {
+            json!({
+                "metadata": { "name": "deja-replay-k", "labels": { "deja.run-id": "k" } },
+                "status": { "initContainerStatuses": [
+                    { "name": "candidate", "restartCount": 1, "lastState": last }
+                ] }
+            })
+        };
+        let reason_for = |last: serde_json::Value| {
+            let pods = run_pods_from_items(&[pod_json(last)], "deja.run-id");
+            pod_trouble_reason(&pods[0].pod_name, &pod_trouble(&pods[0]).expect("trouble"))
+        };
+
+        let killed =
+            reason_for(json!({ "terminated": { "reason": "OOMKilled", "exitCode": 137 } }));
+        assert!(
+            killed.contains("OOMKilled") && killed.contains("137"),
+            "a killed container must say so: {killed}"
+        );
+
+        let clean = reason_for(json!({ "terminated": { "reason": "Completed", "exitCode": 0 } }));
+        assert!(
+            clean.contains("Completed") && clean.contains("code 0"),
+            "a clean exit is still a restart, and must not read like a crash: {clean}"
+        );
+
+        // A pod whose previous state kubelet has not filled in is still a
+        // restart — the run is just as invalid, so it must not be skipped.
+        let unknown = reason_for(json!({}));
+        assert!(
+            unknown.contains("restarted 1 time(s)") && !unknown.contains("last exit"),
+            "an unknown previous life must still report the restart: {unknown}"
+        );
+    }
+
     /// A restart outranks a blocked init: a container that has restarted has
     /// already run, so the replay is invalid whatever the pod does next, and
     /// reporting the block instead would send the reader to the wrong cause.
@@ -830,17 +901,19 @@ mod tests {
         let pod = RunPod {
             run_id: "x".into(),
             pod_name: "deja-replay-x".into(),
-            restarts: vec![("candidate".into(), 1)],
+            restarts: vec![Restarted {
+                container: "candidate".into(),
+                count: 1,
+                last_reason: None,
+                last_exit_code: None,
+            }],
             blocked_init: Some(BlockedInit {
                 container: "candidate".into(),
                 reason: "CrashLoopBackOff".into(),
                 message: String::new(),
             }),
         };
-        assert!(matches!(
-            pod_trouble(&pod),
-            Some(PodTrouble::Restarted { .. })
-        ));
+        assert!(matches!(pod_trouble(&pod), Some(PodTrouble::Restarted(_))));
     }
 
     /// Pods that are not ours carry no run-id label and must be ignored — the
