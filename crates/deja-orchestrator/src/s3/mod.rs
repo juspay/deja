@@ -2314,6 +2314,49 @@ mod tests {
         );
     }
 
+    /// The refusal must cover the NODE dimension, not only event sequences.
+    ///
+    /// A resumed member can sit entirely inside its event reservation while its
+    /// graph node ids run past the node reservation — node ids are allocated on
+    /// span close and events on boundary entry, so the two extents grow at
+    /// different rates and either can be the one that overflows. The guard
+    /// checks events FIRST and returns early, so a check covering only that
+    /// dimension still passes the interleaved test above while writing
+    /// colliding node ids — which `node_offset` shifts into `node_id`,
+    /// `parent_id`, `causal_parent_ids` and every event's `graph_node_id`.
+    #[test]
+    fn a_resume_that_overflows_only_its_node_reservation_is_refused_too() {
+        let member = |rid: &str, lo: u64, hi: u64, n_lo: u64, n_hi: u64| {
+            a_member(&[
+                envelope(rid, lo, &format!(r#","graph_node_id":{n_lo}"#)),
+                envelope(rid, hi, &format!(r#","graph_node_id":{n_hi}"#)),
+                graph_envelope_with(rid, lo, n_lo, r#","parent_id":null,"causal_parent_ids":[]"#),
+                graph_envelope_with(
+                    rid,
+                    hi,
+                    n_hi,
+                    &format!(r#","parent_id":{n_lo},"causal_parent_ids":[{n_lo}]"#),
+                ),
+            ])
+        };
+        let mut first = member("rA", 0, 1, 3, 7);
+        let mut other = member("rB", 0, 1, 3, 7);
+        // rA resumes INSIDE its event reservation — sequences 0..=1 is all it
+        // reserved and all this member uses — but its graph counter ran on.
+        let mut resumed = member("rA", 0, 1, 20, 21);
+
+        let mut renumbering = Renumbering::default();
+        renumbering.apply(&mut first).expect("first placement");
+        renumbering.apply(&mut other).expect("second stream");
+        let refused = renumbering
+            .apply(&mut resumed)
+            .expect_err("a resume overflowing only its NODE reservation must be refused");
+        assert!(
+            refused.contains("rA") && refused.contains("node id"),
+            "the refusal must name the stream and the node dimension: {refused}"
+        );
+    }
+
     #[test]
     fn two_streams_that_both_count_from_zero_are_placed_end_to_end() {
         let stream = |rid: &str| {
