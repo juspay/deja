@@ -2547,14 +2547,26 @@ impl<'a> ArgsFreePairing<'a> {
         }
         let mut addressed: BTreeMap<u64, Addressed<'_>> = BTreeMap::new();
         for entry in &table.entries {
-            let slot = addressed
+            // FIRST entry per sequence wins. In a rendered table every rank of
+            // one event carries that event's own boundary and operation — the
+            // ranks differ in the ADDRESS they are looked up by, not in whose
+            // call it is — so which one lands here does not matter.
+            //
+            // That is a property of the renderer, not something this loop
+            // checks, and it cannot be asserted here: the test fixtures build
+            // their rank-2 entries by copying a rank-6 one and overwriting the
+            // boundary (`span_entry`), so a `debug_assert_eq!` on identity
+            // across an event's entries fails 32 tests on fixture artifacts
+            // while saying nothing about real tables. Pinning it properly means
+            // selecting by rank rather than by position, which `Locus` cannot
+            // express today (it has no rank-6 variant).
+            addressed
                 .entry(entry.source_event_global_sequence)
                 .or_insert(Addressed {
                     correlation: entry.key.correlation_id.as_deref(),
                     boundary: entry.key.boundary.as_str(),
                     method: entry.key.operation.as_str(),
                 });
-            let _ = slot;
         }
 
         // `addressed` is ordered by sequence, so each queue comes out in source
