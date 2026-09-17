@@ -66,6 +66,10 @@ pub struct RunJob {
     pub job_name: String,
     pub run_id: String,
     pub verdict: Option<bool>,
+    /// `spec.suspend` — the Job exists but runs nothing. This is what a queued
+    /// run looks like: the scheduler creates the Job suspended and resumes it
+    /// when the pool has room.
+    pub suspended: bool,
 }
 
 /// What the reconciler decides to do about one run. Every variant carries a
@@ -107,6 +111,10 @@ pub fn run_jobs_from_items(items: &[Value], label_key: &str) -> Vec<RunJob> {
                 job_name,
                 run_id,
                 verdict: job_terminal_verdict(job),
+                suspended: job
+                    .pointer("/spec/suspend")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -116,6 +124,11 @@ pub fn run_jobs_from_items(items: &[Value], label_key: &str) -> Vec<RunJob> {
 /// classify each run into exactly one [`ReconcileAction`]. No I/O, no clock —
 /// ages are supplied on `runs`, the grace threshold is a parameter — so the
 /// classification is fully unit-testable.
+///
+/// A queued run needs no exception here: the scheduler creates its Job up
+/// front, SUSPENDED, so "no Job" still means what it always meant. Only the
+/// wording of the wait changes — a suspended Job is waiting for capacity, and
+/// saying "still running" about one would be false.
 pub fn reconcile_decisions(
     runs: &[ReconcileRun],
     jobs: &[RunJob],
@@ -138,6 +151,10 @@ pub fn reconcile_decisions(
                         "Job {} reached terminal verdict: failed (see runner logs / pod events)",
                         job.job_name
                     ),
+                },
+                None if job.suspended => ReconcileAction::Wait {
+                    run_id: run.run_id.clone(),
+                    reason: format!("Job {} suspended — queued for capacity", job.job_name),
                 },
                 None => ReconcileAction::Wait {
                     run_id: run.run_id.clone(),
@@ -316,7 +333,7 @@ async fn settle(store: &Store, run_id: &str, ok: bool, reason: &str) {
 
 /// Read a u64 seconds knob from the environment, falling back to `default` when
 /// unset or unparseable.
-fn env_secs(key: &str, default: u64) -> u64 {
+pub(super) fn env_secs(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -341,6 +358,15 @@ mod tests {
             job_name: format!("deja-replay-{run_id}"),
             run_id: run_id.to_owned(),
             verdict,
+            suspended: false,
+        }
+    }
+
+    /// A queued run's Job: created, suspended, running nothing.
+    fn suspended_job(run_id: &str) -> RunJob {
+        RunJob {
+            suspended: true,
+            ..job(run_id, None)
         }
     }
 
@@ -427,6 +453,69 @@ mod tests {
             GRACE,
         );
         assert!(matches!(&actions[0], ReconcileAction::Wait { .. }));
+    }
+
+    /// A queued run has a Job — suspended — so it takes the Job arm, and the
+    /// wait must not call it "still running". A suspended Job is running
+    /// nothing; reading that line during an incident would send someone looking
+    /// for a pod that does not exist.
+    #[test]
+    fn a_suspended_job_waits_as_queued_rather_than_as_running() {
+        let actions = reconcile_decisions(
+            &[run("run-q", Duration::from_secs(600))],
+            &[suspended_job("run-q")],
+            GRACE,
+        );
+        match &actions[0] {
+            ReconcileAction::Wait { run_id, reason } => {
+                assert_eq!(run_id, "run-q");
+                assert!(
+                    reason.contains("suspended") && reason.contains("queued for capacity"),
+                    "the wait must say the Job is queued, not running: {reason}"
+                );
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    /// And the orphan rule is untouched by the queue existing: a run with no Job
+    /// past the grace is still failed, whether or not a scheduler is running.
+    /// This is what creating the Job up front buys — no exception to carry.
+    #[test]
+    fn a_run_with_no_job_is_still_an_orphan_with_a_scheduler_running() {
+        let actions = reconcile_decisions(&[run("run-r", Duration::from_secs(600))], &[], GRACE);
+        assert!(
+            matches!(&actions[0], ReconcileAction::OrphanFail { reason, .. } if reason.contains("no Job")),
+            "{:?}",
+            actions[0]
+        );
+    }
+
+    /// `spec.suspend` is how a queued Job is told apart from a running one, so
+    /// it has to survive the parse — a Job read as un-suspended would be counted
+    /// as holding a slot it does not hold.
+    #[test]
+    fn run_jobs_from_items_reads_suspension() {
+        let items = vec![
+            json!({
+                "metadata": { "name": "deja-replay-q", "labels": { "deja.run-id": "q" } },
+                "spec": { "suspend": true }
+            }),
+            json!({
+                "metadata": { "name": "deja-replay-r", "labels": { "deja.run-id": "r" } },
+                "spec": {}
+            }),
+        ];
+        let jobs = run_jobs_from_items(&items, "deja.run-id");
+        assert_eq!(jobs[0].run_id, "q");
+        assert!(
+            jobs[0].suspended,
+            "spec.suspend true must read as suspended"
+        );
+        assert!(
+            !jobs[1].suspended,
+            "an absent spec.suspend is a running Job, not a queued one"
+        );
     }
 
     #[test]

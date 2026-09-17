@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::executor::{
     collect_pod_diagnostics, launch, launch_spec_for_run, watch_to_terminal, InClusterConfig,
-    K8sExecutorConfig, KubeApi, UreqTransport,
+    K8sExecutorConfig, KubeApi, LaunchSpec, UreqTransport,
 };
 use crate::lifecycle::StoreCtx;
 use crate::{
@@ -248,6 +248,54 @@ pub fn spawn_k8s_run(
     incluster: InClusterConfig,
     cfg: K8sExecutorConfig,
 ) {
+    spawn_k8s_job(root, run, ctx, incluster, cfg, false);
+}
+
+/// Create a run's Job SUSPENDED and stop there — the scheduler starts it.
+///
+/// The Job is built in full at request time (candidate image resolved, bundle
+/// staged, env patched) so that a queued run is a real, inspectable object
+/// rather than an intention: `kubectl get jobs` shows the queue, and a bad
+/// candidate ref fails now instead of after the wait. Nothing watches it yet,
+/// because there is nothing to watch until it is resumed.
+pub fn spawn_k8s_run_queued(
+    root: &HarnessRoot,
+    run: Run,
+    ctx: StoreCtx,
+    incluster: InClusterConfig,
+    cfg: K8sExecutorConfig,
+) {
+    spawn_k8s_job(root, run, ctx, incluster, cfg, true);
+}
+
+/// Watch an already-running Job to its terminal state. Used by the scheduler
+/// once it resumes a suspended Job, so a scheduled run gets the same infra
+/// safety net a direct launch has.
+pub fn watch_k8s_run(
+    run_id: &str,
+    job_name: &str,
+    ctx: StoreCtx,
+    incluster: InClusterConfig,
+    cfg: K8sExecutorConfig,
+) {
+    let (run_id, job_name) = (run_id.to_owned(), job_name.to_owned());
+    std::thread::spawn(move || {
+        let api = match UreqTransport::new(&incluster) {
+            Ok(t) => KubeApi::new(t),
+            Err(e) => return ctx.finish(false, Some(&format!("k8s client: {e}"))),
+        };
+        watch_job_to_finish(&api, &cfg, &run_id, &job_name, &ctx);
+    });
+}
+
+fn spawn_k8s_job(
+    root: &HarnessRoot,
+    run: Run,
+    ctx: StoreCtx,
+    incluster: InClusterConfig,
+    cfg: K8sExecutorConfig,
+    suspend: bool,
+) {
     let root_path = root.root.clone();
     std::thread::spawn(move || {
         // Fail the run cleanly if the control plane's own state root is unusable.
@@ -268,7 +316,10 @@ pub fn spawn_k8s_run(
             None => (None, None),
         };
         let spec = match launch_spec_for_run(&run, &cfg, expected, uri) {
-            Ok(s) => s,
+            // Suspended: the Job exists and holds the run, but starts no pod
+            // until the scheduler resumes it. `activeDeadlineSeconds` does not
+            // run while it waits.
+            Ok(s) => LaunchSpec { suspend, ..s },
             Err(e) => {
                 ctx.log("launch", &format!("build launch spec failed: {e}"));
                 return ctx.finish(false, Some(&format!("build launch spec: {e}")));
@@ -282,42 +333,69 @@ pub fn spawn_k8s_run(
             Ok(n) => {
                 ctx.log(
                     "launch",
-                    &format!("created Job {n} in namespace {}", cfg.jobs_namespace),
+                    &format!(
+                        "created {}Job {n} in namespace {}",
+                        if suspend { "suspended " } else { "" },
+                        cfg.jobs_namespace
+                    ),
                 );
                 n
             }
             Err(e) => return ctx.finish(false, Some(&format!("launch job: {e}"))),
         };
-        // Poll to a terminal Job state. The Job's own activeDeadlineSeconds is
-        // the authoritative timeout and the watch reads it off the Job, so the
-        // two cannot drift; this hour is only the ceiling for a template that
-        // declares no deadline at all.
-        match watch_to_terminal(
-            &api,
-            &cfg.jobs_namespace,
-            &name,
-            Duration::from_secs(5),
-            Duration::from_secs(60 * 60),
-            std::thread::sleep,
-        ) {
-            Ok(Some(true)) => ctx.finish(true, None),
-            Ok(Some(false)) => {
-                let cause = capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
-                ctx.finish(false, Some(&failure_line("job failed", cause.as_deref())))
-            }
-            Ok(None) => {
-                let cause = capture_diagnostics(&api, &cfg, &run.run_id, &ctx);
-                ctx.finish(
-                    false,
-                    Some(&failure_line(
-                        "job did not reach a terminal state within the watch deadline",
-                        cause.as_deref(),
-                    )),
-                )
-            }
-            Err(e) => ctx.finish(false, Some(&format!("watch job: {e}"))),
+        if suspend {
+            // Queued. The scheduler resumes it and takes up the watch; watching
+            // a suspended Job here would hold a thread for the whole wait and
+            // report "no terminal state" for a run that has not started.
+            return;
         }
+        watch_job_to_finish(&api, &cfg, &run.run_id, &name, &ctx);
     });
+}
+
+/// Poll a Job to its terminal state and report it.
+///
+/// The in-Job runner reports its own stages + Finish through push-back (the
+/// `/events` ingest), so this does NOT drive the run — it is the infra safety
+/// net: an image-pull failure, OOM, or a pod that never runs the runner would
+/// otherwise leave the run hanging forever. The terminal-guard (V4) makes the
+/// report a no-op when the runner already reported its own verdict.
+fn watch_job_to_finish<T: crate::executor::KubeTransport>(
+    api: &KubeApi<T>,
+    cfg: &K8sExecutorConfig,
+    run_id: &str,
+    name: &str,
+    ctx: &StoreCtx,
+) {
+    // Poll to a terminal Job state. The Job's own activeDeadlineSeconds is
+    // the authoritative timeout and the watch reads it off the Job, so the
+    // two cannot drift; this hour is only the ceiling for a template that
+    // declares no deadline at all.
+    match watch_to_terminal(
+        api,
+        &cfg.jobs_namespace,
+        name,
+        Duration::from_secs(5),
+        Duration::from_secs(60 * 60),
+        std::thread::sleep,
+    ) {
+        Ok(Some(true)) => ctx.finish(true, None),
+        Ok(Some(false)) => {
+            let cause = capture_diagnostics(api, cfg, run_id, ctx);
+            ctx.finish(false, Some(&failure_line("job failed", cause.as_deref())))
+        }
+        Ok(None) => {
+            let cause = capture_diagnostics(api, cfg, run_id, ctx);
+            ctx.finish(
+                false,
+                Some(&failure_line(
+                    "job did not reach a terminal state within the watch deadline",
+                    cause.as_deref(),
+                )),
+            )
+        }
+        Err(e) => ctx.finish(false, Some(&format!("watch job: {e}"))),
+    }
 }
 
 /// Pull the pod's per-container state and output into the run's log, so a failure

@@ -391,6 +391,12 @@ pub struct RunParams {
     /// fact about the run, not a field that happens to be missing.
     #[serde(default)]
     pub recording_id: Option<String>,
+    /// The deployment-day group, when the run named one instead of a single
+    /// recording. Recorded for the same reason as `recording_id`, and because
+    /// without it this row cannot say what the run was asked to drive: a group
+    /// run's `recording_id` is unset until the tape is pulled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_source: Option<S3Source>,
     /// The driven test-case subset, normalized. `None` = the entire session,
@@ -414,6 +420,7 @@ impl RunParams {
             system_under_test: spec.system_under_test.clone(),
             candidate_repo: spec.candidate_repo.clone(),
             recording_id: spec.recording_id.clone(),
+            recording_group: spec.recording_group.clone(),
             s3_source: spec.s3_source.clone(),
             correlation_filter: scope::RunScope::of_spec(spec)
                 .ids()
@@ -1317,6 +1324,29 @@ mod run_params_tests {
             serde_json::to_value(&spec.candidate_spec).unwrap(),
             serde_json::to_value(&params.candidate_spec).unwrap()
         );
+    }
+
+    /// The row is the only durable record of what a run was asked to drive, and
+    /// a GROUP run's `recording_id` is unset until the tape is pulled — so a row
+    /// without the group says nothing about what that run was for, and a report
+    /// built from it (or a rerun posted from it) would name the wrong thing.
+    #[test]
+    fn a_group_run_records_the_group_it_was_asked_to_drive() {
+        let mut spec = replay_spec();
+        spec.recording_group = Some("9e7e428a89-0917".to_owned());
+        spec.recording_id = None;
+
+        let stored = RunParams::resolved(&spec, Some("pass")).to_json();
+
+        assert_eq!(
+            stored.get("recording_group").and_then(|v| v.as_str()),
+            Some("9e7e428a89-0917")
+        );
+        // …and the row still reads back as a request the create endpoint takes,
+        // group included, so a run is reproducible from its own record.
+        let reposted: RunSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(reposted.recording_group, spec.recording_group);
+        assert_eq!(reposted.recording_id, None);
     }
 
     #[test]
