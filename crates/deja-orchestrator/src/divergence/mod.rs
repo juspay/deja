@@ -10811,6 +10811,42 @@ mod tests {
         );
     }
 
+    /// Every field in `IDENTITY_FIELDS` must SEPARATE, not merely survive.
+    ///
+    /// The test above asserts a re-keyed cache write keeps its twin —
+    /// `shape(cache=A,key=a) == shape(cache=A,key=b)` — which stays true when
+    /// `cache` is dropped from the identity altogether, because both sides
+    /// collapse to `key`. An equality is the one assertion that cannot notice a
+    /// field going missing, so `cache` was covered in the only direction that
+    /// could not fail. `endpoint` and `operation` had no assertion at all.
+    ///
+    /// All three name a distinct call in production: `cache` from
+    /// `storage_impl/src/redis/cache.rs`, `endpoint` from
+    /// `common_utils/src/keymanager.rs`, and `operation` from every diesel
+    /// generic via `deja/src/lib.rs` — `generic_insert` and `generic_delete`
+    /// are different calls on one table.
+    #[test]
+    fn each_identity_field_separates_calls_that_differ_only_in_it() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+
+        assert_ne!(
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
+            shape(&serde_json::json!({"cache": "CONFIG_CACHE", "key": "a"})),
+            "two different caches are two different calls"
+        );
+        assert_ne!(
+            shape(&serde_json::json!({"endpoint": "/key/transfer", "id": "m1"})),
+            shape(&serde_json::json!({"endpoint": "/key/rotate", "id": "m1"})),
+            "two different keymanager endpoints are two different calls"
+        );
+        assert_ne!(
+            shape(&serde_json::json!({"operation": "generic_insert", "table": "payment_attempt"})),
+            shape(&serde_json::json!({"operation": "generic_delete", "table": "payment_attempt"})),
+            "an insert and a delete on one table are two different calls"
+        );
+    }
+
     #[test]
     fn rekeyed_write_pairs_args_free_into_one_value_divergence() {
         // GOTCHA #1: the diverged WRITE carries a mutated operand, so its args
