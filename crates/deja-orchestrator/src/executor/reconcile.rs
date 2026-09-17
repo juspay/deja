@@ -16,6 +16,11 @@
 //!   * Job still running, or a young orphan still inside the grace period (a
 //!     launch may be in flight) → wait, do nothing this pass.
 //!
+//! It also settles what a Job cannot report, from the pod: a sidecar that
+//! restarted mid-run (the replay continued against a cold process), and a pod
+//! that cannot get past its init containers (the runner never starts, so the
+//! thing that would normally report a broken candidate never runs).
+//!
 //! Every settle goes through [`deja_store::Store::update_run_state`], which is
 //! terminal-guarded (V4: `WHERE state NOT IN ('completed','failed')`), so a
 //! report that races the run's own push-back is a harmless zero-row no-op. That
@@ -30,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -41,6 +46,12 @@ use deja_store::Store;
 
 /// How often the reconciler runs a pass (override: `DEJA_RECONCILE_INTERVAL_SECS`).
 const DEFAULT_INTERVAL_SECS: u64 = 30;
+
+/// How long an init container must stay blocked before its run is failed
+/// (override: `DEJA_INIT_BLOCKED_GRACE_SECS`). A pull can fail transiently and
+/// recover; two passes of the same blocked reason is not a blip. Short, because
+/// the alternative is a pod holding a node until `activeDeadlineSeconds`.
+const DEFAULT_INIT_BLOCKED_GRACE_SECS: u64 = 120;
 
 /// How long a non-terminal run with NO Job is tolerated before it is failed as
 /// orphaned (override: `DEJA_RECONCILE_ORPHAN_GRACE_SECS`). Generous enough to
@@ -87,6 +98,155 @@ pub enum ReconcileAction {
     OrphanFail { run_id: String, reason: String },
     /// Leave the run alone this pass (running Job, or young orphan).
     Wait { run_id: String, reason: String },
+}
+
+/// A pod backing a run, reduced to the two things its Job never reports.
+///
+/// Both became reachable when the candidate became a native sidecar. A Job's
+/// conditions describe its APP containers; a sidecar that crashes and comes back,
+/// or an init container that cannot start at all, leaves the Job saying nothing
+/// while the run is already lost.
+#[derive(Debug, Clone)]
+pub struct RunPod {
+    pub run_id: String,
+    pub pod_name: String,
+    /// Containers that have restarted, with their counts.
+    pub restarts: Vec<(String, u64)>,
+    /// An init container that is not going to start on its own.
+    pub blocked_init: Option<BlockedInit>,
+}
+
+/// An init container stuck in a waiting state it will not leave by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedInit {
+    pub container: String,
+    pub reason: String,
+    pub message: String,
+}
+
+/// What a pod says about a run that its Job does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PodTrouble {
+    /// A container restarted mid-run.
+    Restarted { container: String, count: u64 },
+    /// The pod cannot get past its init containers.
+    BlockedInit(BlockedInit),
+}
+
+/// Waiting reasons that mean "this container is not going to start on its own".
+/// `ContainerCreating` and `PodInitializing` are deliberately absent: those are
+/// a pod doing its job, and failing on them would fail every healthy run.
+const BLOCKED_REASONS: [&str; 5] = [
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "InvalidImageName",
+    "CreateContainerConfigError",
+    "CrashLoopBackOff",
+];
+
+/// Map raw Pod `.items` (from [`KubeApi::list_pods`]) to what each says about
+/// its run. Pods without the run-id label are skipped (not ours). Pure — tested
+/// against hand-built Pod JSON.
+pub fn run_pods_from_items(items: &[Value], label_key: &str) -> Vec<RunPod> {
+    items
+        .iter()
+        .filter_map(|pod| {
+            let run_id = pod
+                .pointer("/metadata/labels")
+                .and_then(|labels| labels.get(label_key))
+                .and_then(Value::as_str)?
+                .to_owned();
+            let statuses = |path: &str| -> Vec<Value> {
+                pod.pointer(path)
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let inits = statuses("/status/initContainerStatuses");
+            let apps = statuses("/status/containerStatuses");
+            let name_of = |c: &Value| {
+                c.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>")
+                    .to_owned()
+            };
+            let restarts = inits
+                .iter()
+                .chain(apps.iter())
+                .filter_map(|c| {
+                    let count = c.get("restartCount").and_then(Value::as_u64).unwrap_or(0);
+                    (count > 0).then(|| (name_of(c), count))
+                })
+                .collect();
+            let blocked_init = inits.iter().find_map(|c| {
+                let reason = c
+                    .pointer("/state/waiting/reason")
+                    .and_then(Value::as_str)?
+                    .to_owned();
+                BLOCKED_REASONS
+                    .contains(&reason.as_str())
+                    .then(|| BlockedInit {
+                        container: name_of(c),
+                        reason,
+                        message: c
+                            .pointer("/state/waiting/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    })
+            });
+            Some(RunPod {
+                run_id,
+                pod_name: pod
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>")
+                    .to_owned(),
+                restarts,
+                blocked_init,
+            })
+        })
+        .collect()
+}
+
+/// The pure pod decision: what, if anything, is wrong with this pod that its
+/// Job will never say. A restart outranks a blocked init — a container that has
+/// restarted has already run, so the run is already invalid whatever the pod
+/// does next.
+pub fn pod_trouble(pod: &RunPod) -> Option<PodTrouble> {
+    if let Some((container, count)) = pod.restarts.first() {
+        return Some(PodTrouble::Restarted {
+            container: container.clone(),
+            count: *count,
+        });
+    }
+    pod.blocked_init.clone().map(PodTrouble::BlockedInit)
+}
+
+/// The failure a [`PodTrouble`] settles the run with. Written here, once, so
+/// the run's `failure_reason` explains itself without a reader having to go and
+/// find the pod — which by then is usually gone.
+pub fn pod_trouble_reason(pod_name: &str, trouble: &PodTrouble) -> String {
+    match trouble {
+        PodTrouble::Restarted { container, count } => format!(
+            "pod {pod_name}: container '{container}' restarted {count} time(s) during the run. \
+             A restarted sidecar comes back COLD — its in-process state is empty while postgres \
+             and redis keep theirs — so the rest of the replay would diverge at boundaries the \
+             candidate never touched. Failing the run rather than scoring those divergences"
+        ),
+        PodTrouble::BlockedInit(b) => format!(
+            "pod {pod_name}: init container '{}' cannot start ({}{}). The runner does not start \
+             until every init container has, so nothing would report this run until its \
+             activeDeadlineSeconds expires",
+            b.container,
+            b.reason,
+            if b.message.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", b.message)
+            }
+        ),
+    }
 }
 
 /// Map raw Job `.items` (from [`KubeApi::list_jobs`]) to the run each backs. A
@@ -214,13 +374,17 @@ pub fn spawn(store: Arc<Store>, incluster: InClusterConfig, cfg: K8sExecutorConf
         "DEJA_RECONCILE_ORPHAN_GRACE_SECS",
         DEFAULT_ORPHAN_GRACE_SECS,
     ));
+    let init_grace = Duration::from_secs(env_secs(
+        "DEJA_INIT_BLOCKED_GRACE_SECS",
+        DEFAULT_INIT_BLOCKED_GRACE_SECS,
+    ));
     eprintln!(
         "deja-orchestrator: k8s reconciler started (jobs ns {}, every {}s, orphan grace {}s)",
         cfg.jobs_namespace,
         interval.as_secs(),
         grace.as_secs()
     );
-    tokio::spawn(run_loop(store, api, cfg.jobs_namespace, interval, grace));
+    tokio::spawn(run_loop(store, api, cfg, interval, grace, init_grace));
 }
 
 /// The live loop: one pass, then sleep, forever. The blocking kube LIST is the
@@ -228,14 +392,19 @@ pub fn spawn(store: Arc<Store>, incluster: InClusterConfig, cfg: K8sExecutorConf
 async fn run_loop<T>(
     store: Arc<Store>,
     api: Arc<KubeApi<T>>,
-    jobs_namespace: String,
+    cfg: K8sExecutorConfig,
     interval: Duration,
     grace: Duration,
+    init_grace: Duration,
 ) where
     T: KubeTransport + Send + Sync + 'static,
 {
+    // When each still-blocked run was FIRST seen blocked. Held across passes so
+    // a transient pull failure is not a verdict; lost on restart, which costs
+    // one more grace period and never a wrong failure.
+    let mut blocked_since: HashMap<String, Instant> = HashMap::new();
     loop {
-        reconcile_pass(&store, &api, &jobs_namespace, grace).await;
+        reconcile_pass(&store, &api, &cfg, grace, init_grace, &mut blocked_since).await;
         tokio::time::sleep(interval).await;
     }
 }
@@ -246,8 +415,10 @@ async fn run_loop<T>(
 async fn reconcile_pass<T>(
     store: &Store,
     api: &Arc<KubeApi<T>>,
-    jobs_namespace: &str,
+    cfg: &K8sExecutorConfig,
     grace: Duration,
+    init_grace: Duration,
+    blocked_since: &mut HashMap<String, Instant>,
 ) where
     T: KubeTransport + Send + Sync + 'static,
 {
@@ -264,7 +435,7 @@ async fn reconcile_pass<T>(
 
     // The kube client is blocking (ureq); keep it off the async runtime worker.
     let api_for_list = api.clone();
-    let ns = jobs_namespace.to_owned();
+    let ns = cfg.jobs_namespace.clone();
     let items = match tokio::task::spawn_blocking(move || api_for_list.list_jobs(&ns, RUN_ID_LABEL))
         .await
     {
@@ -310,6 +481,75 @@ async fn reconcile_pass<T>(
         runs.len(),
         jobs.len()
     );
+
+    // Second half: what the PODS say that their Jobs do not. A sidecar that
+    // restarted, or an init container that cannot start, leaves the Job
+    // reporting nothing at all — the first because the pod is still Running, the
+    // second because the app containers never begin. Both end with a node held
+    // until activeDeadlineSeconds, and the second one silently: the runner is
+    // the thing that reports a candidate it cannot reach, and it never starts.
+    let still_live: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            ReconcileAction::Wait { run_id, .. } => Some(run_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if still_live.is_empty() {
+        blocked_since.clear();
+        return;
+    }
+    let api_for_pods = api.clone();
+    let ns = cfg.jobs_namespace.clone();
+    let pod_items = match tokio::task::spawn_blocking(move || {
+        api_for_pods.list_pods(&ns, RUN_ID_LABEL)
+    })
+    .await
+    {
+        Ok(Ok(items)) => items,
+        Ok(Err(e)) => {
+            eprintln!("reconcile: list_pods failed: {e} — skipping the pod checks this pass");
+            return;
+        }
+        Err(e) => {
+            eprintln!("reconcile: list_pods task join failed: {e} — skipping the pod checks");
+            return;
+        }
+    };
+    for pod in run_pods_from_items(&pod_items, RUN_ID_LABEL) {
+        if !still_live.contains(&pod.run_id.as_str()) {
+            continue;
+        }
+        let Some(trouble) = pod_trouble(&pod) else {
+            // Healthy: whatever it was blocked on earlier, it is not blocked now.
+            blocked_since.remove(&pod.run_id);
+            continue;
+        };
+        if matches!(trouble, PodTrouble::BlockedInit(_)) {
+            let first_seen = blocked_since
+                .entry(pod.run_id.clone())
+                .or_insert_with(Instant::now);
+            if first_seen.elapsed() < init_grace {
+                continue; // a pull can fail once and recover; wait one more pass
+            }
+        }
+        let reason = pod_trouble_reason(&pod.pod_name, &trouble);
+        eprintln!("reconcile: {}: {reason}", pod.run_id);
+        settle(store, &pod.run_id, false, &reason).await;
+        blocked_since.remove(&pod.run_id);
+        // Reclaim the node. The run is settled either way, but a Job left behind
+        // goes on holding a pod that cannot finish — which is the whole failure
+        // being reported here.
+        let api_for_kill = api.clone();
+        let (ns, run_id) = (cfg.jobs_namespace.clone(), pod.run_id.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || {
+            super::launch::kill_run(&api_for_kill, &ns, &run_id)
+        })
+        .await
+        {
+            eprintln!("reconcile: {}: could not delete its Job: {e}", pod.run_id);
+        }
+    }
 }
 
 /// Settle one run through the terminal-guarded store update (idempotent). A
@@ -494,6 +734,126 @@ mod tests {
     /// `spec.suspend` is how a queued Job is told apart from a running one, so
     /// it has to survive the parse — a Job read as un-suspended would be counted
     /// as holding a slot it does not hold.
+    /// Finding A, made a test: a sidecar that crashes is restarted in place, so
+    /// the pod stays Running and the Job stays happy while the replay continues
+    /// against a router with empty in-process caches. Nothing else in the system
+    /// notices — which is how a candidate crash would surface as cache-shaped
+    /// divergences at a boundary the candidate never touched.
+    #[test]
+    fn a_restarted_container_is_trouble_the_job_never_reports() {
+        let items = vec![json!({
+            "metadata": { "name": "deja-replay-r-abc", "labels": { "deja.run-id": "r" } },
+            "status": {
+                "phase": "Running",
+                "initContainerStatuses": [
+                    { "name": "postgres", "restartCount": 0 },
+                    { "name": "candidate", "restartCount": 2 }
+                ],
+                "containerStatuses": [{ "name": "runner", "restartCount": 0 }]
+            }
+        })];
+        let pods = run_pods_from_items(&items, "deja.run-id");
+        assert_eq!(pods[0].run_id, "r");
+        let trouble = pod_trouble(&pods[0]).expect("a restarted container is trouble");
+        assert_eq!(
+            trouble,
+            PodTrouble::Restarted {
+                container: "candidate".into(),
+                count: 2
+            }
+        );
+        let reason = pod_trouble_reason(&pods[0].pod_name, &trouble);
+        assert!(
+            reason.contains("deja-replay-r-abc") && reason.to_lowercase().contains("cold"),
+            "the failure must name the pod and explain why a restart invalidates the \
+             replay: {reason}"
+        );
+    }
+
+    /// Finding B: an init container that cannot start means the RUNNER never
+    /// starts — and the runner is what reports an unreachable candidate. So the
+    /// run would sit until activeDeadlineSeconds holding its node, reported by
+    /// nothing. This is the state that has to be recognised from the pod.
+    #[test]
+    fn an_init_container_that_cannot_start_is_recognised() {
+        let items = vec![json!({
+            "metadata": { "name": "deja-replay-b-xyz", "labels": { "deja.run-id": "b" } },
+            "status": {
+                "phase": "Pending",
+                "initContainerStatuses": [
+                    { "name": "postgres", "restartCount": 0, "state": { "running": {} } },
+                    { "name": "candidate", "restartCount": 0, "state": { "waiting": {
+                        "reason": "ImagePullBackOff",
+                        "message": "Back-off pulling image \"candidate-image-patched-per-run\""
+                    } } }
+                ]
+            }
+        })];
+        let pods = run_pods_from_items(&items, "deja.run-id");
+        let Some(PodTrouble::BlockedInit(blocked)) = pod_trouble(&pods[0]) else {
+            panic!("expected BlockedInit: {:?}", pod_trouble(&pods[0]));
+        };
+        assert_eq!(blocked.container, "candidate");
+        assert_eq!(blocked.reason, "ImagePullBackOff");
+        assert!(blocked.message.contains("Back-off pulling"));
+    }
+
+    /// The other half of that rule, and the one that would hurt if it were
+    /// wrong: a pod doing normal work is NOT trouble. `PodInitializing` and
+    /// `ContainerCreating` are what every healthy run looks like for its first
+    /// seconds, and failing on them would fail every run.
+    #[test]
+    fn a_pod_merely_starting_up_is_not_trouble() {
+        let items = vec![json!({
+            "metadata": { "name": "deja-replay-h", "labels": { "deja.run-id": "h" } },
+            "status": {
+                "phase": "Pending",
+                "initContainerStatuses": [
+                    { "name": "migrations", "restartCount": 0, "state": { "waiting": {
+                        "reason": "ContainerCreating" } } }
+                ],
+                "containerStatuses": [
+                    { "name": "runner", "restartCount": 0, "state": { "waiting": {
+                        "reason": "PodInitializing" } } }
+                ]
+            }
+        })];
+        let pods = run_pods_from_items(&items, "deja.run-id");
+        assert_eq!(pod_trouble(&pods[0]), None, "{:?}", pods[0]);
+    }
+
+    /// A restart outranks a blocked init: a container that has restarted has
+    /// already run, so the replay is invalid whatever the pod does next, and
+    /// reporting the block instead would send the reader to the wrong cause.
+    #[test]
+    fn a_restart_outranks_a_blocked_init() {
+        let pod = RunPod {
+            run_id: "x".into(),
+            pod_name: "deja-replay-x".into(),
+            restarts: vec![("candidate".into(), 1)],
+            blocked_init: Some(BlockedInit {
+                container: "candidate".into(),
+                reason: "CrashLoopBackOff".into(),
+                message: String::new(),
+            }),
+        };
+        assert!(matches!(
+            pod_trouble(&pod),
+            Some(PodTrouble::Restarted { .. })
+        ));
+    }
+
+    /// Pods that are not ours carry no run-id label and must be ignored — the
+    /// LIST is namespace-wide.
+    #[test]
+    fn pods_without_a_run_id_label_are_not_ours() {
+        let items = vec![json!({
+            "metadata": { "name": "some-other-pod", "labels": { "app": "unrelated" } },
+            "status": { "phase": "Running" }
+        })];
+        assert!(run_pods_from_items(&items, "deja.run-id").is_empty());
+    }
+
     #[test]
     fn run_jobs_from_items_reads_suspension() {
         let items = vec![
