@@ -732,6 +732,16 @@ pub struct StreamRenumbering {
 #[derive(Debug, Default)]
 struct Renumbering {
     streams: std::collections::BTreeMap<String, StreamRenumbering>,
+    /// Per stream, the end of the range it has RESERVED: `(events, nodes)`.
+    ///
+    /// A stream's offset is fixed the first time it is seen, but its extent is
+    /// only known from the members read so far. A later member can therefore
+    /// need more room than was reserved, and if another stream has since been
+    /// placed above it there is nowhere to grow into — the two ranges overlap
+    /// and the tape carries colliding sequences again, which is the exact
+    /// defect this type exists to remove. Reservations are what let that be
+    /// DETECTED rather than silently produced.
+    reserved: std::collections::BTreeMap<String, (u64, u64)>,
     /// One past the highest event sequence handed out so far.
     next_event: u64,
     /// One past the highest graph node id (or node-stream sequence) handed
@@ -755,7 +765,7 @@ impl Renumbering {
     /// is rewritten; the second rewrites. A stream already placed by an earlier
     /// member keeps its offsets (the counter it continues is the same one), and
     /// only widens the high-water marks.
-    fn apply(&mut self, collated: &mut Collated) {
+    fn apply(&mut self, collated: &mut Collated) -> Result<(), String> {
         let mut high: std::collections::BTreeMap<String, (u64, u64, usize, usize)> =
             Default::default();
         for (run, kind, gseq, raw) in &collated.events {
@@ -791,8 +801,41 @@ impl Renumbering {
                 });
             stream.events += events;
             stream.graph_nodes += nodes;
-            self.next_event = self.next_event.max(stream.event_offset + event_hwm);
-            self.next_node = self.next_node.max(stream.node_offset + node_hwm);
+            let want_event_end = stream.event_offset + event_hwm;
+            let want_node_end = stream.node_offset + node_hwm;
+            let reserved = self
+                .reserved
+                .entry(run.clone())
+                .or_insert((want_event_end, want_node_end));
+            // Growing past the reservation is fine while this stream is still
+            // the highest one placed — nothing is above it to collide with.
+            // Once another stream has been placed above, it is not: the records
+            // already written for the earlier members cannot be moved, so the
+            // only honest outcome is to say so.
+            for (want, have, next, what) in [
+                (
+                    want_event_end,
+                    &mut reserved.0,
+                    &mut self.next_event,
+                    "event sequence",
+                ),
+                (
+                    want_node_end,
+                    &mut reserved.1,
+                    &mut self.next_node,
+                    "node id",
+                ),
+            ] {
+                if want > *have {
+                    if *have < *next {
+                        return Err(format!(
+                            "stream {run} resumed in a later member and needs {what}s up to {want}, but only {have} was reserved for it and another stream is already placed at {next}. Writing it would overlap that stream, which is the sequence collision this renumbering removes. The members carrying one stream must be read together."
+                        ));
+                    }
+                    *have = want;
+                }
+                *next = (*next).max(*have);
+            }
         }
         for (run, kind, gseq, raw) in &mut collated.events {
             let stream = &self.streams[&run.clone().unwrap_or_default()];
@@ -808,6 +851,7 @@ impl Renumbering {
                 };
             }
         }
+        Ok(())
     }
 
     /// The streams, for the report — only when there was more than one, so a
@@ -1055,7 +1099,7 @@ pub fn pull_recordings(
             // Concatenation is sound for ORDER — see above — but not for
             // IDENTITY: each member counts from zero, so the streams are placed
             // end to end before a byte is written.
-            tally.renumbering.apply(&mut collated);
+            tally.renumbering.apply(&mut collated)?;
             for (_, _, _, line) in &collated.events {
                 out.write_all(line.as_bytes())
                     .and_then(|_| out.write_all(b"\n"))
@@ -1188,7 +1232,7 @@ pub fn pull_recording_from_prefix(
     // One session is normally one process, so this is a no-op that leaves the
     // bytes alone; a session two processes wrote into is placed like a pull.
     let mut renumbering = Renumbering::default();
-    renumbering.apply(&mut collated);
+    renumbering.apply(&mut collated)?;
 
     let dest = dest_for(&resolved);
     let dest = dest.as_path();
@@ -2190,6 +2234,86 @@ mod tests {
     /// recorded event by its bare sequence answers with the wrong process's
     /// event. Placing the second stream after the first keeps every id unique
     /// and every reference (event -> node, node -> parent) pointing where it did.
+    /// A stream split across members, with ANOTHER stream's member between its
+    /// two halves, cannot be placed without overlapping — and must say so.
+    ///
+    /// The offsets are high-water marks taken per MEMBER, so a stream's range
+    /// is reserved from the first member that carries it. Its continuation
+    /// resumes the producer's counter exactly where it stopped, which is
+    /// precisely the range already handed to whatever was placed next. Before
+    /// the reservation check this wrote a tape where two streams shared
+    /// sequences 2 and 3 — the collision the renumbering exists to remove,
+    /// reintroduced by the renumbering itself, with nothing said anywhere.
+    ///
+    /// Unreachable as the deployment stands: `recording_run_id` falls back to
+    /// `run-{boot_ns}` per process and `DEJA_RUN_ID` is set only for the replay
+    /// runner, so one process is one session is one member. It is asserted
+    /// rather than deleted because `apply` deliberately supports a resumed
+    /// stream, and support that silently corrupts is worse than none.
+    #[test]
+    fn a_stream_resumed_after_another_was_placed_is_refused_not_overlapped() {
+        let member = |rid: &str, lo: u64, hi: u64| {
+            a_member(&[
+                envelope(rid, lo, r#","graph_node_id":3"#),
+                envelope(rid, hi, r#","graph_node_id":7"#),
+                graph_envelope_with(rid, lo, 3, r#","parent_id":null,"causal_parent_ids":[]"#),
+                graph_envelope_with(rid, hi, 7, r#","parent_id":3,"causal_parent_ids":[3]"#),
+            ])
+        };
+        let mut first = member("rA", 0, 1);
+        let mut other = member("rB", 0, 1);
+        // rA's producer counter CONTINUES from 1 — which is the range rB now
+        // holds. This is the ordinary shape of a continuation, not a contrived
+        // one: a counter that resumed anywhere else would have skipped.
+        let mut resumed = member("rA", 2, 3);
+
+        let mut renumbering = Renumbering::default();
+        renumbering.apply(&mut first).expect("first placement");
+        renumbering.apply(&mut other).expect("second stream");
+        let refused = renumbering
+            .apply(&mut resumed)
+            .expect_err("a resumed stream that would overlap must be refused");
+        assert!(
+            refused.contains("rA") && refused.contains("overlap"),
+            "the refusal must name the stream and what it would do: {refused}"
+        );
+    }
+
+    /// The legitimate resume — same stream, consecutive members, nothing placed
+    /// in between — still works. Without this the check above is satisfied by a
+    /// guard that simply refuses every resumed stream.
+    #[test]
+    fn a_stream_resumed_with_nothing_placed_above_it_just_extends() {
+        let member = |rid: &str, lo: u64, hi: u64| {
+            a_member(&[
+                envelope(rid, lo, r#","graph_node_id":3"#),
+                envelope(rid, hi, r#","graph_node_id":7"#),
+            ])
+        };
+        let mut first = member("rA", 0, 1);
+        let mut resumed = member("rA", 2, 3);
+        let mut after = member("rB", 0, 1);
+
+        let mut renumbering = Renumbering::default();
+        renumbering.apply(&mut first).expect("first placement");
+        renumbering
+            .apply(&mut resumed)
+            .expect("a stream may grow while it is the highest one placed");
+        renumbering
+            .apply(&mut after)
+            .expect("the next stream starts above the grown range");
+
+        let report = renumbering.into_report();
+        let b = report
+            .iter()
+            .find(|s| s.recording_run_id == "rB")
+            .expect("rB is in the report");
+        assert_eq!(
+            b.event_offset, 4,
+            "rB must start above rA's GROWN extent (0..=3), not its first reservation"
+        );
+    }
+
     #[test]
     fn two_streams_that_both_count_from_zero_are_placed_end_to_end() {
         let stream = |rid: &str| {
@@ -2205,8 +2329,12 @@ mod tests {
         let first_bytes: Vec<String> = first.events.iter().map(|e| e.3.clone()).collect();
 
         let mut renumbering = Renumbering::default();
-        renumbering.apply(&mut first);
-        renumbering.apply(&mut second);
+        renumbering
+            .apply(&mut first)
+            .expect("first member places cleanly");
+        renumbering
+            .apply(&mut second)
+            .expect("second stream places above the first");
 
         let untouched: Vec<String> = first.events.iter().map(|e| e.3.clone()).collect();
         assert_eq!(
@@ -2262,7 +2390,9 @@ mod tests {
         ]);
         let before: Vec<String> = member.events.iter().map(|e| e.3.clone()).collect();
         let mut renumbering = Renumbering::default();
-        renumbering.apply(&mut member);
+        renumbering
+            .apply(&mut member)
+            .expect("a single member places cleanly");
         let after: Vec<String> = member.events.iter().map(|e| e.3.clone()).collect();
         assert_eq!(after, before);
         assert!(renumbering.into_report().is_empty());
@@ -2278,8 +2408,12 @@ mod tests {
             graph_envelope("r2", 4),
         ]);
         let mut renumbering = Renumbering::default();
-        renumbering.apply(&mut first);
-        renumbering.apply(&mut second);
+        renumbering
+            .apply(&mut first)
+            .expect("first member places cleanly");
+        renumbering
+            .apply(&mut second)
+            .expect("second stream places above the first");
         let event = line_of(&second, "r2", "boundary_event", 0);
         assert_eq!(event["graph_node_id"], 9, "4 + (4 + 1)");
         assert_eq!(line_of(&second, "r2", "graph_node", 0)["node_id"], 9);
