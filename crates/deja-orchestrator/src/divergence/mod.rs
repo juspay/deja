@@ -83,6 +83,24 @@ fn is_nonblocking_boundary(boundary: &str, role: Option<&str>) -> bool {
         || boundary == "http_incoming"
 }
 
+/// Whether a call the candidate made, and that missed, is excused as no
+/// divergence at all.
+///
+/// A pure boundary's miss is excused on the premise that re-drawing a clock or
+/// an id changes nothing the run compares. That premise holds only while the
+/// process survives the miss. A miss that STOPPED the request is the reason its
+/// response is missing and its later calls never ran, so excusing it leaves a
+/// verdict made entirely of its consequences: an unused id draw read as a run
+/// of status mismatches and omitted calls, with the draw itself named nowhere.
+/// A stopped miss is therefore classified as any other boundary's miss would be
+/// at the same site.
+///
+/// Recorded-side omissions have no outcome and keep [`is_nonblocking_boundary`].
+pub(crate) fn observed_miss_is_excused(call: &ObservedCall) -> bool {
+    call.outcome != deja::SubstituteOutcome::Stopped
+        && is_nonblocking_boundary(&call.boundary, call.role.as_deref())
+}
+
 /// Whether replay is *incapable* of producing a counterpart for this boundary,
 /// however faithfully the candidate behaves.
 ///
@@ -704,12 +722,8 @@ struct GraphCorrelationPlan {
     novel_replay_events: HashSet<usize>,
     scoring_mode: deja_forest::ScoringMode,
     alignment: Option<deja_forest::Alignment>,
-    record: Option<deja_forest::ActivationForest>,
     replay: Option<deja_forest::ActivationForest>,
     flat_replay_nodes: HashSet<u64>,
-    flat_record_nodes: HashSet<u64>,
-    flat_record_events: HashSet<u64>,
-    flat_replay_events: HashSet<usize>,
 }
 
 /// The single record/replay graph seam shared by scorecard and call-ledger
@@ -875,83 +889,77 @@ impl GraphScoringPlan {
                 })
                 .unwrap_or_default();
 
-            let (scoring_mode, alignment, flat_replay_nodes, flat_record_nodes) =
-                if let Some(reason) = reason {
-                    (
-                        deja_forest::ScoringMode::Flat { reason },
-                        None,
-                        HashSet::new(),
-                        HashSet::new(),
-                    )
-                } else {
-                    let record_forest = record.as_ref().expect("graph mode has a record forest");
-                    let replay_forest = replay.as_ref().expect("graph mode has a replay forest");
-                    let mut alignment = deja_forest::align(record_forest, replay_forest);
-                    alignment
-                        .flat_tier_events
-                        .extend(flat_record_events.iter().copied());
-                    alignment
-                        .flat_tier_events
-                        .extend(flat_replay_events.iter().map(|index| *index as u64));
-                    alignment.flat_tier_events.sort_unstable();
-                    alignment.flat_tier_events.dedup();
-                    let mut flat_replay_nodes = HashSet::new();
-                    let mut flat_record_nodes = HashSet::new();
-                    let mut paired_fallback_metadata = Vec::new();
-                    for row in &alignment.nodes {
-                        let (Some(record_node), Some(replay_node)) =
-                            (row.record_node, row.replay_node)
-                        else {
-                            continue;
-                        };
-                        if record_forest.nodes[&record_node].events.len() != 1
-                            || replay_forest.nodes[&replay_node].events.len() != 1
-                        {
-                            flat_record_nodes.insert(record_node);
-                            flat_replay_nodes.insert(replay_node);
-                            paired_fallback_metadata
-                                .extend(record_forest.nodes[&record_node].events.iter().copied());
-                            paired_fallback_metadata
-                                .extend(replay_forest.nodes[&replay_node].events.iter().copied());
-                        }
+            let (scoring_mode, alignment, flat_replay_nodes) = if let Some(reason) = reason {
+                (
+                    deja_forest::ScoringMode::Flat { reason },
+                    None,
+                    HashSet::new(),
+                )
+            } else {
+                let record_forest = record.as_ref().expect("graph mode has a record forest");
+                let replay_forest = replay.as_ref().expect("graph mode has a replay forest");
+                let mut alignment = deja_forest::align(record_forest, replay_forest);
+                alignment
+                    .flat_tier_events
+                    .extend(flat_record_events.iter().copied());
+                alignment
+                    .flat_tier_events
+                    .extend(flat_replay_events.iter().map(|index| *index as u64));
+                alignment.flat_tier_events.sort_unstable();
+                alignment.flat_tier_events.dedup();
+                let mut flat_replay_nodes = HashSet::new();
+                let mut paired_fallback_metadata = Vec::new();
+                for row in &alignment.nodes {
+                    let (Some(record_node), Some(replay_node)) = (row.record_node, row.replay_node)
+                    else {
+                        continue;
+                    };
+                    if record_forest.nodes[&record_node].events.len() != 1
+                        || replay_forest.nodes[&replay_node].events.len() != 1
+                    {
+                        flat_replay_nodes.insert(replay_node);
+                        paired_fallback_metadata
+                            .extend(record_forest.nodes[&record_node].events.iter().copied());
+                        paired_fallback_metadata
+                            .extend(replay_forest.nodes[&replay_node].events.iter().copied());
                     }
-                    alignment.flat_tier_events.extend(paired_fallback_metadata);
-                    alignment.flat_tier_events.sort_unstable();
-                    alignment.flat_tier_events.dedup();
-                    let served: BTreeMap<u64, u64> = replay_forest
-                        .nodes
-                        .values()
-                        .filter(|node| !flat_replay_nodes.contains(&node.node_id))
-                        .filter_map(|node| match node.events.as_slice() {
-                            [index] => art
-                                .observed
-                                .get(*index as usize)
-                                .and_then(|observed| observed.source_event_global_sequence)
-                                .map(|sequence| (node.node_id, sequence)),
-                            _ => None,
-                        })
-                        .collect();
-                    deja_forest::reconcile_serving(&mut alignment, &served, record_forest);
-                    let record_skeleton_nodes = record_forest
-                        .nodes
-                        .values()
-                        .filter(|node| node.subtree_events > 0)
-                        .count() as u64;
-                    let replay_skeleton_nodes = replay_forest
-                        .nodes
-                        .values()
-                        .filter(|node| node.subtree_events > 0)
-                        .count() as u64;
-                    alignment
-                        .balance(record_skeleton_nodes, replay_skeleton_nodes)
-                        .expect("graph alignment must account for both event-bearing skeletons");
-                    (
-                        deja_forest::ScoringMode::Graph,
-                        Some(alignment),
-                        flat_replay_nodes,
-                        flat_record_nodes,
-                    )
-                };
+                }
+                alignment.flat_tier_events.extend(paired_fallback_metadata);
+                alignment.flat_tier_events.sort_unstable();
+                alignment.flat_tier_events.dedup();
+                let served: BTreeMap<u64, u64> = replay_forest
+                    .nodes
+                    .values()
+                    .filter(|node| !flat_replay_nodes.contains(&node.node_id))
+                    .filter_map(|node| match node.events.as_slice() {
+                        [index] => art
+                            .observed
+                            .get(*index as usize)
+                            .and_then(|observed| observed.source_event_global_sequence)
+                            .map(|sequence| (node.node_id, sequence)),
+                        _ => None,
+                    })
+                    .collect();
+                deja_forest::reconcile_serving(&mut alignment, &served, record_forest);
+                let record_skeleton_nodes = record_forest
+                    .nodes
+                    .values()
+                    .filter(|node| node.subtree_events > 0)
+                    .count() as u64;
+                let replay_skeleton_nodes = replay_forest
+                    .nodes
+                    .values()
+                    .filter(|node| node.subtree_events > 0)
+                    .count() as u64;
+                alignment
+                    .balance(record_skeleton_nodes, replay_skeleton_nodes)
+                    .expect("graph alignment must account for both event-bearing skeletons");
+                (
+                    deja_forest::ScoringMode::Graph,
+                    Some(alignment),
+                    flat_replay_nodes,
+                )
+            };
             let mut pruned_record_events = HashSet::new();
             let mut novel_replay_events = HashSet::new();
             if let Some(alignment) = &alignment {
@@ -981,12 +989,8 @@ impl GraphScoringPlan {
                 GraphCorrelationPlan {
                     scoring_mode,
                     alignment,
-                    record,
                     replay,
                     flat_replay_nodes,
-                    flat_record_nodes,
-                    flat_record_events,
-                    flat_replay_events,
                     pruned_record_events,
                     novel_replay_events,
                 },
@@ -1024,19 +1028,6 @@ impl GraphScoringPlan {
             .find(|row| row.replay_node == Some(replay_node))
     }
 
-    pub(crate) fn recorded_sequence_for_replay_node(
-        &self,
-        correlation_id: &str,
-        replay_node: u64,
-    ) -> Option<u64> {
-        let entry = self.correlations.get(correlation_id)?;
-        let record_node = self
-            .alignment_row_for_replay_node(correlation_id, replay_node)?
-            .record_node?;
-        let events = &entry.record.as_ref()?.nodes.get(&record_node)?.events;
-        (events.len() == 1).then(|| events[0])
-    }
-
     pub(crate) fn replay_node_uses_flat_tier(
         &self,
         correlation_id: &str,
@@ -1045,26 +1036,6 @@ impl GraphScoringPlan {
         self.correlations
             .get(correlation_id)
             .is_some_and(|entry| entry.flat_replay_nodes.contains(&replay_node))
-    }
-
-    pub(crate) fn alignment_row_uses_flat_tier(
-        &self,
-        correlation_id: &str,
-        row: &deja_forest::AlignedNode,
-    ) -> bool {
-        self.correlations.get(correlation_id).is_some_and(|entry| {
-            row.record_node
-                .is_some_and(|node| entry.flat_record_nodes.contains(&node))
-                || row
-                    .replay_node
-                    .is_some_and(|node| entry.flat_replay_nodes.contains(&node))
-        })
-    }
-
-    pub(crate) fn record_event_uses_flat_tier(&self, correlation_id: &str, sequence: u64) -> bool {
-        self.correlations
-            .get(correlation_id)
-            .is_some_and(|entry| entry.flat_record_events.contains(&sequence))
     }
 
     fn recorded_event_is_pruned(&self, correlation_id: &str, sequence: u64) -> bool {
@@ -1077,79 +1048,6 @@ impl GraphScoringPlan {
         self.correlations
             .get(correlation_id)
             .is_some_and(|entry| entry.novel_replay_events.contains(&index))
-    }
-
-    pub(crate) fn replay_event_uses_flat_tier(&self, correlation_id: &str, index: usize) -> bool {
-        self.correlations
-            .get(correlation_id)
-            .is_some_and(|entry| entry.flat_replay_events.contains(&index))
-    }
-
-    pub(crate) fn recorded_event_sequences(
-        &self,
-        correlation_id: &str,
-        record_node: u64,
-        include_subtree: bool,
-    ) -> Vec<u64> {
-        let Some(forest) = self
-            .correlations
-            .get(correlation_id)
-            .and_then(|entry| entry.record.as_ref())
-        else {
-            return Vec::new();
-        };
-        forest_event_sequences(forest, record_node, include_subtree)
-    }
-
-    pub(crate) fn replay_event_indices(
-        &self,
-        correlation_id: &str,
-        replay_node: u64,
-        include_subtree: bool,
-    ) -> Vec<usize> {
-        let Some(forest) = self
-            .correlations
-            .get(correlation_id)
-            .and_then(|entry| entry.replay.as_ref())
-        else {
-            return Vec::new();
-        };
-        forest_event_sequences(forest, replay_node, include_subtree)
-            .into_iter()
-            .map(|index| index as usize)
-            .collect()
-    }
-
-    pub(crate) fn alignment_recorded_sequences(
-        &self,
-        correlation_id: &str,
-        row: &deja_forest::AlignedNode,
-    ) -> Vec<u64> {
-        row.record_node
-            .map(|node| {
-                self.recorded_event_sequences(
-                    correlation_id,
-                    node,
-                    matches!(&row.outcome, deja_forest::NodeOutcome::PrunedSubtree { .. }),
-                )
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn alignment_replay_indices(
-        &self,
-        correlation_id: &str,
-        row: &deja_forest::AlignedNode,
-    ) -> Vec<usize> {
-        row.replay_node
-            .map(|node| {
-                self.replay_event_indices(
-                    correlation_id,
-                    node,
-                    matches!(&row.outcome, deja_forest::NodeOutcome::NovelSubtree { .. }),
-                )
-            })
-            .unwrap_or_default()
     }
 
     fn scored_alignment(
@@ -1185,6 +1083,48 @@ impl GraphScoringPlan {
         }
         Some(alignment)
     }
+}
+
+/// A tape whose recorded events do not have unique sequence numbers.
+///
+/// `global_sequence` is a per-process counter. A recording pulled from several
+/// recorder processes places each stream on its own range at ingest
+/// (`s3::Renumbering`); a tape materialized before that existed still carries
+/// every stream counting from zero. The lookup is keyed by correlation and
+/// serves correctly either way, but this module keys recorded events by bare
+/// sequence in a dozen places — the ledger's recorded side, the consumed and
+/// expected sets, the forest's event refs, the rank-2 span paths — and each of
+/// them answers with whichever stream's event was inserted last. That is a
+/// wrong recorded twin on a matched row, a hidden omission, an ingress event
+/// reported as an omitted side-effect call. Named here so the scorecard says
+/// which of its rows can be trusted, and what to do: re-ingest.
+fn tape_identity_warning(events: &[deja::BoundaryEvent]) -> Option<String> {
+    let mut streams_by_sequence: HashMap<u64, BTreeSet<Option<&str>>> = HashMap::new();
+    for event in events {
+        streams_by_sequence
+            .entry(event.global_sequence)
+            .or_default()
+            .insert(event.recording_run_id.as_deref());
+    }
+    let colliding = streams_by_sequence
+        .values()
+        .filter(|streams| streams.len() > 1)
+        .count();
+    if colliding == 0 {
+        return None;
+    }
+    let streams: BTreeSet<Option<&str>> = events
+        .iter()
+        .map(|event| event.recording_run_id.as_deref())
+        .collect();
+    Some(format!(
+        "{colliding} recorded sequence number(s) are shared by events from different producer \
+         streams ({} stream(s) on this tape): the tape was materialized before its streams were \
+         placed on one sequence space, so a recorded twin, a recorded span path or an omitted \
+         call may name another request's event — re-ingest the recording; the verdict's \
+         http rows and lookup resolutions are unaffected",
+        streams.len()
+    ))
 }
 
 fn event_bearing_ingress_root(forest: &deja_forest::ActivationForest) -> bool {
@@ -2228,13 +2168,33 @@ enum ValueAbsorption {
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
-/// reason. Callers that only need the bool use [`values_diverge_under_event`];
-/// callers that need to SAY why a difference stopped counting use this.
+/// reason, so a caller can SAY why a difference stopped counting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueVerdict {
     Equal,
     Absorbed(ValueAbsorption),
     Diverged,
+}
+
+/// What a pair SENT, judged. A pair is one call whose address missed only by its
+/// arguments, and its arguments are the outgoing request: the part of the call
+/// the candidate produced, and so the part it is asserted on. Its result is what
+/// came back IN from the boundary — an input to the candidate, not an output of
+/// it — so a pair whose arguments agree missed its address by position alone,
+/// and is a match whatever it got back.
+///
+/// The comparison is the one every value goes through ([`value_verdict`]): an
+/// order-only permutation, a recorder-declared clause and replay-local database
+/// infrastructure are absorbed here exactly as they are anywhere else.
+fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+    let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
+    value_verdict(
+        &call.boundary,
+        &recorded,
+        &call.args,
+        twin,
+        call.args.get("sql").and_then(serde_json::Value::as_str),
+    )
 }
 
 fn value_verdict(
@@ -2278,23 +2238,6 @@ fn value_verdict(
     ValueVerdict::Diverged
 }
 
-/// Whether a matched call's values diverge — the bool a caller that only routes
-/// on the outcome needs. A caller that has to REPORT why a difference did not
-/// count must use [`value_verdict`] instead: taking this bool because it is
-/// here is how a reason gets discarded on the way to the scorecard.
-pub(crate) fn values_diverge_under_event(
-    boundary: &str,
-    recorded: &serde_json::Value,
-    observed: &serde_json::Value,
-    event: Option<&deja::BoundaryEvent>,
-    observed_sql: Option<&str>,
-) -> bool {
-    matches!(
-        value_verdict(boundary, recorded, observed, event, observed_sql),
-        ValueVerdict::Diverged
-    )
-}
-
 /// [`value_verdict`] for an execute-shadow observed call against its recorded
 /// baseline; `None` when the call carries no pair to compare (not resolved, not
 /// a shadow, or a side missing).
@@ -2317,8 +2260,10 @@ fn observed_value_verdict(
     }
 }
 
-/// See [`values_diverge_under_event`] for why a caller needing the reason must
-/// not take this bool.
+/// Whether a resolved call's executed value diverged — a bool for callers that
+/// only route on the outcome. A caller that has to REPORT why a difference did
+/// not count must use [`value_verdict`] instead: taking this bool because it is
+/// here is how a reason gets discarded on the way to the scorecard.
 pub(crate) fn observed_value_diverged(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
@@ -2602,14 +2547,26 @@ impl<'a> ArgsFreePairing<'a> {
         }
         let mut addressed: BTreeMap<u64, Addressed<'_>> = BTreeMap::new();
         for entry in &table.entries {
-            let slot = addressed
+            // FIRST entry per sequence wins. In a rendered table every rank of
+            // one event carries that event's own boundary and operation — the
+            // ranks differ in the ADDRESS they are looked up by, not in whose
+            // call it is — so which one lands here does not matter.
+            //
+            // That is a property of the renderer, not something this loop
+            // checks, and it cannot be asserted here: the test fixtures build
+            // their rank-2 entries by copying a rank-6 one and overwriting the
+            // boundary (`span_entry`), so a `debug_assert_eq!` on identity
+            // across an event's entries fails 32 tests on fixture artifacts
+            // while saying nothing about real tables. Pinning it properly means
+            // selecting by rank rather than by position, which `Locus` cannot
+            // express today (it has no rank-6 variant).
+            addressed
                 .entry(entry.source_event_global_sequence)
                 .or_insert(Addressed {
                     correlation: entry.key.correlation_id.as_deref(),
                     boundary: entry.key.boundary.as_str(),
                     method: entry.key.operation.as_str(),
                 });
-            let _ = slot;
         }
 
         // `addressed` is ordered by sequence, so each queue comes out in source
@@ -2706,6 +2663,122 @@ impl<'a> ArgsFreePairing<'a> {
             }
         }
         None
+    }
+}
+
+/// How every call the candidate made pairs with the recording — decided ONCE,
+/// from the addresses, and read by both the scorecard and the ledger, so the two
+/// can never pair one call two ways.
+///
+/// A resolved call is paired with the event its address served. An unresolved
+/// call is then paired by its address minus its args — the same correlation,
+/// span, boundary and operation, first unclaimed — which makes it ONE call whose
+/// input changed rather than a novel call beside an omitted one. Identity is
+/// never relaxed, so a call only ever pairs with the same call. The forest's span
+/// alignment is not consulted: a span holding one event on each side says nothing
+/// about whether those two are one call, and treating it as if it did paired a
+/// uuid draw with an outbound HTTP call.
+///
+/// Every resolved claim is taken before the first twin, so no unresolved call
+/// can take an event a later resolved call owns — the double claim behind the
+/// run-0810 phantom, which is why the scorecard pairs in two passes.
+pub(crate) struct CallPairing {
+    twins: HashMap<usize, ArgsFreePairingResult>,
+    /// Pairs that are the displaced half of an order change another pair already
+    /// reports. See [`CallPairing::changed`].
+    displaced: HashSet<usize>,
+}
+
+impl CallPairing {
+    pub(crate) fn build(
+        table: &LookupTable,
+        events: &[deja::BoundaryEvent],
+        observed: &[ObservedCall],
+        provenance: &CorrelationColumnProvenance,
+    ) -> Self {
+        let resolved: HashSet<u64> = observed
+            .iter()
+            .filter(|call| call.resolved && !observed_is_ingress(call))
+            .filter_map(|call| call.source_event_global_sequence)
+            .collect();
+        let mut pool = ArgsFreePairing::build(table, events, provenance);
+        // An uncorrelated call has no correlation in its address to pair within.
+        let twins: Vec<(usize, ArgsFreePairingResult)> = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                !call.resolved && !observed_is_ingress(call) && call.correlation_id.is_some()
+            })
+            .filter_map(|(index, call)| pool.take_twin(call, &resolved).map(|twin| (index, twin)))
+            .collect();
+
+        // Pairing is FIFO, so two requests sent in swapped order produce two
+        // pairs: the one that jumped ahead is flagged out of order, and the one
+        // it displaced is left paired with the other's recorded request. The
+        // second is the SAME change, not another. A request an out-of-order pair
+        // claimed can explain exactly one displaced call in its pool; a call that
+        // matches none of them changed what it sent, and still counts.
+        let events_by_sequence: HashMap<u64, &deja::BoundaryEvent> = events
+            .iter()
+            .map(|event| (event.global_sequence, event))
+            .collect();
+        let pool_of = |call: &ObservedCall| {
+            (
+                call.correlation_id.clone(),
+                call.span_path.clone(),
+                call.boundary.clone(),
+                call.method_name.clone(),
+            )
+        };
+        let mut claimed_out_of_order: HashMap<_, Vec<&deja::BoundaryEvent>> = HashMap::new();
+        for (index, twin) in twins.iter().filter(|(_, twin)| twin.order_mismatch) {
+            if let Some(event) = events_by_sequence.get(&twin.sequence) {
+                claimed_out_of_order
+                    .entry(pool_of(&observed[*index]))
+                    .or_default()
+                    .push(event);
+            }
+        }
+        let mut displaced = HashSet::new();
+        for (index, _) in twins.iter().filter(|(_, twin)| !twin.order_mismatch) {
+            let call = &observed[*index];
+            let Some(requests) = claimed_out_of_order.get_mut(&pool_of(call)) else {
+                continue;
+            };
+            let same_request = requests.iter().position(|event| {
+                !matches!(
+                    pair_request_verdict(call, Some(event)),
+                    ValueVerdict::Diverged
+                )
+            });
+            if let Some(at) = same_request {
+                requests.remove(at);
+                displaced.insert(*index);
+            }
+        }
+        Self {
+            twins: twins.into_iter().collect(),
+            displaced,
+        }
+    }
+
+    /// Whether the pair at `index` changed what it sent: it went out of order,
+    /// or its request is not the one the recording sent there. The displaced
+    /// half of an order change another pair reports is that same change, and is
+    /// not counted twice. Both the scorecard and the ledger decide through here.
+    pub(crate) fn changed(
+        &self,
+        index: usize,
+        request_diverged: bool,
+        order_mismatch: bool,
+    ) -> bool {
+        order_mismatch || (request_diverged && !self.displaced.contains(&index))
+    }
+
+    /// The recorded event the call at `index` pairs with by its address minus its
+    /// args, if any. A resolved call's pair is its own served event.
+    pub(crate) fn twin(&self, index: usize) -> Option<&ArgsFreePairingResult> {
+        self.twins.get(&index)
     }
 }
 
@@ -4254,29 +4327,6 @@ impl TailGapEvidence {
             .and_then(|correlation| self.tail_begins_at.get(correlation))
             .is_some_and(|tail_begins_at| observed_index >= *tail_begins_at)
     }
-
-    /// Re-express these indices against a FILTERED observed stream, where
-    /// `retained` lists — ascending — the original indices that survived.
-    ///
-    /// The graph-mode ledger scores flat-tier correlations through a rebuilt
-    /// sub-stream, and an index means nothing outside the stream it was taken
-    /// from. Handing the original indices to that sub-stream would demote
-    /// whichever calls happened to land on those positions, which is the
-    /// divergence-hiding failure this class exists to avoid.
-    pub(crate) fn remap_to(&self, retained: &[usize]) -> TailGapEvidence {
-        TailGapEvidence {
-            tail_begins_at: self
-                .tail_begins_at
-                .iter()
-                .map(|(correlation, original)| {
-                    (
-                        correlation.clone(),
-                        retained.partition_point(|index| index < original),
-                    )
-                })
-                .collect(),
-        }
-    }
 }
 
 /// Build [`TailGapEvidence`]. A correlation qualifies only when ALL of these
@@ -4471,7 +4521,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // pairing shapes and can absorb same-correlation response leaves. It never
     // classifies inherited returned-row state or infers provenance.
     let column_provenance = correlation_column_provenance(&art.events, &art.observed);
-    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events, &column_provenance);
+    let pairing = CallPairing::build(&art.table, &art.events, &art.observed, &column_provenance);
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
@@ -4577,62 +4627,23 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if observed_is_ingress(obs) {
             continue;
         }
-        if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
-            graph_plan.replay_event_is_novel(correlation_id, observed_index)
-        }) {
-            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-            if tier_for(&obs.boundary) == Tier::Environmental {
-                stats.bump_kind("EnvironmentalMiss");
-                environmental_misses += 1;
-            } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
-                stats.bump_kind("DeterministicMiss");
-            } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
-                // The recording for this correlation stopped at request teardown
-                // and this call comes after it. There is no baseline to judge it
-                // against, so it is neither novel nor matched — see TailGapEvidence.
-                stats.bump_kind("InconclusiveTailGap");
-                if let Some(correlation_id) = &obs.correlation_id {
-                    tail_gap_correlations.insert(correlation_id.clone());
-                }
-            } else {
-                // Shown, not scored — the graph tier's form of the same call the
-                // flat arm below makes. A novel subtree is added work, at a
-                // coarser granularity than a novel call and of the same kind, so
-                // it is counted and named and charged to nothing. See the note on
-                // the `NovelCall` arm.
-                stats.bump_kind("NovelSubtree");
-            }
-            continue;
-        }
-        if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
-            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-            // ORDER, AND ONLY ORDER. A skew means both sides made the same
-            // calls and each one resolved to its own recorded event — the two
-            // PAIRING methods disagree about which goes with which. The lookup
-            // pairs by args and is order-independent; the graph aligner pairs
-            // structurally by position. Run the same work concurrently and the
-            // two disagree, which is the skew.
-            //
-            // A skew therefore cannot hide a content difference. Under Execute
-            // the candidate runs the real boundary and a differing result is
-            // `ValueDivergedOrigin`; under Substitute the recorded value is
-            // served and there is nothing to differ. Either way the mechanism
-            // that would catch content is elsewhere and still blocking.
-            //
-            // So this is the rule c7c8918 already established for arrays —
-            // "a permutation of an identical multiset is not a difference" —
-            // reaching graph pairing. Counted and named, charged to nothing.
-            stats.bump_kind("IdentitySkew");
-            identity_skews += 1;
-            consumed.extend(aligned_event);
-            consumed.extend(served_event);
-            continue;
-        }
+        // The address pairs a call, before structure is consulted. A resolved
+        // call is paired with the event it resolved to, wherever the aligner put
+        // its span; an unresolved call is paired in pass 2, once every resolved
+        // claim is in.
         if !obs.resolved {
             deferred.push((observed_index, obs));
             continue;
         }
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+        // The aligner bound this call's span crosswise to the event its address
+        // served. That is a fact about structure, not about the call: the call is
+        // paired by its address and scored below, and the crosswise binding is
+        // named and charged to nothing.
+        if graph_identity_skew(graph_plan, obs).is_some() {
+            stats.note_kind("IdentitySkew");
+            identity_skews += 1;
+        }
         {
             // The recorded baseline was found (args still aligned). Under lookup
             // mode observed_result == recorded_result (substituted) so this is a
@@ -4758,37 +4769,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // occurrence stable). `consumed` is complete: no pairing decision below
     // can bind a recorded event that a resolved call owns.
     for (observed_index, obs) in deferred {
-        if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
-            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-            // Order only — see the note on the pass-1 arm.
-            stats.bump_kind("IdentitySkew");
-            identity_skews += 1;
-            paired_consumed.extend(aligned_event);
-            paired_consumed.extend(served_event);
-            continue;
-        }
-        let graph_mode = graph_plan.is_graph(obs.correlation_id.as_deref())
-            && obs.correlation_id.as_deref().is_some_and(|correlation_id| {
-                !graph_plan.replay_event_uses_flat_tier(correlation_id, observed_index)
-                    && obs.graph_node_id.is_some_and(|node_id| {
-                        !graph_plan.replay_node_uses_flat_tier(correlation_id, node_id)
-                    })
-            });
-        let paired_twin = if graph_mode {
-            obs.correlation_id
-                .as_deref()
-                .zip(obs.graph_node_id)
-                .and_then(|(correlation_id, node_id)| {
-                    graph_plan.recorded_sequence_for_replay_node(correlation_id, node_id)
-                })
-                .map(|sequence| ArgsFreePairingResult {
-                    sequence,
-                    order_mismatch: false,
-                })
-        } else {
-            recorded_pairing.take_twin(obs, &consumed)
-        }
-        .map(|twin| {
+        // Paired before any policy is asked (see `CallPairing`). A pair is one
+        // call whose input changed, and that is a divergence at whatever tier
+        // the boundary sits: an outbound request the candidate altered is its
+        // own output, not the environment's.
+        let paired_twin = pairing.twin(observed_index).map(|twin| {
             let result = expected
                 .get(&twin.sequence)
                 .map(|exp| exp.result.clone())
@@ -4796,19 +4781,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             (twin.sequence, twin.order_mismatch, result)
         });
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-        if tier_for(&obs.boundary) == Tier::Environmental {
-            stats.bump_kind("EnvironmentalMiss");
-            environmental_misses += 1;
-        } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
-            // Deterministic-live (crypto/time/id/rng) or the request boundary
-            // (ingress) — not a real divergence. See is_nonblocking_boundary.
-            stats.bump_kind("DeterministicMiss");
-        } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
-            // Background-task call with no correlation — tolerated in V1. Named
-            // apart from the blocking `NovelCall` because it is a different
-            // thing, not a different count of the same thing.
-            stats.bump_kind("NovelCallTolerated");
-        } else if let Some((twin_seq, order_mismatch, recorded)) = paired_twin {
+        if let Some((twin_seq, order_mismatch, recorded)) = paired_twin {
             // GOTCHA #1 resolution: this unresolved observed call pairs args-free
             // (correlation+boundary+method, FIFO occurrence) with a recorded twin
             // that the candidate "omitted" because its args were re-keyed. The
@@ -4817,20 +4790,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let verdict = value_verdict(
-                &obs.boundary,
-                &recorded_val,
-                &observed_val,
-                twin_event,
-                obs.args.get("sql").and_then(serde_json::Value::as_str),
-            );
+            let verdict = pair_request_verdict(obs, twin_event);
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
             }
-            let value_diverged = order_mismatch || matches!(verdict, ValueVerdict::Diverged);
+            let value_diverged = pairing.changed(
+                observed_index,
+                matches!(verdict, ValueVerdict::Diverged),
+                order_mismatch,
+            );
             if value_diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -4890,13 +4861,52 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     }
                 }
             } else {
-                // Re-keyed but identical value — the write reproduced. Count it as
-                // a (recovered) match rather than a Novel+Omitted split.
+                // It sent what the recording sent; its address missed by position
+                // alone. A (recovered) match, not a Novel+Omitted split.
                 stats.matched += 1;
                 matched_side_effect_calls += 1;
             }
             // Either way the recorded twin is accounted for here, not omitted.
             paired_consumed.insert(twin_seq);
+        } else if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
+            graph_plan.replay_event_is_novel(correlation_id, observed_index)
+        }) {
+            // Unpaired, inside a subtree the recording never had. Structure names
+            // WHERE the added work is; it is the graph tier's form of the same
+            // unpaired call the arms below classify.
+            if tier_for(&obs.boundary) == Tier::Environmental {
+                stats.bump_kind("EnvironmentalMiss");
+                environmental_misses += 1;
+            } else if observed_miss_is_excused(obs) {
+                stats.bump_kind("DeterministicMiss");
+            } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+                // The recording for this correlation stopped at request teardown
+                // and this call comes after it. There is no baseline to judge it
+                // against, so it is neither novel nor matched — see TailGapEvidence.
+                stats.bump_kind("InconclusiveTailGap");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    tail_gap_correlations.insert(correlation_id.clone());
+                }
+            } else {
+                // Shown, not scored. A novel subtree is added work, at a coarser
+                // granularity than a novel call and of the same kind, so it is
+                // counted and named and charged to nothing. See the note on the
+                // `NovelCall` arm.
+                stats.bump_kind("NovelSubtree");
+            }
+        } else if tier_for(&obs.boundary) == Tier::Environmental {
+            stats.bump_kind("EnvironmentalMiss");
+            environmental_misses += 1;
+        } else if observed_miss_is_excused(obs) {
+            // Deterministic-live (crypto/time/id/rng) or the request boundary
+            // (ingress) — not a real divergence, unless the miss stopped the
+            // request. See observed_miss_is_excused.
+            stats.bump_kind("DeterministicMiss");
+        } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
+            // Background-task call with no correlation — tolerated in V1. Named
+            // apart from the blocking `NovelCall` because it is a different
+            // thing, not a different count of the same thing.
+            stats.bump_kind("NovelCallTolerated");
         } else if obs.seed_gap {
             // Execute-mode State call that ran the REAL boundary but found no
             // recorded baseline to compare against (no pairing either). Surface as
@@ -4970,7 +4980,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         let pruned = exp.correlation.is_some_and(|correlation_id| {
             graph_recorded_event_is_pruned(graph_plan, correlation_id, *seq)
         });
-        if !pruned && (consumed.contains(seq) || paired_consumed.contains(seq)) {
+        // Claimed by an address — resolved, or paired minus its args — is
+        // accounted for, whatever structure concluded about its span.
+        if consumed.contains(seq) || paired_consumed.contains(seq) {
             continue;
         }
         // No `"unknown"` fallback any more. That string existed because the
@@ -5139,6 +5151,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut novel_scored_spans = 0u64;
     let mut span_field_divergences = 0u64;
     let mut warnings_extra: Vec<String> = Vec::new();
+    if let Some(warning) = tape_identity_warning(&art.events) {
+        warnings_extra.push(warning);
+    }
     let mut span_shapes: BTreeMap<String, span_shape::CorrelationSpanShape> = BTreeMap::new();
     if !art.scored_span_namespaces.is_empty() {
         match art.record_graph.as_ref() {
@@ -5373,6 +5388,42 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
 
     let mut warnings = art.warnings.clone();
     warnings.extend(warnings_extra);
+    // The call each request STOPPED at. The transport warning can only say that
+    // no response came back; the runtime recorded why, and the reason is what a
+    // reader acts on. Grouped by call site, so a hundred requests ending at one
+    // line read as one fact rather than a hundred.
+    {
+        let mut stops: BTreeMap<(&str, &str, String, bool), BTreeSet<&str>> = BTreeMap::new();
+        for call in &art.observed {
+            if call.outcome != deja::SubstituteOutcome::Stopped {
+                continue;
+            }
+            let Some(correlation_id) = call.correlation_id.as_deref() else {
+                continue;
+            };
+            let site = match (call.call_file.as_deref(), call.call_line) {
+                (Some(file), Some(line)) => format!("{file}:{line}"),
+                _ => "an unrecorded location".to_owned(),
+            };
+            stops
+                .entry((&call.boundary, &call.method_name, site, call.resolved))
+                .or_default()
+                .insert(correlation_id);
+        }
+        for ((boundary, method, site, resolved), requests) in &stops {
+            warnings.push(format!(
+                "{} request(s) stopped at {boundary}/{method} ({site}): {} — the missing \
+                 response and every call after it follow from this one stop, not from \
+                 separate changes",
+                requests.len(),
+                if *resolved {
+                    "its recorded value would not rebuild"
+                } else {
+                    "the recording holds no value for this call"
+                },
+            ));
+        }
+    }
     for (seq, row) in &inconclusive_race.row_labels {
         warnings.push(format!(
             "inconclusive_race event {seq} on db row {row}: auto-rerun recommended"
@@ -5616,9 +5667,12 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .map(crate::scope::RunScope::of)
         .unwrap_or_else(crate::scope::RunScope::entire_session);
     let correlation_scope: Option<std::collections::BTreeSet<String>> = scope.ids().cloned();
+    // Resolved the same way the params row was, so what the run's record says
+    // is scored and what the scorer scores cannot differ — see
+    // `RunSpec::effective_scored_span_namespaces`.
     let scored_span_namespaces = run
         .as_ref()
-        .map(|run| run.spec.scored_span_namespaces.clone())
+        .map(|run| run.spec.effective_scored_span_namespaces())
         .unwrap_or_default();
     // The system's own declaration, not the run's: whether an array is a set is
     // a property of the recorded system's contract, so it is read from the
@@ -6073,6 +6127,21 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Whether two values diverge under the comparison every value goes through
+    /// ([`value_verdict`]), as a bool, for tests that pin the comparison itself.
+    fn values_diverge_under_event(
+        boundary: &str,
+        recorded: &serde_json::Value,
+        observed: &serde_json::Value,
+        event: Option<&deja::BoundaryEvent>,
+        observed_sql: Option<&str>,
+    ) -> bool {
+        matches!(
+            value_verdict(boundary, recorded, observed, event, observed_sql),
+            ValueVerdict::Diverged
+        )
+    }
     use deja::{Locus, LookupEntry, LookupKey};
     use deja_kernel::JsonFieldDiff;
 
@@ -6459,6 +6528,85 @@ mod tests {
     fn with_span(mut o: ObservedCall, path: &str) -> ObservedCall {
         o.span_path = Some(path.to_owned());
         o
+    }
+
+    fn run_with_namespaces(
+        root: &HarnessRoot,
+        run_id: &str,
+        namespaces: Vec<String>,
+    ) -> crate::RunSpec {
+        let spec = crate::RunSpec {
+            scored_span_namespaces: namespaces,
+            mode: crate::RunMode::Replay,
+            system_under_test: Some("prism".to_owned()),
+            candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                image: "deja-demo".to_owned(),
+            },
+            candidate_repo: None,
+            recording_id: Some("rec-ns".to_owned()),
+            recording_group: None,
+            s3_source: None,
+            correlation_filter: None,
+            workload: serde_json::Value::Null,
+        };
+        crate::write_json(
+            &root.run_path(run_id),
+            &crate::Run {
+                run_id: run_id.to_owned(),
+                spec: spec.clone(),
+                status: crate::RunStatus::Completed,
+                recording_id: Some("rec-ns".to_owned()),
+                candidate_image: None,
+                failure_reason: None,
+                stage: None,
+                step: 0,
+                steps_total: 0,
+                stage_updated_ms: 0,
+            },
+        )
+        .unwrap();
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: "rec-ns".to_owned(),
+                policy_version: deja::POLICY_VERSION,
+                entries: vec![],
+            },
+        )
+        .unwrap();
+        spec
+    }
+
+    /// The namespaces the scorer checks are the ones the run's own params row
+    /// says it checks. The row resolved an empty spec to the system's
+    /// declaration while the scorer read the raw spec: every CI-created prism
+    /// run showed `["ucs::", "connector::"]` and scored no span at all.
+    #[test]
+    fn the_scorer_checks_the_namespaces_the_params_row_says_it_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+
+        let explicit = run_with_namespaces(&root, "run-ns-explicit", vec!["x::".to_owned()]);
+        let art = load_artifacts(&root, "run-ns-explicit").unwrap();
+        assert_eq!(art.scored_span_namespaces, vec!["x::".to_owned()]);
+        assert_eq!(
+            art.scored_span_namespaces,
+            crate::RunParams::resolved(&explicit, None).scored_span_namespaces
+        );
+
+        // An empty spec — what the API and CI send — resolves through the same
+        // seam as the params row, so the two cannot disagree whatever the
+        // system declares in this environment.
+        let empty = run_with_namespaces(&root, "run-ns-empty", Vec::new());
+        let art = load_artifacts(&root, "run-ns-empty").unwrap();
+        assert_eq!(
+            art.scored_span_namespaces,
+            crate::RunParams::resolved(&empty, None).scored_span_namespaces
+        );
+        assert_eq!(
+            art.scored_span_namespaces,
+            empty.effective_scored_span_namespaces()
+        );
     }
 
     /// A correlation filter must scope scoring to the DRIVEN subset: an
@@ -9939,7 +10087,7 @@ mod tests {
         let c_recorded_read = serde_json::json!({"c_seen": "derived-from-recorded"});
         let c_candidate_read = serde_json::json!({"c_seen": "derived-from-candidate"});
 
-        let card = detect(&art(
+        let mut artifacts = art(
             vec![
                 seq_entry_method_res(Some(corr), "storage", "write_a", 10, a_write_ack.clone()),
                 seq_entry_method_res(Some(corr), "redis", "read_a", 11, b_recorded_read.clone()),
@@ -10002,7 +10150,26 @@ mod tests {
                 ),
             ],
             vec![http(corr, true, vec![])],
-        ));
+        );
+        // B' and C were re-keyed by B's changed read: what each SENT carries the
+        // value it was derived from, recorded on the tape and changed by the
+        // candidate. That difference is where the two pairs are judged.
+        let recorded_request = |sequence, boundary, operation: &str| {
+            let mut event = omitted_ev(sequence, boundary, Some(corr));
+            event.method_name = operation.to_owned();
+            event.args = serde_json::json!({"b_prime": "derived-from-recorded"}).into();
+            event
+        };
+        artifacts.events = vec![
+            recorded_request(12, "storage", "write_b_prime"),
+            recorded_request(13, "db", "read_b_prime"),
+        ];
+        for call in &mut artifacts.observed {
+            if matches!(call.method_name.as_str(), "write_b_prime" | "read_b_prime") {
+                call.args = serde_json::json!({"b_prime": "derived-from-candidate"});
+            }
+        }
+        let card = detect(&artifacts);
 
         assert_eq!(card.summary.http_status_mismatches, 0);
         assert_eq!(card.summary.http_body_mismatches, 0);
@@ -10110,6 +10277,14 @@ mod tests {
         );
         downstream_observation.args = serde_json::json!({"source": envelope(raced_row.clone())});
 
+        // What the downstream write SENT in the recording: the row it read before
+        // the conflicting write landed.
+        let mut recorded_downstream = omitted_ev(302, "storage", Some(corr));
+        recorded_downstream.method_name = "write_branch".to_owned();
+        recorded_downstream.args = serde_json::json!({
+            "source": envelope(serde_json::json!({"attempt_id": "pay_1", "status": "pending"}))
+        })
+        .into();
         let card = detect(&art_with_events(
             vec![
                 seq_entry_method_res(
@@ -10123,7 +10298,7 @@ mod tests {
             ],
             vec![read_observation, downstream_observation],
             vec![http(corr, true, vec![])],
-            vec![read_event, conflicting_write],
+            vec![read_event, conflicting_write, recorded_downstream],
         ));
         let wire = serde_json::to_value(&card).unwrap();
 
@@ -10648,13 +10823,49 @@ mod tests {
         );
     }
 
+    /// Every field in `IDENTITY_FIELDS` must SEPARATE, not merely survive.
+    ///
+    /// The test above asserts a re-keyed cache write keeps its twin —
+    /// `shape(cache=A,key=a) == shape(cache=A,key=b)` — which stays true when
+    /// `cache` is dropped from the identity altogether, because both sides
+    /// collapse to `key`. An equality is the one assertion that cannot notice a
+    /// field going missing, so `cache` was covered in the only direction that
+    /// could not fail. `endpoint` and `operation` had no assertion at all.
+    ///
+    /// All three name a distinct call in production: `cache` from
+    /// `storage_impl/src/redis/cache.rs`, `endpoint` from
+    /// `common_utils/src/keymanager.rs`, and `operation` from every diesel
+    /// generic via `deja/src/lib.rs` — `generic_insert` and `generic_delete`
+    /// are different calls on one table.
+    #[test]
+    fn each_identity_field_separates_calls_that_differ_only_in_it() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+
+        assert_ne!(
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
+            shape(&serde_json::json!({"cache": "CONFIG_CACHE", "key": "a"})),
+            "two different caches are two different calls"
+        );
+        assert_ne!(
+            shape(&serde_json::json!({"endpoint": "/key/transfer", "id": "m1"})),
+            shape(&serde_json::json!({"endpoint": "/key/rotate", "id": "m1"})),
+            "two different keymanager endpoints are two different calls"
+        );
+        assert_ne!(
+            shape(&serde_json::json!({"operation": "generic_insert", "table": "payment_attempt"})),
+            shape(&serde_json::json!({"operation": "generic_delete", "table": "payment_attempt"})),
+            "an insert and a delete on one table are two different calls"
+        );
+    }
+
     #[test]
     fn rekeyed_write_pairs_args_free_into_one_value_divergence() {
         // GOTCHA #1: the diverged WRITE carries a mutated operand, so its args
         // miss the recorded baseline → recorded twin would be Omitted, the execute
         // call would be Novel. The args-free pairing must collapse them into ONE
         // ValueDiverged (NOT Novel+Omitted), and flip the correlation to diverged.
-        let card = detect(&art(
+        let mut artifacts = art(
             vec![
                 seq_entry_res(Some("c1"), "storage", 7, serde_json::json!(100)),
                 span_entry(Some("c1"), 7, "root>write_amount"),
@@ -10671,7 +10882,14 @@ mod tests {
                 "root>write_amount", // same call site — the identity that pairs
             )],
             vec![http("c1", true, vec![])],
-        ));
+        );
+        // The operand is part of what each side SENT, which is where a pair is
+        // judged: the recorded write sent 100, the candidate's sends 200.
+        let mut recorded = omitted_ev(7, "storage", Some("c1"));
+        recorded.args = serde_json::json!({"amount": 100}).into();
+        artifacts.events.push(recorded);
+        artifacts.observed[0].args = serde_json::json!({"amount": 200});
+        let card = detect(&artifacts);
         assert_eq!(card.summary.value_divergences, 1, "one value divergence");
         assert_eq!(card.summary.novel_calls, 0, "not a Novel");
         assert_eq!(card.summary.omitted_calls, 0, "not an Omitted");
@@ -11196,33 +11414,85 @@ mod tests {
         assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
-    #[test]
-    fn rekeyed_write_with_same_value_is_recovered_match_not_split() {
-        // A re-keyed call (args missed) whose VALUE nonetheless reproduced is
-        // paired args-free and counted as a match — never a Novel+Omitted split.
-        let card = detect(&art(
+    /// A write whose address missed, recorded under `root>write_v` with
+    /// `recorded_args`, and the candidate's unresolved call there with
+    /// `observed_args`. Both got back the same value.
+    fn paired_write(
+        recorded_args: Option<serde_json::Value>,
+        observed_args: serde_json::Value,
+    ) -> RunArtifacts {
+        let mut call = with_span(
+            exec_obs(
+                "storage",
+                Some("c1"),
+                false,
+                None,
+                None,
+                serde_json::json!("v"),
+            ),
+            "root>write_v",
+        );
+        call.args = observed_args;
+        let events = recorded_args
+            .map(|args| {
+                let mut event = omitted_ev(7, "storage", Some("c1"));
+                event.args = args.into();
+                vec![event]
+            })
+            .unwrap_or_default();
+        art_with_events(
             vec![
                 seq_entry_res(Some("c1"), "storage", 7, serde_json::json!("v")),
                 span_entry(Some("c1"), 7, "root>write_v"),
             ],
-            vec![with_span(
-                exec_obs(
-                    "storage",
-                    Some("c1"),
-                    false,
-                    None,
-                    None,
-                    serde_json::json!("v"),
-                ),
-                "root>write_v",
-            )],
+            vec![call],
             vec![http("c1", true, vec![])],
+            events,
+        )
+    }
+
+    /// A call that missed its address but sent what the recording sent — the same
+    /// arguments at a shifted position — is paired and matched: never a
+    /// Novel+Omitted split.
+    #[test]
+    fn a_paired_call_that_sent_the_same_request_is_a_recovered_match() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({"value": 1})),
+            serde_json::json!({"value": 1}),
         ));
         assert_eq!(card.summary.value_divergences, 0);
         assert_eq!(card.summary.novel_calls, 0);
         assert_eq!(card.summary.omitted_calls, 0);
         assert_eq!(card.summary.matched_side_effect_calls, 1);
         assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// What goes out is asserted; what comes back is not. A call that sent a
+    /// different request diverges even though the boundary answered it with the
+    /// value the recording got — judging it by that value called it a match.
+    #[test]
+    fn a_paired_call_that_sent_a_different_request_diverges_whatever_came_back() {
+        let art = paired_write(
+            Some(serde_json::json!({"value": 1})),
+            serde_json::json!({"value": 2}),
+        );
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 0);
+        assert!(!card.verdict.pass);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let changed: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(changed.len(), 1, "{rows:?}");
+        assert!(changed[0].blocking);
+    }
+
+    /// A pair whose recorded request the tape does not hold cannot be shown to
+    /// have sent what the recording sent, and is not assumed to have.
+    #[test]
+    fn a_pair_whose_recorded_request_is_not_on_the_tape_is_not_assumed_to_agree() {
+        let card = detect(&paired_write(None, serde_json::json!({"value": 1})));
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 0);
     }
 
     /// The run-0810 phantom-lock shape. An error path makes a novel call of a
@@ -11933,9 +12203,18 @@ mod tests {
         let rows = build_ledger(&art).expect("ledger builds");
         let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
         assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        // Nothing upstream of this write returned a different value, so the
+        // changed operand did not arrive from anywhere — the candidate produced
+        // it. That makes the write the origin. It used to be labelled a
+        // consequence regardless, and the viewer then pointed at "an origin
+        // above it" that did not exist.
         assert!(
-            !diverged[0].origin,
-            "the write is the consequence, not the cause"
+            diverged[0].origin,
+            "a re-keyed write with no origin upstream is itself the origin"
+        );
+        assert!(
+            !diverged[0].stopped,
+            "an execute-mode write ran; it was not refused"
         );
         assert_eq!(
             diverged[0].source_event_global_sequence,
@@ -11945,6 +12224,259 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.kind != "omitted"),
             "the twin is accounted for by the pair, not omitted as well"
+        );
+    }
+
+    /// The same re-keyed write, with an executed read upstream in the same
+    /// correlation that returned a different row. Now the write's changed
+    /// operand has a source, and the write is the consequence of it.
+    #[test]
+    fn a_rekeyed_write_downstream_of_a_diverged_read_stays_a_consequence() {
+        let corr = "c1";
+        let read_seq = 6;
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed_row = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        let mut read_event = omitted_ev(read_seq, "db", Some(corr));
+        read_event.method_name = "generic_find_one".to_owned();
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    read_seq,
+                    envelope(recorded_row.clone()),
+                ),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    7,
+                    envelope(recorded_row.clone()),
+                ),
+                span_entry(Some(corr), 7, "root>update_attempt"),
+            ],
+            vec![
+                exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(read_seq),
+                    Some(envelope(recorded_row.clone())),
+                    envelope(observed_row.clone()),
+                ),
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, observed_row),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                read_event,
+                attempt_update_ev(corr, 7, ATTEMPT_UPDATE_STATUS, recorded_row),
+            ],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let read = rows
+            .iter()
+            .find(|r| r.method_name == "generic_find_one")
+            .expect("the read has a row");
+        assert_eq!(read.kind, "value_diverged");
+        assert!(
+            read.origin,
+            "the executed read that returned a different row is the origin"
+        );
+        let write = rows
+            .iter()
+            .find(|r| r.method_name == "generic_update")
+            .expect("the write has a row");
+        assert_eq!(write.kind, "value_diverged");
+        assert!(
+            !write.origin,
+            "with a diverged read upstream, the re-keyed write is its consequence"
+        );
+    }
+
+    /// "Upstream" must mean upstream, not "anywhere in this correlation".
+    ///
+    /// `correlations_with_a_value_origin` collects the correlation ids in which
+    /// SOME executed boundary diverged and compares nothing else. A divergence
+    /// that happened AFTER the re-keyed call therefore demotes that call from
+    /// origin to consequence, and the viewer sends the reader hunting for a
+    /// cause above a row whose only candidate cause is below it — the same
+    /// complaint this commit set out to fix, with the order reversed.
+    ///
+    /// `observed_index` is already in scope where the flag is set
+    /// (`ledger.rs:317`), so the comparison is available.
+    #[test]
+    fn a_rekeyed_write_is_the_origin_when_the_only_divergence_came_after_it() {
+        let corr = "c1";
+        let write_seq = 6;
+        let read_seq = 7;
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed_row = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        let mut read_event = omitted_ev(read_seq, "db", Some(corr));
+        read_event.method_name = "generic_find_one".to_owned();
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    write_seq,
+                    envelope(recorded_row.clone()),
+                ),
+                span_entry(Some(corr), write_seq, "root>update_attempt"),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    read_seq,
+                    envelope(recorded_row.clone()),
+                ),
+            ],
+            // The candidate WROTE first, and only then read a differing row.
+            vec![
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, observed_row.clone()),
+                exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(read_seq),
+                    Some(envelope(recorded_row.clone())),
+                    envelope(observed_row.clone()),
+                ),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                attempt_update_ev(corr, write_seq, ATTEMPT_UPDATE_STATUS, recorded_row),
+                read_event,
+            ],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let write = rows
+            .iter()
+            .find(|r| r.method_name == "generic_update")
+            .expect("the write has a row");
+        assert_eq!(write.kind, "value_diverged");
+        assert!(
+            write.origin,
+            "nothing diverged before this write, so the write is the finding itself"
+        );
+    }
+
+    /// A `Substitute` egress boundary (an outbound call) whose arguments
+    /// miss the tape fails closed: the call is refused and the request stops.
+    /// The request is the candidate's own output — an input to the boundary — so
+    /// the changed arguments are a blocking divergence on the scorecard, not an
+    /// environmental miss beside an omitted call, and the ledger row agrees. It
+    /// must say the request stopped here, name the row the origin (nothing
+    /// upstream changed — the candidate built a different request), and pair it
+    /// with the recorded call at the same span, by its address minus its
+    /// arguments, so the argument diff is the recorded request against the
+    /// attempted one.
+    #[test]
+    fn a_refused_substitute_miss_is_an_origin_that_stopped_the_request() {
+        let corr = "refused-request";
+        let sequence = 801;
+        let recorded_args = serde_json::json!({
+            "url": "https://upstream.example/v1/orders",
+            "method": "POST",
+            "body": {"Json": {"items": [{"order_id": "order-1"}]}},
+        });
+        let attempted_args = serde_json::json!({
+            "url": "https://upstream.example/v1/orders",
+            "method": "POST",
+            "body": {"Json": {"items": [{"order_id": "order-1-v2"}]}},
+        });
+        let recorded_result = serde_json::json!({"kind": "ok", "status_code": 201});
+        let mut event = omitted_ev(sequence, "http_outgoing", Some(corr));
+        event.method_name = "send_request".to_owned();
+        event.args = recorded_args.into();
+        event.result = recorded_result.clone().into();
+        event.graph_node_id = Some(111);
+        let mut call = obs("http_outgoing", Some(corr), false, None, None);
+        call.method_name = "send_request".to_owned();
+        call.args = attempted_args;
+        call.outcome = deja::SubstituteOutcome::Stopped;
+        call.graph_node_id = Some(211);
+        // Both sides carry the span their call ran under, as a real address does:
+        // "the same span" is how the attempted call finds its recorded twin.
+        let span = "request>call_upstream";
+        call.span_path = Some(span.to_owned());
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(
+                        Some(corr),
+                        "http_outgoing",
+                        "send_request",
+                        sequence,
+                        recorded_result,
+                    ),
+                    span_entry(Some(corr), sequence, span),
+                ],
+                vec![call],
+                vec![http(corr, false, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(111, corr, None, 0, "call_upstream")],
+            vec![graph_span(211, corr, None, 0, "call_upstream")],
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+            0,
+            "a request the candidate changed is not the environment's miss"
+        );
+        assert_eq!(
+            card.summary.value_divergences, 1,
+            "the scorecard names the changed request, as the ledger row does"
+        );
+        assert!(
+            !card.verdict.pass,
+            "the refused request's status mismatch fails the run"
+        );
+
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        let row = diverged[0];
+        assert!(row.stopped, "the request stopped at this call");
+        assert!(
+            row.origin,
+            "nothing upstream changed; the attempted request is the finding"
+        );
+        assert_eq!(
+            row.source_event_global_sequence,
+            Some(sequence),
+            "paired with the recorded call at the same span"
+        );
+        assert_eq!(
+            row.recorded
+                .as_ref()
+                .and_then(|side| side.args.as_ref())
+                .and_then(|args| args.pointer("/body/Json/items/0/order_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("order-1"),
+            "the recorded side carries the request the tape holds"
+        );
+        assert_eq!(
+            row.observed
+                .as_ref()
+                .and_then(|side| side.args.as_ref())
+                .and_then(|args| args.pointer("/body/Json/items/0/order_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("order-1-v2"),
+            "the observed side carries the request the candidate attempted"
+        );
+        assert!(
+            row.observed
+                .as_ref()
+                .is_none_or(|side| side.result.is_none()),
+            "a refused call has no replayed result"
         );
     }
     fn graph_span(
@@ -12515,17 +13047,17 @@ mod tests {
     }
     /// A bind-order swap is a SKEW and not a divergence.
     ///
-    /// This fixture is the change's best evidence, which is why it is rewritten
-    /// rather than deleted: two sibling spans with identical names, the recorded
-    /// side pairing 51→501 (bind a) and 52→502 (bind b), the observed side
-    /// serving them the other way round. Every call resolved to its own recorded
-    /// event; the two PAIRING methods disagree, and that disagreement is the
-    /// skew. It is the same shape as a concurrent fan-out reordering work both
-    /// sides performed.
+    /// Two sibling spans with identical names, the recorded side attaching
+    /// 51→501 (bind a) and 52→502 (bind b), the observed side resolving them the
+    /// other way round. Every call resolved to its own recorded event, so each
+    /// is MATCHED by its address; the aligner's structural binding of the two
+    /// spans is crosswise to what the addresses served, and that disagreement
+    /// is the skew. It is the same shape as a concurrent fan-out reordering work
+    /// both sides performed.
     ///
     /// Both bindings are still asserted below. If this test could pass without
-    /// naming the skew, the change would be untested — the classification is the
-    /// thing that has to survive, only its cost changes.
+    /// naming the skew, the change would be untested: the skew is named beside
+    /// the match, never instead of it.
     #[test]
     fn same_statement_bind_order_swap_is_a_tolerated_identity_skew() {
         let corr = "identity-swap";
@@ -12626,7 +13158,11 @@ mod tests {
              cannot be hiding one"
         );
         assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
-        assert_eq!(card.summary.matched_side_effect_calls, 0);
+        assert_eq!(
+            card.summary.matched_side_effect_calls, 2,
+            "each call matched the event its address resolved to; where the \
+             aligner placed the spans does not unmake that"
+        );
         assert!(
             outcome.passed,
             "the response matched and every call resolved; the order the two \
@@ -12932,6 +13468,649 @@ mod tests {
             .expect("the graph call has one ledger row");
         assert_eq!(row.kind, "schema_default");
         assert!(!row.blocking);
+    }
+
+    // --- one span, two identities ---------------------------------------------
+    //
+    // A candidate adds an id draw at the top of a span; the draw misses and stops
+    // the request, and the outbound call the recording made under that same span
+    // never happens. Each span then carries exactly ONE boundary event, and the
+    // two events are different calls.
+
+    const ADDED_CALL_CORR: &str = "added-call";
+    const UPSTREAM_CALL: u64 = 900;
+    const UPSTREAM_SPAN: &str = "request>handle>call_upstream";
+
+    /// A graph-mode run whose recorded span holds the outbound call and
+    /// whose replayed span holds `observed` instead.
+    fn one_span_two_identities(observed: ObservedCall) -> RunArtifacts {
+        one_span_recording(
+            ("http_outgoing", "send_request"),
+            serde_json::json!({}),
+            observed,
+        )
+    }
+
+    /// A graph-mode run whose recorded span holds one call, `(boundary,
+    /// operation)` made with `recorded_args`, and whose replayed span holds
+    /// `observed` instead. Both sides carry the span path, as a real table and a
+    /// real observation do, so a call can pair by its address minus its args.
+    fn one_span_recording(
+        (boundary, operation): (&str, &str),
+        recorded_args: serde_json::Value,
+        observed: ObservedCall,
+    ) -> RunArtifacts {
+        let corr = ADDED_CALL_CORR;
+        let response = serde_json::json!({"status": 200, "body": "ok"});
+        let mut event = omitted_ev(UPSTREAM_CALL, boundary, Some(corr));
+        event.method_name = operation.to_owned();
+        event.args = recorded_args.into();
+        event.result = response.clone().into();
+        event.graph_node_id = Some(111);
+        with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(
+                        Some(corr),
+                        boundary,
+                        operation,
+                        UPSTREAM_CALL,
+                        envelope(response),
+                    ),
+                    span_entry(Some(corr), UPSTREAM_CALL, UPSTREAM_SPAN),
+                ],
+                vec![observed],
+                vec![http(corr, false, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(111, corr, None, 0, "call_upstream")],
+            vec![graph_span(211, corr, None, 0, "call_upstream")],
+        )
+    }
+
+    /// The call the candidate added: an unresolved draw at a line the
+    /// recording never reached.
+    fn added_draw(boundary: &str, method: &str, outcome: deja::SubstituteOutcome) -> ObservedCall {
+        let mut call = obs(boundary, Some(ADDED_CALL_CORR), false, None, None);
+        call.trait_name = "common_utils".to_owned();
+        call.method_name = method.to_owned();
+        call.graph_node_id = Some(211);
+        call.span_path = Some(UPSTREAM_SPAN.to_owned());
+        call.call_file = Some("src/handler.rs".to_owned());
+        call.call_line = Some(42);
+        call.outcome = outcome;
+        call
+    }
+
+    /// Two events sharing a span are not thereby the same call. Pairing a uuid
+    /// draw with the recorded outbound call reported a `value_diverged` row whose
+    /// "recorded" side was an HTTP request body, and consumed that call so its
+    /// omission vanished from the ledger while the scorecard still counted it.
+    #[test]
+    fn a_call_is_never_paired_with_a_recorded_call_of_another_identity() {
+        let art =
+            one_span_two_identities(added_draw("id", "new_id", deja::SubstituteOutcome::Stopped));
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(
+            rows.iter()
+                .all(|r| !(r.boundary == "id"
+                    && r.source_event_global_sequence == Some(UPSTREAM_CALL))),
+            "an id draw was paired with the recorded outbound call: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.kind != "value_diverged"),
+            "no value was compared across two different calls: {rows:?}"
+        );
+        let upstream: Vec<_> = rows
+            .iter()
+            .filter(|r| r.source_event_global_sequence == Some(UPSTREAM_CALL))
+            .collect();
+        assert_eq!(upstream.len(), 1, "the outbound call has one row: {rows:?}");
+        assert_eq!(upstream[0].boundary, "http_outgoing");
+        assert!(
+            matches!(upstream[0].kind.as_str(), "omitted" | "pruned_subtree"),
+            "the recorded call the candidate never made is reported as not made: {rows:?}"
+        );
+        let card = detect(&art);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        // The correlation is still scored as a graph. Only the two events leave
+        // the graph tier's event pairing, as a multi-event span's always have.
+        assert_eq!(
+            card.per_correlation[0].scoring_mode,
+            deja_forest::ScoringMode::Graph
+        );
+    }
+
+    /// The scorecard holds the same line. A stateful call in that position is not
+    /// excused the way a pure draw is, so it is where a pairing across identity
+    /// would surface as a value divergence against an unrelated outbound call.
+    #[test]
+    fn the_scorecard_does_not_pair_across_identity_either() {
+        let art = one_span_two_identities(added_draw(
+            "redis",
+            "get_key",
+            deja::SubstituteOutcome::Stopped,
+        ));
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "a redis read was compared against an outbound HTTP call"
+        );
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "http_outgoing", "OmittedCall"), 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// A miss at a pure boundary was excused as "not a real divergence". That
+    /// holds only while the process survives it. This one STOPPED the request —
+    /// the runtime says so — so it is the reason the response is missing, and
+    /// excusing it leaves a verdict made entirely of its consequences.
+    #[test]
+    fn a_miss_that_stopped_the_request_is_a_blocking_novel_call() {
+        let art =
+            one_span_two_identities(added_draw("id", "new_id", deja::SubstituteOutcome::Stopped));
+        let card = detect(&art);
+        assert_eq!(kind_count(&card, "id", "DeterministicMiss"), 0);
+        assert_eq!(kind_count(&card, "id", "NovelCall"), 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        let draw: Vec<_> = rows
+            .iter()
+            .filter(|r| r.boundary == "id" && r.method_name == "new_id")
+            .collect();
+        assert_eq!(draw.len(), 1, "rows: {rows:?}");
+        assert_eq!(draw[0].kind, "novel");
+        assert!(draw[0].blocking, "the stop is blocking: {rows:?}");
+    }
+
+    /// The same rule where the stopping draw sits inside a subtree the recording
+    /// never had. A novel subtree is added work and is charged to nothing, for
+    /// every boundary alike; a pure boundary's stop gets that treatment too, not
+    /// a separate excusal that names it a deterministic miss.
+    #[test]
+    fn a_stopping_miss_inside_a_novel_subtree_is_not_excused_either() {
+        let mut draw = added_draw("id", "new_id", deja::SubstituteOutcome::Stopped);
+        draw.graph_node_id = Some(212);
+        let mut art = one_span_two_identities(draw);
+        art.replay_graph
+            .push(graph_span(212, ADDED_CALL_CORR, Some(211), 1, "added_work"));
+        let card = detect(&art);
+        assert_eq!(kind_count(&card, "id", "DeterministicMiss"), 0);
+        assert_eq!(kind_count(&card, "id", "NovelSubtree"), 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        let draw: Vec<_> = rows.iter().filter(|r| r.boundary == "id").collect();
+        assert_eq!(draw.len(), 1, "rows: {rows:?}");
+        assert_eq!(draw[0].kind, "novel_subtree");
+        assert!(draw[0].blocking, "the stop is blocking: {rows:?}");
+    }
+
+    /// The same run scored both ways — as a graph, and flat with its forests
+    /// withheld — so a test can hold that how a call pairs does not depend on
+    /// which tier scored its correlation.
+    fn in_both_tiers(build: impl Fn() -> RunArtifacts) -> [(&'static str, RunArtifacts); 2] {
+        let mut flat = build();
+        flat.record_graph = None;
+        flat.replay_graph = Vec::new();
+        [("graph", build()), ("flat", flat)]
+    }
+
+    /// The candidate sends its outbound request with one header
+    /// changed. The request is the candidate's own output — an input to the
+    /// boundary — so the change is a blocking divergence at that one call, found
+    /// by its address minus its args. It is not an egress miss beside an omitted
+    /// call: those were two rows describing one call whose input changed.
+    #[test]
+    fn a_changed_outbound_request_is_one_blocking_divergence() {
+        let headers = |accept: &str| serde_json::json!({"headers": [["Accept", accept]]});
+        for (tier, art) in in_both_tiers(|| {
+            let mut call = added_draw(
+                "http_outgoing",
+                "send_request",
+                deja::SubstituteOutcome::Stopped,
+            );
+            call.args = headers("text/plain");
+            one_span_recording(
+                ("http_outgoing", "send_request"),
+                headers("application/json"),
+                call,
+            )
+        }) {
+            let card = detect(&art);
+            let kinds = &card.per_boundary.get("http_outgoing").map(|b| &b.kinds);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{tier}: {kinds:?}");
+            assert!(!card.verdict.pass, "{tier}");
+            assert!(
+                card.counter_disagreements().is_empty(),
+                "{tier}: {:?}",
+                card.counter_disagreements()
+            );
+
+            let rows = build_ledger(&art).expect("ledger builds");
+            let call: Vec<_> = rows
+                .iter()
+                .filter(|r| r.boundary == "http_outgoing")
+                .collect();
+            assert_eq!(call.len(), 1, "{tier}: one call, one row: {rows:?}");
+            assert_eq!(call[0].kind, "value_diverged", "{tier}: {rows:?}");
+            assert!(call[0].blocking, "{tier}");
+            assert_eq!(
+                call[0].source_event_global_sequence,
+                Some(UPSTREAM_CALL),
+                "{tier}"
+            );
+            assert_eq!(
+                call[0].recorded.as_ref().and_then(|side| side.args.clone()),
+                Some(headers("application/json")),
+                "{tier}: the recorded input is on the row"
+            );
+            assert_eq!(
+                call[0].observed.as_ref().and_then(|side| side.args.clone()),
+                Some(headers("text/plain")),
+                "{tier}: the candidate's input is on the row"
+            );
+        }
+    }
+
+    // --- pairing is by address -------------------------------------------------
+
+    /// An unresolved call on its boundary, made under `span` with `args`.
+    fn unresolved_call(
+        boundary: &str,
+        corr: Option<&str>,
+        operation: &str,
+        span: &str,
+        args: serde_json::Value,
+    ) -> ObservedCall {
+        let mut call = obs(boundary, corr, false, None, None);
+        call.method_name = operation.to_owned();
+        call.span_path = Some(span.to_owned());
+        call.args = args;
+        call
+    }
+
+    /// A recorded call and the table entries that address it under `span`.
+    fn addressed_event(
+        boundary: &str,
+        corr: Option<&str>,
+        operation: &str,
+        sequence: u64,
+        span: &str,
+        args: serde_json::Value,
+    ) -> (Vec<LookupEntry>, deja::BoundaryEvent) {
+        let result = serde_json::json!({"rows": 1});
+        let mut event = omitted_ev(sequence, boundary, corr);
+        event.method_name = operation.to_owned();
+        event.args = args.into();
+        event.result = result.clone().into();
+        (
+            vec![
+                seq_entry_method_res(corr, boundary, operation, sequence, envelope(result)),
+                span_entry(corr, sequence, span),
+            ],
+            event,
+        )
+    }
+
+    /// The boundary is identity as much as the operation is. Two boundaries can
+    /// share an operation name, and a call on one must never pair with a call on
+    /// the other, however alike their spans and names.
+    #[test]
+    fn a_call_is_not_paired_with_the_same_operation_on_another_boundary() {
+        let corr = Some("same-name");
+        let span = "request>load";
+        let (entries, event) =
+            addressed_event("redis", corr, "get", 700, span, serde_json::json!({"k": 1}));
+        let art = art_with_events(
+            entries,
+            vec![unresolved_call(
+                "db",
+                corr,
+                "get",
+                span,
+                serde_json::json!({"k": 2}),
+            )],
+            vec![http("same-name", true, vec![])],
+            vec![event],
+        );
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "a db call was compared against a redis call"
+        );
+        assert_eq!(kind_count(&card, "db", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "redis", "OmittedCall"), 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(rows.iter().all(|r| r.kind != "value_diverged"), "{rows:?}");
+    }
+
+    /// Every resolved claim is in before the first pairing by address minus
+    /// args. Here the call whose input changed comes FIRST in the stream, and the
+    /// head of its pool is the event a later call resolved to. Taking the head
+    /// would pair one recorded event with two calls; it must pair with the next.
+    #[test]
+    fn a_changed_call_never_takes_the_event_a_later_call_resolved_to() {
+        let corr = "claims-first";
+        let span = "request>load";
+        let (mut entries, first) = addressed_event(
+            "db",
+            Some(corr),
+            "load",
+            901,
+            span,
+            serde_json::json!({"id": "a"}),
+        );
+        let (more, second) = addressed_event(
+            "db",
+            Some(corr),
+            "load",
+            902,
+            span,
+            serde_json::json!({"id": "b"}),
+        );
+        entries.extend(more);
+        let changed = unresolved_call(
+            "db",
+            Some(corr),
+            "load",
+            span,
+            serde_json::json!({"id": "c"}),
+        );
+        let mut resolved = substituted_obs_method(
+            "db",
+            Some(corr),
+            "load",
+            901,
+            serde_json::json!({"rows": 1}),
+        );
+        resolved.args = serde_json::json!({"id": "a"});
+        resolved.span_path = Some(span.to_owned());
+        let art = art_with_events(
+            entries,
+            vec![changed, resolved],
+            vec![http(corr, true, vec![])],
+            vec![first, second],
+        );
+
+        let card = detect(&art);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.omitted_calls, 0);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let changed = rows
+            .iter()
+            .find(|r| r.kind == "value_diverged")
+            .expect("the changed call is one pair");
+        assert_eq!(changed.source_event_global_sequence, Some(902), "{rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.source_event_global_sequence == Some(901))
+                .count(),
+            1,
+            "one recorded event, one row: {rows:?}"
+        );
+    }
+
+    /// A call with no correlation has no correlation in its address to pair
+    /// within, so it is not paired at all: it stays the tolerated background
+    /// call it has always been, rather than becoming a blocking divergence.
+    #[test]
+    fn an_uncorrelated_call_is_never_paired() {
+        let span = "background>sweep";
+        let (entries, event) = addressed_event(
+            "db",
+            None,
+            "sweep",
+            950,
+            span,
+            serde_json::json!({"batch": 1}),
+        );
+        let art = art_with_events(
+            entries,
+            vec![unresolved_call(
+                "db",
+                None,
+                "sweep",
+                span,
+                serde_json::json!({"batch": 2}),
+            )],
+            vec![],
+            vec![event],
+        );
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.novel_calls_tolerated, 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(rows.iter().all(|r| r.kind != "value_diverged"), "{rows:?}");
+    }
+
+    /// Structure never unmakes a pair. A call that resolved to its recorded event
+    /// under a span the aligner could not match — renamed, say — is MATCHED: the
+    /// address found it. The rename is a fact about spans, reported as one; it is
+    /// not a novel call beside a pruned one.
+    #[test]
+    fn a_call_that_resolved_under_a_renamed_span_is_matched() {
+        let corr = "renamed-span";
+        let result = serde_json::json!({"result": "Ok", "value": 7});
+        let event = graph_event(
+            corr,
+            900,
+            111,
+            "load",
+            serde_json::json!({"id": 7}),
+            result.clone(),
+        );
+        let call = graph_observed(
+            corr,
+            211,
+            900,
+            "load",
+            serde_json::json!({"id": 7}),
+            result.clone(),
+        );
+        let art = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(Some(corr), "db", "load", 900, result)],
+                vec![call],
+                vec![http(corr, true, vec![])],
+                vec![event],
+            ),
+            vec![
+                graph_span(110, corr, None, 0, "request"),
+                graph_span(111, corr, Some(110), 1, "load_before"),
+            ],
+            vec![
+                graph_span(210, corr, None, 0, "request"),
+                graph_span(211, corr, Some(210), 1, "load_after"),
+            ],
+        );
+
+        let card = detect(&art);
+        assert_eq!(
+            card.per_correlation[0].scoring_mode,
+            deja_forest::ScoringMode::Graph
+        );
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(kind_count(&card, "db", "NovelSubtree"), 0);
+        assert_eq!(kind_count(&card, "db", "PrunedSubtree"), 0);
+        assert_eq!(card.summary.omitted_calls, 0);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].kind, "matched", "{rows:?}");
+        assert_eq!(rows[0].source_event_global_sequence, Some(900));
+    }
+
+    /// The runtime records the call each request stopped at. A report that says
+    /// only "no response from the candidate" sends the reader to find it; name
+    /// it, once per call site however many requests it stopped.
+    #[test]
+    fn the_report_names_the_call_each_request_stopped_at() {
+        let mut art =
+            one_span_two_identities(added_draw("id", "new_id", deja::SubstituteOutcome::Stopped));
+        let mut again = added_draw("id", "new_id", deja::SubstituteOutcome::Stopped);
+        again.correlation_id = Some("added-call-again".to_owned());
+        again.graph_node_id = None;
+        art.observed.push(again);
+
+        let card = detect(&art);
+        let stops: Vec<_> = card
+            .warnings
+            .iter()
+            .filter(|w| w.contains("stopped at"))
+            .collect();
+        assert_eq!(
+            stops.len(),
+            1,
+            "one line per call site: {:?}",
+            card.warnings
+        );
+        assert!(
+            stops[0].starts_with("2 request(s) stopped at"),
+            "{}",
+            stops[0]
+        );
+        assert!(stops[0].contains("id/new_id"), "{}", stops[0]);
+        assert!(stops[0].contains("src/handler.rs:42"), "{}", stops[0]);
+    }
+
+    /// Only a stop is named as one. A draw the site answered let its request go
+    /// on, and saying it stopped would send a reader after a cause that is not
+    /// there.
+    #[test]
+    fn a_request_the_site_answered_is_not_named_as_stopped() {
+        let mut draw = added_draw("id", "new_id", deja::SubstituteOutcome::Synthesized);
+        draw.absorbed = true;
+        let card = detect(&one_span_two_identities(draw));
+        assert!(
+            card.warnings.iter().all(|w| !w.contains("stopped at")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// The guard for the rule above: it keys on the request STOPPING, not on a
+    /// pure boundary missing. A miss with no recorded stop is still excused —
+    /// and that is every miss in an observed artifact written before the runtime
+    /// reported stops, whose absent outcome reads as `substituted`. Re-scoring
+    /// such a run must not turn its clock and id misses into findings.
+    #[test]
+    fn a_pure_miss_that_did_not_stop_is_still_excused() {
+        let art = one_span_two_identities(added_draw(
+            "id",
+            "new_id",
+            deja::SubstituteOutcome::default(),
+        ));
+        let card = detect(&art);
+        assert_eq!(kind_count(&card, "id", "DeterministicMiss"), 1);
+        assert_eq!(kind_count(&card, "id", "NovelCall"), 0);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let draw: Vec<_> = rows.iter().filter(|r| r.boundary == "id").collect();
+        assert_eq!(draw.len(), 1, "rows: {rows:?}");
+        assert_eq!(draw[0].kind, "deterministic", "{rows:?}");
+        assert!(!draw[0].blocking, "{rows:?}");
+    }
+
+    /// Identity is the operation as well as the boundary. Two different calls on
+    /// one boundary that share a span are still two calls, and the flat tier's
+    /// pairing, keyed on the operation, would never join them.
+    #[test]
+    fn a_call_is_not_paired_with_another_operation_on_its_own_boundary() {
+        let art = one_span_recording(
+            ("db", "generic_find_one"),
+            serde_json::json!({}),
+            added_draw("db", "generic_insert", deja::SubstituteOutcome::default()),
+        );
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "an insert was compared against a find"
+        );
+        assert_eq!(kind_count(&card, "db", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "db", "OmittedCall"), 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(rows.iter().all(|r| r.kind != "value_diverged"), "{rows:?}");
+    }
+
+    /// Not counting the displaced half of a swap twice must never hide a request
+    /// the candidate changed. Here it sends statement A twice where the recording
+    /// sent A then B. The first A resolves; the second pairs with B and matches
+    /// nothing an out-of-order pair claimed, so it is exactly what it looks like:
+    /// B was never sent, and A went out in its place.
+    #[test]
+    fn a_repeated_request_in_place_of_another_is_still_a_change() {
+        let corr = "repeated-request";
+        let result = serde_json::json!({"rows_affected": 1});
+        let mut resolved = attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS, result.clone());
+        resolved.resolved = true;
+        resolved.resolved_rank = Some(2);
+        resolved.source_event_global_sequence = Some(810);
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    810,
+                    envelope(result.clone()),
+                ),
+                span_entry(Some(corr), 810, "root>update_attempt"),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    811,
+                    envelope(result.clone()),
+                ),
+                span_entry(Some(corr), 811, "root>update_attempt"),
+            ],
+            vec![
+                resolved,
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS, result.clone()),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                attempt_update_ev(corr, 810, ATTEMPT_UPDATE_STATUS, result.clone()),
+                attempt_update_ev(corr, 811, ATTEMPT_UPDATE_STATUS_REKEYED, result),
+            ],
+        );
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 1, "{:?}", card.per_boundary);
+        assert_eq!(card.summary.omitted_calls, 0);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let changed: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(changed.len(), 1, "{rows:?}");
+        assert_eq!(changed[0].source_event_global_sequence, Some(811));
     }
 
     #[test]

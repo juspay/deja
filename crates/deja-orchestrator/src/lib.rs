@@ -302,6 +302,22 @@ pub struct RunSpec {
 }
 
 impl RunSpec {
+    /// The span namespaces this run scores: the run's own list when it gave
+    /// one, otherwise the system's declaration.
+    ///
+    /// THE resolution, for every reader. The stored params row already
+    /// resolved it this way, so `/runs/{id}` showed `["ucs::", "connector::"]`
+    /// on every prism run — while the scorer read the raw spec, found the empty
+    /// list a CI-created run carries, and silently checked no span at all. A
+    /// renamed `ucs::` span passed replay on a run whose own record said the
+    /// contract was in force.
+    pub fn effective_scored_span_namespaces(&self) -> Vec<String> {
+        if self.scored_span_namespaces.is_empty() {
+            system::system_config(self.system()).scored_span_namespaces
+        } else {
+            self.scored_span_namespaces.clone()
+        }
+    }
     /// The system under test with the default applied — never read the raw
     /// field for dispatch.
     pub fn system(&self) -> &str {
@@ -411,11 +427,7 @@ impl RunParams {
             // reachable only by whoever went through that form. A run created
             // by the API or by CI got an empty list and silently scored
             // nothing, for the same system.
-            scored_span_namespaces: if spec.scored_span_namespaces.is_empty() {
-                system::system_config(spec.system()).scored_span_namespaces
-            } else {
-                spec.scored_span_namespaces.clone()
-            },
+            scored_span_namespaces: spec.effective_scored_span_namespaces(),
             expectation: expectation.map(str::to_owned),
         }
     }

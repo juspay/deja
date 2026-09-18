@@ -18,7 +18,7 @@
 // `total_correlations === 0` is a GUARD THAT FORBIDS GREEN, not a sixth state:
 // it downgrades to INCONCLUSIVE and carries the reason.
 
-import { RunRow, Scorecard, runParams } from "./api";
+import { RunRow, RunSummaryRow, ScorecardDigest, runParams } from "./api";
 
 export type ResultState =
   /** Not terminal yet. Nothing is known. */
@@ -59,7 +59,36 @@ export type RunResult = {
 
 const TERMINAL = new Set(["completed", "failed"]);
 
-function failureText(run: RunRow): string | null {
+/**
+ * A run as this module needs it: the LIST's summary row or a full run row.
+ *
+ * Both callers exist and must agree. The report page holds a whole `RunRow`;
+ * the list holds a `RunSummaryRow` that deliberately has no scorecard on it.
+ * Taking the union here, rather than duplicating the ladder, is what keeps the
+ * two pages from drifting into different verdicts for the same run.
+ */
+export type ScoredRun = RunRow | RunSummaryRow;
+
+/**
+ * The five scalars [`resultOf`] decides on, whichever shape the run arrived in.
+ *
+ * `null` means NO SCORECARD, from either source — the list says so by sending
+ * `scorecard_digest: null`, a full row says so by having `scorecard: null`.
+ */
+function digestOf(run: ScoredRun): ScorecardDigest | null {
+  if ("scorecard_digest" in run) return run.scorecard_digest;
+  const sc = run.scorecard;
+  if (!sc) return null;
+  return {
+    pass: sc.verdict?.pass ?? null,
+    inconclusive: sc.verdict?.inconclusive ?? null,
+    reason: sc.verdict?.reason ?? null,
+    total_correlations: sc.summary?.total_correlations ?? null,
+    matched_correlations: sc.summary?.matched_correlations ?? null,
+  };
+}
+
+function failureText(run: ScoredRun): string | null {
   const m = run.failure?.message?.trim();
   if (m) return m;
   const live = run.live?.failure_reason?.trim();
@@ -79,7 +108,7 @@ function failureText(run: RunRow): string | null {
  *   7. verdict.pass === true       -> REPRODUCED
  *   8. otherwise                   -> DIVERGED
  */
-export function resultOf(run: RunRow): RunResult {
+export function resultOf(run: ScoredRun): RunResult {
   const state = (run.state || "").toLowerCase();
 
   // 1. Still moving.
@@ -121,7 +150,7 @@ export function resultOf(run: RunRow): RunResult {
     };
   }
 
-  const sc: Scorecard | null = run.scorecard;
+  const sc = digestOf(run);
 
   // 4. Terminal, but nothing was scored.
   if (!sc) {
@@ -135,12 +164,12 @@ export function resultOf(run: RunRow): RunResult {
     };
   }
 
-  const reason = sc.verdict?.reason?.trim() || null;
-  const total = sc.summary?.total_correlations ?? 0;
-  const matched = sc.summary?.matched_correlations ?? 0;
+  const reason = sc.reason?.trim() || null;
+  const total = sc.total_correlations ?? 0;
+  const matched = sc.matched_correlations ?? 0;
 
   // 5. The scorer said so itself.
-  if (sc.verdict?.inconclusive) {
+  if (sc.inconclusive) {
     return {
       state: "INCONCLUSIVE",
       label: "inconclusive",
@@ -165,7 +194,7 @@ export function resultOf(run: RunRow): RunResult {
   }
 
   // 7. The only green.
-  if (sc.verdict?.pass === true) {
+  if (sc.pass === true) {
     return {
       state: "REPRODUCED",
       label: "reproduced",
@@ -191,8 +220,8 @@ export function resultOf(run: RunRow): RunResult {
  * The WHAT HAPPENED column: the server's own sentence about this run.
  * `verdict.reason` when it was scored, `failure.message` when it was not.
  */
-export function whatHappened(run: RunRow): string | null {
-  return run.scorecard?.verdict?.reason?.trim() || failureText(run);
+export function whatHappened(run: ScoredRun): string | null {
+  return digestOf(run)?.reason?.trim() || failureText(run);
 }
 
 /** The run's system under test as the caller stated it, or null when it stated
@@ -201,12 +230,12 @@ export function whatHappened(run: RunRow): string | null {
  *  Deliberately not resolved to a name here. Which system is default is the
  *  orchestrator's to say (`/api/v1/systems`), and substituting a literal made
  *  every reader of this function quietly assume the same one. */
-export function systemUnderTest(run: RunRow): string | null {
+export function systemUnderTest(run: ScoredRun): string | null {
   return runParams(run)?.system_under_test || null;
 }
 
 /** A candidate ref rendered for a table cell, for every CandidateSpec kind. */
-export function candidateRef(run: RunRow): { label: string; full: string } {
+export function candidateRef(run: ScoredRun): { label: string; full: string } {
   const c = (run.candidate ?? {}) as Record<string, unknown>;
   const s = (k: string) => (typeof c[k] === "string" ? (c[k] as string) : "");
   switch (c.kind) {
@@ -246,15 +275,15 @@ export function candidateRef(run: RunRow): { label: string; full: string } {
  * carry none, and two of those differing only in scope still group together.
  * Labelled "derived" in the UI for that reason.
  */
-export function attemptOrdinals(runs: RunRow[]): Map<string, { attempt: number; of: number }> {
-  const subject = (r: RunRow) => {
+export function attemptOrdinals(runs: ScoredRun[]): Map<string, { attempt: number; of: number }> {
+  const subject = (r: ScoredRun) => {
     const scope = runParams(r)?.correlation_filter;
     const scopeKey = scope ? [...scope].sort().join(",") : "*";
     // The system under test is part of the subject: the same recording driven
     // against hyperswitch and against prism is two different experiments.
     return `${r.mode}|${systemUnderTest(r)}|${(r.recording_id ?? "").trim()}|${candidateRef(r).full}|${scopeKey}`;
   };
-  const groups = new Map<string, RunRow[]>();
+  const groups = new Map<string, ScoredRun[]>();
   for (const r of runs) {
     const k = subject(r);
     const g = groups.get(k);

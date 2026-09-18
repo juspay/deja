@@ -60,6 +60,60 @@ pub struct RunRow {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// A run as the LIST renders it: every column except `scorecard`, plus the few
+/// scalars the list actually decides on out of it.
+///
+/// The scorecard is deliberately absent rather than emptied. On 2026-09-17 the
+/// orchestrator entered a CrashLoopBackOff — OOMKilled at a 2Gi limit, ten
+/// restarts, roughly two minutes of life each — because `GET /api/v1/runs`
+/// returned 46.5 MB and the dashboard polls it every five seconds from every
+/// open tab on every machine. 97.5% of those bytes were `scorecard`, and
+/// `per_correlation` alone was 36.8 MB of it. The list renders ONE field out of
+/// the whole structure.
+///
+/// The cost was not the bytes on the wire but the three materialisations behind
+/// them: sqlx decodes the JSONB column into a `serde_json::Value` tree (larger
+/// than its own text, since every string and map node carries allocation
+/// overhead), the handler then deep-CLONES that tree with `to_value`, and only
+/// then serialises it. One request was hundreds of megabytes; four concurrent
+/// ones were the pod.
+///
+/// So the column is not selected at all, and the five scalars `resultOf` reads
+/// are extracted by Postgres into `scorecard_digest`. Nothing large is read,
+/// cloned, or sent. A caller that wants a scorecard asks for one run — `GET
+/// /runs/{id}` and `GET /runs/{id}/scorecard` both still carry it whole, which
+/// is what the report page has always used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummaryRow {
+    pub run_id: String,
+    pub mode: String,
+    pub recording_id: Option<String>,
+    pub candidate: serde_json::Value,
+    pub candidate_sha256: Option<String>,
+    pub params: serde_json::Value,
+    pub state: String,
+    pub verdict: Option<String>,
+    /// The five scalars the list's result badge decides on, extracted in SQL,
+    /// and `None` when there is no scorecard at all.
+    ///
+    /// A DIGEST under its own name, not a stubbed `scorecard`: a value shaped
+    /// like a scorecard but holding five fields would read as a scorecard to
+    /// every consumer and be wrong for all of them but this one. Under its own
+    /// name it says what it is, and widening it is a deliberate act.
+    ///
+    /// `None` is load-bearing and not merely "empty". `resultOf` in the
+    /// dashboard distinguishes "completed but produced no scorecard" (a warning
+    /// — terminal with no evidence) from "scored", and it makes that call on
+    /// the absence of this value. A digest of nulls would collapse the two.
+    pub scorecard_digest: Option<serde_json::Value>,
+    pub failure: Option<serde_json::Value>,
+    pub expectation: Option<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 /// A run that has NOT reached a terminal state — the k8s reconciler's work
 /// list. Minimal by design: the reconciler only needs the id (to correlate
 /// with its Job), the current state (for log context), and how old the run is
@@ -367,17 +421,38 @@ impl Store {
         Ok(row.map(run_row))
     }
 
-    pub async fn list_runs(&self, limit: i64) -> Result<Vec<RunRow>, sqlx::Error> {
+    /// The run list, WITHOUT the scorecard column. See [`RunSummaryRow`] for
+    /// why the column is not selected rather than dropped afterwards.
+    ///
+    /// Postgres walks the JSONB and returns five scalars, so nothing large is
+    /// read, decoded or cloned. `#>` yields `jsonb`, keeping booleans and
+    /// numbers typed rather than stringified, and a path that is not there
+    /// yields NULL rather than an error — so a scorecard with no verdict, or a
+    /// verdict with no reason, degrades field by field.
+    ///
+    /// The `CASE` is what keeps "no scorecard" distinguishable from "a
+    /// scorecard whose fields are all absent": without it `jsonb_build_object`
+    /// would return an object of nulls for a run that was never scored, and the
+    /// dashboard would report it as scored-with-nothing instead of unscored.
+    pub async fn list_run_summaries(&self, limit: i64) -> Result<Vec<RunSummaryRow>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT run_id, mode, recording_id, candidate, candidate_sha256, params, state,
-                    verdict, scorecard, failure, expectation, created_by, created_at,
+                    verdict,
+                    CASE WHEN scorecard IS NULL THEN NULL ELSE jsonb_build_object(
+                        'pass',                 scorecard #> '{verdict,pass}',
+                        'inconclusive',         scorecard #> '{verdict,inconclusive}',
+                        'reason',               scorecard #> '{verdict,reason}',
+                        'total_correlations',   scorecard #> '{summary,total_correlations}',
+                        'matched_correlations', scorecard #> '{summary,matched_correlations}'
+                    ) END AS scorecard_digest,
+                    failure, expectation, created_by, created_at,
                     started_at, finished_at
              FROM replay_runs ORDER BY created_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(run_row).collect())
+        Ok(rows.into_iter().map(run_summary_row).collect())
     }
 
     /// Every run that is NOT terminal (state not in 'completed'/'failed'), with
@@ -608,6 +683,26 @@ fn run_row(r: sqlx::postgres::PgRow) -> RunRow {
     }
 }
 
+fn run_summary_row(r: sqlx::postgres::PgRow) -> RunSummaryRow {
+    RunSummaryRow {
+        run_id: r.get(0),
+        mode: r.get(1),
+        recording_id: r.get(2),
+        candidate: r.get(3),
+        candidate_sha256: r.get(4),
+        params: r.get(5),
+        state: r.get(6),
+        verdict: r.get(7),
+        scorecard_digest: r.get(8),
+        failure: r.get(9),
+        expectation: r.get(10),
+        created_by: r.get(11),
+        created_at: r.get(12),
+        started_at: r.get(13),
+        finished_at: r.get(14),
+    }
+}
+
 fn recording_row(r: sqlx::postgres::PgRow) -> RecordingRow {
     RecordingRow {
         recording_id: r.get(0),
@@ -620,5 +715,109 @@ fn recording_row(r: sqlx::postgres::PgRow) -> RecordingRow {
         created_by: r.get(7),
         created_at: r.get(8),
         manifest: r.get(9),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The digest is a CONTRACT ACROSS TWO LANGUAGES with no compiler between
+    /// its halves: Postgres builds the object, TypeScript reads it, and nothing
+    /// checks that they name the same fields.
+    ///
+    /// Getting it wrong is silent in the worst way. `resultOf` reads every
+    /// field with `?? null`, so a key renamed on one side alone does not throw
+    /// — every run renders "no verdict"/0 of 0 and the dashboard looks like the
+    /// scorer stopped working. That is the producer/consumer split this repo
+    /// keeps rediscovering, so it is asserted rather than reviewed.
+    ///
+    /// Reading the sources is the point: any check written against a constant
+    /// in THIS file would pass while the two real halves disagreed.
+    fn source(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn the_digest_postgres_builds_is_the_digest_the_dashboard_reads() {
+        let sql = source("src/lib.rs");
+        // Anchored from the END and walked backwards: this file has another
+        // `jsonb_build_object` (the recording_id patch at ~line 371), and
+        // taking the first one made the slice span both queries and pick up a
+        // sixth key. The count assertion below caught that, which is the whole
+        // reason it is there.
+        let build = sql
+            .split_once(") END AS scorecard_digest")
+            .expect("the projection no longer closes as scorecard_digest")
+            .0
+            .rsplit_once("jsonb_build_object(")
+            .expect("the digest projection is gone from list_run_summaries")
+            .1;
+        let mut from_sql: Vec<&str> = build
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('\''))
+            .filter_map(|l| l.split_once('\''))
+            .map(|(key, _)| key)
+            .collect();
+        from_sql.sort_unstable();
+
+        let ts = source("../../web/src/lib/api.ts");
+        let decl = ts
+            .split_once("export type ScorecardDigest = {")
+            .expect("ScorecardDigest is gone from the dashboard")
+            .1
+            .split_once("};")
+            .expect("ScorecardDigest declaration is unterminated")
+            .0;
+        let mut from_ts: Vec<&str> = decl
+            .lines()
+            .filter_map(|l| l.trim().split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| !name.is_empty() && !name.starts_with("//"))
+            .collect();
+        from_ts.sort_unstable();
+
+        // Non-emptiness first: two empty lists compare equal, so without this
+        // the assertion below passes when a parse silently matches nothing —
+        // which is how a source-inspection test turns into a tautology.
+        assert_eq!(
+            from_sql.len(),
+            5,
+            "parsed {from_sql:?} out of the SQL; expected the five scalars"
+        );
+        assert_eq!(
+            from_sql, from_ts,
+            "the SQL digest and the dashboard's ScorecardDigest name different \
+             fields. Every mismatched field reads as null in the dashboard and \
+             renders as 'no verdict' with no error anywhere."
+        );
+    }
+
+    #[test]
+    fn the_list_row_still_carries_no_scorecard() {
+        let src = source("src/lib.rs");
+        let decl = src
+            .split_once("pub struct RunSummaryRow {")
+            .expect("RunSummaryRow is gone")
+            .1
+            .split_once('}')
+            .expect("RunSummaryRow declaration is unterminated")
+            .0;
+        let fields: Vec<&str> = decl
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split_once(':'))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            fields.contains(&"scorecard_digest"),
+            "the digest is gone; found {fields:?}"
+        );
+        assert!(
+            !fields.contains(&"scorecard"),
+            "RunSummaryRow has regained a `scorecard` field. That single field \
+             was 97.5% of a 46.5 MB list response, polled every five seconds \
+             from every open tab, and it OOMKilled the orchestrator ten times \
+             on 2026-09-17. A caller that needs a scorecard fetches one run."
+        );
     }
 }

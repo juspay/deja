@@ -14,7 +14,7 @@ import {
   SpineNode,
   transportFailure,
 } from "../lib/spine";
-import { diffArgs, LeafDiff } from "../lib/argdiff";
+import { diffArgs, LeafDiff, summarizeLeaves } from "../lib/argdiff";
 import { useSystems } from "../lib/systems";
 import { JsonView, ValuePair } from "./JsonView";
 import { JsonDiff } from "./JsonDiff";
@@ -174,6 +174,7 @@ function typeNameOf(v: unknown): string | null {
 function ValueDiverged({ e }: { e: CallEntry }) {
   const c = e.call;
   const origin = !!c.origin;
+  const stopped = !!c.stopped;
   const tr = typeNameOf(c.recorded?.result);
   const to = typeNameOf(c.observed?.result);
   return (
@@ -181,7 +182,20 @@ function ValueDiverged({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">
-        {origin ? (
+        {stopped && origin ? (
+          <>
+            <b>Origin.</b> The candidate asked this boundary for something the recording does not
+            hold: its arguments match no call recorded at this span, so replay refused the call and
+            the request stopped here. The argument diff below is the finding — the request the
+            candidate would have sent, against the one the recording made.
+          </>
+        ) : stopped ? (
+          <>
+            <b>Consequence.</b> The candidate's arguments here carried a value that had already
+            changed upstream, so they match no recorded call and replay refused this one. The cause
+            is at an origin above it; the argument diff shows what changed by the time it got here.
+          </>
+        ) : origin ? (
           <>
             <b>Origin.</b> This boundary was declared <code>Execute</code>, so it really ran during
             replay instead of serving the recorded value — and what it returned differs. Everything
@@ -202,13 +216,48 @@ function ValueDiverged({ e }: { e: CallEntry }) {
           finding.
         </p>
       )}
-      <h4>result</h4>
-      <FieldDiff recorded={c.recorded?.result} candidate={c.observed?.result} />
-      <details className="evraw">
-        <summary>arguments</summary>
-        <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
-      </details>
+      {stopped ? (
+        <>
+          <h4>arguments</h4>
+          <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+          <FullArguments c={c} />
+          <h4>result</h4>
+          <p className="hint">
+            No replayed result: the call was refused before it ran, so there is nothing to set
+            against the recorded one.
+          </p>
+          <details className="evraw">
+            <summary>recorded result</summary>
+            <JsonView value={c.recorded?.result} />
+          </details>
+        </>
+      ) : (
+        <>
+          <h4>result</h4>
+          <FieldDiff recorded={c.recorded?.result} candidate={c.observed?.result} />
+          <details className="evraw">
+            <summary>arguments</summary>
+            <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+            <FullArguments c={c} />
+          </details>
+        </>
+      )}
     </div>
+  );
+}
+
+/**
+ * Both sides' arguments in full, folded away. The leaf diff above names what
+ * changed; this is for reading the whole request around it — the headers that
+ * did not change, the body as sent — when the leaf alone is not enough.
+ */
+function FullArguments({ c }: { c: CallRecord }) {
+  if (c.recorded?.args === undefined && c.observed?.args === undefined) return null;
+  return (
+    <details className="evraw">
+      <summary>full arguments, recorded and replayed</summary>
+      <ValuePair baseline={c.recorded?.args} candidate={c.observed?.args} />
+    </details>
   );
 }
 
@@ -868,6 +917,7 @@ function Row({
       </span>
       <span className="uvname">{n.name}</span>
       {n.mark && <span className={`mchip m-${n.mark}`}>{MARK_LABEL[n.mark]}</span>}
+      <RowChange n={n} />
       {n.calls.length > 1 && <span className="uvn">×{n.calls.length}</span>}
       {n.presence === "record-only" && <span className="presdot p-rec" title={PRESENCE_LABEL["record-only"]} />}
       {n.presence === "replay-only" && <span className="presdot p-rep" title={PRESENCE_LABEL["replay-only"]} />}
@@ -875,6 +925,52 @@ function Row({
       <span className="uvdur rec">{fmtMs(n.recMs)}</span>
       <span className="uvdur rep">{fmtMs(n.repMs)}</span>
     </div>
+  );
+}
+
+/**
+ * What changed on this row's value-divergence, in one line beside its chip —
+ * the first changed leaf of recorded-vs-attempted arguments — so the tree
+ * already answers "what" and the panel is for "why".
+ */
+function RowChange({ n }: { n: SpineNode }) {
+  const summary = React.useMemo(() => {
+    const e = n.calls.find(
+      (c) =>
+        c.call.kind === "value_diverged" &&
+        c.call.recorded?.args !== undefined &&
+        c.call.observed?.args !== undefined,
+    );
+    if (!e) return null;
+    const s = summarizeLeaves(diffArgs(e.call.recorded!.args, e.call.observed!.args), 1);
+    // A flagged row whose leaves all compare EQUAL differs only in ORDER — the
+    // two sides serialise differently, `diffArgs` descends, and every key
+    // matches. Returning null here rendered nothing at all, so the commonest
+    // divergence we have (26 of 27 blocking body mismatches on the run this
+    // viewer exists for are `payment_methods_enabled` ordering) showed a
+    // divergence chip beside an empty explanation. Saying "order only" is not a
+    // guess: it is what an empty leaf-diff on a flagged row MEANS.
+    return { leaves: s, orderOnly: s.shown.length === 0 };
+  }, [n.calls]);
+  if (!summary) return null;
+  if (summary.orderOnly) {
+    return (
+      <span
+        className="uvwhat mono"
+        title="the two sides hold the same values in a different order — no leaf differs"
+      >
+        <span className="jpath">order only</span>
+      </span>
+    );
+  }
+  const l = summary.leaves.shown[0];
+  return (
+    <span className="uvwhat mono" title={`${l.path}: ${l.recorded} → ${l.candidate}`}>
+      <span className="jpath">{l.path}</span>
+      <del>{l.recorded}</del>
+      <ins>{l.candidate}</ins>
+      {summary.leaves.more > 0 && <span className="fmore">+{summary.leaves.more}</span>}
+    </span>
   );
 }
 
