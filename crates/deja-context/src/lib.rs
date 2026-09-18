@@ -195,6 +195,26 @@ pub fn current_correlation_id() -> Option<String> {
 /// `None` is the honest answer to both. A destroyed cell and a busy cell both
 /// mean this thread has no correlation to hand out, which is exactly what an
 /// empty cell means, and every caller already handles that.
+///
+/// # The collapse is safe only while the busy arm is unreachable
+///
+/// Three situations answer `None` here — no correlation, a destroyed cell, and
+/// a busy one — and the caller cannot tell them apart. That is fine today
+/// because the third cannot happen, and it stops being fine the moment the
+/// writer holds a borrow across a call.
+///
+/// The consumer that shows why: a collection facade seeding `HashMap` from the
+/// current correlation maps `None` to RANDOM keys, deliberately, because a
+/// collection built outside a request has no correlation to derive from. For a
+/// destroyed cell that is harmless — nothing built during thread teardown is
+/// part of a recorded request. For a BUSY cell inside a live correlation it
+/// would silently break the determinism the facade exists to provide, and
+/// iteration order is the largest class of replay divergence there is. A loud
+/// panic would become a quiet wrong answer in the one caller that motivates
+/// this function.
+///
+/// So: whoever makes the writer hold a borrow across a call has to give the
+/// busy case its own answer, not just remove the panic.
 pub fn try_current_correlation_id() -> Option<String> {
     CURRENT_CONTEXT
         .try_with(|cell| cell.try_borrow().ok().and_then(|cell| cell.clone()))
@@ -1073,6 +1093,13 @@ mod teardown_safety {
     /// a property of an empty set.
     #[test]
     fn the_fallible_reader_survives_teardown_where_the_plain_one_panics() {
+        // `take_hook`/`set_hook` are PROCESS-global and cargo runs this crate's
+        // tests in parallel threads, so another test's panic output can be
+        // suppressed inside this window. It cannot change a result — nothing here
+        // touches `catch_unwind` semantics — but it can swallow a diagnostic from a
+        // DIFFERENT failing test. Left unserialised: the cost is a lost message on a
+        // run that is already failing, and serialising would be a heavier fix than
+        // the problem.
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         std::thread::spawn(|| {
