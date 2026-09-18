@@ -56,6 +56,10 @@ pub struct KubeRequest {
     pub method: &'static str,
     pub path: String,
     pub body: Option<Value>,
+    /// Content type for the body. `None` means JSON, which is every verb but
+    /// PATCH; the apiserver decides what a PATCH MEANS from this header, so a
+    /// merge patch sent as `application/json` is rejected rather than applied.
+    pub content_type: Option<&'static str>,
 }
 
 /// The parsed apiserver response.
@@ -141,6 +145,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "GET",
             path: format!("/api/v1/namespaces/{ns}/configmaps/{name}"),
             body: None,
+            content_type: None,
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
@@ -155,6 +160,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "GET",
             path: format!("/apis/apps/v1/namespaces/{ns}/deployments/{name}"),
             body: None,
+            content_type: None,
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
@@ -167,6 +173,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "GET",
             path: format!("/api/v1/namespaces/{ns}/secrets/{name}"),
             body: None,
+            content_type: None,
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
@@ -180,6 +187,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "GET",
             path: format!("/api/v1/namespaces/{ns}/pods?labelSelector={label_selector}"),
             body: None,
+            content_type: None,
         };
         let list = self.expect_2xx(self.transport.send(&req)?, label_selector)?;
         Ok(list
@@ -208,6 +216,7 @@ impl<T: KubeTransport> KubeApi<T> {
                 "/api/v1/namespaces/{ns}/pods/{pod}/log?container={container}&tailLines={tail_lines}"
             ),
             body: None,
+            content_type: None,
         };
         let body = self.expect_2xx(self.transport.send(&req)?, pod)?;
         Ok(match body {
@@ -225,6 +234,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "DELETE",
             path: format!("/api/v1/namespaces/{ns}/pods/{name}?propagationPolicy=Background"),
             body: None,
+            content_type: None,
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
@@ -241,6 +251,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "POST",
             path: format!("/apis/batch/v1/namespaces/{ns}/jobs"),
             body: Some(job.clone()),
+            content_type: None,
         };
         let resp = self.transport.send(&req)?;
         if resp.status == 409 {
@@ -255,6 +266,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "GET",
             path: format!("/apis/batch/v1/namespaces/{ns}/jobs/{name}"),
             body: None,
+            content_type: None,
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
@@ -273,6 +285,7 @@ impl<T: KubeTransport> KubeApi<T> {
             method: "GET",
             path: format!("/apis/batch/v1/namespaces/{ns}/jobs?labelSelector={label_selector}"),
             body: None,
+            content_type: None,
         };
         let body = self.expect_2xx(self.transport.send(&req)?, "jobs")?;
         Ok(body
@@ -283,6 +296,21 @@ impl<T: KubeTransport> KubeApi<T> {
     }
 
     /// DELETE a Job. `propagationPolicy=Background` so the pods go too.
+    /// Merge-patch a Job. Used to resume a suspended one — the scheduler's whole
+    /// mechanism — so the patch is deliberately the smallest thing that says it:
+    /// `{"spec":{"suspend":false}}`, which leaves every other field of a Job
+    /// built minutes earlier exactly as it was.
+    pub fn patch_job(&self, ns: &str, name: &str, patch: &Value) -> Result<Value, KubeError> {
+        let req = KubeRequest {
+            method: "PATCH",
+            path: format!("/apis/batch/v1/namespaces/{ns}/jobs/{name}"),
+            body: Some(patch.clone()),
+            content_type: Some("application/merge-patch+json"),
+        };
+        let resp = self.transport.send(&req)?;
+        self.expect_2xx(resp, name)
+    }
+
     pub fn delete_job(&self, ns: &str, name: &str) -> Result<Value, KubeError> {
         let req = KubeRequest {
             method: "DELETE",
@@ -290,6 +318,7 @@ impl<T: KubeTransport> KubeApi<T> {
                 "/apis/batch/v1/namespaces/{ns}/jobs/{name}?propagationPolicy=Background"
             ),
             body: None,
+            content_type: None,
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
@@ -407,9 +436,13 @@ impl KubeTransport for UreqTransport {
             .request(req.method, &url)
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/json");
-        let resp = match &req.body {
-            Some(b) => r.send_json(b),
-            None => r.call(),
+        let resp = match (&req.body, req.content_type) {
+            // A PATCH body must carry the patch's own content type; `send_json`
+            // would label it application/json, which the apiserver reads as a
+            // different operation entirely.
+            (Some(b), Some(ct)) => r.set("Content-Type", ct).send_string(&b.to_string()),
+            (Some(b), None) => r.send_json(b),
+            (None, _) => r.call(),
         };
         // ureq treats non-2xx as Err(Status); we want the body either way so the
         // verb layer can parse the Status object.

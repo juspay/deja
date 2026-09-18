@@ -70,6 +70,11 @@ enum ExecutorSelection {
 struct K8sExecutor {
     incluster: InClusterConfig,
     cfg: K8sExecutorConfig,
+    /// How many runs may RUN at once; `0` = no scheduling, which is the create
+    /// endpoint launching Jobs that start immediately, as it always did.
+    /// Resolved once at startup so the queue the endpoint creates into and the
+    /// queue the scheduler drains are the same one.
+    scheduler_capacity: usize,
 }
 
 impl ExecutorSelection {
@@ -85,6 +90,7 @@ impl ExecutorSelection {
                 Ok(ExecutorSelection::K8s(Box::new(K8sExecutor {
                     incluster,
                     cfg,
+                    scheduler_capacity: deja_orchestrator::executor::scheduler_capacity_from_env(),
                 })))
             }
         }
@@ -177,11 +183,22 @@ async fn main() {
     // registry — without one there is nothing to reconcile, so log and skip.
     if let ExecutorSelection::K8s(k) = &*state.executor {
         match &state.store {
-            Some(store) => deja_orchestrator::executor::reconcile::spawn(
-                store.clone(),
-                k.incluster.clone(),
-                k.cfg.clone(),
-            ),
+            Some(store) => {
+                deja_orchestrator::executor::reconcile::spawn(
+                    store.clone(),
+                    k.incluster.clone(),
+                    k.cfg.clone(),
+                );
+                // The run scheduler. Off unless the environment declares a
+                // capacity, in which case `v1_create_run` creates each Job
+                // SUSPENDED and this loop resumes it when the pool has room.
+                deja_orchestrator::executor::scheduler::spawn(
+                    store.clone(),
+                    k.incluster.clone(),
+                    k.cfg.clone(),
+                    k.scheduler_capacity,
+                );
+            }
             None => eprintln!(
                 "deja-orchestrator: k8s reconciler disabled — no store (the reconciler needs \
                  the run registry to know which runs to settle)"
@@ -458,6 +475,17 @@ async fn v1_create_run(
     };
     match &*st.executor {
         ExecutorSelection::Compose => runs::spawn_worker(&st.root, &run.run_id, ctx),
+        // Scheduling on: the run is ACCEPTED and its Job created SUSPENDED —
+        // the scheduler resumes it when the pool has room. Starting it here
+        // would be the burst the queue exists to prevent, and a running Job
+        // spends its `activeDeadlineSeconds` waiting for a node.
+        ExecutorSelection::K8s(k) if k.scheduler_capacity > 0 => runs::spawn_k8s_run_queued(
+            &st.root,
+            run.clone(),
+            ctx,
+            k.incluster.clone(),
+            k.cfg.clone(),
+        ),
         ExecutorSelection::K8s(k) => runs::spawn_k8s_run(
             &st.root,
             run.clone(),

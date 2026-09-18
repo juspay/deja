@@ -48,6 +48,9 @@ pub struct LaunchSpec {
     /// workload. Read at Job build (it needs a cluster read). `None` disables
     /// copying.
     pub config_source: Option<ConfigSourceRef>,
+    /// Create the Job suspended, for the scheduler to resume when the pool has
+    /// room. See [`JobPatch::suspend`]; `false` is the unscheduled launch.
+    pub suspend: bool,
 }
 
 /// A resolved pointer to the rendered workload whose container env is copied.
@@ -186,6 +189,8 @@ pub fn launch_spec_for_run(
     });
 
     Ok(LaunchSpec {
+        // The caller decides: a scheduled launch sets this before `launch`.
+        suspend: false,
         run_id: run.run_id.clone(),
         jobs_namespace: cfg.jobs_namespace.clone(),
         template_namespace: cfg.template_namespace.clone(),
@@ -250,6 +255,7 @@ pub fn build_job<T: KubeTransport>(
     };
 
     let patch = JobPatch {
+        suspend: spec.suspend,
         job_name: job_name_for(&spec.run_id),
         labels: spec.labels.clone(),
         images: vec![(
@@ -543,6 +549,24 @@ pub fn launch<T: KubeTransport>(
     }
 }
 
+/// Resume a suspended Job: the scheduler's start signal.
+///
+/// A merge patch of one field, so nothing else about a Job built earlier can be
+/// disturbed by starting it. Idempotent — resuming a running Job is a no-op
+/// write, which is what makes a scheduler pass safe to repeat.
+pub fn resume_job<T: KubeTransport>(
+    api: &KubeApi<T>,
+    namespace: &str,
+    job_name: &str,
+) -> Result<(), ExecutorError> {
+    api.patch_job(
+        namespace,
+        job_name,
+        &serde_json::json!({ "spec": { "suspend": false } }),
+    )?;
+    Ok(())
+}
+
 /// How much longer than the Job's own deadline this watches for.
 ///
 /// Once `activeDeadlineSeconds` passes, kubernetes still has to notice and
@@ -613,16 +637,25 @@ mod tests {
     use serde_json::json;
     use std::cell::RefCell;
 
+    /// What a fake saw: method, path, body, content type. Shared with the test
+    /// (the transport itself is moved into the `KubeApi`), so a request can be
+    /// asserted on rather than only answered.
+    type SentLog = std::rc::Rc<RefCell<Vec<(String, String, Option<Value>, Option<&'static str>)>>>;
+
     struct FakeTransport {
         responses: RefCell<Vec<KubeResponse>>,
-        seen: RefCell<Vec<(String, String, Option<Value>)>>,
+        seen: SentLog,
     }
     impl FakeTransport {
         fn new(responses: Vec<KubeResponse>) -> Self {
             Self {
                 responses: RefCell::new(responses),
-                seen: RefCell::new(Vec::new()),
+                seen: SentLog::default(),
             }
+        }
+        /// Take a handle to the request log before the transport is moved.
+        fn log(&self) -> SentLog {
+            self.seen.clone()
         }
     }
     impl KubeTransport for FakeTransport {
@@ -631,6 +664,7 @@ mod tests {
                 req.method.to_owned(),
                 req.path.clone(),
                 req.body.clone(),
+                req.content_type,
             ));
             Ok(self.responses.borrow_mut().remove(0))
         }
@@ -654,6 +688,7 @@ mod tests {
 
     fn spec() -> LaunchSpec {
         LaunchSpec {
+            suspend: false,
             run_id: "run-9f".into(),
             jobs_namespace: "replay-sbx".into(),
             template_namespace: "replay-env".into(),
@@ -1045,6 +1080,54 @@ mod tests {
         assert_eq!(containers[1]["image"], json!("hyperswitch:sha_c"));
         assert_eq!(containers[0]["env"][0]["name"], json!("DEJA_RUN_ID"));
         assert_eq!(containers[1]["env"][0]["name"], json!("ROUTER__DEJA__MODE"));
+    }
+
+    /// The wiring the scheduler rides on: a queued launch must reach the
+    /// apiserver already suspended. Built running and suspended afterwards, the
+    /// pod would start in the gap — and with a full pool that is the ninth pod
+    /// on an eight-node pool, which is exactly the Pending-with-a-running-
+    /// deadline state the queue exists to avoid.
+    #[test]
+    fn a_queued_launch_builds_a_suspended_job() {
+        let _lock = crate::test_env::env_guard();
+        let api = KubeApi::new(FakeTransport::new(vec![resp(200, template_cm())]));
+        let queued = LaunchSpec {
+            suspend: true,
+            ..spec()
+        };
+        let job = build_job(&api, &queued).expect("built");
+        assert_eq!(job["spec"]["suspend"], json!(true));
+        // and it is otherwise the same Job: suspension is when it runs, not what
+        // it runs.
+        let containers = job["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect("containers");
+        assert_eq!(containers[1]["image"], json!("hyperswitch:sha_c"));
+    }
+
+    /// Resuming is one field, sent as a MERGE patch. As `application/json` the
+    /// apiserver reads a patch body as a replacement and rejects it, so the
+    /// content type is load-bearing, not decoration.
+    #[test]
+    fn resuming_sends_a_merge_patch_of_one_field() {
+        let transport = FakeTransport::new(vec![resp(200, json!({ "metadata": { "name": "j" } }))]);
+        let sent = transport.log();
+        let api = KubeApi::new(transport);
+        resume_job(&api, "replay-sbx", "deja-replay-run-9f").expect("resumed");
+
+        let sent = sent.borrow();
+        let (method, path, body, content_type) = &sent[0];
+        assert_eq!(method, "PATCH");
+        assert_eq!(
+            path,
+            "/apis/batch/v1/namespaces/replay-sbx/jobs/deja-replay-run-9f"
+        );
+        assert_eq!(*content_type, Some("application/merge-patch+json"));
+        assert_eq!(
+            body.as_ref(),
+            Some(&json!({ "spec": { "suspend": false } })),
+            "a resume must touch nothing but suspend"
+        );
     }
 
     // template_cm() plus the ConfigMap's OWN metadata.uid, so the owner (the

@@ -20,6 +20,7 @@ mod k8s;
 mod launch;
 mod patch;
 pub mod reconcile;
+pub mod scheduler;
 
 pub use config::{resolve_candidate_image, ExecutorKind, K8sExecutorConfig};
 pub use env::{runner_env, CandidateBinding};
@@ -29,6 +30,7 @@ pub use k8s::{
 };
 pub use launch::{
     build_job, collect_pod_diagnostics, job_name_for, kill_run, launch, launch_spec_for_run,
-    watch_to_terminal, ExecutorError, LaunchSpec, RUN_ID_LABEL,
+    resume_job, watch_to_terminal, ExecutorError, LaunchSpec, RUN_ID_LABEL,
 };
 pub use patch::{apply_job_patch, EnvUpsert, JobPatch, PatchError};
+pub use scheduler::capacity_from_env as scheduler_capacity_from_env;
