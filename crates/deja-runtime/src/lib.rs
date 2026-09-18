@@ -4138,18 +4138,27 @@ where
 /// that forgot it would have to be written by hand to do so.
 /// Whether a declined miss falls back to a borrowed payload, or stops.
 ///
-/// `DEJA_MISS_FALLBACK=stop` restores the fail-stop; anything else, including
-/// unset, answers. The switch exists so ONE tape can be replayed both ways and
-/// the grading compared — a synthesized value is only worth serving if the
-/// scorecard can tell you whether it mattered, and that claim should be checked
-/// against a real recording rather than argued.
+/// **Defaults to STOPPING, and must keep doing so until the scorecard charges
+/// for an absorbed miss.**
 ///
-/// It is not a permanent knob. Once the comparison has been made the fallback
-/// is the only behaviour and this goes away, so it is deliberately not named in
-/// any chart or values file: a deployment that needs it can set it, and nothing
-/// grows a dependency on it in the meantime.
+/// The mechanism below is the easy half. The hard half is that a run which
+/// completed on fabricated values must not read as a clean one — and today it
+/// does. `Synthesized` becomes `NovelCallAbsorbed`, which lands in
+/// `absorbed_misses`, which `divergence::…` explicitly SUBTRACTS from the
+/// blocking-reason count, and which is not a term in a correlation's `passed`
+/// at all. The comment beside that subtraction says it plainly: the fact is
+/// carried, "nothing yet spends it, and that is the follow-up".
+///
+/// While a declined miss is rare that costs little. This fallback makes it
+/// common — which would convert a loud blocking failure into a silent
+/// non-blocking one, at scale, by default. So the default stays `stop`, and the
+/// change that flips it is the change that makes an absorbed miss count. Those
+/// are one commit, not two.
+///
+/// `DEJA_MISS_FALLBACK=answer` opts in, which is how one tape gets replayed both
+/// ways so the grading can be compared on real data rather than argued.
 fn miss_fallback_enabled() -> bool {
-    !std::env::var("DEJA_MISS_FALLBACK").is_ok_and(|v| v.eq_ignore_ascii_case("stop"))
+    std::env::var("DEJA_MISS_FALLBACK").is_ok_and(|v| v.eq_ignore_ascii_case("answer"))
 }
 
 fn substitute_decide<T, C, E>(

@@ -2261,6 +2261,19 @@ impl crate::graph::GraphNodeSink for LookupTableHook {
     }
 }
 
+/// Does a recorded payload carry a typed-codec `Err` discriminant?
+///
+/// Conservative by construction: only an explicit `"result": "Err"` counts. A
+/// payload that is not an envelope, or whose `result` says anything else, is
+/// treated as borrowable — the alternative would be refusing to borrow from
+/// every boundary that does not use the typed codec, which is most of them.
+fn recorded_envelope_is_error(value: &serde_json::Value) -> bool {
+    value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|result| result.eq_ignore_ascii_case("Err"))
+}
+
 impl DejaHook for LookupTableHook {
     fn process_mode(&self) -> RuntimeMode {
         RuntimeMode::Replay
@@ -2327,20 +2340,32 @@ impl DejaHook for LookupTableHook {
         // nondeterministic — the one property `crate::synth` says matters more
         // than honesty, because without it two replays of one candidate disagree
         // with each other and "the candidate changed" cannot be separated from
-        // "the fabrication changed". The earliest call at the site is also the
-        // most likely to be the plain one, before the correlation built up
-        // state.
+        // "the fabrication changed".
         //
-        // Whether the borrowed payload encodes a SUCCESS or a recorded failure
-        // is not visible here — a `LookupEntry` carries the result and not the
-        // `is_error` flag the event had. The site's own rebuild closure decides
-        // what the payload means, which is the same thing it does for a hit.
+        // A RECORDED FAILURE IS NOT BORROWABLE. The typed codec envelope is
+        // `{"version": _, "result": "Ok"|"Err", "value": …}`, so the discriminant
+        // is in the payload — an earlier version of this comment claimed it was
+        // invisible here because `LookupEntry` carries no `is_error`, which is
+        // true of the entry and false of the value inside it. Handing back an
+        // `Err` rebuilds faithfully, the candidate takes its error branch, and
+        // the divergence is attributed to the candidate for a failure the
+        // RECORDING had — the misattribution this ladder exists to remove.
+        //
+        // "Earliest at the site" actively selects for it at cache-shaped
+        // boundaries, where the first `get_key` of a request is the cold one and
+        // the likeliest to have recorded a not-found. Determinism is equally
+        // satisfied by "earliest that is not an error", so nothing is traded.
+        //
+        // When every recorded call at the site failed there is nothing honest to
+        // borrow, and `None` lets the miss fall through to the stop rather than
+        // inventing a success the recording never saw.
         self.table
             .values()
             .filter(|entry| {
                 entry.key.boundary == boundary
                     && entry.key.component == component
                     && entry.key.operation == operation
+                    && !recorded_envelope_is_error(&entry.result)
             })
             .min_by_key(|entry| entry.source_event_global_sequence)
             .map(|entry| entry.result.clone())
@@ -3797,6 +3822,81 @@ mod tests {
             crate::DejaHook::borrow_recorded_payload(&hook, "db", "RedisStore", "get_key")
                 .is_none(),
             "matching must include the boundary, not just the operation"
+        );
+    }
+
+    /// A recorded FAILURE is never borrowed, even when it is the earliest call
+    /// at the site — and at cache-shaped boundaries it usually is.
+    ///
+    /// The first `get_key` of a request is the cold one, so "earliest" selects
+    /// for exactly the call most likely to have recorded a not-found. Handing
+    /// that back rebuilds an `Err`, the candidate takes its error branch, and
+    /// the divergence is blamed on the candidate for a failure the RECORDING
+    /// had. Determinism is equally satisfied by "earliest that is not an error",
+    /// so the two properties do not trade against each other.
+    #[test]
+    fn a_recorded_error_is_never_the_payload_that_gets_borrowed() {
+        let envelope = |result: &str, value: &str| serde_json::json!({ "version": 1, "result": result, "value": value });
+        let table = LookupTable {
+            recording_id: "borrow-error-test".to_owned(),
+            policy_version: POLICY_VERSION,
+            entries: vec![
+                // EARLIEST, and an error — the shape "earliest" would pick.
+                entry_with(
+                    None,
+                    explicit("site"),
+                    &serde_json::json!({ "id": 1 }),
+                    0,
+                    envelope("Err", "NotFound"),
+                    1,
+                ),
+                entry_with(
+                    None,
+                    explicit("site"),
+                    &serde_json::json!({ "id": 2 }),
+                    0,
+                    envelope("Ok", "later-but-usable"),
+                    7,
+                ),
+            ],
+        };
+        let hook =
+            LookupTableHook::from_source(VecSource(Some(table)), InMemoryObservedSink::new())
+                .expect("from_source");
+
+        let borrowed =
+            crate::DejaHook::borrow_recorded_payload(&hook, "redis", "RedisStore", "get_key")
+                .expect("an Ok entry exists at the site, so something is borrowable");
+        assert_eq!(
+            borrowed["value"], "later-but-usable",
+            "the earliest entry recorded an Err and must be skipped, not borrowed"
+        );
+    }
+
+    /// When EVERY recorded call at the site failed there is nothing honest to
+    /// borrow, and the answer is `None` — which lets the miss fall through to
+    /// the stop rather than inventing a success the recording never saw.
+    #[test]
+    fn a_site_whose_every_recorded_call_failed_offers_nothing() {
+        let table = LookupTable {
+            recording_id: "borrow-all-errors".to_owned(),
+            policy_version: POLICY_VERSION,
+            entries: vec![entry_with(
+                None,
+                explicit("site"),
+                &serde_json::json!({ "id": 1 }),
+                0,
+                serde_json::json!({ "version": 1, "result": "Err", "value": "NotFound" }),
+                1,
+            )],
+        };
+        let hook =
+            LookupTableHook::from_source(VecSource(Some(table)), InMemoryObservedSink::new())
+                .expect("from_source");
+        assert!(
+            crate::DejaHook::borrow_recorded_payload(&hook, "redis", "RedisStore", "get_key")
+                .is_none(),
+            "nothing borrowable means None, not the failure itself"
         );
     }
 

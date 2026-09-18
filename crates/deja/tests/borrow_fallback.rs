@@ -131,6 +131,14 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 #[test]
 fn a_declined_miss_is_answered_from_the_tape_rather_than_stopping() {
+    // OPT IN. The fallback defaults to STOPPING and must keep doing so until an
+    // absorbed miss costs something on the scorecard — today it is subtracted
+    // from the blocking-reason count and is not a term in a correlation's
+    // `passed`, so flipping the default would turn a loud blocking failure into
+    // a silent non-blocking one at scale. This test exercises the mechanism; it
+    // is not evidence that the mechanism should be on.
+    unsafe { std::env::set_var("DEJA_MISS_FALLBACK", "answer") };
+
     // The tape covers this SITE but not this CALL: one recorded entry at
     // (imc, BorrowFallbackTest, read), and the call below asks with different
     // args, so the lookup misses and the site declines.
