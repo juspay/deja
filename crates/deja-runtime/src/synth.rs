@@ -113,8 +113,17 @@ pub fn bytes<const N: usize>(miss: &SubstituteMiss) -> [u8; N] {
 /// keyed on a recorded one, so a false resync on fabricated data is impossible
 /// rather than unlikely.
 pub fn uuid_v8(miss: &SubstituteMiss) -> String {
-    let hi = digest(miss, "uuid/hi").to_be_bytes();
-    let lo = digest(miss, "uuid/lo").to_be_bytes();
+    format_uuid_v8(digest(miss, "uuid/hi"), digest(miss, "uuid/lo"))
+}
+
+/// The v8 formatting, shared by [`uuid_v8`] and [`reshape`].
+///
+/// Split out rather than duplicated: the version and variant bits below are the
+/// whole non-collision guarantee, and a second copy is a second place for it to
+/// be got wrong.
+fn format_uuid_v8(hi_word: ::std::primitive::u64, lo_word: ::std::primitive::u64) -> String {
+    let hi = hi_word.to_be_bytes();
+    let lo = lo_word.to_be_bytes();
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&hi);
     b[8..].copy_from_slice(&lo);
@@ -173,6 +182,149 @@ pub fn id(miss: &SubstituteMiss) -> String {
 /// `step_ns` cannot wrap into the past.
 pub fn monotonic(miss: &SubstituteMiss, base_ns: i64, step_ns: i64) -> i64 {
     base_ns.saturating_add(i64::from(miss.occurrence).saturating_mul(step_ns))
+}
+
+// ---------------------------------------------------------------------------
+// Answering a miss from the recording's own shape
+// ---------------------------------------------------------------------------
+
+/// Is this string a formatted UUID?
+///
+/// Shape only — 8-4-4-4-12 hex with dashes. Deliberately not a parse into a
+/// uuid type: this crate does not depend on one, and the question here is
+/// whether the RECORDED value looked like a uuid, not whether it was a valid
+/// one.
+fn is_uuid_shaped(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let mut parts = s.split('-');
+    for want in groups {
+        match parts.next() {
+            Some(part) if part.len() == want && part.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
+/// Does this object key name something that IDENTIFIES a thing?
+///
+/// The opinionated half of [`reshape`], and the half to change when it is
+/// wrong. Keyed on the FIELD NAME rather than the value's shape, because the
+/// name is the only place the recording states intent: `String` covers an id and
+/// a status alike, and this repo has already been bitten by reading a type as a
+/// meaning. A name is not proof either — it is a better guess, made in one place
+/// where it can be read and argued with.
+fn key_is_identity(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "id"
+        || k.ends_with("_id")
+        || k.ends_with("_ids")
+        || k.ends_with("_reference")
+        || k.ends_with("_token")
+        || k.ends_with("_key")
+        || k == "reference"
+        || k == "token"
+}
+
+/// Rewrite a recorded payload's IDENTITY leaves into the synthesized subspace,
+/// leaving every other leaf exactly as recorded.
+///
+/// # Why borrow a payload at all
+///
+/// Answering a miss needs a value of the site's own return type, and nothing at
+/// the seam knows how to build one — there is no reflection, and `Default` fails
+/// both distinguishability and non-collision. But a miss at a site whose OTHER
+/// calls were recorded has a real, well-formed value of exactly that type
+/// sitting in the tape. Borrowing it and handing it back through the site's own
+/// rebuild path makes type-validity structural rather than something this
+/// function has to achieve.
+///
+/// # Why it cannot be handed back unchanged
+///
+/// A recorded payload is, by construction, made of values the recording holds.
+/// Returned verbatim, its fields flow into DOWNSTREAM args, and a downstream
+/// lookup keyed on them HITS — the request silently resyncs onto the borrowed
+/// call's recorded trace and the scorecard reports matches. That is worse than
+/// a stop: a fabricated run that reads as a clean one. So the identity leaves
+/// are moved into the marked subspace, where a downstream lookup MISSES and
+/// answers down the same ladder instead of pretending.
+///
+/// Everything that is not identity is kept. A status, an amount, a currency, an
+/// enum: perturbing those buys no non-collision that the identity change has not
+/// already bought, and costs a value the service may validate — and a value the
+/// service REJECTS is worse than a stop, because the rejection is attributed to
+/// the candidate.
+///
+/// Deterministic: every rewritten leaf is a function of the miss and the leaf's
+/// own path, so the same miss against the same tape yields the same payload in
+/// every run.
+pub fn reshape(miss: &SubstituteMiss, borrowed: &serde_json::Value) -> serde_json::Value {
+    fn walk(
+        miss: &SubstituteMiss,
+        value: &serde_json::Value,
+        path: &str,
+        under_identity: bool,
+    ) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| {
+                        let child = format!("{path}.{k}");
+                        (k.clone(), walk(miss, v, &child, key_is_identity(k)))
+                    })
+                    .collect(),
+            ),
+            // An array inherits its key's verdict: `payment_ids: [..]` names
+            // identities, and each element is addressed by its own index so two
+            // elements cannot be rewritten alike.
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| walk(miss, v, &format!("{path}[{i}]"), under_identity))
+                    .collect(),
+            ),
+            serde_json::Value::String(s) => {
+                // Already synthesized: leave it. Reshaping a reshaped payload
+                // must be a no-op, or a value's identity would drift between
+                // two misses that should agree.
+                if s.starts_with(SYNTH_PREFIX) {
+                    return value.clone();
+                }
+                // A uuid stays a uuid — moved to the v8 space, which no recorder
+                // produces, so it is disjoint by construction rather than by
+                // luck. Shape is preserved for services that parse it.
+                if is_uuid_shaped(s) {
+                    return serde_json::Value::String(uuid_v8_at(miss, path));
+                }
+                if under_identity {
+                    return serde_json::Value::String(id_at(miss, path));
+                }
+                value.clone()
+            }
+            // Numbers, bools and null are never rewritten. A numeric id is
+            // indistinguishable from an amount at this layer, and getting that
+            // wrong turns a fabricated identity into a fabricated sum.
+            _ => value.clone(),
+        }
+    }
+    walk(miss, borrowed, "$", false)
+}
+
+/// [`uuid_v8`] domain-separated by a leaf's path, so two uuid leaves of one
+/// payload do not become the same value.
+fn uuid_v8_at(miss: &SubstituteMiss, path: &str) -> String {
+    let hi = digest(miss, &format!("reshape/uuid/hi{path}"));
+    let lo = digest(miss, &format!("reshape/uuid/lo{path}"));
+    format_uuid_v8(hi, lo)
+}
+
+/// [`id`] domain-separated by a leaf's path.
+fn id_at(miss: &SubstituteMiss, path: &str) -> String {
+    format!(
+        "{SYNTH_PREFIX}{:016x}",
+        digest(miss, &format!("reshape/id{path}"))
+    )
 }
 
 #[cfg(test)]
@@ -397,5 +549,134 @@ mod tests {
         let m = miss(json!({})).with_call_context(u32::MAX, None);
         assert_eq!(monotonic(&m, i64::MAX, i64::MAX), i64::MAX);
         assert!(monotonic(&m, 0, i64::MAX) > 0, "must not wrap negative");
+    }
+
+    /// A borrowed payload's IDENTITY leaves must all move, or the request
+    /// silently resyncs onto the borrowed call's recorded trace.
+    ///
+    /// This is the property the whole borrow rests on. If a recorded id came
+    /// back unchanged it would flow into a downstream call's args, that
+    /// lookup would HIT, and the run would report matches against a trace it
+    /// never earned — a fabricated replay reading as a clean one, which is
+    /// worse than the stop it replaced.
+    #[test]
+    fn every_identity_leaf_of_a_borrowed_payload_moves() {
+        let miss = miss(serde_json::json!({"q":1}));
+        let borrowed = serde_json::json!({
+            "payment_id": "pay_7c9e2a",
+            "attempt": {
+                "id": "01a0a9ff-4280-7c01-94c1-4f01ada45bf9",
+                "connector_token": "tok_live_abc",
+                "status": "succeeded",
+                "amount": 1299,
+                "currency": "USD"
+            },
+            "refund_ids": ["ref_1", "ref_2"]
+        });
+
+        let out = reshape(&miss, &borrowed);
+
+        // Vacuity guard FIRST: this asserts a property about identity leaves,
+        // so a payload holding none would pass it for free.
+        let identities = [
+            out["payment_id"]
+                .as_str()
+                .expect("a rewritten identity leaf is a string"),
+            out["attempt"]["id"]
+                .as_str()
+                .expect("a rewritten identity leaf is a string"),
+            out["attempt"]["connector_token"]
+                .as_str()
+                .expect("a rewritten identity leaf is a string"),
+            out["refund_ids"][0]
+                .as_str()
+                .expect("a rewritten identity leaf is a string"),
+            out["refund_ids"][1]
+                .as_str()
+                .expect("a rewritten identity leaf is a string"),
+        ];
+        assert_eq!(
+            identities.len(),
+            5,
+            "the fixture must carry identity leaves"
+        );
+
+        assert_ne!(out["payment_id"], borrowed["payment_id"]);
+        assert_ne!(out["attempt"]["id"], borrowed["attempt"]["id"]);
+        assert_ne!(
+            out["attempt"]["connector_token"],
+            borrowed["attempt"]["connector_token"]
+        );
+        assert_ne!(out["refund_ids"][0], borrowed["refund_ids"][0]);
+        assert_ne!(out["refund_ids"][1], borrowed["refund_ids"][1]);
+
+        // Each rewritten leaf is MARKED, so it is disjoint from anything a
+        // recorder produces and an operator reading a diff can see it.
+        assert!(out["payment_id"]
+            .as_str()
+            .expect("a rewritten identity leaf is a string")
+            .starts_with(SYNTH_PREFIX));
+        assert!(out["attempt"]["connector_token"]
+            .as_str()
+            .expect("a rewritten identity leaf is a string")
+            .starts_with(SYNTH_PREFIX));
+        // The uuid stays a uuid — parseable for a service that validates the
+        // shape — but in the v8 space no recorder writes.
+        let rebuilt = out["attempt"]["id"]
+            .as_str()
+            .expect("a rewritten identity leaf is a string");
+        assert!(is_uuid_shaped(rebuilt), "a uuid must stay uuid-shaped");
+        assert_eq!(&rebuilt[14..15], "8", "version nibble must be 8");
+
+        // Two identity leaves must not collapse onto one another.
+        assert_ne!(out["refund_ids"][0], out["refund_ids"][1]);
+        assert_ne!(out["payment_id"], out["attempt"]["connector_token"]);
+    }
+
+    /// Everything that is NOT identity is kept exactly. A value the service
+    /// validates and rejects is worse than a stop, because the rejection is
+    /// attributed to the candidate rather than to us.
+    #[test]
+    fn a_borrowed_payload_keeps_everything_that_is_not_identity() {
+        let miss = miss(serde_json::json!({"q":1}));
+        let borrowed = serde_json::json!({
+            "status": "succeeded",
+            "amount": 1299,
+            "currency": "USD",
+            "captured": true,
+            "error": serde_json::Value::Null,
+            "nested": {"method": "card"}
+        });
+        assert_eq!(
+            reshape(&miss, &borrowed),
+            borrowed,
+            "a payload with no identity leaf must come back untouched"
+        );
+    }
+
+    /// Same miss, same tape, same payload — every run. Without this, two
+    /// replays of one candidate disagree with each other and "the candidate
+    /// changed" cannot be separated from "the fabrication changed".
+    #[test]
+    fn reshaping_is_deterministic_and_reshaping_twice_changes_nothing() {
+        let miss = miss(serde_json::json!({"q":1}));
+        let borrowed = serde_json::json!({"payment_id": "pay_1", "id": "x"});
+        let once = reshape(&miss, &borrowed);
+        assert_eq!(once, reshape(&miss, &borrowed), "same miss, same payload");
+        assert_eq!(
+            reshape(&miss, &once),
+            once,
+            "already-synthesized leaves must not drift on a second pass"
+        );
+    }
+
+    /// Two different misses must not fabricate the same identity, or two
+    /// distinct calls merge silently.
+    #[test]
+    fn different_misses_fabricate_different_identities() {
+        let borrowed = serde_json::json!({"payment_id": "pay_1"});
+        let a = reshape(&miss(serde_json::json!({"q":1})), &borrowed);
+        let b = reshape(&miss(serde_json::json!({"q":2})), &borrowed);
+        assert_ne!(a["payment_id"], b["payment_id"]);
     }
 }

@@ -1144,6 +1144,32 @@ pub trait DejaHook: Send + Sync {
         CaptureVerdict::NotRecording
     }
 
+    /// A recorded payload from ANOTHER call at this same site, for answering a
+    /// miss.
+    ///
+    /// Nothing at the seam can build a value of a site's return type — there is
+    /// no reflection, and `Default` is neither distinguishable nor disjoint from
+    /// what a recording holds. But a miss at a site whose other calls WERE
+    /// recorded has a real, well-formed payload of exactly that type in the
+    /// tape. Handing it back through the site's own rebuild path makes
+    /// type-validity structural instead of something the seam has to achieve.
+    ///
+    /// MUST NOT advance any cursor or otherwise perturb lookup state: this runs
+    /// on a path the recording did not cover, and moving the cursor would change
+    /// the answer to a later call that the recording DOES cover.
+    ///
+    /// `None` when the tape holds no call at this site — a genuinely novel
+    /// boundary, where there is nothing to borrow and the caller falls through
+    /// to whatever it does without one.
+    fn borrow_recorded_payload(
+        &self,
+        _boundary: &str,
+        _component: &str,
+        _operation: &str,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Return true when the hook is active (recording or replaying).
     ///
     /// Process-level: true when [`process_mode`](Self::process_mode) is Record
@@ -1802,6 +1828,22 @@ impl DejaHook for RuntimeHook {
             RuntimeHook::Replay(h) => h.try_replay_with_context(query),
             RuntimeHook::LookupReplay(h) => h.try_replay_with_context(query),
             RuntimeHook::Disabled(h) => h.try_replay_with_context(query),
+        }
+    }
+
+    fn borrow_recorded_payload(
+        &self,
+        boundary: &str,
+        component: &str,
+        operation: &str,
+    ) -> Option<serde_json::Value> {
+        match self {
+            RuntimeHook::Recording(h) => h.borrow_recorded_payload(boundary, component, operation),
+            RuntimeHook::Replay(h) => h.borrow_recorded_payload(boundary, component, operation),
+            RuntimeHook::LookupReplay(h) => {
+                h.borrow_recorded_payload(boundary, component, operation)
+            }
+            RuntimeHook::Disabled(h) => h.borrow_recorded_payload(boundary, component, operation),
         }
     }
 
@@ -4073,7 +4115,7 @@ fn substitute_lookup<T, C>(
     reconstruct: C,
 ) -> T
 where
-    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    C: Fn(ReconstructInput<'_>) -> Reconstructed<T>,
 {
     let peek = substitute_peek_boundary(caller, spec, &boundary_args, Some(identity));
     substitute_decide(
@@ -4094,6 +4136,31 @@ where
 /// [`substitute_observe_boundary`]. They share this instead — which is the
 /// point: the emit-before-stop ordering lives in exactly ONE place, and a seam
 /// that forgot it would have to be written by hand to do so.
+/// Whether a declined miss falls back to a borrowed payload, or stops.
+///
+/// **Defaults to STOPPING, and must keep doing so until the scorecard charges
+/// for an absorbed miss.**
+///
+/// The mechanism below is the easy half. The hard half is that a run which
+/// completed on fabricated values must not read as a clean one — and today it
+/// does. `Synthesized` becomes `NovelCallAbsorbed`, which lands in
+/// `absorbed_misses`, which `divergence::…` explicitly SUBTRACTS from the
+/// blocking-reason count, and which is not a term in a correlation's `passed`
+/// at all. The comment beside that subtraction says it plainly: the fact is
+/// carried, "nothing yet spends it, and that is the follow-up".
+///
+/// While a declined miss is rare that costs little. This fallback makes it
+/// common — which would convert a loud blocking failure into a silent
+/// non-blocking one, at scale, by default. So the default stays `stop`, and the
+/// change that flips it is the change that makes an absorbed miss count. Those
+/// are one commit, not two.
+///
+/// `DEJA_MISS_FALLBACK=answer` opts in, which is how one tape gets replayed both
+/// ways so the grading can be compared on real data rather than argued.
+fn miss_fallback_enabled() -> bool {
+    std::env::var("DEJA_MISS_FALLBACK").is_ok_and(|v| v.eq_ignore_ascii_case("answer"))
+}
+
 fn substitute_decide<T, C, E>(
     spec: &BoundarySpec,
     identity: &CallsiteIdentity,
@@ -4104,7 +4171,7 @@ fn substitute_decide<T, C, E>(
     observe: E,
 ) -> T
 where
-    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    C: Fn(ReconstructInput<'_>) -> Reconstructed<T>,
     E: FnOnce(SubstituteToken, SubstituteOutcome),
 {
     let SubstitutePeek { recorded, token } = peek;
@@ -4116,7 +4183,8 @@ where
     // The seam can build it from the spec alone (`trait_name` IS the declared
     // component), so the cold path pays and the hot path does not.
     let miss;
-    let rebuilt = match recorded {
+    let mut fallback_miss: Option<SubstituteMiss> = None;
+    let mut rebuilt = match recorded {
         Some(value) => reconstruct(ReconstructInput::Hit(value)),
         None => {
             miss = SubstituteMiss::new(
@@ -4134,9 +4202,51 @@ where
                     .map(ToOwned::to_owned)
                     .or_else(deja_context::current_correlation_id),
             );
-            reconstruct(ReconstructInput::Miss(&miss))
+            let declined = reconstruct(ReconstructInput::Miss(&miss));
+            // Kept for the fallback below, which needs the same miss the site
+            // was shown so its fabricated leaves are a function of the query.
+            fallback_miss = Some(miss);
+            declined
         }
     };
+
+    // A SITE THAT DECLINED GETS ONE MORE ANSWER, FROM THE TAPE'S OWN SHAPE.
+    //
+    // `NoValue` and `Failed` both used to end the request. Both now try once
+    // more: borrow a recorded payload from another call at this same site,
+    // move its identity leaves into the synthesized subspace, and hand it back
+    // through the site's OWN rebuild closure — the same closure, the same code
+    // path a hit takes, so the value is type-valid by construction rather than
+    // by anything this seam manages to guess.
+    //
+    // Why here and not in the macro's missing-`on_miss` arm, which was the
+    // obvious place: a site may hand-write its reconstruct closure rather than
+    // use the macro's sugar, and the most important one does. hyperswitch's
+    // gRPC transport returns `NoValue` from a plain `fn`, so a macro-level
+    // default would never have reached the boundary that matters most. The seam
+    // sees every site the same way.
+    //
+    // A site that ANSWERS is untouched: `Value` and `Synthesized` never reach
+    // here, so a declared `on_miss` still wins and vendor intent is preserved
+    // wherever it was expressed.
+    if matches!(rebuilt, Reconstructed::NoValue | Reconstructed::Failed(_))
+        && miss_fallback_enabled()
+    {
+        if let Some(borrowed) = global_runtime_hook_from_env()
+            .and_then(|hook| {
+                hook.borrow_recorded_payload(spec.boundary, spec.trait_name, spec.method_name)
+            })
+            .zip(fallback_miss.as_ref())
+            .map(|(payload, miss)| synth::reshape(miss, &payload))
+        {
+            // The site may STILL decline — a payload it cannot rebuild is a
+            // real answer, and overriding it twice would be inventing a value
+            // the site has now twice said it cannot produce.
+            if let Reconstructed::Value(value) = reconstruct(ReconstructInput::Hit(borrowed)) {
+                rebuilt = Reconstructed::Synthesized(value);
+            }
+        }
+    }
 
     let outcome = match &rebuilt {
         Reconstructed::Value(_) => SubstituteOutcome::Substituted,
@@ -4229,7 +4339,7 @@ pub fn dispatch<T, A, F, C, R, O>(
 where
     A: FnOnce() -> serde_json::Value,
     F: FnOnce() -> T,
-    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    C: Fn(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
@@ -4353,7 +4463,7 @@ where
     A: FnOnce() -> serde_json::Value,
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
-    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    C: Fn(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
@@ -4451,7 +4561,7 @@ pub fn dispatch_with_hook<T, F, C, R, O>(
 ) -> T
 where
     F: FnOnce() -> T,
-    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    C: Fn(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
@@ -4536,7 +4646,7 @@ pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O>(
 where
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
-    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    C: Fn(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
 {
@@ -5991,8 +6101,8 @@ mod tests {
     /// seam fail-stops), so a fixture written before the miss arm existed keeps
     /// asserting what it always asserted.
     fn hit_only<T>(
-        f: impl FnOnce(serde_json::Value) -> Reconstructed<T>,
-    ) -> impl FnOnce(ReconstructInput<'_>) -> Reconstructed<T> {
+        f: impl Fn(serde_json::Value) -> Reconstructed<T>,
+    ) -> impl Fn(ReconstructInput<'_>) -> Reconstructed<T> {
         move |input| match input {
             ReconstructInput::Hit(recorded) => f(recorded),
             ReconstructInput::Miss(_) => Reconstructed::NoValue,
@@ -6049,7 +6159,7 @@ mod tests {
     /// seam returned. `None` for the value means the seam fail-stopped.
     fn drive(
         recorded: Option<serde_json::Value>,
-        produce: impl FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>,
+        produce: impl Fn(ReconstructInput<'_>) -> Reconstructed<u64>,
     ) -> (Option<crate::replay::ObservedCall>, Option<u64>) {
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = std::sync::Arc::clone(&emitted);
@@ -6148,7 +6258,7 @@ mod tests {
                 "declined miss",
                 None,
                 Box::new(|_: ReconstructInput<'_>| Reconstructed::<u64>::NoValue)
-                    as Box<dyn FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>>,
+                    as Box<dyn Fn(ReconstructInput<'_>) -> Reconstructed<u64>>,
             ),
             (
                 "unreconstructable hit",
@@ -6211,7 +6321,7 @@ mod tests {
                 "substituted",
                 Some(serde_json::json!(7u64)),
                 Box::new(|_: ReconstructInput<'_>| Reconstructed::Value(7u64))
-                    as Box<dyn FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>>,
+                    as Box<dyn Fn(ReconstructInput<'_>) -> Reconstructed<u64>>,
             ),
             (
                 "synthesized",
