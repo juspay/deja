@@ -59,6 +59,12 @@ pub enum Outcome {
         /// success so the ledger supplies the size distribution that sizes the
         /// budget and, later, an external merge sort's spill.
         landing_bytes_read: u64,
+        /// Compressed bytes fetched for the same landing. Recorded beside the
+        /// decompressed total because ONE of them sizes a memory budget and
+        /// only the PAIR gives a compression ratio — the number every
+        /// "decide it from the listing" proposal needs and that nothing has
+        /// ever written down.
+        landing_bytes_fetched: u64,
         /// Whether those bytes are this recording's alone — see
         /// [`Outcome::TooLarge`].
         shared_prefix: bool,
@@ -90,6 +96,11 @@ pub enum Outcome {
     TooLarge {
         budget_bytes: u64,
         read_bytes: u64,
+        /// Stored bytes fetched before the ceiling was hit. A lower bound, the
+        /// same as `read_bytes` — but the RATIO between the two is exact for
+        /// the objects that were read, and this is the population any
+        /// decide-from-the-listing gate would be judged on.
+        fetched_bytes: u64,
         objects_read: usize,
         objects_total: usize,
         /// False means the bytes are this recording's. True means they are the
@@ -172,6 +183,7 @@ impl std::fmt::Display for Row {
                 correlations,
                 landing_objects,
                 landing_bytes_read,
+                landing_bytes_fetched,
                 shared_prefix,
                 resealed,
                 instances_without_eof,
@@ -185,7 +197,8 @@ impl std::fmt::Display for Row {
                 write!(
                     f,
                     "{verb} ({correlations} correlation(s), {landing_objects} landing object(s), \
-                     {landing_bytes_read} decompressed byte(s){whose})"
+                     {landing_bytes_read} decompressed from {landing_bytes_fetched} compressed \
+                     byte(s){whose})"
                 )?;
                 if !instances_without_eof.is_empty() {
                     write!(
@@ -207,6 +220,7 @@ impl std::fmt::Display for Row {
                 budget_bytes,
                 read_bytes,
                 objects_read,
+                fetched_bytes: _,
                 objects_total,
                 shared_prefix,
             } => {
@@ -528,23 +542,27 @@ async fn seal_outcome_in(
         Compaction::Sealed {
             manifest,
             landing_bytes_read,
+            landing_bytes_fetched,
             shared_prefix,
         } => Ok(sealed_outcome(
             &manifest,
             resealed,
             &readiness,
             landing_bytes_read,
+            landing_bytes_fetched,
             shared_prefix,
         )),
         Compaction::RefusedTooLarge {
             budget_bytes,
             read_bytes,
+            fetched_bytes,
             objects_read,
             objects_total,
             shared_prefix,
         } => Ok(Outcome::TooLarge {
             budget_bytes,
             read_bytes,
+            fetched_bytes,
             objects_read,
             objects_total,
             shared_prefix,
@@ -557,12 +575,14 @@ fn sealed_outcome(
     resealed: bool,
     readiness: &SealReadiness,
     landing_bytes_read: u64,
+    landing_bytes_fetched: u64,
     shared_prefix: bool,
 ) -> Outcome {
     Outcome::Sealed {
         correlations: manifest.counts.correlations,
         landing_objects: manifest.counts.landing_objects,
         landing_bytes_read,
+        landing_bytes_fetched,
         shared_prefix,
         resealed,
         instances_without_eof: match readiness {
@@ -775,11 +795,65 @@ mod tests {
         block(crate::put(store, &key, lines.join("\n").into_bytes())).unwrap();
     }
 
+    /// Land a GZIP object, which is what the deployed aggregators write when
+    /// `compression: gzip` is set. The only fixture in which a landing's
+    /// fetched and held sizes differ — every plain fixture makes them equal,
+    /// so a row that reported one in the other's slot would look right in all
+    /// of them.
+    fn land_gzip(store: &DynStore, session: &str, object: usize, lines: &[String]) -> (u64, u64) {
+        use std::io::Write as _;
+        let payload = lines.join("\n").into_bytes();
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+        let key = format!("{ROOT}/session={session}/inst=i1/part-{object}.log.gz");
+        let stored = gz.len() as u64;
+        block(crate::put(store, &key, gz)).unwrap();
+        (stored, payload.len() as u64)
+    }
+
     /// Land under a DATE partition, the layout the deployed Vector aggregator
     /// actually writes. A session under two of them is addressed at the root.
     fn land_dated(store: &DynStore, date: &str, session: &str, object: usize, lines: &[String]) {
         let key = format!("{ROOT}/dt={date}/session={session}/inst=i1/part-{object}.json");
         block(crate::put(store, &key, lines.join("\n").into_bytes())).unwrap();
+    }
+
+    /// The ROW reports the two sizes in the right slots.
+    ///
+    /// `sealed_outcome` takes both as bare `u64` and hands them to a struct
+    /// whose fields are also both `u64`, so swapping them is invisible to the
+    /// compiler and to every plain fixture — where the two numbers are equal
+    /// by construction. This is the only pass-level test where they differ,
+    /// which makes it the only one that can tell the slots apart.
+    #[test]
+    fn a_sealed_row_reports_fetched_and_held_in_the_right_slots() {
+        let store = store();
+        let lines: Vec<String> = (0..40).map(|n| envelope("big", n as u64, 200)).collect();
+        let (stored, decompressed) = land_gzip(&store, "big", 0, &lines);
+        assert!(
+            stored < decompressed,
+            "the fixture must actually compress, or it proves nothing: {stored} vs {decompressed}"
+        );
+
+        let row = block(seal_one_in(&store, "sys", "big", ROOT, 0, None));
+        match row.outcome {
+            Outcome::Sealed {
+                landing_bytes_read,
+                landing_bytes_fetched,
+                ..
+            } => {
+                assert_eq!(
+                    landing_bytes_read, decompressed,
+                    "held = the decompressed payload"
+                );
+                assert_eq!(landing_bytes_fetched, stored, "fetched = the bytes stored");
+            }
+            other => panic!("expected a seal, got {other:?}"),
+        }
     }
 
     fn row(id: &str, outcome: Outcome) -> Row {
@@ -797,6 +871,7 @@ mod tests {
                 correlations: 1,
                 landing_objects: 1,
                 landing_bytes_read: 0,
+                landing_bytes_fetched: 0,
                 shared_prefix: false,
                 resealed: false,
                 instances_without_eof: Vec::new(),
@@ -923,6 +998,9 @@ mod tests {
                     Outcome::TooLarge {
                         budget_bytes: 536_870_912,
                         read_bytes: 561_616_085,
+                        // Stored, from the real refusal this fixture copies:
+                        // 18 of 67 objects, so both figures are floors.
+                        fetched_bytes: 561_616_085,
                         objects_read: 18,
                         objects_total: 67,
                         shared_prefix: false,
@@ -1134,6 +1212,7 @@ mod tests {
                 budget_bytes,
                 read_bytes,
                 objects_read,
+                fetched_bytes: _,
                 objects_total,
                 shared_prefix,
             } => {
