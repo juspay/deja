@@ -3141,10 +3141,6 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 // A delete that found NO key proves absence. Seeding the reply
                 // as a value would create the key — the opposite of what the
                 // recording shows — so the read is skipped and accounted.
-
-                // A delete that found NO key proves absence. Seeding the reply
-                // as a value would create the key — the opposite of what the
-                // recording shows — so the read is skipped and accounted.
                 if delete_proved_presence(event) == Some(false) {
                     plan.note_non_precondition(
                         &event.boundary,
@@ -6417,6 +6413,47 @@ mod tests {
                 .any(|(boundary, key, reason)| (boundary, key, reason)
                     == ("redis", "k", NotPreconditionReason::DeleteProvedAbsence)),
             "and the skip is accounted, not silent"
+        );
+    }
+
+    /// The same first-wins rule on the path production actually takes: the
+    /// delete declares no read set, so its key is derived rather than declared.
+    ///
+    /// The assertion that matters is the COUNT. If the two paths ever disagreed
+    /// about how a key is spelled, the symptom is not a clobbered value — it is
+    /// a second key seeded under a name nothing reads, sitting quietly beside
+    /// the right one.
+    #[test]
+    fn a_derived_delete_key_lands_on_the_key_the_read_already_seeded() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "k"}),
+                serde_json::json!("the-recorded-value"),
+                &["public:k"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.resolve("redis", "public:k").map(|e| &e.value),
+            Some(&serde_json::json!("the-recorded-value")),
+            "the read's value wins: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter().filter(|e| e.boundary == "redis").count(),
+            1,
+            "and the delete adds no second key beside it: {plan:?}"
         );
     }
 
