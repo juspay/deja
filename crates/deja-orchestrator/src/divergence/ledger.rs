@@ -114,10 +114,18 @@ pub struct CallRecord {
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
-    /// For a `value_diverged` row: `true` on the ORIGIN (the executed read whose
-    /// real-boundary value differed from the recorded baseline — the cause),
-    /// `false` on the CONSEQUENCE (a downstream write paired args-free). Absent on
-    /// every other kind. Lets the UI render the origin -> consequence cascade.
+    /// `true` on the ORIGIN of a cascade, `false` on its CONSEQUENCES. Lets the
+    /// UI render the origin -> consequence chain instead of a list of peers.
+    ///
+    /// Two kinds carry it. For a `value_diverged` row the origin is the executed
+    /// read whose real-boundary value differed from the recorded baseline, and a
+    /// consequence is a downstream write paired args-free. For a `novel` /
+    /// `novel_subtree` row the origin is the first added call at a site, and a
+    /// consequence is a later added call BENEATH it — the work that only
+    /// happened because the first one did. A cache read the recording never made
+    /// returns "not in cache", the caller falls back to redis and then the
+    /// database, and those calls are added too: one decision, four rows. Absent
+    /// on every other kind.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin: bool,
     /// The candidate's request STOPPED at this call: a `Substitute` boundary
@@ -321,6 +329,13 @@ pub(crate) fn build_with_inconclusive_into(
     // --- observed calls (candidate side) ------------------------------------
     // Enumerated because a truncated-recording tail is a POSITIONAL fact: the
     // call must come after the correlation's last recorded event was reproduced.
+    // The span of each novel ORIGIN seen so far, per correlation. A later novel
+    // call whose span lies at or beneath one of them is that origin's
+    // consequence; anything else is an origin of its own. Built as rows are
+    // emitted, which is observed order, so "beneath" can only ever mean
+    // "beneath something that already happened" — the same ordering rule
+    // `correlations_with_a_value_origin` states for value divergences.
+    let mut novel_origin_spans: HashMap<String, Vec<String>> = HashMap::new();
     for (observed_index, obs) in observed.iter().enumerate() {
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
         // result differs from the recorded baseline — the cause of a cascade.
@@ -521,6 +536,26 @@ pub(crate) fn build_with_inconclusive_into(
         } else {
             ("novel", true)
         };
+        // Novel rows carry the cascade. A call with no span cannot be placed
+        // under anything, so it stands alone rather than being attributed to a
+        // neighbour it may have nothing to do with.
+        let novel_origin = if matches!(kind, "novel" | "novel_subtree") {
+            let span = obs.span_path.clone();
+            let corr = obs.correlation_id.clone().unwrap_or_default();
+            let seen = novel_origin_spans.entry(corr).or_default();
+            match &span {
+                Some(path) => {
+                    let beneath_an_origin = seen.iter().any(|origin| path.starts_with(origin));
+                    if !beneath_an_origin {
+                        seen.push(path.clone());
+                    }
+                    !beneath_an_origin
+                }
+                None => true,
+            }
+        } else {
+            false
+        };
         let recorded = obs
             .source_event_global_sequence
             .and_then(recorded_for)
@@ -538,7 +573,7 @@ pub(crate) fn build_with_inconclusive_into(
             method_name: obs.method_name.clone(),
             kind: kind.to_owned(),
             blocking,
-            origin: false,
+            origin: novel_origin,
             stopped: stopped_at(obs),
             resolved_rank: obs.resolved_rank,
             recorded,
@@ -787,6 +822,93 @@ mod tests {
             policy_version: deja::POLICY_VERSION,
             entries,
         }
+    }
+
+    /// A novel call at a site drags work behind it: a cache read the recording
+    /// never made returns "not in cache", so the caller falls back to redis and
+    /// then the database, and those calls are added too. Four rows, one
+    /// decision. Reporting them as peers makes the reader hunt for which one
+    /// the candidate actually changed.
+    #[test]
+    fn a_novel_call_owns_the_added_work_beneath_it() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let span = "root>handler>get_or_populate";
+        let mut added_read = obs("imc", Some("c1"), false, None, None);
+        added_read.span_path = Some(span.to_owned());
+        let mut fallback_redis = obs("redis", Some("c1"), false, None, None);
+        fallback_redis.span_path = Some(span.to_owned());
+        let mut fallback_db = obs("db", Some("c1"), false, None, None);
+        fallback_db.span_path = Some(format!("{span}>find_by_id"));
+
+        let rows = build(
+            &events,
+            &[added_read, fallback_redis, fallback_db],
+            &table,
+            &HashSet::new(),
+        );
+        let novel = find(&rows, "novel");
+        assert_eq!(
+            novel.len(),
+            3,
+            "precondition: all three are novel: {rows:?}"
+        );
+
+        assert!(novel[0].origin, "the first added call is the cause");
+        assert!(
+            !novel[1].origin,
+            "a later added call in the SAME span follows from it: {:?}",
+            novel[1]
+        );
+        assert!(
+            !novel[2].origin,
+            "and so does one in a span BENEATH it: {:?}",
+            novel[2]
+        );
+    }
+
+    /// Attribution must not swallow independent findings. Two added calls in
+    /// unrelated parts of the request are two causes, and a viewer that showed
+    /// one of them as a consequence of the other would send the reader to the
+    /// wrong code.
+    #[test]
+    fn added_calls_in_unrelated_spans_are_each_their_own_origin() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let mut first = obs("imc", Some("c1"), false, None, None);
+        first.span_path = Some("root>handler>authenticate".to_owned());
+        let mut second = obs("redis", Some("c1"), false, None, None);
+        second.span_path = Some("root>handler>settle".to_owned());
+
+        let rows = build(&events, &[first, second], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 2);
+        assert!(novel[0].origin && novel[1].origin, "{novel:?}");
+    }
+
+    /// The correlation is part of the attribution: two requests running the same
+    /// code have the same span path, and one request's added call explains
+    /// nothing about another's.
+    #[test]
+    fn attribution_does_not_cross_correlations() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let span = "root>handler>get_or_populate";
+        let mut first = obs("imc", Some("c1"), false, None, None);
+        first.span_path = Some(span.to_owned());
+        let mut other_request = obs("imc", Some("c2"), false, None, None);
+        other_request.span_path = Some(span.to_owned());
+
+        let rows = build(&events, &[first, other_request], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 2);
+        assert!(
+            novel[0].origin && novel[1].origin,
+            "each correlation owns its own cascade: {novel:?}"
+        );
     }
 
     /// The scorecard tolerates an ABSORBED novel call (`NovelCallAbsorbed`,
