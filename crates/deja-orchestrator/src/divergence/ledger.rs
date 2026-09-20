@@ -203,11 +203,30 @@ fn stopped_at(obs: &ObservedCall) -> bool {
 /// correlation alone, a divergence occurring AFTER the re-keyed call demotes it
 /// to a consequence of a cause that had not happened yet — the same complaint
 /// this function exists to answer, with the order reversed.
+fn correlations_with_a_value_origin(
+    observed: &[ObservedCall],
+    by_seq: &HashMap<u64, &BoundaryEvent>,
+) -> HashMap<String, usize> {
+    let mut earliest: HashMap<String, usize> = HashMap::new();
+    for (index, obs) in observed.iter().enumerate() {
+        let source = obs
+            .source_event_global_sequence
+            .and_then(|seq| by_seq.get(&seq).copied());
+        if !observed_value_diverged(obs, source) {
+            continue;
+        }
+        if let Some(id) = obs.correlation_id.clone() {
+            earliest.entry(id).or_insert(index);
+        }
+    }
+    earliest
+}
+
 /// The index of each correlation's last divergence — what an earlier novel call
 /// in that correlation can have caused.
 ///
-/// Novel calls are not counted: a novel call is not a finding on its own, so a
-/// pile of them explaining each other would be a cascade with no effect.
+/// A novel call enters only by STOPPING the request, and a request stops once,
+/// so novel calls cannot form a chain of each other's causes.
 fn last_divergence_per_correlation(
     observed: &[ObservedCall],
     by_seq: &HashMap<u64, &BoundaryEvent>,
@@ -233,25 +252,6 @@ fn last_divergence_per_correlation(
         }
     }
     last
-}
-
-fn correlations_with_a_value_origin(
-    observed: &[ObservedCall],
-    by_seq: &HashMap<u64, &BoundaryEvent>,
-) -> HashMap<String, usize> {
-    let mut earliest: HashMap<String, usize> = HashMap::new();
-    for (index, obs) in observed.iter().enumerate() {
-        let source = obs
-            .source_event_global_sequence
-            .and_then(|seq| by_seq.get(&seq).copied());
-        if !observed_value_diverged(obs, source) {
-            continue;
-        }
-        if let Some(id) = obs.correlation_id.clone() {
-            earliest.entry(id).or_insert(index);
-        }
-    }
-    earliest
 }
 
 /// Build the per-call ledger from the recording's events (recorded side), the
@@ -851,6 +851,33 @@ mod tests {
 
     /// A novel call is not a finding on its own, so with nothing diverging
     /// after it there is no cause to point at.
+    /// The twin of the test below: the same two novel calls, but the second
+    /// STOPPED the request. That makes it a divergence, so the first is a cause
+    /// of it — and it proves the other test passes on the rule, not because
+    /// nothing could ever enter the map.
+    #[test]
+    fn a_novel_call_before_one_that_stopped_the_request_is_an_origin() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let mut stopped = obs("redis", Some("c1"), false, None, None);
+        stopped.outcome = deja::SubstituteOutcome::Stopped;
+
+        let rows = build(&events, &[added_read, stopped], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 2, "precondition: both are novel: {rows:?}");
+        assert!(novel[0].origin, "the earlier call is the cause: {novel:?}");
+        assert!(
+            novel[1].blocking,
+            "a novel call that stopped the request blocks: {novel:?}"
+        );
+        assert!(
+            !novel[0].blocking,
+            "but the earlier one did not stop anything: {novel:?}"
+        );
+    }
+
     #[test]
     fn a_novel_call_with_nothing_diverging_after_it_is_not_an_origin() {
         let events: Vec<BoundaryEvent> = vec![];
