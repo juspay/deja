@@ -114,18 +114,13 @@ pub struct CallRecord {
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
-    /// `true` on the ORIGIN of a cascade, `false` on its CONSEQUENCES. Lets the
-    /// UI render the origin -> consequence chain instead of a list of peers.
+    /// `true` on the ORIGIN of a cascade, `false` elsewhere. Lets the UI render
+    /// origin -> consequence instead of a list of peers.
     ///
-    /// Two kinds carry it. For a `value_diverged` row the origin is the executed
-    /// read whose real-boundary value differed from the recorded baseline, and a
-    /// consequence is a downstream write paired args-free. For a `novel` /
-    /// `novel_subtree` row the origin is the first added call at a site, and a
-    /// consequence is a later added call BENEATH it — the work that only
-    /// happened because the first one did. A cache read the recording never made
-    /// returns "not in cache", the caller falls back to redis and then the
-    /// database, and those calls are added too: one decision, four rows. Absent
-    /// on every other kind.
+    /// For a `value_diverged` row: the executed read whose value differed from
+    /// the baseline. For a `novel` / `novel_subtree` row: an added call with a
+    /// divergence after it in the same correlation. Absent on every other
+    /// kind.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin: bool,
     /// The candidate's request STOPPED at this call: a `Substitute` boundary
@@ -208,20 +203,11 @@ fn stopped_at(obs: &ObservedCall) -> bool {
 /// correlation alone, a divergence occurring AFTER the re-keyed call demotes it
 /// to a consequence of a cause that had not happened yet — the same complaint
 /// this function exists to answer, with the order reversed.
-/// The index of each correlation's LAST divergence — what a novel call earlier
+/// The index of each correlation's last divergence — what an earlier novel call
 /// in that correlation can have caused.
 ///
-/// "Divergence" here means a row that reports the candidate behaving
-/// differently: a value that differs from the recorded baseline, or a recorded
-/// call the candidate never made. Novel calls are deliberately NOT counted. A
-/// novel call is not a finding on its own — adding a call is what a change is,
-/// which is why the scorecard charges it to nothing — so a pile of them
-/// explaining each other would be a cascade with no cause and no effect.
-///
-/// Position, not containment. An added call changes what happens after it
-/// RETURNS as much as what happens beneath it: the sibling read its answer
-/// forced, the write-back, the response assembled further up. A span-prefix rule
-/// would miss all three while sounding precise.
+/// Novel calls are not counted: a novel call is not a finding on its own, so a
+/// pile of them explaining each other would be a cascade with no effect.
 fn last_divergence_per_correlation(
     observed: &[ObservedCall],
     by_seq: &HashMap<u64, &BoundaryEvent>,
@@ -239,12 +225,9 @@ fn last_divergence_per_correlation(
         let source = obs
             .source_event_global_sequence
             .and_then(|seq| by_seq.get(&seq).copied());
-        // Two signals, and both have a POSITION in the observed stream, which is
-        // what attribution needs: a value that came back different, and a
-        // request that stopped here. An omitted call is a divergence too, but it
-        // is a recorded call with no observed counterpart — there is no index at
-        // which it did not happen — so using it would mean guessing where in the
-        // candidate's order to put it.
+        // Both signals have a position in the observed stream, which is what
+        // attribution needs. An omitted call is a divergence too, but it has no
+        // observed counterpart and so no index to be after.
         if observed_value_diverged(obs, source) || stopped_at(obs) {
             last.insert(corr.to_owned(), index);
         }
@@ -373,11 +356,8 @@ pub(crate) fn build_with_inconclusive_into(
     // --- observed calls (candidate side) ------------------------------------
     // Enumerated because a truncated-recording tail is a POSITIONAL fact: the
     // call must come after the correlation's last recorded event was reproduced.
-    // Where each correlation's LAST divergence sits. A novel call before it is
-    // an origin — something the candidate added, and something went wrong after
-    // it. A novel call with nothing diverging after it is not a finding at all:
-    // adding a call is what a change IS, which is why the scorecard charges it
-    // to nothing.
+    // A novel call before a correlation's last divergence is an origin; one
+    // with nothing diverging after it is not a finding at all.
     let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap);
     for (observed_index, obs) in observed.iter().enumerate() {
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
@@ -579,15 +559,9 @@ pub(crate) fn build_with_inconclusive_into(
         } else {
             ("novel", true)
         };
-        // A novel call is an ORIGIN only when a divergence follows it in the same
-        // correlation. Not "the first novel call", and not "the novel call whose
-        // span contains the others": an added call changes what happens after it
-        // RETURNS as much as what happens beneath it — a sibling read, a
-        // write-back, a response assembled further up — so containment is a
-        // structural guess about a causal question. Position is the relation the
-        // ledger can actually defend, and it is the one
-        // `correlations_with_a_value_origin` already states for value
-        // divergences.
+        // Origin only when a divergence follows it in the same correlation.
+        // Not span containment: an added call changes what happens after it
+        // returns as much as what happens beneath it.
         let novel_origin = matches!(kind, "novel" | "novel_subtree")
             && obs
                 .correlation_id
@@ -862,8 +836,7 @@ mod tests {
         }
     }
 
-    /// A call whose executed result differs from the recorded baseline: the
-    /// divergence a novel call earlier in the correlation may have caused.
+    /// A call whose executed result differs from the recorded baseline.
     fn diverging(boundary: &str, corr: Option<&str>, src: u64) -> ObservedCall {
         let mut o = obs(boundary, corr, true, Some(6), Some(src));
         o.provenance = deja::Provenance::Shadow;
@@ -872,10 +845,8 @@ mod tests {
         o
     }
 
-    /// A novel call is NOT a finding. Adding a call is what a change is, which
-    /// is why the scorecard charges it to nothing — so a run whose only news is
-    /// "the candidate made some calls the recording did not" has no cause to
-    /// point at, and the ledger must not invent one.
+    /// A novel call is not a finding on its own, so with nothing diverging
+    /// after it there is no cause to point at.
     #[test]
     fn a_novel_call_with_nothing_diverging_after_it_is_not_an_origin() {
         let events: Vec<BoundaryEvent> = vec![];
@@ -893,10 +864,7 @@ mod tests {
         );
     }
 
-    /// And when something DOES diverge afterwards, the added call is what to
-    /// look at. This is the case the flag exists for: a cache read the recording
-    /// never made sends the caller down a fallback, and a value further on comes
-    /// back different.
+    /// With a divergence after it, the added call is what to look at.
     #[test]
     fn a_novel_call_is_an_origin_when_a_divergence_follows_it() {
         let events = vec![event(7, "db", Some("c1"))];
@@ -915,9 +883,7 @@ mod tests {
         );
     }
 
-    /// Position is the whole claim. A divergence that happened BEFORE the added
-    /// call cannot have been caused by it, and saying otherwise would send the
-    /// reader to code that ran afterwards.
+    /// A divergence before the added call cannot have been caused by it.
     #[test]
     fn a_divergence_before_the_novel_call_does_not_make_it_an_origin() {
         let events = vec![event(7, "db", Some("c1"))];
@@ -932,8 +898,8 @@ mod tests {
         assert!(!novel[0].origin, "{:?}", novel[0]);
     }
 
-    /// Two requests run the same code, so a divergence in one says nothing about
-    /// an added call in another.
+    /// Two requests run the same code, so one's divergence says nothing about
+    /// another's added call.
     #[test]
     fn attribution_does_not_cross_correlations() {
         let events = vec![event(7, "db", Some("c2"))];
