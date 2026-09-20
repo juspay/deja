@@ -2589,6 +2589,9 @@ pub enum NotPreconditionReason {
     /// This correlation CREATED rows in the table; seeding a later read-back
     /// would collide with the replayed create.
     SelfCreatedTable,
+    /// A delete that found NO key. The reply proves absence, so there is
+    /// nothing to seed — and seeding the reply as a value would create the key.
+    DeleteProvedAbsence,
 }
 
 impl SeedPlan {
@@ -3024,6 +3027,29 @@ fn is_redis_event(event: &BoundaryEvent) -> bool {
         .is_some_and(|declaration| declaration.effect == Some(EffectKind::Redis))
 }
 
+/// Whether a redis delete's reply proves the key was present. `None` when the
+/// event is not a delete reply.
+fn delete_proved_presence(event: &BoundaryEvent) -> Option<bool> {
+    if !is_redis_event(event) {
+        return None;
+    }
+    let result = event.result.to_value();
+    let reply = match &result {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(m) => m
+            .get("value")
+            .or_else(|| m.get("result"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }?;
+    match reply.as_str() {
+        "KeyDeleted" => Some(true),
+        "KeyNotDeleted" => Some(false),
+        _ => None,
+    }
+}
+
 /// What to seed for a reply that proves the key EXISTED but not what it held —
 /// a redis delete.
 ///
@@ -3036,20 +3062,9 @@ fn is_redis_event(event: &BoundaryEvent) -> bool {
 /// `KeyNotDeleted` seeds nothing: a delete that found no key is evidence of
 /// ABSENCE, and seeding presence there would contradict the recording.
 fn presence_placeholder_for(event: &BoundaryEvent) -> Option<serde_json::Value> {
-    if !is_redis_event(event) {
-        return None;
-    }
-    // The reply serializes as a bare enum-name string; tolerate an envelope.
-    let result = event.result.to_value();
-    let reply = match &result {
-        serde_json::Value::String(s) => Some(s.as_str()),
-        serde_json::Value::Object(m) => m
-            .get("value")
-            .or_else(|| m.get("result"))
-            .and_then(serde_json::Value::as_str),
-        _ => None,
-    }?;
-    (reply == "KeyDeleted").then(|| serde_json::Value::String(PRESENCE_PLACEHOLDER.to_owned()))
+    delete_proved_presence(event)
+        .filter(|proved| *proved)
+        .map(|_| serde_json::Value::String(PRESENCE_PLACEHOLDER.to_owned()))
 }
 
 /// What a presence-only seed writes. Self-describing so a reader can tell it
@@ -3121,6 +3136,22 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                             continue;
                         }
                     }
+                }
+
+                // A delete that found NO key proves absence. Seeding the reply
+                // as a value would create the key — the opposite of what the
+                // recording shows — so the read is skipped and accounted.
+
+                // A delete that found NO key proves absence. Seeding the reply
+                // as a value would create the key — the opposite of what the
+                // recording shows — so the read is skipped and accounted.
+                if delete_proved_presence(event) == Some(false) {
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::DeleteProvedAbsence,
+                    );
+                    continue;
                 }
 
                 plan.upsert(SeedEntry {
@@ -6360,10 +6391,13 @@ mod tests {
         );
     }
 
-    /// A delete that found nothing says the key was ABSENT. Seeding presence
-    /// there would contradict the recording.
+    /// A delete that found nothing proves the key was ABSENT, so it seeds
+    /// NOTHING — not the placeholder, and not its reply either: seeding
+    /// "KeyNotDeleted" as a value would create the key the recording shows was
+    /// missing. Asserted as absence plus an accounted skip, because "the value
+    /// is not the placeholder" passes while the key exists.
     #[test]
-    fn a_delete_that_found_nothing_seeds_no_presence() {
+    fn a_delete_that_found_nothing_seeds_nothing_at_all() {
         let events = vec![redis_event(
             0,
             Some("c1"),
@@ -6374,13 +6408,15 @@ mod tests {
         )];
 
         let plan = build_seed_plan(&events, Some("c1"));
-        let entry = plan
-            .resolve("redis", "k")
-            .expect("the read set still seeds");
-        assert_ne!(
-            entry.value,
-            serde_json::json!(PRESENCE_PLACEHOLDER),
-            "a delete that deleted nothing is evidence of ABSENCE, not presence"
+        assert!(
+            plan.resolve("redis", "k").is_none(),
+            "the key must not be in the plan at all: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(boundary, key, reason)| (boundary, key, reason)
+                    == ("redis", "k", NotPreconditionReason::DeleteProvedAbsence)),
+            "and the skip is accounted, not silent"
         );
     }
 
