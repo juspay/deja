@@ -208,6 +208,50 @@ fn stopped_at(obs: &ObservedCall) -> bool {
 /// correlation alone, a divergence occurring AFTER the re-keyed call demotes it
 /// to a consequence of a cause that had not happened yet — the same complaint
 /// this function exists to answer, with the order reversed.
+/// The index of each correlation's LAST divergence — what a novel call earlier
+/// in that correlation can have caused.
+///
+/// "Divergence" here means a row that reports the candidate behaving
+/// differently: a value that differs from the recorded baseline, or a recorded
+/// call the candidate never made. Novel calls are deliberately NOT counted. A
+/// novel call is not a finding on its own — adding a call is what a change is,
+/// which is why the scorecard charges it to nothing — so a pile of them
+/// explaining each other would be a cascade with no cause and no effect.
+///
+/// Position, not containment. An added call changes what happens after it
+/// RETURNS as much as what happens beneath it: the sibling read its answer
+/// forced, the write-back, the response assembled further up. A span-prefix rule
+/// would miss all three while sounding precise.
+fn last_divergence_per_correlation(
+    observed: &[ObservedCall],
+    by_seq: &HashMap<u64, &BoundaryEvent>,
+    tail_gap: &TailGapEvidence,
+) -> HashMap<String, usize> {
+    let mut last: HashMap<String, usize> = HashMap::new();
+    for (index, obs) in observed.iter().enumerate() {
+        let Some(corr) = obs.correlation_id.as_deref() else {
+            continue;
+        };
+        if tail_gap.covers(Some(corr), index) || obs.seed_gap {
+            // No baseline for this call, so it is not evidence of anything.
+            continue;
+        }
+        let source = obs
+            .source_event_global_sequence
+            .and_then(|seq| by_seq.get(&seq).copied());
+        // Two signals, and both have a POSITION in the observed stream, which is
+        // what attribution needs: a value that came back different, and a
+        // request that stopped here. An omitted call is a divergence too, but it
+        // is a recorded call with no observed counterpart — there is no index at
+        // which it did not happen — so using it would mean guessing where in the
+        // candidate's order to put it.
+        if observed_value_diverged(obs, source) || stopped_at(obs) {
+            last.insert(corr.to_owned(), index);
+        }
+    }
+    last
+}
+
 fn correlations_with_a_value_origin(
     observed: &[ObservedCall],
     by_seq: &HashMap<u64, &BoundaryEvent>,
@@ -329,13 +373,12 @@ pub(crate) fn build_with_inconclusive_into(
     // --- observed calls (candidate side) ------------------------------------
     // Enumerated because a truncated-recording tail is a POSITIONAL fact: the
     // call must come after the correlation's last recorded event was reproduced.
-    // The span of each novel ORIGIN seen so far, per correlation. A later novel
-    // call whose span lies at or beneath one of them is that origin's
-    // consequence; anything else is an origin of its own. Built as rows are
-    // emitted, which is observed order, so "beneath" can only ever mean
-    // "beneath something that already happened" — the same ordering rule
-    // `correlations_with_a_value_origin` states for value divergences.
-    let mut novel_origin_spans: HashMap<String, Vec<String>> = HashMap::new();
+    // Where each correlation's LAST divergence sits. A novel call before it is
+    // an origin — something the candidate added, and something went wrong after
+    // it. A novel call with nothing diverging after it is not a finding at all:
+    // adding a call is what a change IS, which is why the scorecard charges it
+    // to nothing.
+    let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap);
     for (observed_index, obs) in observed.iter().enumerate() {
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
         // result differs from the recorded baseline — the cause of a cascade.
@@ -536,26 +579,21 @@ pub(crate) fn build_with_inconclusive_into(
         } else {
             ("novel", true)
         };
-        // Novel rows carry the cascade. A call with no span cannot be placed
-        // under anything, so it stands alone rather than being attributed to a
-        // neighbour it may have nothing to do with.
-        let novel_origin = if matches!(kind, "novel" | "novel_subtree") {
-            let span = obs.span_path.clone();
-            let corr = obs.correlation_id.clone().unwrap_or_default();
-            let seen = novel_origin_spans.entry(corr).or_default();
-            match &span {
-                Some(path) => {
-                    let beneath_an_origin = seen.iter().any(|origin| path.starts_with(origin));
-                    if !beneath_an_origin {
-                        seen.push(path.clone());
-                    }
-                    !beneath_an_origin
-                }
-                None => true,
-            }
-        } else {
-            false
-        };
+        // A novel call is an ORIGIN only when a divergence follows it in the same
+        // correlation. Not "the first novel call", and not "the novel call whose
+        // span contains the others": an added call changes what happens after it
+        // RETURNS as much as what happens beneath it — a sibling read, a
+        // write-back, a response assembled further up — so containment is a
+        // structural guess about a causal question. Position is the relation the
+        // ledger can actually defend, and it is the one
+        // `correlations_with_a_value_origin` already states for value
+        // divergences.
+        let novel_origin = matches!(kind, "novel" | "novel_subtree")
+            && obs
+                .correlation_id
+                .as_deref()
+                .and_then(|corr| last_divergence.get(corr))
+                .is_some_and(|last| *last > observed_index);
         let recorded = obs
             .source_event_global_sequence
             .and_then(recorded_for)
@@ -824,90 +862,98 @@ mod tests {
         }
     }
 
-    /// A novel call at a site drags work behind it: a cache read the recording
-    /// never made returns "not in cache", so the caller falls back to redis and
-    /// then the database, and those calls are added too. Four rows, one
-    /// decision. Reporting them as peers makes the reader hunt for which one
-    /// the candidate actually changed.
+    /// A call whose executed result differs from the recorded baseline: the
+    /// divergence a novel call earlier in the correlation may have caused.
+    fn diverging(boundary: &str, corr: Option<&str>, src: u64) -> ObservedCall {
+        let mut o = obs(boundary, corr, true, Some(6), Some(src));
+        o.provenance = deja::Provenance::Shadow;
+        o.recorded_result = Some(serde_json::json!({"v": "recorded"}));
+        o.observed_result = Some(serde_json::json!({"v": "different"}));
+        o
+    }
+
+    /// A novel call is NOT a finding. Adding a call is what a change is, which
+    /// is why the scorecard charges it to nothing — so a run whose only news is
+    /// "the candidate made some calls the recording did not" has no cause to
+    /// point at, and the ledger must not invent one.
     #[test]
-    fn a_novel_call_owns_the_added_work_beneath_it() {
+    fn a_novel_call_with_nothing_diverging_after_it_is_not_an_origin() {
         let events: Vec<BoundaryEvent> = vec![];
         let table = table_for(&events, &HashMap::new());
 
-        let span = "root>handler>get_or_populate";
-        let mut added_read = obs("imc", Some("c1"), false, None, None);
-        added_read.span_path = Some(span.to_owned());
-        let mut fallback_redis = obs("redis", Some("c1"), false, None, None);
-        fallback_redis.span_path = Some(span.to_owned());
-        let mut fallback_db = obs("db", Some("c1"), false, None, None);
-        fallback_db.span_path = Some(format!("{span}>find_by_id"));
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let fallback = obs("redis", Some("c1"), false, None, None);
+
+        let rows = build(&events, &[added_read, fallback], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 2, "precondition: both are novel: {rows:?}");
+        assert!(
+            novel.iter().all(|r| !r.origin),
+            "nothing diverged, so nothing is a cause: {novel:?}"
+        );
+    }
+
+    /// And when something DOES diverge afterwards, the added call is what to
+    /// look at. This is the case the flag exists for: a cache read the recording
+    /// never made sends the caller down a fallback, and a value further on comes
+    /// back different.
+    #[test]
+    fn a_novel_call_is_an_origin_when_a_divergence_follows_it() {
+        let events = vec![event(7, "db", Some("c1"))];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let later = diverging("db", Some("c1"), 7);
+
+        let rows = build(&events, &[added_read, later], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 1, "{rows:?}");
+        assert!(
+            novel[0].origin,
+            "an added call with a divergence after it is the cause to show: {:?}",
+            novel[0]
+        );
+    }
+
+    /// Position is the whole claim. A divergence that happened BEFORE the added
+    /// call cannot have been caused by it, and saying otherwise would send the
+    /// reader to code that ran afterwards.
+    #[test]
+    fn a_divergence_before_the_novel_call_does_not_make_it_an_origin() {
+        let events = vec![event(7, "db", Some("c1"))];
+        let table = table_for(&events, &HashMap::new());
+
+        let earlier = diverging("db", Some("c1"), 7);
+        let added_read = obs("imc", Some("c1"), false, None, None);
+
+        let rows = build(&events, &[earlier, added_read], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 1, "{rows:?}");
+        assert!(!novel[0].origin, "{:?}", novel[0]);
+    }
+
+    /// Two requests run the same code, so a divergence in one says nothing about
+    /// an added call in another.
+    #[test]
+    fn attribution_does_not_cross_correlations() {
+        let events = vec![event(7, "db", Some("c2"))];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let other_request = diverging("db", Some("c2"), 7);
 
         let rows = build(
             &events,
-            &[added_read, fallback_redis, fallback_db],
+            &[added_read, other_request],
             &table,
             &HashSet::new(),
         );
         let novel = find(&rows, "novel");
-        assert_eq!(
-            novel.len(),
-            3,
-            "precondition: all three are novel: {rows:?}"
-        );
-
-        assert!(novel[0].origin, "the first added call is the cause");
+        assert_eq!(novel.len(), 1, "{rows:?}");
         assert!(
-            !novel[1].origin,
-            "a later added call in the SAME span follows from it: {:?}",
-            novel[1]
-        );
-        assert!(
-            !novel[2].origin,
-            "and so does one in a span BENEATH it: {:?}",
-            novel[2]
-        );
-    }
-
-    /// Attribution must not swallow independent findings. Two added calls in
-    /// unrelated parts of the request are two causes, and a viewer that showed
-    /// one of them as a consequence of the other would send the reader to the
-    /// wrong code.
-    #[test]
-    fn added_calls_in_unrelated_spans_are_each_their_own_origin() {
-        let events: Vec<BoundaryEvent> = vec![];
-        let table = table_for(&events, &HashMap::new());
-
-        let mut first = obs("imc", Some("c1"), false, None, None);
-        first.span_path = Some("root>handler>authenticate".to_owned());
-        let mut second = obs("redis", Some("c1"), false, None, None);
-        second.span_path = Some("root>handler>settle".to_owned());
-
-        let rows = build(&events, &[first, second], &table, &HashSet::new());
-        let novel = find(&rows, "novel");
-        assert_eq!(novel.len(), 2);
-        assert!(novel[0].origin && novel[1].origin, "{novel:?}");
-    }
-
-    /// The correlation is part of the attribution: two requests running the same
-    /// code have the same span path, and one request's added call explains
-    /// nothing about another's.
-    #[test]
-    fn attribution_does_not_cross_correlations() {
-        let events: Vec<BoundaryEvent> = vec![];
-        let table = table_for(&events, &HashMap::new());
-
-        let span = "root>handler>get_or_populate";
-        let mut first = obs("imc", Some("c1"), false, None, None);
-        first.span_path = Some(span.to_owned());
-        let mut other_request = obs("imc", Some("c2"), false, None, None);
-        other_request.span_path = Some(span.to_owned());
-
-        let rows = build(&events, &[first, other_request], &table, &HashSet::new());
-        let novel = find(&rows, "novel");
-        assert_eq!(novel.len(), 2);
-        assert!(
-            novel[0].origin && novel[1].origin,
-            "each correlation owns its own cascade: {novel:?}"
+            !novel[0].origin,
+            "another correlation's divergence is not this call's consequence: {:?}",
+            novel[0]
         );
     }
 
