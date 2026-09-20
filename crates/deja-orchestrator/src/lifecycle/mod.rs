@@ -2717,6 +2717,9 @@ impl SeedCertificateEntry {
             deja::NotPreconditionReason::SelfCreatedTable => {
                 "not a precondition: this correlation creates the table's rows itself on replay"
             }
+            deja::NotPreconditionReason::DeleteProvedAbsence => {
+                "not a precondition: the delete found no key, so the recording proves absence"
+            }
         };
         Self {
             correlation_id: correlation_id.clone(),
