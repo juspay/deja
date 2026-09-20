@@ -3170,27 +3170,40 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // the key (not a precondition) or when the recording never showed the
         // prefix.
         if event.read_set.is_empty() && !(event.is_error || is_miss_result(event)) {
-            if let (Some(value), Some(prefix)) =
-                (presence_placeholder_for(event), key_prefix.as_ref())
-            {
-                if let Some(logical) = event
-                    .args
-                    .to_value()
-                    .get("key")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    let canonical_key = canonical_state_key_wire(&format!("{prefix}{logical}"));
-                    if !written.contains(&(event.boundary.clone(), canonical_key.clone())) {
-                        plan.upsert(SeedEntry {
-                            boundary: event.boundary.clone(),
-                            key: canonical_key,
-                            value,
-                            image: None,
-                            method: Some(event.method_name.clone()),
-                            origin: SeedOrigin::Recording,
-                            source_sequence: event.global_sequence,
-                        });
-                    }
+            let args = event.args.to_value();
+            let logical = args.get("key").and_then(serde_json::Value::as_str);
+            if let (Some(proved), Some(prefix), Some(logical)) = (
+                delete_proved_presence(event),
+                key_prefix.as_deref(),
+                logical,
+            ) {
+                let canonical_key = canonical_state_key_wire(&format!("{prefix}{logical}"));
+                if !proved {
+                    // Absence: nothing to seed, but the certificate says so
+                    // rather than staying silent about the key.
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::DeleteProvedAbsence,
+                    );
+                } else if written.contains(&(event.boundary.clone(), canonical_key.clone())) {
+                    // Same conclusion the declared branch reaches for this key,
+                    // so it is named the same way.
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::ReadAfterWrite,
+                    );
+                } else {
+                    plan.upsert(SeedEntry {
+                        boundary: event.boundary.clone(),
+                        key: canonical_key,
+                        value: serde_json::Value::String(PRESENCE_PLACEHOLDER.to_owned()),
+                        image: None,
+                        method: Some(event.method_name.clone()),
+                        origin: SeedOrigin::Recording,
+                        source_sequence: event.global_sequence,
+                    });
                 }
             }
         }
@@ -6413,6 +6426,100 @@ mod tests {
                 .any(|(boundary, key, reason)| (boundary, key, reason)
                     == ("redis", "k", NotPreconditionReason::DeleteProvedAbsence)),
             "and the skip is accounted, not silent"
+        );
+    }
+
+    /// A delete that found nothing, in the shape production records: the
+    /// certificate names the decline instead of staying silent about the key.
+    #[test]
+    fn a_derived_delete_that_found_nothing_is_accounted() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "other"}),
+                serde_json::json!("v"),
+                &["public:other"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyNotDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            plan.resolve("redis", "public:k").is_none(),
+            "absence seeds nothing: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(boundary, key, reason)| {
+                    (boundary, key, reason)
+                        == (
+                            "redis",
+                            "public:k",
+                            NotPreconditionReason::DeleteProvedAbsence,
+                        )
+                }),
+            "and the decline is named: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
+    }
+
+    /// The derived branch reaches the same conclusion as the declared one when
+    /// the correlation already wrote the key, and names it the same way. Once
+    /// deletes start declaring read sets, the two must not disagree.
+    #[test]
+    fn a_derived_delete_of_a_key_this_correlation_wrote_is_accounted() {
+        let mut write = redis_event(
+            1,
+            Some("c1"),
+            "set_key",
+            serde_json::json!({"key": "k"}),
+            serde_json::json!("Ok"),
+            &[],
+        );
+        write.write_set = vec!["public:k".to_owned()];
+
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "other"}),
+                serde_json::json!("v"),
+                &["public:other"],
+            ),
+            write,
+            redis_event(
+                2,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            plan.resolve("redis", "public:k").is_none(),
+            "a key this correlation wrote is not a precondition: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(boundary, key, reason)| {
+                    (boundary, key, reason)
+                        == ("redis", "public:k", NotPreconditionReason::ReadAfterWrite)
+                }),
+            "and it is named the way the declared branch names it: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
         );
     }
 
