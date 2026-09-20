@@ -557,7 +557,11 @@ pub(crate) fn build_with_inconclusive_into(
             // nothing, as the scorecard's `NovelCallAbsorbed` is.
             ("novel_absorbed", false)
         } else {
-            ("novel", true)
+            // Blocking only when the miss STOPPED the request. A novel call on
+            // its own is charged to nothing by the scorecard — adding a call is
+            // what a change is — and this row is what the viewer routes on, so
+            // the two must agree.
+            ("novel", stopped_at(obs))
         };
         // Origin only when a divergence follows it in the same correlation.
         // Not span containment: an added call changes what happens after it
@@ -996,7 +1000,11 @@ mod tests {
 
         let novel = find(&rows, "novel");
         assert_eq!(novel.len(), 1);
-        assert!(novel[0].blocking, "correlated novel call blocks");
+        assert!(
+            !novel[0].blocking,
+            "a novel call that did not stop the request is charged to nothing by \
+             the scorecard, and this row is what the viewer routes on"
+        );
         assert!(novel[0].recorded.is_none(), "novel has no recorded side");
         assert!(novel[0].observed.is_some());
 
