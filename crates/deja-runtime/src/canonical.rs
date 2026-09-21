@@ -52,10 +52,8 @@ use serde_json::Value;
 /// Type paths whose SEQUENCE serialisation carries no order.
 ///
 /// Matched on the path before the generic arguments, so `HashSet<T>` and
-/// `HashSet<T, S>` both hit. `HashMap` is deliberately absent: it serialises
-/// through `serialize_map` into a JSON OBJECT, and object key order is
-/// insignificant by JSON's own rules (`canonical_args_hash` already sorts keys,
-/// and this module emits them in `serde_json::Map` order either way).
+/// `HashSet<T, S>` both hit. `HashMap` is not a sequence; its keys are handled
+/// by [`is_unordered_map`].
 ///
 /// `std::any::type_name` promises no stable format, so
 /// [`tests::type_name_strings_are_what_this_module_matches_on`] pins every entry
@@ -79,6 +77,25 @@ pub fn is_unordered_sequence(type_name: &str) -> bool {
     let name = type_name.trim_start_matches('&');
     let path = name.split('<').next().unwrap_or(name);
     UNORDERED_SEQUENCE_TYPES.contains(&path)
+}
+
+/// Type paths whose MAP serialisation carries no key order.
+///
+/// An ordered map is absent on purpose. `serde_json::Map` built with
+/// `preserve_order`, or an `IndexMap`, holds an order its builder chose, and a
+/// recorded value is handed back to the service on replay: sorting it here
+/// would return something other than what was recorded.
+const UNORDERED_MAP_TYPES: &[&str] = &[
+    "std::collections::hash::map::HashMap",
+    "hashbrown::map::HashMap",
+];
+
+/// Does the static type at this position serialise as a map with no key order?
+#[must_use]
+pub fn is_unordered_map(type_name: &str) -> bool {
+    let name = type_name.trim_start_matches('&');
+    let path = name.split('<').next().unwrap_or(name);
+    UNORDERED_MAP_TYPES.contains(&path)
 }
 
 /// The canonical order for a multiset of JSON values: by serialised form.
@@ -131,19 +148,25 @@ where
 /// it, because that is the only place the concrete type is visible.
 struct Canonical {
     unordered: bool,
+    unordered_map: bool,
 }
 
 impl Canonical {
     fn for_type<T: ?Sized>() -> Self {
+        let type_name = std::any::type_name::<T>();
         Self {
-            unordered: is_unordered_sequence(std::any::type_name::<T>()),
+            unordered: is_unordered_sequence(type_name),
+            unordered_map: is_unordered_map(type_name),
         }
     }
 
     /// A position that is positional by construction — a tuple, a tuple struct,
     /// a map key — and therefore never canonicalised whatever its type says.
     fn positional() -> Self {
-        Self { unordered: false }
+        Self {
+            unordered: false,
+            unordered_map: false,
+        }
     }
 }
 
@@ -303,6 +326,7 @@ impl Serializer for Canonical {
         Ok(MapBuilder {
             entries: Vec::with_capacity(len.unwrap_or(0)),
             pending_key: None,
+            sort_keys: self.unordered_map,
         })
     }
     fn serialize_struct(
@@ -418,19 +442,16 @@ impl ser::SerializeTupleVariant for VariantSeqBuilder {
     }
 }
 
-/// The builder for a MAP — a `HashMap`, a `BTreeMap`, anything reached through
-/// `serialize_map`. Entries are collected and emitted in KEY order, whatever
-/// `serde_json::Map` would do with them: a consumer may build `serde_json` with
-/// `preserve_order` (hyperswitch's router does, through `josekit`, `thirtyfour`
-/// and `ucs_common_utils`), and then `Map` is an `IndexMap` that keeps
-/// insertion order — which for a `HashMap` is this process's hash order, put
-/// onto the tape as JSON object key order. Sorting here makes a map canonical
-/// on every build. Structs do NOT go through this: their field order is
-/// declaration order, deterministic on every run of a build, so
-/// [`StructBuilder`] inserts straight into the map and pays nothing.
+/// The builder for a MAP. A map that is unordered BY ITS STATIC TYPE is emitted
+/// in key order: a consumer may build `serde_json` with `preserve_order`, and
+/// then a `HashMap`'s per-process hash order would reach the tape as object key
+/// order. A map whose type keeps an order is emitted as it arrived, because the
+/// recorded value is what replay hands back. Structs do not go through this:
+/// their field order is declaration order, so [`StructBuilder`] inserts directly.
 struct MapBuilder {
     entries: Vec<(String, Value)>,
     pending_key: Option<String>,
+    sort_keys: bool,
 }
 
 /// The builder for a STRUCT. Field names are static and arrive in declaration
@@ -447,8 +468,10 @@ fn sort_map_entries(entries: &mut [(String, Value)]) {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 }
 
-fn finish_map(mut entries: Vec<(String, Value)>) -> Value {
-    sort_map_entries(&mut entries);
+fn finish_map(mut entries: Vec<(String, Value)>, sort_keys: bool) -> Value {
+    if sort_keys {
+        sort_map_entries(&mut entries);
+    }
     let mut map = serde_json::Map::with_capacity(entries.len());
     for (key, value) in entries {
         map.insert(key, value);
@@ -495,7 +518,7 @@ impl ser::SerializeMap for MapBuilder {
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
-        Ok(finish_map(self.entries))
+        Ok(finish_map(self.entries, self.sort_keys))
     }
 }
 
@@ -555,6 +578,18 @@ mod tests {
             "the HashSet path this module matches on has moved"
         );
         assert!(is_unordered_sequence(std::any::type_name::<HashSet<u8>>()));
+        assert_eq!(
+            std::any::type_name::<HashMap<String, u8>>(),
+            "std::collections::hash::map::HashMap<alloc::string::String, u8>",
+            "the HashMap path this module matches on has moved"
+        );
+        assert!(is_unordered_map(
+            std::any::type_name::<HashMap<String, u8>>()
+        ));
+        assert!(!is_unordered_map(std::any::type_name::<
+            serde_json::Map<String, Value>,
+        >()));
+        assert!(!is_unordered_map(std::any::type_name::<Value>()));
         assert!(is_unordered_sequence(std::any::type_name::<
             HashSet<String, std::collections::hash_map::RandomState>,
         >()));
@@ -834,6 +869,58 @@ mod tests {
         let emitted: Vec<&String> = value.as_object().expect("object").keys().collect();
         assert_eq!(emitted, ["alpha", "mid", "zeta"]);
         assert_eq!(value, serde_json::to_value(&map).expect("serde_json"));
+    }
+
+    /// An ordered map reaches the tape in the order it was built. The recorded
+    /// value is what replay hands back, so sorting it would return something
+    /// other than what was recorded.
+    #[test]
+    fn an_ordered_map_keeps_the_order_it_was_built_in() {
+        let mut headers = serde_json::Map::new();
+        for name in ["date", "content-type", "accept-ranges"] {
+            headers.insert(name.to_owned(), Value::from(1));
+        }
+        let built: Vec<&String> = headers.keys().collect();
+        assert_eq!(
+            built,
+            ["date", "content-type", "accept-ranges"],
+            "this build's serde_json::Map does not keep insertion order, so the \
+             assertion below could not fail"
+        );
+
+        let value = to_value(&Value::Object(headers)).expect("canonical");
+        let emitted: Vec<&String> = value.as_object().expect("object").keys().collect();
+        assert_eq!(emitted, ["date", "content-type", "accept-ranges"]);
+    }
+
+    /// The same keys through a `HashMap` are sorted: its order is this process's
+    /// hash order and means nothing.
+    #[test]
+    fn an_unordered_map_nested_in_an_ordered_one_is_still_sorted() {
+        #[derive(serde::Serialize)]
+        struct Payload {
+            ordered: serde_json::Map<String, Value>,
+            unordered: HashMap<String, u8>,
+        }
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("zeta".to_owned(), Value::from(1));
+        ordered.insert("alpha".to_owned(), Value::from(2));
+        let unordered = [("zeta", 1u8), ("alpha", 2), ("mid", 3)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+
+        let value = to_value(&Payload { ordered, unordered }).expect("canonical");
+        let keys = |field: &str| -> Vec<String> {
+            value[field]
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(keys("ordered"), ["zeta", "alpha"]);
+        assert_eq!(keys("unordered"), ["alpha", "mid", "zeta"]);
     }
 
     /// Integer and boolean map keys are accepted, exactly as `serde_json`
