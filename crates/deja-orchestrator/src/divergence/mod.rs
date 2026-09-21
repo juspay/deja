@@ -62,9 +62,20 @@ fn tier_for(boundary: &str) -> Tier {
 /// A boundary whose recorded-vs-replayed mismatch is NOT a real divergence and so
 /// must not block the verdict:
 ///   - `Tier::Pure` (time/id/rng): an entropy SEAM whose recorded value is
-///     substituted on replay, after which everything downstream is pure. These are
-///     fully substituted in practice (they never miss), so the non-blocking status
-///     is a safety net, not a load-bearing exclusion.
+///     SUBSTITUTED on replay, after which everything downstream is pure.
+///
+///     The premise is the substitution, not the tier. A seam that missed and
+///     FABRICATED a value satisfies neither half: the value is not the
+///     recording's, so what follows it is not pure, and a seam with an
+///     `on_miss` arm misses on every call of a tape recorded before it existed
+///     rather than never. This was written when these seams could not miss in
+///     practice, which made it a safety net; a declared `on_miss` turned it
+///     into a load-bearing exclusion, and a clock read into an outgoing request
+///     body then reached a verdict of "every side-effect call resolved" about a
+///     request that ran on a number the recording never held.
+///
+///     So [`observed_miss_is_excused`] tests the OUTCOME rather than the tier
+///     alone, and a synthesized pure miss is scored as the fabrication it is.
 ///   - ingress: the request boundary the kernel re-drives by construction,
 ///     not a side effect at all. Self-described by `role: "ingress"`; the
 ///     legacy `http_incoming` name keeps pre-`role` tapes working.
@@ -87,17 +98,28 @@ fn is_nonblocking_boundary(boundary: &str, role: Option<&str>) -> bool {
 /// divergence at all.
 ///
 /// A pure boundary's miss is excused on the premise that re-drawing a clock or
-/// an id changes nothing the run compares. That premise holds only while the
-/// process survives the miss. A miss that STOPPED the request is the reason its
-/// response is missing and its later calls never ran, so excusing it leaves a
-/// verdict made entirely of its consequences: an unused id draw read as a run
-/// of status mismatches and omitted calls, with the draw itself named nowhere.
-/// A stopped miss is therefore classified as any other boundary's miss would be
-/// at the same site.
+/// an id changes nothing the run compares. That premise is about the value the
+/// call returned, so the OUTCOME decides, not the boundary alone.
 ///
-/// Recorded-side omissions have no outcome and keep [`is_nonblocking_boundary`].
+/// `Substituted` is the excused case, and the only one. It is also what a
+/// recorded-side omission carries, since the field defaults to it.
+///
+/// `Stopped` is not: the miss is the reason the response is missing and the
+/// later calls never ran, so excusing it leaves a verdict made entirely of its
+/// consequences — an unused id draw read as a run of status mismatches and
+/// omitted calls, with the draw itself named nowhere.
+///
+/// `Synthesized` is not either, and that is the newer half. The site answered a
+/// miss with a value it derived rather than one the recording held, so nothing
+/// downstream of it is the recording's — the premise above simply does not
+/// apply. Excusing it let two tolerations compose: a fabricated clock reading
+/// flowed into an outgoing request, which the environmental tier excuses in
+/// turn, and a run that continued on a value the recording never held reported
+/// "full-mock replay clean: http responses match and every side-effect call
+/// resolved". It now reaches the absorbed-miss arm instead, which counts it,
+/// names its site, and makes the run inconclusive rather than clean.
 pub(crate) fn observed_miss_is_excused(call: &ObservedCall) -> bool {
-    call.outcome != deja::SubstituteOutcome::Stopped
+    call.outcome == deja::SubstituteOutcome::Substituted
         && is_nonblocking_boundary(&call.boundary, call.role.as_deref())
 }
 
@@ -9933,17 +9955,22 @@ mod tests {
     /// "every side-effect call resolved", about a request that continued on a
     /// value the recording never held.
     ///
-    /// KNOWN HOLE, PINNED DELIBERATELY. The second assertion below documents
-    /// current behaviour, not desired behaviour. When it is fixed this test will
-    /// fail, and that failure is the point: it should be updated by someone who
-    /// meant to change this, not discovered by someone reading a clean scorecard.
+    /// FIXED. This test pinned the hole first and now pins its absence: a
+    /// synthesized pure miss is no longer excused, so it reaches the
+    /// absorbed-miss arm, and the run it belongs to can no longer call itself
+    /// clean. The environmental toleration downstream is unchanged and still
+    /// correct on its own — what was wrong was the first toleration, not the
+    /// second, and only their composition made a pass.
     #[test]
-    fn a_pure_miss_reaching_an_outgoing_request_blocks_only_if_something_was_omitted() {
+    fn a_synthesized_pure_miss_reaching_an_outgoing_request_is_not_excused() {
         let clock_miss = |corr: &str| {
             let mut call = obs("time", Some(corr), false, None, None);
-            // The miss arm answered. Synthesized, not Stopped, so
-            // `observed_miss_is_excused` takes it before any absorbed arm.
+            // The miss arm answered. `stamp_outcome` sets all three of these
+            // together and `the_derived_flags_never_disagree_with_the_outcome`
+            // pins that they cannot drift, so a fixture setting fewer of them
+            // builds a call the runtime cannot emit.
             call.outcome = deja::SubstituteOutcome::Synthesized;
+            call.absorbed = true;
             call.synthesized = true;
             call
         };
@@ -9969,6 +9996,27 @@ mod tests {
             "an unconsumed recorded side-effect call blocks: {}",
             with_twin.verdict.reason
         );
+        // A genuine divergence outranks an unjudgeable, so this stays a
+        // FAILURE rather than softening to "could not tell".
+        assert!(
+            !with_twin.verdict.inconclusive,
+            "a run that diverged for a real reason is not inconclusive: {}",
+            with_twin.verdict.reason
+        );
+        // But both facts are on the line. The run failed for the omission AND
+        // separately ran partly on a fabricated value, and neither may hide the
+        // other — this is the only place the two rules meet.
+        assert!(
+            with_twin.verdict.reason.contains("omitted"),
+            "the blocking reason is still stated: {}",
+            with_twin.verdict.reason
+        );
+        assert!(
+            with_twin.verdict.reason.contains("absorbed miss")
+                && with_twin.verdict.reason.contains("time::m"),
+            "and so is the fabrication, named at its site: {}",
+            with_twin.verdict.reason
+        );
 
         // The same fabricated value, reaching a call the recording never made.
         // Nothing is omitted, so nothing blocks.
@@ -9985,14 +10033,29 @@ mod tests {
             without_twin.summary.omitted_calls, 0,
             "and nothing is left over to block"
         );
-        assert!(
-            without_twin.verdict.pass,
-            "CURRENT behaviour, not desired: two tolerations compose into a pass"
+        // Vacuity guard: with nothing omitted and the outgoing call tolerated,
+        // the ONLY thing left that can stop this being a pass is the clock
+        // miss. If it stopped being counted the assertions below would pass
+        // for the wrong reason.
+        assert_eq!(
+            without_twin.summary.absorbed_misses, 1,
+            "the fabricated clock reading must be counted, not excused"
         );
         assert!(
-            without_twin.verdict.reason.contains("every side-effect call resolved"),
-            "and the reason claims every call resolved, of a request that ran on \
-             a value the recording never held: {}",
+            !without_twin.verdict.pass,
+            "a run that continued on a fabricated value is not clean: {}",
+            without_twin.verdict.reason
+        );
+        assert!(
+            without_twin.verdict.inconclusive,
+            "and the honest verdict is inconclusive — nothing here diverged, \
+             the run simply cannot say it was clean: {}",
+            without_twin.verdict.reason
+        );
+        assert!(
+            without_twin.verdict.reason.contains("time::m"),
+            "naming the seam, so a reader of a wholly inconclusive run knows \
+             which one went uncovered rather than suspecting the scorer: {}",
             without_twin.verdict.reason
         );
     }
@@ -14334,7 +14397,10 @@ mod tests {
     /// reported stops, whose absent outcome reads as `substituted`. Re-scoring
     /// such a run must not turn its clock and id misses into findings.
     #[test]
-    fn a_pure_miss_that_did_not_stop_is_still_excused() {
+    fn a_substituted_pure_miss_is_still_excused() {
+        // Renamed with the rule it pins: "did not stop" used to be sufficient,
+        // and is not any more — a synthesized miss did not stop either. What
+        // earns the excusal is that the value came from the recording.
         let art = one_span_two_identities(added_draw(
             "id",
             "new_id",
