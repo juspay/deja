@@ -2724,7 +2724,7 @@ impl SeedCertificateEntry {
                 "not a precondition: the read found nothing, so there is no recorded value to seed"
             }
             deja::NotPreconditionReason::ReadErrored => {
-                "not a precondition: the read errored, which says nothing about whether the key was there"
+                "not a precondition: the read errored, and this boundary does not declare whether that means the key was absent or that the call failed"
             }
         };
         Self {

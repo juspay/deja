@@ -2595,8 +2595,10 @@ pub enum NotPreconditionReason {
     /// The boundary declared it found nothing. There is no value to seed, and
     /// the recording says the key was not there.
     ReadFoundNothing,
-    /// The read ERRORED. Unlike a declared miss this says nothing about whether
-    /// the key was there, so the planner draws no conclusion from it.
+    /// The read ERRORED. Most such errors are not-founds, which would be
+    /// evidence of absence — but the boundary does not declare which of its
+    /// errors mean that, so the planner cannot tell one from a real failure
+    /// and draws no conclusion from either.
     ReadErrored,
 }
 
@@ -3118,9 +3120,9 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // table this correlation created (it reconstructs those via its own replayed
         // create), so create-then-update of the same table is unaffected.
         if event.is_error {
-            // An error does not say whether the key was there — a not-found and
-            // a timeout are indistinguishable at this level — so the planner
-            // concludes nothing and records that it concluded nothing.
+            // A not-found and a real failure are indistinguishable here: the
+            // error carries the service's own error type, not a meaning deja
+            // can read. So the planner concludes nothing and records that.
             for key in &event.read_set {
                 plan.note_non_precondition(
                     &event.boundary,
