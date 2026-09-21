@@ -2037,12 +2037,30 @@ pub(crate) fn merge_runs(runs: Vec<Vec<Accepted>>, window: usize) -> (Vec<Accept
     // this function exists to avoid.
     let mut runs: Vec<std::iter::Peekable<std::vec::IntoIter<Accepted>>> =
         runs.into_iter().map(|r| r.into_iter().peekable()).collect();
-    // How many runs are held at once. A run is admitted only once an earlier
-    // one is exhausted, so peak memory is `window` runs and not the landing.
-    let mut open: usize = window.max(1).min(runs.len());
+    // How many runs have been admitted. `window` of them are kept LIVE — a new
+    // run opens as soon as an open one runs dry, so the window slides along the
+    // landing rather than draining it in batches.
+    //
+    // It has to slide. Admitting only once EVERY open run was exhausted meant
+    // run N was fully drained before run N+1 opened, so a record displaced by
+    // exactly one object — the case the window exists for — was still late by a
+    // whole window. With four runs and a one-object displacement that produced
+    // `[0,1,2,3,4,6,5,7]` and a reported backward jump, which is the merge
+    // correctly reporting its own admission policy as a violation.
+    let window = window.max(1);
+    let mut open: usize = 0;
     let mut last: Option<(String, u64)> = None;
 
     loop {
+        // Top up to `window` live runs before choosing, so the next run's head
+        // is visible while the current one still has records.
+        while open < runs.len() {
+            let live = (0..open).filter(|&r| runs[r].peek().is_some()).count();
+            if live >= window {
+                break;
+            }
+            open += 1;
+        }
         // `peek` needs `&mut`, so two heads cannot be borrowed at once to be
         // compared. Snapshot the ORDER KEY of each open head instead and pick
         // from that. The key clones an instance id per open run per record,
@@ -2062,10 +2080,8 @@ pub(crate) fn merge_runs(runs: Vec<Vec<Accepted>>, window: usize) -> (Vec<Accept
             .min_by(|(_, a), (_, b)| a.cmp(b))
             .map(|(r, _)| r);
         let Some(r) = pick else {
-            if open < runs.len() {
-                open += 1;
-                continue;
-            }
+            // Every admitted run is dry and the top-up above could admit no
+            // more, so the landing is consumed.
             break;
         };
         let rec = runs[r].next().expect("the picked run had a head");
@@ -3482,23 +3498,63 @@ mod tests {
     /// says how far, which is the number that would size a larger window.
     #[test]
     fn a_displacement_past_the_window_is_reported_with_its_distance() {
-        // gseq 1 is written so late it lands two objects on. A window of two
-        // has already emitted 2..=5 by the time it arrives.
+        // gseq 1 lands THREE runs on. A sliding window of two has admitted and
+        // emitted runs 1 and 2 by the time run 3 opens, so 1 arrives after 3
+        // has already gone out. Note a two-run displacement would NOT do: the
+        // window slides as runs run dry, so a short early run lets it reach
+        // further than its own size suggests — which is why this fixture is
+        // built from the emission order rather than from run indices.
         let runs = vec![
             vec![accepted("i1", 0)],
             vec![accepted("i1", 2), accepted("i1", 3)],
-            vec![accepted("i1", 1), accepted("i1", 4)],
+            vec![accepted("i1", 4), accepted("i1", 5)],
+            vec![accepted("i1", 1), accepted("i1", 6)],
         ];
         let (merged, report) = merge_runs(runs, 2);
         assert!(!report.ordered(), "the window did not hold and must say so");
-        assert_eq!(report.backward_jumps.len(), 1);
+        assert_eq!(report.backward_jumps.len(), 1, "{report:?}");
         let jump = &report.backward_jumps[0];
-        assert_eq!(jump.previous_gseq, 3);
-        assert_eq!(jump.arrived_gseq, 1);
-        assert_eq!(jump.from_run, 2, "names the run that beat the window");
+        assert_eq!(jump.arrived_gseq, 1, "the late record");
+        assert!(
+            jump.previous_gseq > jump.arrived_gseq,
+            "a jump is backwards by definition: {jump:?}"
+        );
+        assert_eq!(jump.from_run, 3, "names the run that beat the window");
         // Still emits everything — a seal short of perfect order beats no seal,
         // and the caller decides what to do with the report.
-        assert_eq!(merged.len(), 5);
+        assert_eq!(merged.len(), 7);
+    }
+
+    /// The window SLIDES; it does not drain in batches.
+    ///
+    /// Two runs are not enough to tell the difference, which is why the first
+    /// version of this merge shipped the wrong admission policy and its tests
+    /// passed. With four runs and a displacement between the third and fourth,
+    /// a batched window drains run 2 dry before opening run 3, so a record late
+    /// by exactly one object — the case the window exists for — is still late
+    /// by a whole window, and the merge reports its own policy as a violation:
+    /// `[0,1,2,3,4,6,5,7]`.
+    #[test]
+    fn the_window_slides_rather_than_draining_in_batches() {
+        let runs = vec![
+            vec![accepted("i1", 0), accepted("i1", 1)],
+            vec![accepted("i1", 2), accepted("i1", 3)],
+            vec![accepted("i1", 4), accepted("i1", 6)],
+            vec![accepted("i1", 5), accepted("i1", 7)],
+        ];
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(
+            report.ordered(),
+            "a one-object displacement must be absorbed: {report:?}"
+        );
+        assert_eq!(
+            order_keys(&merged)
+                .iter()
+                .map(|(_, g)| *g)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "the late record takes its place, it is not merely tolerated"
+        );
     }
 
     /// Several instances interleave without their sequences being compared to
