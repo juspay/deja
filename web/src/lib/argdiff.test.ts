@@ -70,3 +70,33 @@ describe("an absent key is still distinguishable from a present one", () => {
     expect(s.shown[0].recorded).not.toBe(s.shown[0].candidate);
   });
 });
+
+describe("a change past the truncation point is still visible", () => {
+  // The second route to "a real change renders as no change", and the likelier
+  // one in a Hyperswitch report: `short()` cuts at 40 characters, so two long
+  // values that share a prefix render identically. The type-based quoting above
+  // does not help — both sides are the same type, so `mixed` is false.
+  const blob = (v: string) =>
+    `PaymentAttemptNew { payment_id: "pay_abcdefghijklmnop", status: ${v}, amount: 100 }`;
+
+  test("two long strings differing past char 40", () => {
+    const s = summarizeLeaves(diffArgs({ b: blob("Charged") }, { b: blob("Pending") }), 1);
+    expect(s.shown).toHaveLength(1);
+    expect(s.shown[0].recorded).not.toBe(s.shown[0].candidate);
+  });
+
+  test("the differing region itself is shown, not the shared prefix", () => {
+    const s = summarizeLeaves(diffArgs({ b: blob("Charged") }, { b: blob("Pending") }), 1);
+    expect(s.shown[0].recorded).toContain("Charged");
+    expect(s.shown[0].candidate).toContain("Pending");
+  });
+
+  test("arrays differing at a late element", () => {
+    const rec = Array.from({ length: 14 }, (_, i) => `item-${i}`);
+    const cand = [...rec];
+    cand[11] = "item-CHANGED";
+    const s = summarizeLeaves(diffArgs({ xs: rec }, { xs: cand }), 1);
+    expect(s.shown).toHaveLength(1);
+    expect(s.shown[0].recorded).not.toBe(s.shown[0].candidate);
+  });
+});
