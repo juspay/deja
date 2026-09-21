@@ -100,3 +100,24 @@ describe("a change past the truncation point is still visible", () => {
     expect(s.shown[0].recorded).not.toBe(s.shown[0].candidate);
   });
 });
+
+describe("a header list that starts empty", () => {
+  // `isPairList` required length > 0, so an empty list was not recognised as
+  // one and the pair-by-name comparison never ran. Adding the FIRST header
+  // dumped both whole lists as a single leaf — the thirty-lines-each rendering
+  // this module exists to avoid, reached through the one case where the list
+  // is shortest.
+  test("adding the first header names that header", () => {
+    const s = summarizeLeaves(diffArgs({ h: [] }, { h: [["authorization", "Bearer x"]] }), 1);
+    expect(s.shown[0].path).toBe("h.authorization");
+  });
+
+  test("removing the last header names that header", () => {
+    const s = summarizeLeaves(diffArgs({ h: [["prefer", "return=minimal"]] }, { h: [] }), 1);
+    expect(s.shown[0].path).toBe("h.prefer");
+  });
+
+  test("two empty lists are not a difference", () => {
+    expect(diffArgs({ h: [] }, { h: [] })).toHaveLength(0);
+  });
+});
