@@ -1834,15 +1834,15 @@ async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) 
         .unwrap_or_else(|| deja_orchestrator::default_system().to_owned());
     let config = deja_orchestrator::system::system_config(&system);
     let nonempty = |s: String| (!s.trim().is_empty()).then(|| s.trim().to_owned());
-    let Some(repo) = params
-        .candidate_repo
-        .clone()
-        .and_then(nonempty)
-        .or_else(|| config.source_repo.clone())
-        .or_else(|| std::env::var("DEJA_CANDIDATE_REPO").ok().and_then(nonempty))
-    else {
+    let deployment_default = std::env::var("DEJA_CANDIDATE_REPO").ok();
+    let Some(repo) = change_coverage::source_repo_for(
+        params.candidate_repo.as_deref(),
+        config.source_repo.as_deref(),
+        config.is_default,
+        deployment_default.as_deref(),
+    ) else {
         return unavailable(format!(
-            "no source repository is known for system '{system}': declare systems.{system}.source_repo (owner/name) or send candidate_repo on the run"
+            "no source repository is declared for system '{system}': set systems.{system}.source_repo (owner/name) in the deja configuration, or send candidate_repo on the run"
         ));
     };
     let Some(template) = std::env::var("DEJA_CANDIDATE_TARBALL_URL")

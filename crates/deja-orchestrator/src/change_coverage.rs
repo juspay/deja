@@ -110,6 +110,35 @@ pub enum Assessment {
     Unavailable { unavailable: String },
 }
 
+// ── which repository ────────────────────────────────────────────────────────
+
+/// The repository a run's change set is read from.
+///
+/// The run's own `candidate_repo` wins (a candidate can be built from any
+/// fork). Then the system's declared `source_repo`. The deployment-wide
+/// `DEJA_CANDIDATE_REPO` is the DEFAULT SYSTEM's repository and is consulted
+/// only for it: a prism run that borrowed it compared its sha against
+/// juspay/hyperswitch, where the commit does not exist, and reported a 404 as
+/// if the candidate were unreachable. A non-default system with nothing
+/// declared gets `None`, and the caller says which key to declare.
+pub fn source_repo_for(
+    run_repo: Option<&str>,
+    declared: Option<&str>,
+    system_is_default: bool,
+    deployment_default: Option<&str>,
+) -> Option<String> {
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    clean(run_repo).or_else(|| clean(declared)).or_else(|| {
+        system_is_default
+            .then(|| clean(deployment_default))
+            .flatten()
+    })
+}
+
 // ── change set ──────────────────────────────────────────────────────────────
 
 /// One changed source file: its path and the new-side line ranges its hunks
@@ -1205,6 +1234,42 @@ impl Payments {
     fn only(items: Vec<ChangedItem>) -> ChangedItem {
         assert_eq!(items.len(), 1, "{items:?}");
         items.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_non_default_system_never_borrows_the_deployment_default_repository() {
+        // the default system may fall back to the deployment-wide default
+        assert_eq!(
+            source_repo_for(None, None, true, Some("juspay/hyperswitch")).as_deref(),
+            Some("juspay/hyperswitch")
+        );
+        // another system with nothing declared gets nothing, not the default's repo
+        assert_eq!(
+            source_repo_for(None, None, false, Some("juspay/hyperswitch")),
+            None
+        );
+        // its declaration wins over the deployment default, and the run's own over both
+        assert_eq!(
+            source_repo_for(
+                None,
+                Some("juspay/hyperswitch-prism"),
+                false,
+                Some("juspay/hyperswitch")
+            )
+            .as_deref(),
+            Some("juspay/hyperswitch-prism")
+        );
+        assert_eq!(
+            source_repo_for(
+                Some(" fork/prism "),
+                Some("juspay/hyperswitch-prism"),
+                false,
+                None
+            )
+            .as_deref(),
+            Some("fork/prism")
+        );
+        assert_eq!(source_repo_for(Some("  "), None, true, Some("")), None);
     }
 
     #[test]
