@@ -1806,8 +1806,16 @@ async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) 
     use deja_orchestrator::change_coverage::{self, Assessment};
 
     // Every path below is built from the id, so an id that is not one is
-    // refused before the first is.
-    if !change_coverage::is_plain_run_id(&id) {
+    // refused before the first is. The separator and parent-reference checks
+    // are spelled out here, on the value itself, rather than only inside
+    // `is_plain_run_id`: that is the shape a static analyser recognises as the
+    // guard for the paths that follow, and the helper's stricter alphabet
+    // check comes after it.
+    if id.contains("..")
+        || id.contains('/')
+        || id.contains('\\')
+        || !change_coverage::is_plain_run_id(&id)
+    {
         return error_resp(
             400,
             "run id must be plain: letters, digits, '-', '_' and '.'",
