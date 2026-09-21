@@ -2592,6 +2592,14 @@ pub enum NotPreconditionReason {
     /// A delete that found NO key. The reply proves absence, so there is
     /// nothing to seed — and seeding the reply as a value would create the key.
     DeleteProvedAbsence,
+    /// The boundary declared it found nothing. There is no value to seed, and
+    /// the recording says the key was not there.
+    ReadFoundNothing,
+    /// The read ERRORED. Most such errors are not-founds, which would be
+    /// evidence of absence — but the boundary does not declare which of its
+    /// errors mean that, so the planner cannot tell one from a real failure
+    /// and draws no conclusion from either.
+    ReadErrored,
 }
 
 impl SeedPlan {
@@ -3111,7 +3119,26 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // UPDATE would hit an empty table. `created_tables` still skips reads of a
         // table this correlation created (it reconstructs those via its own replayed
         // create), so create-then-update of the same table is unaffected.
-        if !(event.is_error || is_miss_result(event)) {
+        if event.is_error {
+            // A not-found and a real failure are indistinguishable here: the
+            // error carries the service's own error type, not a meaning deja
+            // can read. So the planner concludes nothing and records that.
+            for key in &event.read_set {
+                plan.note_non_precondition(
+                    &event.boundary,
+                    &canonical_state_key_wire(key),
+                    NotPreconditionReason::ReadErrored,
+                );
+            }
+        } else if is_miss_result(event) {
+            for key in &event.read_set {
+                plan.note_non_precondition(
+                    &event.boundary,
+                    &canonical_state_key_wire(key),
+                    NotPreconditionReason::ReadFoundNothing,
+                );
+            }
+        } else {
             for key in &event.read_set {
                 let canonical_key = canonical_state_key_wire(key);
                 let written_key = (event.boundary.clone(), canonical_key.clone());
@@ -3211,8 +3238,14 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // post-write value (no longer a precondition), and a create additionally
         // declines later read-backs of the whole table (they'd collide with the
         // replayed create).
-        for key in &event.write_set {
-            written.insert((event.boundary.clone(), canonical_state_key_wire(key)));
+        // A write that FAILED wrote nothing, so it must not mark its keys: a
+        // later read of one is still a precondition. Marking costs a missing
+        // row and a divergence charged to an innocent candidate; not marking
+        // costs at worst a seeded row the replayed write re-applies.
+        if !event.is_error {
+            for key in &event.write_set {
+                written.insert((event.boundary.clone(), canonical_state_key_wire(key)));
+            }
         }
         if event.boundary == "db" && is_db_create_event(event) {
             if let Some(table) = db_created_table(event) {
@@ -6087,6 +6120,134 @@ mod tests {
         ev.read_set = read_set.iter().map(|s| (*s).to_owned()).collect();
         ev.write_set = write_set.iter().map(|s| (*s).to_owned()).collect();
         ev
+    }
+
+    /// A write that failed wrote nothing, so a later read of its key is still
+    /// a precondition. The old rule declined that read AND told the certificate
+    /// it observed a prior write — a reason that was not true.
+    #[test]
+    fn a_write_that_failed_does_not_decline_a_later_read() {
+        let failed_write = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "insert",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Err", "kind": "UniqueViolation"}),
+            &[],
+            &["k1"],
+            true,
+        );
+        let later_read = state_event(
+            1,
+            Some("c1"),
+            "db",
+            "find_by_id",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Ok", "value": {"id": "x"}}),
+            &["k1"],
+            &[],
+            false,
+        );
+
+        let plan = build_seed_plan(&[failed_write, later_read], Some("c1"));
+        assert!(
+            plan.resolve("db", "k1").is_some(),
+            "the row was there before the read: {plan:?}"
+        );
+        assert!(
+            !plan
+                .non_precondition_reads()
+                .any(|(_, key, reason)| key == "k1"
+                    && reason == NotPreconditionReason::ReadAfterWrite),
+            "and nothing claims it observed a write that never happened: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
+    }
+
+    /// A write that SUCCEEDED still marks its key, so the guard above did not
+    /// simply disable read-after-write.
+    #[test]
+    fn a_write_that_succeeded_still_declines_a_later_read() {
+        let ok_write = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "insert",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Ok", "value": null}),
+            &[],
+            &["k1"],
+            false,
+        );
+        let later_read = state_event(
+            1,
+            Some("c1"),
+            "db",
+            "find_by_id",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Ok", "value": {"id": "x"}}),
+            &["k1"],
+            &[],
+            false,
+        );
+
+        let plan = build_seed_plan(&[ok_write, later_read], Some("c1"));
+        assert!(
+            plan.resolve("db", "k1").is_none(),
+            "the correlation wrote it, so it is not a precondition: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(_, key, reason)| key == "k1"
+                    && reason == NotPreconditionReason::ReadAfterWrite),
+            "and that is still the named reason: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
+    }
+
+    /// An errored read and a declared miss were both dropped in silence. They
+    /// mean different things, so they are named differently.
+    #[test]
+    fn an_errored_read_and_a_miss_are_named_apart() {
+        let errored = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "find_by_id",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Err", "kind": "Timeout"}),
+            &["k1"],
+            &[],
+            true,
+        );
+        let mut missed = state_event(
+            1,
+            Some("c1"),
+            "redis",
+            "get_key",
+            serde_json::json!({"key": "k2"}),
+            serde_json::Value::Null,
+            &["k2"],
+            &[],
+            false,
+        );
+        missed.declaration =
+            Some(crate::BoundaryDeclaration::default().effect(crate::EffectKind::Redis));
+
+        let plan = build_seed_plan(&[errored, missed], Some("c1"));
+        let named: Vec<_> = plan
+            .non_precondition_reads()
+            .map(|(_, key, reason)| (key.to_owned(), reason))
+            .collect();
+        assert!(
+            named.contains(&("k1".to_owned(), NotPreconditionReason::ReadErrored)),
+            "the error concluded nothing, and says so: {named:?}"
+        );
+        assert!(
+            named.contains(&("k2".to_owned(), NotPreconditionReason::ReadFoundNothing)),
+            "the miss found nothing, which is a different fact: {named:?}"
+        );
     }
 
     fn test_db_query_key(operation: &str, table: &str, sql: &str) -> String {
