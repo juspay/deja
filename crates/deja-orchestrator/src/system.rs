@@ -564,6 +564,12 @@ mod tests {
             "the prefix is anchored at the start of the pod name"
         );
         assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
+        assert_eq!(p.source_repo.as_deref(), Some("juspay/hyperswitch-prism"));
+        assert_eq!(
+            h.source_repo, None,
+            "the default system declares none and keeps DEJA_CANDIDATE_REPO"
+        );
+        assert_eq!(p.change_base_ref, "main", "undeclared, so the default");
         assert!(
             p.reply_canons.is_empty(),
             "a canon declared for one system must not reach another"
@@ -655,7 +661,8 @@ instance_pattern = "ucs"
 # deployment entirely, like `pi-1-<nanos>`, which is a boot-derived local tape
 # no pull-request replay wants to be compared against.
 main_instance_prefix = "sbx-custom-hyperswitch-ucs-"
-scored_span_namespaces = ["ucs::", "connector::"]"#;
+scored_span_namespaces = ["ucs::", "connector::"]
+source_repo = "juspay/hyperswitch-prism""#;
 
     #[test]
     fn a_declared_system_resolves_every_field() {
