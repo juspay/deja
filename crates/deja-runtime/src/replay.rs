@@ -2589,6 +2589,9 @@ pub enum NotPreconditionReason {
     /// This correlation CREATED rows in the table; seeding a later read-back
     /// would collide with the replayed create.
     SelfCreatedTable,
+    /// A delete that found NO key. The reply proves absence, so there is
+    /// nothing to seed — and seeding the reply as a value would create the key.
+    DeleteProvedAbsence,
 }
 
 impl SeedPlan {
@@ -2980,6 +2983,94 @@ fn preferred_seed_image(
     image_from_rows(resolved)
 }
 
+/// The prefix this recording's physical redis keys carry, derived from its own
+/// reads: a read names the physical key in its read set and the logical key in
+/// its args, so the difference between them is the prefix.
+///
+/// `None` when no read shows the mapping, or when reads disagree — a delete
+/// then seeds nothing rather than guessing where the key lives.
+fn derived_key_prefix(events: &[BoundaryEvent], correlation_id: Option<&str>) -> Option<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for event in events {
+        if !correlation_matches(event, correlation_id) || !is_redis_event(event) {
+            continue;
+        }
+        let [state_key] = event.read_set.as_slice() else {
+            continue;
+        };
+        let state_key = canonical_state_key_wire(state_key);
+        let Some(logical) = event
+            .args
+            .to_value()
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let Some(prefix) = state_key.strip_suffix(&logical) else {
+            continue;
+        };
+        seen.insert(prefix.to_owned());
+    }
+    match seen.len() {
+        1 => seen.into_iter().next(),
+        _ => None,
+    }
+}
+
+/// Whether the event declares the redis effect.
+fn is_redis_event(event: &BoundaryEvent) -> bool {
+    event
+        .declaration
+        .as_ref()
+        .is_some_and(|declaration| declaration.effect == Some(EffectKind::Redis))
+}
+
+/// Whether a redis delete's reply proves the key was present. `None` when the
+/// event is not a delete reply.
+fn delete_proved_presence(event: &BoundaryEvent) -> Option<bool> {
+    if !is_redis_event(event) {
+        return None;
+    }
+    let result = event.result.to_value();
+    let reply = match &result {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(m) => m
+            .get("value")
+            .or_else(|| m.get("result"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }?;
+    match reply.as_str() {
+        "KeyDeleted" => Some(true),
+        "KeyNotDeleted" => Some(false),
+        _ => None,
+    }
+}
+
+/// What to seed for a reply that proves the key EXISTED but not what it held —
+/// a redis delete.
+///
+/// Seeding the reply itself would write "KeyDeleted" as the key's value, which
+/// is what happened to the key, not what it held. So the seed is a placeholder:
+/// presence without value. It cannot displace a real one — a correlation that
+/// read the key first seeds the true value, and `SeedPlan::upsert` keeps the
+/// first entry per key.
+///
+/// `KeyNotDeleted` seeds nothing: a delete that found no key is evidence of
+/// ABSENCE, and seeding presence there would contradict the recording.
+fn presence_placeholder_for(event: &BoundaryEvent) -> Option<serde_json::Value> {
+    delete_proved_presence(event)
+        .filter(|proved| *proved)
+        .map(|_| serde_json::Value::String(PRESENCE_PLACEHOLDER.to_owned()))
+}
+
+/// What a presence-only seed writes. Self-describing so a reader can tell it
+/// apart from recorded data.
+pub const PRESENCE_PLACEHOLDER: &str = "deja:seeded-presence";
+
 pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -> SeedPlan {
     let mut plan = SeedPlan::new();
     // A key is "pristine" until the correlation first WRITES it; only reads
@@ -3001,6 +3092,9 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     // state its row was in BEFORE it (see `preferred_seed_image`). Updated
     // AFTER each event is planned, so an event never sees its own image.
     let mut observed_rows: ObservedRowImages = std::collections::HashMap::new();
+    // How this recording spells a physical redis key, so a delete that declares
+    // no read set can still name the key it proves existed.
+    let key_prefix = derived_key_prefix(events, correlation_id);
 
     for event in events {
         if !correlation_matches(event, correlation_id) {
@@ -3044,17 +3138,73 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     }
                 }
 
+                // A delete that found NO key proves absence. Seeding the reply
+                // as a value would create the key — the opposite of what the
+                // recording shows — so the read is skipped and accounted.
+                if delete_proved_presence(event) == Some(false) {
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::DeleteProvedAbsence,
+                    );
+                    continue;
+                }
+
                 plan.upsert(SeedEntry {
                     boundary: event.boundary.clone(),
                     key: canonical_key.clone(),
                     // Redis typed-codec envelopes seed their inner value; every
                     // other boundary seeds the raw recorded result unchanged.
-                    value: redis_seedable_result(event),
+                    // A reply that proves only presence seeds a placeholder.
+                    value: presence_placeholder_for(event)
+                        .unwrap_or_else(|| redis_seedable_result(event)),
                     image: preferred_seed_image(event, &canonical_key, &observed_rows),
                     method: Some(event.method_name.clone()),
                     origin: SeedOrigin::Recording,
                     source_sequence: event.global_sequence,
                 });
+            }
+        }
+        // A delete declares no read set, so its key comes from its args, spelled
+        // the way the store holds it. Skipped when the correlation already wrote
+        // the key (not a precondition) or when the recording never showed the
+        // prefix.
+        if event.read_set.is_empty() && !(event.is_error || is_miss_result(event)) {
+            let args = event.args.to_value();
+            let logical = args.get("key").and_then(serde_json::Value::as_str);
+            if let (Some(proved), Some(prefix), Some(logical)) = (
+                delete_proved_presence(event),
+                key_prefix.as_deref(),
+                logical,
+            ) {
+                let canonical_key = canonical_state_key_wire(&format!("{prefix}{logical}"));
+                if !proved {
+                    // Absence: nothing to seed, but the certificate says so
+                    // rather than staying silent about the key.
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::DeleteProvedAbsence,
+                    );
+                } else if written.contains(&(event.boundary.clone(), canonical_key.clone())) {
+                    // Same conclusion the declared branch reaches for this key,
+                    // so it is named the same way.
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::ReadAfterWrite,
+                    );
+                } else {
+                    plan.upsert(SeedEntry {
+                        boundary: event.boundary.clone(),
+                        key: canonical_key,
+                        value: serde_json::Value::String(PRESENCE_PLACEHOLDER.to_owned()),
+                        image: None,
+                        method: Some(event.method_name.clone()),
+                        origin: SeedOrigin::Recording,
+                        source_sequence: event.global_sequence,
+                    });
+                }
             }
         }
         // THEN mark this event's writes: subsequent reads of these keys observe the
@@ -6110,6 +6260,361 @@ mod tests {
         assert_eq!(
             plan.resolve("custom_store", "k").unwrap().origin,
             SeedOrigin::Recording
+        );
+    }
+
+    /// A redis event carrying its declaration, so the planner reads the
+    /// boundary's family from the event rather than its name.
+    fn redis_event(
+        global_seq: u64,
+        correlation_id: Option<&str>,
+        method: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+        read_set: &[&str],
+    ) -> BoundaryEvent {
+        let mut ev = state_event(
+            global_seq,
+            correlation_id,
+            "redis",
+            method,
+            args,
+            result,
+            read_set,
+            &[],
+            false,
+        );
+        ev.declaration =
+            Some(crate::BoundaryDeclaration::default().effect(crate::EffectKind::Redis));
+        ev
+    }
+
+    /// A delete declares no read set, so its key comes from its args — spelled
+    /// the way the store holds it, which the recording's own reads show.
+    #[test]
+    fn a_delete_without_a_read_set_seeds_the_key_the_store_holds() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "k"}),
+                serde_json::json!("v"),
+                &["public:k"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "other", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            plan.resolve("redis", "public:other").is_some(),
+            "the delete seeds the prefixed key the reads show: {plan:?}"
+        );
+        assert!(
+            plan.resolve("redis", "other").is_none(),
+            "the raw args key is not what the store holds"
+        );
+    }
+
+    /// Nothing in the recording shows how a physical key is spelled, so the
+    /// delete declines rather than seeding a key the store will not look at.
+    #[test]
+    fn a_delete_seeds_nothing_when_the_recording_never_shows_the_prefix() {
+        let events = vec![redis_event(
+            0,
+            Some("c1"),
+            "delete_key",
+            serde_json::json!({"key": "k", "command": "DEL"}),
+            serde_json::json!("KeyDeleted"),
+            &[],
+        )];
+
+        assert!(build_seed_plan(&events, Some("c1")).is_empty());
+    }
+
+    /// Reads that disagree about the prefix are not evidence, so the delete
+    /// declines rather than picking one.
+    #[test]
+    fn a_delete_seeds_nothing_when_reads_disagree_about_the_prefix() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "a"}),
+                serde_json::json!("v"),
+                &["public:a"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "b"}),
+                serde_json::json!("v"),
+                &["tenant2:b"],
+            ),
+            redis_event(
+                2,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "c", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(plan.resolve("redis", "public:c").is_none(), "{plan:?}");
+        assert!(plan.resolve("redis", "tenant2:c").is_none(), "{plan:?}");
+    }
+
+    /// A recorded DELETE proves the key existed, so it seeds — but as presence,
+    /// not as its reply (#162).
+    #[test]
+    fn a_recorded_delete_seeds_presence_not_its_reply() {
+        let events = vec![redis_event(
+            0,
+            Some("c1"),
+            "delete_key",
+            serde_json::json!({"key": "k", "command": "DEL"}),
+            serde_json::json!("KeyDeleted"),
+            &["k"],
+        )];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        let entry = plan
+            .resolve("redis", "k")
+            .expect("the delete seeds its key");
+        assert_eq!(entry.value, serde_json::json!(PRESENCE_PLACEHOLDER));
+        assert_ne!(
+            entry.value,
+            serde_json::json!("KeyDeleted"),
+            "seeding the reply would write what happened to the key as its value"
+        );
+    }
+
+    /// A delete that found nothing proves the key was ABSENT, so it seeds
+    /// NOTHING — not the placeholder, and not its reply either: seeding
+    /// "KeyNotDeleted" as a value would create the key the recording shows was
+    /// missing. Asserted as absence plus an accounted skip, because "the value
+    /// is not the placeholder" passes while the key exists.
+    #[test]
+    fn a_delete_that_found_nothing_seeds_nothing_at_all() {
+        let events = vec![redis_event(
+            0,
+            Some("c1"),
+            "delete_key",
+            serde_json::json!({"key": "k", "command": "DEL"}),
+            serde_json::json!("KeyNotDeleted"),
+            &["k"],
+        )];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            plan.resolve("redis", "k").is_none(),
+            "the key must not be in the plan at all: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(boundary, key, reason)| (boundary, key, reason)
+                    == ("redis", "k", NotPreconditionReason::DeleteProvedAbsence)),
+            "and the skip is accounted, not silent"
+        );
+    }
+
+    /// A delete that found nothing, in the shape production records: the
+    /// certificate names the decline instead of staying silent about the key.
+    #[test]
+    fn a_derived_delete_that_found_nothing_is_accounted() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "other"}),
+                serde_json::json!("v"),
+                &["public:other"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyNotDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            plan.resolve("redis", "public:k").is_none(),
+            "absence seeds nothing: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(boundary, key, reason)| {
+                    (boundary, key, reason)
+                        == (
+                            "redis",
+                            "public:k",
+                            NotPreconditionReason::DeleteProvedAbsence,
+                        )
+                }),
+            "and the decline is named: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
+    }
+
+    /// The derived branch reaches the same conclusion as the declared one when
+    /// the correlation already wrote the key, and names it the same way. Once
+    /// deletes start declaring read sets, the two must not disagree.
+    #[test]
+    fn a_derived_delete_of_a_key_this_correlation_wrote_is_accounted() {
+        let mut write = redis_event(
+            1,
+            Some("c1"),
+            "set_key",
+            serde_json::json!({"key": "k"}),
+            serde_json::json!("Ok"),
+            &[],
+        );
+        write.write_set = vec!["public:k".to_owned()];
+
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "other"}),
+                serde_json::json!("v"),
+                &["public:other"],
+            ),
+            write,
+            redis_event(
+                2,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            plan.resolve("redis", "public:k").is_none(),
+            "a key this correlation wrote is not a precondition: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(boundary, key, reason)| {
+                    (boundary, key, reason)
+                        == ("redis", "public:k", NotPreconditionReason::ReadAfterWrite)
+                }),
+            "and it is named the way the declared branch names it: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
+    }
+
+    /// The same first-wins rule on the path production actually takes: the
+    /// delete declares no read set, so its key is derived rather than declared.
+    ///
+    /// The assertion that matters is the COUNT. If the two paths ever disagreed
+    /// about how a key is spelled, the symptom is not a clobbered value — it is
+    /// a second key seeded under a name nothing reads, sitting quietly beside
+    /// the right one.
+    #[test]
+    fn a_derived_delete_key_lands_on_the_key_the_read_already_seeded() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "k"}),
+                serde_json::json!("the-recorded-value"),
+                &["public:k"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &[],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.resolve("redis", "public:k").map(|e| &e.value),
+            Some(&serde_json::json!("the-recorded-value")),
+            "the read's value wins: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter().filter(|e| e.boundary == "redis").count(),
+            1,
+            "and the delete adds no second key beside it: {plan:?}"
+        );
+    }
+
+    /// A placeholder must never displace a value the recording observed.
+    #[test]
+    fn a_real_value_read_before_a_delete_outranks_the_placeholder() {
+        let events = vec![
+            redis_event(
+                0,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "k"}),
+                serde_json::json!("the-recorded-value"),
+                &["k"],
+            ),
+            redis_event(
+                1,
+                Some("c1"),
+                "delete_key",
+                serde_json::json!({"key": "k", "command": "DEL"}),
+                serde_json::json!("KeyDeleted"),
+                &["k"],
+            ),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.resolve("redis", "k").unwrap().value,
+            serde_json::json!("the-recorded-value"),
+            "the first recording entry wins, so presence cannot clobber a value"
+        );
+    }
+
+    /// Redis-only: another boundary returning the same string is not a delete
+    /// reply.
+    #[test]
+    fn presence_seeding_is_scoped_to_a_declared_redis_boundary() {
+        let events = vec![state_event(
+            0,
+            Some("c1"),
+            "custom_store",
+            "delete_key",
+            serde_json::json!({"key": "k"}),
+            serde_json::json!("KeyDeleted"),
+            &["k"],
+            &[],
+            false,
+        )];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.resolve("custom_store", "k").unwrap().value,
+            serde_json::json!("KeyDeleted"),
+            "an undeclared boundary keeps the existing behaviour verbatim"
         );
     }
 
