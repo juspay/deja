@@ -114,10 +114,13 @@ pub struct CallRecord {
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
-    /// For a `value_diverged` row: `true` on the ORIGIN (the executed read whose
-    /// real-boundary value differed from the recorded baseline — the cause),
-    /// `false` on the CONSEQUENCE (a downstream write paired args-free). Absent on
-    /// every other kind. Lets the UI render the origin -> consequence cascade.
+    /// `true` on the ORIGIN of a cascade, `false` elsewhere. Lets the UI render
+    /// origin -> consequence instead of a list of peers.
+    ///
+    /// For a `value_diverged` row: the executed read whose value differed from
+    /// the baseline. For a `novel` / `novel_subtree` row: an added call with a
+    /// divergence after it in the same correlation. Absent on every other
+    /// kind.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin: bool,
     /// The candidate's request STOPPED at this call: a `Substitute` boundary
@@ -217,6 +220,38 @@ fn correlations_with_a_value_origin(
         }
     }
     earliest
+}
+
+/// The index of each correlation's last divergence — what an earlier novel call
+/// in that correlation can have caused.
+///
+/// A novel call enters only by STOPPING the request, and a request stops once,
+/// so novel calls cannot form a chain of each other's causes.
+fn last_divergence_per_correlation(
+    observed: &[ObservedCall],
+    by_seq: &HashMap<u64, &BoundaryEvent>,
+    tail_gap: &TailGapEvidence,
+) -> HashMap<String, usize> {
+    let mut last: HashMap<String, usize> = HashMap::new();
+    for (index, obs) in observed.iter().enumerate() {
+        let Some(corr) = obs.correlation_id.as_deref() else {
+            continue;
+        };
+        if tail_gap.covers(Some(corr), index) || obs.seed_gap {
+            // No baseline for this call, so it is not evidence of anything.
+            continue;
+        }
+        let source = obs
+            .source_event_global_sequence
+            .and_then(|seq| by_seq.get(&seq).copied());
+        // Both signals have a position in the observed stream, which is what
+        // attribution needs. An omitted call is a divergence too, but it has no
+        // observed counterpart and so no index to be after.
+        if observed_value_diverged(obs, source) || stopped_at(obs) {
+            last.insert(corr.to_owned(), index);
+        }
+    }
+    last
 }
 
 /// Build the per-call ledger from the recording's events (recorded side), the
@@ -321,6 +356,9 @@ pub(crate) fn build_with_inconclusive_into(
     // --- observed calls (candidate side) ------------------------------------
     // Enumerated because a truncated-recording tail is a POSITIONAL fact: the
     // call must come after the correlation's last recorded event was reproduced.
+    // A novel call before a correlation's last divergence is an origin; one
+    // with nothing diverging after it is not a finding at all.
+    let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap);
     for (observed_index, obs) in observed.iter().enumerate() {
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
         // result differs from the recorded baseline — the cause of a cascade.
@@ -519,8 +557,21 @@ pub(crate) fn build_with_inconclusive_into(
             // nothing, as the scorecard's `NovelCallAbsorbed` is.
             ("novel_absorbed", false)
         } else {
-            ("novel", true)
+            // Blocking only when the miss STOPPED the request. A novel call on
+            // its own is charged to nothing by the scorecard — adding a call is
+            // what a change is — and this row is what the viewer routes on, so
+            // the two must agree.
+            ("novel", stopped_at(obs))
         };
+        // Origin only when a divergence follows it in the same correlation.
+        // Not span containment: an added call changes what happens after it
+        // returns as much as what happens beneath it.
+        let novel_origin = matches!(kind, "novel" | "novel_subtree")
+            && obs
+                .correlation_id
+                .as_deref()
+                .and_then(|corr| last_divergence.get(corr))
+                .is_some_and(|last| *last > observed_index);
         let recorded = obs
             .source_event_global_sequence
             .and_then(recorded_for)
@@ -538,7 +589,7 @@ pub(crate) fn build_with_inconclusive_into(
             method_name: obs.method_name.clone(),
             kind: kind.to_owned(),
             blocking,
-            origin: false,
+            origin: novel_origin,
             stopped: stopped_at(obs),
             resolved_rank: obs.resolved_rank,
             recorded,
@@ -789,6 +840,120 @@ mod tests {
         }
     }
 
+    /// A call whose executed result differs from the recorded baseline.
+    fn diverging(boundary: &str, corr: Option<&str>, src: u64) -> ObservedCall {
+        let mut o = obs(boundary, corr, true, Some(6), Some(src));
+        o.provenance = deja::Provenance::Shadow;
+        o.recorded_result = Some(serde_json::json!({"v": "recorded"}));
+        o.observed_result = Some(serde_json::json!({"v": "different"}));
+        o
+    }
+
+    /// A novel call is not a finding on its own, so with nothing diverging
+    /// after it there is no cause to point at.
+    /// The twin of the test below: the same two novel calls, but the second
+    /// STOPPED the request. That makes it a divergence, so the first is a cause
+    /// of it — and it proves the other test passes on the rule, not because
+    /// nothing could ever enter the map.
+    #[test]
+    fn a_novel_call_before_one_that_stopped_the_request_is_an_origin() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let mut stopped = obs("redis", Some("c1"), false, None, None);
+        stopped.outcome = deja::SubstituteOutcome::Stopped;
+
+        let rows = build(&events, &[added_read, stopped], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 2, "precondition: both are novel: {rows:?}");
+        assert!(novel[0].origin, "the earlier call is the cause: {novel:?}");
+        assert!(
+            novel[1].blocking,
+            "a novel call that stopped the request blocks: {novel:?}"
+        );
+        assert!(
+            !novel[0].blocking,
+            "but the earlier one did not stop anything: {novel:?}"
+        );
+    }
+
+    #[test]
+    fn a_novel_call_with_nothing_diverging_after_it_is_not_an_origin() {
+        let events: Vec<BoundaryEvent> = vec![];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let fallback = obs("redis", Some("c1"), false, None, None);
+
+        let rows = build(&events, &[added_read, fallback], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 2, "precondition: both are novel: {rows:?}");
+        assert!(
+            novel.iter().all(|r| !r.origin),
+            "nothing diverged, so nothing is a cause: {novel:?}"
+        );
+    }
+
+    /// With a divergence after it, the added call is what to look at.
+    #[test]
+    fn a_novel_call_is_an_origin_when_a_divergence_follows_it() {
+        let events = vec![event(7, "db", Some("c1"))];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let later = diverging("db", Some("c1"), 7);
+
+        let rows = build(&events, &[added_read, later], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 1, "{rows:?}");
+        assert!(
+            novel[0].origin,
+            "an added call with a divergence after it is the cause to show: {:?}",
+            novel[0]
+        );
+    }
+
+    /// A divergence before the added call cannot have been caused by it.
+    #[test]
+    fn a_divergence_before_the_novel_call_does_not_make_it_an_origin() {
+        let events = vec![event(7, "db", Some("c1"))];
+        let table = table_for(&events, &HashMap::new());
+
+        let earlier = diverging("db", Some("c1"), 7);
+        let added_read = obs("imc", Some("c1"), false, None, None);
+
+        let rows = build(&events, &[earlier, added_read], &table, &HashSet::new());
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 1, "{rows:?}");
+        assert!(!novel[0].origin, "{:?}", novel[0]);
+    }
+
+    /// Two requests run the same code, so one's divergence says nothing about
+    /// another's added call.
+    #[test]
+    fn attribution_does_not_cross_correlations() {
+        let events = vec![event(7, "db", Some("c2"))];
+        let table = table_for(&events, &HashMap::new());
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        let other_request = diverging("db", Some("c2"), 7);
+
+        let rows = build(
+            &events,
+            &[added_read, other_request],
+            &table,
+            &HashSet::new(),
+        );
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 1, "{rows:?}");
+        assert!(
+            !novel[0].origin,
+            "another correlation's divergence is not this call's consequence: {:?}",
+            novel[0]
+        );
+    }
+
     /// The scorecard tolerates an ABSORBED novel call (`NovelCallAbsorbed`,
     /// charged to nothing) and an inconclusive seed gap; the ledger reads
     /// neither `obs.absorbed` nor `obs.seed_gap`, so both fall through to
@@ -862,7 +1027,11 @@ mod tests {
 
         let novel = find(&rows, "novel");
         assert_eq!(novel.len(), 1);
-        assert!(novel[0].blocking, "correlated novel call blocks");
+        assert!(
+            !novel[0].blocking,
+            "a novel call that did not stop the request is charged to nothing by \
+             the scorecard, and this row is what the viewer routes on"
+        );
         assert!(novel[0].recorded.is_none(), "novel has no recorded side");
         assert!(novel[0].observed.is_some());
 
