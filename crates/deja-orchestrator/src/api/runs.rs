@@ -52,9 +52,25 @@ fn run_id_for(spec: &RunSpec) -> String {
         CandidateSpec::RepoPr { pr, .. } => format!("pr{pr}"),
         CandidateSpec::LocalPath { .. } => "local".to_owned(),
     };
-    // With an s3_source the recording is resolved later, in the worker; name
-    // the session filter when there is one and say so plainly when there isn't.
-    let recording = spec.recording_id.as_deref().unwrap_or("unresolved");
+    // What this run drives, whichever way it was named. A GROUP is a name, not
+    // an absence: it says "every recording this revision wrote that day", and
+    // the worker resolves it to members at pull time exactly as an `s3_source`
+    // prefix resolves to a session.
+    //
+    // Reading `recording_id` alone made every group replay address itself
+    // `…-unresolved-…`, because a group arrives in `recording_group` and leaves
+    // the other field empty. That is the same shape as three other checks that
+    // asked about `recording_id` specifically after a second way to name a
+    // recording existed — the run's submit gate, the pull dispatch, and here.
+    //
+    // `unresolved` stays for the case it was written for: an `s3_source` with
+    // no session filter, where the recording genuinely is not known until the
+    // worker scans the prefix.
+    let recording = spec
+        .recording_group
+        .as_deref()
+        .or(spec.recording_id.as_deref())
+        .unwrap_or("unresolved");
     replay_run_id(
         &std::env::var("DEJA_ENV").unwrap_or_else(|_| "dev".to_owned()),
         &candidate,
@@ -468,7 +484,90 @@ pub fn get(root: &HarnessRoot, run_id: &str) -> std::io::Result<Run> {
 
 #[cfg(test)]
 mod tests {
-    use super::{failure_line, resolve_tarball_url, terminal_cause};
+    use super::{failure_line, resolve_tarball_url, run_id_for, terminal_cause};
+    use crate::{CandidateSpec, RunMode, RunSpec};
+
+    /// A replay spec naming nothing in particular, so each test states only the
+    /// field it is about.
+    fn replay_spec() -> RunSpec {
+        RunSpec {
+            mode: RunMode::Replay,
+            candidate_spec: CandidateSpec::PrebuiltImage {
+                image: "repo/router:abc123".to_owned(),
+            },
+            system_under_test: None,
+            candidate_repo: None,
+            recording_id: None,
+            recording_group: None,
+            correlation_filter: None,
+            workload: serde_json::Value::Null,
+            scored_span_namespaces: Vec::new(),
+            s3_source: None,
+        }
+    }
+
+    /// A run driving a DEPLOYMENT DAY addresses itself by that day.
+    ///
+    /// The id read `…-unresolved-…` for every group replay, because it asked
+    /// `recording_id` and a group arrives in `recording_group`. "Unresolved" is
+    /// a real answer for an `s3_source` whose session is not known until the
+    /// worker scans the prefix; it is the wrong word for a run that named
+    /// precisely what it wanted.
+    #[test]
+    fn a_group_replay_is_addressed_by_its_group_not_as_unresolved() {
+        let mut spec = replay_spec();
+        spec.recording_group = Some("f42feeb-0916".to_owned());
+        let id = run_id_for(&spec);
+        assert!(
+            !id.contains("unresolved"),
+            "a named group is not an unresolved recording: {id}"
+        );
+        assert!(
+            id.contains("0916"),
+            "the day the run drives must be in its address: {id}"
+        );
+    }
+
+    /// Naming a single recording is unchanged.
+    #[test]
+    fn a_recording_replay_is_still_addressed_by_its_recording() {
+        let mut spec = replay_spec();
+        spec.recording_id = Some("rec-f42feeb-09161131-k8".to_owned());
+        let id = run_id_for(&spec);
+        assert!(!id.contains("unresolved"), "{id}");
+        assert!(id.contains("09161131"), "{id}");
+    }
+
+    /// The address agrees with the RESOLVER about which name wins.
+    ///
+    /// `stage_resolve_recording` takes `recording_group.or(recording_id)`, so
+    /// the id must prefer the group too. A spec naming both is refused at
+    /// stage 1 — that refusal is the point, a caller that set both has not
+    /// decided — but the id is minted before the refusal, and an address
+    /// naming the field the resolver would NOT have used would describe a run
+    /// that never existed.
+    #[test]
+    fn the_address_prefers_the_same_name_the_resolver_does() {
+        let mut spec = replay_spec();
+        spec.recording_group = Some("f42feeb-0916".to_owned());
+        spec.recording_id = Some("rec-f42feeb-09161131-k8".to_owned());
+        let id = run_id_for(&spec);
+        assert!(
+            id.contains("0916") && !id.contains("09161131"),
+            "the group wins, as it does in stage_resolve_recording: {id}"
+        );
+    }
+
+    /// And a run that genuinely does not know yet still says so. This is the
+    /// case the word was written for and the one it should keep.
+    #[test]
+    fn a_run_with_nothing_named_is_still_unresolved() {
+        let id = run_id_for(&replay_spec());
+        assert!(
+            id.contains("unresolved"),
+            "an s3_source run resolves its session in the worker: {id}"
+        );
+    }
 
     /// The case this exists for: a run whose runner was OOMKilled reported only
     /// "job failed (see pod diagnostics in the run log)", so an operator had to
