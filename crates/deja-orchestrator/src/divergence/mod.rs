@@ -9910,6 +9910,93 @@ mod tests {
     }
 
     /// An observed call that MISSED and was answered by a synthesized value.
+    /// Two tolerations compose into a pass, and the pure-tier exclusion's
+    /// stated premise is what lets them.
+    ///
+    /// `divergence/mod.rs` justifies excusing `Tier::Pure` on the grounds that
+    /// such a seam is "an entropy SEAM whose recorded value is substituted on
+    /// replay, after which everything downstream is pure … fully substituted in
+    /// practice (they never miss), so the non-blocking status is a safety net,
+    /// not a load-bearing exclusion."
+    ///
+    /// A clock seam that reads a duration into an OUTGOING REQUEST BODY breaks
+    /// both halves. Its value is not downstream-pure — reaching the body is the
+    /// whole reason it matters — and on a tape recorded before the seam existed
+    /// it misses on every call rather than never.
+    ///
+    /// What saves the first case below is incidental: the recording had a
+    /// counterpart the candidate's changed request could not claim, and an
+    /// unconsumed recorded side-effect call blocks whatever tier it sits at. Take
+    /// that away and nothing is left to block — the clock miss is excused as a
+    /// `DeterministicMiss` and the outgoing call is excused as an
+    /// `EnvironmentalMiss`. The run then reports a PASS whose reason reads
+    /// "every side-effect call resolved", about a request that continued on a
+    /// value the recording never held.
+    ///
+    /// KNOWN HOLE, PINNED DELIBERATELY. The second assertion below documents
+    /// current behaviour, not desired behaviour. When it is fixed this test will
+    /// fail, and that failure is the point: it should be updated by someone who
+    /// meant to change this, not discovered by someone reading a clean scorecard.
+    #[test]
+    fn a_pure_miss_reaching_an_outgoing_request_blocks_only_if_something_was_omitted() {
+        let clock_miss = |corr: &str| {
+            let mut call = obs("time", Some(corr), false, None, None);
+            // The miss arm answered. Synthesized, not Stopped, so
+            // `observed_miss_is_excused` takes it before any absorbed arm.
+            call.outcome = deja::SubstituteOutcome::Synthesized;
+            call.synthesized = true;
+            call
+        };
+        let carrying_call = |corr: &str| {
+            let mut call = obs("http_outgoing", Some(corr), false, None, None);
+            call.args = serde_json::json!({"body": {"elapsed": 0}});
+            call
+        };
+
+        // The recording expected a call here and the candidate's differs, so a
+        // recorded call is left unconsumed.
+        let with_twin = detect(&art(
+            vec![seq_entry(Some("c1"), "http_outgoing", 1)],
+            vec![clock_miss("c1"), carrying_call("c1")],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(
+            with_twin.summary.omitted_calls, 1,
+            "the fixture must leave a recorded call unconsumed, or it proves nothing"
+        );
+        assert!(
+            !with_twin.verdict.pass,
+            "an unconsumed recorded side-effect call blocks: {}",
+            with_twin.verdict.reason
+        );
+
+        // The same fabricated value, reaching a call the recording never made.
+        // Nothing is omitted, so nothing blocks.
+        let without_twin = detect(&art(
+            vec![],
+            vec![clock_miss("c2"), carrying_call("c2")],
+            vec![http("c2", true, vec![])],
+        ));
+        assert_eq!(
+            without_twin.summary.environmental_misses, 1,
+            "the outgoing call is tolerated as an environmental miss"
+        );
+        assert_eq!(
+            without_twin.summary.omitted_calls, 0,
+            "and nothing is left over to block"
+        );
+        assert!(
+            without_twin.verdict.pass,
+            "CURRENT behaviour, not desired: two tolerations compose into a pass"
+        );
+        assert!(
+            without_twin.verdict.reason.contains("every side-effect call resolved"),
+            "and the reason claims every call resolved, of a request that ran on \
+             a value the recording never held: {}",
+            without_twin.verdict.reason
+        );
+    }
+
     fn absorbed_obs(boundary: &str, corr: &str) -> ObservedCall {
         let mut o = obs(boundary, Some(corr), false, None, None);
         o.absorbed = true;
