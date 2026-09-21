@@ -121,8 +121,20 @@ export function diffArgs(recorded: unknown, candidate: unknown): LeafDiff[] {
 
 const SHOWN = 40;
 
-function short(v: unknown): string {
-  const s = typeof v === "string" ? v : v === undefined ? "∅" : JSON.stringify(v);
+/* Strings render bare so a header value reads as itself, not as a quoted blob.
+   That hides a type change: `short(5)` and `short("5")` are both `5`, so a leaf
+   that really did change renders as `amount: 5 -> 5` and reads as no change at
+   all. When the two sides are not the same type — the case where it matters —
+   quote the string side so the difference is on screen. */
+function short(v: unknown, quoteStrings = false): string {
+  const s =
+    typeof v === "string"
+      ? quoteStrings
+        ? JSON.stringify(v)
+        : v
+      : v === undefined
+        ? "∅"
+        : JSON.stringify(v);
   return s.length > SHOWN ? `${s.slice(0, SHOWN - 1)}…` : s;
 }
 
@@ -135,10 +147,15 @@ export function summarizeLeaves(
   leaves: LeafDiff[],
   max = 2,
 ): { shown: LeafSummary[]; more: number } {
-  const shown = leaves.slice(0, max).map((d) => ({
-    path: d.path || "(value)",
-    recorded: short(d.recorded),
-    candidate: short(d.candidate),
-  }));
+  const shown = leaves.slice(0, max).map((d) => {
+    // `null` is typeof "object" and `undefined` its own type, so this catches
+    // null-vs-"null" and ∅-vs-"" as well as 5-vs-"5".
+    const mixed = typeof d.recorded !== typeof d.candidate;
+    return {
+      path: d.path || "(value)",
+      recorded: short(d.recorded, mixed),
+      candidate: short(d.candidate, mixed),
+    };
+  });
   return { shown, more: Math.max(0, leaves.length - shown.length) };
 }
