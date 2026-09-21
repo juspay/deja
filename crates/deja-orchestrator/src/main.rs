@@ -1808,10 +1808,14 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
     let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
 
     // The run's own parameters — the live record on compose, the stored row's
-    // params on k8s — name the system and the candidate.
-    let params: Option<deja_orchestrator::RunParams> = match runs::get(&st.root, &id) {
-        Ok(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
-        Err(_) => match &st.store {
+    // params on k8s — name the system and the candidate. The live record is
+    // read through the same containment check as every other file this
+    // handler opens: resolved, and confirmed to lie under the runs directory.
+    let live: Option<Run> = confined(st.root.run_path(&id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    let params: Option<deja_orchestrator::RunParams> = match live {
+        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        None => match &st.store {
             Some(store) => match store.get_run(&id).await {
                 Ok(Some(row)) => serde_json::from_value(row.params).ok(),
                 _ => None,
