@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::HarnessRoot;
 
+pub(crate) mod elapsed;
 pub mod ledger;
 pub mod span_shape;
 pub use ledger::CallRecord;
@@ -2454,12 +2455,32 @@ fn pairing_shape(
 fn collect_args_shape(value: &serde_json::Value, prefix: String, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
+            // deja's byte capture declares itself with `captured: true`. Inside
+            // one of those envelopes `raw_bytes` is the ENCODING of the body's
+            // own leaves, so its length moves whenever a leaf does: admitting it
+            // re-admits exactly what eliding leaf values is here to exclude, and
+            // splits one call's identity in two so its recorded twin is never
+            // claimed. The path still contributes — a body is present — but its
+            // length does not.
+            //
+            // Scoped to the declared envelope, not to the key name, and not to
+            // arrays in general: a line-item count is independent of its leaves
+            // and IS shape. `captured: true` is deja's own contract and rides
+            // tapes already recorded, which a producer-side tag could not.
+            let captured = map
+                .get("captured")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             for (key, child) in map {
                 let next = if prefix.is_empty() {
                     key.clone()
                 } else {
                     format!("{prefix}.{key}")
                 };
+                if captured && key == "raw_bytes" && child.is_array() {
+                    out.push(next);
+                    continue;
+                }
                 collect_args_shape(child, next, out);
             }
         }
@@ -10820,6 +10841,125 @@ mod tests {
         assert_eq!(
             shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
             shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "b"}))
+        );
+    }
+
+    /// The `{captured, bytes_len, utf8, text, json, raw_bytes}` envelope deja's
+    /// own byte capture emits, built from its content so the renderings are
+    /// genuinely derived rather than asserted into agreement.
+    fn captured_body_envelope(content: &serde_json::Value) -> serde_json::Value {
+        let text = serde_json::to_string(content).expect("content serializes");
+        serde_json::json!({
+            "captured": true,
+            "bytes_len": text.len(),
+            "utf8": true,
+            "text": text,
+            "json": content,
+            "raw_bytes": text.as_bytes().to_vec(),
+        })
+    }
+
+    /// A captured body's `raw_bytes` length is a FUNCTION of the leaves it
+    /// encodes, so admitting it to the shape re-admits exactly what eliding leaf
+    /// values was meant to exclude: change one scalar inside the body and the
+    /// encoded length moves with it, giving the same call two identities and
+    /// leaving its recorded twin unclaimed.
+    ///
+    /// `captured: true` is deja's own contract for a captured byte payload, and
+    /// it is on tapes already recorded — which is why the envelope is recognized
+    /// by it rather than by a `kind` its producer never emitted.
+    #[test]
+    fn a_captured_body_pairs_across_a_scalar_its_own_bytes_encode() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+        let call = |elapsed: u64| {
+            serde_json::json!({
+                "endpoint": "https://example.test/v1/check",
+                "request_body": captured_body_envelope(
+                    &serde_json::json!({"stage": "settle", "elapsed_ms": elapsed}),
+                ),
+            })
+        };
+        // The two bodies encode to different lengths precisely because the
+        // scalar differs — the fixture is worthless if they do not.
+        assert_ne!(
+            call(4004)["request_body"]["bytes_len"],
+            call(0)["request_body"]["bytes_len"],
+            "fixture must exercise a real length difference"
+        );
+        assert_eq!(
+            shape(&call(4004)),
+            shape(&call(0)),
+            "a body's encoded length is an operand: the call must keep its twin"
+        );
+    }
+
+    /// The narrowness of the rule above. An array OUTSIDE a captured envelope
+    /// keeps its length, because its length is independent of its leaf values —
+    /// two line items and three are a different request, not the same request
+    /// re-encoded.
+    #[test]
+    fn an_array_outside_a_captured_envelope_still_separates_by_length() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+        let call = |count: usize| {
+            serde_json::json!({
+                "endpoint": "https://example.test/v1/order",
+                "line_items": vec![serde_json::json!({"sku": "s"}); count],
+            })
+        };
+        assert_ne!(
+            shape(&call(2)),
+            shape(&call(3)),
+            "a line-item count is shape, not an operand"
+        );
+    }
+
+    /// `captured: true` governs its OWN object, not the content nested under
+    /// it. A captured body's `json` carries collections of its own and their
+    /// lengths are content — two line items and three are a different request
+    /// even when both arrive as a captured body.
+    ///
+    /// (This does not kill a mutant that exempts every array directly inside the
+    /// envelope: `deja::value::bytes` puts no array there but `raw_bytes`, so
+    /// that mutation is equivalent on real data. The `raw_bytes` key check is
+    /// deliberate narrowness, matching the declared rule rather than relying on
+    /// the envelope never gaining another array.)
+    #[test]
+    fn the_captured_flag_does_not_reach_content_nested_under_it() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+        let call = |count: usize| {
+            serde_json::json!({
+                "endpoint": "https://example.test/v1/order",
+                "request_body": captured_body_envelope(&serde_json::json!({
+                    "items": vec![serde_json::json!({"sku": "s"}); count],
+                })),
+            })
+        };
+        assert_ne!(
+            shape(&call(2)),
+            shape(&call(3)),
+            "a collection inside the body is content, not the body's encoding"
+        );
+    }
+
+    /// And `raw_bytes` outside the envelope is not special either: the rule is
+    /// scoped to the object that declares `captured: true`, not to the key name.
+    #[test]
+    fn raw_bytes_without_the_captured_contract_keeps_its_length() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+        let call = |len: usize| {
+            serde_json::json!({
+                "endpoint": "https://example.test/v1/blob",
+                "payload": {"raw_bytes": vec![0u8; len]},
+            })
+        };
+        assert_ne!(
+            shape(&call(4)),
+            shape(&call(7)),
+            "only a declared capture envelope exempts its bytes"
         );
     }
 
