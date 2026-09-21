@@ -1023,10 +1023,9 @@ impl PullTally {
 pub fn pull_recording(
     cfg: &S3Config,
     recording_id: &str,
-    root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, deja_compactor::SessionManifest), String> {
-    let (report, mut manifests) = pull_recordings(cfg, &[recording_id], root, dest)?;
+    let (report, mut manifests) = pull_recordings(cfg, &[recording_id], dest)?;
     // One member in, one manifest out. Delegating rather than keeping a second
     // implementation is the point: the single-recording path IS the many-member
     // path with one member, so it cannot drift from it.
@@ -1065,7 +1064,6 @@ pub fn pull_recording(
 pub fn pull_recordings(
     cfg: &S3Config,
     recording_ids: &[&str],
-    root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, Vec<deja_compactor::SessionManifest>), String> {
     if recording_ids.is_empty() {
@@ -1084,9 +1082,43 @@ pub fn pull_recordings(
     let mut tally = PullTally::default();
 
     for recording_id in recording_ids {
-        let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
-            Some(m) => m,
-            None => deja_compactor::compact_session(cfg, recording_id, root)?,
+        // A REPLAY READS THE TAPE STORE AND NEVER WRITES IT.
+        //
+        // This used to seal an unsealed member right here, by calling
+        // `compact_session` — which writes `sessions/v1/*`. The replay Job's
+        // role is deliberately least-privilege, so a group holding one unsealed
+        // member died with a 403 naming a member nobody had asked about. Five
+        // runs failed that way on one day.
+        //
+        // The permission is the visible half. The other is why this is not
+        // merely a permissions bug: with credentials that allowed it, a replay
+        // would SEAL a recording the sealer has not judged quiescent — a run
+        // altering the evidence it is judged against, and fixing a tape that
+        // may still be being written. Sealing belongs to the job that is
+        // allowed to write tapes and runs on its own schedule.
+        //
+        // The denial does not even fail fast: the object store retries with
+        // backoff, several multipart pieces at a time, so a read becomes a
+        // hang. One recording spent 3,589s there and never reached stage 2.
+        //
+        // The sibling `pull_recording_from_prefix` had promote-on-pull removed
+        // for exactly these reasons and says so at length. This arm did not, so
+        // one half of the puller obeyed a stated rule and the other did not.
+        //
+        // Refusing rather than reading the landing here is deliberate. Only the
+        // GROUP path reaches this function — a single unsealed recording is
+        // short-circuited to the prefix rescan before it gets here — and a
+        // group whose day is not fully sealed is a day that is not ready, which
+        // is what both the dashboard and the pipeline already require before
+        // they offer one. A partial day replayed as if whole would report a
+        // verdict over a denominator that moves.
+        let Some(manifest) = deja_compactor::read_manifest(cfg, recording_id)? else {
+            return Err(format!(
+                "{recording_id} is part of this selection but is not sealed yet, and a replay \
+                 must not seal it — sealing writes the tape store, which a replay may not do \
+                 and is not permitted to. Wait for the sealer to reach it (it runs every 30 \
+                 minutes), or name a day whose recordings are all sealed."
+            ));
         };
         // Scoped so the lines, the joined bytes and the parsed events are all
         // released before the next member is read. Without this the peak is the

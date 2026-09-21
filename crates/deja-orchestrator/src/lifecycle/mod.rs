@@ -5323,6 +5323,41 @@ fn pull_recording(
             // and so a diff between them is about the recording rather than
             // about which order the listing happened to return.
             ids.sort();
+            // A DAY IS READY OR IT IS NOT, and the answer belongs here rather
+            // than eighty lines later in the pull.
+            //
+            // The pull refuses an unsealed member — a replay may not seal, and
+            // sealing is what it would take to read one — but by then the
+            // failure names a single member the caller never chose, out of a
+            // day they did. Checking at resolution lets the refusal say which
+            // day, how many of its recordings are waiting, and that the wait is
+            // bounded: the sealer runs every thirty minutes.
+            //
+            // It also costs one small GET per member rather than a compaction,
+            // and it happens before anything is read or written.
+            let unsealed: Vec<String> = ids
+                .iter()
+                .filter(|id| {
+                    deja_compactor::read_manifest(&cfg, id)
+                        .map(|m| m.is_none())
+                        // A store that cannot answer is not evidence of an
+                        // unsealed member; let the pull produce the real error.
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if !unsealed.is_empty() {
+                return Err(format!(
+                    "group {recording_id} has {} of {} recording(s) not sealed yet, so the day \
+                     cannot be replayed whole: {}. A replay reads the tape store and never \
+                     writes it, so it cannot seal them itself. The sealer runs every 30 \
+                     minutes; replay a day whose recordings are all sealed, or name one \
+                     recording directly.",
+                    unsealed.len(),
+                    ids.len(),
+                    unsealed.join(", ")
+                ));
+            }
             if ids.is_empty() {
                 return Err(format!(
                     "group {recording_id} names no recordings in {}/{landing_root} — it may be \
@@ -5342,7 +5377,7 @@ fn pull_recording(
 
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
     let refs: Vec<&str> = members.iter().map(String::as_str).collect();
-    let (report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &landing_root, &dest)?;
+    let (report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &dest)?;
     // Gaps are per instance and instances do not span members, so the sum over
     // every member's manifest is the selection's gap count rather than a
     // double-count.
