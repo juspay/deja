@@ -335,6 +335,29 @@ pub struct InstanceCoverage {
     pub events: u64,
     /// Inclusive `[from, to]` ranges missing between gseq_min and gseq_max.
     pub gaps: Vec<[u64; 2]>,
+    /// The subset of [`Self::gaps`] the RECORDER accounted for: sequences it
+    /// shed deliberately because its sink could not keep up, taken from the
+    /// `dropped` markers in the landing.
+    ///
+    /// This exists because a gap alone cannot say what it is. Deliberate
+    /// load-shedding, a pod killed with calls in flight, and an object lost
+    /// between the recorder and the bucket all produce the same hole, and they
+    /// are not the same news: the first is the fail-open contract working as
+    /// designed, the second bounds what the tape can be replayed as, the third
+    /// is a delivery fault. The recorder already distinguished them and said
+    /// so; nothing carried it forward.
+    ///
+    /// An UNEXPLAINED gap — one in `gaps` and not here — is therefore the
+    /// interesting one. Note the recorder cannot account for every drop even in
+    /// principle: only the enqueue path that finds a full channel remembers the
+    /// sequence, while a write to a sink already disabled by an earlier error
+    /// is counted and forgotten. So this is "what the recorder admitted to",
+    /// never "all shedding".
+    ///
+    /// `#[serde(default)]` so a manifest written before markers were read still
+    /// deserialises, reporting no explanation rather than failing.
+    #[serde(default)]
+    pub gaps_accounted: Vec<[u64; 2]>,
     pub duplicates_dropped: u64,
 }
 
@@ -474,6 +497,12 @@ struct EnvelopeProbe<'a> {
     /// while reporting a clean seal.
     #[serde(borrow)]
     node: Option<&'a serde_json::value::RawValue>,
+    /// A loss-accounting marker's body. Markers are not session data and are
+    /// not collated, but a `dropped` one carries the sequence ranges the
+    /// RECORDER shed on purpose, which is the only statement anywhere about
+    /// WHY a gap exists.
+    #[serde(default)]
+    marker: Option<MarkerBody>,
 }
 
 impl<'a> EnvelopeProbe<'a> {
@@ -856,6 +885,13 @@ pub fn count_landing_objects(
 /// inference from silence.
 const MARKER_KIND_EOF: &str = "eof";
 
+/// The marker the recorder writes when its sink could not keep up and it shed
+/// records rather than block the request (`deja-runtime`'s
+/// `MarkerKind::Dropped`, written from the FailOpen enqueue path). Its payload
+/// names the sequences it shed, which is what turns an unexplained gap into an
+/// accounted one.
+const MARKER_KIND_DROPPED: &str = "dropped";
+
 #[derive(Deserialize)]
 struct MarkerProbe {
     #[serde(default)]
@@ -872,6 +908,17 @@ struct MarkerProbe {
 struct MarkerBody {
     #[serde(default)]
     kind: String,
+    /// A `dropped` marker's payload — `{"ranges": [[from, to], ...]}`,
+    /// inclusive, in the recorder's own global sequence. Absent on every other
+    /// marker kind, which is why it is optional rather than a second struct.
+    #[serde(default)]
+    payload: Option<MarkerPayload>,
+}
+
+#[derive(Deserialize)]
+struct MarkerPayload {
+    #[serde(default)]
+    ranges: Vec<[u64; 2]>,
 }
 
 /// What the landing says about whether a session is still being written.
@@ -1883,6 +1930,11 @@ fn chunk_lines(chunks: &[Vec<u8>]) -> impl Iterator<Item = Cow<'_, str>> {
 fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
     let mut seen: BTreeSet<(String, RecordKind, u64)> = BTreeSet::new();
     let mut dupes_by_instance: BTreeMap<String, u64> = BTreeMap::new();
+    // Sequence ranges the RECORDER says it shed, per instance, from `dropped`
+    // markers. Not sorted or merged here — the recorder may emit several
+    // markers over a session and they arrive in whatever order the objects
+    // did.
+    let mut shed_by_instance: BTreeMap<String, Vec<[u64; 2]>> = BTreeMap::new();
     let mut events: Vec<Accepted> = Vec::new();
     let mut lines_in = 0usize;
     let mut duplicates = 0usize;
@@ -1905,7 +1957,27 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
             }
         };
         if env.is_marker() {
-            continue; // loss accounting, not session data (P2.4)
+            // Markers are loss accounting, not session data, so none of them
+            // becomes an event. A `dropped` one is still READ before it is
+            // discarded: it carries the sequence ranges the recorder shed on
+            // purpose when its sink could not keep up, and that is the only
+            // statement in the whole pipeline about WHY a gap exists. Throwing
+            // it away left every gap looking identical — deliberate
+            // load-shedding, a pod killed mid-flight, and an object lost in
+            // transit all arriving as the same unexplained hole.
+            if let Some(marker) = env.marker.as_ref() {
+                if marker.kind == MARKER_KIND_DROPPED {
+                    if let (Some(inst), Some(payload)) =
+                        (env.instance_id.as_ref(), marker.payload.as_ref())
+                    {
+                        shed_by_instance
+                            .entry(inst.clone())
+                            .or_default()
+                            .extend(payload.ranges.iter().copied());
+                    }
+                }
+            }
+            continue;
         }
         let Some((kind, payload)) = env.payload() else {
             eprintln!("compactor: dropping envelope without a payload");
@@ -1979,11 +2051,29 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
                 gseq_max: acc.gseq,
                 events: 1,
                 gaps: Vec::new(),
+                gaps_accounted: Vec::new(),
                 duplicates_dropped: 0,
             }),
         }
     }
     for cov in &mut instances {
+        // Only ranges that are ACTUALLY missing are reported as accounted for.
+        // A recorder can shed a sequence whose event nonetheless arrives — a
+        // later retry, or a marker written before the batch it describes got
+        // through — and claiming such a range as an explained gap would say a
+        // hole exists where the tape is whole. Intersecting with `gaps` keeps
+        // this a statement about holes, and keeps `gaps_accounted` a genuine
+        // subset of `gaps` so their difference means what it says.
+        if let Some(shed) = shed_by_instance.get(&cov.instance_id) {
+            let mut accounted: Vec<[u64; 2]> = shed
+                .iter()
+                .filter(|r| cov.gaps.iter().any(|g| r[0] >= g[0] && r[1] <= g[1]))
+                .copied()
+                .collect();
+            accounted.sort_unstable();
+            accounted.dedup();
+            cov.gaps_accounted = accounted;
+        }
         cov.duplicates_dropped = dupes_by_instance
             .get(&cov.instance_id)
             .copied()
@@ -2956,6 +3046,90 @@ mod tests {
         format!(
             r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"{inst}","capture":{{"mode":"session","session_id":"{session}"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"{session}","global_sequence":{gseq},"correlation_id":{corr_json},"boundary":"http_incoming","event_schema_version":1}}}}"#
         )
+    }
+
+    /// A `dropped` marker, exactly as the router's Kafka sink writes it:
+    /// `artifact_type: deja_sink_marker`, the instance that shed, and a payload
+    /// naming the inclusive sequence ranges.
+    fn dropped_marker(session: &str, inst: &str, ranges: &[[u64; 2]]) -> String {
+        let ranges_json = ranges
+            .iter()
+            .map(|r| format!("[{},{}]", r[0], r[1]))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_sink_marker","instance_id":"{inst}","capture":{{"mode":"session","session_id":"{session}"}},"marker":{{"kind":"dropped","payload":{{"ranges":[{ranges_json}]}}}}}}"#
+        )
+    }
+
+    /// A gap the recorder ADMITTED to is reported apart from one it did not.
+    ///
+    /// Both are holes in the same sequence and were indistinguishable before:
+    /// a reader saw two gaps and had no way to tell deliberate load-shedding
+    /// from a pod killed with calls in flight. The recorder had already said
+    /// which was which and compaction discarded the statement.
+    #[test]
+    fn a_shed_range_is_reported_as_accounted_and_an_unexplained_one_is_not() {
+        let mut lines: Vec<String> = Vec::new();
+        // 0,1 land; 2..=4 are shed and the recorder says so; 5 lands;
+        // 6..=7 vanish with nothing said about them; 8 lands.
+        for g in [0u64, 1, 5, 8] {
+            lines.push(envelope_for("s1", "i1", g, Some("c1")));
+        }
+        lines.push(dropped_marker("s1", "i1", &[[2, 4]]));
+
+        let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let cov = collated
+            .instances
+            .iter()
+            .find(|c| c.instance_id == "i1")
+            .expect("one instance");
+
+        assert_eq!(
+            cov.gaps,
+            vec![[2, 4], [6, 7]],
+            "both holes are still reported as gaps; explaining one does not hide it"
+        );
+        assert_eq!(
+            cov.gaps_accounted,
+            vec![[2, 4]],
+            "only the range the recorder named is accounted for"
+        );
+        // The difference is the point: what is left is what nobody explained.
+        let unexplained: Vec<[u64; 2]> = cov
+            .gaps
+            .iter()
+            .filter(|g| !cov.gaps_accounted.contains(g))
+            .copied()
+            .collect();
+        assert_eq!(unexplained, vec![[6, 7]]);
+    }
+
+    /// A shed range whose events ARRIVED anyway is not an accounted gap.
+    ///
+    /// The recorder writes the marker when it sheds, but a sequence can still
+    /// reach the tape afterwards. Reporting it as an explained gap would claim
+    /// a hole in a stream that is whole, and would break the one property that
+    /// makes the pair useful: `gaps_accounted` must be a subset of `gaps`, so
+    /// that subtracting gives the unexplained ones.
+    #[test]
+    fn a_shed_range_that_landed_anyway_is_not_a_gap() {
+        let mut lines: Vec<String> = (0u64..=4)
+            .map(|g| envelope_for("s1", "i1", g, Some("c1")))
+            .collect();
+        lines.push(dropped_marker("s1", "i1", &[[2, 3]]));
+
+        let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let cov = collated
+            .instances
+            .iter()
+            .find(|c| c.instance_id == "i1")
+            .expect("one instance");
+        assert!(cov.gaps.is_empty(), "nothing is actually missing");
+        assert!(
+            cov.gaps_accounted.is_empty(),
+            "a shed sequence that arrived is not a hole, whatever the marker said"
+        );
     }
 
     fn eof_marker(session: &str, inst: &str) -> String {
