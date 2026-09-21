@@ -227,10 +227,37 @@ fn correlations_with_a_value_origin(
 ///
 /// A novel call enters only by STOPPING the request, and a request stops once,
 /// so novel calls cannot form a chain of each other's causes.
+/// Whether the call at `index` is an args-free PAIRED divergence: it claimed a
+/// recorded twin by locus rather than by args, and its request changed.
+///
+/// Read from one place by the row builder and by the attribution map below.
+/// They answer the same question, and a ledger whose rows and whose cascade
+/// disagree about what diverged is the failure `CallPairing` exists to prevent.
+fn paired_value_diverged(
+    obs: &ObservedCall,
+    index: usize,
+    by_seq: &HashMap<u64, &BoundaryEvent>,
+    pairing: &super::CallPairing,
+) -> bool {
+    let Some(twin) = pairing.twin(index) else {
+        return false;
+    };
+    let twin_event = by_seq.get(&twin.sequence).copied();
+    pairing.changed(
+        index,
+        matches!(
+            super::pair_request_verdict(obs, twin_event),
+            super::ValueVerdict::Diverged
+        ),
+        twin.order_mismatch,
+    )
+}
+
 fn last_divergence_per_correlation(
     observed: &[ObservedCall],
     by_seq: &HashMap<u64, &BoundaryEvent>,
     tail_gap: &TailGapEvidence,
+    pairing: &super::CallPairing,
 ) -> HashMap<String, usize> {
     let mut last: HashMap<String, usize> = HashMap::new();
     for (index, obs) in observed.iter().enumerate() {
@@ -247,7 +274,14 @@ fn last_divergence_per_correlation(
         // Both signals have a position in the observed stream, which is what
         // attribution needs. An omitted call is a divergence too, but it has no
         // observed counterpart and so no index to be after.
-        if observed_value_diverged(obs, source) || stopped_at(obs) {
+        // The paired arm is not a widening: an args-free pair is the SHAPE
+        // most divergences take — a call whose input changed, which the
+        // address ladder could not bind — and the map that decides what an
+        // added call caused could not see any of them.
+        if observed_value_diverged(obs, source)
+            || stopped_at(obs)
+            || paired_value_diverged(obs, index, by_seq, pairing)
+        {
             last.insert(corr.to_owned(), index);
         }
     }
@@ -358,7 +392,7 @@ pub(crate) fn build_with_inconclusive_into(
     // call must come after the correlation's last recorded event was reproduced.
     // A novel call before a correlation's last divergence is an origin; one
     // with nothing diverging after it is not a finding at all.
-    let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap);
+    let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap, &pairing);
     for (observed_index, obs) in observed.iter().enumerate() {
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
         // result differs from the recorded baseline — the cause of a cascade.
@@ -441,14 +475,7 @@ pub(crate) fn build_with_inconclusive_into(
             let twin_event = by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded_result, obs, twin_event);
-            let value_diverged = pairing.changed(
-                observed_index,
-                matches!(
-                    super::pair_request_verdict(obs, twin_event),
-                    super::ValueVerdict::Diverged
-                ),
-                twin.order_mismatch,
-            );
+            let value_diverged = paired_value_diverged(obs, observed_index, &by_seq, &pairing);
             let race_downstream = !twin.order_mismatch
                 && value_diverged
                 && inconclusive_race
@@ -896,6 +923,40 @@ mod tests {
     }
 
     /// With a divergence after it, the added call is what to look at.
+    /// The divergence that follows an added call is usually an ARGS-FREE PAIR —
+    /// 224 of 267 value divergences on a real corpus carry no address rank. The
+    /// added call is still its cause.
+    #[test]
+    fn a_novel_call_is_an_origin_when_an_args_free_pair_diverges_after_it() {
+        let events = vec![event(7, "db", Some("c1"))];
+        let spans: HashMap<u64, String> = [(7u64, "root>handler".to_owned())].into_iter().collect();
+        let table = table_for(&events, &spans);
+
+        let added_read = obs("imc", Some("c1"), false, None, None);
+        // Pairs by locus rather than args, so it is unresolved and rankless —
+        // which is what the origin map could not see.
+        let mut paired = obs("db", Some("c1"), false, None, None);
+        paired.args = serde_json::json!({"k": 999});
+        paired.observed_result = Some(serde_json::json!({"r": "different"}));
+
+        let rows = build(&events, &[added_read, paired], &table, &HashSet::new());
+        let diverged = find(&rows, "value_diverged");
+        assert_eq!(diverged.len(), 1, "precondition: the pair formed: {rows:?}");
+        assert!(
+            diverged[0].blocking && diverged[0].resolved_rank.is_none(),
+            "precondition: blocking and rankless, i.e. args-free: {:?}",
+            diverged[0]
+        );
+
+        let novel = find(&rows, "novel");
+        assert_eq!(novel.len(), 1, "{rows:?}");
+        assert!(
+            novel[0].origin,
+            "the added call is the cause of what diverged after it: {:?}",
+            novel[0]
+        );
+    }
+
     #[test]
     fn a_novel_call_is_an_origin_when_a_divergence_follows_it() {
         let events = vec![event(7, "db", Some("c1"))];
