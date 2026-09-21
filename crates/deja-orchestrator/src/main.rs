@@ -39,7 +39,7 @@ use axum::{
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
-use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunStatus};
+use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunId, RunStatus};
 use deja_store::Store;
 use sha2::{Digest, Sha256};
 
@@ -586,7 +586,7 @@ async fn v1_kill_run(
 /// 202 regardless) — matching the in-process transport's semantics.
 async fn v1_ingest_run_event(
     State(st): State<AppState>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
     body: axum::body::Bytes,
 ) -> Response {
     use deja_orchestrator::lifecycle::store_ctx::{apply_run_event, RunEvent};
@@ -1484,7 +1484,7 @@ fn live_json(live: &Run) -> serde_json::Value {
 /// the snapshot carries the worker's live stage/step (file store is the
 /// worker's source of truth mid-run). Degrades to the snapshot alone when the
 /// store is down, so script polling works file-only too.
-async fn v1_get_run(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
     let row = match &st.store {
         Some(store) => match store.get_run(&id).await {
             Ok(row) => row,
@@ -1575,7 +1575,7 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
 /// `GET /api/v1/runs/{id}/scorecard` — serve the divergence scorecard. Prefers
 /// the runner's PRECOMPUTED scorecard (a k8s recompute would need the recording,
 /// which isn't on the orchestrator); falls back to recomputing for compose.
-async fn v1_scorecard(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_scorecard(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     if let Ok(content) = std::fs::read_to_string(st.root.scorecard_path(&id)) {
         if let Ok(card) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -1676,7 +1676,7 @@ fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String 
 /// observed, classified + located) that backs the interactive diff view. Prefers
 /// the runner's PRECOMPUTED ledger (a recompute needs the recording, absent on
 /// the orchestrator for k8s runs); falls back to recomputing for compose.
-async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     if let Ok(content) = std::fs::read_to_string(st.root.call_ledger_path(&id)) {
         let rows: Vec<serde_json::Value> = content
@@ -1696,7 +1696,7 @@ async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Respons
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
 /// (status + field-level body diff), parsed from the run's http-diff stream.
-async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(st.root.http_diff_path(&id))
         .map(|c| {
@@ -1715,7 +1715,7 @@ async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// (recorded events + the call ledger's observed side). Graph nodes ride the
 /// shared `DejaRecord` stream: record-side in the recording tape, replay-side
 /// in the run's observed stream.
-async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_graph(State(st): State<AppState>, id: RunId) -> Response {
     // k8s: the replay-side observed stream AND the record-side graph nodes both
     // ride S3 artifacts — hydrate pulls them to their local paths. The record
     // side comes from the `record_graph` artifact (span STRUCTURE only, extracted
@@ -1802,17 +1802,9 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
 /// call ledger, then cached beside the run. Never an error for a run that
 /// cannot be assessed: the body says why, so the report can say "not assessed"
 /// instead of a reader receiving a 500 from a successful run.
-async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
     use deja_orchestrator::change_coverage::{self, Assessment};
 
-    // Every path below is built from the id, so an id that is not one is
-    // refused before the first is.
-    if !change_coverage::is_plain_run_id(&id) {
-        return error_resp(
-            400,
-            "run id must be plain: letters, digits, '-', '_' and '.'",
-        );
-    }
     let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
 
     // The run's own parameters — the live record on compose, the stored row's

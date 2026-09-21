@@ -144,6 +144,130 @@ impl SchemaFingerprint {
     }
 }
 
+/// A run id that is safe to use as a path component: the orchestrator mints
+/// ids from a fixed alphabet, so anything carrying a path separator or a
+/// parent reference is not a run id and should never reach a handler as one.
+///
+/// This is the ONE place that check is spelled out. A handler that names a
+/// file beside a run extracts `Path<RunId>` instead of `Path<String>` — the
+/// validation happens during extraction, before the handler body runs, so
+/// there is nothing for a new handler to remember to call and nothing for an
+/// existing one to have skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RunId(String);
+
+impl RunId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RunId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for RunId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A candidate run id that is not one: empty, too long, carrying a path
+/// separator, a parent reference, or a character outside the id alphabet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRunId(pub String);
+
+impl std::fmt::Display for InvalidRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run id must be plain: letters, digits, '-', '_' and '.'")
+    }
+}
+
+impl std::error::Error for InvalidRunId {}
+
+impl std::str::FromStr for RunId {
+    type Err = InvalidRunId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let plain = !s.is_empty()
+            && s.len() <= 200
+            && !s.starts_with('.')
+            && !s.contains("..")
+            && !s.contains('/')
+            && !s.contains('\\')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if plain {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(InvalidRunId(s.to_owned()))
+        }
+    }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for RunId
+where
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::response::IntoResponse;
+        let axum::extract::Path(raw) =
+            axum::extract::Path::<String>::from_request_parts(parts, state)
+                .await
+                .map_err(axum::response::IntoResponse::into_response)?;
+        raw.parse::<RunId>().map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": e.to_string() }).to_string(),
+            )
+                .into_response()
+        })
+    }
+}
+
+#[cfg(test)]
+mod run_id_tests {
+    use super::RunId;
+
+    #[test]
+    fn a_run_id_that_could_name_another_path_is_refused() {
+        assert!("rp-sbx-60d382c2ee-unresolved-0916172101607"
+            .parse::<RunId>()
+            .is_ok());
+        assert!("run-1787741712798218945".parse::<RunId>().is_ok());
+        assert!("".parse::<RunId>().is_err());
+        assert!("../runs/other".parse::<RunId>().is_err());
+        assert!("a/b".parse::<RunId>().is_err());
+        assert!("a\\b".parse::<RunId>().is_err());
+        assert!(".hidden".parse::<RunId>().is_err());
+        assert!("x..y".parse::<RunId>().is_err());
+        assert!("id with space".parse::<RunId>().is_err());
+    }
+
+    #[test]
+    fn a_valid_run_id_derefs_to_the_str_a_path_is_built_from() {
+        let id: RunId = "run-1".parse().expect("plain id");
+        let path: &str = &id;
+        assert_eq!(path, "run-1");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {

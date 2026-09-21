@@ -139,22 +139,6 @@ pub fn source_repo_for(
     })
 }
 
-// ── run ids ─────────────────────────────────────────────────────────────────
-
-/// Whether a run id can name files beside the run. Run ids are minted by the
-/// orchestrator from a fixed alphabet; one carrying a path separator or a
-/// parent reference is not a run id, and the handler refuses it before any
-/// path is built from it.
-pub fn is_plain_run_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 200
-        && !id.starts_with('.')
-        && !id.contains("..")
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
 // ── change set ──────────────────────────────────────────────────────────────
 
 /// One changed source file: its path and the new-side line ranges its hunks
@@ -1520,20 +1504,6 @@ impl<'a> Client<'a> {
             masked.matches('}').count(),
             "balanced once literals are gone"
         );
-    }
-
-    #[test]
-    fn a_run_id_that_could_name_another_path_is_refused() {
-        assert!(is_plain_run_id(
-            "rp-sbx-60d382c2ee-unresolved-0916172101607"
-        ));
-        assert!(is_plain_run_id("run-1787741712798218945"));
-        assert!(!is_plain_run_id(""));
-        assert!(!is_plain_run_id("../runs/other"));
-        assert!(!is_plain_run_id("a/b"));
-        assert!(!is_plain_run_id(".hidden"));
-        assert!(!is_plain_run_id("x..y"));
-        assert!(!is_plain_run_id("id with space"));
     }
 
     #[test]
