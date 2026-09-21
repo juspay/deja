@@ -2720,6 +2720,12 @@ impl SeedCertificateEntry {
             deja::NotPreconditionReason::DeleteProvedAbsence => {
                 "not a precondition: the delete found no key, so the recording proves absence"
             }
+            deja::NotPreconditionReason::ReadFoundNothing => {
+                "not a precondition: the read found nothing, so there is no recorded value to seed"
+            }
+            deja::NotPreconditionReason::ReadErrored => {
+                "not a precondition: the read errored, which says nothing about whether the key was there"
+            }
         };
         Self {
             correlation_id: correlation_id.clone(),

@@ -2592,6 +2592,12 @@ pub enum NotPreconditionReason {
     /// A delete that found NO key. The reply proves absence, so there is
     /// nothing to seed — and seeding the reply as a value would create the key.
     DeleteProvedAbsence,
+    /// The boundary declared it found nothing. There is no value to seed, and
+    /// the recording says the key was not there.
+    ReadFoundNothing,
+    /// The read ERRORED. Unlike a declared miss this says nothing about whether
+    /// the key was there, so the planner draws no conclusion from it.
+    ReadErrored,
 }
 
 impl SeedPlan {
@@ -3111,7 +3117,26 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // UPDATE would hit an empty table. `created_tables` still skips reads of a
         // table this correlation created (it reconstructs those via its own replayed
         // create), so create-then-update of the same table is unaffected.
-        if !(event.is_error || is_miss_result(event)) {
+        if event.is_error {
+            // An error does not say whether the key was there — a not-found and
+            // a timeout are indistinguishable at this level — so the planner
+            // concludes nothing and records that it concluded nothing.
+            for key in &event.read_set {
+                plan.note_non_precondition(
+                    &event.boundary,
+                    &canonical_state_key_wire(key),
+                    NotPreconditionReason::ReadErrored,
+                );
+            }
+        } else if is_miss_result(event) {
+            for key in &event.read_set {
+                plan.note_non_precondition(
+                    &event.boundary,
+                    &canonical_state_key_wire(key),
+                    NotPreconditionReason::ReadFoundNothing,
+                );
+            }
+        } else {
             for key in &event.read_set {
                 let canonical_key = canonical_state_key_wire(key);
                 let written_key = (event.boundary.clone(), canonical_key.clone());
@@ -6087,6 +6112,50 @@ mod tests {
         ev.read_set = read_set.iter().map(|s| (*s).to_owned()).collect();
         ev.write_set = write_set.iter().map(|s| (*s).to_owned()).collect();
         ev
+    }
+
+    /// An errored read and a declared miss were both dropped in silence. They
+    /// mean different things, so they are named differently.
+    #[test]
+    fn an_errored_read_and_a_miss_are_named_apart() {
+        let errored = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "find_by_id",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Err", "kind": "Timeout"}),
+            &["k1"],
+            &[],
+            true,
+        );
+        let mut missed = state_event(
+            1,
+            Some("c1"),
+            "redis",
+            "get_key",
+            serde_json::json!({"key": "k2"}),
+            serde_json::Value::Null,
+            &["k2"],
+            &[],
+            false,
+        );
+        missed.declaration =
+            Some(crate::BoundaryDeclaration::default().effect(crate::EffectKind::Redis));
+
+        let plan = build_seed_plan(&[errored, missed], Some("c1"));
+        let named: Vec<_> = plan
+            .non_precondition_reads()
+            .map(|(_, key, reason)| (key.to_owned(), reason))
+            .collect();
+        assert!(
+            named.contains(&("k1".to_owned(), NotPreconditionReason::ReadErrored)),
+            "the error concluded nothing, and says so: {named:?}"
+        );
+        assert!(
+            named.contains(&("k2".to_owned(), NotPreconditionReason::ReadFoundNothing)),
+            "the miss found nothing, which is a different fact: {named:?}"
+        );
     }
 
     fn test_db_query_key(operation: &str, table: &str, sql: &str) -> String {
