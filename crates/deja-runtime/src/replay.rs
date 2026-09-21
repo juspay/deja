@@ -3236,8 +3236,14 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // post-write value (no longer a precondition), and a create additionally
         // declines later read-backs of the whole table (they'd collide with the
         // replayed create).
-        for key in &event.write_set {
-            written.insert((event.boundary.clone(), canonical_state_key_wire(key)));
+        // A write that FAILED wrote nothing, so it must not mark its keys: a
+        // later read of one is still a precondition. Marking costs a missing
+        // row and a divergence charged to an innocent candidate; not marking
+        // costs at worst a seeded row the replayed write re-applies.
+        if !event.is_error {
+            for key in &event.write_set {
+                written.insert((event.boundary.clone(), canonical_state_key_wire(key)));
+            }
         }
         if event.boundary == "db" && is_db_create_event(event) {
             if let Some(table) = db_created_table(event) {
@@ -6112,6 +6118,90 @@ mod tests {
         ev.read_set = read_set.iter().map(|s| (*s).to_owned()).collect();
         ev.write_set = write_set.iter().map(|s| (*s).to_owned()).collect();
         ev
+    }
+
+    /// A write that failed wrote nothing, so a later read of its key is still
+    /// a precondition. The old rule declined that read AND told the certificate
+    /// it observed a prior write — a reason that was not true.
+    #[test]
+    fn a_write_that_failed_does_not_decline_a_later_read() {
+        let failed_write = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "insert",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Err", "kind": "UniqueViolation"}),
+            &[],
+            &["k1"],
+            true,
+        );
+        let later_read = state_event(
+            1,
+            Some("c1"),
+            "db",
+            "find_by_id",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Ok", "value": {"id": "x"}}),
+            &["k1"],
+            &[],
+            false,
+        );
+
+        let plan = build_seed_plan(&[failed_write, later_read], Some("c1"));
+        assert!(
+            plan.resolve("db", "k1").is_some(),
+            "the row was there before the read: {plan:?}"
+        );
+        assert!(
+            !plan
+                .non_precondition_reads()
+                .any(|(_, key, reason)| key == "k1"
+                    && reason == NotPreconditionReason::ReadAfterWrite),
+            "and nothing claims it observed a write that never happened: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
+    }
+
+    /// A write that SUCCEEDED still marks its key, so the guard above did not
+    /// simply disable read-after-write.
+    #[test]
+    fn a_write_that_succeeded_still_declines_a_later_read() {
+        let ok_write = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "insert",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Ok", "value": null}),
+            &[],
+            &["k1"],
+            false,
+        );
+        let later_read = state_event(
+            1,
+            Some("c1"),
+            "db",
+            "find_by_id",
+            serde_json::json!({"id": "x"}),
+            serde_json::json!({"version": 1, "result": "Ok", "value": {"id": "x"}}),
+            &["k1"],
+            &[],
+            false,
+        );
+
+        let plan = build_seed_plan(&[ok_write, later_read], Some("c1"));
+        assert!(
+            plan.resolve("db", "k1").is_none(),
+            "the correlation wrote it, so it is not a precondition: {plan:?}"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .any(|(_, key, reason)| key == "k1"
+                    && reason == NotPreconditionReason::ReadAfterWrite),
+            "and that is still the named reason: {:?}",
+            plan.non_precondition_reads().collect::<Vec<_>>()
+        );
     }
 
     /// An errored read and a declared miss were both dropped in silence. They
