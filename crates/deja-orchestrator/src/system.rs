@@ -117,6 +117,13 @@ pub struct SystemConfig {
     /// Span-name prefixes this system's instrumentation contract declares as
     /// scored. Deja does not know these; the system does, so it declares them.
     pub scored_span_namespaces: Vec<String>,
+    /// `owner/name` of the candidate's source repository, for change coverage.
+    /// `None` = undeclared; the run's `candidate_repo` or `DEJA_CANDIDATE_REPO`
+    /// may still supply it.
+    pub source_repo: Option<String>,
+    /// The branch a candidate's change set is measured against for change
+    /// coverage. `main` when undeclared.
+    pub change_base_ref: String,
     /// Reply canons declared per boundary, in the recorder's own grammar. See
     /// `SystemDeclaration::reply_canons`.
     pub reply_canons: std::collections::BTreeMap<String, String>,
@@ -311,6 +318,8 @@ pub fn system_config(name: &str) -> SystemConfig {
         instance_pattern: clean(d.instance_pattern),
         main_instance_prefix: clean(d.main_instance_prefix),
         scored_span_namespaces: d.scored_span_namespaces.unwrap_or_default(),
+        source_repo: clean(d.source_repo),
+        change_base_ref: clean(d.change_base_ref).unwrap_or_else(|| "main".to_owned()),
         reply_canons: reply_canons_resolved.clone(),
         candidate_config_files: d.candidate_config_files,
         code_bundle_uri_env: clean(d.code_bundle_uri_env),

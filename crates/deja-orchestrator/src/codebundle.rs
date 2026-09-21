@@ -533,7 +533,7 @@ pub fn bundle_migrations_from_targz<R: Read>(
 /// call and never redirects the in-cluster k8s API / S3 clients — then falls
 /// back to the conventional `HTTPS_PROXY`/`HTTP_PROXY`. Unset → a direct agent,
 /// so local/demo/CI keep working unchanged.
-fn tarball_agent() -> ureq::Agent {
+pub(crate) fn tarball_agent() -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(15));
     let proxy = [
         "DEJA_HTTP_PROXY",

@@ -106,7 +106,11 @@ pub fn spawn_worker(root: &HarnessRoot, run_id: &str, ctx: StoreCtx) {
 /// default. Returns None (logged) if the template still needs a repo that none
 /// was supplied for — better to fall back to a local checkout than to fetch a
 /// malformed URL.
-fn resolve_tarball_url(template: &str, run_repo: Option<&str>, sha: &str) -> Option<String> {
+pub(crate) fn resolve_tarball_url(
+    template: &str,
+    run_repo: Option<&str>,
+    sha: &str,
+) -> Option<String> {
     let url = template.replace("{sha}", sha);
     if !url.contains("{repo}") {
         return Some(url);

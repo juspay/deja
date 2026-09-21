@@ -263,6 +263,7 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/calls", get(v1_calls))
         .route("/runs/{run_id}/http-diffs", get(v1_http_diffs))
         .route("/runs/{run_id}/graph", get(v1_graph))
+        .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit));
@@ -1793,6 +1794,125 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
         "replay": replay,
         "record_note": record_note,
     }))
+}
+
+/// `GET /api/v1/runs/{id}/change-coverage` — did the replay reach what the
+/// candidate changed? Computed on first request from the git host's compare of
+/// the candidate against its base branch and the run's own replay graph and
+/// call ledger, then cached beside the run. Never an error for a run that
+/// cannot be assessed: the body says why, so the report can say "not assessed"
+/// instead of a reader receiving a 500 from a successful run.
+async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    use deja_orchestrator::change_coverage::{self, Assessment};
+
+    let cache = st.root.run_path(&id).with_file_name("change_coverage.json");
+    if let Ok(cached) = std::fs::read_to_string(&cache) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_ok(value);
+        }
+    }
+    let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
+
+    // The run's own parameters — the live record on compose, the stored row's
+    // params on k8s — name the system and the candidate.
+    let params: Option<deja_orchestrator::RunParams> = match runs::get(&st.root, &id) {
+        Ok(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        Err(_) => match &st.store {
+            Some(store) => match store.get_run(&id).await {
+                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+                _ => None,
+            },
+            None => None,
+        },
+    };
+    let Some(params) = params else {
+        return error_resp(404, "run not found");
+    };
+    let system = params
+        .system_under_test
+        .clone()
+        .unwrap_or_else(|| deja_orchestrator::default_system().to_owned());
+    let config = deja_orchestrator::system::system_config(&system);
+    let nonempty = |s: String| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+    let Some(repo) = params
+        .candidate_repo
+        .clone()
+        .and_then(nonempty)
+        .or_else(|| config.source_repo.clone())
+        .or_else(|| std::env::var("DEJA_CANDIDATE_REPO").ok().and_then(nonempty))
+    else {
+        return unavailable(format!(
+            "no source repository is known for system '{system}': declare systems.{system}.source_repo (owner/name) or send candidate_repo on the run"
+        ));
+    };
+    let Some(template) = std::env::var("DEJA_CANDIDATE_TARBALL_URL")
+        .ok()
+        .and_then(nonempty)
+    else {
+        return unavailable(
+            "DEJA_CANDIDATE_TARBALL_URL is not set, so the candidate's source cannot be fetched"
+                .to_owned(),
+        );
+    };
+    let sha = match deja_orchestrator::executor::resolve_candidate_image_for(
+        &params.candidate_spec,
+        &system,
+    ) {
+        Ok((_, sha)) => sha,
+        Err(e) => return unavailable(format!("the candidate does not name a build sha: {e}")),
+    };
+    let base_ref = config.change_base_ref.clone();
+
+    hydrate_run_artifacts(&st, &id).await;
+    let root = st.root.clone();
+    let run_id = id.clone();
+    let computed = tokio::task::spawn_blocking(move || -> Result<change_coverage::ChangeCoverage, String> {
+        let replay: Vec<deja_core::ExecutionGraphNode> = std::fs::File::open(root.observed_path(&run_id))
+            .map(|file| {
+                std::io::BufRead::lines(std::io::BufReader::new(file))
+                    .map_while(Result::ok)
+                    .filter_map(|line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                        Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .map_err(|e| format!("the run's replay graph could not be read: {e}"))?;
+        if replay.is_empty() {
+            return Err("the run published no replay execution graph, so there is no evidence of what ran".to_owned());
+        }
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(root.call_ledger_path(&run_id))
+            .map(|content| {
+                content
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let evidence = change_coverage::Evidence::from_graph_and_calls(&replay, &calls);
+        let change = change_coverage::fetch_change_set(&repo, &base_ref, &sha, &template)?;
+        Ok(change_coverage::assess(&system, &repo, &base_ref, change, &evidence))
+    })
+    .await;
+    let assessment = match computed {
+        Ok(Ok(coverage)) => Assessment::Assessed(coverage),
+        Ok(Err(why)) => Assessment::Unavailable { unavailable: why },
+        Err(e) => Assessment::Unavailable {
+            unavailable: format!("assessment task failed: {e}"),
+        },
+    };
+    // Cache only an assessment: a transient failure must not be remembered as
+    // the answer.
+    if let Assessment::Assessed(_) = &assessment {
+        if let Ok(text) = serde_json::to_string(&assessment) {
+            if let Some(parent) = cache.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&cache, text);
+        }
+    }
+    json_ok_ser(&assessment)
 }
 
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.

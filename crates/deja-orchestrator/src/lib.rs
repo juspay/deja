@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod change_coverage;
 pub mod codebundle;
 pub mod config_layer;
 pub mod divergence;
