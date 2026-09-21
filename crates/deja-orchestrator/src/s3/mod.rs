@@ -60,6 +60,15 @@ pub struct IngestReport {
     /// rather than by parsing `prefix`. One entry is a single recording; many
     /// is a deployment's day pulled as one tape.
     pub members: Vec<String>,
+    /// The recordings a group named that this pull did NOT draw from, because
+    /// they are not sealed yet.
+    ///
+    /// Beside `members` rather than in a log line, because this is the
+    /// persisted artifact a reader acts on: a verdict over part of a day is
+    /// honest when the part is stated and misleading when it is not, and prose
+    /// in a log is not something a consumer can check. Empty for a single
+    /// recording and for a group that was pulled whole.
+    pub excluded_members: Vec<String>,
     pub landing_objects: usize,
     pub lines_in: usize,
     pub duplicates_dropped: usize,
@@ -1000,6 +1009,7 @@ impl PullTally {
                 _ => SESSIONS_ROOT.to_owned(),
             },
             members,
+            excluded_members: Vec::new(),
             landing_objects: self.landing_objects,
             lines_in: self.lines_in,
             duplicates_dropped: self.duplicates_dropped,
@@ -1309,6 +1319,8 @@ pub fn pull_recording_from_prefix(
         // session the scan resolved out of it.
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
         members: vec![resolved.clone()],
+        // One session, resolved whole: nothing was left out.
+        excluded_members: Vec::new(),
         landing_objects: session_objects,
         lines_in: collated.lines_in,
         duplicates_dropped: collated.drops.duplicates,
@@ -1779,6 +1791,7 @@ mod tests {
 
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
+            excluded_members: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in,
@@ -1796,11 +1809,50 @@ mod tests {
         assert!(!report.accounting().contains("UNACCOUNTED"));
     }
 
+    /// A partial run has to say so in the artifact, not only in a log line.
+    ///
+    /// The exclusion was carried in a local, printed to stderr and into the
+    /// ingest log, and then dropped — so the persisted report described a
+    /// subset of a day exactly as it describes a whole one. A consumer reading
+    /// the artifact could not tell the two apart, and prose in a log is not
+    /// something it can check.
+    #[test]
+    fn the_report_names_what_a_partial_pull_left_out() {
+        let report = IngestReport {
+            members: vec!["rec-sealed".to_owned()],
+            excluded_members: vec!["rec-still-open".to_owned()],
+            prefix: "s3://b/p".into(),
+            landing_objects: 1,
+            lines_in: 0,
+            duplicates_dropped: 0,
+            events_out: 0,
+            correlations: 0,
+            sealed: false,
+            markers_dropped: 0,
+            non_envelope_dropped: 0,
+            unparseable_dropped: 0,
+            delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
+        };
+        let json = serde_json::to_value(&report).expect("the report serialises");
+        assert_eq!(
+            json["excluded_members"],
+            serde_json::json!(["rec-still-open"]),
+            "the artifact a reader acts on has to carry the exclusion"
+        );
+        assert_eq!(
+            json["members"],
+            serde_json::json!(["rec-sealed"]),
+            "beside what was drawn from, not instead of it"
+        );
+    }
+
     #[test]
     fn an_unbalanced_report_says_so() {
         // The assertion has to be able to fail, or it is decoration.
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
+            excluded_members: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 139_916,

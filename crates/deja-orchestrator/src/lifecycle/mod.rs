@@ -5238,6 +5238,41 @@ fn is_group(name: &str) -> bool {
     !name.starts_with("rec-") && !name.starts_with("run-")
 }
 
+/// Which "nothing to replay" error an empty group resolution deserves, or
+/// `None` when something was kept.
+///
+/// The two empty cases are different and their messages are not
+/// interchangeable. A group whose members all exist but are unsealed should
+/// wait for the sealer. A group that names nothing at all should NOT, because
+/// there is nothing to seal — sending that reader to wait thirty minutes costs
+/// them thirty minutes and tells them nothing true.
+///
+/// Both were present, but the unsealed check ran first and answered for both,
+/// so a mistyped group reported "all 0 of them are still being written". The
+/// message written for that case had become unreachable.
+fn empty_group_error(
+    recording_id: &str,
+    bucket: &str,
+    landing_root: &str,
+    kept: usize,
+    excluded: &[String],
+) -> Option<String> {
+    if kept > 0 {
+        return None;
+    }
+    if excluded.is_empty() {
+        return Some(format!(
+            "group {recording_id} names no recordings in {bucket}/{landing_root} — it may be \
+             a day nothing has sealed yet, or a revision that never ran here"
+        ));
+    }
+    Some(format!(
+        "group {recording_id} has no sealed recordings yet — all {} of them are still being \
+         written, and a replay cannot seal them itself. The sealer runs every 30 minutes.",
+        excluded.len()
+    ))
+}
+
 fn pull_recording(
     root: &HarnessRoot,
     ctx: &StoreCtx,
@@ -5306,6 +5341,11 @@ fn pull_recording(
     // and already correct when group replay was broken for every group: the
     // predicate was never the defect, the routing that ignored it was, and a
     // test of the predicate cannot catch that.
+    // Hoisted above the match so it can reach the report. A partial run has to
+    // SAY it was partial in the artifact a reader acts on, not only in a log
+    // line, or the persisted verdict describes a subset as though it were the
+    // whole day.
+    let mut excluded: Vec<String> = Vec::new();
     let members: Vec<String> = match is_group_name {
         // Not a group: the caller named one pod's slice, not a day. Left alone.
         false => vec![recording_id.to_owned()],
@@ -5345,7 +5385,11 @@ fn pull_recording(
             // DAY and what was dropped from it; the pull sees one member at a
             // time and cannot say what it is part of. It costs one small GET
             // per member instead of a compaction.
-            let mut excluded: Vec<String> = Vec::new();
+            // Total by construction: `retain` either keeps an id or pushes it
+            // here, and the `Err(_)` arm keeps rather than drops. That holds
+            // today because the match is three arms long and obviously total;
+            // it stops holding the first time a fourth is added, so assert it.
+            let members_before = ids.len();
             ids.retain(|id| {
                 match deja_compactor::read_manifest(&cfg, id) {
                     Ok(Some(_)) => true,
@@ -5359,13 +5403,22 @@ fn pull_recording(
                     Err(_) => true,
                 }
             });
-            if ids.is_empty() {
-                return Err(format!(
-                    "group {recording_id} has no sealed recordings yet — all {} of them are \
-                     still being written, and a replay cannot seal them itself. The sealer \
-                     runs every 30 minutes.",
-                    excluded.len()
-                ));
+            debug_assert_eq!(
+                ids.len() + excluded.len(),
+                members_before,
+                "every member is either kept or named as excluded; \
+                 {members_before} in, {} kept, {} excluded",
+                ids.len(),
+                excluded.len()
+            );
+            if let Some(err) = empty_group_error(
+                recording_id,
+                &cfg.bucket,
+                &landing_root,
+                ids.len(),
+                &excluded,
+            ) {
+                return Err(err);
             }
             if !excluded.is_empty() {
                 let line = format!(
@@ -5377,13 +5430,6 @@ fn pull_recording(
                 );
                 eprintln!("lifecycle: {line}");
                 ctx.log("ingest", &line);
-            }
-            if ids.is_empty() {
-                return Err(format!(
-                    "group {recording_id} names no recordings in {}/{landing_root} — it may be \
-                     a day nothing has sealed yet, or a revision that never ran here",
-                    cfg.bucket
-                ));
             }
             let line = format!(
                 "group {recording_id} resolves to {} recording(s)",
@@ -5397,7 +5443,11 @@ fn pull_recording(
 
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
     let refs: Vec<&str> = members.iter().map(String::as_str).collect();
-    let (report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &dest)?;
+    let (mut report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &dest)?;
+    // Beside `members`, which names what the pull DID draw from. Without this
+    // the artifact describes a partial run as a whole one, and the exclusion
+    // survives only as prose in a log.
+    report.excluded_members = std::mem::take(&mut excluded);
     // Gaps are per instance and instances do not span members, so the sum over
     // every member's manifest is the selection's gap count rather than a
     // double-count.
@@ -5576,6 +5626,52 @@ mod tests {
     ///
     /// The needle is assembled rather than written out, so that this test does
     /// not count itself.
+    /// A group that names NOTHING has nothing for the sealer to seal, so the
+    /// "wait 30 minutes" message sends the reader to wait on the wrong thing.
+    /// The fresh group from a custom build is an identifier nobody has typed
+    /// before, which makes a typo the likeliest first failure.
+    #[test]
+    fn an_empty_group_is_not_told_to_wait_for_the_sealer() {
+        let err = super::empty_group_error("grp-typo", "bkt", "landing/v1", 0, &[])
+            .expect("a group that resolves to nothing is an error");
+        assert!(
+            err.contains("names no recordings"),
+            "an empty group gets the message written for it, got: {err}"
+        );
+        assert!(
+            !err.contains("sealer"),
+            "there is nothing to seal, so do not send the reader to wait for one: {err}"
+        );
+    }
+
+    /// The other empty case, which the message above must not swallow: every
+    /// member exists and none is sealed yet. Waiting IS the right advice here.
+    #[test]
+    fn a_wholly_unsealed_group_is_told_to_wait_for_the_sealer() {
+        let excluded = vec!["rec-a".to_owned(), "rec-b".to_owned()];
+        let err = super::empty_group_error("grp-today", "bkt", "landing/v1", 0, &excluded)
+            .expect("keeping nothing is an error");
+        assert!(
+            err.contains("no sealed recordings yet"),
+            "an unsealed group gets the sealer message, got: {err}"
+        );
+        assert!(
+            err.contains("all 2 of them"),
+            "the count names how many are being waited on, got: {err}"
+        );
+    }
+
+    /// A partial day is not an error at all — that is the whole point of the
+    /// change this guards.
+    #[test]
+    fn a_group_with_one_sealed_member_is_not_an_error() {
+        assert!(
+            super::empty_group_error("g", "bkt", "landing/v1", 1, &["rec-open".to_owned()])
+                .is_none(),
+            "one sealed member is enough to replay"
+        );
+    }
+
     #[test]
     fn only_one_place_in_the_lifecycle_renders_the_lookup_table() {
         let lifecycle_source = include_str!("mod.rs");
@@ -6537,6 +6633,7 @@ mod tests {
     ) {
         let report = crate::s3::IngestReport {
             members: vec!["rec-fixture".to_owned()],
+            excluded_members: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 16258,
