@@ -5323,40 +5323,60 @@ fn pull_recording(
             // and so a diff between them is about the recording rather than
             // about which order the listing happened to return.
             ids.sort();
-            // A DAY IS READY OR IT IS NOT, and the answer belongs here rather
-            // than eighty lines later in the pull.
+            // A DAY REPLAYS THE PART OF IT THAT IS SEALED, and says which part
+            // it left out.
             //
-            // The pull refuses an unsealed member — a replay may not seal, and
-            // sealing is what it would take to read one — but by then the
-            // failure names a single member the caller never chose, out of a
-            // day they did. Checking at resolution lets the refusal say which
-            // day, how many of its recordings are waiting, and that the wait is
-            // bounded: the sealer runs every thirty minutes.
+            // A member with no manifest cannot be read without sealing it, and
+            // a replay may not seal — that writes the tape store it is judged
+            // against, and the Job's role forbids it anyway. The choice is
+            // therefore between refusing the whole day and driving the sealed
+            // part of it.
             //
-            // It also costs one small GET per member rather than a compaction,
-            // and it happens before anything is read or written.
-            let unsealed: Vec<String> = ids
-                .iter()
-                .filter(|id| {
-                    deja_compactor::read_manifest(&cfg, id)
-                        .map(|m| m.is_none())
-                        // A store that cannot answer is not evidence of an
-                        // unsealed member; let the pull produce the real error.
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect();
-            if !unsealed.is_empty() {
+            // Driving it, because the alternative blocks a day on its newest
+            // recording indefinitely: the sealer reaches a recording only once
+            // it has gone quiet, so a day always has a youngest member that is
+            // still open, and a rule of "all or nothing" makes today's traffic
+            // permanently unreplayable. What makes the partial run honest is
+            // that the exclusion is NAMED — a verdict over a subset is fine
+            // when the subset is stated, and misleading only when it is
+            // presented as the whole.
+            //
+            // Checked here rather than in the pull because here it can name the
+            // DAY and what was dropped from it; the pull sees one member at a
+            // time and cannot say what it is part of. It costs one small GET
+            // per member instead of a compaction.
+            let mut excluded: Vec<String> = Vec::new();
+            ids.retain(|id| {
+                match deja_compactor::read_manifest(&cfg, id) {
+                    Ok(Some(_)) => true,
+                    Ok(None) => {
+                        excluded.push(id.clone());
+                        false
+                    }
+                    // A store that cannot answer is not evidence of an unsealed
+                    // member. Keep it and let the pull produce the real error,
+                    // rather than silently shrinking the day over a transient.
+                    Err(_) => true,
+                }
+            });
+            if ids.is_empty() {
                 return Err(format!(
-                    "group {recording_id} has {} of {} recording(s) not sealed yet, so the day \
-                     cannot be replayed whole: {}. A replay reads the tape store and never \
-                     writes it, so it cannot seal them itself. The sealer runs every 30 \
-                     minutes; replay a day whose recordings are all sealed, or name one \
-                     recording directly.",
-                    unsealed.len(),
-                    ids.len(),
-                    unsealed.join(", ")
+                    "group {recording_id} has no sealed recordings yet — all {} of them are \
+                     still being written, and a replay cannot seal them itself. The sealer \
+                     runs every 30 minutes.",
+                    excluded.len()
                 ));
+            }
+            if !excluded.is_empty() {
+                let line = format!(
+                    "group {recording_id}: replaying {} sealed recording(s); excluding {} not \
+                     sealed yet ({})",
+                    ids.len(),
+                    excluded.len(),
+                    excluded.join(", ")
+                );
+                eprintln!("lifecycle: {line}");
+                ctx.log("ingest", &line);
             }
             if ids.is_empty() {
                 return Err(format!(
