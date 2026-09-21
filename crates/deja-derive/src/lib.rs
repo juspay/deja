@@ -120,10 +120,12 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// constructs the host's error: it cannot name an `E` a `replay_ok` site never
 /// declares. The site can, which is the whole inversion.
 ///
-/// This does NOT hide the miss. The seam emits the blocking NovelCall divergence
-/// before it returns the value; only the continuation changes, so the
-/// subtree that needed the value diverges and the graph tier localises it
-/// instead of the request dying with no response at all.
+/// This does NOT hide the miss. The seam emits the NovelCall divergence before
+/// it returns the value; only the continuation changes, so the subtree that
+/// needed the value diverges and the graph tier localises it instead of the
+/// request dying with no response at all. That row is NON-blocking, which is
+/// the same fact said twice: a novel call blocks only when it stopped the
+/// request.
 ///
 /// Legality is the declaration's burden. `None` from a cache read is honest —
 /// it means "not in cache", which is TRUE on replay, and the caller's fallback
