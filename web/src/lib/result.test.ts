@@ -248,6 +248,112 @@ describe("the two row shapes agree", () => {
   }
 });
 
+// Each fixture above trips exactly one rung, which pins what each rung DOES and
+// says nothing about the order they are tried in. Swapping two rungs that never
+// both apply is invisible to every test above — mainchk demonstrated it by
+// moving the `failed` check below the record-run check, which left all of them
+// green while a failed RECORD run reported "a recording is produced, not
+// scored" and lost its failure message.
+//
+// A ladder test has to die on any adjacent swap, so each case here is a run
+// that trips TWO rungs at once and asserts the EARLIER one won.
+type Pair = {
+  earlier: number;
+  later: number;
+  name: string;
+  facts: Facts;
+  expected: ResultState;
+  /** Something only the earlier rung produces. */
+  proof: (r: ReturnType<typeof resultOf>) => void;
+};
+
+const PRECEDENCE: Pair[] = [
+  {
+    earlier: 1,
+    later: 3,
+    name: "a record run still moving is RUNNING, not 'not scored'",
+    facts: { state: "running", mode: "record", stage: "recording", scored: null },
+    expected: "RUNNING",
+    proof: (r) => expect(r.headline).toMatch(/in progress/i),
+  },
+  {
+    earlier: 2,
+    later: 3,
+    name: "a FAILED record run reports the failure, not 'not scored'",
+    facts: { state: "failed", mode: "record", failure: "disk full while sealing", scored: null },
+    expected: "NO_VERDICT",
+    proof: (r) => {
+      expect(r.detail).toBe("disk full while sealing");
+      expect(r.tone).toBe("bad");
+    },
+  },
+  {
+    earlier: 2,
+    later: 4,
+    name: "a failed run with no scorecard reports the failure, not the missing artifact",
+    facts: { state: "failed", mode: "replay", failure: "candidate not healthy within timeout", scored: null },
+    expected: "NO_VERDICT",
+    proof: (r) => {
+      expect(r.detail).toBe("candidate not healthy within timeout");
+      expect(r.guard).toBeNull();
+    },
+  },
+  {
+    earlier: 3,
+    later: 4,
+    name: "a record run with no scorecard is 'not scored', not 'no artifact'",
+    facts: { state: "completed", mode: "record", scored: null },
+    expected: "NO_VERDICT",
+    proof: (r) => {
+      expect(r.tone).toBe("neutral");
+      expect(r.guard).toBeNull();
+    },
+  },
+  {
+    earlier: 5,
+    later: 6,
+    name: "the scorer's own inconclusive outranks the zero-correlation guard",
+    facts: {
+      state: "completed",
+      mode: "replay",
+      scored: digest({ pass: false, inconclusive: true, reason: "no artifacts ingested", total_correlations: 0, matched_correlations: 0 }),
+    },
+    expected: "INCONCLUSIVE",
+    // Rung 6 sets a guard naming the zero count; rung 5 does not. That is the
+    // only thing telling the two INCONCLUSIVE results apart.
+    proof: (r) => expect(r.guard).toBeNull(),
+  },
+  {
+    earlier: 6,
+    later: 7,
+    name: "the zero-correlation guard outranks a passing verdict",
+    facts: {
+      state: "completed",
+      mode: "replay",
+      scored: digest({ pass: true, inconclusive: false, total_correlations: 0, matched_correlations: 0 }),
+    },
+    expected: "INCONCLUSIVE",
+    proof: (r) => expect(r.guard).toMatch(/compared 0 correlations/i),
+  },
+];
+
+describe("precedence: the earlier rung wins when two apply", () => {
+  for (const c of PRECEDENCE) {
+    describe(`rung ${c.earlier} over rung ${c.later} — ${c.name}`, () => {
+      test("full RunRow", () => {
+        const r = resultOf(asFullRow(c.facts));
+        expect(r.state).toBe(c.expected);
+        c.proof(r);
+      });
+      test("list RunSummaryRow", () => {
+        const r = resultOf(asSummaryRow(c.facts));
+        expect(r.state).toBe(c.expected);
+        c.proof(r);
+      });
+    });
+  }
+});
+
 describe("REPRODUCED is reachable from exactly one place", () => {
   // A blunter statement of the same safety property: of every fixture above,
   // only rung 7 may be green. If a change makes any other rung reachable to
