@@ -1805,6 +1805,14 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
 async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     use deja_orchestrator::change_coverage::{self, Assessment};
 
+    // Every path below is built from the id, so an id that is not one is
+    // refused before the first is.
+    if !change_coverage::is_plain_run_id(&id) {
+        return error_resp(
+            400,
+            "run id must be plain: letters, digits, '-', '_' and '.'",
+        );
+    }
     let cache = st.root.run_path(&id).with_file_name("change_coverage.json");
     if let Ok(cached) = std::fs::read_to_string(&cache) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {

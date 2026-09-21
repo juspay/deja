@@ -139,6 +139,22 @@ pub fn source_repo_for(
     })
 }
 
+// ── run ids ─────────────────────────────────────────────────────────────────
+
+/// Whether a run id can name files beside the run. Run ids are minted by the
+/// orchestrator from a fixed alphabet; one carrying a path separator or a
+/// parent reference is not a run id, and the handler refuses it before any
+/// path is built from it.
+pub fn is_plain_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('.')
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 // ── change set ──────────────────────────────────────────────────────────────
 
 /// One changed source file: its path and the new-side line ranges its hunks
@@ -349,6 +365,159 @@ pub struct Item {
     pub flow: Option<String>,
 }
 
+/// The source with every string literal, char literal and comment blanked to
+/// spaces, line structure intact. The scanner counts braces and parens on
+/// THIS, never on the raw text: connector code is full of `format!("{{…}}")`,
+/// JSON-building literals and URLs, and a `//` inside `"https://…"` used to
+/// truncate the line while a `{` inside a literal used to open a scope that
+/// nothing closed, sliding every later item boundary and with it the function
+/// a changed line was charged to.
+///
+/// Rust's literal grammar as far as it matters here: `"…"` with `\` escapes;
+/// `r"…"`, `r#"…"#` (any number of hashes), `b"…"`, `br"…"`; `'x'`, `'\n'`,
+/// `'{'`, told apart from a lifetime `'a` by the closing quote; `//` to end of
+/// line; `/* … */`, nested.
+pub fn mask_literals_and_comments(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        // line comment
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        // block comment, nested
+        if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(chars[i]));
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // raw string: r"…", r#"…"#, br"…", br#"…"#
+        let raw_at = |j: usize| -> Option<(usize, usize)> {
+            // returns (index of opening quote, hashes)
+            let mut k = j;
+            if chars.get(k) == Some(&'b') {
+                k += 1;
+            }
+            if chars.get(k) != Some(&'r') {
+                return None;
+            }
+            k += 1;
+            let mut hashes = 0;
+            while chars.get(k) == Some(&'#') {
+                hashes += 1;
+                k += 1;
+            }
+            (chars.get(k) == Some(&'"')).then_some((k, hashes))
+        };
+        let ident_before = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+        if !ident_before && (c == 'r' || c == 'b') {
+            if let Some((open, hashes)) = raw_at(i) {
+                for _ in i..=open {
+                    out.push(' ');
+                }
+                i = open + 1;
+                loop {
+                    if i >= chars.len() {
+                        break;
+                    }
+                    if chars[i] == '"' && (1..=hashes).all(|h| chars.get(i + h) == Some(&'#')) {
+                        for _ in 0..=hashes {
+                            out.push(' ');
+                        }
+                        i += 1 + hashes;
+                        break;
+                    }
+                    out.push(blank(chars[i]));
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // plain / byte string
+        if c == '"' || (c == 'b' && next == Some('"') && !ident_before) {
+            if c == 'b' {
+                out.push(' ');
+                i += 1;
+            }
+            out.push(' ');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    out.push(' ');
+                    if let Some(n) = chars.get(i + 1) {
+                        out.push(blank(*n));
+                    }
+                    i += 2;
+                    continue;
+                }
+                let ch = chars[i];
+                out.push(blank(ch));
+                i += 1;
+                if ch == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // char literal, told from a lifetime by its closing quote
+        if c == '\'' && !ident_before {
+            let is_char = match next {
+                Some('\\') => true,
+                Some(_) => chars.get(i + 2) == Some(&'\''),
+                None => false,
+            };
+            if is_char {
+                out.push(' ');
+                i += 1;
+                if chars.get(i) == Some(&'\\') {
+                    // '\n', '\'', '\u{…}'
+                    out.push(' ');
+                    i += 1;
+                    while i < chars.len() && chars[i] != '\'' {
+                        out.push(' ');
+                        i += 1;
+                    }
+                } else {
+                    out.push(' ');
+                    i += 1;
+                }
+                if chars.get(i) == Some(&'\'') {
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 fn item_head(line: &str) -> Option<(ItemKind, String)> {
     let t = line.trim_start();
     let mut rest = t;
@@ -441,7 +610,10 @@ pub fn scan_items(text: &str) -> Vec<Item> {
         depth: usize,
         header: String,
     }
-    let lines: Vec<&str> = text.lines().collect();
+    // Structure is read off the masked text; a macro's body is read raw below,
+    // because the flow it names is a bare identifier and the mask leaves it.
+    let masked = mask_literals_and_comments(text);
+    let lines: Vec<&str> = masked.lines().collect();
     let mut items = Vec::new();
     let mut stack: Vec<Open> = Vec::new();
     let mut pending: Option<Open> = None;
@@ -449,7 +621,7 @@ pub fn scan_items(text: &str) -> Vec<Item> {
     let mut pdepth = 0usize; // parens
     for (idx, raw) in lines.iter().enumerate() {
         let no = idx + 1;
-        let line = raw.split("//").next().unwrap_or("");
+        let line = *raw;
         let in_macro = stack.last().is_some_and(|o| o.kind == ItemKind::Macro);
         let item_scope = (depth <= 1 && pdepth == 0) || (in_macro && pdepth == 1 && depth <= 1);
         if pending.is_none() && item_scope {
@@ -1270,6 +1442,98 @@ impl Payments {
             Some("fork/prism")
         );
         assert_eq!(source_repo_for(Some("  "), None, true, Some("")), None);
+    }
+
+    const LITERAL_HEAVY: &str = r##"
+impl<'a> Client<'a> {
+    fn url(&'a self) -> String {
+        let base = "https://api.example.com/v1"; // a URL literal on one line
+        let body = format!("{{\"amount\":{}}}", self.amount);
+        let raw = r#"{"nested": {"braces": true}}"#;
+        let open = '{';
+        let close = '}';
+        let quote = '"';
+        let escaped = "a \" quoted { brace";
+        /* a block comment with { and }
+           /* nested */ still a comment } */
+        format!("{base}/{}{}", body.len(), raw.len() + open.len_utf8() + close.len_utf8() + quote.len_utf8() + escaped.len())
+    }
+
+    fn after(&self) -> u32 {
+        7
+    }
+}
+"##;
+
+    #[test]
+    fn literals_and_comments_do_not_move_item_boundaries() {
+        let items = scan_items(LITERAL_HEAVY);
+        let url = items.iter().find(|i| i.name == "url").expect("url fn");
+        let after = items.iter().find(|i| i.name == "after").expect("after fn");
+        let url_line = LITERAL_HEAVY
+            .lines()
+            .position(|l| l.contains("api.example.com"))
+            .unwrap()
+            + 1;
+        let seven_line = LITERAL_HEAVY.lines().position(|l| l.trim() == "7").unwrap() + 1;
+        assert!(
+            url.start < url_line && url_line < url.end,
+            "the URL line is inside url(): {url:?}"
+        );
+        assert!(
+            url.end < after.start,
+            "url() closes before after() opens: {url:?} {after:?}"
+        );
+        assert!(
+            after.start < seven_line && seven_line < after.end,
+            "{after:?}"
+        );
+        let (fn_at_url, _) = enclosing(&items, url_line);
+        assert_eq!(fn_at_url.map(|f| f.name.as_str()), Some("url"));
+        let (fn_at_seven, _) = enclosing(&items, seven_line);
+        assert_eq!(fn_at_seven.map(|f| f.name.as_str()), Some("after"));
+        let imp = items
+            .iter()
+            .find(|i| i.kind == ItemKind::Impl)
+            .expect("the impl");
+        assert!(imp.end > after.end, "the impl closes after its last fn");
+    }
+
+    #[test]
+    fn the_mask_keeps_code_and_blanks_only_literals_and_comments() {
+        let masked = mask_literals_and_comments(LITERAL_HEAVY);
+        assert_eq!(
+            masked.lines().count(),
+            LITERAL_HEAVY.lines().count(),
+            "line structure intact"
+        );
+        assert!(!masked.contains("api.example.com"));
+        assert!(!masked.contains("nested"));
+        assert!(!masked.contains("block comment"));
+        assert!(
+            masked.contains("fn url(&'a self) -> String {"),
+            "lifetimes are not char literals"
+        );
+        assert!(masked.contains("fn after(&self) -> u32 {"));
+        assert_eq!(
+            masked.matches('{').count(),
+            masked.matches('}').count(),
+            "balanced once literals are gone"
+        );
+    }
+
+    #[test]
+    fn a_run_id_that_could_name_another_path_is_refused() {
+        assert!(is_plain_run_id(
+            "rp-sbx-60d382c2ee-unresolved-0916172101607"
+        ));
+        assert!(is_plain_run_id("run-1787741712798218945"));
+        assert!(!is_plain_run_id(""));
+        assert!(!is_plain_run_id("../runs/other"));
+        assert!(!is_plain_run_id("a/b"));
+        assert!(!is_plain_run_id(".hidden"));
+        assert!(!is_plain_run_id("x..y"));
+        assert!(!is_plain_run_id("id with space"));
     }
 
     #[test]
