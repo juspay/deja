@@ -121,3 +121,42 @@ describe("a header list that starts empty", () => {
     expect(diffArgs({ h: [] }, { h: [] })).toHaveLength(0);
   });
 });
+
+describe("an array that only changed order", () => {
+  // Object KEY reorder already produces no leaves, which is how both views
+  // learned to say "order only". An array ELEMENT reorder did not: it reported
+  // each moved position as an independent content change, so a reordered
+  // `payment_methods_enabled` read as "the candidate sent a different payment
+  // method at position 0" — worse than saying nothing, because it names a
+  // change that did not happen.
+  test("a pure reorder produces no leaves", () => {
+    expect(diffArgs({ pm: ["card", "upi"] }, { pm: ["upi", "card"] })).toHaveLength(0);
+  });
+
+  test("a longer reorder produces no leaves", () => {
+    const a = ["a", "b", "c", "d", "e"];
+    expect(diffArgs({ pm: a }, { pm: [...a].reverse() })).toHaveLength(0);
+  });
+
+  test("duplicates are compared by multiplicity, not by set", () => {
+    // Same elements, same count, different order — a reorder.
+    expect(diffArgs({ x: ["a", "a", "b"] }, { x: ["a", "b", "a"] })).toHaveLength(0);
+    // Same SET but different multiplicity — a real change, not a reorder.
+    expect(diffArgs({ x: ["a", "a", "b"] }, { x: ["a", "b", "b"] })).not.toHaveLength(0);
+  });
+
+  test("a reorder alongside a real change reports only the real change", () => {
+    const leaves = diffArgs(
+      { pm: ["card", "upi"], amount: 1 },
+      { pm: ["upi", "card"], amount: 2 },
+    );
+    expect(leaves).toHaveLength(1);
+    expect(leaves[0].path).toBe("amount");
+  });
+
+  test("a genuinely changed element is still a content change", () => {
+    const leaves = diffArgs({ pm: ["card", "upi"] }, { pm: ["card", "netbanking"] });
+    expect(leaves).toHaveLength(1);
+    expect(leaves[0].path).toBe("pm[1]");
+  });
+});

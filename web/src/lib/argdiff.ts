@@ -82,6 +82,18 @@ function parsedDocument(v: unknown): unknown | undefined {
   }
 }
 
+/* Whether two equal-length arrays hold the same elements in a different order.
+   Compared by MULTIPLICITY rather than as sets, so a list that swapped one
+   element for a duplicate of another is a change, not a reorder. Only reached
+   when the two already differ, so equal order is not a case here. */
+function isReorder(a: unknown[], b: unknown[]): boolean {
+  if (a.length < 2) return false;
+  const key = (v: unknown) => JSON.stringify(v) ?? "\u0000undefined";
+  const ka = a.map(key).sort();
+  const kb = b.map(key).sort();
+  return ka.every((k, i) => k === kb[i]);
+}
+
 function walk(rec: unknown, cand: unknown, path: string, out: LeafDiff[]) {
   if (JSON.stringify(rec) === JSON.stringify(cand)) return;
   if (isObj(rec) && isObj(cand)) {
@@ -102,6 +114,14 @@ function walk(rec: unknown, cand: unknown, path: string, out: LeafDiff[]) {
     return;
   }
   if (Array.isArray(rec) && Array.isArray(cand) && rec.length === cand.length) {
+    // Same elements in a different order. Reported as NOTHING, deliberately:
+    // an empty leaf-diff on a flagged row is what both views already read as
+    // "order only", so a reordered list now says that instead of naming a
+    // change that did not happen. Walking it element-wise called each moved
+    // position an independent content change — a reordered
+    // `payment_methods_enabled` read as "the candidate sent a different payment
+    // method at position 0", which is worse than saying nothing.
+    if (isReorder(rec, cand)) return;
     for (let i = 0; i < rec.length; i++) walk(rec[i], cand[i], `${path}[${i}]`, out);
     return;
   }
