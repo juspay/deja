@@ -90,7 +90,14 @@ function walk(rec: unknown, cand: unknown, path: string, out: LeafDiff[]) {
     }
     return;
   }
-  if (isPairList(rec) && isPairList(cand)) {
+  // An EMPTY list is a header list too, when the other side is one. Requiring
+  // length > 0 on both meant adding the first header, or removing the last,
+  // fell through to the whole-array leaf and rendered both lists in full —
+  // the rendering this module exists to avoid, in the case where the list is
+  // shortest. Two empty lists are equal and never reach here.
+  const pairish = (v: unknown, other: unknown): v is [string, unknown][] =>
+    isPairList(v) || (Array.isArray(v) && v.length === 0 && isPairList(other));
+  if (pairish(rec, cand) && pairish(cand, rec)) {
     walk(pairsByName(rec), pairsByName(cand), path, out);
     return;
   }
