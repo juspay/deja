@@ -13,7 +13,7 @@ deja-core = { path = "../deja-core" }
 deja-derive = { path = "../deja-derive" }
 deja-runtime = { path = "../deja-runtime" }
 serde = "1"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # Optional: enables `codec::ResultCodec` + `db::recorded_output`, whose Value is
 # `Result<T, error_stack::Report<E>>`. Optional so the core facade stays
 # dependency-lean for consumers that don't use error-stack.
@@ -42,7 +42,7 @@ fred = ["dep:fred"]
 redis-rs = ["dep:redis"]
 
 [dev-dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
 error-stack = { version = "0.4", default-features = false }
 # Tests drive the runtime surface (hooks, dispatch, wire value types) directly.
