@@ -1806,26 +1806,12 @@ async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) 
     use deja_orchestrator::change_coverage::{self, Assessment};
 
     // Every path below is built from the id, so an id that is not one is
-    // refused before the first is. The separator and parent-reference checks
-    // are spelled out here, on the value itself, rather than only inside
-    // `is_plain_run_id`: that is the shape a static analyser recognises as the
-    // guard for the paths that follow, and the helper's stricter alphabet
-    // check comes after it.
-    if id.contains("..")
-        || id.contains('/')
-        || id.contains('\\')
-        || !change_coverage::is_plain_run_id(&id)
-    {
+    // refused before the first is.
+    if !change_coverage::is_plain_run_id(&id) {
         return error_resp(
             400,
             "run id must be plain: letters, digits, '-', '_' and '.'",
         );
-    }
-    let cache = st.root.run_path(&id).with_file_name("change_coverage.json");
-    if let Ok(cached) = std::fs::read_to_string(&cache) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
-            return json_ok(value);
-        }
     }
     let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
 
@@ -1844,6 +1830,29 @@ async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) 
     let Some(params) = params else {
         return error_resp(404, "run not found");
     };
+
+    // The evidence files, and the cache beside them. Each path is resolved and
+    // then checked to lie under its own directory before it is opened — the
+    // same containment check whatever the id looked like — and the cache is
+    // named off the resolved replay-graph path rather than off the id, so no
+    // file is ever written to a path the id alone chose.
+    hydrate_run_artifacts(&st, &id).await;
+    let observed_dir = st.root.root.join("observed");
+    let runs_dir = st.root.root.join("runs");
+    let Some(observed_path) = confined(st.root.observed_path(&id), &observed_dir) else {
+        return unavailable(
+            "the run published no replay execution graph, so there is no evidence of what ran"
+                .to_owned(),
+        );
+    };
+    let ledger_path = confined(st.root.call_ledger_path(&id), &runs_dir);
+    let cache = observed_path.with_extension("change-coverage.json");
+    if let Ok(cached) = std::fs::read_to_string(&cache) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_ok(value);
+        }
+    }
+
     let system = params
         .system_under_test
         .clone()
@@ -1879,37 +1888,39 @@ async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) 
     };
     let base_ref = config.change_base_ref.clone();
 
-    hydrate_run_artifacts(&st, &id).await;
-    let root = st.root.clone();
-    let run_id = id.clone();
-    let computed = tokio::task::spawn_blocking(move || -> Result<change_coverage::ChangeCoverage, String> {
-        let replay: Vec<deja_core::ExecutionGraphNode> = std::fs::File::open(root.observed_path(&run_id))
-            .map(|file| {
-                std::io::BufRead::lines(std::io::BufReader::new(file))
-                    .map_while(Result::ok)
-                    .filter_map(|line| match serde_json::from_str::<deja::DejaRecord>(&line) {
-                        Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .map_err(|e| format!("the run's replay graph could not be read: {e}"))?;
-        if replay.is_empty() {
-            return Err("the run published no replay execution graph, so there is no evidence of what ran".to_owned());
-        }
-        let calls: Vec<serde_json::Value> = std::fs::read_to_string(root.call_ledger_path(&run_id))
-            .map(|content| {
-                content
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .filter_map(|l| serde_json::from_str(l).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let evidence = change_coverage::Evidence::from_graph_and_calls(&replay, &calls);
-        let change = change_coverage::fetch_change_set(&repo, &base_ref, &sha, &template)?;
-        Ok(change_coverage::assess(&system, &repo, &base_ref, change, &evidence))
-    })
+    let computed = tokio::task::spawn_blocking(
+        move || -> Result<change_coverage::ChangeCoverage, String> {
+            let replay: Vec<deja_core::ExecutionGraphNode> = std::fs::File::open(&observed_path)
+                .map(|file| {
+                    std::io::BufRead::lines(std::io::BufReader::new(file))
+                        .map_while(Result::ok)
+                        .filter_map(
+                            |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                                Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
+                                _ => None,
+                            },
+                        )
+                        .collect()
+                })
+                .map_err(|e| format!("the run's replay graph could not be read: {e}"))?;
+            if replay.is_empty() {
+                return Err("the run published no replay execution graph, so there is no evidence of what ran".to_owned());
+            }
+            let calls: Vec<serde_json::Value> = ledger_path
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|content| {
+                    content
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let evidence = change_coverage::Evidence::from_graph_and_calls(&replay, &calls);
+            let change = change_coverage::fetch_change_set(&repo, &base_ref, &sha, &template)?;
+            Ok(change_coverage::assess(&system, &repo, &base_ref, change, &evidence))
+        },
+    )
     .await;
     let assessment = match computed {
         Ok(Ok(coverage)) => Assessment::Assessed(coverage),
@@ -1922,13 +1933,22 @@ async fn v1_change_coverage(State(st): State<AppState>, Path(id): Path<String>) 
     // the answer.
     if let Assessment::Assessed(_) = &assessment {
         if let Ok(text) = serde_json::to_string(&assessment) {
-            if let Some(parent) = cache.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             let _ = std::fs::write(&cache, text);
         }
     }
     json_ok_ser(&assessment)
+}
+
+/// `candidate` resolved, if it exists and lies under `base`; `None` otherwise.
+/// The resolution follows symlinks and folds `..`, so what is checked is the
+/// file that would actually be opened.
+fn confined(candidate: std::path::PathBuf, base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base = base.canonicalize().ok()?;
+    let candidate = candidate.canonicalize().ok()?;
+    if !candidate.starts_with(&base) {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.
