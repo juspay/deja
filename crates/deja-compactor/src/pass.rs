@@ -526,6 +526,10 @@ async fn seal_outcome_in(
     };
     match crate::compact_session_inner(store, recording_id, root, max_landing_bytes).await? {
         Compaction::Sealed {
+            // The pass does not act on it yet; the sealer's own line already
+            // carries the warning. Named so the match is exhaustive rather
+            // than silently widening later.
+            merge: _,
             manifest,
             landing_bytes_read,
             shared_prefix,
