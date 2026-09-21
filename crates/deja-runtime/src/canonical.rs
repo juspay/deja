@@ -646,7 +646,12 @@ mod tests {
         #[derive(serde::Serialize)]
         struct NoSets {
             steps: Vec<String>,
-            labels: HashMap<String, u8>,
+            // A BTreeMap, not a HashMap: a HashMap IS one of the unordered
+            // collections this test is meant to exclude, and it iterates in a
+            // per-process random order. The assertion below compares RENDERED
+            // BYTES, so one would make this test fail whenever the random order
+            // is not sorted order.
+            labels: BTreeMap<String, u8>,
             ranked: BTreeMap<String, u8>,
             shape: Shape,
             wrapper: Wrapper,
