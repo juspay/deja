@@ -138,6 +138,32 @@ function short(v: unknown, quoteStrings = false): string {
   return s.length > SHOWN ? `${s.slice(0, SHOWN - 1)}…` : s;
 }
 
+/* How much unchanged text to keep either side of the differing region when the
+   two sides are too long to tell apart at SHOWN characters. */
+const CONTEXT = 12;
+
+/* `short` cuts at SHOWN characters, so two long values that share a prefix
+   render identically — the same "a real change reads as no change" failure the
+   type quoting above fixes, reached by length instead of by type, and the
+   likelier one on a Rust `Debug` blob where the change is buried deep. When the
+   two renderings collide, show the region that actually differs instead of the
+   prefix they have in common. */
+function differingRegion(rec: unknown, cand: unknown): [string, string] | null {
+  const a = typeof rec === "string" ? rec : JSON.stringify(rec) ?? "";
+  const b = typeof cand === "string" ? cand : JSON.stringify(cand) ?? "";
+  if (a === b) return null;
+  const h = highlightString(a, b);
+  const pre = h.before.slice(-CONTEXT);
+  const post = h.after.slice(0, CONTEXT);
+  const lead = h.before.length > pre.length ? "…" : "";
+  const tail = h.after.length > post.length ? "…" : "";
+  const mid = (m: string) => (m.length > SHOWN ? `${m.slice(0, SHOWN - 1)}…` : m);
+  return [
+    `${lead}${pre}${mid(h.recordedMid)}${post}${tail}`,
+    `${lead}${pre}${mid(h.candidateMid)}${post}${tail}`,
+  ];
+}
+
 /** One changed leaf, said in a line: `path: recorded → candidate`. */
 export type LeafSummary = { path: string; recorded: string; candidate: string };
 
@@ -151,11 +177,15 @@ export function summarizeLeaves(
     // `null` is typeof "object" and `undefined` its own type, so this catches
     // null-vs-"null" and ∅-vs-"" as well as 5-vs-"5".
     const mixed = typeof d.recorded !== typeof d.candidate;
-    return {
-      path: d.path || "(value)",
-      recorded: short(d.recorded, mixed),
-      candidate: short(d.candidate, mixed),
-    };
+    let recorded = short(d.recorded, mixed);
+    let candidate = short(d.candidate, mixed);
+    if (recorded === candidate) {
+      // Same rendering for two values the walk says differ: truncation ate the
+      // difference. Fall back to the region that actually changed.
+      const win = differingRegion(d.recorded, d.candidate);
+      if (win) [recorded, candidate] = win;
+    }
+    return { path: d.path || "(value)", recorded, candidate };
   });
   return { shown, more: Math.max(0, leaves.length - shown.length) };
 }
