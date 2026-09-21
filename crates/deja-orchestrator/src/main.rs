@@ -39,7 +39,7 @@ use axum::{
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
-use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunStatus};
+use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunId, RunStatus};
 use deja_store::Store;
 use sha2::{Digest, Sha256};
 
@@ -263,6 +263,7 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/calls", get(v1_calls))
         .route("/runs/{run_id}/http-diffs", get(v1_http_diffs))
         .route("/runs/{run_id}/graph", get(v1_graph))
+        .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit));
@@ -585,7 +586,7 @@ async fn v1_kill_run(
 /// 202 regardless) — matching the in-process transport's semantics.
 async fn v1_ingest_run_event(
     State(st): State<AppState>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
     body: axum::body::Bytes,
 ) -> Response {
     use deja_orchestrator::lifecycle::store_ctx::{apply_run_event, RunEvent};
@@ -1483,7 +1484,7 @@ fn live_json(live: &Run) -> serde_json::Value {
 /// the snapshot carries the worker's live stage/step (file store is the
 /// worker's source of truth mid-run). Degrades to the snapshot alone when the
 /// store is down, so script polling works file-only too.
-async fn v1_get_run(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
     let row = match &st.store {
         Some(store) => match store.get_run(&id).await {
             Ok(row) => row,
@@ -1574,7 +1575,7 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
 /// `GET /api/v1/runs/{id}/scorecard` — serve the divergence scorecard. Prefers
 /// the runner's PRECOMPUTED scorecard (a k8s recompute would need the recording,
 /// which isn't on the orchestrator); falls back to recomputing for compose.
-async fn v1_scorecard(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_scorecard(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     if let Ok(content) = std::fs::read_to_string(st.root.scorecard_path(&id)) {
         if let Ok(card) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -1675,7 +1676,7 @@ fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String 
 /// observed, classified + located) that backs the interactive diff view. Prefers
 /// the runner's PRECOMPUTED ledger (a recompute needs the recording, absent on
 /// the orchestrator for k8s runs); falls back to recomputing for compose.
-async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     if let Ok(content) = std::fs::read_to_string(st.root.call_ledger_path(&id)) {
         let rows: Vec<serde_json::Value> = content
@@ -1695,7 +1696,7 @@ async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Respons
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
 /// (status + field-level body diff), parsed from the run's http-diff stream.
-async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(st.root.http_diff_path(&id))
         .map(|c| {
@@ -1714,7 +1715,7 @@ async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// (recorded events + the call ledger's observed side). Graph nodes ride the
 /// shared `DejaRecord` stream: record-side in the recording tape, replay-side
 /// in the run's observed stream.
-async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_graph(State(st): State<AppState>, id: RunId) -> Response {
     // k8s: the replay-side observed stream AND the record-side graph nodes both
     // ride S3 artifacts — hydrate pulls them to their local paths. The record
     // side comes from the `record_graph` artifact (span STRUCTURE only, extracted
@@ -1793,6 +1794,157 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
         "replay": replay,
         "record_note": record_note,
     }))
+}
+
+/// `GET /api/v1/runs/{id}/change-coverage` — did the replay reach what the
+/// candidate changed? Computed on first request from the git host's compare of
+/// the candidate against its base branch and the run's own replay graph and
+/// call ledger, then cached beside the run. Never an error for a run that
+/// cannot be assessed: the body says why, so the report can say "not assessed"
+/// instead of a reader receiving a 500 from a successful run.
+async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
+    use deja_orchestrator::change_coverage::{self, Assessment};
+
+    let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
+
+    // The run's own parameters — the live record on compose, the stored row's
+    // params on k8s — name the system and the candidate. The live record is
+    // read through the same containment check as every other file this
+    // handler opens: resolved, and confirmed to lie under the runs directory.
+    let live: Option<Run> = confined(st.root.run_path(&id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    let params: Option<deja_orchestrator::RunParams> = match live {
+        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        None => match &st.store {
+            Some(store) => match store.get_run(&id).await {
+                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+                _ => None,
+            },
+            None => None,
+        },
+    };
+    let Some(params) = params else {
+        return error_resp(404, "run not found");
+    };
+
+    // The evidence files, and the cache beside them. Each path is resolved and
+    // then checked to lie under its own directory before it is opened — the
+    // same containment check whatever the id looked like — and the cache is
+    // named off the resolved replay-graph path rather than off the id, so no
+    // file is ever written to a path the id alone chose.
+    hydrate_run_artifacts(&st, &id).await;
+    let observed_dir = st.root.root.join("observed");
+    let runs_dir = st.root.root.join("runs");
+    let Some(observed_path) = confined(st.root.observed_path(&id), &observed_dir) else {
+        return unavailable(
+            "the run published no replay execution graph, so there is no evidence of what ran"
+                .to_owned(),
+        );
+    };
+    let ledger_path = confined(st.root.call_ledger_path(&id), &runs_dir);
+    let cache = observed_path.with_extension("change-coverage.json");
+    if let Ok(cached) = std::fs::read_to_string(&cache) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_ok(value);
+        }
+    }
+
+    let system = params
+        .system_under_test
+        .clone()
+        .unwrap_or_else(|| deja_orchestrator::default_system().to_owned());
+    let config = deja_orchestrator::system::system_config(&system);
+    let nonempty = |s: String| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+    let deployment_default = std::env::var("DEJA_CANDIDATE_REPO").ok();
+    let Some(repo) = change_coverage::source_repo_for(
+        params.candidate_repo.as_deref(),
+        config.source_repo.as_deref(),
+        config.is_default,
+        deployment_default.as_deref(),
+    ) else {
+        return unavailable(format!(
+            "no source repository is declared for system '{system}': set systems.{system}.source_repo (owner/name) in the deja configuration, or send candidate_repo on the run"
+        ));
+    };
+    let Some(template) = std::env::var("DEJA_CANDIDATE_TARBALL_URL")
+        .ok()
+        .and_then(nonempty)
+    else {
+        return unavailable(
+            "DEJA_CANDIDATE_TARBALL_URL is not set, so the candidate's source cannot be fetched"
+                .to_owned(),
+        );
+    };
+    let sha = match deja_orchestrator::executor::resolve_candidate_image_for(
+        &params.candidate_spec,
+        &system,
+    ) {
+        Ok((_, sha)) => sha,
+        Err(e) => return unavailable(format!("the candidate does not name a build sha: {e}")),
+    };
+    let base_ref = config.change_base_ref.clone();
+
+    let computed = tokio::task::spawn_blocking(
+        move || -> Result<change_coverage::ChangeCoverage, String> {
+            let replay: Vec<deja_core::ExecutionGraphNode> = std::fs::File::open(&observed_path)
+                .map(|file| {
+                    std::io::BufRead::lines(std::io::BufReader::new(file))
+                        .map_while(Result::ok)
+                        .filter_map(
+                            |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                                Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
+                                _ => None,
+                            },
+                        )
+                        .collect()
+                })
+                .map_err(|e| format!("the run's replay graph could not be read: {e}"))?;
+            if replay.is_empty() {
+                return Err("the run published no replay execution graph, so there is no evidence of what ran".to_owned());
+            }
+            let calls: Vec<serde_json::Value> = ledger_path
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|content| {
+                    content
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let evidence = change_coverage::Evidence::from_graph_and_calls(&replay, &calls);
+            let change = change_coverage::fetch_change_set(&repo, &base_ref, &sha, &template)?;
+            Ok(change_coverage::assess(&system, &repo, &base_ref, change, &evidence))
+        },
+    )
+    .await;
+    let assessment = match computed {
+        Ok(Ok(coverage)) => Assessment::Assessed(coverage),
+        Ok(Err(why)) => Assessment::Unavailable { unavailable: why },
+        Err(e) => Assessment::Unavailable {
+            unavailable: format!("assessment task failed: {e}"),
+        },
+    };
+    // Cache only an assessment: a transient failure must not be remembered as
+    // the answer.
+    if let Assessment::Assessed(_) = &assessment {
+        if let Ok(text) = serde_json::to_string(&assessment) {
+            let _ = std::fs::write(&cache, text);
+        }
+    }
+    json_ok_ser(&assessment)
+}
+
+/// `candidate` resolved, if it exists and lies under `base`; `None` otherwise.
+/// The resolution follows symlinks and folds `..`, so what is checked is the
+/// file that would actually be opened.
+fn confined(candidate: std::path::PathBuf, base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base = base.canonicalize().ok()?;
+    let candidate = candidate.canonicalize().ok()?;
+    if !candidate.starts_with(&base) {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.

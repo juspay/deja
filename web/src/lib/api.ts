@@ -301,6 +301,43 @@ export type CallRecord = {
 
 export type JsonFieldDiff = { json_path: string; baseline: unknown; candidate: unknown };
 
+// Did the replay reach what the candidate changed? Computed by the orchestrator
+// from the git host's compare of the candidate against its base branch and the
+// run's own replay graph and call ledger; never part of the verdict.
+export type ChangeReach =
+  | "not_exercised"
+  | "exercised"
+  | "flow_ran"
+  | "flow_ran_weak"
+  | "module_ran"
+  | "unknown";
+
+export type ChangedItem = {
+  path: string;
+  item: string;
+  lines: string;
+  connector?: string;
+  flow?: string;
+  reach: ChangeReach;
+  why: string;
+};
+
+export type ChangeCoverage = {
+  system: string;
+  repo: string;
+  base_ref: string;
+  merge_base: string;
+  head: string;
+  driven_requests: number;
+  items: ChangedItem[];
+  never_ran: number;
+  unproven: number;
+  caveats: string[];
+};
+
+// The endpoint answers with the assessment, or with why there is none.
+export type ChangeCoverageResponse = ChangeCoverage | { unavailable: string };
+
 export type HttpDiff = {
   correlation_id: string;
   request_sequence: number;
@@ -435,6 +472,8 @@ export const api = {
   calls: (id: string) => request<CallRecord[]>(`/api/v1/runs/${id}/calls`),
   httpDiffs: (id: string) => request<HttpDiff[]>(`/api/v1/runs/${id}/http-diffs`),
   graph: (id: string) => request<RunGraph>(`/api/v1/runs/${id}/graph`),
+  changeCoverage: (id: string) =>
+    request<ChangeCoverageResponse>(`/api/v1/runs/${id}/change-coverage`),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
   createRun: (spec: Record<string, unknown>) => {

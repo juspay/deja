@@ -22,7 +22,9 @@ mod patch;
 pub mod reconcile;
 pub mod scheduler;
 
-pub use config::{resolve_candidate_image, ExecutorKind, K8sExecutorConfig};
+pub use config::{
+    resolve_candidate_image, resolve_candidate_image_for, ExecutorKind, K8sExecutorConfig,
+};
 pub use env::{runner_env, CandidateBinding};
 pub use k8s::{
     job_terminal_verdict, InClusterConfig, KubeApi, KubeError, KubeRequest, KubeResponse,

@@ -2,7 +2,7 @@ import React from "react";
 import { diffArgs, summarizeLeaves } from "../lib/argdiff";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams } from "../lib/api";
+import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams, ChangeReach } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { VerdictBanner } from "../components/Result";
@@ -391,6 +391,92 @@ function TrustStrip({ run }: { run: RunRow }) {
   );
 }
 
+/* ------------------------------------------------------------- reach ------ */
+
+const REACH_LABEL: Record<ChangeReach, string> = {
+  not_exercised: "not exercised",
+  exercised: "exercised",
+  flow_ran: "flow ran",
+  flow_ran_weak: "flow ran (weak)",
+  module_ran: "module ran",
+  unknown: "unknown",
+};
+
+/**
+ * Did the replay reach what this candidate changed? A verdict says whether
+ * behaviour changed on the recorded traffic; this says how much of the change
+ * that traffic reached. A caveat here never changes the verdict above it.
+ */
+function ChangeReachPanel({ run }: { run: RunRow }) {
+  const q = useQuery({
+    queryKey: ["change-coverage", run.run_id],
+    queryFn: () => api.changeCoverage(run.run_id),
+    staleTime: Infinity,
+  });
+  if (q.isLoading) return <p className="hint">assessing what this candidate changed…</p>;
+  const d = q.data;
+  if (!d) return null;
+  if ("unavailable" in d) {
+    return (
+      <div className="trust">
+        <div className="trustrow">
+          <span className="tkey">change</span>
+          <span className="tval">not assessed — {d.unavailable}</span>
+        </div>
+      </div>
+    );
+  }
+  const worst = d.never_ran > 0 ? "warn" : d.unproven > 0 ? "warn" : "";
+  return (
+    <div className="trust">
+      <div className={`trustrow ${worst}`}>
+        <span className="tkey">change</span>
+        <span className="tval">
+          <b>{d.items.length}</b> changed item{d.items.length === 1 ? "" : "s"} between{" "}
+          <code>{d.base_ref}</code> (<code>{d.merge_base.slice(0, 10)}</code>) and{" "}
+          <code>{d.head.slice(0, 10)}</code> · {d.driven_requests} requests driven
+          {d.caveats.length === 0 && d.items.length > 0 && (
+            <> — every changed item was exercised, so the verdict speaks to this change</>
+          )}
+        </span>
+      </div>
+      {d.caveats.map((c, i) => (
+        <div className="trustrow warn" key={i}>
+          <span className="tkey">caveat</span>
+          <span className="tval">{c}</span>
+        </div>
+      ))}
+      {d.items.length > 0 && (
+        <details className="evraw">
+          <summary>changed items</summary>
+          <table className="fieldtbl">
+            <thead>
+              <tr>
+                <th>reach</th>
+                <th>item</th>
+                <th>where</th>
+                <th>why</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.items.map((it, i) => (
+                <tr key={i} className={it.reach === "exercised" ? undefined : "fdiff"}>
+                  <td className="mono">{REACH_LABEL[it.reach] ?? it.reach}</td>
+                  <td className="mono">{it.item}</td>
+                  <td className="mono">
+                    {it.path}:{it.lines}
+                  </td>
+                  <td>{it.why}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
+    </div>
+  );
+}
+
 /* --------------------------------------------------------------- summary --- */
 
 function Counters({ run }: { run: RunRow }) {
@@ -645,6 +731,7 @@ export default function ReportPage() {
           <section>
             <h2>Summary</h2>
             <TrustStrip run={r} />
+            <ChangeReachPanel run={r} />
             <Counters run={r} />
           </section>
 

@@ -106,6 +106,14 @@ pub struct SystemDeclaration {
     /// Span prefixes its instrumentation declares as scored.
     #[serde(default, deserialize_with = "list_or_csv")]
     pub scored_span_namespaces: Option<Vec<String>>,
+    /// The repository the candidate is built from, as `owner/name`, for the
+    /// change-coverage assessment (what a candidate changed against its base
+    /// branch). A run's own `candidate_repo` wins; `DEJA_CANDIDATE_REPO` is the
+    /// deployment default below both.
+    pub source_repo: Option<String>,
+    /// The branch a candidate's change set is measured against. `main` when
+    /// undeclared.
+    pub change_base_ref: Option<String>,
     /// Reply canons this system declares per BOUNDARY, in the same grammar the
     /// recorder mints — so moving one to the recorder later is a copy of the
     /// string and a deletion of the line, not a translation.
