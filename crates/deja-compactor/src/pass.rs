@@ -55,10 +55,17 @@ pub enum Outcome {
     Sealed {
         correlations: usize,
         landing_objects: usize,
-        /// Decompressed bytes compaction held for this recording. Reported on
+        /// Decompressed bytes compaction READ for this recording. Reported on
         /// success so the ledger supplies the size distribution that sizes the
         /// budget and, later, an external merge sort's spill.
         landing_bytes_read: u64,
+        /// The most of those bytes held AT ONCE — the largest single object,
+        /// unless the shared-prefix path forced them all to be held.
+        ///
+        /// The pair is the point: `read` says how big the recording is, and
+        /// this says what sealing it cost. A budget can only be set against
+        /// the second, and until both are in the ledger nobody has had it.
+        landing_bytes_resident: u64,
         /// Whether those bytes are this recording's alone — see
         /// [`Outcome::TooLarge`].
         shared_prefix: bool,
@@ -172,6 +179,7 @@ impl std::fmt::Display for Row {
                 correlations,
                 landing_objects,
                 landing_bytes_read,
+                landing_bytes_resident,
                 shared_prefix,
                 resealed,
                 instances_without_eof,
@@ -185,7 +193,8 @@ impl std::fmt::Display for Row {
                 write!(
                     f,
                     "{verb} ({correlations} correlation(s), {landing_objects} landing object(s), \
-                     {landing_bytes_read} decompressed byte(s){whose})"
+                     {landing_bytes_read} decompressed byte(s), {landing_bytes_resident} held at \
+                     once{whose})"
                 )?;
                 if !instances_without_eof.is_empty() {
                     write!(
@@ -532,12 +541,14 @@ async fn seal_outcome_in(
             merge: _,
             manifest,
             landing_bytes_read,
+            landing_bytes_resident,
             shared_prefix,
         } => Ok(sealed_outcome(
             &manifest,
             resealed,
             &readiness,
             landing_bytes_read,
+            landing_bytes_resident,
             shared_prefix,
         )),
         Compaction::RefusedTooLarge {
@@ -561,12 +572,14 @@ fn sealed_outcome(
     resealed: bool,
     readiness: &SealReadiness,
     landing_bytes_read: u64,
+    landing_bytes_resident: u64,
     shared_prefix: bool,
 ) -> Outcome {
     Outcome::Sealed {
         correlations: manifest.counts.correlations,
         landing_objects: manifest.counts.landing_objects,
         landing_bytes_read,
+        landing_bytes_resident,
         shared_prefix,
         resealed,
         instances_without_eof: match readiness {
@@ -801,6 +814,7 @@ mod tests {
                 correlations: 1,
                 landing_objects: 1,
                 landing_bytes_read: 0,
+                landing_bytes_resident: 0,
                 shared_prefix: false,
                 resealed: false,
                 instances_without_eof: Vec::new(),

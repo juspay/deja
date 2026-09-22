@@ -1523,7 +1523,8 @@ pub enum Compaction {
         /// and a sort was paid for. Reported rather than logged because a Job's
         /// stderr is not somewhere a caller, or a test, can read.
         merge: MergeReport,
-        /// Decompressed bytes this compaction actually held.
+        /// Decompressed bytes this compaction READ. Not what it held — see
+        /// `landing_bytes_resident`.
         ///
         /// Reported on SUCCESS, not only on refusal, because this number is
         /// what sizes every later decision about this pass — the memory
@@ -1532,6 +1533,20 @@ pub enum Compaction {
         /// reports bytes only when it refuses can never supply it: the
         /// recordings that seal ARE the distribution.
         landing_bytes_read: u64,
+        /// The most decompressed landing bytes held AT ONCE.
+        ///
+        /// These two were the same number while compaction read every object
+        /// before parsing any. They are not any more: an object is freed as
+        /// soon as its run exists, so this is the largest single object on the
+        /// ordinary path, and still the sum on the shared-prefix path, which
+        /// has to hold every object to select lines across them.
+        ///
+        /// Worth reporting rather than merely asserting, because how much a
+        /// seal actually costs in memory has never been answerable from
+        /// outside the process. A pass log carrying both numbers says what the
+        /// budget is really buying, which is what sizing it needs and what
+        /// nobody has had.
+        landing_bytes_resident: u64,
         /// See `RefusedTooLarge::shared_prefix`. Carried here for the same
         /// reason: without it `landing_bytes_read` for a straddling session
         /// reads as that recording's size when it is the whole partition's.
@@ -1732,7 +1747,18 @@ async fn compact_session_inner(
         (key_instance(a.as_ref()), a.as_ref()).cmp(&(key_instance(b.as_ref()), b.as_ref()))
     });
     keys.dedup();
-    let mut chunks = Vec::with_capacity(keys.len());
+    // Retained ONLY for the shared-prefix branch, which selects lines by
+    // envelope content across every object at once and so cannot work an object
+    // at a time. The ordinary path hands each object to the collator and drops
+    // it, which is what keeps the decompressed landing out of the peak.
+    let mut retained: Vec<Vec<u8>> = Vec::new();
+    let mut collator = Collator::default();
+    let mut any_content = false;
+    // Chunk bytes alive right now, and the high-water mark of that. On the
+    // ordinary path only the object being parsed is alive, so the peak is the
+    // largest object; the shared branch accumulates and its peak is the sum.
+    let mut resident = 0u64;
+    let mut peak_resident = 0u64;
     // No budget is `u64::MAX` rather than a branch, so the loop below has one
     // shape and the unbudgeted path is the same code the budgeted path takes.
     let budget = max_landing_bytes.unwrap_or(u64::MAX);
@@ -1740,9 +1766,15 @@ async fn compact_session_inner(
     for (read, key) in keys.iter().enumerate() {
         let chunk = get_decoded(store, key).await?;
         read_bytes += chunk.len() as u64;
-        chunks.push(chunk);
-        // Checked after the push, so `read_bytes` is what is actually held
-        // rather than what is about to be.
+        // Checked before the object is parsed or kept, so a landing that blows
+        // the budget costs one object's bytes and not a parse of it.
+        //
+        // WHAT THE BUDGET BOUNDS HAS MOVED. It used to bound the decompressed
+        // bytes held, because every object was held at once. An object is now
+        // freed as soon as its run exists, so what stays resident is the
+        // RECORDS — and a record keeps its whole source line in `raw_line`, so
+        // the landing's size still bounds them. The number means the same thing
+        // against a peak roughly half what it was.
         //
         // The guard is on THIS recording's landing now. It used to also be
         // the only thing standing between a straddling session and the whole
@@ -1758,6 +1790,19 @@ async fn compact_session_inner(
                 shared_prefix: location.shared,
             });
         }
+        if !chunk.iter().all(u8::is_ascii_whitespace) {
+            any_content = true;
+        }
+        if location.shared {
+            resident += chunk.len() as u64;
+            retained.push(chunk);
+        } else {
+            // The previous object was dropped at the end of the last iteration,
+            // so this one is all that is live.
+            resident = chunk.len() as u64;
+            collator.push_run(object_lines(&chunk));
+        }
+        peak_resident = peak_resident.max(resident);
     }
 
     let landing_objects: usize;
@@ -1772,7 +1817,7 @@ async fn compact_session_inner(
     // deployment reaches, so this costs nothing today; if one ever does, the
     // selection has to carry boundaries out with it.
     let collated = if location.shared {
-        let (lines, objects) = select_session_lines(&chunks, session_id);
+        let (lines, objects) = select_session_lines(&retained, session_id);
         if lines.is_empty() {
             return Err(format!(
                 "no envelope lines for session {session_id} under {}",
@@ -1783,18 +1828,19 @@ async fn compact_session_inner(
         collate(lines.into_iter())
     } else {
         landing_objects = keys.len();
-        if chunks.iter().all(|c| c.iter().all(u8::is_ascii_whitespace)) {
+        if !any_content {
             return Err(format!(
                 "no envelope lines for session {session_id} under {}",
                 location.prefixes.join(", ")
             ));
         }
-        collate_runs(chunks.iter().map(|c| object_lines(c)))
+        collator.finish()
     };
     Ok(Compaction::Sealed {
         merge: collated.merge.clone(),
         manifest: Box::new(write_seal(store, session_id, collated, landing_objects).await?),
         landing_bytes_read: read_bytes,
+        landing_bytes_resident: peak_resident,
         shared_prefix: location.shared,
     })
 }
@@ -2200,42 +2246,61 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
 ///
 /// Passing one run is not a special case: it degenerates to sorting that run,
 /// which is what compaction always did.
-fn collate_runs<'a, R, L>(runs: R) -> Collated
-where
-    R: Iterator<Item = L>,
-    L: Iterator<Item = Cow<'a, str>>,
-{
-    let mut seen: BTreeSet<(String, RecordKind, u64)> = BTreeSet::new();
-    let mut dupes_by_instance: BTreeMap<String, u64> = BTreeMap::new();
-    // Sequence ranges the RECORDER says it shed, per instance, from `dropped`
-    // markers. Not sorted or merged here — the recorder may emit several
-    // markers over a session and they arrive in whatever order the objects
-    // did.
-    let mut shed_by_instance: BTreeMap<String, Vec<[u64; 2]>> = BTreeMap::new();
-    // One accumulator PER RUN. Dedup stays global below — a duplicate can
-    // span objects — but ordering is per-run, which is what lets the merge
-    // hold a window instead of the landing.
-    let mut runs_of_events: Vec<Vec<Accepted>> = Vec::new();
-    let mut lines_in = 0usize;
-    let mut duplicates = 0usize;
-    let mut graph_nodes = 0usize;
-    let mut envelope_versions: BTreeSet<u32> = BTreeSet::new();
-    let mut event_versions: BTreeSet<u32> = BTreeSet::new();
-    let mut codes: Vec<CodeRef> = Vec::new();
-    let mut capture_mode = String::from("session");
+/// Collate landing objects ONE AT A TIME, so an object's bytes can be freed as
+/// soon as its records are parsed.
+///
+/// Compaction used to read every object into memory and only then parse them,
+/// which held two landing-sized copies at once: the decompressed bytes, and the
+/// records — and a record keeps its whole source line in `raw_line`, so the
+/// second copy is no smaller than the first. Feeding runs in as they arrive
+/// drops the first copy, because a chunk is dead the moment its run exists.
+///
+/// The records themselves are still all resident: the merge has to see every
+/// run before it can emit the first output record in seal order, and the seal's
+/// content address is taken over the whole sequence. Bounding THAT is a
+/// separate change to the seal writer, not to this type.
+#[derive(Default)]
+struct Collator {
+    seen: BTreeSet<(String, RecordKind, u64)>,
+    dupes_by_instance: BTreeMap<String, u64>,
+    /// Sequence ranges the RECORDER says it shed, per instance, from `dropped`
+    /// markers. Not sorted or merged here — the recorder may emit several
+    /// markers over a session and they arrive in whatever order the objects
+    /// did.
+    shed_by_instance: BTreeMap<String, Vec<[u64; 2]>>,
+    /// One accumulator PER RUN. Dedup stays global — a duplicate can span
+    /// objects — but ordering is per-run, which is what lets the merge hold a
+    /// window instead of the landing.
+    runs_of_events: Vec<Vec<Accepted>>,
+    lines_in: usize,
+    duplicates: usize,
+    graph_nodes: usize,
+    envelope_versions: BTreeSet<u32>,
+    event_versions: BTreeSet<u32>,
+    codes: Vec<CodeRef>,
+    capture_mode: Option<String>,
+}
 
-    for lines in runs {
+impl Collator {
+    /// Take one landing object's lines as the next run.
+    ///
+    /// Call order is the object order the seal depends on: runs are merged in
+    /// the order they were pushed, and adjacency is what bounds the window.
+    fn push_run<'a>(&mut self, lines: impl Iterator<Item = Cow<'a, str>>) {
         // One run per landing object. Pushed empty first so an object that
         // yields no accepted record still counts as a run — dropping it would
         // silently change which objects are adjacent, and adjacency is the
         // whole basis of the window.
-        runs_of_events.push(Vec::new());
-        let current_run = runs_of_events.last_mut().expect("a run was just pushed");
+        self.runs_of_events.push(Vec::new());
+        let current_run = self
+            .runs_of_events
+            .last_mut()
+            .expect("a run was just pushed");
         for line_str in lines {
             if line_str.trim().is_empty() {
                 continue;
             }
-            lines_in += 1;
+            self.lines_in += 1;
             let env: EnvelopeProbe = match serde_json::from_str(&line_str) {
                 Ok(e) => e,
                 Err(_) => {
@@ -2257,7 +2322,7 @@ where
                         if let (Some(inst), Some(payload)) =
                             (env.instance_id.as_ref(), marker.payload.as_ref())
                         {
-                            shed_by_instance
+                            self.shed_by_instance
                                 .entry(inst.clone())
                                 .or_default()
                                 .extend(payload.ranges.iter().copied());
@@ -2278,9 +2343,12 @@ where
                 }
             };
             let instance_id = env.instance_id.unwrap_or_else(|| "unknown".to_owned());
-            if !seen.insert((instance_id.clone(), kind, probe.global_sequence)) {
-                duplicates += 1;
-                *dupes_by_instance.entry(instance_id).or_default() += 1;
+            if !self
+                .seen
+                .insert((instance_id.clone(), kind, probe.global_sequence))
+            {
+                self.duplicates += 1;
+                *self.dupes_by_instance.entry(instance_id).or_default() += 1;
                 continue;
             }
             // The two version fields describe the boundary-event stream. A graph
@@ -2288,21 +2356,21 @@ where
             // in here would read as the recording spanning two envelope versions.
             if kind == RecordKind::BoundaryEvent {
                 if let Some(v) = env.schema_version {
-                    envelope_versions.insert(v);
+                    self.envelope_versions.insert(v);
                 }
                 if let Some(v) = probe.event_schema_version {
-                    event_versions.insert(v);
+                    self.event_versions.insert(v);
                 }
             } else {
-                graph_nodes += 1;
+                self.graph_nodes += 1;
             }
             if let Some(code) = env.code {
-                if !codes.contains(&code) {
-                    codes.push(code);
+                if !self.codes.contains(&code) {
+                    self.codes.push(code);
                 }
             }
             if let Some(mode) = env.capture.and_then(|c| c.mode) {
-                capture_mode = mode;
+                self.capture_mode = Some(mode);
             }
             current_run.push(Accepted {
                 instance_id,
@@ -2315,160 +2383,206 @@ where
             });
         }
     }
-    // Sequence before kind, so each kind keeps its own order and the kind only
-    // breaks the tie between the two spaces.
-    // Merged rather than sorted. Identical output — the order is the same
-    // total order, stated once in `seal_order` — but expressed as a merge of
-    // per-object runs, which is the shape that can later hold a window instead
-    // of the whole landing.
-    let (events, merge) = merge_runs(runs_of_events, MERGE_WINDOW);
-    let mut events = events;
-    if !merge.ordered() {
-        // THE SEAL MUST NOT LIE ABOUT COVERAGE. The scan below walks events in
-        // order and opens a gap wherever the sequence jumps, so an out-of-order
-        // stream invents gaps over sequences that are present: emitting
-        // 0,2,3,1,4 for a complete run reports gaps [1,1] and [2,3]. That
-        // reaches the dashboard's gap chip, the catalog's gap count, and
-        // `gaps_accounted`, and the manifest is the fast path for ever after.
-        //
-        // "A seal short of perfect order beats no seal" is true of the ORDER
-        // and false of the accounting, so the order is repaired before anything
-        // is derived from it. The repair costs a sort — the thing the merge
-        // exists to avoid — which is exactly why it happens only when the
-        // window was beaten, and why the report below is what says it was.
-        events.sort_by(seal_order);
-        // Loud, and with the distance. The window is a measured default and
-        // this is the only thing that can say it was wrong, so a violation
-        // names what beat it rather than being swallowed silently.
-        for jump in &merge.backward_jumps {
-            eprintln!(
-                "compactor: merge window of {MERGE_WINDOW} was beaten on instance {} — \
+
+    fn finish(self) -> Collated {
+        let Collator {
+            seen: _,
+            dupes_by_instance,
+            shed_by_instance,
+            runs_of_events,
+            lines_in,
+            duplicates,
+            graph_nodes,
+            envelope_versions,
+            event_versions,
+            codes,
+            capture_mode,
+        } = self;
+        // Absent means no object said, which is the same recording as one that
+        // said "session" — the default is applied here rather than at
+        // construction so that `Default` stays derivable.
+        let capture_mode = capture_mode.unwrap_or_else(|| String::from("session"));
+        // Sequence before kind, so each kind keeps its own order and the kind only
+        // breaks the tie between the two spaces.
+        // Merged rather than sorted. Identical output — the order is the same
+        // total order, stated once in `seal_order` — but expressed as a merge of
+        // per-object runs, which is the shape that can later hold a window instead
+        // of the whole landing.
+        let (events, merge) = merge_runs(runs_of_events, MERGE_WINDOW);
+        let mut events = events;
+        if !merge.ordered() {
+            // THE SEAL MUST NOT LIE ABOUT COVERAGE. The scan below walks events in
+            // order and opens a gap wherever the sequence jumps, so an out-of-order
+            // stream invents gaps over sequences that are present: emitting
+            // 0,2,3,1,4 for a complete run reports gaps [1,1] and [2,3]. That
+            // reaches the dashboard's gap chip, the catalog's gap count, and
+            // `gaps_accounted`, and the manifest is the fast path for ever after.
+            //
+            // "A seal short of perfect order beats no seal" is true of the ORDER
+            // and false of the accounting, so the order is repaired before anything
+            // is derived from it. The repair costs a sort — the thing the merge
+            // exists to avoid — which is exactly why it happens only when the
+            // window was beaten, and why the report below is what says it was.
+            events.sort_by(seal_order);
+            // Loud, and with the distance. The window is a measured default and
+            // this is the only thing that can say it was wrong, so a violation
+            // names what beat it rather than being swallowed silently.
+            for jump in &merge.backward_jumps {
+                eprintln!(
+                    "compactor: merge window of {MERGE_WINDOW} was beaten on instance {} — \
                  gseq {} arrived after {} (run {}, output position {}); the seal is still \
                  written, in the order the merge produced",
-                jump.instance_id, jump.arrived_gseq, jump.previous_gseq, jump.from_run, jump.at
-            );
+                    jump.instance_id, jump.arrived_gseq, jump.previous_gseq, jump.from_run, jump.at
+                );
+            }
         }
-    }
 
-    // Per-instance coverage (events are sorted, so gaps fall out of one scan).
-    let mut instances: Vec<InstanceCoverage> = Vec::new();
-    for acc in events
-        .iter()
-        .filter(|a| a.kind == RecordKind::BoundaryEvent)
-    {
-        match instances.last_mut() {
-            Some(cov) if cov.instance_id == acc.instance_id => {
-                if acc.gseq > cov.gseq_max + 1 {
-                    cov.gaps.push([cov.gseq_max + 1, acc.gseq - 1]);
+        // Per-instance coverage (events are sorted, so gaps fall out of one scan).
+        let mut instances: Vec<InstanceCoverage> = Vec::new();
+        for acc in events
+            .iter()
+            .filter(|a| a.kind == RecordKind::BoundaryEvent)
+        {
+            match instances.last_mut() {
+                Some(cov) if cov.instance_id == acc.instance_id => {
+                    if acc.gseq > cov.gseq_max + 1 {
+                        cov.gaps.push([cov.gseq_max + 1, acc.gseq - 1]);
+                    }
+                    cov.gseq_max = acc.gseq;
+                    cov.events += 1;
                 }
-                cov.gseq_max = acc.gseq;
-                cov.events += 1;
+                _ => instances.push(InstanceCoverage {
+                    instance_id: acc.instance_id.clone(),
+                    gseq_min: acc.gseq,
+                    gseq_max: acc.gseq,
+                    events: 1,
+                    gaps: Vec::new(),
+                    gaps_accounted: Vec::new(),
+                    duplicates_dropped: 0,
+                }),
             }
-            _ => instances.push(InstanceCoverage {
-                instance_id: acc.instance_id.clone(),
-                gseq_min: acc.gseq,
-                gseq_max: acc.gseq,
-                events: 1,
-                gaps: Vec::new(),
-                gaps_accounted: Vec::new(),
-                duplicates_dropped: 0,
-            }),
         }
-    }
-    for cov in &mut instances {
-        // Only ranges that are ACTUALLY missing are reported as accounted for.
-        // A recorder can shed a sequence whose event nonetheless arrives — a
-        // later retry, or a marker written before the batch it describes got
-        // through — and claiming such a range as an explained gap would say a
-        // hole exists where the tape is whole. Intersecting with `gaps` keeps
-        // this a statement about holes, and keeps `gaps_accounted` a genuine
-        // subset of `gaps` so their difference means what it says.
-        if let Some(shed) = shed_by_instance.get(&cov.instance_id) {
-            let mut accounted: Vec<[u64; 2]> = shed
-                .iter()
-                .filter(|r| cov.gaps.iter().any(|g| r[0] >= g[0] && r[1] <= g[1]))
+        for cov in &mut instances {
+            // Only ranges that are ACTUALLY missing are reported as accounted for.
+            // A recorder can shed a sequence whose event nonetheless arrives — a
+            // later retry, or a marker written before the batch it describes got
+            // through — and claiming such a range as an explained gap would say a
+            // hole exists where the tape is whole. Intersecting with `gaps` keeps
+            // this a statement about holes, and keeps `gaps_accounted` a genuine
+            // subset of `gaps` so their difference means what it says.
+            if let Some(shed) = shed_by_instance.get(&cov.instance_id) {
+                let mut accounted: Vec<[u64; 2]> = shed
+                    .iter()
+                    .filter(|r| cov.gaps.iter().any(|g| r[0] >= g[0] && r[1] <= g[1]))
+                    .copied()
+                    .collect();
+                accounted.sort_unstable();
+                accounted.dedup();
+                cov.gaps_accounted = accounted;
+            }
+            cov.duplicates_dropped = dupes_by_instance
+                .get(&cov.instance_id)
                 .copied()
-                .collect();
-            accounted.sort_unstable();
-            accounted.dedup();
-            cov.gaps_accounted = accounted;
+                .unwrap_or(0);
         }
-        cov.duplicates_dropped = dupes_by_instance
-            .get(&cov.instance_id)
-            .copied()
-            .unwrap_or(0);
-    }
 
-    // Per-correlation summary, in TAPE ORDER: rows come out in the order each
-    // correlation first appears in the data parts, not sorted by id.
-    //
-    // The order is what a caller reads "the first N correlations" from, so it
-    // has to mean something about the recording. First appearance is the
-    // recording's own order — the earliest requests — and it stays that whatever
-    // the ids look like. Today's ids are UUIDv7, which sort chronologically by
-    // construction, so sorting by id would give the same answer; that is a
-    // property of the current id scheme, not of the recording, and it is not
-    // something a reader should have to know or a future id scheme has to keep.
-    let mut order: Vec<Option<String>> = Vec::new();
-    let mut corr: BTreeMap<Option<String>, CorrelationSummary> = BTreeMap::new();
-    for acc in events
-        .iter()
-        .filter(|a| a.kind == RecordKind::BoundaryEvent)
-    {
-        let row = corr.entry(acc.correlation_id.clone()).or_insert_with(|| {
-            order.push(acc.correlation_id.clone());
-            CorrelationSummary {
-                correlation_id: acc.correlation_id.clone(),
-                events: 0,
-                gseq_min: acc.gseq,
-                gseq_max: acc.gseq,
-                boundaries: Vec::new(),
-                roles: Vec::new(),
-                boundaries_truncated: false,
-            }
-        });
-        row.events += 1;
-        row.gseq_min = row.gseq_min.min(acc.gseq);
-        row.gseq_max = row.gseq_max.max(acc.gseq);
-        // Distinct, sorted, capped. Kept as a sorted Vec rather than a set so
-        // the row serialises in one order for one recording — a seal is
-        // content-addressed and two sealers of the same landing must produce
-        // byte-identical objects.
-        if let Err(at) = row.boundaries.binary_search(&acc.boundary) {
-            if row.boundaries.len() < MAX_BOUNDARIES_PER_CORRELATION {
-                row.boundaries.insert(at, acc.boundary.clone());
-            } else {
-                row.boundaries_truncated = true;
-            }
-        }
-        if let Some(role) = acc.role.as_deref() {
-            if let Err(at) = row.roles.binary_search(&role.to_owned()) {
-                if row.roles.len() < MAX_BOUNDARIES_PER_CORRELATION {
-                    row.roles.insert(at, role.to_owned());
+        // Per-correlation summary, in TAPE ORDER: rows come out in the order each
+        // correlation first appears in the data parts, not sorted by id.
+        //
+        // The order is what a caller reads "the first N correlations" from, so it
+        // has to mean something about the recording. First appearance is the
+        // recording's own order — the earliest requests — and it stays that whatever
+        // the ids look like. Today's ids are UUIDv7, which sort chronologically by
+        // construction, so sorting by id would give the same answer; that is a
+        // property of the current id scheme, not of the recording, and it is not
+        // something a reader should have to know or a future id scheme has to keep.
+        let mut order: Vec<Option<String>> = Vec::new();
+        let mut corr: BTreeMap<Option<String>, CorrelationSummary> = BTreeMap::new();
+        for acc in events
+            .iter()
+            .filter(|a| a.kind == RecordKind::BoundaryEvent)
+        {
+            let row = corr.entry(acc.correlation_id.clone()).or_insert_with(|| {
+                order.push(acc.correlation_id.clone());
+                CorrelationSummary {
+                    correlation_id: acc.correlation_id.clone(),
+                    events: 0,
+                    gseq_min: acc.gseq,
+                    gseq_max: acc.gseq,
+                    boundaries: Vec::new(),
+                    roles: Vec::new(),
+                    boundaries_truncated: false,
+                }
+            });
+            row.events += 1;
+            row.gseq_min = row.gseq_min.min(acc.gseq);
+            row.gseq_max = row.gseq_max.max(acc.gseq);
+            // Distinct, sorted, capped. Kept as a sorted Vec rather than a set so
+            // the row serialises in one order for one recording — a seal is
+            // content-addressed and two sealers of the same landing must produce
+            // byte-identical objects.
+            if let Err(at) = row.boundaries.binary_search(&acc.boundary) {
+                if row.boundaries.len() < MAX_BOUNDARIES_PER_CORRELATION {
+                    row.boundaries.insert(at, acc.boundary.clone());
                 } else {
                     row.boundaries_truncated = true;
                 }
             }
+            if let Some(role) = acc.role.as_deref() {
+                if let Err(at) = row.roles.binary_search(&role.to_owned()) {
+                    if row.roles.len() < MAX_BOUNDARIES_PER_CORRELATION {
+                        row.roles.insert(at, role.to_owned());
+                    } else {
+                        row.boundaries_truncated = true;
+                    }
+                }
+            }
+        }
+        let correlations: Vec<CorrelationSummary> = order
+            .into_iter()
+            .filter_map(|id| corr.remove(&id))
+            .collect();
+
+        Collated {
+            events,
+            graph_nodes,
+            lines_in,
+            duplicates_dropped: duplicates,
+            capture_mode,
+            envelope_schema_versions: envelope_versions.into_iter().collect(),
+            event_schema_versions: event_versions.into_iter().collect(),
+            code: codes,
+            instances,
+            correlations,
+            merge,
         }
     }
-    let correlations: Vec<CorrelationSummary> = order
-        .into_iter()
-        .filter_map(|id| corr.remove(&id))
-        .collect();
+}
 
-    Collated {
-        events,
-        graph_nodes,
-        lines_in,
-        duplicates_dropped: duplicates,
-        capture_mode,
-        envelope_schema_versions: envelope_versions.into_iter().collect(),
-        event_schema_versions: event_versions.into_iter().collect(),
-        code: codes,
-        instances,
-        correlations,
-        merge,
+/// Collate landing objects, each its own run, and MERGE them into seal order.
+///
+/// Objects are the unit because that is how displacement is bounded: a record
+/// late enough to miss its own object lands in the next one, and no later. So
+/// each object is sorted on its own — bounded by one object — and the runs are
+/// merged through a window, instead of every record in the landing being sorted
+/// together.
+///
+/// Passing one run is not a special case: it degenerates to sorting that run,
+/// which is what compaction always did.
+///
+/// This eager form holds every run's source alive at once. `compact_session`
+/// drives [`Collator`] directly so it can free each object as it goes; this
+/// remains for callers that already have the lines in hand.
+fn collate_runs<'a, R, L>(runs: R) -> Collated
+where
+    R: Iterator<Item = L>,
+    L: Iterator<Item = Cow<'a, str>>,
+{
+    let mut collator = Collator::default();
+    for lines in runs {
+        collator.push_run(lines);
     }
+    collator.finish()
 }
 
 /// Where a session's landing objects actually are, whatever layout wrote them.
@@ -3983,6 +4097,58 @@ mod tests {
         assert_eq!(manifest.session_id, "s1");
         assert_eq!(manifest.counts.events, 2);
         assert_eq!(manifest.counts.correlations, 1);
+    }
+
+    #[test]
+    fn an_object_is_freed_once_its_run_exists() {
+        // Compaction used to read every object before parsing any, so what it
+        // HELD was the whole decompressed landing. Each object is now handed to
+        // the collator and dropped, so what it holds is one object.
+        //
+        // The landing is deliberately uniform — three objects, two envelopes
+        // each, sequence numbers of equal width — so the assertion is exact
+        // arithmetic rather than a threshold. On the old shape `resident` and
+        // `read` are the same number and this fails by a factor of three.
+        let store = memory();
+        for (n, gseq) in [(0usize, 10u64), (1, 20), (2, 30)] {
+            put_object_at(
+                &store,
+                &format!("landing/v1/dt=2026-09-01/session=s1/inst=i1/{n}.json"),
+                &[
+                    envelope_for("s1", "i1", gseq, Some("c1")),
+                    envelope_for("s1", "i1", gseq + 1, Some("c1")),
+                ],
+            );
+        }
+
+        match block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            None,
+        ))
+        .unwrap()
+        {
+            Compaction::Sealed {
+                landing_bytes_read,
+                landing_bytes_resident,
+                manifest,
+                ..
+            } => {
+                // Guard the arithmetic: a compaction that read nothing would
+                // satisfy `read == 3 * resident` with both at zero, and would
+                // prove nothing at all.
+                assert_eq!(manifest.counts.events, 6, "all three objects were read");
+                assert!(landing_bytes_resident > 0);
+                assert_eq!(
+                    landing_bytes_read,
+                    landing_bytes_resident * 3,
+                    "three objects of equal size: reading all of them costs three \
+                     times holding one"
+                );
+            }
+            other => panic!("expected a seal, got {other:?}"),
+        }
     }
 
     #[test]
