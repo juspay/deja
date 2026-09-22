@@ -1686,15 +1686,35 @@ fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String 
 async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     if let Ok(content) = std::fs::read_to_string(st.root.call_ledger_path(&id)) {
-        let rows: Vec<serde_json::Value> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        // Every line becomes a row or a NAMED drop. Dropping unparseable lines
+        // silently served a truncated ledger as a whole one, and served an
+        // empty one as a run that made no calls — the reader could not tell a
+        // partial artifact from a complete answer.
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut unparseable = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str(line) {
+                Ok(row) => rows.push(row),
+                Err(_) => unparseable += 1,
+            }
+        }
+        if unparseable > 0 {
+            return error_resp(
+                500,
+                &format!(
+                    "call ledger: {unparseable} of {} lines could not be parsed; \
+                     refusing to serve a partial ledger as a whole one",
+                    rows.len() + unparseable
+                ),
+            );
+        }
         if !rows.is_empty() {
             return json_ok(serde_json::Value::Array(rows));
         }
     }
+    // Falls through when the precomputed artifact is absent or held nothing.
+    // `call_ledger` refuses rather than returning an empty ledger when its own
+    // inputs are absent, so a 200 here means the run genuinely made no calls.
     match divergence::call_ledger(&st.root, &id) {
         Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
         Err(e) => error_resp(500, &format!("call ledger: {e}")),
