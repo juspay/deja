@@ -134,10 +134,12 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // boundary calls — that is what a PR is — and the fail-stop default answers
     // the first one by unwinding the request, which censors every other signal in
     // the run. A boundary whose caller has an honest degraded path declares the
-    // value that path expects; the miss is STILL scored (the blocking NovelCall
-    // divergence is emitted by the lookup, before `on_miss` is ever reached), so
-    // the subtree that depended on the missing value diverges and the graph tier
-    // localises it, instead of the whole correlation dying as a 500.
+    // value that path expects; the miss is STILL scored — the lookup emits its
+    // NovelCall divergence before `on_miss` is ever reached — so the subtree
+    // that depended on the value diverges and the graph tier localises it,
+    // instead of the whole correlation dying as a 500. That row is
+    // NON-blocking, and for the same reason: a novel call blocks only when it
+    // stopped the request, and this one continued.
     //
     // This is legal ONLY where the value asserts nothing untrue. `None` from a
     // cache read means "not in cache", which IS true on replay, and the caller's
