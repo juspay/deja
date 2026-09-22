@@ -356,13 +356,16 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
 }
 
 impl BehaviourTree {
-    /// One JSON object per line: the header, then every entry.
+    /// One JSON object per line: the header, then every entry. The header
+    /// says how many entries follow, so a reader can tell a whole file from a
+    /// prefix of one.
     pub fn to_jsonl(&self) -> String {
         let mut out = String::new();
         out.push_str(
             &serde_json::json!({
                 "run_id": self.run_id,
                 "canon_version": self.canon_version,
+                "entries": self.entries.len(),
                 "lanes": self.lanes,
                 "correlations": self.correlations,
             })
@@ -378,21 +381,55 @@ impl BehaviourTree {
         out
     }
 
+    /// The whole tree, or nothing. A line that does not parse, or a count
+    /// that does not match the header, means the file is not a tree this
+    /// code wrote — a prefix, a corruption, an older layout — and a tree
+    /// served short would report addresses as uncovered or absent that are
+    /// simply not in the file. The caller rebuilds instead.
     pub fn from_jsonl(text: &str) -> Option<Self> {
         let mut lines = text.lines().filter(|l| !l.trim().is_empty());
         let head: serde_json::Value = serde_json::from_str(lines.next()?).ok()?;
-        let entries = lines
-            .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
-            .collect();
+        let expected = head.get("entries")?.as_u64()? as usize;
+        let entries: Vec<Entry> = lines
+            .map(|l| serde_json::from_str::<Entry>(l).ok())
+            .collect::<Option<_>>()?;
+        if entries.len() != expected {
+            return None;
+        }
         Some(Self {
             run_id: head.get("run_id")?.as_str()?.to_owned(),
             canon_version: head.get("canon_version")?.as_u64()? as u32,
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
-            correlations: head
-                .get("correlations")
-                .and_then(|c| serde_json::from_value(c.clone()).ok())
-                .unwrap_or_default(),
+            correlations: serde_json::from_value(head.get("correlations")?.clone()).ok()?,
+        })
+    }
+
+    /// Write the tree so that a concurrent reader sees either the previous
+    /// file or the whole new one, never a prefix: the bytes go to a
+    /// temporary sibling and are renamed onto `path`, which is atomic on
+    /// POSIX. The sibling is removed if anything fails before the rename.
+    pub fn write_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_extension(format!("tmp-{}-{nanos}", std::process::id()));
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(self.to_jsonl().as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
         })
     }
 }
@@ -554,6 +591,61 @@ mod tests {
         assert_eq!(back.lanes, tree.lanes);
         assert_eq!(back.correlations, tree.correlations);
         assert_eq!(back.entries[1].address, tree.entries[1].address);
+    }
+
+    #[test]
+    fn a_prefix_or_a_bad_line_is_not_a_tree() {
+        let span = "request>deja::grpc_incoming>payment_sync>x";
+        let rows = vec![
+            row(
+                "value_diverged",
+                "c1",
+                span,
+                Some(1),
+                serde_json::json!({"u": 1}),
+            ),
+            row(
+                "value_diverged",
+                "c1",
+                span,
+                Some(2),
+                serde_json::json!({"u": 2}),
+            ),
+        ];
+        let tree = build("run", &rows, &[]);
+        let text = tree.to_jsonl();
+        assert_eq!(BehaviourTree::from_jsonl(&text).unwrap().entries.len(), 2);
+        // a reader that arrives after the header and the first entry, before
+        // the second, must not be served a one-entry tree
+        let lines: Vec<&str> = text.lines().collect();
+        let prefix = format!("{}\n{}\n", lines[0], lines[1]);
+        assert!(BehaviourTree::from_jsonl(&prefix).is_none());
+        // a header with a truncated line after it
+        let torn = format!("{}\n{}", lines[0], &lines[1][..lines[1].len() / 2]);
+        assert!(BehaviourTree::from_jsonl(&torn).is_none());
+        // a header alone, count says two
+        assert!(BehaviourTree::from_jsonl(&format!("{}\n", lines[0])).is_none());
+        // an older layout without the count is rebuilt, not trusted
+        let no_count = text.replacen("\"entries\":2,", "", 1);
+        assert!(BehaviourTree::from_jsonl(&no_count).is_none());
+    }
+
+    #[test]
+    fn write_atomic_leaves_a_whole_file_and_no_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.call-ledger.behaviour-tree.jsonl");
+        let tree = build("run", &[], &[]);
+        tree.write_atomic(&path).unwrap();
+        let back = BehaviourTree::from_jsonl(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.run_id, "run");
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["run.call-ledger.behaviour-tree.jsonl".to_owned()]
+        );
     }
 
     #[test]

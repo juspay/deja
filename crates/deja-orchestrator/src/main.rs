@@ -1989,7 +1989,8 @@ async fn behaviour_tree_for(
             })
             .unwrap_or_default();
         let tree = behaviour_tree::build(&id, &rows, &diffs);
-        let _ = std::fs::write(&cache, tree.to_jsonl());
+        // renamed into place, so a concurrent reader never sees a prefix
+        let _ = tree.write_atomic(&cache);
         Ok(tree)
     })
     .await
