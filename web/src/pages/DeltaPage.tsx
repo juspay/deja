@@ -222,6 +222,34 @@ function Buckets({ d }: { d: Delta }) {
   );
 }
 
+/** The comparison's domain, and what fell outside it. A run that stopped
+ *  early drove fewer requests; their addresses are not scored either way. */
+function Coverage({ d }: { d: Delta }) {
+  const u = d.uncovered;
+  if (u.m_only.length === 0 && u.y_only.length === 0) {
+    return (
+      <p className="hint">
+        Compared over all {d.covered_correlations} requests both runs drove.
+      </p>
+    );
+  }
+  const part = (who: string, ids: string[]) =>
+    ids.length > 0 ? (
+      <span title={ids.join("\n")}>
+        {ids.length} request{ids.length === 1 ? "" : "s"} only {who} drove
+      </span>
+    ) : null;
+  return (
+    <p className="hint delta-coverage">
+      Compared over the {d.covered_correlations} requests both runs drove.{" "}
+      <b>Not compared:</b> {part("M", u.m_only)}
+      {u.m_only.length > 0 && u.y_only.length > 0 ? ", " : ""}
+      {part("Y", u.y_only)} ({u.addresses} addresses). A run that stops early is
+      not scored as if it had reproduced what it never reached.
+    </p>
+  );
+}
+
 function Lanes({ d }: { d: Delta }) {
   if (d.lanes.length === 0) return <p className="hint">No connector call placed a request in a lane.</p>;
   return (
@@ -398,6 +426,7 @@ export default function DeltaPage() {
           <section>
             <h2>Addresses by bucket</h2>
             <Buckets d={d} />
+            <Coverage d={d} />
           </section>
 
           <section>

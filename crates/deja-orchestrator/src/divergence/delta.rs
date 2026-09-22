@@ -16,10 +16,14 @@
 //! `changed` is the conflict case of a merge: it is reported apart from both
 //! inherited and introduced, never folded into either.
 //!
+//! The comparison is over the correlations BOTH runs drove. A run that stopped
+//! early has no rows for the requests it never reached; those addresses are
+//! reported as uncovered, never scored as if the run had reproduced them.
+//!
 //! The delta verdict counts only what Y introduced or changed, on blocking
 //! addresses. The tape-relative verdict is untouched and shown beside it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +111,18 @@ pub struct DeltaVerdict {
     pub reason: String,
 }
 
+/// What the comparison could not cover: requests only one run drove. Their
+/// addresses are outside every bucket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Uncovered {
+    /// Correlations M drove that Y never reached.
+    pub m_only: Vec<String>,
+    /// Correlations Y drove that M never reached.
+    pub y_only: Vec<String>,
+    /// Addresses under those correlations, left out of the buckets.
+    pub addresses: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delta {
     pub m_run: String,
@@ -118,6 +134,9 @@ pub struct Delta {
     /// Every non-clean address, flagged ones first.
     pub rows: Vec<Row>,
     pub clean: usize,
+    /// Correlations both runs drove: the comparison's domain.
+    pub covered_correlations: usize,
+    pub uncovered: Uncovered,
 }
 
 fn side_of(v: Option<&Value>, tape_has: bool) -> Side {
@@ -125,8 +144,10 @@ fn side_of(v: Option<&Value>, tape_has: bool) -> Side {
         Some(Value::Reproduced) => Side::Tape,
         Some(Value::Absent) => Side::Absent,
         Some(Value::Diverged { hash }) | Some(Value::Novel { hash }) => Side::Hash(hash.clone()),
-        // not in this run's tree: it reproduced the tape there if the tape has
-        // the address, and never had it otherwise
+        // not in this run's tree, for a request the run DID drive: the scorer
+        // lists every recorded call it classified, so an address it left out
+        // is one the run reproduced. If the tape has no such address, the run
+        // never had it.
         None if tape_has => Side::Tape,
         None => Side::Absent,
     }
@@ -160,20 +181,50 @@ fn classify(tape_has: bool, m: &Side, y: &Side) -> Bucket {
 pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> {
     if m.canon_version != y.canon_version {
         return Err(format!(
-            "the two trees were built under different canonicalisation rules ({} and {}); rebuild one before comparing",
+            "the two trees were built under different rules ({} and {}); rebuild one before comparing",
             m.canon_version, y.canon_version
         ));
     }
+    // The domain: requests both runs drove. A tree that names no correlations
+    // drove nothing, and there is nothing to compare it on.
+    let covered: BTreeSet<&String> = m.correlations.intersection(&y.correlations).collect();
+    if covered.is_empty() {
+        return Err(format!(
+            "the runs share no request: M drove {} and Y drove {}; a run that stopped before its first request has no behaviour to compare",
+            m.correlations.len(),
+            y.correlations.len()
+        ));
+    }
+    let uncovered = Uncovered {
+        m_only: m
+            .correlations
+            .difference(&y.correlations)
+            .cloned()
+            .collect(),
+        y_only: y
+            .correlations
+            .difference(&m.correlations)
+            .cloned()
+            .collect(),
+        addresses: 0,
+    };
+    let mut uncovered = uncovered;
+
     let m_by: BTreeMap<&Address, &super::behaviour_tree::Entry> =
         m.entries.iter().map(|e| (&e.address, e)).collect();
     let y_by: BTreeMap<&Address, &super::behaviour_tree::Entry> =
         y.entries.iter().map(|e| (&e.address, e)).collect();
     let addresses: HashSet<&Address> = m_by.keys().chain(y_by.keys()).copied().collect();
+    let total = addresses.len();
     let mut rows = Vec::new();
     let mut buckets: BTreeMap<Bucket, usize> = BTreeMap::new();
     let mut clean = 0usize;
     let mut lanes: BTreeMap<Lane, (HashSet<String>, BTreeMap<String, usize>)> = BTreeMap::new();
     for address in addresses {
+        if !covered.contains(&address.correlation().to_owned()) {
+            uncovered.addresses += 1;
+            continue;
+        }
         let me = m_by.get(address).copied();
         let ye = y_by.get(address).copied();
         // the tape holds the address unless every side that has it calls it novel
@@ -210,6 +261,10 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             lane,
         });
     }
+    // every address lands in exactly one place: a bucket row, clean, or
+    // uncovered — a new bucket must keep this true
+    debug_assert_eq!(rows.len() + clean + uncovered.addresses, total);
+
     let order = |b: Bucket| match b.family() {
         "changed" => 0,
         "introduced" => 1,
@@ -221,13 +276,7 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             .cmp(&order(b.bucket))
             .then_with(|| a.address.cmp(&b.address))
     });
-    let count = |f: &str| {
-        rows.iter()
-            .filter(|r| {
-                r.bucket.family() == f && (f != "introduced" && f != "changed" || r.blocking)
-            })
-            .count()
-    };
+    let count = |f: &str| rows.iter().filter(|r| r.bucket.family() == f).count();
     let introduced = rows
         .iter()
         .filter(|r| r.blocking && r.bucket.charges_y() && r.bucket != Bucket::Changed)
@@ -239,7 +288,7 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
     let inherited = count("inherited");
     let resolved = count("resolved");
     let pass = introduced == 0 && changed == 0;
-    let reason = if pass {
+    let mut reason = if pass {
         if inherited > 0 {
             format!("Y introduced nothing beyond what M already carries ({inherited} inherited)")
         } else {
@@ -257,6 +306,12 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         }
         parts.join("; ")
     };
+    if !uncovered.m_only.is_empty() || !uncovered.y_only.is_empty() {
+        reason.push_str(&format!(
+            "; {} request(s) only one run drove are not compared",
+            uncovered.m_only.len() + uncovered.y_only.len()
+        ));
+    }
     let mut lane_summaries: Vec<LaneSummary> = lanes
         .into_iter()
         .map(|(lane, (reqs, b))| LaneSummary {
@@ -290,6 +345,8 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         lanes: lane_summaries,
         rows,
         clean,
+        covered_correlations: covered.len(),
+        uncovered,
     })
 }
 
@@ -299,16 +356,36 @@ mod tests {
     use super::*;
     use crate::divergence::behaviour_tree::{Entry, CANON_VERSION};
 
-    fn call(corr: &str, n: u32) -> Address {
+    const SPAN: &str = "request>deja::grpc_incoming>payment_sync>x";
+
+    /// A call that paired to recorded event `event`.
+    fn call(corr: &str, event: u64) -> Address {
         Address::Call {
             correlation: corr.into(),
-            span_path: "request>deja::grpc_incoming>payment_sync>x".into(),
+            span_path: SPAN.into(),
             boundary: "http_outgoing".into(),
             operation: "call".into(),
+            recorded_event: Some(event),
+            occurrence: 0,
+        }
+    }
+    /// The n-th novel call under the span: no recorded counterpart.
+    fn novel(corr: &str, n: u32) -> Address {
+        Address::Call {
+            correlation: corr.into(),
+            span_path: SPAN.into(),
+            boundary: "http_outgoing".into(),
+            operation: "call".into(),
+            recorded_event: None,
             occurrence: n,
         }
     }
     fn tree(run: &str, entries: Vec<(Address, Value)>) -> BehaviourTree {
+        let correlations = entries
+            .iter()
+            .map(|(a, _)| a.correlation().to_owned())
+            .chain(std::iter::once("c".to_owned()))
+            .collect();
         BehaviourTree {
             run_id: run.into(),
             canon_version: CANON_VERSION,
@@ -329,10 +406,14 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            correlations,
         }
     }
     fn div(h: &str) -> Value {
         Value::Diverged { hash: h.into() }
+    }
+    fn nov(h: &str) -> Value {
+        Value::Novel { hash: h.into() }
     }
 
     #[test]
@@ -340,16 +421,16 @@ mod tests {
         let m = tree(
             "m",
             vec![
-                (call("c", 0), Value::Reproduced),                 // clean
-                (call("c", 1), div("v2")),                         // inherited: Y sends v2 too
-                (call("c", 2), Value::Reproduced),                 // introduced: only Y moves
-                (call("c", 3), div("v2")),                         // resolved: Y back to tape
-                (call("c", 4), div("v2")),                         // changed: Y sends v3
-                (call("c", 5), Value::Absent),                     // inherited omission
-                (call("c", 6), Value::Reproduced),                 // introduced omission
-                (call("c", 7), Value::Absent),                     // resolved omission
-                (call("c", 8), Value::Novel { hash: "n".into() }), // inherited novel
-                (call("c", 9), Value::Novel { hash: "n".into() }), // resolved novel
+                (call("c", 0), Value::Reproduced), // clean
+                (call("c", 1), div("v2")),         // inherited: Y sends v2 too
+                (call("c", 2), Value::Reproduced), // introduced: only Y moves
+                (call("c", 3), div("v2")),         // resolved: Y back to tape
+                (call("c", 4), div("v2")),         // changed: Y sends v3
+                (call("c", 5), Value::Absent),     // inherited omission
+                (call("c", 6), Value::Reproduced), // introduced omission
+                (call("c", 7), Value::Absent),     // resolved omission
+                (novel("c", 0), nov("n")),         // inherited novel
+                (novel("c", 1), nov("n")),         // resolved novel
             ],
         );
         let y = tree(
@@ -363,32 +444,33 @@ mod tests {
                 (call("c", 5), Value::Absent),
                 (call("c", 6), Value::Absent),
                 (call("c", 7), Value::Reproduced),
-                (call("c", 8), Value::Novel { hash: "n".into() }),
-                (call("c", 10), Value::Novel { hash: "q".into() }), // introduced novel
+                (novel("c", 0), nov("n")),
+                (novel("c", 2), nov("q")), // introduced novel
             ],
         );
         let d = three_way(&m, &y).unwrap();
-        let by = |n: u32| {
-            d.rows
-                .iter()
-                .find(|r| r.address == call("c", n))
-                .map(|r| r.bucket)
-        };
+        let by = |a: Address| d.rows.iter().find(|r| r.address == a).map(|r| r.bucket);
         assert_eq!(d.clean, 1);
-        assert_eq!(by(1), Some(Bucket::Inherited));
-        assert_eq!(by(2), Some(Bucket::Introduced));
-        assert_eq!(by(3), Some(Bucket::Resolved));
-        assert_eq!(by(4), Some(Bucket::Changed));
-        assert_eq!(by(5), Some(Bucket::InheritedOmission));
-        assert_eq!(by(6), Some(Bucket::IntroducedOmission));
-        assert_eq!(by(7), Some(Bucket::ResolvedOmission));
-        assert_eq!(by(8), Some(Bucket::InheritedNovel));
-        assert_eq!(by(9), Some(Bucket::ResolvedNovel));
-        assert_eq!(by(10), Some(Bucket::IntroducedNovel));
+        assert_eq!(by(call("c", 1)), Some(Bucket::Inherited));
+        assert_eq!(by(call("c", 2)), Some(Bucket::Introduced));
+        assert_eq!(by(call("c", 3)), Some(Bucket::Resolved));
+        assert_eq!(by(call("c", 4)), Some(Bucket::Changed));
+        assert_eq!(by(call("c", 5)), Some(Bucket::InheritedOmission));
+        assert_eq!(by(call("c", 6)), Some(Bucket::IntroducedOmission));
+        assert_eq!(by(call("c", 7)), Some(Bucket::ResolvedOmission));
+        assert_eq!(by(novel("c", 0)), Some(Bucket::InheritedNovel));
+        assert_eq!(by(novel("c", 1)), Some(Bucket::ResolvedNovel));
+        assert_eq!(by(novel("c", 2)), Some(Bucket::IntroducedNovel));
         assert!(!d.verdict.pass);
         assert_eq!((d.verdict.introduced, d.verdict.changed), (3, 1));
         assert_eq!(d.rows[0].bucket, Bucket::Changed, "flagged rows come first");
         assert_eq!(d.lanes[0].requests, 1);
+        assert_eq!(
+            d.rows.len() + d.clean,
+            11,
+            "every address lands in exactly one place"
+        );
+        assert_eq!(d.uncovered.addresses, 0);
     }
 
     #[test]
@@ -405,12 +487,76 @@ mod tests {
     #[test]
     fn an_address_missing_from_one_tree_means_that_run_reproduced_the_tape() {
         // M's tree lists only what M diverged on; an address Y diverged on and
-        // M's tree omits is one M reproduced.
+        // M's tree omits is one M reproduced — for a request M drove.
         let m = tree("m", vec![]);
         let y = tree("y", vec![(call("c", 0), div("v9"))]);
         let d = three_way(&m, &y).unwrap();
         assert_eq!(d.rows[0].bucket, Bucket::Introduced);
         assert_eq!(d.rows[0].m, Side::Tape);
+    }
+
+    #[test]
+    fn an_added_call_does_not_shift_the_calls_after_it() {
+        // M makes A then B, where B diverges. Y makes X, A, B: the same
+        // divergence at B, plus one extra call first. B is inherited; X is the
+        // only thing Y introduced; nothing is resolved.
+        let m = tree(
+            "m",
+            vec![
+                (call("c", 10), Value::Reproduced),
+                (call("c", 11), div("b-moved")),
+            ],
+        );
+        let y = tree(
+            "y",
+            vec![
+                (novel("c", 0), nov("x")),
+                (call("c", 10), Value::Reproduced),
+                (call("c", 11), div("b-moved")),
+            ],
+        );
+        let d = three_way(&m, &y).unwrap();
+        let by = |a: Address| d.rows.iter().find(|r| r.address == a).map(|r| r.bucket);
+        assert_eq!(by(call("c", 11)), Some(Bucket::Inherited));
+        assert_eq!(by(novel("c", 0)), Some(Bucket::IntroducedNovel));
+        assert_eq!(d.buckets.get(&Bucket::Resolved), None);
+        assert_eq!(d.buckets.get(&Bucket::Introduced), None);
+        assert_eq!(d.verdict.introduced, 1, "only the added call charges Y");
+        assert_eq!(d.verdict.inherited, 1);
+    }
+
+    #[test]
+    fn a_request_only_one_run_drove_is_uncovered_not_clean() {
+        // Y stopped before c2. Its addresses are neither reproduced nor
+        // resolved: they are outside the comparison, and the reason says so.
+        let mut m = tree(
+            "m",
+            vec![(call("c", 0), div("v")), (call("c2", 0), div("w"))],
+        );
+        m.correlations = ["c", "c2"].into_iter().map(String::from).collect();
+        let mut y = tree("y", vec![(call("c", 0), div("v"))]);
+        y.correlations = ["c"].into_iter().map(String::from).collect();
+        let d = three_way(&m, &y).unwrap();
+        assert!(d.verdict.pass);
+        assert_eq!(d.verdict.inherited, 1);
+        assert_eq!(d.verdict.resolved, 0);
+        assert_eq!(d.uncovered.m_only, vec!["c2".to_owned()]);
+        assert_eq!(d.uncovered.addresses, 1);
+        assert_eq!(d.covered_correlations, 1);
+        assert!(
+            d.verdict.reason.contains("not compared"),
+            "{}",
+            d.verdict.reason
+        );
+    }
+
+    #[test]
+    fn runs_that_share_no_request_do_not_compare() {
+        let mut m = tree("m", vec![(call("c", 0), div("v"))]);
+        m.correlations = ["c"].into_iter().map(String::from).collect();
+        let mut y = tree("y", vec![]);
+        y.correlations = BTreeSet::new();
+        assert!(three_way(&m, &y).is_err());
     }
 
     #[test]

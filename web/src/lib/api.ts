@@ -731,6 +731,8 @@ export type DeltaAddress =
       span_path: string;
       boundary: string;
       operation: string;
+      /** The recorded event this call paired to; absent for a novel call. */
+      recorded_event?: number;
       occurrence: number;
     }
   | { kind: "status"; correlation: string; request_sequence: number }
@@ -792,6 +794,10 @@ export type Delta = {
   lanes: DeltaLane[];
   rows: DeltaRow[];
   clean: number;
+  /** Correlations both runs drove: the comparison's domain. */
+  covered_correlations: number;
+  /** Requests only one run drove; their addresses are outside every bucket. */
+  uncovered: { m_only: string[]; y_only: string[]; addresses: number };
   tape: string | null;
   sides: { m: DeltaSideInfo; y: DeltaSideInfo };
 };

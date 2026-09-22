@@ -1015,4 +1015,5 @@ main:has(.recintro) { max-width: 1440px; }
 .delta-family .more { padding: var(--s2) var(--s4); color: var(--text-subtle); font-size: var(--fs-12); }
 .delta-family .more button { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
 .delta-unavailable { border: 1px dashed var(--border-strong); border-radius: var(--r-md); padding: var(--s4); color: var(--text-muted); }
+.delta-coverage b { color: var(--amber-fg); font-weight: 600; }
 .delta-legend { color: var(--text-faint); font-size: var(--fs-11); line-height: 1.6; max-width: 80ch; }

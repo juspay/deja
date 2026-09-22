@@ -20,7 +20,7 @@
 //! construction; they are not addresses here. The inconclusive classes are
 //! left out too, so they can never flip a bucket in a comparison.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use deja_kernel::HttpDiff;
 use serde::{Deserialize, Serialize};
@@ -28,21 +28,32 @@ use sha2::{Digest, Sha256};
 
 use super::ledger::CallRecord;
 
-/// Which canonicalisation produced the hashes. Two trees compare only when
-/// they agree, so a delta never mixes hashes from different rules.
-pub const CANON_VERSION: u32 = 1;
+/// Which addressing and canonicalisation produced the tree. Two trees compare
+/// only when they agree, so a delta never mixes keys or hashes from different
+/// rules.
+///
+/// 1: calls keyed positionally under their span.
+/// 2: calls keyed by the recorded event they paired to; the tree carries the
+///    correlations the run drove.
+pub const CANON_VERSION: u32 = 2;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Address {
-    /// A side-effect call: the k-th call of this boundary and operation under
-    /// this span path within the correlation.
+    /// A side-effect call. A call that paired to a recorded event is keyed by
+    /// that event's global sequence: two runs of one tape pairing to the same
+    /// recorded event are at the same place in the tape whatever else either
+    /// run did, so an added or removed call elsewhere never shifts it. A novel
+    /// call has no recorded counterpart and is keyed by its position among the
+    /// novel calls under the same span, boundary and operation.
     Call {
         correlation: String,
         span_path: String,
         boundary: String,
         operation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recorded_event: Option<u64>,
         occurrence: u32,
     },
     /// The status the request's response came back with.
@@ -107,11 +118,22 @@ pub struct BehaviourTree {
     pub entries: Vec<Entry>,
     /// The lane each correlation ran in, from its connector call.
     pub lanes: HashMap<String, Lane>,
+    /// The correlations the run drove: every one the scorer wrote a row or a
+    /// diff for. A run that stopped early has no rows for the requests it
+    /// never reached, and their absence must read as "not covered", never as
+    /// "reproduced the tape"; the comparator restricts itself to the
+    /// correlations both trees drove.
+    #[serde(default)]
+    pub correlations: BTreeSet<String>,
 }
 
 /// The canonical form of an argument value: keys sorted, and a header list
 /// (`[[name, value], …]`) ordered by name, because the sending process's map
 /// order is not behaviour.
+///
+/// Header NAMES are lowercased, in the sort and in the output, so a case-only
+/// difference between two runs hashes identically. HTTP header names are
+/// case-insensitive, so the wire treats them as the same header too.
 fn canonical(v: &serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::Object(map) => {
@@ -215,41 +237,25 @@ pub fn lane_of(row: &CallRecord) -> Option<Lane> {
 pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> BehaviourTree {
     let mut entries = Vec::new();
     let mut lanes: HashMap<String, Lane> = HashMap::new();
-    let mut occurrence: HashMap<(String, String, String, String), u32> = HashMap::new();
+    let mut correlations = BTreeSet::new();
+    // position among the NOVEL calls under one (correlation, span, boundary,
+    // operation); calls with a recorded counterpart are keyed by that event
+    let mut novel_occurrence: HashMap<(String, String, String, String), u32> = HashMap::new();
     for row in rows {
+        let Some(correlation) = row.correlation_id.clone() else {
+            continue;
+        };
+        // any row at all is evidence the run drove this request, seams included
+        correlations.insert(correlation.clone());
         if matches!(
             row.boundary.as_str(),
             "time" | "id" | "id_generation" | "uuid" | "rng"
         ) {
             continue;
         }
-        let Some(correlation) = row.correlation_id.clone() else {
-            continue;
-        };
         if let Some(lane) = lane_of(row) {
             lanes.entry(correlation.clone()).or_insert(lane);
         }
-        let span_path = row
-            .observed
-            .as_ref()
-            .and_then(|s| s.span_path.clone())
-            .or_else(|| row.recorded.as_ref().and_then(|s| s.span_path.clone()))
-            .unwrap_or_default();
-        let key = (
-            correlation.clone(),
-            span_path.clone(),
-            row.boundary.clone(),
-            row.method_name.clone(),
-        );
-        let n = occurrence.entry(key).or_insert(0);
-        let address = Address::Call {
-            correlation,
-            span_path,
-            boundary: row.boundary.clone(),
-            operation: row.method_name.clone(),
-            occurrence: *n,
-        };
-        *n += 1;
         let observed_hash = || {
             row.observed
                 .as_ref()
@@ -268,13 +274,51 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 hash: observed_hash(),
             },
         };
+        // A row that paired to a recorded event takes the RECORDED span path,
+        // which is the same in every run of the tape; a novel row has only the
+        // observed one.
+        let recorded_event = if matches!(value, Value::Novel { .. }) {
+            None
+        } else {
+            row.source_event_global_sequence
+        };
+        let span_path = match recorded_event {
+            Some(_) => row.recorded.as_ref().and_then(|s| s.span_path.clone()),
+            None => row.observed.as_ref().and_then(|s| s.span_path.clone()),
+        }
+        .or_else(|| row.observed.as_ref().and_then(|s| s.span_path.clone()))
+        .or_else(|| row.recorded.as_ref().and_then(|s| s.span_path.clone()))
+        .unwrap_or_default();
+        let occurrence = match recorded_event {
+            Some(_) => 0,
+            None => {
+                let key = (
+                    correlation.clone(),
+                    span_path.clone(),
+                    row.boundary.clone(),
+                    row.method_name.clone(),
+                );
+                let n = novel_occurrence.entry(key).or_insert(0);
+                let this = *n;
+                *n += 1;
+                this
+            }
+        };
         entries.push(Entry {
-            address,
+            address: Address::Call {
+                correlation,
+                span_path,
+                boundary: row.boundary.clone(),
+                operation: row.method_name.clone(),
+                recorded_event,
+                occurrence,
+            },
             value,
             blocking: row.blocking,
         });
     }
     for d in diffs {
+        correlations.insert(d.correlation_id.clone());
         entries.push(Entry {
             address: Address::Status {
                 correlation: d.correlation_id.clone(),
@@ -307,6 +351,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
         canon_version: CANON_VERSION,
         entries,
         lanes,
+        correlations,
     }
 }
 
@@ -319,6 +364,7 @@ impl BehaviourTree {
                 "run_id": self.run_id,
                 "canon_version": self.canon_version,
                 "lanes": self.lanes,
+                "correlations": self.correlations,
             })
             .to_string(),
         );
@@ -343,6 +389,10 @@ impl BehaviourTree {
             canon_version: head.get("canon_version")?.as_u64()? as u32,
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
+            correlations: head
+                .get("correlations")
+                .and_then(|c| serde_json::from_value(c.clone()).ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -353,10 +403,16 @@ mod tests {
     use super::*;
     use crate::divergence::ledger::CallSide;
 
-    fn row(kind: &str, corr: &str, span: &str, args: serde_json::Value) -> CallRecord {
+    fn row(
+        kind: &str,
+        corr: &str,
+        span: &str,
+        source_seq: Option<u64>,
+        args: serde_json::Value,
+    ) -> CallRecord {
         CallRecord {
             correlation_id: Some(corr.to_owned()),
-            source_event_global_sequence: None,
+            source_event_global_sequence: source_seq,
             served_event_global_sequence: None,
             boundary: "http_outgoing".to_owned(),
             trait_name: "svc".to_owned(),
@@ -380,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn header_order_is_not_behaviour() {
+    fn header_order_and_name_case_are_not_behaviour() {
         let a =
             serde_json::json!({"url": "https://api.x.com/v1", "headers": [["B", "2"], ["a", "1"]]});
         let b =
@@ -388,18 +444,19 @@ mod tests {
         assert_eq!(hash_of(&a), hash_of(&b));
         let c =
             serde_json::json!({"url": "https://api.x.com/v1", "headers": [["a", "1"], ["b", "3"]]});
-        assert_ne!(hash_of(&a), hash_of(&c));
+        assert_ne!(hash_of(&a), hash_of(&c), "a header VALUE is behaviour");
     }
 
     #[test]
-    fn a_ledger_becomes_addresses_with_lanes_and_occurrences() {
+    fn a_ledger_becomes_addresses_keyed_by_recorded_event() {
         let args = serde_json::json!({"url": "https://api-m.sandbox.paypal.com/v2/checkout/orders", "method": "POST"});
         let span = "request>deja::grpc_incoming>payment_authorize>ucs::flow_orchestration>execute";
         let rows = vec![
-            row("matched", "c1", span, args.clone()),
-            row("value_diverged", "c1", span, args.clone()),
-            row("omitted", "c2", span, args.clone()),
-            row("novel", "c2", span, args),
+            row("matched", "c1", span, Some(10), args.clone()),
+            row("value_diverged", "c1", span, Some(11), args.clone()),
+            row("omitted", "c2", span, Some(20), args.clone()),
+            row("novel", "c2", span, None, args.clone()),
+            row("novel", "c2", span, None, args),
         ];
         let diffs = vec![HttpDiff {
             correlation_id: "c1".into(),
@@ -421,24 +478,65 @@ mod tests {
                 flow: "authorize".into()
             }
         );
+        assert_eq!(
+            tree.correlations,
+            ["c1", "c2"].into_iter().map(String::from).collect()
+        );
         let calls: Vec<_> = tree
             .entries
             .iter()
             .filter(|e| matches!(e.address, Address::Call { .. }))
             .collect();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 5);
         assert!(matches!(calls[0].value, Value::Reproduced));
         assert!(matches!(
             &calls[0].address,
-            Address::Call { occurrence: 0, .. }
+            Address::Call {
+                recorded_event: Some(10),
+                occurrence: 0,
+                ..
+            }
         ));
         assert!(
-            matches!(&calls[1].address, Address::Call { occurrence: 1, .. }),
-            "the second call under the same span is the next occurrence"
+            matches!(
+                &calls[1].address,
+                Address::Call {
+                    recorded_event: Some(11),
+                    occurrence: 0,
+                    ..
+                }
+            ),
+            "a paired call is keyed by its recorded event, not by position"
         );
         assert!(matches!(calls[1].value, Value::Diverged { .. }));
         assert!(matches!(calls[2].value, Value::Absent));
+        assert!(matches!(
+            &calls[2].address,
+            Address::Call {
+                recorded_event: Some(20),
+                ..
+            }
+        ));
         assert!(matches!(calls[3].value, Value::Novel { .. }));
+        assert!(
+            matches!(
+                &calls[3].address,
+                Address::Call {
+                    recorded_event: None,
+                    occurrence: 0,
+                    ..
+                }
+            ),
+            "a novel call has no recorded counterpart and is keyed by position"
+        );
+        assert!(matches!(
+            &calls[4].address,
+            Address::Call {
+                recorded_event: None,
+                occurrence: 1,
+                ..
+            }
+        ));
         let status = tree
             .entries
             .iter()
@@ -454,25 +552,29 @@ mod tests {
         let back = BehaviourTree::from_jsonl(&text).unwrap();
         assert_eq!(back.entries.len(), tree.entries.len());
         assert_eq!(back.lanes, tree.lanes);
+        assert_eq!(back.correlations, tree.correlations);
+        assert_eq!(back.entries[1].address, tree.entries[1].address);
     }
 
     #[test]
-    fn seams_and_inconclusive_rows_are_not_addresses() {
-        let mut seam = row(
-            "matched",
-            "c1",
-            "request>deja::grpc_incoming>payment_sync>x",
-            serde_json::json!({}),
-        );
+    fn seams_and_inconclusive_rows_are_not_addresses_but_still_mark_the_request_driven() {
+        let span = "request>deja::grpc_incoming>payment_sync>x";
+        let mut seam = row("matched", "c1", span, Some(1), serde_json::json!({}));
         seam.boundary = "time".into();
         let mut inconclusive = row(
             "inconclusive_race",
             "c1",
-            "request>deja::grpc_incoming>payment_sync>x",
+            span,
+            Some(2),
             serde_json::json!({}),
         );
         inconclusive.boundary = "db".into();
         let tree = build("run", &[seam, inconclusive], &[]);
         assert!(tree.entries.is_empty());
+        assert_eq!(
+            tree.correlations.len(),
+            1,
+            "the request was driven even though nothing in it is an address"
+        );
     }
 }
