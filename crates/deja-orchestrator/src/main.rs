@@ -1940,6 +1940,11 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
 /// A run's behaviour tree: read from the cache beside its ledger when one is
 /// there, else built from the ledger and the http diffs and cached. `Err` names
 /// why no tree can exist for the run (no ledger, so nothing was scored).
+///
+/// Every file is opened through a path that was resolved and confirmed to lie
+/// under its own directory, and the cache is named off the resolved ledger
+/// path rather than off the id, so no file is read or written at a path the
+/// id alone chose.
 async fn behaviour_tree_for(
     st: &AppState,
     id: &str,
@@ -1948,23 +1953,29 @@ async fn behaviour_tree_for(
 
     hydrate_run_artifacts(st, id).await;
     let runs_dir = st.root.root.join("runs");
-    if let Some(cached) = confined(st.root.behaviour_tree_path(id), &runs_dir) {
-        if let Some(tree) = std::fs::read_to_string(&cached)
-            .ok()
-            .and_then(|t| BehaviourTree::from_jsonl(&t))
-        {
-            if tree.canon_version == behaviour_tree::CANON_VERSION {
-                return Ok(tree);
-            }
-        }
-    }
     let Some(ledger_path) = confined(st.root.call_ledger_path(id), &runs_dir) else {
         return Err(format!(
             "run {id} published no call ledger, so it was never scored and has no behaviour to compare"
         ));
     };
-    let rows: Vec<divergence::ledger::CallRecord> = std::fs::read_to_string(&ledger_path)
-        .map_err(|e| format!("read call ledger of {id}: {e}"))?
+    // `<run>.call-ledger.jsonl` → `<run>.behaviour-tree.jsonl`, beside it
+    let cache = ledger_path.with_file_name(
+        ledger_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .replace(".call-ledger.", ".behaviour-tree."),
+    );
+    if let Some(tree) = Some(&cache)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| BehaviourTree::from_jsonl(&t))
+        .filter(|t| t.canon_version == behaviour_tree::CANON_VERSION)
+    {
+        return Ok(tree);
+    }
+    let rows: Vec<divergence::ledger::CallRecord> = Some(&ledger_path)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .ok_or_else(|| format!("read call ledger of {id}"))?
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -1980,12 +1991,7 @@ async fn behaviour_tree_for(
             })
             .unwrap_or_default();
     let tree = behaviour_tree::build(id, &rows, &diffs);
-    // cached next to the ledger it was built from, under the resolved ledger
-    // path rather than a path the id alone chose
-    let _ = std::fs::write(
-        ledger_path.with_file_name(format!("{id}.behaviour-tree.jsonl")),
-        tree.to_jsonl(),
-    );
+    let _ = Some(&cache).map(|p| std::fs::write(p, tree.to_jsonl()));
     Ok(tree)
 }
 
