@@ -2418,3 +2418,50 @@ mod db_result_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod optional_return_round_trip {
+    use crate::codec::{ReplayCodec, SerdeCodec};
+
+    /// A `Substitute` boundary returning `Some(None)` must replay `Some(None)`.
+    ///
+    /// `Cache::get_val<T>` returns `Option<T>`, and a config lookup instantiates
+    /// `T = Option<Config>`, so the captured type is `Option<Option<_>>`. Serde
+    /// flattens both arms onto JSON `null`: a cache HIT holding "this config does
+    /// not exist" records the same byte as a cache MISS, and replay reads the
+    /// miss. The site then runs its populate path — a redis read, a db find and a
+    /// redis write the recording never made — and every one of them is a blocking
+    /// novel call. It was the first divergence in 325 of 376 failing correlations
+    /// on one self-replay.
+    #[test]
+    fn a_present_none_is_not_an_absent_one() {
+        type Cached = Option<Option<String>>;
+        let hit_holding_nothing: Cached = Some(None);
+        let miss: Cached = None;
+
+        let (hit_json, _) = SerdeCodec::<Cached>::capture(&hit_holding_nothing);
+        let (miss_json, _) = SerdeCodec::<Cached>::capture(&miss);
+
+        // Vacuity guard: both must actually capture, or the assertions below
+        // are about a failure to serialise rather than about the encoding.
+        assert!(
+            SerdeCodec::<Cached>::reconstruct(hit_json.clone()).is_some(),
+            "the hit must round-trip at all"
+        );
+
+        assert_ne!(
+            hit_json, miss_json,
+            "a cache hit holding None and a cache miss must not be the same byte"
+        );
+        assert_eq!(
+            SerdeCodec::<Cached>::reconstruct(hit_json),
+            Some(Some(None)),
+            "and the hit must come back as a hit"
+        );
+        assert_eq!(
+            SerdeCodec::<Cached>::reconstruct(miss_json),
+            Some(None),
+            "while the miss still comes back as a miss"
+        );
+    }
+}
