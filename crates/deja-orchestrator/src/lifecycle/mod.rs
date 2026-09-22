@@ -5238,6 +5238,32 @@ fn is_group(name: &str) -> bool {
     !name.starts_with("rec-") && !name.starts_with("run-")
 }
 
+/// Which members of a group a replay may READ, and which it must leave alone.
+///
+/// Sealed members only, returned as `(sealed, open)` with the caller's order
+/// kept so two runs of one group drive the same tape.
+///
+/// An open member has no manifest, and pulling one COMPACTS it — a write,
+/// issued from the path that serves a replay. That is why a group with one open
+/// member failed for every correlation in it, including those living entirely
+/// in sealed members: the pull reached the open one and the replay role has no
+/// `s3:PutObject`, correctly. Selecting here is what keeps the read read-only.
+///
+/// A member whose manifest could not be read counts as open. Leaving a sealed
+/// recording out costs one member of one run; compacting an open one races the
+/// sealer over what is still being written.
+fn replayable_members(ids: Vec<String>, sealed: &[bool]) -> (Vec<String>, Vec<String>) {
+    let mut members = Vec::new();
+    let mut open = Vec::new();
+    for (i, id) in ids.into_iter().enumerate() {
+        match sealed.get(i).copied().unwrap_or(false) {
+            true => members.push(id),
+            false => open.push(id),
+        }
+    }
+    (members, open)
+}
+
 fn pull_recording(
     root: &HarnessRoot,
     ctx: &StoreCtx,
@@ -5330,8 +5356,32 @@ fn pull_recording(
                     cfg.bucket
                 ));
             }
+            // Sealed members only — see `replayable_members`.
+            let sealed: Vec<bool> = deja_compactor::read_manifests(&cfg, &ids)?
+                .iter()
+                .map(Option::is_some)
+                .collect();
+            let landed = ids.len();
+            let (ids, open) = replayable_members(ids, &sealed);
+            if !open.is_empty() {
+                // Named, not counted: a run has to record which members it did
+                // not drive, or a short tape reads as a short recording.
+                let line = format!(
+                    "group {recording_id}: {} of {landed} member(s) still open, left out: {}",
+                    open.len(),
+                    open.join(", ")
+                );
+                eprintln!("lifecycle: {line}");
+                ctx.log("ingest", &line);
+            }
+            if ids.is_empty() {
+                return Err(format!(
+                    "group {recording_id} has {landed} member(s) and none of them is sealed \
+                     yet — a replay reads sealed recordings, and sealing is the sealer's to do"
+                ));
+            }
             let line = format!(
-                "group {recording_id} resolves to {} recording(s)",
+                "group {recording_id} resolves to {} sealed recording(s)",
                 ids.len()
             );
             eprintln!("lifecycle: {line}");
@@ -5586,6 +5636,80 @@ mod tests {
         assert!(
             !super::is_group("rec-typo"),
             "a malformed recording id is a recording, not a group"
+        );
+    }
+
+    /// An open member is left out of the pull and NAMED.
+    ///
+    /// Pulling one compacts it, which is a write from a read path, and the
+    /// whole group failed on it — sealed members included. Naming it matters as
+    /// much as excluding it: a run that silently drove fewer members reads as a
+    /// recording that held less.
+    #[test]
+    fn a_group_replays_its_sealed_members_and_names_the_open_ones() {
+        let ids = vec![
+            "rec-80d4269-09210932-fb".to_owned(),
+            "rec-80d4269-09211610-jv".to_owned(),
+            "rec-80d4269-09212251-c1".to_owned(),
+        ];
+        let (members, open) = super::replayable_members(ids, &[false, true, false]);
+        assert_eq!(
+            members,
+            vec!["rec-80d4269-09211610-jv".to_owned()],
+            "only the sealed member may be read"
+        );
+        assert_eq!(
+            open,
+            vec![
+                "rec-80d4269-09210932-fb".to_owned(),
+                "rec-80d4269-09212251-c1".to_owned(),
+            ],
+            "both open members are reported by name, not as a count"
+        );
+    }
+
+    /// Sealed members keep the order they were given, so two runs of one group
+    /// drive the same tape and a diff between them is about the recording.
+    #[test]
+    fn selecting_members_does_not_reorder_them() {
+        let ids = vec![
+            "rec-a-1-x".to_owned(),
+            "rec-b-2-y".to_owned(),
+            "rec-c-3-z".to_owned(),
+        ];
+        let (members, open) = super::replayable_members(ids, &[true, false, true]);
+        assert_eq!(members, vec!["rec-a-1-x".to_owned(), "rec-c-3-z".to_owned()]);
+        assert!(open.len() == 1, "the middle member is the only open one");
+    }
+
+    /// A group whose members have all landed but none sealed yields NO members,
+    /// so the caller refuses instead of pulling — which is what compacted an
+    /// open recording from a replay.
+    #[test]
+    fn a_group_with_nothing_sealed_yields_no_members_to_pull() {
+        let ids = vec!["rec-a-1-x".to_owned(), "rec-b-2-y".to_owned()];
+        let (members, open) = super::replayable_members(ids, &[false, false]);
+        assert!(
+            members.is_empty(),
+            "nothing sealed means nothing a replay may read"
+        );
+        assert_eq!(open.len(), 2, "and both are named as still open");
+    }
+
+    /// A member the manifest read could not answer for counts as OPEN.
+    ///
+    /// Leaving a sealed recording out costs one member of one run; compacting
+    /// an open one races the sealer over what is still being written.
+    #[test]
+    fn a_member_with_no_seal_answer_is_treated_as_open() {
+        let ids = vec!["rec-a-1-x".to_owned(), "rec-b-2-y".to_owned()];
+        // Shorter than `ids`: the second member got no answer at all.
+        let (members, open) = super::replayable_members(ids, &[true]);
+        assert_eq!(members, vec!["rec-a-1-x".to_owned()]);
+        assert_eq!(
+            open,
+            vec!["rec-b-2-y".to_owned()],
+            "an unanswered member is left alone, not read"
         );
     }
 
