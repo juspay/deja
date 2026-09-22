@@ -660,6 +660,14 @@ export type RecordingCorrelations = {
    * rendered as an empty list.
    */
   correlations?: CorrelationRow[] | null;
+  /**
+   * The largest `max_correlations` this deployment will accept, from its
+   * `DEJA_MAX_CORRELATIONS_PER_RUN`. Absent on a server older than the
+   * configurable cap, in which case the client falls back to its own constant.
+   */
+  max_per_run?: number;
+  /** What a run drives when it names no cap. Absent on an older server. */
+  default_per_run?: number;
 };
 
 /**

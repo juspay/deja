@@ -288,6 +288,16 @@ pub struct RunSpec {
     /// counted omitted. Unset/empty = drive everything.
     #[serde(default)]
     pub correlation_filter: Option<Vec<String>>,
+    /// For mode=replay: how many correlations this run may drive.
+    ///
+    /// Unset = [`scope::DEFAULT_CORRELATIONS_PER_RUN`]. Bounded by the
+    /// deployment's `DEJA_MAX_CORRELATIONS_PER_RUN`, and a request above that
+    /// ceiling is refused rather than clamped: a run that drove fewer cases than
+    /// it was asked for would score the ones it skipped as though they had
+    /// passed. Applies to an explicit `correlation_filter` too — the filter is
+    /// the list, this is how long the list may be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_correlations: Option<usize>,
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,
@@ -1234,6 +1244,7 @@ mod run_params_tests {
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            max_correlations: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,

@@ -38,14 +38,28 @@ import { ApiError, recordingCorrelations } from "./api";
  *    arbitrary hundred — which is what makes it a defensible default and
  *    something the form can state in words.
  *
- * `RunSpec` has no limit field, so a client bounds a run only by naming ids.
+ * This is the CLIENT'S FALLBACK, not the authority. `RunSpec.max_correlations`
+ * now carries a limit, and the server reports both its default and its ceiling
+ * on the correlations endpoint — so a deployment that has raised either one is
+ * described by `defaultPerRun`/`ceiling` below, and this constant is what a
+ * client falls back to when talking to a server too old to send them.
+ *
  * When the ids are knowable this module names them, so the run's scope is
  * exactly what the form showed. When they are not (an unsealed recording), the
  * request carries no filter and the ORCHESTRATOR applies the same limit — the
- * one case where the dashboard cannot say in advance which hundred will run, and
- * says that instead of guessing.
+ * one case where the dashboard cannot say in advance which correlations will
+ * run, and says that instead of guessing.
  */
 export const CORRELATION_CAP = 100;
+
+/**
+ * The client's fallback for the largest cap a run may ask for.
+ *
+ * Mirrors the orchestrator's built-in ceiling. Like `CORRELATION_CAP` it is a
+ * fallback only: a deployment that raised or lowered the ceiling reports its own
+ * value, and `ceiling` below prefers that over this.
+ */
+export const CORRELATION_CAP_CEILING = 500;
 
 /**
  * How much of the index to pull for the picker.
@@ -102,6 +116,17 @@ export type CorrelationSource = {
   defaultScope: string[];
   /** True when the cap is applied by the orchestrator because this page cannot name the ids. */
   defaultIsServerSide: boolean;
+  /**
+   * What a run here drives when it names no cap — the SERVER'S default when it
+   * reported one, `CORRELATION_CAP` otherwise.
+   *
+   * Read from the same response as the rows, so the number the form states is
+   * the number that deployment will actually apply rather than one this bundle
+   * was built with.
+   */
+  defaultPerRun: number;
+  /** The largest cap this deployment accepts. Server's, or the fallback. */
+  ceiling: number;
 };
 
 /**
@@ -187,7 +212,9 @@ export function useCorrelationCandidates(recordingId: string): CorrelationSource
 
   // Exact even when `candidates` is only a page: the page starts at offset 0 in
   // the index's own order, so its first N are the index's first N.
-  const defaultScope = candidates.slice(0, CORRELATION_CAP).map((c) => c.id);
+  const defaultPerRun = data?.default_per_run ?? CORRELATION_CAP;
+  const ceiling = data?.max_per_run ?? CORRELATION_CAP_CEILING;
+  const defaultScope = candidates.slice(0, defaultPerRun).map((c) => c.id);
 
   return {
     candidates,
@@ -200,5 +227,7 @@ export function useCorrelationCandidates(recordingId: string): CorrelationSource
     error: q.error && !notFound ? String(q.error) : undecoded,
     defaultScope,
     defaultIsServerSide: defaultScope.length === 0,
+    defaultPerRun,
+    ceiling,
   };
 }

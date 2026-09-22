@@ -1103,7 +1103,7 @@ struct AdmissionStamp {
     /// Extra text for the verdict line, `None` when there is nothing a reader
     /// needs warning about. Driving fewer correlations than the recording holds
     /// is the ordinary case — a run is capped at
-    /// [`crate::scope::MAX_CORRELATIONS_PER_RUN`] — so a line here would be
+    /// [`crate::scope::DEFAULT_CORRELATIONS_PER_RUN`] — so a line here would be
     /// noise on every run and would stop being read exactly when it mattered.
     line: Option<String>,
     /// The numbers, always. A reader who wants to check a verdict's denominator
@@ -1170,7 +1170,7 @@ fn admission_stamp(admission: &TapeAdmission, recording_id: &str, run: &Run) -> 
 /// An unbounded replay must not be reachable. Driving a whole session is not a
 /// choice anyone makes on purpose — the one run that did it drove 455
 /// correlations, took 439.8s and died in the scorer — so an absent filter
-/// resolves to the first [`crate::scope::MAX_CORRELATIONS_PER_RUN`] in tape
+/// resolves to the first [`crate::scope::DEFAULT_CORRELATIONS_PER_RUN`] in tape
 /// order rather than to everything.
 ///
 /// The resolution is written back into `run.spec.correlation_filter`, so what
@@ -1226,7 +1226,11 @@ fn resolve_correlation_filter(
         .filter(|id| !admission.excludes(id))
         .cloned()
         .collect();
-    let resolved = crate::scope::resolve_run_correlations(requested.as_deref(), &admissible)?;
+    let resolved = crate::scope::resolve_run_correlations(
+        requested.as_deref(),
+        &admissible,
+        run.spec.max_correlations,
+    )?;
     // An explicit filter is the caller's list, so it can name a correlation the
     // recording cannot show whole. Driving it anyway would score a half-landed
     // request as though it were a whole one — the failure this phase exists to
@@ -6306,6 +6310,7 @@ mod tests {
         Run {
             run_id: "r1".into(),
             spec: RunSpec {
+                max_correlations: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Record,
                 system_under_test: None,
@@ -6379,6 +6384,7 @@ mod tests {
         Run {
             run_id: "run-backstop".into(),
             spec: RunSpec {
+                max_correlations: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,
@@ -6567,7 +6573,7 @@ mod tests {
         resolve_correlation_filter(&root, &mut run, &StoreCtx::disabled("run-cap"), "rec").unwrap();
 
         let resolved = run.spec.correlation_filter.clone().unwrap();
-        assert_eq!(resolved.len(), crate::scope::MAX_CORRELATIONS_PER_RUN);
+        assert_eq!(resolved.len(), crate::scope::DEFAULT_CORRELATIONS_PER_RUN);
         assert!(!resolved.contains(&recorded[0]));
         assert!(!resolved.contains(&recorded[7]));
         let admissible: Vec<String> = recorded
@@ -6577,7 +6583,7 @@ mod tests {
             .collect();
         assert_eq!(
             resolved,
-            admissible[..crate::scope::MAX_CORRELATIONS_PER_RUN].to_vec(),
+            admissible[..crate::scope::DEFAULT_CORRELATIONS_PER_RUN].to_vec(),
             "still recording order — the exclusion removes, it does not reorder"
         );
     }
@@ -6799,10 +6805,10 @@ mod tests {
         let resolved = run.spec.correlation_filter.clone().expect(
             "the run must carry the concrete ids it will drive, not an empty filter and a rule",
         );
-        assert_eq!(resolved.len(), crate::scope::MAX_CORRELATIONS_PER_RUN);
+        assert_eq!(resolved.len(), crate::scope::DEFAULT_CORRELATIONS_PER_RUN);
         assert_eq!(
             resolved,
-            recorded[..crate::scope::MAX_CORRELATIONS_PER_RUN].to_vec(),
+            recorded[..crate::scope::DEFAULT_CORRELATIONS_PER_RUN].to_vec(),
             "the earliest hundred requests, in recording order"
         );
         // And the scope every stage builds from the spec now covers exactly them.
@@ -7110,6 +7116,7 @@ mod tests {
         let run = Run {
             run_id: run_id.to_owned(),
             spec: RunSpec {
+                max_correlations: None,
                 scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
@@ -9095,6 +9102,7 @@ mod stage_timing {
         let mut run = Run {
             run_id: "run-timing".into(),
             spec: RunSpec {
+                max_correlations: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,

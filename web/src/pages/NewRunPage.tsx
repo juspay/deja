@@ -8,7 +8,7 @@ import { RecordingPicker, RecordingSummary } from "../components/RecordingPicker
 import { CorrelationPicker } from "../components/CorrelationPicker";
 import { spanOf } from "../lib/recordings";
 import { useSystems } from "../lib/systems";
-import { CORRELATION_CAP, useCorrelationCandidates } from "../lib/correlations";
+import { useCorrelationCandidates } from "../lib/correlations";
 import { daySummary, groupRecordings } from "../lib/recordings";
 
 function shellQuote(value: string): string {
@@ -85,6 +85,13 @@ export default function NewRunPage() {
   const [candidateRepo, setCandidateRepo] = React.useState("");
   const [s3Path, setS3Path] = React.useState(params.get("s3") ?? "");
   const [corrs, setCorrs] = React.useState<string[]>([]);
+  // How many correlations an UNFILTERED run drives here.
+  //
+  // Null is "did not choose", which is not the same as choosing whatever number
+  // this form is currently showing: the spec then carries no cap at all and the
+  // orchestrator applies its own. A deployment that raises its default is
+  // therefore not silently overridden by a value this bundle rendered.
+  const [maxCorr, setMaxCorr] = React.useState<number | null>(null);
   const [expectation, setExpectation] = React.useState("");
   const [launched, setLaunched] = React.useState<string | null>(null);
 
@@ -159,8 +166,17 @@ export default function NewRunPage() {
   // mistaken for "picked and trimmed", which are different situations with
   // different rules.
   const usingDefault = corrs.length === 0;
-  const scope = usingDefault ? corrSource.defaultScope : corrs;
-  const overCap = corrs.length > CORRELATION_CAP;
+  // The cap in force: the caller's if they named one, else this deployment's
+  // own default as the server reported it.
+  const cap = maxCorr ?? corrSource.defaultPerRun;
+  // Re-sliced here against that cap rather than taken from the hook, so the
+  // list the form SHOWS stays the list the run will DRIVE when the cap moves.
+  const defaultScope = React.useMemo(
+    () => corrSource.candidates.slice(0, cap).map((c) => c.id),
+    [corrSource.candidates, cap],
+  );
+  const scope = usingDefault ? defaultScope : corrs;
+  const overCap = corrs.length > cap;
 
   const triggerSpec = React.useMemo(() => {
     const candidate = imageRef
@@ -210,9 +226,11 @@ export default function NewRunPage() {
     // payload rather than trusted to be empty, because the picker's default is
     // a non-empty list.
     if (!recordingGroup.trim() && scope.length) spec.correlation_filter = scope;
+    // Only when the caller actually chose one — see `maxCorr` above.
+    if (maxCorr != null) spec.max_correlations = maxCorr;
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [candidateRepo, expectation, imageRef, recordingGroup, recordingId, s3Path, scope, systemUnderTest]);
+  }, [candidateRepo, expectation, imageRef, maxCorr, recordingGroup, recordingId, s3Path, scope, systemUnderTest]);
 
   const curlCommand = React.useMemo(
     () =>
@@ -507,6 +525,45 @@ export default function NewRunPage() {
           />
         </label>
 
+        <label>
+          how many to drive{" "}
+          <span className="hint">
+            (the ceiling on this run — default {corrSource.defaultPerRun}, at most{" "}
+            {corrSource.ceiling} here; leave blank to let the orchestrator apply its own)
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={corrSource.ceiling}
+            step={1}
+            placeholder={String(corrSource.defaultPerRun)}
+            value={maxCorr ?? ""}
+            onChange={(e) => {
+              const raw = e.target.value.trim();
+              if (!raw) return setMaxCorr(null);
+              const n = Number.parseInt(raw, 10);
+              // A blank or unparseable box is "did not choose", never zero: zero
+              // is refused by the server and would read here as "drive nothing".
+              setMaxCorr(Number.isFinite(n) && n > 0 ? n : null);
+            }}
+          />
+        </label>
+
+        {maxCorr != null && maxCorr > corrSource.ceiling && (
+          <div className="scopewarn">
+            <p>
+              <b>
+                {maxCorr.toLocaleString()} is above this deployment's ceiling of{" "}
+                {corrSource.ceiling.toLocaleString()}.
+              </b>{" "}
+              The run will be refused rather than trimmed — a run that drove fewer cases than it
+              was asked for would score the ones it skipped as though they had passed. Raise
+              <code> DEJA_MAX_CORRELATIONS_PER_RUN </code> on the orchestrator, or split the work
+              across runs.
+            </p>
+          </div>
+        )}
+
         <div className="recfield">
           <span className="reclabel">
             correlations to drive{" "}
@@ -517,7 +574,7 @@ export default function NewRunPage() {
           </span>
           <CorrelationPicker
             source={corrSource}
-            cap={CORRELATION_CAP}
+            cap={cap}
             value={corrs}
             onChange={setCorrs}
           />
@@ -526,7 +583,8 @@ export default function NewRunPage() {
         {/* THE DEFAULT, STATED BEFORE IT IS USED. Nothing selected does not mean
             "the whole session" — the live recordings hold 42,310 and 170,568
             correlations, and the spec has no limit field, so an unfiltered run
-            would drive every one of them. It means the first CORRELATION_CAP.
+            would drive every one of them. It means the first `cap` — this
+            deployment's default unless the caller raised it above.
 
             "First" is worth a sentence rather than a term: correlation ids sort
             by when the request arrived, so the head of the index is the opening
@@ -539,8 +597,8 @@ export default function NewRunPage() {
             <p>
               <b>
                 Nothing selected — this run will drive the first{" "}
-                {scope.length ? scope.length.toLocaleString() : CORRELATION_CAP} correlation
-                {(scope.length || CORRELATION_CAP) === 1 ? "" : "s"}
+                {scope.length ? scope.length.toLocaleString() : cap} correlation
+                {(scope.length || cap) === 1 ? "" : "s"}
                 {corrSource.total != null ? ` of ${corrSource.total.toLocaleString()}` : ""}.
               </b>{" "}
               Correlations are ordered by when the request arrived, so these are the earliest
@@ -554,9 +612,9 @@ export default function NewRunPage() {
               Pick specific correlations above to replace this.
             </p>
 
-            {corrSource.defaultIsServerSide ? (
+            {defaultScope.length === 0 ? (
               <p className="hint">
-                Which {CORRELATION_CAP} cannot be named here: this recording's index is not readable
+                Which {cap} cannot be named here: this recording's index is not readable
                 yet, so the request goes out without a filter and the orchestrator applies the limit
                 itself.
               </p>
@@ -590,12 +648,13 @@ export default function NewRunPage() {
         {overCap && (
           <p className="scopewarn">
             <b>
-              {corrs.length.toLocaleString()} correlations selected, over the limit of{" "}
-              {CORRELATION_CAP}.
+              {corrs.length.toLocaleString()} correlations selected, over this run's limit of{" "}
+              {cap}.
             </b>{" "}
             Nothing will be sent until the selection fits — it is not trimmed to the first{" "}
-            {CORRELATION_CAP}, because a run that drove {CORRELATION_CAP} of{" "}
-            {corrs.length.toLocaleString()} would still score as if it had driven them all.
+            {cap}, because a run that drove {cap} of {corrs.length.toLocaleString()} would still
+            score as if it had driven them all. Raise “how many to drive” above (up to{" "}
+            {corrSource.ceiling}) to keep this selection.
           </p>
         )}
 

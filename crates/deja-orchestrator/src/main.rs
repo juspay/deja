@@ -426,9 +426,10 @@ async fn v1_create_run(
     // lifecycle refuses it too — that is the gate no caller can go around — but
     // a request that will never be honoured should fail as a 400 now rather than
     // as a failed run several minutes later.
-    if let Err(e) =
-        deja_orchestrator::scope::check_requested_correlations(spec.correlation_filter.as_deref())
-    {
+    if let Err(e) = deja_orchestrator::scope::check_requested_correlations(
+        spec.correlation_filter.as_deref(),
+        spec.max_correlations,
+    ) {
         return error_resp(400, &e);
     }
     let run = match runs::persist_new(&st.root, spec) {
@@ -1373,7 +1374,8 @@ async fn v1_recording_correlations(
                 // "showing 100 of 455" needs the 455 to stay the recording's.
                 "total": cases.len(),
                 "matched": matched.len(),
-                "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+                "max_per_run": deja_orchestrator::scope::correlation_cap_ceiling(),
+            "default_per_run": deja_orchestrator::scope::DEFAULT_CORRELATIONS_PER_RUN,
                 "offset": offset,
                 "limit": limit,
                 "correlations": page,
@@ -1402,7 +1404,8 @@ async fn v1_recording_correlations(
                 // many correlations it holds is unknown rather than none.
                 "total": total,
                 "matched": serde_json::Value::Null,
-                "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+                "max_per_run": deja_orchestrator::scope::correlation_cap_ceiling(),
+            "default_per_run": deja_orchestrator::scope::DEFAULT_CORRELATIONS_PER_RUN,
                 "offset": offset,
                 "limit": limit,
                 "correlations": serde_json::Value::Null,
@@ -1423,7 +1426,8 @@ async fn v1_recording_correlations(
             // was sealed as one holding nothing.
             "total": correlations,
             "matched": serde_json::Value::Null,
-            "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+            "max_per_run": deja_orchestrator::scope::correlation_cap_ceiling(),
+            "default_per_run": deja_orchestrator::scope::DEFAULT_CORRELATIONS_PER_RUN,
             "cases": Vec::<serde_json::Value>::new(),
             "note": "sealed before the correlation index existed: the manifest knows how many \
                      correlations the seal covered but not which",
@@ -2304,6 +2308,7 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                max_correlations: None,
                 scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
                 system_under_test: None,

@@ -31,7 +31,7 @@ use deja_forest::{root_for, RootResolution};
 
 use crate::{HarnessRoot, Run, RunSpec};
 
-/// The most correlations one replay run drives.
+/// The correlations one replay run drives when the caller does not choose.
 ///
 /// Seeding is LINEAR in correlations — 362.5s for 455 (~0.8 s/correlation) and
 /// 3.8s for 3 (1.27 s/correlation) — so 100 costs roughly 80 seconds of seeding,
@@ -41,62 +41,153 @@ use crate::{HarnessRoot, Run, RunSpec};
 /// unfiltered run of a real session is 455 correlations, took 439.8s and died in
 /// the scorer, which is why "no choice" resolves to a bounded default rather
 /// than to everything.
-pub const MAX_CORRELATIONS_PER_RUN: usize = 100;
+pub const DEFAULT_CORRELATIONS_PER_RUN: usize = 100;
 
-/// Refuse an explicit filter larger than [`MAX_CORRELATIONS_PER_RUN`].
+/// The largest cap a caller may ask for, unless the deployment says otherwise.
 ///
-/// A caller that names 400 correlations is asking for something this harness
-/// will not do, and the wrong answer is to drive 100 of them: the run would
-/// score as though it had driven all 400, and the 300 it never touched would
-/// read as clean. So an oversized filter is a refusal, never a truncation. The
-/// cap applies to the NORMALIZED set — blank and duplicate ids are not names of
-/// test cases and must not count against a caller.
-pub fn check_requested_correlations(requested: Option<&[String]>) -> Result<(), String> {
+/// Above the 455 an unfiltered real session holds, so a caller who wants a whole
+/// session can ask for one and know the number was chosen rather than met by
+/// accident. At ~0.8 s/correlation it is about six minutes of seeding, which is
+/// why it is the ceiling and not the default.
+pub const CORRELATION_CAP_CEILING: usize = 500;
+
+/// The ceiling this deployment puts on a run's `max_correlations` —
+/// `DEJA_MAX_CORRELATIONS_PER_RUN`.
+///
+/// A deployment that does not say keeps [`CORRELATION_CAP_CEILING`]. Zero and
+/// unparseable values are ignored rather than honoured: a ceiling of zero would
+/// refuse every run, which nobody sets on purpose, and a value that will not
+/// parse is a typo rather than a policy. Both would otherwise turn a mistyped
+/// variable into a harness that quietly stops driving anything.
+pub fn correlation_cap_ceiling() -> usize {
+    ceiling_from(
+        std::env::var("DEJA_MAX_CORRELATIONS_PER_RUN")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`correlation_cap_ceiling`] against a stated value rather than the
+/// environment's — see [`resolve_cap_against`] for why the variable is read at
+/// the edge and nowhere else.
+fn ceiling_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(CORRELATION_CAP_CEILING)
+}
+
+/// How many correlations one run may drive: what the caller asked for, else the
+/// default.
+///
+/// THE resolution, for every reader. The admission gate and the lifecycle must
+/// agree on one number — a run admitted against one cap and driven against
+/// another is the shape that let a renamed span pass a run whose own record said
+/// the contract was in force.
+///
+/// An explicit request above the ceiling is REFUSED, never clamped, for the same
+/// reason an oversized filter is: a run that drove fewer cases than it was asked
+/// for would score the ones it skipped as though they had passed. The DEFAULT is
+/// clamped rather than refused, because it is not a caller's request — a
+/// deployment that lowers the ceiling below 100 is saying runs are smaller here,
+/// not that every unfiltered run should fail.
+pub fn resolve_correlation_cap(requested: Option<usize>) -> Result<usize, String> {
+    resolve_cap_against(requested, correlation_cap_ceiling())
+}
+
+/// [`resolve_correlation_cap`] against a stated ceiling rather than the
+/// environment's.
+///
+/// Separate so the decision can be tested at all: `#[test]` functions share one
+/// process, so a test that set `DEJA_MAX_CORRELATIONS_PER_RUN` would change the
+/// ceiling under every test reading it concurrently. The env is read once, at
+/// the edge, and every rule below is a pure function of its argument.
+fn resolve_cap_against(requested: Option<usize>, ceiling: usize) -> Result<usize, String> {
+    match requested {
+        None => Ok(DEFAULT_CORRELATIONS_PER_RUN.min(ceiling)),
+        Some(0) => Err(
+            "max_correlations is 0; a run must drive at least one correlation. \
+             Leave it unset to drive the default."
+                .to_owned(),
+        ),
+        Some(n) if n > ceiling => Err(format!(
+            "max_correlations is {n}; this deployment drives at most {ceiling} \
+             correlations in one run. Raise DEJA_MAX_CORRELATIONS_PER_RUN on the \
+             orchestrator, or split this into {} runs.",
+            n.div_ceil(ceiling),
+        )),
+        Some(n) => Ok(n),
+    }
+}
+
+/// Refuse an explicit filter larger than this run's cap.
+///
+/// A caller that names 400 correlations under a cap of 100 is asking for
+/// something this harness will not do, and the wrong answer is to drive 100 of
+/// them: the run would score as though it had driven all 400, and the 300 it
+/// never touched would read as clean. So an oversized filter is a refusal, never
+/// a truncation. The cap applies to the NORMALIZED set — blank and duplicate ids
+/// are not names of test cases and must not count against a caller.
+pub fn check_requested_correlations(
+    requested: Option<&[String]>,
+    requested_cap: Option<usize>,
+) -> Result<usize, String> {
+    check_against(requested, requested_cap, correlation_cap_ceiling())
+}
+
+/// [`check_requested_correlations`] against a stated ceiling — see
+/// [`resolve_cap_against`] for why the environment is not read here.
+fn check_against(
+    requested: Option<&[String]>,
+    requested_cap: Option<usize>,
+    ceiling: usize,
+) -> Result<usize, String> {
+    let cap = resolve_cap_against(requested_cap, ceiling)?;
     if let Some(ids) = RunScope::from_filter(requested).ids() {
-        if ids.len() > MAX_CORRELATIONS_PER_RUN {
+        if ids.len() > cap {
             return Err(format!(
-                "correlation_filter names {} correlations; one run drives at most {}. \
-                 Split this into {} runs — driving a subset under one run id would score \
-                 the correlations it skipped as though they had passed.",
+                "correlation_filter names {} correlations; this run drives at most {cap}. \
+                 Raise max_correlations (up to {}) or split this into {} runs — driving a \
+                 subset under one run id would score the correlations it skipped as though \
+                 they had passed.",
                 ids.len(),
-                MAX_CORRELATIONS_PER_RUN,
-                ids.len().div_ceil(MAX_CORRELATIONS_PER_RUN),
+                ceiling,
+                ids.len().div_ceil(cap),
             ));
         }
     }
-    Ok(())
+    Ok(cap)
 }
 
 /// The concrete correlations a run will drive.
 ///
 /// An absent or blank filter is not "drive everything" for a replay run: it is
-/// "the caller did not choose", and the answer is the first
-/// [`MAX_CORRELATIONS_PER_RUN`] in TAPE ORDER — the earliest requests in the
-/// recording. That is deterministic and explainable ("the first 100 requests of
-/// the session"), and it is a real default rather than a refusal.
+/// "the caller did not choose", and the answer is the first `cap` in TAPE ORDER
+/// — the earliest requests in the recording. That is deterministic and
+/// explainable ("the first hundred requests of the session"), and it is a real
+/// default rather than a refusal.
 ///
 /// The result is always the explicit list, never an empty filter plus a rule
-/// applied somewhere downstream: the run's own record has to show which 100 ran.
+/// applied somewhere downstream: the run's own record has to show which ones
+/// ran. That persisted list is what makes the cap safe to configure — the number
+/// a run was capped at is recoverable from what it drove, not only from an
+/// environment that may have moved since.
+///
 /// A recording with fewer correlations than the cap runs all of them — the cap
 /// is a ceiling, not a target.
 ///
 /// A default keeps tape order, so the persisted list reads as what it is (the
-/// session's first hundred requests, in order); an explicit filter comes back
-/// normalized and sorted. Neither ordering reaches behaviour — [`RunScope`]
-/// takes the list as a set — so the difference is only in how the run's record
-/// reads.
+/// session's first requests, in order); an explicit filter comes back normalized
+/// and sorted. Neither ordering reaches behaviour — [`RunScope`] takes the list
+/// as a set — so the difference is only in how the run's record reads.
 pub fn resolve_run_correlations(
     requested: Option<&[String]>,
     tape_order: &[String],
+    requested_cap: Option<usize>,
 ) -> Result<Vec<String>, String> {
-    check_requested_correlations(requested)?;
+    let cap = check_against(requested, requested_cap, correlation_cap_ceiling())?;
     match RunScope::from_filter(requested).ids() {
         Some(ids) => Ok(ids.iter().cloned().collect()),
-        None => Ok(tape_order
-            .iter()
-            .take(MAX_CORRELATIONS_PER_RUN)
-            .cloned()
-            .collect()),
+        None => Ok(tape_order.iter().take(cap).cloned().collect()),
     }
 }
 
@@ -1132,9 +1223,9 @@ mod tests {
         // LAST hundred requests of the session and call them the first.
         let tape: Vec<String> = (0..455).map(|i| format!("c-{:04}", 455 - i)).collect();
 
-        let resolved = resolve_run_correlations(None, &tape).unwrap();
-        assert_eq!(resolved.len(), MAX_CORRELATIONS_PER_RUN);
-        let expected: Vec<String> = tape[..MAX_CORRELATIONS_PER_RUN].to_vec();
+        let resolved = resolve_run_correlations(None, &tape, None).unwrap();
+        assert_eq!(resolved.len(), DEFAULT_CORRELATIONS_PER_RUN);
+        let expected: Vec<String> = tape[..DEFAULT_CORRELATIONS_PER_RUN].to_vec();
         assert_eq!(
             resolved, expected,
             "the first 100 the recording saw, in the order it saw them, whatever \
@@ -1144,11 +1235,11 @@ mod tests {
         // A blank filter is not a choice either — the dashboard sends one when
         // nothing is selected.
         assert_eq!(
-            resolve_run_correlations(Some(&[]), &tape).unwrap(),
+            resolve_run_correlations(Some(&[]), &tape, None).unwrap(),
             expected
         );
         assert_eq!(
-            resolve_run_correlations(Some(&[" ".to_owned()]), &tape).unwrap(),
+            resolve_run_correlations(Some(&[" ".to_owned()]), &tape, None).unwrap(),
             expected
         );
     }
@@ -1157,7 +1248,7 @@ mod tests {
     fn a_recording_smaller_than_the_cap_runs_all_of_it() {
         // The cap is a ceiling, not a target.
         let tape = ids(40);
-        let resolved = resolve_run_correlations(None, &tape).unwrap();
+        let resolved = resolve_run_correlations(None, &tape, None).unwrap();
         assert_eq!(resolved.len(), 40);
         assert_eq!(resolved, tape);
     }
@@ -1167,33 +1258,128 @@ mod tests {
         // Silently driving 100 of 400 would score the 300 that never ran as
         // though they had passed — a run that looks clean because it did less.
         let asked = ids(101);
-        let err = resolve_run_correlations(Some(&asked), &ids(500)).unwrap_err();
+        let err = resolve_run_correlations(Some(&asked), &ids(500), None).unwrap_err();
         assert!(err.contains("101"), "{err}");
         assert!(err.contains("100"), "{err}");
         assert!(
-            check_requested_correlations(Some(&asked)).is_err(),
+            check_requested_correlations(Some(&asked), None).is_err(),
             "the same refusal is available before a run is created"
         );
 
         // Exactly at the cap is allowed, and is returned whole.
-        let at_cap = ids(MAX_CORRELATIONS_PER_RUN);
+        let at_cap = ids(DEFAULT_CORRELATIONS_PER_RUN);
         assert_eq!(
-            resolve_run_correlations(Some(&at_cap), &[]).unwrap().len(),
-            MAX_CORRELATIONS_PER_RUN
+            resolve_run_correlations(Some(&at_cap), &[], None)
+                .unwrap()
+                .len(),
+            DEFAULT_CORRELATIONS_PER_RUN
         );
     }
 
     #[test]
     fn blanks_and_duplicates_do_not_count_against_a_callers_cap() {
         // The cap is about test cases, and neither a blank nor a repeat is one.
-        let mut asked = ids(MAX_CORRELATIONS_PER_RUN);
+        let mut asked = ids(DEFAULT_CORRELATIONS_PER_RUN);
         asked.push(asked[0].clone());
         asked.push("   ".to_owned());
-        assert!(check_requested_correlations(Some(&asked)).is_ok());
+        assert!(check_requested_correlations(Some(&asked), None).is_ok());
         assert_eq!(
-            resolve_run_correlations(Some(&asked), &[]).unwrap().len(),
-            MAX_CORRELATIONS_PER_RUN
+            resolve_run_correlations(Some(&asked), &[], None)
+                .unwrap()
+                .len(),
+            DEFAULT_CORRELATIONS_PER_RUN
         );
+    }
+
+    #[test]
+    fn a_filter_is_bounded_by_this_runs_cap_not_by_the_ceiling() {
+        // The ceiling is what a caller MAY ask for; the cap is what this run
+        // DID ask for. A filter of 200 is refused under the default cap even
+        // though the deployment would happily run 200 — the caller has to say
+        // so, because a run that quietly grew to fit its filter would make the
+        // number of cases a run drives unanswerable from the run itself.
+        let asked = ids(200);
+        let err = check_against(Some(&asked), None, 500).unwrap_err();
+        assert!(err.contains("200") && err.contains("100"), "{err}");
+        assert!(
+            err.contains("max_correlations"),
+            "the refusal names the knob that lifts it, or the caller is stuck: {err}"
+        );
+
+        // Saying so is all it takes.
+        assert_eq!(check_against(Some(&asked), Some(200), 500).unwrap(), 200);
+    }
+
+    #[test]
+    fn a_cap_above_the_ceiling_is_refused_rather_than_clamped() {
+        // Clamping would return 500 and drive 500 of the 600 asked for, scoring
+        // the 100 it skipped as though they had passed — the same failure an
+        // oversized filter is refused for.
+        let err = resolve_cap_against(Some(600), 500).unwrap_err();
+        assert!(err.contains("600") && err.contains("500"), "{err}");
+        assert!(
+            err.contains("DEJA_MAX_CORRELATIONS_PER_RUN"),
+            "the refusal names the variable that raises the ceiling: {err}"
+        );
+        assert_eq!(
+            resolve_cap_against(Some(500), 500).unwrap(),
+            500,
+            "exactly at the ceiling is allowed, not off by one"
+        );
+    }
+
+    #[test]
+    fn a_lowered_ceiling_clamps_the_default_but_never_raises_it() {
+        // A deployment that says "runs are 50 here" is not saying "every
+        // unfiltered run fails": the default is not a caller's request, so it
+        // bends rather than refusing.
+        assert_eq!(resolve_cap_against(None, 50).unwrap(), 50);
+        // And a generous ceiling does not silently turn a 100-correlation run
+        // into a 500-correlation one. This is the assertion that fails if
+        // anyone "simplifies" the default to the ceiling.
+        assert_eq!(
+            resolve_cap_against(None, 500).unwrap(),
+            DEFAULT_CORRELATIONS_PER_RUN
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_is_refused_rather_than_read_as_unlimited() {
+        // Zero is the spelling someone reaches for meaning "no limit". It is
+        // refused so that it cannot quietly mean "drive nothing" instead.
+        let err = resolve_cap_against(Some(0), 500).unwrap_err();
+        assert!(err.contains('0'), "{err}");
+    }
+
+    #[test]
+    fn an_unusable_ceiling_variable_keeps_the_built_in_one() {
+        // A ceiling of zero, or a typo, would otherwise refuse every run in the
+        // deployment that mistyped it — a harness that stops driving anything
+        // because of a stray character.
+        assert_eq!(ceiling_from(None), CORRELATION_CAP_CEILING);
+        assert_eq!(ceiling_from(Some("")), CORRELATION_CAP_CEILING);
+        assert_eq!(ceiling_from(Some("0")), CORRELATION_CAP_CEILING);
+        assert_eq!(ceiling_from(Some("not-a-number")), CORRELATION_CAP_CEILING);
+        assert_eq!(
+            ceiling_from(Some(" 250 ")),
+            250,
+            "surrounding space is a deployment's whitespace, not its policy"
+        );
+        assert_eq!(
+            ceiling_from(Some("900")),
+            900,
+            "a deployment may raise the ceiling above the built-in default"
+        );
+    }
+
+    #[test]
+    fn a_raised_cap_takes_more_of_the_tape_in_the_order_it_was_recorded() {
+        // The ids sort backwards against the traffic, so a resolution that
+        // sorted would return the LAST 300 and call them the first.
+        let tape: Vec<String> = (0..455).map(|i| format!("c-{:04}", 455 - i)).collect();
+        let more = resolve_run_correlations(None, &tape, Some(300)).unwrap();
+        assert_eq!(more.len(), 300);
+        assert_eq!(more, tape[..300].to_vec());
     }
 
     #[test]
@@ -1201,7 +1387,7 @@ mod tests {
         // The default applies to an ABSENT filter only. A caller that named
         // three correlations gets three, not the first hundred.
         let resolved =
-            resolve_run_correlations(Some(&["c-2".to_owned(), "c-1".to_owned()]), &ids(400))
+            resolve_run_correlations(Some(&["c-2".to_owned(), "c-1".to_owned()]), &ids(400), None)
                 .unwrap();
         assert_eq!(resolved, vec!["c-1".to_owned(), "c-2".to_owned()]);
     }
