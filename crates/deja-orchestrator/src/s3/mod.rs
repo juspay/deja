@@ -60,6 +60,15 @@ pub struct IngestReport {
     /// rather than by parsing `prefix`. One entry is a single recording; many
     /// is a deployment's day pulled as one tape.
     pub members: Vec<String>,
+    /// The recordings a group named that this pull did NOT draw from, because
+    /// they are not sealed yet.
+    ///
+    /// Beside `members` rather than in a log line, because this is the
+    /// persisted artifact a reader acts on: a verdict over part of a day is
+    /// honest when the part is stated and misleading when it is not, and prose
+    /// in a log is not something a consumer can check. Empty for a single
+    /// recording and for a group that was pulled whole.
+    pub excluded_members: Vec<String>,
     pub landing_objects: usize,
     pub lines_in: usize,
     pub duplicates_dropped: usize,
@@ -1000,6 +1009,7 @@ impl PullTally {
                 _ => SESSIONS_ROOT.to_owned(),
             },
             members,
+            excluded_members: Vec::new(),
             landing_objects: self.landing_objects,
             lines_in: self.lines_in,
             duplicates_dropped: self.duplicates_dropped,
@@ -1023,10 +1033,9 @@ impl PullTally {
 pub fn pull_recording(
     cfg: &S3Config,
     recording_id: &str,
-    root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, deja_compactor::SessionManifest), String> {
-    let (report, mut manifests) = pull_recordings(cfg, &[recording_id], root, dest)?;
+    let (report, mut manifests) = pull_recordings(cfg, &[recording_id], dest)?;
     // One member in, one manifest out. Delegating rather than keeping a second
     // implementation is the point: the single-recording path IS the many-member
     // path with one member, so it cannot drift from it.
@@ -1065,7 +1074,6 @@ pub fn pull_recording(
 pub fn pull_recordings(
     cfg: &S3Config,
     recording_ids: &[&str],
-    root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, Vec<deja_compactor::SessionManifest>), String> {
     if recording_ids.is_empty() {
@@ -1084,9 +1092,43 @@ pub fn pull_recordings(
     let mut tally = PullTally::default();
 
     for recording_id in recording_ids {
-        let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
-            Some(m) => m,
-            None => deja_compactor::compact_session(cfg, recording_id, root)?,
+        // A REPLAY READS THE TAPE STORE AND NEVER WRITES IT.
+        //
+        // This used to seal an unsealed member right here, by calling
+        // `compact_session` — which writes `sessions/v1/*`. The replay Job's
+        // role is deliberately least-privilege, so a group holding one unsealed
+        // member died with a 403 naming a member nobody had asked about. Five
+        // runs failed that way on one day.
+        //
+        // The permission is the visible half. The other is why this is not
+        // merely a permissions bug: with credentials that allowed it, a replay
+        // would SEAL a recording the sealer has not judged quiescent — a run
+        // altering the evidence it is judged against, and fixing a tape that
+        // may still be being written. Sealing belongs to the job that is
+        // allowed to write tapes and runs on its own schedule.
+        //
+        // The denial does not even fail fast: the object store retries with
+        // backoff, several multipart pieces at a time, so a read becomes a
+        // hang. One recording spent 3,589s there and never reached stage 2.
+        //
+        // The sibling `pull_recording_from_prefix` had promote-on-pull removed
+        // for exactly these reasons and says so at length. This arm did not, so
+        // one half of the puller obeyed a stated rule and the other did not.
+        //
+        // Refusing rather than reading the landing here is deliberate. Only the
+        // GROUP path reaches this function — a single unsealed recording is
+        // short-circuited to the prefix rescan before it gets here — and a
+        // group whose day is not fully sealed is a day that is not ready, which
+        // is what both the dashboard and the pipeline already require before
+        // they offer one. A partial day replayed as if whole would report a
+        // verdict over a denominator that moves.
+        let Some(manifest) = deja_compactor::read_manifest(cfg, recording_id)? else {
+            return Err(format!(
+                "{recording_id} is part of this selection but is not sealed yet, and a replay \
+                 must not seal it — sealing writes the tape store, which a replay may not do \
+                 and is not permitted to. Wait for the sealer to reach it (it runs every 30 \
+                 minutes), or name a day whose recordings are all sealed."
+            ));
         };
         // Scoped so the lines, the joined bytes and the parsed events are all
         // released before the next member is read. Without this the peak is the
@@ -1277,6 +1319,8 @@ pub fn pull_recording_from_prefix(
         // session the scan resolved out of it.
         prefix: format!("s3://{}/{prefix}", cfg.bucket),
         members: vec![resolved.clone()],
+        // One session, resolved whole: nothing was left out.
+        excluded_members: Vec::new(),
         landing_objects: session_objects,
         lines_in: collated.lines_in,
         duplicates_dropped: collated.drops.duplicates,
@@ -1747,6 +1791,7 @@ mod tests {
 
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
+            excluded_members: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in,
@@ -1764,11 +1809,50 @@ mod tests {
         assert!(!report.accounting().contains("UNACCOUNTED"));
     }
 
+    /// A partial run has to say so in the artifact, not only in a log line.
+    ///
+    /// The exclusion was carried in a local, printed to stderr and into the
+    /// ingest log, and then dropped — so the persisted report described a
+    /// subset of a day exactly as it describes a whole one. A consumer reading
+    /// the artifact could not tell the two apart, and prose in a log is not
+    /// something it can check.
+    #[test]
+    fn the_report_names_what_a_partial_pull_left_out() {
+        let report = IngestReport {
+            members: vec!["rec-sealed".to_owned()],
+            excluded_members: vec!["rec-still-open".to_owned()],
+            prefix: "s3://b/p".into(),
+            landing_objects: 1,
+            lines_in: 0,
+            duplicates_dropped: 0,
+            events_out: 0,
+            correlations: 0,
+            sealed: false,
+            markers_dropped: 0,
+            non_envelope_dropped: 0,
+            unparseable_dropped: 0,
+            delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
+        };
+        let json = serde_json::to_value(&report).expect("the report serialises");
+        assert_eq!(
+            json["excluded_members"],
+            serde_json::json!(["rec-still-open"]),
+            "the artifact a reader acts on has to carry the exclusion"
+        );
+        assert_eq!(
+            json["members"],
+            serde_json::json!(["rec-sealed"]),
+            "beside what was drawn from, not instead of it"
+        );
+    }
+
     #[test]
     fn an_unbalanced_report_says_so() {
         // The assertion has to be able to fail, or it is decoration.
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
+            excluded_members: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 139_916,
