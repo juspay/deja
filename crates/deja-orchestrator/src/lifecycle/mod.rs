@@ -5385,24 +5385,29 @@ fn pull_recording(
             // DAY and what was dropped from it; the pull sees one member at a
             // time and cannot say what it is part of. It costs one small GET
             // per member instead of a compaction.
-            // Total by construction: `retain` either keeps an id or pushes it
-            // here, and the `Err(_)` arm keeps rather than drops. That holds
-            // today because the match is three arms long and obviously total;
-            // it stops holding the first time a fourth is added, so assert it.
+            // One store, one runtime, sixteen GETs in flight — read_manifests'
+            // own concurrency — rather than the connection-per-member, runtime-
+            // per-member cost a member-at-a-time read had here: `read_manifest`
+            // builds both fresh on every call, so a group of N cost N of each,
+            // serially, on this fetch path. A wholesale failure (the store
+            // itself, not any one member) reads as every member unreadable, so
+            // it falls through the same per-member rule below rather than
+            // aborting the pull outright.
             let members_before = ids.len();
-            ids.retain(|id| {
-                match deja_compactor::read_manifest(&cfg, id) {
-                    Ok(Some(_)) => true,
-                    Ok(None) => {
-                        excluded.push(id.clone());
-                        false
-                    }
+            let manifests = deja_compactor::read_manifests(&cfg, &ids)
+                .unwrap_or_else(|e| ids.iter().map(|_| Err(e.clone())).collect());
+            let mut kept = Vec::with_capacity(ids.len());
+            for (id, manifest) in ids.into_iter().zip(manifests) {
+                match manifest {
+                    Ok(Some(_)) => kept.push(id),
+                    Ok(None) => excluded.push(id),
                     // A store that cannot answer is not evidence of an unsealed
                     // member. Keep it and let the pull produce the real error,
                     // rather than silently shrinking the day over a transient.
-                    Err(_) => true,
+                    Err(_) => kept.push(id),
                 }
-            });
+            }
+            ids = kept;
             debug_assert_eq!(
                 ids.len() + excluded.len(),
                 members_before,

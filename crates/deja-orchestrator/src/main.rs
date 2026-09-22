@@ -931,13 +931,20 @@ async fn v1_available_recordings(
     // answer, so nothing downstream could tell it from the truth.
     let mut cfg_for_manifests = deja_orchestrator::s3::S3Config::from_env();
     cfg_for_manifests.bucket = scan_bucket.clone();
-    let manifests = tokio::task::spawn_blocking(move || {
-        deja_compactor::read_manifests(&cfg_for_manifests, &ids)
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_default();
+    // This listing does not distinguish "not sealed" from "could not tell" —
+    // read_manifests preserves that per-recording, a replay's membership check
+    // needs it, this enrichment does not.
+    let manifests: Vec<Option<deja_compactor::SessionManifest>> =
+        tokio::task::spawn_blocking(move || {
+            deja_compactor::read_manifests(&cfg_for_manifests, &ids)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.ok().flatten())
+        .collect();
 
     let page: Vec<serde_json::Value> = page_rows
         .into_iter()
