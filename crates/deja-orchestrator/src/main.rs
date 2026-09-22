@@ -1958,14 +1958,10 @@ async fn behaviour_tree_for(
             "run {id} published no call ledger, so it was never scored and has no behaviour to compare"
         ));
     };
-    // `<run>.call-ledger.jsonl` → `<run>.behaviour-tree.jsonl`, beside it
-    let cache = ledger_path.with_file_name(
-        ledger_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .replace(".call-ledger.", ".behaviour-tree."),
-    );
+    // beside the ledger it is built from, named off the confined ledger path
+    // the way the change-coverage cache is named off the replay graph:
+    // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
+    let cache = ledger_path.with_extension("behaviour-tree.jsonl");
     if let Some(tree) = Some(&cache)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| BehaviourTree::from_jsonl(&t))
@@ -1991,7 +1987,7 @@ async fn behaviour_tree_for(
             })
             .unwrap_or_default();
     let tree = behaviour_tree::build(id, &rows, &diffs);
-    let _ = Some(&cache).map(|p| std::fs::write(p, tree.to_jsonl()));
+    let _ = std::fs::write(&cache, tree.to_jsonl());
     Ok(tree)
 }
 
