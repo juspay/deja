@@ -4433,6 +4433,37 @@ fn finish_round_tripped<T, R, O, C, S>(
     }
 }
 
+/// Whether an execute-shadow boundary should SERVE a recorded result instead of
+/// re-running its statement.
+///
+/// An execute boundary re-runs so the replay's state evolves as the recording's
+/// did. A recorded `Err` that changed no state has nothing to evolve, so
+/// re-running it is not "evolving like the recording" — it is evolving
+/// DIFFERENTLY from it. Measured on one self-replay: 40 origins where an INSERT
+/// recorded as a unique-constraint violation replayed `Ok`, because the
+/// per-correlation schema was seeded without the row that made it collide. The
+/// reported divergence is the visible half; the damaging half is that the
+/// replay then WROTE a row the recording never wrote, so every later statement
+/// in that correlation ran against a different database.
+///
+/// Two conditions, and deja owns only the first.
+///
+/// The recorded envelope must say `Err`. That is `ResultCodec`'s own
+/// discriminator, a shape deja defined, so reading it is not deja learning an
+/// error taxonomy. A boundary whose codec writes no discriminator has no
+/// opinion here and is left alone.
+///
+/// And the SITE must have declared that error class state-neutral. A unique
+/// violation wrote nothing; a partially-applied statement did; a timeout or a
+/// deadlock says nothing about state at all and re-running it is how a candidate
+/// that no longer fails that way gets to show it. Only the site can tell these
+/// apart — `UniqueViolation` is a driver concept — so the predicate is the
+/// vendor's over its own error type and deja never inspects the error itself.
+pub fn serves_recorded_error(recorded: &serde_json::Value, site_declares_neutral: bool) -> bool {
+    site_declares_neutral
+        && recorded.get("result").and_then(serde_json::Value::as_str) == Some("Err")
+}
+
 /// The inactive / pure-record branch of [`dispatch`].
 ///
 /// Split out so the inactive fast path stays trivially the same shape as the
@@ -7616,5 +7647,69 @@ mod payload_tests {
         assert!(Payload::default().is_null());
         assert_eq!(Payload::default().to_value(), serde_json::Value::Null);
         assert!(!payload(r#"{"a":1}"#).is_null());
+    }
+}
+
+#[cfg(test)]
+mod serves_recorded_error_tests {
+    use super::serves_recorded_error;
+
+    /// `ResultCodec`'s own envelope shape, which is the only thing deja reads
+    /// here — not the error inside it.
+    fn envelope(result: &str) -> serde_json::Value {
+        serde_json::json!({ "result": result, "value": [] })
+    }
+
+    /// The case this exists for: a recorded constraint violation the site has
+    /// declared state-neutral is served, not re-run.
+    #[test]
+    fn a_declared_neutral_recorded_error_is_served() {
+        assert!(serves_recorded_error(&envelope("Err"), true));
+    }
+
+    /// Undeclared is today's behaviour, unchanged. The whole design rests on the
+    /// site opting in, so a site that says nothing must execute exactly as it
+    /// does now.
+    #[test]
+    fn an_undeclared_recorded_error_still_executes() {
+        assert!(!serves_recorded_error(&envelope("Err"), false));
+    }
+
+    /// A recorded `Ok` executes even where the site declared neutrality.
+    ///
+    /// Neutrality is a claim about an ERROR — that it wrote nothing. A recorded
+    /// success wrote something, and serving it instead of re-running it would
+    /// skip exactly the state change the execute boundary exists to reproduce.
+    #[test]
+    fn a_recorded_ok_executes_even_when_the_site_declares_neutrality() {
+        assert!(!serves_recorded_error(&envelope("Ok"), true));
+    }
+
+    /// A boundary whose codec writes no discriminator is left alone.
+    ///
+    /// Only `ResultCodec` stamps `result`. Without it deja cannot tell a failure
+    /// from a value, and guessing would serve a recorded SUCCESS as though it
+    /// were an error — the inverse of the bug, at a boundary that never asked.
+    #[test]
+    fn an_envelope_without_a_discriminator_is_not_served() {
+        assert!(!serves_recorded_error(
+            &serde_json::json!({ "value": [1, 2] }),
+            true
+        ));
+        assert!(!serves_recorded_error(&serde_json::json!("Err"), true));
+        assert!(!serves_recorded_error(&serde_json::Value::Null, true));
+    }
+
+    /// The discriminator is matched exactly, not by prefix or case. `ResultCodec`
+    /// writes `Ok` and `Err` and nothing else, so anything adjacent is a codec
+    /// deja does not own.
+    #[test]
+    fn the_discriminator_is_matched_exactly() {
+        for other in ["err", "ERR", "Error", "Err2", ""] {
+            assert!(
+                !serves_recorded_error(&envelope(other), true),
+                "{other:?} must not be read as Err"
+            );
+        }
     }
 }
