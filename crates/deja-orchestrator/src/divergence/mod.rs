@@ -4613,6 +4613,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // diverge" but "how much of what it did ran on values the recording never
     // held".
     let mut corr_absorbed: BTreeMap<String, u64> = BTreeMap::new();
+    // Absorbed misses per CALL SITE, for the verdict's reason line. A count
+    // with no location is not an explanation: a run can carry hundreds from one
+    // uncovered seam, and "412 absorbed miss(es)" reads the same as a broken
+    // scorer. The site turns the number into something a reader can act on.
+    let mut absorbed_sites: BTreeMap<String, u64> = BTreeMap::new();
 
     // PASS 1 — resolved calls claim their recorded events. The verdict must be
     // a function of the two SETS (recorded events × observed calls), never of
@@ -4953,6 +4958,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             if let Some(corr) = &obs.correlation_id {
                 *corr_absorbed.entry(corr.clone()).or_insert(0) += 1;
             }
+            *absorbed_sites.entry(call_site_label(obs)).or_insert(0) += 1;
         } else {
             // SHOWN, NOT SCORED. A candidate that calls something the recording
             // never held has ADDED a call, and adding one is what a change is —
@@ -5221,7 +5227,25 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // there would have handed this correlation a clean `passed` — the
         // silent-absorption failure — so the unjudgeable state is carried
         // explicitly instead.
-        let inconclusive = tail_gap_correlations.contains(corr);
+        // An absorbed miss makes its correlation unjudgeable for the same
+        // reason it makes the run unjudgeable: this correlation continued on a
+        // value the recording never held, so "matched" would be a claim about
+        // a trace that is partly fabricated. Without this the run verdict says
+        // inconclusive while `matched_correlations` still counts the
+        // correlation as clean — a headline contradicting its own verdict.
+        // Blocking WINS, mirroring the run rule, where `inconclusive` is
+        // guarded on `blocking_reasons == 0` so a real divergence is never
+        // reported as an unjudgeable. Without the same guard here a
+        // correlation carrying both reported `inconclusive: true`: `passed`
+        // was still false and no count was wrong, but a reader filtering
+        // failures on `!inconclusive` dropped a real divergence into the
+        // "could not tell" bucket. The two levels must not disagree about
+        // which answer wins.
+        let has_blocking =
+            !*status_match || !*body_match || side_effect_divergences > 0 || !span_shape_clean;
+        let inconclusive = !has_blocking
+            && (tail_gap_correlations.contains(corr)
+                || corr_absorbed.get(corr).is_some_and(|&n| n > 0));
         let passed = *status_match
             && *body_match
             && side_effect_divergences == 0
@@ -5309,8 +5333,24 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // the alternative is a run that got quieter without saying why. Everything
     // after an absorbed miss ran on a value the recording never held.
     if absorbed_misses > 0 {
+        // Highest count first, then by name, so one dominant uncovered seam
+        // leads the line and the line itself is stable between two replays of
+        // one candidate.
+        let mut sites: Vec<(&String, &u64)> = absorbed_sites.iter().collect();
+        sites.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let named: Vec<String> = sites
+            .iter()
+            .take(2)
+            .map(|(site, count)| format!("{site} {count}"))
+            .collect();
+        let rest = sites.len().saturating_sub(named.len());
+        let at = if rest > 0 {
+            format!(" at {} and {rest} other site(s)", named.join(", "))
+        } else {
+            format!(" at {}", named.join(", "))
+        };
         reasons.push(format!(
-            "{absorbed_misses} absorbed miss(es): the request continued on a \
+            "{absorbed_misses} absorbed miss(es){at}: the request continued on a \
              declared value the recording did not hold"
         ));
     }
@@ -5372,8 +5412,20 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // a run carrying one has not been shown to be clean and must never report a
     // pass. A seed gap deliberately does not do this — its missing baseline is a
     // single call's, not a whole correlation's unjudged tail.
+    // An absorbed miss joins them, and for the tail gap's exact reason. It is
+    // deliberately NOT a blocking term — an absorbed miss is an added call the
+    // process survived, so it cannot cost more than an unabsorbed one, which
+    // costs nothing. What it costs is CONFIDENCE, and confidence is what this
+    // term means: the run continued on a value the recording never held, so it
+    // has not been SHOWN to be clean whatever its responses looked like.
+    // Subtracting it from `blocking_reasons` while `pass` is
+    // `blocking_reasons == 0` had the effect of excusing it from the only test a
+    // pass applies, so the verdict read "1 absorbed miss(es): the request
+    // continued on a declared value the recording did not hold" beside
+    // `pass: true`.
     let inconclusive = nothing
-        || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0) && blocking_reasons == 0);
+        || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0 || absorbed_misses > 0)
+            && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
         NO_ARTIFACTS_REASON.to_owned()
@@ -9912,16 +9964,186 @@ mod tests {
              which costs nothing. What it costs is confidence, and that is \
              carried by absorbed_misses rather than by this counter"
         );
+        // CONTRACT CHANGED. This asserted `c1.passed` on the grounds that the
+        // response matched and every recorded call resolved. Both are still
+        // true, and they are no longer sufficient: the correlation continued on
+        // a value the recording never held, so counting it in
+        // `matched_correlations` states that a partly fabricated trace matched.
+        // It is not a FAILURE either — the candidate did not diverge — which is
+        // what `inconclusive` is for.
         assert!(
-            c1.passed,
-            "the response matched and every recorded call resolved: {}",
+            !c1.passed,
+            "a correlation that ran on a fabricated value cannot be counted \
+             matched: {}",
             card.verdict.reason
+        );
+        assert!(
+            c1.inconclusive,
+            "and the reason must be that it cannot be judged, not that it \
+             diverged: {}",
+            card.verdict.reason
+        );
+        assert_eq!(
+            card.summary.matched_correlations, 0,
+            "the headline must not contradict its own verdict"
         );
         assert!(
             card.verdict.reason.contains("absorbed miss"),
             "and the verdict must SAY so rather than leaving it to a breakdown \
              nobody reads: {}",
             card.verdict.reason
+        );
+    }
+
+    /// A run that continued on a value the recording never held has not been
+    /// shown to be clean, and must not report a pass.
+    ///
+    /// `absorbed_misses` is subtracted out of `blocking_reasons`, which is right
+    /// — an absorbed miss is an added call the process SURVIVED, so it cannot
+    /// cost more than an unabsorbed one, which costs nothing. But `pass` is
+    /// `!inconclusive && blocking_reasons == 0`, so subtracting it from the only
+    /// term that gates a pass makes the run pass. The reason line says "absorbed
+    /// miss" and the verdict says `pass: true` beside it.
+    ///
+    /// What an absorbed miss costs is CONFIDENCE — the scorecard's own words at
+    /// the subtraction — and confidence is what `inconclusive` already means
+    /// here: a tail gap forces it on exactly this ground, that the run "has not
+    /// been shown to be clean and must never report a pass". An absorbed miss is
+    /// the same statement about what the run is a verdict OVER, so it belongs in
+    /// the same term, not in the blocking count.
+    ///
+    /// This mattered little while a declined miss ended the request. It stops
+    /// being little the moment the miss fallback answers by default.
+    #[test]
+    fn a_run_that_continued_on_a_fabricated_value_is_not_a_pass() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1")],
+            vec![http("c1", true, vec![])],
+        ));
+
+        // Vacuity guard FIRST: this asserts a property of a run carrying an
+        // absorbed miss, so a run carrying none would satisfy it for free.
+        assert_eq!(
+            card.summary.absorbed_misses, 1,
+            "the fixture must actually carry an absorbed miss"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and nothing else may be wrong with it, or the verdict would be decided by something other than the absorbed miss"
+        );
+
+        assert!(
+            !card.verdict.pass,
+            "a run that ran on a fabricated value must not report a pass: {:?}",
+            card.verdict
+        );
+        assert!(
+            card.verdict.inconclusive,
+            "and the honest verdict is INCONCLUSIVE rather than a failure — the              candidate did not diverge, the run simply cannot say it was clean:              {:?}",
+            card.verdict
+        );
+    }
+
+    /// The reason must name WHERE the fabrication happened, not only how much.
+    ///
+    /// An absorbed miss now forces inconclusive, and the elapsed seam declares
+    /// `on_miss` at a site every connector call passes through — so every tape
+    /// A run can carry hundreds of them, and a line reading "412 absorbed
+    /// miss(es)" with no location is indistinguishable from a broken scorer.
+    /// The same line naming `redis::get_key` tells the reader which seam went
+    /// uncovered, which is the thought they need to have.
+    #[test]
+    fn the_absorbed_miss_reason_names_the_sites_not_just_the_count() {
+        let site = |boundary: &str, method: &str| {
+            let mut o = absorbed_obs(boundary, "c1");
+            o.method_name = method.to_owned();
+            o
+        };
+        let card = detect(&art(
+            vec![],
+            vec![
+                site("redis", "get_key"),
+                site("redis", "get_key"),
+                site("db", "find_one"),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+
+        // Vacuity guard: the property is about absorbed misses, so a run with
+        // none would satisfy every assertion below for free.
+        assert_eq!(
+            card.summary.absorbed_misses, 3,
+            "the fixture must carry absorbed misses at more than one site"
+        );
+
+        let reason = &card.verdict.reason;
+        assert!(
+            reason.contains("redis::get_key"),
+            "the reason must name the site the fabrication happened at: {reason}"
+        );
+        assert!(
+            reason.contains("redis::get_key 2"),
+            "with how many were at it, so one dominant seam is visible: {reason}"
+        );
+        // The BUSIEST site leads. Sorting the other way still mentions both
+        // here, so an assertion on presence alone would not notice.
+        let lead = reason
+            .find("redis::get_key")
+            .expect("the dominant site is named");
+        let tail = reason
+            .find("db::find_one")
+            .expect("the lesser site is named");
+        assert!(
+            lead < tail,
+            "the site with the most absorbed misses must come first: {reason}"
+        );
+        assert!(
+            reason.contains("3 absorbed miss(es)"),
+            "without losing the total: {reason}"
+        );
+    }
+
+    /// A correlation that genuinely diverged is a DIVERGENCE, not an
+    /// unjudgeable, even when it also carries an absorbed miss.
+    ///
+    /// The run rule already says this — `inconclusive` there is guarded on
+    /// `blocking_reasons == 0`, so a real divergence wins. The correlation term
+    /// had no such guard, so a correlation with both reported
+    /// `inconclusive: true`. `passed` is false either way and no count is
+    /// wrong, but a reader or UI filtering failures on `!inconclusive` drops a
+    /// real divergence into the "could not tell" bucket. The two levels should
+    /// not disagree about which answer wins.
+    #[test]
+    fn a_correlation_that_diverged_is_not_excused_by_an_absorbed_miss() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1")],
+            vec![http("c1", false, vec![])],
+        ));
+
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+
+        // Vacuity guard: both halves must actually be present, or this asserts
+        // a property of a correlation that had nothing to weigh.
+        assert_eq!(
+            c1.absorbed_misses, 1,
+            "the fixture must carry an absorbed miss"
+        );
+        assert!(
+            !c1.http_status_match || !c1.http_body_match,
+            "and a genuine blocking divergence beside it"
+        );
+
+        assert!(!c1.passed, "it did not pass");
+        assert!(
+            !c1.inconclusive,
+            "and it is a divergence rather than an unjudgeable — blocking wins, \
+             as it already does at the run level"
         );
     }
 
