@@ -177,6 +177,10 @@ export default function NewRunPage() {
   );
   const scope = usingDefault ? defaultScope : corrs;
   const overCap = corrs.length > cap;
+  // The deployment's ceiling is the most ANYONE may replay in one run, so a
+  // caller above it is stopped here as well as by the server. Warning alone
+  // would send a request whose only possible answer is a 400.
+  const capOverCeiling = maxCorr != null && maxCorr > corrSource.ceiling;
 
   const triggerSpec = React.useMemo(() => {
     const candidate = imageRef
@@ -549,7 +553,7 @@ export default function NewRunPage() {
           />
         </label>
 
-        {maxCorr != null && maxCorr > corrSource.ceiling && (
+        {capOverCeiling && (
           <div className="scopewarn">
             <p>
               <b>
@@ -679,7 +683,8 @@ export default function NewRunPage() {
           disabled={
             create.isPending ||
             (!recordingGroup.trim() && !recordingId.trim() && !s3Path) ||
-            overCap
+            overCap ||
+            capOverCeiling
           }
         >
           {create.isPending ? "scheduling…" : "schedule run"}
