@@ -6056,9 +6056,44 @@ pub(crate) fn build_ledger_into(
 
 /// Read-through ledger for `GET /runs/{id}/calls` (recomputes from artifacts;
 /// works for runs scored before the sidecar existed).
+/// Which of a ledger's inputs are not on disk.
+///
+/// `load_table` and `load_jsonl` both answer a missing path with an empty
+/// value and no warning, which is right for building — a run really can be
+/// missing one stream — and wrong for REPORTING, because it leaves an absence
+/// and a fact about the run wearing the same shape.
+fn absent_ledger_inputs(root: &HarnessRoot, run_id: &str) -> Vec<&'static str> {
+    let mut absent = Vec::new();
+    if !root.lookup_table_path(run_id).exists() {
+        absent.push("lookup table");
+    }
+    if !root.observed_path(run_id).exists() {
+        absent.push("observed calls");
+    }
+    absent
+}
+
 pub fn call_ledger(root: &HarnessRoot, run_id: &str) -> io::Result<Vec<CallRecord>> {
     let art = load_artifacts(root, run_id)?;
-    build_ledger(&art)
+    let rows = build_ledger(&art)?;
+    // An empty ledger names which of its causes applies. A ledger built from
+    // inputs that are not there is an ABSENCE — the artifacts were never
+    // hydrated, or the pull failed — and returning it as an empty ledger says
+    // instead that the run made no calls. A run with ninety-four side-effect
+    // divergences served `[]` through this path, and nothing in the response
+    // could tell the reader which of the two it was looking at.
+    if rows.is_empty() {
+        let absent = absent_ledger_inputs(root, run_id);
+        if !absent.is_empty() {
+            return Err(io::Error::other(format!(
+                "no call ledger for {run_id}: {} not present on this host — an \
+                 empty ledger built from absent inputs is an absence, not a run \
+                 that made no calls",
+                absent.join(" and ")
+            )));
+        }
+    }
+    Ok(rows)
 }
 
 /// Build and write the ledger without ever holding it whole.
@@ -6655,6 +6690,63 @@ mod tests {
     /// says it checks. The row resolved an empty spec to the system's
     /// declaration while the scorer read the raw spec: every CI-created prism
     /// run showed `["ucs::", "connector::"]` and scored no span at all.
+    /// An empty ledger must say which of its causes applies.
+    ///
+    /// `load_table` and `load_jsonl` both return empty for a path that does not
+    /// exist, and neither records a warning for it, so a ledger built from
+    /// artifacts that were never hydrated comes back `Ok(vec![])` — identical
+    /// to a run that genuinely made no calls. Served through
+    /// `GET /runs/{id}/calls` that is a 200 `[]`, which is what a run with 94
+    /// side-effect divergences returned: the reader cannot tell an absence from
+    /// a fact about the run, and the absence is the likelier of the two.
+    /// The other half: inputs PRESENT and empty is a fact about the run, and
+    /// must still be an empty ledger rather than a refusal.
+    ///
+    /// Without this, "refuse whenever the ledger is empty" passes every test —
+    /// I ran that mutation and nothing died. The pair is what distinguishes
+    /// naming an absence from refusing to answer.
+    #[test]
+    fn a_run_whose_inputs_are_present_and_empty_is_not_an_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+
+        // Both inputs exist and hold nothing: this run really made no calls.
+        write_jsonl_rows::<deja::DejaRecord>(&root.observed_path("run-quiet"), &[]);
+        let table = root.lookup_table_path("run-quiet");
+        if let Some(parent) = table.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&table, "").unwrap();
+
+        // Vacuity guard: the paths must actually exist, or this asserts the
+        // absent case over again under a different name.
+        assert!(table.exists() && root.observed_path("run-quiet").exists());
+
+        let rows = call_ledger(&root, "run-quiet")
+            .expect("present-and-empty is a fact about the run, not an absence");
+        assert!(rows.is_empty(), "and the fact is that it made no calls");
+    }
+
+    #[test]
+    fn an_empty_ledger_says_whether_it_had_anything_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+
+        // Nothing was ever written for this run.
+        let err = call_ledger(&root, "run-never-hydrated")
+            .expect_err("a ledger built from nothing is an absence, not an empty ledger");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("run-never-hydrated"),
+            "the error names the run: {msg}"
+        );
+        assert!(
+            msg.contains("lookup table") && msg.contains("observed"),
+            "and names WHICH inputs were absent, so the reader knows whether to \
+             hydrate or to believe the run made no calls: {msg}"
+        );
+    }
+
     #[test]
     fn the_scorer_checks_the_namespaces_the_params_row_says_it_checks() {
         let dir = tempfile::tempdir().unwrap();
