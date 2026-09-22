@@ -115,9 +115,7 @@ fn sort_canonically(items: &mut [Value]) {
 ///
 /// It also records a present `Option` whose contents serialise to `null` — a
 /// cache hit holding `None` — under [`PRESENT_KEY`], so replay can tell
-/// `Some(None)` from `None`. That is the default because the other choice fails
-/// silently: an unmarked result replays the wrong arm. Arguments, whose bytes
-/// are a lookup key, use [`to_args_value`] instead.
+/// `Some(None)` from `None`. Arguments and results share this one encoding.
 ///
 /// Identical to [`serde_json::to_value`] for every value that contains neither
 /// such a collection nor such an `Option` — asserted by
@@ -134,7 +132,10 @@ pub fn to_value<T>(value: &T) -> Result<Value, serde_json::Error>
 where
     T: ?Sized + Serialize,
 {
-    capture(value, true)
+    match value.serialize(Canonical::for_type::<T>()) {
+        Ok(value) => Ok(value),
+        Err(_) => serde_json::to_value(value),
+    }
 }
 
 /// [`to_value`], with the same never-panic fallback every capture site in this
@@ -148,59 +149,20 @@ where
     to_value(value).unwrap_or(Value::Null)
 }
 
-/// [`to_value`] for a boundary's ARGUMENTS: never marks a present `Option`, so
-/// an `args_hash` is computed from the same bytes it always was and a sealed
-/// tape addresses unchanged. Only argument capture calls this; the source gate
-/// in `deja/tests/capture_sites.rs` fails when a new caller appears.
-///
-/// # Errors
-///
-/// As [`to_value`].
-pub fn to_args_value<T>(value: &T) -> Result<Value, serde_json::Error>
-where
-    T: ?Sized + Serialize,
-{
-    capture(value, false)
-}
-
-/// [`to_args_value`] with the never-panic fallback of [`to_value_or_null`].
-#[must_use]
-pub fn to_args_value_or_null<T>(value: &T) -> Value
-where
-    T: ?Sized + Serialize,
-{
-    to_args_value(value).unwrap_or(Value::Null)
-}
-
-fn capture<T>(value: &T, mark_present: bool) -> Result<Value, serde_json::Error>
-where
-    T: ?Sized + Serialize,
-{
-    match value.serialize(Canonical::for_type::<T>(mark_present)) {
-        Ok(value) => Ok(value),
-        Err(_) => serde_json::to_value(value),
-    }
-}
-
 /// The serialiser. Carries whether the value it is about to serialise is, BY
 /// ITS STATIC TYPE, an unordered collection — decided by the position above it,
-/// because that is the only place the concrete type is visible — and whether
-/// this capture marks a present `Option`.
+/// because that is the only place the concrete type is visible.
 struct Canonical {
     unordered: bool,
     unordered_map: bool,
-    /// Whether a present `Option` over `null` is marked: true for a result
-    /// capture, false for an argument. Inherited by every nested position.
-    mark_present: bool,
 }
 
 impl Canonical {
-    fn for_type<T: ?Sized>(mark_present: bool) -> Self {
+    fn for_type<T: ?Sized>() -> Self {
         let type_name = std::any::type_name::<T>();
         Self {
             unordered: is_unordered_sequence(type_name),
             unordered_map: is_unordered_map(type_name),
-            mark_present,
         }
     }
 
@@ -210,7 +172,6 @@ impl Canonical {
         Self {
             unordered: false,
             unordered_map: false,
-            mark_present: false,
         }
     }
 }
@@ -292,13 +253,8 @@ impl Serializer for Canonical {
     {
         // The `Option` is transparent in JSON, so the type that decides is the
         // one INSIDE it: `Option<HashSet<_>>` canonicalises.
-        let mark = self.mark_present;
-        let inner = value.serialize(Self::for_type::<T>(mark))?;
-        Ok(if mark {
-            mark_if_ambiguous(inner)
-        } else {
-            inner
-        })
+        let inner = value.serialize(Self::for_type::<T>())?;
+        Ok(mark_if_ambiguous(inner))
     }
     fn serialize_unit(self) -> Result<Value, Self::Error> {
         Ok(Value::Null)
@@ -322,7 +278,7 @@ impl Serializer for Canonical {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(Self::for_type::<T>(self.mark_present))
+        value.serialize(Self::for_type::<T>())
     }
     fn serialize_newtype_variant<T>(
         self,
@@ -334,21 +290,19 @@ impl Serializer for Canonical {
     where
         T: ?Sized + Serialize,
     {
-        let inner = value.serialize(Self::for_type::<T>(self.mark_present))?;
+        let inner = value.serialize(Self::for_type::<T>())?;
         let mut map = serde_json::Map::with_capacity(1);
         map.insert(variant.to_owned(), inner);
         Ok(Value::Object(map))
     }
     fn serialize_seq(self, len: Option<usize>) -> Result<SeqBuilder, Self::Error> {
         Ok(SeqBuilder {
-            mark_present: self.mark_present,
             items: Vec::with_capacity(len.unwrap_or(0)),
             unordered: self.unordered,
         })
     }
     fn serialize_tuple(self, len: usize) -> Result<SeqBuilder, Self::Error> {
         Ok(SeqBuilder {
-            mark_present: self.mark_present,
             items: Vec::with_capacity(len),
             unordered: false,
         })
@@ -359,7 +313,6 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<SeqBuilder, Self::Error> {
         Ok(SeqBuilder {
-            mark_present: self.mark_present,
             items: Vec::with_capacity(len),
             unordered: false,
         })
@@ -372,14 +325,12 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<VariantSeqBuilder, Self::Error> {
         Ok(VariantSeqBuilder {
-            mark_present: self.mark_present,
             variant,
             items: Vec::with_capacity(len),
         })
     }
     fn serialize_map(self, len: Option<usize>) -> Result<MapBuilder, Self::Error> {
         Ok(MapBuilder {
-            mark_present: self.mark_present,
             entries: Vec::with_capacity(len.unwrap_or(0)),
             pending_key: None,
             sort_keys: self.unordered_map,
@@ -391,7 +342,6 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<StructBuilder, Self::Error> {
         Ok(StructBuilder {
-            mark_present: self.mark_present,
             entries: serde_json::Map::with_capacity(len),
         })
     }
@@ -403,7 +353,6 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<VariantMapBuilder, Self::Error> {
         Ok(VariantMapBuilder {
-            mark_present: self.mark_present,
             variant,
             entries: serde_json::Map::with_capacity(len),
         })
@@ -411,7 +360,6 @@ impl Serializer for Canonical {
 }
 
 struct SeqBuilder {
-    mark_present: bool,
     items: Vec<Value>,
     /// Decided by the position ABOVE this sequence, where the concrete type was
     /// visible. `false` for a tuple, which is positional whatever it holds.
@@ -424,7 +372,7 @@ impl SeqBuilder {
         T: ?Sized + Serialize,
     {
         self.items
-            .push(value.serialize(Canonical::for_type::<T>(self.mark_present))?);
+            .push(value.serialize(Canonical::for_type::<T>())?);
         Ok(())
     }
 
@@ -479,7 +427,6 @@ impl ser::SerializeTupleStruct for SeqBuilder {
 }
 
 struct VariantSeqBuilder {
-    mark_present: bool,
     variant: &'static str,
     items: Vec<Value>,
 }
@@ -492,7 +439,7 @@ impl ser::SerializeTupleVariant for VariantSeqBuilder {
         T: ?Sized + Serialize,
     {
         self.items
-            .push(value.serialize(Canonical::for_type::<T>(self.mark_present))?);
+            .push(value.serialize(Canonical::for_type::<T>())?);
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -509,7 +456,6 @@ impl ser::SerializeTupleVariant for VariantSeqBuilder {
 /// recorded value is what replay hands back. Structs do not go through this:
 /// their field order is declaration order, so [`StructBuilder`] inserts directly.
 struct MapBuilder {
-    mark_present: bool,
     entries: Vec<(String, Value)>,
     pending_key: Option<String>,
     sort_keys: bool,
@@ -519,7 +465,6 @@ struct MapBuilder {
 /// order, so the key order on the tape is the same on every run whether or not
 /// `serde_json::Map` preserves insertion order.
 struct StructBuilder {
-    mark_present: bool,
     entries: serde_json::Map<String, Value>,
 }
 
@@ -575,10 +520,8 @@ impl ser::SerializeMap for MapBuilder {
             .pending_key
             .take()
             .ok_or_else(|| error("value serialized before key"))?;
-        self.entries.push((
-            key,
-            value.serialize(Canonical::for_type::<T>(self.mark_present))?,
-        ));
+        self.entries
+            .push((key, value.serialize(Canonical::for_type::<T>())?));
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -593,10 +536,8 @@ impl ser::SerializeStruct for StructBuilder {
     where
         T: ?Sized + Serialize,
     {
-        self.entries.insert(
-            key.to_owned(),
-            value.serialize(Canonical::for_type::<T>(self.mark_present))?,
-        );
+        self.entries
+            .insert(key.to_owned(), value.serialize(Canonical::for_type::<T>())?);
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -605,7 +546,6 @@ impl ser::SerializeStruct for StructBuilder {
 }
 
 struct VariantMapBuilder {
-    mark_present: bool,
     variant: &'static str,
     entries: serde_json::Map<String, Value>,
 }
@@ -617,10 +557,8 @@ impl ser::SerializeStructVariant for VariantMapBuilder {
     where
         T: ?Sized + Serialize,
     {
-        self.entries.insert(
-            key.to_owned(),
-            value.serialize(Canonical::for_type::<T>(self.mark_present))?,
-        );
+        self.entries
+            .insert(key.to_owned(), value.serialize(Canonical::for_type::<T>())?);
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -635,13 +573,12 @@ impl ser::SerializeStructVariant for VariantMapBuilder {
 ///
 /// JSON has one `null`, and serde's `Option` spends it on `None`, so
 /// `Some(None)` — a cache hit holding "this does not exist" — would record the
-/// same byte as `None`, a miss, and replay would take the wrong arm. In a
-/// [`to_value`] capture a `Some` is therefore recorded as `{"deja:some": inner}`
-/// exactly when its inner value is `null` or is itself such an object; every
-/// other `Some(x)` records as `x`, as it always has. The second condition is
-/// what makes the encoding unambiguous at any depth: `Some(Some(None))` nests
-/// the marker, and a genuine map that happens to look like one is escaped
-/// rather than misread.
+/// same byte as `None`, a miss, and replay would take the wrong arm. A `Some`
+/// is therefore recorded as `{"deja:some": inner}` exactly when its inner value
+/// is `null` or is itself such an object; every other `Some(x)` records as `x`,
+/// as it always has. The second condition is what makes the encoding
+/// unambiguous at any depth: `Some(Some(None))` nests the marker, and a
+/// genuine map that happens to look like one is escaped rather than misread.
 pub const PRESENT_KEY: &str = "deja:some";
 
 fn is_present_marker(value: &Value) -> bool {
@@ -1416,19 +1353,6 @@ mod tests {
         assert_eq!(
             to_value(&row).expect("canonical"),
             serde_json::to_value(&row).expect("serde_json"),
-        );
-    }
-
-    /// An argument is never marked, so a lookup key built from one hashes as
-    /// it did before the marker existed and every sealed tape still addresses.
-    #[test]
-    fn an_argument_holding_a_present_none_records_as_it_always_did() {
-        let arg: Option<Option<String>> = Some(None);
-        assert_eq!(to_args_value(&arg).expect("canonical"), Value::Null);
-        assert_ne!(
-            to_value(&arg).expect("canonical"),
-            Value::Null,
-            "the same value as a result must be marked"
         );
     }
 

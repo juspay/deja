@@ -766,7 +766,7 @@ fn extract_arg_key(pat: &Pat) -> Option<String> {
 /// Uses `&arg` so the original value is borrowed, not moved — this preserves
 /// the variable for the subsequent delegation call to `self.$inner.method(...)`.
 ///
-/// Each value goes through `canonical::to_args_value_or_null` rather than
+/// Each value goes through `canonical::to_value_or_null` rather than
 /// `serde_json::json!`, for two reasons. It canonicalises a collection whose
 /// static type says its order carries no information, which is the whole point
 /// of capturing while the type is still in hand. And `json!` on an expression
@@ -784,7 +784,7 @@ fn build_args_json(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma
                 let key_lit = syn::LitStr::new(&key, proc_macro2::Span::call_site());
                 let val = extract_arg_name(pat);
                 entries.push(quote!(
-                    #key_lit: ::deja_runtime::canonical::to_args_value_or_null(&#val)
+                    #key_lit: ::deja_runtime::canonical::to_value_or_null(&#val)
                 ));
             }
         }

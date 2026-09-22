@@ -80,13 +80,13 @@ async fn a_cached_absence_replays_as_a_hit_and_a_miss_as_a_miss() {
         "the hit and the miss must not record as the same value"
     );
     assert!(
-        events[0].args.get("scope").is_some(),
-        "the argument must be on the tape, or the next assertion reads a missing key"
+        events[0].result.get("Ok").is_some_and(|ok| !ok.is_null()),
+        "the hit is recorded as a marked value, or the next assertion compares nothing"
     );
     assert_eq!(
-        events[0].args["scope"],
-        serde_json::Value::Null,
-        "an argument is not marked, so its lookup key is unchanged"
+        events[0].args.get("scope"),
+        events[0].result.get("Ok"),
+        "an argument holding a present None encodes as the result does"
     );
 
     let replay_calls = Arc::new(AtomicUsize::new(0));

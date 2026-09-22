@@ -295,7 +295,7 @@ pub mod value {
     }
     impl<T: serde::Serialize + ?Sized> CaptureSerde for &Capture<'_, T> {
         fn deja_capture(&self) -> serde_json::Value {
-            crate::canonical::to_args_value(self.0).unwrap_or_else(|_| {
+            crate::canonical::to_value(self.0).unwrap_or_else(|_| {
                 serde_json::json!({
                     "deja_unserializable": std::any::type_name::<T>(),
                 })
@@ -344,7 +344,7 @@ pub mod value {
     /// JSON-null if the value cannot be serialized (it never panics, so a
     /// serialize failure can't take down an instrumented call site).
     pub fn serialize<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Value {
-        crate::canonical::to_args_value_or_null(value)
+        crate::canonical::to_value_or_null(value)
     }
 
     /// Capture the full Rust debug representation of an error.
@@ -2465,12 +2465,16 @@ mod optional_return_round_trip {
         );
     }
 
-    /// Both argument captures leave a present `None` as the bare `null` it has
-    /// always been, so an `args_hash` on a sealed tape still matches.
+    /// Arguments share the result encoding, so two calls that differ only in
+    /// `Some(None)` against `None` get two different lookup keys.
     #[test]
-    fn an_argument_holding_a_present_none_is_not_marked() {
-        let arg: Option<Option<String>> = Some(None);
-        assert_eq!(crate::capture!(arg), serde_json::Value::Null);
-        assert_eq!(crate::value::serialize(&arg), serde_json::Value::Null);
+    fn an_argument_encodes_a_present_none_as_a_result_does() {
+        let present: Option<Option<String>> = Some(None);
+        let absent: Option<Option<String>> = None;
+        let (as_result, _) = SerdeCodec::<Option<Option<String>>>::capture(&present);
+        assert_ne!(as_result, serde_json::Value::Null);
+        assert_eq!(crate::capture!(present), as_result);
+        assert_eq!(crate::value::serialize(&present), as_result);
+        assert_eq!(crate::capture!(absent), serde_json::Value::Null);
     }
 }
