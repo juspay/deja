@@ -46,6 +46,7 @@
 //! unordered in the database's contract while the Rust type says otherwise. Both
 //! are producer-side problems and this module correctly leaves both alone.
 
+use serde::de::{self, DeserializeOwned, Deserializer, IntoDeserializer, Visitor};
 use serde::ser::{self, Serialize, Serializer};
 use serde_json::Value;
 
@@ -112,9 +113,16 @@ fn sort_canonically(items: &mut [Value]) {
 /// Serialise `value` to JSON, recording every collection whose static type says
 /// its order carries no information in a canonical order.
 ///
-/// Identical to [`serde_json::to_value`] for every value that contains no such
-/// collection — asserted by
-/// [`tests::a_payload_without_an_unordered_collection_is_byte_identical`], not
+/// It also records a present `Option` whose contents serialise to `null` — a
+/// cache hit holding `None` — under [`PRESENT_KEY`], so replay can tell
+/// `Some(None)` from `None`. That is the default because the other choice fails
+/// silently: an unmarked result replays the wrong arm. Arguments, whose bytes
+/// are a lookup key, use [`to_args_value`] instead.
+///
+/// Identical to [`serde_json::to_value`] for every value that contains neither
+/// such a collection nor such an `Option` — asserted by
+/// [`tests::a_payload_without_an_unordered_collection_is_byte_identical`] and
+/// `tests::a_present_value_that_is_not_null_records_as_it_always_did`, not
 /// argued.
 ///
 /// # Errors
@@ -126,10 +134,7 @@ pub fn to_value<T>(value: &T) -> Result<Value, serde_json::Error>
 where
     T: ?Sized + Serialize,
 {
-    match value.serialize(Canonical::for_type::<T>()) {
-        Ok(value) => Ok(value),
-        Err(_) => serde_json::to_value(value),
-    }
+    capture(value, true)
 }
 
 /// [`to_value`], with the same never-panic fallback every capture site in this
@@ -143,20 +148,59 @@ where
     to_value(value).unwrap_or(Value::Null)
 }
 
-/// The serialiser. Carries one bit — whether the value it is about to serialise
-/// is, BY ITS STATIC TYPE, an unordered sequence — decided by the position above
-/// it, because that is the only place the concrete type is visible.
+/// [`to_value`] for a boundary's ARGUMENTS: never marks a present `Option`, so
+/// an `args_hash` is computed from the same bytes it always was and a sealed
+/// tape addresses unchanged. Only argument capture calls this; the source gate
+/// in `deja/tests/capture_sites.rs` fails when a new caller appears.
+///
+/// # Errors
+///
+/// As [`to_value`].
+pub fn to_args_value<T>(value: &T) -> Result<Value, serde_json::Error>
+where
+    T: ?Sized + Serialize,
+{
+    capture(value, false)
+}
+
+/// [`to_args_value`] with the never-panic fallback of [`to_value_or_null`].
+#[must_use]
+pub fn to_args_value_or_null<T>(value: &T) -> Value
+where
+    T: ?Sized + Serialize,
+{
+    to_args_value(value).unwrap_or(Value::Null)
+}
+
+fn capture<T>(value: &T, mark_present: bool) -> Result<Value, serde_json::Error>
+where
+    T: ?Sized + Serialize,
+{
+    match value.serialize(Canonical::for_type::<T>(mark_present)) {
+        Ok(value) => Ok(value),
+        Err(_) => serde_json::to_value(value),
+    }
+}
+
+/// The serialiser. Carries whether the value it is about to serialise is, BY
+/// ITS STATIC TYPE, an unordered collection — decided by the position above it,
+/// because that is the only place the concrete type is visible — and whether
+/// this capture marks a present `Option`.
 struct Canonical {
     unordered: bool,
     unordered_map: bool,
+    /// Whether a present `Option` over `null` is marked: true for a result
+    /// capture, false for an argument. Inherited by every nested position.
+    mark_present: bool,
 }
 
 impl Canonical {
-    fn for_type<T: ?Sized>() -> Self {
+    fn for_type<T: ?Sized>(mark_present: bool) -> Self {
         let type_name = std::any::type_name::<T>();
         Self {
             unordered: is_unordered_sequence(type_name),
             unordered_map: is_unordered_map(type_name),
+            mark_present,
         }
     }
 
@@ -166,6 +210,7 @@ impl Canonical {
         Self {
             unordered: false,
             unordered_map: false,
+            mark_present: false,
         }
     }
 }
@@ -247,7 +292,13 @@ impl Serializer for Canonical {
     {
         // The `Option` is transparent in JSON, so the type that decides is the
         // one INSIDE it: `Option<HashSet<_>>` canonicalises.
-        value.serialize(Self::for_type::<T>())
+        let mark = self.mark_present;
+        let inner = value.serialize(Self::for_type::<T>(mark))?;
+        Ok(if mark {
+            mark_if_ambiguous(inner)
+        } else {
+            inner
+        })
     }
     fn serialize_unit(self) -> Result<Value, Self::Error> {
         Ok(Value::Null)
@@ -271,7 +322,7 @@ impl Serializer for Canonical {
     where
         T: ?Sized + Serialize,
     {
-        value.serialize(Self::for_type::<T>())
+        value.serialize(Self::for_type::<T>(self.mark_present))
     }
     fn serialize_newtype_variant<T>(
         self,
@@ -283,19 +334,21 @@ impl Serializer for Canonical {
     where
         T: ?Sized + Serialize,
     {
-        let inner = value.serialize(Self::for_type::<T>())?;
+        let inner = value.serialize(Self::for_type::<T>(self.mark_present))?;
         let mut map = serde_json::Map::with_capacity(1);
         map.insert(variant.to_owned(), inner);
         Ok(Value::Object(map))
     }
     fn serialize_seq(self, len: Option<usize>) -> Result<SeqBuilder, Self::Error> {
         Ok(SeqBuilder {
+            mark_present: self.mark_present,
             items: Vec::with_capacity(len.unwrap_or(0)),
             unordered: self.unordered,
         })
     }
     fn serialize_tuple(self, len: usize) -> Result<SeqBuilder, Self::Error> {
         Ok(SeqBuilder {
+            mark_present: self.mark_present,
             items: Vec::with_capacity(len),
             unordered: false,
         })
@@ -306,6 +359,7 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<SeqBuilder, Self::Error> {
         Ok(SeqBuilder {
+            mark_present: self.mark_present,
             items: Vec::with_capacity(len),
             unordered: false,
         })
@@ -318,12 +372,14 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<VariantSeqBuilder, Self::Error> {
         Ok(VariantSeqBuilder {
+            mark_present: self.mark_present,
             variant,
             items: Vec::with_capacity(len),
         })
     }
     fn serialize_map(self, len: Option<usize>) -> Result<MapBuilder, Self::Error> {
         Ok(MapBuilder {
+            mark_present: self.mark_present,
             entries: Vec::with_capacity(len.unwrap_or(0)),
             pending_key: None,
             sort_keys: self.unordered_map,
@@ -335,6 +391,7 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<StructBuilder, Self::Error> {
         Ok(StructBuilder {
+            mark_present: self.mark_present,
             entries: serde_json::Map::with_capacity(len),
         })
     }
@@ -346,6 +403,7 @@ impl Serializer for Canonical {
         len: usize,
     ) -> Result<VariantMapBuilder, Self::Error> {
         Ok(VariantMapBuilder {
+            mark_present: self.mark_present,
             variant,
             entries: serde_json::Map::with_capacity(len),
         })
@@ -353,6 +411,7 @@ impl Serializer for Canonical {
 }
 
 struct SeqBuilder {
+    mark_present: bool,
     items: Vec<Value>,
     /// Decided by the position ABOVE this sequence, where the concrete type was
     /// visible. `false` for a tuple, which is positional whatever it holds.
@@ -365,7 +424,7 @@ impl SeqBuilder {
         T: ?Sized + Serialize,
     {
         self.items
-            .push(value.serialize(Canonical::for_type::<T>())?);
+            .push(value.serialize(Canonical::for_type::<T>(self.mark_present))?);
         Ok(())
     }
 
@@ -420,6 +479,7 @@ impl ser::SerializeTupleStruct for SeqBuilder {
 }
 
 struct VariantSeqBuilder {
+    mark_present: bool,
     variant: &'static str,
     items: Vec<Value>,
 }
@@ -432,7 +492,7 @@ impl ser::SerializeTupleVariant for VariantSeqBuilder {
         T: ?Sized + Serialize,
     {
         self.items
-            .push(value.serialize(Canonical::for_type::<T>())?);
+            .push(value.serialize(Canonical::for_type::<T>(self.mark_present))?);
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -449,6 +509,7 @@ impl ser::SerializeTupleVariant for VariantSeqBuilder {
 /// recorded value is what replay hands back. Structs do not go through this:
 /// their field order is declaration order, so [`StructBuilder`] inserts directly.
 struct MapBuilder {
+    mark_present: bool,
     entries: Vec<(String, Value)>,
     pending_key: Option<String>,
     sort_keys: bool,
@@ -458,6 +519,7 @@ struct MapBuilder {
 /// order, so the key order on the tape is the same on every run whether or not
 /// `serde_json::Map` preserves insertion order.
 struct StructBuilder {
+    mark_present: bool,
     entries: serde_json::Map<String, Value>,
 }
 
@@ -513,8 +575,10 @@ impl ser::SerializeMap for MapBuilder {
             .pending_key
             .take()
             .ok_or_else(|| error("value serialized before key"))?;
-        self.entries
-            .push((key, value.serialize(Canonical::for_type::<T>())?));
+        self.entries.push((
+            key,
+            value.serialize(Canonical::for_type::<T>(self.mark_present))?,
+        ));
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -529,8 +593,10 @@ impl ser::SerializeStruct for StructBuilder {
     where
         T: ?Sized + Serialize,
     {
-        self.entries
-            .insert(key.to_owned(), value.serialize(Canonical::for_type::<T>())?);
+        self.entries.insert(
+            key.to_owned(),
+            value.serialize(Canonical::for_type::<T>(self.mark_present))?,
+        );
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
@@ -539,6 +605,7 @@ impl ser::SerializeStruct for StructBuilder {
 }
 
 struct VariantMapBuilder {
+    mark_present: bool,
     variant: &'static str,
     entries: serde_json::Map<String, Value>,
 }
@@ -550,14 +617,365 @@ impl ser::SerializeStructVariant for VariantMapBuilder {
     where
         T: ?Sized + Serialize,
     {
-        self.entries
-            .insert(key.to_owned(), value.serialize(Canonical::for_type::<T>())?);
+        self.entries.insert(
+            key.to_owned(),
+            value.serialize(Canonical::for_type::<T>(self.mark_present))?,
+        );
         Ok(())
     }
     fn end(self) -> Result<Value, Self::Error> {
         let mut map = serde_json::Map::with_capacity(1);
         map.insert(self.variant.to_owned(), Value::Object(self.entries));
         Ok(Value::Object(map))
+    }
+}
+
+/// The key of the one-entry object that records a PRESENT `Option` whose
+/// contents serialise to `null`.
+///
+/// JSON has one `null`, and serde's `Option` spends it on `None`, so
+/// `Some(None)` — a cache hit holding "this does not exist" — would record the
+/// same byte as `None`, a miss, and replay would take the wrong arm. In a
+/// [`to_value`] capture a `Some` is therefore recorded as `{"deja:some": inner}`
+/// exactly when its inner value is `null` or is itself such an object; every
+/// other `Some(x)` records as `x`, as it always has. The second condition is
+/// what makes the encoding unambiguous at any depth: `Some(Some(None))` nests
+/// the marker, and a genuine map that happens to look like one is escaped
+/// rather than misread.
+pub const PRESENT_KEY: &str = "deja:some";
+
+fn is_present_marker(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.len() == 1 && map.contains_key(PRESENT_KEY))
+}
+
+fn mark_if_ambiguous(inner: Value) -> Value {
+    if inner.is_null() || is_present_marker(&inner) {
+        let mut map = serde_json::Map::with_capacity(1);
+        map.insert(PRESENT_KEY.to_owned(), inner);
+        Value::Object(map)
+    } else {
+        inner
+    }
+}
+
+fn carries_present_marker(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(carries_present_marker),
+        Value::Object(map) => is_present_marker(value) || map.values().any(carries_present_marker),
+        _ => false,
+    }
+}
+
+/// Rebuild a recorded value, reading the present-`Option` marker that
+/// [`to_value`] writes.
+///
+/// A value with no marker anywhere — every tape recorded before the marker
+/// existed — goes straight to [`serde_json::from_value`], so a bare `null`
+/// still decodes as `None` and an old tape reads exactly as it did.
+///
+/// # Errors
+///
+/// Whatever the target type's `Deserialize` rejects.
+pub fn from_value<T>(value: Value) -> Result<T, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    if carries_present_marker(&value) {
+        T::deserialize(Recorded(value))
+    } else {
+        serde_json::from_value(value)
+    }
+}
+
+/// A `serde_json::Value` deserializer that answers `deserialize_option` from
+/// the marker and hands every nested value to another `Recorded`, so an
+/// `Option` at any depth is reached. Scalars defer to `Value`'s own impl.
+struct Recorded(Value);
+
+macro_rules! defer_scalar {
+    ($($method:ident)*) => {$(
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            match self.0 {
+                Value::Array(_) | Value::Object(_) => self.deserialize_any(visitor),
+                scalar => scalar.$method(visitor),
+            }
+        }
+    )*};
+}
+
+impl<'de> Deserializer<'de> for Recorded {
+    type Error = serde_json::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            Value::Array(items) => visitor.visit_seq(RecordedSeq(items.into_iter())),
+            Value::Object(map) => visitor.visit_map(RecordedMap {
+                entries: map.into_iter(),
+                pending: None,
+            }),
+            scalar => scalar.deserialize_any(visitor),
+        }
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            Value::Null => visitor.visit_none(),
+            Value::Object(mut map) if map.len() == 1 && map.contains_key(PRESENT_KEY) => {
+                let inner = map.remove(PRESENT_KEY).unwrap_or(Value::Null);
+                visitor.visit_some(Recorded(inner))
+            }
+            other => visitor.visit_some(Recorded(other)),
+        }
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.0 {
+            Value::Object(map) if map.len() == 1 => {
+                let (variant, value) = map.into_iter().next().unwrap_or_default();
+                visitor.visit_enum(RecordedEnum { variant, value })
+            }
+            other => other.deserialize_enum(name, variants, visitor),
+        }
+    }
+
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0.deserialize_unit_struct(name, visitor)
+    }
+
+    fn deserialize_tuple<V: Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_tuple_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_unit()
+    }
+
+    defer_scalar! {
+        deserialize_bool deserialize_i8 deserialize_i16 deserialize_i32 deserialize_i64
+        deserialize_i128 deserialize_u8 deserialize_u16 deserialize_u32 deserialize_u64
+        deserialize_u128 deserialize_f32 deserialize_f64 deserialize_char deserialize_str
+        deserialize_string deserialize_bytes deserialize_byte_buf deserialize_unit
+        deserialize_identifier
+    }
+}
+
+struct RecordedSeq(std::vec::IntoIter<Value>);
+
+impl<'de> de::SeqAccess<'de> for RecordedSeq {
+    type Error = serde_json::Error;
+
+    fn next_element_seed<S: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, Self::Error> {
+        self.0
+            .next()
+            .map(|item| seed.deserialize(Recorded(item)))
+            .transpose()
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.0.len())
+    }
+}
+
+struct RecordedMap {
+    entries: serde_json::map::IntoIter,
+    pending: Option<Value>,
+}
+
+impl<'de> de::MapAccess<'de> for RecordedMap {
+    type Error = serde_json::Error;
+
+    fn next_key_seed<S: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, Self::Error> {
+        match self.entries.next() {
+            Some((key, value)) => {
+                self.pending = Some(value);
+                seed.deserialize(RecordedKey(key)).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<S: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        let value = self
+            .pending
+            .take()
+            .ok_or_else(|| <serde_json::Error as de::Error>::custom("value before key"))?;
+        seed.deserialize(Recorded(value))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.entries.len())
+    }
+}
+
+/// An object key, read the way `serde_json` reads one: a string, or a scalar
+/// written as its string form (`HashMap<u64, _>` keys arrive as `"7"`).
+struct RecordedKey(String);
+
+macro_rules! parse_key {
+    ($($method:ident => $visit:ident: $ty:ty),*) => {$(
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            match self.0.parse::<$ty>() {
+                Ok(parsed) => visitor.$visit(parsed),
+                Err(_) => visitor.visit_string(self.0),
+            }
+        }
+    )*};
+}
+
+impl<'de> Deserializer<'de> for RecordedKey {
+    type Error = serde_json::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_string(self.0)
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_enum(self.0.into_deserializer())
+    }
+
+    parse_key! {
+        deserialize_bool => visit_bool: bool,
+        deserialize_i8 => visit_i8: i8,
+        deserialize_i16 => visit_i16: i16,
+        deserialize_i32 => visit_i32: i32,
+        deserialize_i64 => visit_i64: i64,
+        deserialize_i128 => visit_i128: i128,
+        deserialize_u8 => visit_u8: u8,
+        deserialize_u16 => visit_u16: u16,
+        deserialize_u32 => visit_u32: u32,
+        deserialize_u64 => visit_u64: u64,
+        deserialize_u128 => visit_u128: u128,
+        deserialize_f32 => visit_f32: f32,
+        deserialize_f64 => visit_f64: f64
+    }
+
+    serde::forward_to_deserialize_any! {
+        char str string bytes byte_buf unit unit_struct seq tuple tuple_struct map
+        struct identifier ignored_any
+    }
+}
+
+struct RecordedEnum {
+    variant: String,
+    value: Value,
+}
+
+impl<'de> de::EnumAccess<'de> for RecordedEnum {
+    type Error = serde_json::Error;
+    type Variant = Recorded;
+
+    fn variant_seed<S: de::DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> Result<(S::Value, Recorded), Self::Error> {
+        let name: de::value::StringDeserializer<serde_json::Error> =
+            self.variant.into_deserializer();
+        let variant = seed.deserialize(name)?;
+        Ok((variant, Recorded(self.value)))
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for Recorded {
+    type Error = serde_json::Error;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        <() as de::Deserialize>::deserialize(self)
+    }
+
+    fn newtype_variant_seed<S: de::DeserializeSeed<'de>>(
+        self,
+        seed: S,
+    ) -> Result<S::Value, Self::Error> {
+        seed.deserialize(self)
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_any(visitor)
     }
 }
 
@@ -938,5 +1356,119 @@ mod tests {
             to_value(&bools).expect("canonical"),
             serde_json::to_value(&bools).expect("serde_json"),
         );
+    }
+
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        from_value(to_value(value).expect("canonical")).expect("decode")
+    }
+
+    /// A tape recorded before the marker holds a bare `null` for both arms, and
+    /// must keep reading as it always did: `None`.
+    #[test]
+    fn a_bare_null_still_decodes_as_absent() {
+        let decoded: Option<Option<String>> = from_value(Value::Null).expect("decode");
+        assert_eq!(decoded, None);
+    }
+
+    /// Every depth of a nested `Option` records distinctly and comes back as
+    /// itself, which is what the marker nesting exists for.
+    #[test]
+    fn each_depth_of_a_nested_option_is_its_own_value() {
+        type Deep = Option<Option<Option<String>>>;
+        let cases: [Deep; 4] = [
+            None,
+            Some(None),
+            Some(Some(None)),
+            Some(Some(Some("x".into()))),
+        ];
+        let captured: Vec<Value> = cases
+            .iter()
+            .map(|case| to_value(case).expect("canonical"))
+            .collect();
+        for (i, a) in captured.iter().enumerate() {
+            for b in &captured[i + 1..] {
+                assert_ne!(a, b, "two depths captured as one value");
+            }
+        }
+        for case in &cases {
+            assert_eq!(&round_trip(case), case);
+        }
+    }
+
+    /// The marker is spent only where `null` would be ambiguous. A `Some` whose
+    /// contents are anything else records exactly as `serde_json` records it.
+    #[test]
+    fn a_present_value_that_is_not_null_records_as_it_always_did() {
+        #[derive(serde::Serialize)]
+        struct Row {
+            name: Option<String>,
+            nested: Option<Option<u8>>,
+            missing: Option<u8>,
+        }
+        let row = Row {
+            name: Some("n".into()),
+            nested: Some(Some(3)),
+            missing: None,
+        };
+        assert_eq!(
+            to_value(&row).expect("canonical"),
+            serde_json::to_value(&row).expect("serde_json"),
+        );
+    }
+
+    /// An argument is never marked, so a lookup key built from one hashes as
+    /// it did before the marker existed and every sealed tape still addresses.
+    #[test]
+    fn an_argument_holding_a_present_none_records_as_it_always_did() {
+        let arg: Option<Option<String>> = Some(None);
+        assert_eq!(to_args_value(&arg).expect("canonical"), Value::Null);
+        assert_ne!(
+            to_value(&arg).expect("canonical"),
+            Value::Null,
+            "the same value as a result must be marked"
+        );
+    }
+
+    /// A genuine map that happens to have the marker's shape is escaped when it
+    /// sits in an `Option`, and read as a map where no `Option` is asked for.
+    #[test]
+    fn a_map_shaped_like_the_marker_is_not_mistaken_for_one() {
+        let lookalike: BTreeMap<String, Option<u8>> =
+            [(PRESENT_KEY.to_owned(), None)].into_iter().collect();
+        assert_eq!(round_trip(&lookalike), lookalike);
+        assert_eq!(round_trip(&Some(lookalike.clone())), Some(lookalike));
+    }
+
+    /// The marker is read wherever an `Option` sits: a struct field, a sequence
+    /// element, a map value under an integer key, and an enum variant's payload.
+    #[test]
+    fn a_present_none_survives_at_any_position() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        enum Reply {
+            Cached(Option<Option<String>>),
+            Rows { rows: Vec<Option<Option<u8>>> },
+        }
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Holder {
+            field: Option<Option<String>>,
+            by_id: BTreeMap<u64, Option<Option<u8>>>,
+            replies: Vec<Reply>,
+            unit: Option<()>,
+        }
+        let holder = Holder {
+            field: Some(None),
+            by_id: [(7, Some(None)), (9, None)].into_iter().collect(),
+            replies: vec![
+                Reply::Cached(Some(None)),
+                Reply::Rows {
+                    rows: vec![Some(None), None, Some(Some(1))],
+                },
+            ],
+            unit: Some(()),
+        };
+        assert_eq!(round_trip(&holder), holder);
     }
 }

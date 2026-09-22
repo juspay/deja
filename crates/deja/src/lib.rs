@@ -295,7 +295,7 @@ pub mod value {
     }
     impl<T: serde::Serialize + ?Sized> CaptureSerde for &Capture<'_, T> {
         fn deja_capture(&self) -> serde_json::Value {
-            crate::canonical::to_value(self.0).unwrap_or_else(|_| {
+            crate::canonical::to_args_value(self.0).unwrap_or_else(|_| {
                 serde_json::json!({
                     "deja_unserializable": std::any::type_name::<T>(),
                 })
@@ -344,7 +344,7 @@ pub mod value {
     /// JSON-null if the value cannot be serialized (it never panics, so a
     /// serialize failure can't take down an instrumented call site).
     pub fn serialize<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Value {
-        crate::canonical::to_value_or_null(value)
+        crate::canonical::to_args_value_or_null(value)
     }
 
     /// Capture the full Rust debug representation of an error.
@@ -1006,7 +1006,7 @@ pub mod codec {
         }
 
         fn reconstruct(recorded: serde_json::Value) -> Option<R> {
-            serde_json::from_value::<R>(recorded).ok()
+            crate::canonical::from_value::<R>(recorded).ok()
         }
     }
 
@@ -1067,7 +1067,7 @@ pub mod codec {
             match object.get("result").and_then(serde_json::Value::as_str) {
                 Some("Ok") => {
                     let value = object.get("value")?;
-                    let inner: T = serde_json::from_value(value.clone()).ok()?;
+                    let inner: T = crate::canonical::from_value(value.clone()).ok()?;
                     Some(Ok(inner))
                 }
                 Some("Err") => {
@@ -1075,7 +1075,7 @@ pub mod codec {
                     // A `kind` that no longer names a variant of the candidate's
                     // error type is a reconstruction FAILURE (never a silent
                     // fabrication) — the seam fail-stops on it.
-                    let context: E = serde_json::from_value(kind.clone()).ok()?;
+                    let context: E = crate::canonical::from_value(kind.clone()).ok()?;
                     Some(Err(error_stack::report!(context)))
                 }
                 _ => None,
@@ -2463,5 +2463,14 @@ mod optional_return_round_trip {
             Some(None),
             "while the miss still comes back as a miss"
         );
+    }
+
+    /// Both argument captures leave a present `None` as the bare `null` it has
+    /// always been, so an `args_hash` on a sealed tape still matches.
+    #[test]
+    fn an_argument_holding_a_present_none_is_not_marked() {
+        let arg: Option<Option<String>> = Some(None);
+        assert_eq!(crate::capture!(arg), serde_json::Value::Null);
+        assert_eq!(crate::value::serialize(&arg), serde_json::Value::Null);
     }
 }
