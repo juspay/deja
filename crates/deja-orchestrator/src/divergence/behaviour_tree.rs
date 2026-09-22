@@ -1,0 +1,478 @@
+//! A run as a tree of behaviour: every address the tape holds, with what the
+//! run produced there.
+//!
+//! Git never stores diffs; it stores snapshots and derives every diff by
+//! walking two trees. A replay has the same shape once the recording is seen
+//! for what it is — a run captured live rather than under substitution. The
+//! scorecard is the diff between the tape's run and a candidate's run; the
+//! delta a pull request needs is the same diff between two candidates' runs,
+//! with the tape as the common ancestor. Both need the same object: a map from
+//! address to canonical value, which this module builds.
+//!
+//! The tree is a PROJECTION of what the scorer already produced — the call
+//! ledger and the kernel's http diffs — so it inherits the scorer's
+//! canonicalisation and its classification of every row. It stores whether the
+//! run reproduced the tape at each address and, when it did not, a hash of
+//! what the run produced instead. It never stores the tape's own payloads, so
+//! it can leave the pod.
+//!
+//! Pure seams (`time`, `id`) are substituted and therefore identical by
+//! construction; they are not addresses here. The inconclusive classes are
+//! left out too, so they can never flip a bucket in a comparison.
+
+use std::collections::HashMap;
+
+use deja_kernel::HttpDiff;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::ledger::CallRecord;
+
+/// Which canonicalisation produced the hashes. Two trees compare only when
+/// they agree, so a delta never mixes hashes from different rules.
+pub const CANON_VERSION: u32 = 1;
+
+/// One place a run's behaviour can be observed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Address {
+    /// A side-effect call: the k-th call of this boundary and operation under
+    /// this span path within the correlation.
+    Call {
+        correlation: String,
+        span_path: String,
+        boundary: String,
+        operation: String,
+        occurrence: u32,
+    },
+    /// The status the request's response came back with.
+    Status {
+        correlation: String,
+        request_sequence: u64,
+    },
+    /// One path of the response body the kernel compared.
+    Body {
+        correlation: String,
+        json_path: String,
+    },
+}
+
+impl Address {
+    pub fn correlation(&self) -> &str {
+        match self {
+            Address::Call { correlation, .. }
+            | Address::Status { correlation, .. }
+            | Address::Body { correlation, .. } => correlation,
+        }
+    }
+}
+
+/// What the run produced at an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Value {
+    /// The run reproduced the tape's value here.
+    Reproduced,
+    /// The tape holds this address; the run never reached it.
+    Absent,
+    /// The tape holds this address; the run produced something else.
+    Diverged { hash: String },
+    /// The tape does not hold this address; the run produced it.
+    Novel { hash: String },
+}
+
+/// The lane an address belongs to: the connector the request went to and
+/// the flow it ran under, read off the call itself. Attribution rolls
+/// addresses up by lane, so a divergence can be placed next to the code that
+/// could have caused it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Lane {
+    pub connector: String,
+    pub flow: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entry {
+    pub address: Address,
+    pub value: Value,
+    /// Whether this address blocks a verdict when it diverges — mirrors the
+    /// ledger row's `blocking` for calls; responses always block.
+    pub blocking: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviourTree {
+    pub run_id: String,
+    pub canon_version: u32,
+    pub entries: Vec<Entry>,
+    /// The lane each correlation ran in, from its connector call.
+    pub lanes: HashMap<String, Lane>,
+}
+
+/// The canonical form of an argument value: keys sorted, and a header list
+/// (`[[name, value], …]`) ordered by name, because the sending process's map
+/// order is not behaviour.
+fn canonical(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            // insert in key order: with `preserve_order` the map keeps
+            // insertion order, so the order of insertion is the wire order
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for k in keys {
+                let x = &map[k];
+                let x = if k == "headers" && is_pair_list(x) {
+                    let mut pairs: Vec<(String, serde_json::Value)> = x
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|p| {
+                                    let p = p.as_array()?;
+                                    Some((p[0].as_str()?.to_ascii_lowercase(), canonical(&p[1])))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    pairs.sort_by(|a, b| {
+                        a.0.cmp(&b.0)
+                            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
+                    });
+                    serde_json::Value::Array(
+                        pairs
+                            .into_iter()
+                            .map(|(k, v)| serde_json::json!([k, v]))
+                            .collect(),
+                    )
+                } else {
+                    canonical(x)
+                };
+                out.insert(k.clone(), x);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn is_pair_list(v: &serde_json::Value) -> bool {
+    v.as_array().is_some_and(|a| {
+        !a.is_empty()
+            && a.iter().all(|p| {
+                p.as_array()
+                    .is_some_and(|p| p.len() == 2 && p[0].is_string())
+            })
+    })
+}
+
+/// A short, stable hash of a canonical value.
+pub fn hash_of(v: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(&canonical(v)).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    hex::encode(&digest[..8])
+}
+
+/// The lane a call ran in: the host's most specific label as the connector
+/// (`api-m.sandbox.paypal.com` → `paypal`), and the flow span on its path.
+pub fn lane_of(row: &CallRecord) -> Option<Lane> {
+    if row.boundary != "http_outgoing" {
+        return None;
+    }
+    let side = row.observed.as_ref().or(row.recorded.as_ref())?;
+    let url = side.args.as_ref()?.get("url")?.as_str()?;
+    let host = url
+        .split("//")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let labels: Vec<&str> = host.split('.').collect();
+    // the registrable label: the one before the public suffix
+    let connector = if labels.len() >= 2 {
+        labels[labels.len() - 2]
+    } else {
+        host
+    }
+    .to_owned();
+    let span_path = side.span_path.clone().unwrap_or_default();
+    let flow = span_path
+        .split('>')
+        .skip_while(|s| !s.starts_with("deja::"))
+        .nth(1)
+        .unwrap_or("other")
+        .to_owned();
+    Some(Lane {
+        connector,
+        flow: flow.trim_start_matches("payment_").to_owned(),
+    })
+}
+
+/// Build the tree from the scorer's ledger rows and the kernel's http diffs.
+pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> BehaviourTree {
+    let mut entries = Vec::new();
+    let mut lanes: HashMap<String, Lane> = HashMap::new();
+    let mut occurrence: HashMap<(String, String, String, String), u32> = HashMap::new();
+    for row in rows {
+        if matches!(
+            row.boundary.as_str(),
+            "time" | "id" | "id_generation" | "uuid" | "rng"
+        ) {
+            continue;
+        }
+        let Some(correlation) = row.correlation_id.clone() else {
+            continue;
+        };
+        if let Some(lane) = lane_of(row) {
+            lanes.entry(correlation.clone()).or_insert(lane);
+        }
+        let span_path = row
+            .observed
+            .as_ref()
+            .and_then(|s| s.span_path.clone())
+            .or_else(|| row.recorded.as_ref().and_then(|s| s.span_path.clone()))
+            .unwrap_or_default();
+        let key = (
+            correlation.clone(),
+            span_path.clone(),
+            row.boundary.clone(),
+            row.method_name.clone(),
+        );
+        let n = occurrence.entry(key).or_insert(0);
+        let address = Address::Call {
+            correlation,
+            span_path,
+            boundary: row.boundary.clone(),
+            operation: row.method_name.clone(),
+            occurrence: *n,
+        };
+        *n += 1;
+        let observed_hash = || {
+            row.observed
+                .as_ref()
+                .and_then(|s| s.args.as_ref())
+                .map(hash_of)
+                .unwrap_or_else(|| "∅".to_owned())
+        };
+        let value = match row.kind.as_str() {
+            "matched" | "recovered" | "identity_skew" | "deterministic" => Value::Reproduced,
+            "omitted" | "pruned_subtree" => Value::Absent,
+            "novel" | "novel_subtree" | "environmental" | "novel_absorbed" => Value::Novel {
+                hash: observed_hash(),
+            },
+            k if k.starts_with("inconclusive") || k.starts_with("schema_default") => continue,
+            _ => Value::Diverged {
+                hash: observed_hash(),
+            },
+        };
+        entries.push(Entry {
+            address,
+            value,
+            blocking: row.blocking,
+        });
+    }
+    for d in diffs {
+        entries.push(Entry {
+            address: Address::Status {
+                correlation: d.correlation_id.clone(),
+                request_sequence: d.request_sequence,
+            },
+            value: if d.status_match {
+                Value::Reproduced
+            } else {
+                Value::Diverged {
+                    hash: format!("status={}", d.status_candidate),
+                }
+            },
+            blocking: true,
+        });
+        for p in &d.body_diff {
+            entries.push(Entry {
+                address: Address::Body {
+                    correlation: d.correlation_id.clone(),
+                    json_path: p.json_path.clone(),
+                },
+                value: Value::Diverged {
+                    hash: hash_of(&p.candidate),
+                },
+                blocking: true,
+            });
+        }
+    }
+    BehaviourTree {
+        run_id: run_id.to_owned(),
+        canon_version: CANON_VERSION,
+        entries,
+        lanes,
+    }
+}
+
+impl BehaviourTree {
+    /// One JSON object per line: the header, then every entry.
+    pub fn to_jsonl(&self) -> String {
+        let mut out = String::new();
+        out.push_str(
+            &serde_json::json!({
+                "run_id": self.run_id,
+                "canon_version": self.canon_version,
+                "lanes": self.lanes,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+        for e in &self.entries {
+            if let Ok(line) = serde_json::to_string(e) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    pub fn from_jsonl(text: &str) -> Option<Self> {
+        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+        let head: serde_json::Value = serde_json::from_str(lines.next()?).ok()?;
+        let entries = lines
+            .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
+            .collect();
+        Some(Self {
+            run_id: head.get("run_id")?.as_str()?.to_owned(),
+            canon_version: head.get("canon_version")?.as_u64()? as u32,
+            entries,
+            lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::divergence::ledger::CallSide;
+
+    fn row(kind: &str, corr: &str, span: &str, args: serde_json::Value) -> CallRecord {
+        CallRecord {
+            correlation_id: Some(corr.to_owned()),
+            source_event_global_sequence: None,
+            served_event_global_sequence: None,
+            boundary: "http_outgoing".to_owned(),
+            trait_name: "svc".to_owned(),
+            method_name: "call_connector_api".to_owned(),
+            kind: kind.to_owned(),
+            blocking: kind == "value_diverged",
+            origin: false,
+            stopped: false,
+            resolved_rank: None,
+            recorded: Some(CallSide {
+                args: Some(args.clone()),
+                span_path: Some(span.to_owned()),
+                ..Default::default()
+            }),
+            observed: Some(CallSide {
+                args: Some(args),
+                span_path: Some(span.to_owned()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn header_order_is_not_behaviour() {
+        let a =
+            serde_json::json!({"url": "https://api.x.com/v1", "headers": [["B", "2"], ["a", "1"]]});
+        let b =
+            serde_json::json!({"headers": [["A", "1"], ["b", "2"]], "url": "https://api.x.com/v1"});
+        assert_eq!(hash_of(&a), hash_of(&b));
+        let c =
+            serde_json::json!({"url": "https://api.x.com/v1", "headers": [["a", "1"], ["b", "3"]]});
+        assert_ne!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn a_ledger_becomes_addresses_with_lanes_and_occurrences() {
+        let args = serde_json::json!({"url": "https://api-m.sandbox.paypal.com/v2/checkout/orders", "method": "POST"});
+        let span = "request>deja::grpc_incoming>payment_authorize>ucs::flow_orchestration>execute";
+        let rows = vec![
+            row("matched", "c1", span, args.clone()),
+            row("value_diverged", "c1", span, args.clone()),
+            row("omitted", "c2", span, args.clone()),
+            row("novel", "c2", span, args),
+        ];
+        let diffs = vec![HttpDiff {
+            correlation_id: "c1".into(),
+            request_sequence: 0,
+            request_path: "/p".into(),
+            status_baseline: 200,
+            status_candidate: 0,
+            status_match: false,
+            body_diff: vec![],
+            baseline_body: None,
+            candidate_body: None,
+            transport_error: None,
+        }];
+        let tree = build("run", &rows, &diffs);
+        assert_eq!(
+            tree.lanes["c1"],
+            Lane {
+                connector: "paypal".into(),
+                flow: "authorize".into()
+            }
+        );
+        let calls: Vec<_> = tree
+            .entries
+            .iter()
+            .filter(|e| matches!(e.address, Address::Call { .. }))
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert!(matches!(calls[0].value, Value::Reproduced));
+        assert!(matches!(
+            &calls[0].address,
+            Address::Call { occurrence: 0, .. }
+        ));
+        assert!(
+            matches!(&calls[1].address, Address::Call { occurrence: 1, .. }),
+            "the second call under the same span is the next occurrence"
+        );
+        assert!(matches!(calls[1].value, Value::Diverged { .. }));
+        assert!(matches!(calls[2].value, Value::Absent));
+        assert!(matches!(calls[3].value, Value::Novel { .. }));
+        let status = tree
+            .entries
+            .iter()
+            .find(|e| matches!(e.address, Address::Status { .. }))
+            .unwrap();
+        assert_eq!(
+            status.value,
+            Value::Diverged {
+                hash: "status=0".into()
+            }
+        );
+        let text = tree.to_jsonl();
+        let back = BehaviourTree::from_jsonl(&text).unwrap();
+        assert_eq!(back.entries.len(), tree.entries.len());
+        assert_eq!(back.lanes, tree.lanes);
+    }
+
+    #[test]
+    fn seams_and_inconclusive_rows_are_not_addresses() {
+        let mut seam = row(
+            "matched",
+            "c1",
+            "request>deja::grpc_incoming>payment_sync>x",
+            serde_json::json!({}),
+        );
+        seam.boundary = "time".into();
+        let mut inconclusive = row(
+            "inconclusive_race",
+            "c1",
+            "request>deja::grpc_incoming>payment_sync>x",
+            serde_json::json!({}),
+        );
+        inconclusive.boundary = "db".into();
+        let tree = build("run", &[seam, inconclusive], &[]);
+        assert!(tree.entries.is_empty());
+    }
+}

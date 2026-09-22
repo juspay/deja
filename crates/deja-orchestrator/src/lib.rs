@@ -1046,6 +1046,13 @@ impl HarnessRoot {
     /// tape (span STRUCTURE only — no boundary payloads). Published as a run
     /// artifact so the dashboard's `/graph` record side renders for in-pod runs
     /// without copying the sensitive recording tape off the pod.
+    /// The run as a behaviour tree (one address per line), the projection two
+    /// runs on one tape are compared through.
+    pub fn behaviour_tree_path(&self, run_id: &str) -> PathBuf {
+        self.root
+            .join("runs")
+            .join(format!("{run_id}.behaviour-tree.jsonl"))
+    }
     pub fn record_graph_path(&self, run_id: &str) -> PathBuf {
         self.root
             .join("runs")

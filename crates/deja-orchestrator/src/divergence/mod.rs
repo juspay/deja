@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::HarnessRoot;
 
+pub mod behaviour_tree;
+pub mod delta;
 pub mod ledger;
 pub mod span_shape;
 pub use ledger::CallRecord;

@@ -948,3 +948,71 @@ main:has(.recintro) { max-width: 1440px; }
   color: var(--text-muted); font-size: var(--fs-11); line-height: 1.7;
 }
 .scopeidlist li::marker { color: var(--text-faint); font-family: var(--font-mono); }
+
+/* ==========================================================================
+   BEHAVIOUR DELTA PAGE — two verdicts side by side, then the addresses that
+   separate them. Flagged (changed) first, introduced next; inherited and
+   resolved are shown but never charged.
+   ========================================================================== */
+.delta-link { margin: calc(-1 * var(--s2)) 0 var(--s4); }
+.delta-head { display: flex; gap: var(--s4); align-items: flex-end; flex-wrap: wrap; margin-bottom: var(--s4); }
+.delta-head .field { display: grid; gap: 2px; }
+.delta-head .field > span { color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; }
+.delta-head select, .delta-head input[type="text"] { min-width: 34ch; font-family: var(--font-mono); font-size: var(--fs-12); }
+.delta-sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--s3); margin-bottom: var(--s4); }
+.delta-side { background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3) var(--s4); display: grid; gap: var(--s2); }
+.delta-side .role { color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; }
+.delta-side .rid { font-family: var(--font-mono); font-size: var(--fs-13); color: var(--text); overflow-wrap: anywhere; }
+.delta-side .cand { color: var(--text-subtle); font-family: var(--font-mono); font-size: var(--fs-11); overflow-wrap: anywhere; }
+.delta-verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--s3); margin-bottom: var(--s4); }
+.delta-verdict { border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3) var(--s4); display: grid; gap: var(--s2); background: var(--surface); }
+.delta-verdict.tone-good { border-left: 3px solid var(--diff-add-edge); background: var(--surface); }
+.delta-verdict.tone-bad { border-left: 3px solid var(--diff-del-edge); background: var(--surface); }
+.delta-verdict.tone-neutral { border-left: 3px solid var(--border-strong); background: var(--surface); }
+.delta-verdict .vq { color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; }
+.delta-verdict .vrow { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; }
+.delta-verdict .vreason { color: var(--text-muted); font-size: var(--fs-12); line-height: 1.5; }
+.delta-buckets { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--s2); margin-bottom: var(--s4); }
+.delta-bucket { border: 1px solid var(--border-muted); border-radius: var(--r-sm); padding: var(--s2) var(--s3); display: grid; gap: 2px; background: var(--surface-raised); }
+.delta-bucket .bn { font-family: var(--font-mono); font-size: var(--fs-19); font-variant-numeric: tabular-nums; color: var(--text); }
+.delta-bucket .bk { font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-subtle); }
+.delta-bucket .bw { font-size: var(--fs-11); color: var(--text-faint); line-height: 1.4; }
+.delta-bucket.f-changed { border-color: var(--diff-del-edge); }
+.delta-bucket.f-changed .bn, .delta-bucket.f-changed .bk { color: var(--red-fg); }
+.delta-bucket.f-introduced { border-color: var(--diff-mod-edge); }
+.delta-bucket.f-introduced .bn, .delta-bucket.f-introduced .bk { color: var(--amber-fg); }
+.delta-bucket.f-resolved .bn { color: var(--cyan); }
+.delta-bucket.f-inherited .bn { color: var(--text-muted); }
+.delta-bucket.f-clean .bn { color: var(--green-fg); }
+.delta-bucket.zero .bn, .delta-bucket.zero .bk { color: var(--text-faint); }
+.delta-lanes td.lane { font-family: var(--font-mono); font-size: var(--fs-12); white-space: nowrap; }
+.delta-lanes td.num.hot-changed { color: var(--red-fg); font-weight: 600; }
+.delta-lanes td.num.hot-introduced { color: var(--amber-fg); font-weight: 600; }
+.delta-lanes td.num.hot-resolved { color: var(--cyan); }
+.delta-lanes td.num.dim { color: var(--text-faint); }
+.delta-lanes td.note { color: var(--text-subtle); font-size: var(--fs-12); }
+.delta-family { margin-bottom: var(--s3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-raised); }
+.delta-family > summary { cursor: pointer; padding: var(--s2) var(--s4); display: flex; gap: var(--s3); align-items: baseline; list-style: none; }
+.delta-family > summary::-webkit-details-marker { display: none; }
+.delta-family > summary::before { content: "▸"; color: var(--text-faint); font-size: var(--fs-11); }
+.delta-family[open] > summary::before { content: "▾"; }
+.delta-family > summary .fn { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.delta-family > summary .fw { color: var(--text-subtle); font-size: var(--fs-12); }
+.delta-family.f-changed > summary .fn { color: var(--red-fg); }
+.delta-family.f-introduced > summary .fn { color: var(--amber-fg); }
+.delta-family table { font-size: var(--fs-12); }
+.delta-family td.addr { font-family: var(--font-mono); font-size: var(--fs-11); overflow-wrap: anywhere; }
+.delta-family td.addr .corr { color: var(--text-faint); }
+.delta-family td.addr .leaf { color: var(--text); }
+.delta-family td.addr .site { color: var(--text-subtle); }
+.delta-family td.val { font-family: var(--font-mono); font-size: var(--fs-11); white-space: nowrap; }
+.delta-family td.val.tape { color: var(--green-fg); }
+.delta-family td.val.absent { color: var(--text-faint); font-style: italic; }
+.delta-family td.val.hash { color: var(--amber-fg); }
+.delta-family td.val.hash.same { color: var(--text-subtle); }
+.delta-family td.bk { white-space: nowrap; color: var(--text-subtle); font-size: var(--fs-11); }
+.delta-family td.bk .nb { color: var(--text-faint); }
+.delta-family .more { padding: var(--s2) var(--s4); color: var(--text-subtle); font-size: var(--fs-12); }
+.delta-family .more button { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
+.delta-unavailable { border: 1px dashed var(--border-strong); border-radius: var(--r-md); padding: var(--s4); color: var(--text-muted); }
+.delta-legend { color: var(--text-faint); font-size: var(--fs-11); line-height: 1.6; max-width: 80ch; }

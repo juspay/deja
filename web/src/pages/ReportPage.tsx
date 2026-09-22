@@ -725,6 +725,14 @@ export default function ReportPage() {
 
       <RunHeader run={r} />
       <VerdictBanner result={result} />
+      {isReplay && scored && (
+        <p className="hint delta-link">
+          This verdict is against the tape.{" "}
+          <Link to={withDebug(`/r/${r.run_id}/delta`, debug)}>
+            Compare against another run of the same tape →
+          </Link>
+        </p>
+      )}
 
       {isReplay && scored && (
         <>

@@ -474,6 +474,10 @@ export const api = {
   graph: (id: string) => request<RunGraph>(`/api/v1/runs/${id}/graph`),
   changeCoverage: (id: string) =>
     request<ChangeCoverageResponse>(`/api/v1/runs/${id}/change-coverage`),
+  delta: (id: string, against: string) =>
+    request<DeltaResponse>(
+      `/api/v1/runs/${id}/delta?against=${encodeURIComponent(against)}`,
+    ),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
   createRun: (spec: Record<string, unknown>) => {
@@ -714,3 +718,87 @@ export const recordingCorrelations = (id: string, limit = 1000, offset = 0) =>
   request<RecordingCorrelations>(
     `/api/v1/recordings/${encodeURIComponent(id)}/correlations?limit=${limit}&offset=${offset}`,
   );
+
+// ---------------------------------------------------------------------------
+// Behaviour delta — what a run changed relative to ANOTHER run of the same
+// tape, three-way against the tape. `GET /runs/{y}/delta?against={m}`.
+// Never part of the tape-relative verdict; shown beside it.
+
+export type DeltaAddress =
+  | {
+      kind: "call";
+      correlation: string;
+      span_path: string;
+      boundary: string;
+      operation: string;
+      occurrence: number;
+    }
+  | { kind: "status"; correlation: string; request_sequence: number }
+  | { kind: "body"; correlation: string; json_path: string };
+
+/** What one side produced at an address: it reproduced the tape, never
+ *  reached the address, or produced something else (hashed). */
+export type DeltaSide = "tape" | "absent" | { hash: string };
+
+export type DeltaBucket =
+  | "clean"
+  | "inherited"
+  | "introduced"
+  | "resolved"
+  | "changed"
+  | "inherited_novel"
+  | "introduced_novel"
+  | "resolved_novel"
+  | "inherited_omission"
+  | "introduced_omission"
+  | "resolved_omission";
+
+export type DeltaFamily = "clean" | "inherited" | "introduced" | "resolved" | "changed";
+
+export type DeltaRow = {
+  address: DeltaAddress;
+  bucket: DeltaBucket;
+  m: DeltaSide;
+  y: DeltaSide;
+  blocking: boolean;
+  lane?: { connector: string; flow: string } | null;
+};
+
+export type DeltaLane = {
+  lane: { connector: string; flow: string };
+  requests: number;
+  buckets: Partial<Record<DeltaFamily, number>>;
+};
+
+export type DeltaSideInfo = {
+  run: string;
+  tape_verdict: { pass: boolean; inconclusive: boolean; reason: string } | null;
+  candidate: Record<string, unknown> | null;
+};
+
+export type Delta = {
+  m_run: string;
+  y_run: string;
+  canon_version: number;
+  verdict: {
+    pass: boolean;
+    introduced: number;
+    changed: number;
+    inherited: number;
+    resolved: number;
+    reason: string;
+  };
+  buckets: Partial<Record<DeltaBucket, number>>;
+  lanes: DeltaLane[];
+  rows: DeltaRow[];
+  clean: number;
+  tape: string | null;
+  sides: { m: DeltaSideInfo; y: DeltaSideInfo };
+};
+
+export type DeltaResponse = Delta | { unavailable: string };
+
+export function deltaFamily(b: DeltaBucket): DeltaFamily {
+  if (b === "clean" || b === "changed") return b;
+  return b.split("_")[0] as DeltaFamily;
+}

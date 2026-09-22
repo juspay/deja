@@ -264,6 +264,8 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/http-diffs", get(v1_http_diffs))
         .route("/runs/{run_id}/graph", get(v1_graph))
         .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
+        .route("/runs/{run_id}/tree", get(v1_tree))
+        .route("/runs/{run_id}/delta", get(v1_delta))
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit));
@@ -1933,6 +1935,168 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
         }
     }
     json_ok_ser(&assessment)
+}
+
+/// A run's behaviour tree: read from the cache beside its ledger when one is
+/// there, else built from the ledger and the http diffs and cached. `Err` names
+/// why no tree can exist for the run (no ledger, so nothing was scored).
+async fn behaviour_tree_for(
+    st: &AppState,
+    id: &str,
+) -> Result<divergence::behaviour_tree::BehaviourTree, String> {
+    use divergence::behaviour_tree::{self, BehaviourTree};
+
+    hydrate_run_artifacts(st, id).await;
+    let runs_dir = st.root.root.join("runs");
+    if let Some(cached) = confined(st.root.behaviour_tree_path(id), &runs_dir) {
+        if let Some(tree) = std::fs::read_to_string(&cached)
+            .ok()
+            .and_then(|t| BehaviourTree::from_jsonl(&t))
+        {
+            if tree.canon_version == behaviour_tree::CANON_VERSION {
+                return Ok(tree);
+            }
+        }
+    }
+    let Some(ledger_path) = confined(st.root.call_ledger_path(id), &runs_dir) else {
+        return Err(format!(
+            "run {id} published no call ledger, so it was never scored and has no behaviour to compare"
+        ));
+    };
+    let rows: Vec<divergence::ledger::CallRecord> = std::fs::read_to_string(&ledger_path)
+        .map_err(|e| format!("read call ledger of {id}: {e}"))?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let diffs: Vec<deja_kernel::HttpDiff> =
+        confined(st.root.http_diff_path(id), &st.root.root.join("http-diffs"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|c| {
+                c.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let tree = behaviour_tree::build(id, &rows, &diffs);
+    // cached next to the ledger it was built from, under the resolved ledger
+    // path rather than a path the id alone chose
+    let _ = std::fs::write(
+        ledger_path.with_file_name(format!("{id}.behaviour-tree.jsonl")),
+        tree.to_jsonl(),
+    );
+    Ok(tree)
+}
+
+/// `GET /api/v1/runs/{id}/tree` — the run as a behaviour tree: every address
+/// the tape holds, with whether the run reproduced it and, when not, a hash of
+/// what it produced. `{unavailable}` when the run was never scored.
+async fn v1_tree(State(st): State<AppState>, id: RunId) -> Response {
+    match behaviour_tree_for(&st, &id).await {
+        Ok(tree) => json_ok_ser(&tree),
+        Err(why) => json_ok(serde_json::json!({ "unavailable": why })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeltaQuery {
+    /// The run to measure against: the baseline `M`. The path's run is `Y`.
+    against: Option<String>,
+}
+
+/// `GET /api/v1/runs/{id}/delta?against={run}` — what this run changed
+/// relative to another run of the same tape, three-way against the tape.
+/// Both runs' tape-relative verdicts ride along so a reader sees the two
+/// verdicts side by side. `{unavailable}` names why no delta can be computed:
+/// no baseline named, different tapes, or a side that was never scored.
+async fn v1_delta(
+    State(st): State<AppState>,
+    id: RunId,
+    axum::extract::Query(q): axum::extract::Query<DeltaQuery>,
+) -> Response {
+    let unavailable = |why: String| json_ok(serde_json::json!({ "unavailable": why }));
+    let against = match q
+        .against
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        None => {
+            return unavailable(
+                "no baseline run named: pass ?against=<run id> of a run on the same tape"
+                    .to_owned(),
+            )
+        }
+        Some(raw) => match raw.parse::<RunId>() {
+            Ok(id) => id,
+            Err(e) => return unavailable(format!("against is not a run id: {e}")),
+        },
+    };
+    if *against == *id {
+        return unavailable("a run measured against itself has no delta".to_owned());
+    }
+    let (y_params, m_params) = (
+        run_params_for(&st, &id).await,
+        run_params_for(&st, &against).await,
+    );
+    let tape = |p: &Option<deja_orchestrator::RunParams>| {
+        p.as_ref()
+            .and_then(|p| p.recording_group.clone().or_else(|| p.recording_id.clone()))
+    };
+    if let (Some(y_tape), Some(m_tape)) = (tape(&y_params), tape(&m_params)) {
+        if y_tape != m_tape {
+            return unavailable(format!(
+                "the runs drove different tapes ({y_tape} and {m_tape}); a delta only holds between runs of one tape"
+            ));
+        }
+    }
+    let y = match behaviour_tree_for(&st, &id).await {
+        Ok(t) => t,
+        Err(why) => return unavailable(why),
+    };
+    let m = match behaviour_tree_for(&st, &against).await {
+        Ok(t) => t,
+        Err(why) => return unavailable(why),
+    };
+    let delta = match divergence::delta::three_way(&m, &y) {
+        Ok(d) => d,
+        Err(why) => return unavailable(why),
+    };
+    let verdict_of = |run: &str| -> serde_json::Value {
+        confined(st.root.scorecard_path(run), &st.root.root.join("runs"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("verdict").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let candidate_of = |p: &Option<deja_orchestrator::RunParams>| {
+        p.as_ref()
+            .map(|p| serde_json::to_value(&p.candidate_spec).unwrap_or_default())
+    };
+    let mut body = serde_json::to_value(&delta).unwrap_or_default();
+    body["tape"] = serde_json::json!(tape(&y_params).or_else(|| tape(&m_params)));
+    body["sides"] = serde_json::json!({
+        "m": { "run": *against, "tape_verdict": verdict_of(&against), "candidate": candidate_of(&m_params) },
+        "y": { "run": *id, "tape_verdict": verdict_of(&id), "candidate": candidate_of(&y_params) },
+    });
+    json_ok(body)
+}
+
+/// The run's parameters: the live record on compose, the stored row on k8s.
+async fn run_params_for(st: &AppState, id: &str) -> Option<deja_orchestrator::RunParams> {
+    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    match live {
+        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        None => match &st.store {
+            Some(store) => match store.get_run(id).await {
+                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+                _ => None,
+            },
+            None => None,
+        },
+    }
 }
 
 /// `candidate` resolved, if it exists and lies under `base`; `None` otherwise.
