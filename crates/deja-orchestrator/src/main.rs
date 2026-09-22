@@ -1276,8 +1276,9 @@ struct CorrelationsQuery {
 ///
 /// Rows are in TAPE ORDER — each correlation's first appearance — and paging
 /// never reorders them. That matters beyond presentation: a run that names no
-/// correlations drives the first [`deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN`]
-/// in this same order, so the head of page zero IS what such a run will drive.
+/// correlations drives the first [`deja_orchestrator::scope::DEFAULT_CORRELATIONS_PER_RUN`]
+/// of them — or the first `max_correlations` when the run named one — in this
+/// same order, so the head of page zero IS what such a run will drive.
 /// Any other default ordering here would show one set and run another.
 async fn v1_recording_correlations(
     State(st): State<AppState>,
