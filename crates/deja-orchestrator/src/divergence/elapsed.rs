@@ -168,7 +168,10 @@ fn in_correlation<'a>(
 /// and almost nothing happens between them. That is one call measured at several
 /// depths, not an ambiguous match, so "unique" means unique up to ancestry.
 /// Unrelated spans that happen to share a duration are ambiguous and refused.
-fn one_ancestry_chain(nodes: &[&ExecutionGraphNode], by_id: &BTreeMap<u64, &ExecutionGraphNode>) -> bool {
+fn one_ancestry_chain(
+    nodes: &[&ExecutionGraphNode],
+    by_id: &BTreeMap<u64, &ExecutionGraphNode>,
+) -> bool {
     let ids: std::collections::BTreeSet<u64> = nodes.iter().map(|node| node.node_id).collect();
     // Every node but one must have an ancestor inside the set: walking up from
     // each, exactly one reaches the top without meeting another member.
@@ -211,8 +214,10 @@ pub(crate) fn elapsed_derived(
         return ElapsedVerdict::Refused;
     }
     let recorded_nodes = in_correlation(record_graph, correlation);
-    let recorded_by_id: BTreeMap<u64, &ExecutionGraphNode> =
-        recorded_nodes.iter().map(|node| (node.node_id, *node)).collect();
+    let recorded_by_id: BTreeMap<u64, &ExecutionGraphNode> = recorded_nodes
+        .iter()
+        .map(|node| (node.node_id, *node))
+        .collect();
 
     let matches: Vec<&ExecutionGraphNode> = recorded_nodes
         .iter()
@@ -236,8 +241,10 @@ pub(crate) fn elapsed_derived(
     let path = span_path(deepest, &recorded_by_id);
 
     let replay_nodes = in_correlation(replay_graph, correlation);
-    let replay_by_id: BTreeMap<u64, &ExecutionGraphNode> =
-        replay_nodes.iter().map(|node| (node.node_id, *node)).collect();
+    let replay_by_id: BTreeMap<u64, &ExecutionGraphNode> = replay_nodes
+        .iter()
+        .map(|node| (node.node_id, *node))
+        .collect();
     // CONSISTENCY, not proof: the recorded side already identified the span. The
     // replay side only has to agree that the span at that path read what the
     // candidate sent.
@@ -390,7 +397,8 @@ pub(crate) fn pair_differs_only_by_elapsed(
     }
     let mut matched = Vec::with_capacity(leaves.len());
     for (_, recorded_leaf, observed_leaf) in &leaves {
-        let (Some(recorded_ms), Some(observed_ms)) = (recorded_leaf.as_u64(), observed_leaf.as_u64())
+        let (Some(recorded_ms), Some(observed_ms)) =
+            (recorded_leaf.as_u64(), observed_leaf.as_u64())
         else {
             return PairElapsed::Refused;
         };
