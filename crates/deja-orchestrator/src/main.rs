@@ -1958,26 +1958,28 @@ async fn behaviour_tree_for(
             "run {id} published no call ledger, so it was never scored and has no behaviour to compare"
         ));
     };
-    // beside the ledger it is built from, named off the confined ledger path
-    // the way the change-coverage cache is named off the replay graph:
+    // beside the ledger it is built from, named off the confined ledger path:
     // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
     let cache = ledger_path.with_extension("behaviour-tree.jsonl");
-    if let Some(tree) = Some(&cache)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| BehaviourTree::from_jsonl(&t))
-        .filter(|t| t.canon_version == behaviour_tree::CANON_VERSION)
-    {
-        return Ok(tree);
-    }
-    let rows: Vec<divergence::ledger::CallRecord> = Some(&ledger_path)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .ok_or_else(|| format!("read call ledger of {id}"))?
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    let diffs: Vec<deja_kernel::HttpDiff> =
-        confined(st.root.http_diff_path(id), &st.root.root.join("http-diffs"))
+    let diffs_path = confined(st.root.http_diff_path(id), &st.root.root.join("http-diffs"));
+    let id = id.to_owned();
+    // Reading a ledger of megabytes and writing the cache is blocking file IO;
+    // it runs off the async worker, as the change-coverage assessment does.
+    tokio::task::spawn_blocking(move || -> Result<BehaviourTree, String> {
+        if let Some(tree) = std::fs::read_to_string(&cache)
+            .ok()
+            .and_then(|t| BehaviourTree::from_jsonl(&t))
+            .filter(|t| t.canon_version == behaviour_tree::CANON_VERSION)
+        {
+            return Ok(tree);
+        }
+        let rows: Vec<divergence::ledger::CallRecord> = std::fs::read_to_string(&ledger_path)
+            .map_err(|e| format!("read call ledger of {id}: {e}"))?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let diffs: Vec<deja_kernel::HttpDiff> = diffs_path
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|c| {
                 c.lines()
@@ -1986,9 +1988,12 @@ async fn behaviour_tree_for(
                     .collect()
             })
             .unwrap_or_default();
-    let tree = behaviour_tree::build(id, &rows, &diffs);
-    let _ = std::fs::write(&cache, tree.to_jsonl());
-    Ok(tree)
+        let tree = behaviour_tree::build(&id, &rows, &diffs);
+        let _ = std::fs::write(&cache, tree.to_jsonl());
+        Ok(tree)
+    })
+    .await
+    .map_err(|e| format!("build behaviour tree of a run: {e}"))?
 }
 
 /// `GET /api/v1/runs/{id}/tree` — the run as a behaviour tree: every address
