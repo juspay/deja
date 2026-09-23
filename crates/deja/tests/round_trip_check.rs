@@ -76,6 +76,46 @@ fn uncomparable(n: u64) -> Opaque {
     Opaque(n)
 }
 
+/// An error type with nothing to compare by, and a codec that rebuilds every
+/// `Ok` it captured as an `Err`.
+#[derive(Debug)]
+struct NoCompare;
+struct ErringCodec;
+
+impl ReplayCodec for ErringCodec {
+    type Value = Result<u64, NoCompare>;
+    fn capture(value: &Self::Value) -> (serde_json::Value, bool) {
+        match value {
+            Ok(n) => (serde_json::json!(n), false),
+            Err(_) => (serde_json::Value::Null, true),
+        }
+    }
+    fn reconstruct(_: serde_json::Value) -> Option<Self::Value> {
+        Some(Err(NoCompare))
+    }
+}
+
+#[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "erring", codec = ErringCodec)]
+fn erring(n: u64) -> Result<u64, NoCompare> {
+    Ok(n)
+}
+
+/// A set behind a wrapper that serialises through its own `Serialize`, as a
+/// collections facade does: the check cannot see it is a set.
+#[derive(serde::Deserialize)]
+struct Delegating(std::collections::HashSet<u32>);
+
+impl serde::Serialize for Delegating {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
+#[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "delegating", codec = SerdeCodec)]
+fn delegating() -> Delegating {
+    Delegating((0..64).collect())
+}
+
 /// A float whose JSON text does not read back as the same bits.
 #[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "float", codec = SerdeCodec)]
 fn float(x: f64) -> f64 {
@@ -163,6 +203,8 @@ fn every_recorded_value_is_rebuilt_and_compared() {
 
     assert_eq!(uncomparable(7).0, 7);
     assert_eq!(float(0.5), 0.5);
+    assert_eq!(delegating().0.len(), 64);
+    let ok_as_err = std::panic::catch_unwind(|| erring(3));
     let lossy = std::panic::catch_unwind(|| halved(3));
     let reconstruct_panicked = std::panic::catch_unwind(|| panicking(3));
     let text_lossy = std::panic::catch_unwind(|| float(1.071_566_039_146_582_6e-75));
@@ -214,6 +256,18 @@ fn every_recorded_value_is_rebuilt_and_compared() {
         text_lossy.is_err(),
         "and a value the text changes fails a debug build"
     );
+    assert_eq!(
+        fidelity_of(&events, "erring"),
+        [Fidelity::Lossy],
+        "an Ok rebuilt as an Err is lossy, whatever the error type offers"
+    );
+    assert!(ok_as_err.is_err(), "and fails a debug build");
+    assert_ne!(
+        fidelity_of(&events, "delegating"),
+        [Fidelity::Lossy],
+        "a set the check cannot see does not fail a debug build over its order"
+    );
+    assert_eq!(fidelity_of(&events, "delegating").len(), 1);
     assert_eq!(
         fidelity_of(&events, "fallible"),
         [Fidelity::Lossless],

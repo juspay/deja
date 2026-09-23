@@ -16,14 +16,17 @@
 //! 2. `Serialize` — the serde data model, which is finer than JSON: it keeps
 //!    `Some` apart from its contents, a unit apart from `None`, a newtype apart
 //!    from its field and every integer width apart. [`fingerprint`] renders that
-//!    model exactly, maps in key order and sets sorted, so two equal values
-//!    always render alike. This is the tier a generic boundary reaches, since
+//!    model exactly, maps in key order and sets sorted where the type name at
+//!    their position shows one. This is the tier a generic boundary reaches, since
 //!    its codec already requires `Serialize` — and it cannot see what
 //!    serialisation drops (`#[serde(skip)]`, a value that serialises masked).
+//!    A set behind a wrapper that serialises through its own `Serialize` is
+//!    invisible to it and renders in iteration order, so two renderings that
+//!    differ in nothing but sequence order are not called different.
 //! 3. A `Result` whose error offers neither — an `error_stack::Report`, which
-//!    most fallible boundaries return — compared by its `Ok` arm's serde image.
-//!    The recorder only checks values that are not errors, so the `Ok` arm is
-//!    the whole of what it compares.
+//!    most fallible boundaries return — compared by its `Ok` arm, by that
+//!    arm's `PartialEq` or else its serde image. An `Ok` rebuilt as an `Err` is
+//!    different; two `Err`s cannot be compared.
 //! 4. None of these — the check cannot be made and says so.
 //!
 //! Which tier a type reaches is known where the type is concrete, so
@@ -62,9 +65,13 @@ impl Comparison {
 /// Use [`compare!`](crate::compare) and [`round_trip!`](crate::round_trip).
 ///
 /// Each tier is implemented one reference level below the one above it, and
-/// both macros call through four references, so the first applicable tier in
+/// both macros call through five references, so the first applicable tier in
 /// the order the module documents is the one method lookup reaches first.
-pub struct Compare<'a, T: ?Sized>(pub Option<(&'a T, &'a T)>);
+pub struct Compare<'a, T: ?Sized>(pub Pair<'a, T>);
+
+/// A value and its rebuilt copy, or none when only the type is being asked
+/// about.
+pub type Pair<'a, T> = Option<(&'a T, &'a T)>;
 
 impl<T: ?Sized> Compare<'_, T> {
     /// The pair-less receiver [`round_trip!`](crate::round_trip) probes with.
@@ -78,7 +85,7 @@ pub trait CompareByEq {
     fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
-impl<T: PartialEq + ?Sized> CompareByEq for &&&Compare<'_, T> {
+impl<T: PartialEq + ?Sized> CompareByEq for &&&&Compare<'_, T> {
     fn deja_comparable(&self) -> bool {
         true
     }
@@ -94,7 +101,7 @@ pub trait CompareBySerde {
     fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
-impl<T: Serialize + ?Sized> CompareBySerde for &&Compare<'_, T> {
+impl<T: Serialize + ?Sized> CompareBySerde for &&&Compare<'_, T> {
     fn deja_comparable(&self) -> bool {
         true
     }
@@ -106,26 +113,62 @@ impl<T: Serialize + ?Sized> CompareBySerde for &&Compare<'_, T> {
     }
 }
 
-pub trait CompareOkArm {
+/// A `Result` compared by its `Ok` arms. Two `Err`s cannot be compared, but
+/// an `Ok` that comes back as an `Err`, or the reverse, is a different value.
+fn by_ok_arm<T, E>(
+    pair: Pair<'_, Result<T, E>>,
+    ok: impl FnOnce(&T, &T) -> Comparison,
+) -> Comparison {
+    match pair {
+        Some((Ok(a), Ok(b))) => ok(a, b),
+        Some((Ok(_), Err(_)) | (Err(_), Ok(_))) => Comparison::Different,
+        Some((Err(_), Err(_))) | None => Comparison::Incomparable,
+    }
+}
+
+pub trait CompareOkArmByEq {
     fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
-impl<T: Serialize, E> CompareOkArm for &Compare<'_, Result<T, E>> {
+impl<T: PartialEq, E> CompareOkArmByEq for &&Compare<'_, Result<T, E>> {
     fn deja_comparable(&self) -> bool {
         true
     }
     fn deja_compare(&self) -> Comparison {
-        match self.0 {
-            Some((Ok(a), Ok(b))) => by_fingerprint(a, b),
-            _ => Comparison::Incomparable,
-        }
+        by_ok_arm(self.0, |a, b| Comparison::from_equal(a == b))
     }
 }
 
+pub trait CompareOkArmBySerde {
+    fn deja_comparable(&self) -> bool;
+    fn deja_compare(&self) -> Comparison;
+}
+impl<T: Serialize, E> CompareOkArmBySerde for &Compare<'_, Result<T, E>> {
+    fn deja_comparable(&self) -> bool {
+        true
+    }
+    fn deja_compare(&self) -> Comparison {
+        by_ok_arm(self.0, |a, b| by_fingerprint(a, b))
+    }
+}
+
+/// Compare by serde image. One side that serialises and one that does not
+/// differ. Two that differ only in the order of some sequence cannot be told
+/// apart from a set the fingerprint could not see — one behind a delegating
+/// wrapper, which serialises through its own `Serialize` — so they are not
+/// called different: that would fail a debug build over two equal values.
 fn by_fingerprint<T: Serialize + ?Sized>(a: &T, b: &T) -> Comparison {
     match (fingerprint(a), fingerprint(b)) {
-        (Some(a), Some(b)) => Comparison::from_equal(a == b),
-        _ => Comparison::Incomparable,
+        (Some(a), Some(b)) if a == b => Comparison::Same,
+        (Some(_), Some(_)) => {
+            if fingerprint_ignoring_sequence_order(a) == fingerprint_ignoring_sequence_order(b) {
+                Comparison::Incomparable
+            } else {
+                Comparison::Different
+            }
+        }
+        (None, None) => Comparison::Incomparable,
+        (Some(_), None) | (None, Some(_)) => Comparison::Different,
     }
 }
 
@@ -148,9 +191,10 @@ macro_rules! compare {
     ($a:expr, $b:expr) => {{
         #[allow(unused_imports)]
         use $crate::round_trip::{
-            CompareByEq as _, CompareBySerde as _, CompareNothing as _, CompareOkArm as _,
+            CompareByEq as _, CompareBySerde as _, CompareNothing as _, CompareOkArmByEq as _,
+            CompareOkArmBySerde as _,
         };
-        (&&&&$crate::round_trip::Compare(::core::option::Option::Some(($a, $b)))).deja_compare()
+        (&&&&&$crate::round_trip::Compare(::core::option::Option::Some(($a, $b)))).deja_compare()
     }};
 }
 
@@ -172,9 +216,10 @@ macro_rules! round_trip {
     ($ty:ty) => {{
         #[allow(unused_imports)]
         use $crate::round_trip::{
-            CompareByEq as _, CompareBySerde as _, CompareNothing as _, CompareOkArm as _,
+            CompareByEq as _, CompareBySerde as _, CompareNothing as _, CompareOkArmByEq as _,
+            CompareOkArmBySerde as _,
         };
-        if (&&&&$crate::round_trip::Compare::<$ty>::probe()).deja_comparable() {
+        if (&&&&&$crate::round_trip::Compare::<$ty>::probe()).deja_comparable() {
             $crate::round_trip::RoundTrip::Check(|a: &$ty, b: &$ty| $crate::compare!(a, b))
         } else {
             $crate::round_trip::RoundTrip::Unverifiable
@@ -188,7 +233,13 @@ macro_rules! round_trip {
 /// the value refuses to serialise.
 #[must_use]
 pub fn fingerprint<T: Serialize + ?Sized>(value: &T) -> Option<String> {
-    value.serialize(Fingerprint::for_type::<T>()).ok()
+    value.serialize(Fingerprint::for_type::<T>(false)).ok()
+}
+
+/// [`fingerprint`] with every sequence rendered sorted, so two values that
+/// render alike here differ, if at all, only in sequence order.
+fn fingerprint_ignoring_sequence_order<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    value.serialize(Fingerprint::for_type::<T>(true)).ok()
 }
 
 /// Length-prefix a rendered part, so a composite is unambiguous whatever its
@@ -214,12 +265,16 @@ fn join(tag: &str, mut parts: Vec<String>, unordered: bool) -> String {
 /// `#[serde(flatten)]`, `serialize_with` — where a type name cannot be seen.
 struct Fingerprint {
     unordered: bool,
+    /// Render EVERY sequence sorted: used only to ask whether two renderings
+    /// differ in nothing but sequence order.
+    sequences_as_sets: bool,
 }
 
 impl Fingerprint {
-    fn for_type<T: ?Sized>() -> Self {
+    fn for_type<T: ?Sized>(sequences_as_sets: bool) -> Self {
         Self {
             unordered: is_set_behind_wrappers(std::any::type_name::<T>()),
+            sequences_as_sets,
         }
     }
 }
@@ -309,7 +364,7 @@ impl Serializer for Fingerprint {
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<String, Error> {
         Ok(format!(
             "S{}",
-            part(&value.serialize(Self::for_type::<T>())?)
+            part(&value.serialize(Self::for_type::<T>(self.sequences_as_sets))?)
         ))
     }
     fn serialize_unit(self) -> Result<String, Error> {
@@ -331,7 +386,7 @@ impl Serializer for Fingerprint {
         name: &'static str,
         value: &T,
     ) -> Result<String, Error> {
-        let inner = value.serialize(Self::for_type::<T>())?;
+        let inner = value.serialize(Self::for_type::<T>(self.sequences_as_sets))?;
         Ok(format!("ns{}{}", part(name), part(&inner)))
     }
     fn serialize_newtype_variant<T: Serialize + ?Sized>(
@@ -341,7 +396,7 @@ impl Serializer for Fingerprint {
         variant: &'static str,
         value: &T,
     ) -> Result<String, Error> {
-        let inner = value.serialize(Self::for_type::<T>())?;
+        let inner = value.serialize(Self::for_type::<T>(self.sequences_as_sets))?;
         Ok(format!(
             "nv{}{index};{}{}",
             part(name),
@@ -350,13 +405,21 @@ impl Serializer for Fingerprint {
         ))
     }
     fn serialize_seq(self, _len: Option<usize>) -> Result<Parts, Error> {
-        Ok(Parts::new("q".to_owned(), self.unordered))
+        Ok(Parts::new(
+            "q".to_owned(),
+            self.unordered || self.sequences_as_sets,
+            self.sequences_as_sets,
+        ))
     }
     fn serialize_tuple(self, _len: usize) -> Result<Parts, Error> {
-        Ok(Parts::new("t".to_owned(), false))
+        Ok(Parts::new("t".to_owned(), false, self.sequences_as_sets))
     }
     fn serialize_tuple_struct(self, name: &'static str, _len: usize) -> Result<Parts, Error> {
-        Ok(Parts::new(format!("ts{}", part(name)), false))
+        Ok(Parts::new(
+            format!("ts{}", part(name)),
+            false,
+            self.sequences_as_sets,
+        ))
     }
     fn serialize_tuple_variant(
         self,
@@ -368,13 +431,18 @@ impl Serializer for Fingerprint {
         Ok(Parts::new(
             format!("tv{}{index};{}", part(name), part(variant)),
             false,
+            self.sequences_as_sets,
         ))
     }
     fn serialize_map(self, _len: Option<usize>) -> Result<Parts, Error> {
-        Ok(Parts::new("m".to_owned(), true))
+        Ok(Parts::new("m".to_owned(), true, self.sequences_as_sets))
     }
     fn serialize_struct(self, name: &'static str, _len: usize) -> Result<Parts, Error> {
-        Ok(Parts::new(format!("st{}", part(name)), false))
+        Ok(Parts::new(
+            format!("st{}", part(name)),
+            false,
+            self.sequences_as_sets,
+        ))
     }
     fn serialize_struct_variant(
         self,
@@ -386,6 +454,7 @@ impl Serializer for Fingerprint {
         Ok(Parts::new(
             format!("sv{}{index};{}", part(name), part(variant)),
             false,
+            self.sequences_as_sets,
         ))
     }
 }
@@ -396,27 +465,29 @@ struct Parts {
     tag: String,
     parts: Vec<String>,
     unordered: bool,
+    sequences_as_sets: bool,
     pending_key: Option<String>,
 }
 
 impl Parts {
-    fn new(tag: String, unordered: bool) -> Self {
+    fn new(tag: String, unordered: bool, sequences_as_sets: bool) -> Self {
         Self {
             tag,
             parts: Vec::new(),
             unordered,
+            sequences_as_sets,
             pending_key: None,
         }
     }
 
     fn push<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
         self.parts
-            .push(value.serialize(Fingerprint::for_type::<T>())?);
+            .push(value.serialize(Fingerprint::for_type::<T>(self.sequences_as_sets))?);
         Ok(())
     }
 
     fn push_field<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) -> Result<(), Error> {
-        let value = value.serialize(Fingerprint::for_type::<T>())?;
+        let value = value.serialize(Fingerprint::for_type::<T>(self.sequences_as_sets))?;
         self.parts.push(format!("{}{}", part(key), part(&value)));
         Ok(())
     }
@@ -474,7 +545,10 @@ impl ser::SerializeMap for Parts {
     type Ok = String;
     type Error = Error;
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
-        self.pending_key = Some(key.serialize(Fingerprint { unordered: false })?);
+        self.pending_key = Some(key.serialize(Fingerprint {
+            unordered: false,
+            sequences_as_sets: self.sequences_as_sets,
+        })?);
         Ok(())
     }
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
@@ -667,8 +741,7 @@ mod tests {
     }
 
     /// A map renders in key order behind any wrapper, and a set behind the
-    /// pointers that serialise as their contents, so two equal values can
-    /// never render differently and fail a debug build for nothing.
+    /// pointers that serialise as their contents.
     #[test]
     fn equal_values_render_alike_behind_wrappers() {
         #[derive(serde::Serialize)]
@@ -703,6 +776,92 @@ mod tests {
         assert_eq!(
             fingerprint(&Some(Box::new(set_a))),
             fingerprint(&Some(Box::new(set_b)))
+        );
+    }
+
+    /// An `Ok` that comes back as an `Err` is a different value, whatever the
+    /// error type offers; only two `Err`s cannot be compared.
+    #[test]
+    fn an_ok_rebuilt_as_an_err_is_different() {
+        struct Neither;
+        fn fallible<T: Serialize>(a: &Result<T, Neither>, b: &Result<T, Neither>) -> Comparison {
+            crate::compare!(a, b)
+        }
+        assert_eq!(fallible(&Ok(1_u8), &Err(Neither)), Comparison::Different);
+        assert_eq!(fallible::<u8>(&Err(Neither), &Ok(1)), Comparison::Different);
+        assert_eq!(
+            crate::compare!(&Ok::<u8, Neither>(1), &Err(Neither)),
+            Comparison::Different
+        );
+    }
+
+    /// For a `Result` whose error offers nothing, the `Ok` arm is compared by
+    /// its own equality before its serde image.
+    #[test]
+    fn the_ok_arms_partial_eq_outranks_its_serde_image() {
+        #[derive(serde::Serialize)]
+        struct AlwaysEqual(u8);
+        impl PartialEq for AlwaysEqual {
+            fn eq(&self, _: &Self) -> bool {
+                true
+            }
+        }
+        struct Neither;
+        assert_eq!(
+            crate::compare!(&Ok::<_, Neither>(AlwaysEqual(1)), &Ok(AlwaysEqual(2))),
+            Comparison::Same
+        );
+    }
+
+    /// A set the fingerprint cannot see — behind a wrapper that serialises
+    /// through its own `Serialize` — renders in iteration order. Two equal ones
+    /// must not read as different, so a difference in nothing but sequence
+    /// order is not called one; a difference in content still is.
+    #[test]
+    fn a_difference_in_nothing_but_order_is_not_called_one() {
+        struct Delegating(HashSet<u32>);
+        impl Serialize for Delegating {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_seq(self.0.iter())
+            }
+        }
+        let forward = Delegating((0..64).collect());
+        let backward = Delegating((0..64).rev().collect());
+        assert_ne!(
+            crate::compare!(&forward, &backward),
+            Comparison::Different,
+            "equal sets behind a delegating wrapper"
+        );
+        assert_eq!(
+            crate::compare!(
+                &Delegating((0..64).collect()),
+                &Delegating((1..65).collect())
+            ),
+            Comparison::Different,
+            "a set that lost a member is still different"
+        );
+    }
+
+    /// A value that serialises on one side and not the other has changed.
+    #[test]
+    fn a_value_that_serialises_on_one_side_only_is_different() {
+        struct Refusing(bool);
+        impl Serialize for Refusing {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if self.0 {
+                    Err(ser::Error::custom("refused"))
+                } else {
+                    serializer.serialize_unit()
+                }
+            }
+        }
+        assert_eq!(
+            crate::compare!(&Refusing(false), &Refusing(true)),
+            Comparison::Different
+        );
+        assert_eq!(
+            crate::compare!(&Refusing(true), &Refusing(true)),
+            Comparison::Incomparable
         );
     }
 }
