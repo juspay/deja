@@ -1327,16 +1327,17 @@ async fn manifest_of(
 /// a PAGE of recordings, so doing this one at a time would be one connection
 /// setup and one round trip per row, serially, on the request path.
 ///
-/// A recording that is not sealed yields `None`; a recording whose manifest
-/// cannot be READ also yields `None`, because a listing that fails wholesale
-/// because one manifest is corrupt tells the caller less than a listing that
-/// reports that row as unsealed. The distinction that matters to a caller —
-/// sealed versus not — is preserved; the distinction between "absent" and
-/// "unreadable" belongs to the single-recording read, which reports it.
+/// Each recording's OWN result is preserved rather than folded to `None`: a
+/// recording that is not sealed is `Ok(None)`, one whose manifest could not be
+/// read is its own `Err`, and a caller that needs to tell "not sealed" from
+/// "could not tell" — a replay deciding which members to keep — is not forced
+/// to guess. A caller that does not care collapses it the way this function
+/// used to: `.map(|r| r.ok().flatten())`. The outer `Result` is only the
+/// store's own construction; it holds nothing about any one recording.
 pub fn read_manifests(
     cfg: &S3Config,
     session_ids: &[String],
-) -> Result<Vec<Option<SessionManifest>>, String> {
+) -> Result<Vec<Result<Option<SessionManifest>, String>>, String> {
     if session_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1348,16 +1349,15 @@ pub fn read_manifests(
 /// The batch read's store-facing half, separated from its connection setup so
 /// the ordering guarantee callers depend on can be tested against a store rather
 /// than asserted about a bucket.
-async fn manifests_of(store: &DynStore, session_ids: &[String]) -> Vec<Option<SessionManifest>> {
+async fn manifests_of(
+    store: &DynStore,
+    session_ids: &[String],
+) -> Vec<Result<Option<SessionManifest>, String>> {
     use futures::StreamExt;
-    futures::stream::iter(
-        session_ids
-            .iter()
-            .map(|id| async { manifest_of(store, id).await.unwrap_or(None) }),
-    )
-    .buffered(MANIFEST_FETCH_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await
+    futures::stream::iter(session_ids.iter().map(|id| manifest_of(store, id)))
+        .buffered(MANIFEST_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
 }
 
 /// Manifest GETs in flight while enriching a listing. Bounded so a large page
@@ -3602,10 +3602,14 @@ mod tests {
     // -- what a listing can say about a recording without pulling it ----------
 
     #[test]
-    fn a_batch_of_manifests_answers_in_the_order_asked_and_nulls_the_unsealed() {
+    fn a_batch_of_manifests_answers_in_the_order_asked_and_keeps_each_outcome_apart() {
         // The listing enriches a PAGE, so the rows have to line up with the ids
         // by position. An unsealed recording must come back as "not counted",
-        // never as a recording with zero correlations.
+        // never as a recording with zero correlations — and an unparseable one
+        // must come back as ITS OWN error, never folded into "not sealed": a
+        // caller telling "not sealed" from "could not tell" (a replay deciding
+        // which members to keep) needs the two apart, which `.unwrap_or(None)`
+        // used to erase.
         let store = memory();
         // Two sealed recordings with DIFFERENT counts, and the unsealed one off
         // centre: a symmetric fixture would pass just as happily if the batch
@@ -3620,16 +3624,51 @@ mod tests {
         );
         let one = seal(&store, "s2", &[envelope_for("s2", "i2", 0, Some("c9"))]);
         assert_eq!((two.counts.correlations, one.counts.correlations), (2, 1));
+        block(put(
+            &store,
+            &layout::manifest_key("corrupt"),
+            b"not json".to_vec(),
+        ))
+        .unwrap();
 
-        let ids = ["s1".to_owned(), "missing".to_owned(), "s2".to_owned()];
+        let ids = [
+            "s1".to_owned(),
+            "missing".to_owned(),
+            "s2".to_owned(),
+            "corrupt".to_owned(),
+        ];
         let got = block(manifests_of(&store, &ids));
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].as_ref().unwrap().counts.correlations, 2);
-        assert!(
-            got[1].is_none(),
-            "an unsealed recording is not a recording with zero correlations"
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            got[0]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .counts
+                .correlations,
+            2
         );
-        assert_eq!(got[2].as_ref().unwrap().counts.correlations, 1);
+        assert!(
+            matches!(got[1], Ok(None)),
+            "an unsealed recording is not a recording with zero correlations: {:?}",
+            got[1]
+        );
+        assert_eq!(
+            got[2]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .counts
+                .correlations,
+            1
+        );
+        assert!(
+            got[3].is_err(),
+            "an unparseable manifest is its own Err, not Ok(None): {:?}",
+            got[3]
+        );
     }
     // -- a session that resumes after it was sealed ---------------------------
 

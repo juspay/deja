@@ -2600,6 +2600,10 @@ pub enum NotPreconditionReason {
     /// errors mean that, so the planner cannot tell one from a real failure
     /// and draws no conclusion from either.
     ReadErrored,
+    /// A delete that found the key, after an earlier op in this correlation
+    /// on it. The delete then proves only what that op left behind, so the
+    /// earlier op decides the precondition.
+    EarlierOpDecided,
 }
 
 impl SeedPlan {
@@ -2997,10 +3001,10 @@ fn preferred_seed_image(
 ///
 /// `None` when no read shows the mapping, or when reads disagree — a delete
 /// then seeds nothing rather than guessing where the key lives.
-fn derived_key_prefix(events: &[BoundaryEvent], correlation_id: Option<&str>) -> Option<String> {
+fn derived_key_prefix<'a>(events: impl Iterator<Item = &'a BoundaryEvent>) -> Option<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for event in events {
-        if !correlation_matches(event, correlation_id) || !is_redis_event(event) {
+        if !is_redis_event(event) {
             continue;
         }
         let [state_key] = event.read_set.as_slice() else {
@@ -3025,6 +3029,16 @@ fn derived_key_prefix(events: &[BoundaryEvent], correlation_id: Option<&str>) ->
         1 => seen.into_iter().next(),
         _ => None,
     }
+}
+
+/// The physical key a redis event names in its args, spelled with `prefix`.
+fn redis_args_key(event: &BoundaryEvent, prefix: Option<&str>) -> Option<String> {
+    if !is_redis_event(event) {
+        return None;
+    }
+    let args = event.args.to_value();
+    let logical = args.get("key").and_then(serde_json::Value::as_str)?;
+    Some(canonical_state_key_wire(&format!("{}{logical}", prefix?)))
 }
 
 /// Whether the event declares the redis effect.
@@ -3102,7 +3116,18 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     let mut observed_rows: ObservedRowImages = std::collections::HashMap::new();
     // How this recording spells a physical redis key, so a delete that declares
     // no read set can still name the key it proves existed.
-    let key_prefix = derived_key_prefix(events, correlation_id);
+    // A delete-only correlation shows no read, so the rest of the run's
+    // recording is asked how keys are spelled.
+    let key_prefix = derived_key_prefix(
+        events
+            .iter()
+            .filter(|event| correlation_matches(event, correlation_id)),
+    )
+    .or_else(|| derived_key_prefix(events.iter()));
+    // Keys any earlier op in this correlation touched. A delete proves the
+    // key existed before the correlation only when it is the first op on it:
+    // after a set it proves the set, after a read the read already decided.
+    let mut touched: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
     for event in events {
         if !correlation_matches(event, correlation_id) {
@@ -3176,6 +3201,14 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     );
                     continue;
                 }
+                if delete_proved_presence(event) == Some(true) && touched.contains(&written_key) {
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::EarlierOpDecided,
+                    );
+                    continue;
+                }
 
                 plan.upsert(SeedEntry {
                     boundary: event.boundary.clone(),
@@ -3193,18 +3226,14 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
             }
         }
         // A delete declares no read set, so its key comes from its args, spelled
-        // the way the store holds it. Skipped when the correlation already wrote
-        // the key (not a precondition) or when the recording never showed the
-        // prefix.
+        // the way the store holds it. Skipped when an earlier op in the
+        // correlation touched the key (not a precondition) or when the
+        // recording never showed the prefix.
         if event.read_set.is_empty() && !(event.is_error || is_miss_result(event)) {
-            let args = event.args.to_value();
-            let logical = args.get("key").and_then(serde_json::Value::as_str);
-            if let (Some(proved), Some(prefix), Some(logical)) = (
+            if let (Some(proved), Some(canonical_key)) = (
                 delete_proved_presence(event),
-                key_prefix.as_deref(),
-                logical,
+                redis_args_key(event, key_prefix.as_deref()),
             ) {
-                let canonical_key = canonical_state_key_wire(&format!("{prefix}{logical}"));
                 if !proved {
                     // Absence: nothing to seed, but the certificate says so
                     // rather than staying silent about the key.
@@ -3220,6 +3249,12 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                         &event.boundary,
                         &canonical_key,
                         NotPreconditionReason::ReadAfterWrite,
+                    );
+                } else if touched.contains(&(event.boundary.clone(), canonical_key.clone())) {
+                    plan.note_non_precondition(
+                        &event.boundary,
+                        &canonical_key,
+                        NotPreconditionReason::EarlierOpDecided,
                     );
                 } else {
                     plan.upsert(SeedEntry {
@@ -3246,6 +3281,12 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
             for key in &event.write_set {
                 written.insert((event.boundary.clone(), canonical_state_key_wire(key)));
             }
+        }
+        for key in event.read_set.iter().chain(&event.write_set) {
+            touched.insert((event.boundary.clone(), canonical_state_key_wire(key)));
+        }
+        if let Some(key) = redis_args_key(event, key_prefix.as_deref()) {
+            touched.insert((event.boundary.clone(), key));
         }
         if event.boundary == "db" && is_db_create_event(event) {
             if let Some(table) = db_created_table(event) {
@@ -6752,6 +6793,186 @@ mod tests {
             plan.resolve("redis", "k").unwrap().value,
             serde_json::json!("the-recorded-value"),
             "the first recording entry wins, so presence cannot clobber a value"
+        );
+    }
+
+    /// A redis reply in the typed envelope production records.
+    fn redis_reply(type_name: &str, value: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"version": 1, "result": "Ok", "type_name": type_name, "value": value})
+    }
+
+    fn recorded_get(seq: u64, corr: &str, key: &str, value: serde_json::Value) -> BoundaryEvent {
+        redis_event(
+            seq,
+            Some(corr),
+            "get_key",
+            serde_json::json!({"command": "GET", "key": key}),
+            redis_reply("deja::value::RedisWireValue", value),
+            &[&format!("public:{key}")],
+        )
+    }
+
+    /// A set as production records it: no declared write set.
+    fn recorded_set(seq: u64, corr: &str, key: &str) -> BoundaryEvent {
+        redis_event(
+            seq,
+            Some(corr),
+            "set_key",
+            serde_json::json!({"command": "SET", "has_ttl": true, "key": key}),
+            redis_reply("()", serde_json::Value::Null),
+            &[],
+        )
+    }
+
+    /// A delete as production records it: no declared read set.
+    fn recorded_delete(seq: u64, corr: &str, key: &str) -> BoundaryEvent {
+        redis_event(
+            seq,
+            Some(corr),
+            "delete_key",
+            serde_json::json!({"command": "DEL", "key": key}),
+            redis_reply(
+                "redis_interface::types::DelReply",
+                serde_json::json!("KeyDeleted"),
+            ),
+            &[],
+        )
+    }
+
+    fn earlier_op_decided(plan: &SeedPlan, key: &str) -> bool {
+        plan.non_precondition_reads().any(|(boundary, k, reason)| {
+            (boundary, k, reason) == ("redis", key, NotPreconditionReason::EarlierOpDecided)
+        })
+    }
+
+    /// First op a delete: the delete is the only evidence the key existed
+    /// before the correlation ran, so it seeds presence — even when this
+    /// correlation made no read that shows how the store spells its keys.
+    #[test]
+    fn a_delete_that_is_the_first_op_on_its_key_seeds_presence() {
+        let events = vec![
+            recorded_get(
+                0,
+                "other",
+                "unrelated",
+                serde_json::json!({"BulkString": [118]}),
+            ),
+            recorded_delete(1, "c1", "k"),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.resolve("redis", "public:k").map(|e| &e.value),
+            Some(&serde_json::json!(PRESENCE_PLACEHOLDER)),
+            "{plan:?}"
+        );
+    }
+
+    /// First op a read that found nothing: absence is the precondition. A later
+    /// set and delete are the correlation's own doing, so seeding presence
+    /// would make the first read see a key the recording saw absent.
+    #[test]
+    fn a_delete_after_a_read_that_found_nothing_seeds_nothing() {
+        let events = vec![
+            recorded_get(0, "c1", "k", serde_json::json!("Null")),
+            recorded_set(1, "c1", "k"),
+            recorded_delete(2, "c1", "k"),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(plan.resolve("redis", "public:k").is_none(), "{plan:?}");
+        assert!(earlier_op_decided(&plan, "public:k"), "{plan:?}");
+    }
+
+    /// The same order through the declared branch: a delete that names its
+    /// key in a read set is held to the same first-op rule.
+    #[test]
+    fn a_declared_delete_after_a_read_that_found_nothing_seeds_nothing() {
+        let mut delete = recorded_delete(3, "c1", "k");
+        delete.read_set = vec!["public:k".to_owned()];
+        let events = vec![
+            // Reads that disagree about the prefix, so only the read set can
+            // name the key.
+            recorded_get(0, "c1", "a", serde_json::json!("Null")),
+            redis_event(
+                1,
+                Some("c1"),
+                "get_key",
+                serde_json::json!({"key": "b"}),
+                serde_json::json!("v"),
+                &["tenant2:b"],
+            ),
+            recorded_get(2, "c1", "k", serde_json::json!("Null")),
+            delete,
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(plan.resolve("redis", "public:k").is_none(), "{plan:?}");
+        assert!(earlier_op_decided(&plan, "public:k"), "{plan:?}");
+    }
+
+    /// A delete-only correlation borrows the prefix from the rest of the
+    /// recording only when the recording agrees on one.
+    #[test]
+    fn a_delete_only_correlation_seeds_nothing_when_the_recording_disagrees_about_the_prefix() {
+        let events = vec![
+            recorded_get(0, "r1", "a", serde_json::json!({"BulkString": [118]})),
+            redis_event(
+                1,
+                Some("r2"),
+                "get_key",
+                serde_json::json!({"key": "b"}),
+                serde_json::json!("v"),
+                &["tenant2:b"],
+            ),
+            recorded_delete(2, "c1", "k"),
+        ];
+
+        assert!(build_seed_plan(&events, Some("c1")).is_empty());
+    }
+
+    /// First op a set: the set creates the key the delete later removes, so
+    /// the delete proves nothing about the key before the correlation ran.
+    #[test]
+    fn a_delete_after_an_undeclared_set_seeds_nothing() {
+        let events = vec![
+            recorded_get(
+                0,
+                "c1",
+                "unrelated",
+                serde_json::json!({"BulkString": [118]}),
+            ),
+            recorded_set(1, "c1", "k"),
+            recorded_delete(2, "c1", "k"),
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(plan.resolve("redis", "public:k").is_none(), "{plan:?}");
+        assert!(earlier_op_decided(&plan, "public:k"), "{plan:?}");
+    }
+
+    /// Each correlation's plan answers from its own ops. A key another
+    /// correlation read a value for is still seeded as presence where only a
+    /// delete touched it, and the reader keeps its recorded value.
+    #[test]
+    fn a_delete_does_not_see_another_correlations_seed() {
+        let value = serde_json::json!({"BulkString": [118]});
+        let events = vec![
+            recorded_get(0, "reader", "k", value.clone()),
+            recorded_delete(1, "deleter", "k"),
+        ];
+
+        let deleter = build_seed_plan(&events, Some("deleter"));
+        assert_eq!(
+            deleter.resolve("redis", "public:k").map(|e| &e.value),
+            Some(&serde_json::json!(PRESENCE_PLACEHOLDER)),
+            "{deleter:?}"
+        );
+        let reader = build_seed_plan(&events, Some("reader"));
+        assert_eq!(
+            reader.resolve("redis", "public:k").map(|e| &e.value),
+            Some(&value),
+            "{reader:?}"
         );
     }
 

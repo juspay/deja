@@ -519,7 +519,15 @@ impl DejaRecord {
 ///   comparison must be gated on the RECORDING's `event_schema_version >= 9`.
 ///
 /// Self-consistent within a v9 recording, exactly as v6 was for `capture!`.
-pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 9;
+///
+/// v10 records a present `Option` whose contents serialise to `null` — a cache
+/// hit holding `None` — as `{"deja:some": null}` ([`canonical::PRESENT_KEY`])
+/// instead of the bare `null` that also means `None`, in `args` and `result`
+/// alike. Like v9 it adds no field. A pre-v10 tape still decodes, bare `null`
+/// as `None`, so its collapsed values stay collapsed, and an argument holding
+/// such a value hashes differently across the line. **A pre-v10 recording is
+/// re-recorded rather than replayed against a v10 candidate**, as for v9.
+pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 10;
 
 /// The [`BoundaryEvent::role`] value marking a correlation's ingress root.
 pub const ROLE_INGRESS: &str = "ingress";

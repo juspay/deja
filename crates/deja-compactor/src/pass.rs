@@ -605,7 +605,13 @@ pub(crate) async fn plan_in(store: &DynStore, root: &str) -> Result<Vec<String>,
         .collect();
     let landed = crate::index_landed_keys(root, &keys);
     let ids: Vec<String> = landed.iter().map(|r| r.session_id.clone()).collect();
-    let manifests = crate::manifests_of(store, &ids).await;
+    // Sealing does not need to tell "not sealed" from "could not tell": either
+    // way there is a seal to attempt, so both plan the recording the same way
+    // the collapsed shape used to.
+    let manifests = crate::manifests_of(store, &ids)
+        .await
+        .into_iter()
+        .map(|r| r.ok().flatten());
     Ok(landed
         .into_iter()
         .zip(manifests)

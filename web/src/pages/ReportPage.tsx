@@ -235,7 +235,12 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
       span: spanOf(c),
       nodeId,
       side,
-      what: what && what.shown.length > 0 ? what : undefined,
+      // Kept when it is EMPTY as well. An empty leaf-diff on a flagged finding
+      // means the two sides hold the same values in a different order, and
+      // dropping it here rendered nothing at all — the silent case `UnifiedView`
+      // was taught to name as "order only", still live in this view because the
+      // fix landed in one of the two places that needed it.
+      what,
     });
   }
   for (const d of https) {
@@ -279,6 +284,18 @@ function FindingRow({ f, onOpen }: { f: Finding; onOpen: (f: Finding) => void })
 
 /** The changed leaves of a finding, inline under its row. */
 function ChangedLeaves({ what }: { what: NonNullable<Finding["what"]> }) {
+  // No leaf differs, yet the finding was flagged: same values, different order.
+  // Saying so is not a guess — it is what an empty leaf-diff here means.
+  if (what.shown.length === 0) {
+    return (
+      <div
+        className="fwhat mono"
+        title="the two sides hold the same values in a different order — no leaf differs"
+      >
+        <span className="jpath">order only</span>
+      </div>
+    );
+  }
   return (
     <div className="fwhat mono">
       {what.shown.map((l) => (

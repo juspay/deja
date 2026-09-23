@@ -1006,7 +1006,7 @@ pub mod codec {
         }
 
         fn reconstruct(recorded: serde_json::Value) -> Option<R> {
-            serde_json::from_value::<R>(recorded).ok()
+            crate::canonical::from_value::<R>(recorded).ok()
         }
     }
 
@@ -1067,7 +1067,7 @@ pub mod codec {
             match object.get("result").and_then(serde_json::Value::as_str) {
                 Some("Ok") => {
                     let value = object.get("value")?;
-                    let inner: T = serde_json::from_value(value.clone()).ok()?;
+                    let inner: T = crate::canonical::from_value(value.clone()).ok()?;
                     Some(Ok(inner))
                 }
                 Some("Err") => {
@@ -1075,7 +1075,7 @@ pub mod codec {
                     // A `kind` that no longer names a variant of the candidate's
                     // error type is a reconstruction FAILURE (never a silent
                     // fabrication) — the seam fail-stops on it.
-                    let context: E = serde_json::from_value(kind.clone()).ok()?;
+                    let context: E = crate::canonical::from_value(kind.clone()).ok()?;
                     Some(Err(error_stack::report!(context)))
                 }
                 _ => None,
@@ -2416,5 +2416,65 @@ mod db_result_tests {
             }
             _ => panic!("expected Err payload"),
         }
+    }
+}
+
+#[cfg(test)]
+mod optional_return_round_trip {
+    use crate::codec::{ReplayCodec, SerdeCodec};
+
+    /// A `Substitute` boundary returning `Some(None)` must replay `Some(None)`.
+    ///
+    /// `Cache::get_val<T>` returns `Option<T>`, and a config lookup instantiates
+    /// `T = Option<Config>`, so the captured type is `Option<Option<_>>`. Serde
+    /// flattens both arms onto JSON `null`: a cache HIT holding "this config does
+    /// not exist" records the same byte as a cache MISS, and replay reads the
+    /// miss. The site then runs its populate path — a redis read, a db find and a
+    /// redis write the recording never made — and every one of them is a blocking
+    /// novel call. It was the first divergence in 325 of 376 failing correlations
+    /// on one self-replay.
+    #[test]
+    fn a_present_none_is_not_an_absent_one() {
+        type Cached = Option<Option<String>>;
+        let hit_holding_nothing: Cached = Some(None);
+        let miss: Cached = None;
+
+        let (hit_json, _) = SerdeCodec::<Cached>::capture(&hit_holding_nothing);
+        let (miss_json, _) = SerdeCodec::<Cached>::capture(&miss);
+
+        // Vacuity guard: both must actually capture, or the assertions below
+        // are about a failure to serialise rather than about the encoding.
+        assert!(
+            SerdeCodec::<Cached>::reconstruct(hit_json.clone()).is_some(),
+            "the hit must round-trip at all"
+        );
+
+        assert_ne!(
+            hit_json, miss_json,
+            "a cache hit holding None and a cache miss must not be the same byte"
+        );
+        assert_eq!(
+            SerdeCodec::<Cached>::reconstruct(hit_json),
+            Some(Some(None)),
+            "and the hit must come back as a hit"
+        );
+        assert_eq!(
+            SerdeCodec::<Cached>::reconstruct(miss_json),
+            Some(None),
+            "while the miss still comes back as a miss"
+        );
+    }
+
+    /// Arguments share the result encoding, so two calls that differ only in
+    /// `Some(None)` against `None` get two different lookup keys.
+    #[test]
+    fn an_argument_encodes_a_present_none_as_a_result_does() {
+        let present: Option<Option<String>> = Some(None);
+        let absent: Option<Option<String>> = None;
+        let (as_result, _) = SerdeCodec::<Option<Option<String>>>::capture(&present);
+        assert_ne!(as_result, serde_json::Value::Null);
+        assert_eq!(crate::capture!(present), as_result);
+        assert_eq!(crate::value::serialize(&present), as_result);
+        assert_eq!(crate::capture!(absent), serde_json::Value::Null);
     }
 }
