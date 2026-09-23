@@ -522,7 +522,7 @@ async fn v1_create_run(
 async fn v1_kill_run(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
 ) -> Response {
     let ExecutorSelection::K8s(k) = &*st.executor else {
         return error_resp(400, "kill is only supported for the k8s executor");
@@ -577,7 +577,7 @@ async fn v1_kill_run(
     }
 
     json_ok(serde_json::json!({
-        "run_id": run_id,
+        "run_id": run_id.as_str(),
         "job_deleted": report.job_deleted,
         "pods_deleted": report.pods_deleted,
         "problems": report.problems,
@@ -1806,15 +1806,35 @@ fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String 
 async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
     if let Ok(content) = std::fs::read_to_string(st.root.call_ledger_path(&id)) {
-        let rows: Vec<serde_json::Value> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        // Every line becomes a row or a NAMED drop. Dropping unparseable lines
+        // silently served a truncated ledger as a whole one, and served an
+        // empty one as a run that made no calls — the reader could not tell a
+        // partial artifact from a complete answer.
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut unparseable = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str(line) {
+                Ok(row) => rows.push(row),
+                Err(_) => unparseable += 1,
+            }
+        }
+        if unparseable > 0 {
+            return error_resp(
+                500,
+                &format!(
+                    "call ledger: {unparseable} of {} lines could not be parsed; \
+                     refusing to serve a partial ledger as a whole one",
+                    rows.len() + unparseable
+                ),
+            );
+        }
         if !rows.is_empty() {
             return json_ok(serde_json::Value::Array(rows));
         }
     }
+    // Falls through when the precomputed artifact is absent or held nothing.
+    // `call_ledger` refuses rather than returning an empty ledger when its own
+    // inputs are absent, so a 200 here means the run genuinely made no calls.
     match divergence::call_ledger(&st.root, &id) {
         Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
         Err(e) => error_resp(500, &format!("call ledger: {e}")),
@@ -2075,7 +2095,7 @@ fn confined(candidate: std::path::PathBuf, base: &std::path::Path) -> Option<std
 }
 
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.
-async fn v1_run_stages(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_run_stages(State(st): State<AppState>, id: RunId) -> Response {
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -2096,7 +2116,7 @@ struct LogsQuery {
 /// `GET /api/v1/runs/{id}/logs?stage=&after_seq=` — persisted worker logs.
 async fn v1_run_logs(
     State(st): State<AppState>,
-    Path(id): Path<String>,
+    id: RunId,
     axum::extract::Query(q): axum::extract::Query<LogsQuery>,
 ) -> Response {
     let store = match require_store(&st) {
@@ -2118,7 +2138,7 @@ async fn v1_run_logs(
 }
 
 /// `GET /api/v1/runs/{id}/artifacts` — registered artifacts for a run.
-async fn v1_run_artifacts(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_run_artifacts(State(st): State<AppState>, id: RunId) -> Response {
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -2196,7 +2216,7 @@ async fn v1_audit(State(st): State<AppState>) -> Response {
 /// LISTEN/NOTIFY wake-ups without changing the wire contract).
 async fn run_stream(
     State(st): State<AppState>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         let mut last: Option<String> = None;
@@ -2441,6 +2461,61 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
+
+    /// The guard the type exists to enforce, on the endpoints that had skipped it.
+    ///
+    /// `RunId` refuses anything carrying a path separator or a parent reference,
+    /// and its own doc says the check happens during extraction so "there is
+    /// nothing for a new handler to remember to call and nothing for an existing
+    /// one to have skipped". Five handlers had skipped it, by taking
+    /// `Path<String>` instead — which is how a check documented as unskippable
+    /// gets skipped: the seam is opt-in by TYPE, and the comment asserts the
+    /// property rather than enforcing it.
+    ///
+    /// `run_stream` is the one that mattered. It carries no auth layer and its id
+    /// reached `runs::get`, which resolves to a filesystem path.
+    ///
+    /// The body is asserted, not just the status, so a refusal is attributable
+    /// to the run-id check rather than to a later failure that happens to share
+    /// a status. On these four the statuses differ anyway when the guard is
+    /// removed — the stream yields 200 with an SSE error event, the store-backed
+    /// three yield the store's own refusal — but `v1_kill_run` answers a wrong
+    /// executor with the same 400 this asserts, so status alone is not a safe
+    /// thing to rely on for the family.
+    #[tokio::test]
+    async fn a_run_id_carrying_a_traversal_is_refused_before_the_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = Router::new()
+            .route("/runs/{run_id}/stages", get(v1_run_stages))
+            .route("/runs/{run_id}/logs", get(v1_run_logs))
+            .route("/runs/{run_id}/artifacts", get(v1_run_artifacts))
+            .route("/runs/{run_id}/stream", get(run_stream))
+            .with_state(test_state(dir.path()));
+
+        for suffix in ["stages", "logs", "artifacts", "stream"] {
+            let uri = format!("/runs/..%2F..%2Fetc%2Fpasswd/{suffix}");
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "/{suffix} must refuse a traversal id: {text}"
+            );
+            assert!(
+                text.contains("run id must be plain"),
+                "/{suffix} must refuse it AS a malformed run id, not as some \
+                 later failure that happens to share a status: {text}"
+            );
+        }
+    }
 
     async fn ok(Extension(actor): Extension<AuthenticatedActor>) -> String {
         actor.0

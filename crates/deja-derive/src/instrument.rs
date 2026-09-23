@@ -394,7 +394,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                             )
                         );
                     }
-                    match ::serde_json::from_value::<#ok_ty>(__deja_recorded) {
+                    match ::deja::canonical::from_value::<#ok_ty>(__deja_recorded) {
                         ::std::result::Result::Ok(__deja_replayed) =>
                             ::deja::__private::Reconstructed::Value(::std::result::Result::Ok(__deja_replayed)),
                         ::std::result::Result::Err(__deja_err) => ::deja::__private::Reconstructed::Failed(
@@ -409,7 +409,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         }
         CaptureMode::Serde => quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja::__private::Reconstructed<#recon_ty> {
-                match ::serde_json::from_value::<#recon_ty>(__deja_recorded) {
+                match ::deja::canonical::from_value::<#recon_ty>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja::__private::Reconstructed::Value(__deja_replayed),
                     ::std::result::Result::Err(__deja_err) => ::deja::__private::Reconstructed::Failed(
@@ -2125,5 +2125,36 @@ mod tests {
                 .contains("unsupported deja instrument argument"),
             "{err}"
         );
+    }
+
+    /// Both serde reconstruct arms decode through `canonical::from_value`, the
+    /// one reader of the present-`Option` marker the capture side writes. A bare
+    /// `serde_json::from_value` would read the marker as a value and a recorded
+    /// `Some(None)` would stop replaying as itself.
+    #[test]
+    fn serde_reconstruction_reads_the_canonical_marker() {
+        for (codec, output) in [
+            (quote!(SerdeCodec), quote!(Option<Option<u64>>)),
+            (
+                quote!(ResultOkCodec),
+                quote!(CustomResult<Option<Option<u64>>, E>),
+            ),
+        ] {
+            let args = parse_args(quote!(boundary = "imc", replay = Substitute, codec = #codec));
+            let func = parse_fn(quote!(
+                fn get(k: String) -> #output {
+                    unimplemented!()
+                }
+            ));
+            let expanded = generate(args, func).to_string();
+            assert!(
+                expanded.contains(":: deja :: canonical :: from_value"),
+                "{codec} must reconstruct through the canonical decoder: {expanded}"
+            );
+            assert!(
+                !expanded.contains(":: serde_json :: from_value"),
+                "{codec} must not reconstruct through bare serde_json: {expanded}"
+            );
+        }
     }
 }

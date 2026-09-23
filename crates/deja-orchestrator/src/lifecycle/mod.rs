@@ -2723,6 +2723,9 @@ impl SeedCertificateEntry {
             deja::NotPreconditionReason::ReadFoundNothing => {
                 "not a precondition: the read found nothing, so there is no recorded value to seed"
             }
+            deja::NotPreconditionReason::EarlierOpDecided => {
+                "not a precondition: an earlier op in this correlation on the key decides it, so the delete proves only what that op left"
+            }
             deja::NotPreconditionReason::ReadErrored => {
                 "not a precondition: the read errored, and this boundary does not declare whether that means the key was absent or that the call failed"
             }

@@ -377,7 +377,7 @@ fn generate_async_method(
     let reconstruct_closure = if enable_replay {
         quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja_runtime::Reconstructed<#return_type> {
-                match ::serde_json::from_value::<#return_type>(__deja_recorded) {
+                match ::deja_runtime::canonical::from_value::<#return_type>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja_runtime::Reconstructed::Value(__deja_replayed),
                     ::std::result::Result::Err(__deja_err) => ::deja_runtime::Reconstructed::Failed(
@@ -575,7 +575,7 @@ fn generate_sync_method(
         let return_type_for_replay = output_type_tokens(return_type);
         quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja_runtime::Reconstructed<#return_type_for_replay> {
-                match ::serde_json::from_value::<#return_type_for_replay>(__deja_recorded) {
+                match ::deja_runtime::canonical::from_value::<#return_type_for_replay>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja_runtime::Reconstructed::Value(__deja_replayed),
                     ::std::result::Result::Err(__deja_err) => ::deja_runtime::Reconstructed::Failed(
