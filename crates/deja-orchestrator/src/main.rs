@@ -2515,9 +2515,6 @@ async fn delta_for_run(
     computed
 }
 
-/// Whether ingesting `ev` settles deltas. A run's finish, not its result: the
-/// runner reports the result BEFORE it publishes the ledger and diffs a tree
-/// is read from, and finishes after.
 /// The run row's delta verdict, from a computed delta or the reason there is
 /// none. Idempotent; the newest answer wins.
 async fn record_delta_verdict(
@@ -2535,6 +2532,9 @@ async fn record_delta_verdict(
     }
 }
 
+/// Whether ingesting `ev` settles deltas. A run's finish, not its result: the
+/// runner reports the result BEFORE it publishes the ledger and diffs a tree
+/// is read from, and finishes after.
 fn settles_deltas(ev: &deja_orchestrator::lifecycle::store_ctx::RunEvent) -> bool {
     use deja_orchestrator::lifecycle::store_ctx::RunEvent;
     matches!(ev, RunEvent::Finish { .. })
