@@ -43,8 +43,26 @@ describe("evidenceOf", () => {
 
   it("an empty list claims nothing was published only when every read succeeded", () => {
     expect(emptyFindingsText(evidenceOf(read([]), read([])))).toContain("were published");
-    const partial = emptyFindingsText(evidenceOf(read([]), failed("x")));
-    expect(partial).not.toContain("were published");
-    expect(partial).toContain("could not be read");
+    const e = evidenceOf(read([]), failed("x"));
+    expect(emptyFindingsText(e)).not.toContain("were published");
+    expect(emptyFindingsText(e)).toContain("named above");
+    // "named above" must have something above it.
+    expect(e.notes).toHaveLength(1);
+  });
+
+  it("a read still in flight is not a successful empty one", () => {
+    const inflight = { data: undefined, error: null };
+    for (const e of [evidenceOf(inflight, read([])), evidenceOf(read([]), inflight)]) {
+      expect(e.pending).toBe(true);
+      expect(e.complete).toBe(false);
+      expect(emptyFindingsText(e)).not.toContain("were published");
+    }
+  });
+
+  it("passes HTTP diffs through, and withholds a stale set the note says is not shown", () => {
+    const diff = { correlation_id: "c1" } as never;
+    expect(evidenceOf(read([]), read([diff])).https).toEqual([diff]);
+    const stale = { data: [diff], error: new Error("refetch failed") };
+    expect(evidenceOf(read([]), stale).https).toEqual([]);
   });
 });

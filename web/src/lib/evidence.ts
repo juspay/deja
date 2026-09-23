@@ -17,28 +17,36 @@ export type Evidence = {
   notes: string[];
   /** True only when every read succeeded, so an empty result is a fact about the run. */
   complete: boolean;
+  /** A read has neither answered nor failed yet. */
+  pending: boolean;
 };
 
 /** What an empty findings list may claim: a fact about the run only when every read succeeded. */
 export function emptyFindingsText(e: Evidence): string {
-  return e.complete
-    ? "no divergence rows were published for this run."
-    : "no divergence rows in what could be read; what could not be read is named above.";
+  if (e.complete) return "no divergence rows were published for this run.";
+  if (e.pending) return "still reading the run's evidence…";
+  return "no divergence rows in what could be read; what could not be read is named above.";
 }
 
 function reasonOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+const settled = (r: Read<unknown>) => r.data !== undefined || !!r.error;
+
 export function evidenceOf(calls: Read<CallRecord[]>, https: Read<HttpDiff[]>): Evidence {
   const notes: string[] = [];
+  const pending = !settled(calls) || !settled(https);
   if (https.error)
     notes.push(`HTTP differences are not shown, because they could not be read: ${reasonOf(https.error)}`);
   return {
     calls: calls.data ?? [],
-    https: https.data ?? [],
+    // A failed refetch can leave an earlier answer cached; the note says the
+    // diffs are not shown, so they are not.
+    https: https.error ? [] : (https.data ?? []),
     blocking: calls.error ? `The call ledger could not be read: ${reasonOf(calls.error)}` : null,
     notes,
-    complete: !calls.error && !https.error,
+    complete: !pending && !calls.error && !https.error,
+    pending,
   };
 }
