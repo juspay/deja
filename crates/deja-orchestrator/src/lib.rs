@@ -436,6 +436,12 @@ pub struct RunSpec {
     /// never acted on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// What the candidate is, in the words of whoever created the run: for
+    /// a pull request its number and title, for a baseline the main commit
+    /// and which branch's merge-base it is. Displayed on the report beside
+    /// the image tag; never parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl RunSpec {
@@ -550,6 +556,8 @@ pub struct RunParams {
     pub delta_against: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl RunParams {
@@ -579,6 +587,7 @@ impl RunParams {
             expectation: expectation.map(str::to_owned),
             delta_against: spec.delta_against.clone(),
             purpose: spec.purpose.clone(),
+            label: spec.label.clone(),
         }
     }
 
@@ -1384,6 +1393,7 @@ mod run_params_tests {
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            label: None,
             delta_against: None,
             purpose: None,
             scored_span_namespaces: Vec::new(),
@@ -1415,9 +1425,11 @@ mod run_params_tests {
         let mut spec = replay_spec();
         spec.delta_against = Some("rp-sbx-main-1".into());
         spec.purpose = Some("baseline".into());
+        spec.label = Some("main at 147f435ade, merge-base of PR #2338".into());
         let params = RunParams::resolved(&spec, None);
         assert_eq!(params.delta_against.as_deref(), Some("rp-sbx-main-1"));
         assert_eq!(params.purpose.as_deref(), Some("baseline"));
+        assert!(params.label.as_deref().unwrap().starts_with("main at"));
         let back = RunParams::from_stored(&params.to_json()).unwrap();
         assert_eq!(back, params, "both fields survive the stored row");
         let plain = RunParams::resolved(&replay_spec(), None).to_json();
