@@ -11,6 +11,7 @@ import { KillRun } from "../components/KillRun";
 import UnifiedView from "../components/UnifiedView";
 import { BaselineNote, DeltaPanel } from "../components/DeltaSummary";
 import { Side, transportFailure } from "../lib/spine";
+import { emptyFindingsText, evidenceOf } from "../lib/evidence";
 
 /* ---------------------------------------------------------------- header --- */
 
@@ -310,7 +311,15 @@ function ChangedLeaves({ what }: { what: NonNullable<Finding["what"]> }) {
   );
 }
 
-function FindingList({ findings, onOpen }: { findings: Finding[]; onOpen: (f: Finding) => void }) {
+function FindingList({
+  findings,
+  onOpen,
+  emptyText,
+}: {
+  findings: Finding[];
+  onOpen: (f: Finding) => void;
+  emptyText: string;
+}) {
   const [show, setShow] = React.useState<FindingRank | "all">("all");
   const counts = React.useMemo(() => {
     const m = new Map<FindingRank, number>();
@@ -319,8 +328,7 @@ function FindingList({ findings, onOpen }: { findings: Finding[]; onOpen: (f: Fi
   }, [findings]);
   const rows = show === "all" ? findings : findings.filter((f) => f.rank === show);
 
-  if (findings.length === 0)
-    return <p className="hint">no divergence rows were published for this run.</p>;
+  if (findings.length === 0) return <p className="hint">{emptyText}</p>;
 
   return (
     <>
@@ -701,9 +709,14 @@ export default function ReportPage() {
     enabled: isReplay && scored,
   });
 
+  const evidence = React.useMemo(
+    () =>
+      evidenceOf({ data: calls.data, error: calls.error }, { data: https.data, error: https.error }),
+    [calls.data, calls.error, https.data, https.error],
+  );
   const findings = React.useMemo(
-    () => buildFindings(calls.data ?? [], https.data ?? []),
-    [calls.data, https.data],
+    () => buildFindings(evidence.calls, evidence.https),
+    [evidence],
   );
 
   // A finding is an anchor into the one execution view — the same
@@ -767,7 +780,20 @@ export default function ReportPage() {
 
           <section>
             <h2>What diverged</h2>
-            <FindingList findings={findings} onOpen={openFinding} />
+            {evidence.notes.map((note) => (
+              <p className="err" key={note}>
+                {note}
+              </p>
+            ))}
+            {evidence.blocking ? (
+              <p className="err">{evidence.blocking}</p>
+            ) : (
+              <FindingList
+                findings={findings}
+                onOpen={openFinding}
+                emptyText={emptyFindingsText(evidence)}
+              />
+            )}
           </section>
 
           <section>
