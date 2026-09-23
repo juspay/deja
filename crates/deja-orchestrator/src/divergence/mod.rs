@@ -7036,6 +7036,7 @@ mod tests {
         namespaces: Vec<String>,
     ) -> crate::RunSpec {
         let spec = crate::RunSpec {
+            label: None,
             delta_against: None,
             purpose: None,
             scored_span_namespaces: namespaces,
@@ -7125,6 +7126,7 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    label: None,
                     delta_against: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
@@ -7248,6 +7250,7 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    label: None,
                     delta_against: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
@@ -7446,6 +7449,7 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    label: None,
                     delta_against: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),

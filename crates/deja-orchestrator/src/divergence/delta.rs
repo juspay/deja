@@ -98,16 +98,33 @@ pub struct LaneSummary {
     pub requests: usize,
     /// Bucket family → addresses.
     pub buckets: BTreeMap<String, usize>,
+    /// Bucket family → requests with at least one address in it. A request
+    /// with five differing response fields is one request here and five
+    /// addresses above; the report counts in requests, as the tape verdict
+    /// does, and shows the addresses beneath.
+    #[serde(default)]
+    pub requests_by_family: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaVerdict {
     /// True when Y introduced or changed nothing on a blocking address.
     pub pass: bool,
+    /// Addresses, by family. Blocking only for the two that charge Y.
     pub introduced: usize,
     pub changed: usize,
     pub inherited: usize,
     pub resolved: usize,
+    /// Requests with at least one address in the family: the unit the tape
+    /// verdict counts in, so the two verdicts read in the same numbers.
+    #[serde(default)]
+    pub introduced_requests: usize,
+    #[serde(default)]
+    pub changed_requests: usize,
+    #[serde(default)]
+    pub inherited_requests: usize,
+    #[serde(default)]
+    pub resolved_requests: usize,
     pub reason: String,
 }
 
@@ -137,6 +154,14 @@ pub struct Delta {
     /// Correlations both runs drove: the comparison's domain.
     pub covered_correlations: usize,
     pub uncovered: Uncovered,
+    /// Bucket family → requests with at least one address in it, over the
+    /// covered requests. `clean` counts requests with no other family.
+    #[serde(default)]
+    pub requests: BTreeMap<String, usize>,
+    /// The lane of every covered request, clean ones included, so a reader
+    /// can place a request that has no row.
+    #[serde(default)]
+    pub request_lanes: BTreeMap<String, Lane>,
 }
 
 fn side_of(v: Option<&Value>, tape_has: bool) -> Side {
@@ -242,6 +267,10 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
     let mut buckets: BTreeMap<Bucket, usize> = BTreeMap::new();
     let mut clean = 0usize;
     let mut lanes: BTreeMap<Lane, (HashSet<String>, BTreeMap<String, usize>)> = BTreeMap::new();
+    // requests per family, overall and per lane
+    let mut requests_in: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    let mut lane_requests_in: BTreeMap<(Lane, String), HashSet<String>> = BTreeMap::new();
+    let mut requests_touched: HashSet<String> = HashSet::new();
     for address in addresses {
         if !covered.contains(&address.correlation().to_owned()) {
             uncovered.addresses += 1;
@@ -264,10 +293,24 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             .get(address.correlation())
             .or_else(|| m.lanes.get(address.correlation()))
             .cloned();
+        let correlation = address.correlation().to_owned();
+        if bucket != Bucket::Clean {
+            requests_touched.insert(correlation.clone());
+            requests_in
+                .entry(bucket.family().to_owned())
+                .or_default()
+                .insert(correlation.clone());
+        }
         if let Some(l) = &lane {
             let slot = lanes.entry(l.clone()).or_default();
-            slot.0.insert(address.correlation().to_owned());
+            slot.0.insert(correlation.clone());
             *slot.1.entry(bucket.family().to_owned()).or_default() += 1;
+            if bucket != Bucket::Clean {
+                lane_requests_in
+                    .entry((l.clone(), bucket.family().to_owned()))
+                    .or_default()
+                    .insert(correlation.clone());
+            }
         }
         if bucket == Bucket::Clean {
             clean += 1;
@@ -310,20 +353,41 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
     let inherited = count("inherited");
     let resolved = count("resolved");
     let pass = introduced == 0 && changed == 0;
+    // requests per family; a request charged to Y is one with a BLOCKING
+    // address in a charging family, matching the address counts above
+    let requests_with = |pred: &dyn Fn(&Row) -> bool| -> usize {
+        rows.iter()
+            .filter(|r| pred(r))
+            .map(|r| r.address.correlation())
+            .collect::<HashSet<_>>()
+            .len()
+    };
+    let introduced_requests =
+        requests_with(&|r: &Row| r.blocking && r.bucket.charges_y() && r.bucket != Bucket::Changed);
+    let changed_requests = requests_with(&|r: &Row| r.blocking && r.bucket == Bucket::Changed);
+    let inherited_requests = requests_in.get("inherited").map_or(0, HashSet::len);
+    let resolved_requests = requests_in.get("resolved").map_or(0, HashSet::len);
+    let total_requests = covered.len();
     let mut reason = if pass {
         if inherited > 0 {
-            format!("Y introduced nothing beyond what M already carries ({inherited} inherited)")
+            format!(
+                "This run introduced nothing beyond what the baseline already carries: {inherited_requests} of {total_requests} requests differ from the recording exactly as the baseline does ({inherited} fields and calls)"
+            )
         } else {
-            "Y behaves as M does on every address".to_owned()
+            format!(
+                "This run behaves as the baseline does on every one of {total_requests} requests"
+            )
         }
     } else {
         let mut parts = Vec::new();
         if introduced > 0 {
-            parts.push(format!("{introduced} introduced"));
+            parts.push(format!(
+                "{introduced_requests} of {total_requests} requests differ from the recording on this run but not on the baseline ({introduced} fields and calls)"
+            ));
         }
         if changed > 0 {
             parts.push(format!(
-                "{changed} changed where M had already moved (flagged)"
+                "{changed_requests} request(s) differ from both the recording and the baseline, flagged ({changed} fields and calls)"
             ));
         }
         parts.join("; ")
@@ -336,12 +400,38 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
     }
     let mut lane_summaries: Vec<LaneSummary> = lanes
         .into_iter()
-        .map(|(lane, (reqs, b))| LaneSummary {
-            lane,
-            requests: reqs.len(),
-            buckets: b,
+        .map(|(lane, (reqs, b))| {
+            let mut requests_by_family: BTreeMap<String, usize> = b
+                .keys()
+                .filter(|f| f.as_str() != "clean")
+                .map(|f| {
+                    let n = lane_requests_in
+                        .get(&(lane.clone(), f.clone()))
+                        .map_or(0, HashSet::len);
+                    (f.clone(), n)
+                })
+                .collect();
+            // clean requests: those in the lane touched by no other family
+            let touched_here = lane_requests_in
+                .iter()
+                .filter(|((l, _), _)| *l == lane)
+                .flat_map(|(_, set)| set.iter())
+                .collect::<HashSet<_>>()
+                .len();
+            requests_by_family.insert("clean".to_owned(), reqs.len() - touched_here);
+            LaneSummary {
+                lane,
+                requests: reqs.len(),
+                buckets: b,
+                requests_by_family,
+            }
         })
         .collect();
+    let mut requests: BTreeMap<String, usize> = requests_in
+        .iter()
+        .map(|(f, set)| (f.clone(), set.len()))
+        .collect();
+    requests.insert("clean".to_owned(), total_requests - requests_touched.len());
     lane_summaries.sort_by_key(|l| {
         let hot: usize = l
             .buckets
@@ -361,6 +451,10 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             changed,
             inherited,
             resolved,
+            introduced_requests,
+            changed_requests,
+            inherited_requests,
+            resolved_requests,
             reason,
         },
         buckets,
@@ -369,6 +463,16 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         clean,
         covered_correlations: covered.len(),
         uncovered,
+        requests,
+        request_lanes: covered
+            .iter()
+            .filter_map(|c| {
+                y.lanes
+                    .get(*c)
+                    .or_else(|| m.lanes.get(*c))
+                    .map(|l| ((*c).clone(), l.clone()))
+            })
+            .collect(),
     })
 }
 
@@ -494,6 +598,18 @@ mod tests {
             "every address lands in exactly one place"
         );
         assert_eq!(d.uncovered.addresses, 0);
+        // one request carries every bucket: in requests it is 1 everywhere
+        assert_eq!(
+            (d.verdict.introduced_requests, d.verdict.changed_requests),
+            (1, 1)
+        );
+        assert_eq!(d.requests.get("inherited"), Some(&1));
+        assert_eq!(
+            d.requests.get("clean"),
+            Some(&0),
+            "the request has other families too"
+        );
+        assert_eq!(d.lanes[0].requests_by_family.get("changed"), Some(&1));
     }
 
     #[test]
@@ -504,7 +620,15 @@ mod tests {
         let d = three_way(&m, &y).unwrap();
         assert!(d.verdict.pass, "{}", d.verdict.reason);
         assert_eq!(d.verdict.inherited, 2);
-        assert!(d.verdict.reason.contains("inherited"));
+        assert_eq!(
+            d.verdict.inherited_requests, 1,
+            "two addresses, one request"
+        );
+        assert!(
+            d.verdict.reason.contains("1 of 1 requests"),
+            "{}",
+            d.verdict.reason
+        );
     }
 
     #[test]
