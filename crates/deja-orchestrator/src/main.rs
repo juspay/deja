@@ -2444,18 +2444,15 @@ async fn delta_for_run(
         .ok()
         .flatten();
         if let Some(doc) = cached {
+            // The row is settled from the cache too: a column that was reset,
+            // or never written because the store was away, catches up on the
+            // next view rather than waiting for a recomputation.
+            record_delta_verdict(st, y_id, &Ok(doc.clone())).await;
             return Ok(doc);
         }
     }
     let computed = delta_between(st, y_id, m_id).await;
-    if let Some(store) = &st.store {
-        if let Err(e) = store
-            .set_delta_verdict(y_id, delta_verdict_word(&computed))
-            .await
-        {
-            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
-        }
-    }
+    record_delta_verdict(st, y_id, &computed).await;
     if let (Ok(body), Some(cache)) = (&computed, cache) {
         let text = body.to_string();
         let _ = tokio::task::spawn_blocking(move || {
@@ -2469,6 +2466,23 @@ async fn delta_for_run(
 /// Whether ingesting `ev` settles deltas. A run's finish, not its result: the
 /// runner reports the result BEFORE it publishes the ledger and diffs a tree
 /// is read from, and finishes after.
+/// The run row's delta verdict, from a computed delta or the reason there is
+/// none. Idempotent; the newest answer wins.
+async fn record_delta_verdict(
+    st: &AppState,
+    y_id: &str,
+    computed: &Result<serde_json::Value, Unavailable>,
+) {
+    if let Some(store) = &st.store {
+        if let Err(e) = store
+            .set_delta_verdict(y_id, delta_verdict_word(computed))
+            .await
+        {
+            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
+        }
+    }
+}
+
 fn settles_deltas(ev: &deja_orchestrator::lifecycle::store_ctx::RunEvent) -> bool {
     use deja_orchestrator::lifecycle::store_ctx::RunEvent;
     matches!(ev, RunEvent::Finish { .. })
