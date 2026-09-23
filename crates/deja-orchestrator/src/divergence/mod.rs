@@ -13524,6 +13524,7 @@ mod tests {
             .find(|row| row.method_name == "novel")
             .expect("the call has a ledger row");
         assert_eq!(row.kind, "inconclusive_tail_gap", "{row:?}");
+        assert!(!row.blocking, "{row:?}");
     }
 
     #[test]
