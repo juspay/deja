@@ -1080,8 +1080,8 @@ pub struct LookupTable {
     pub policy_version: u32,
     /// The event schema the recording was captured under, read by the renderer
     /// off the recording's own events. `None` from a renderer that predates
-    /// this field, or for a recording with no events; the loader treats either
-    /// as older than this build.
+    /// this field, or for a recording with no events; a candidate installing
+    /// the table treats either as older than this build.
     #[serde(default)]
     pub event_schema_version: Option<u16>,
     pub entries: Vec<LookupEntry>,
@@ -1864,15 +1864,15 @@ fn check_event_schema_version(table: LookupTable) -> std::io::Result<LookupTable
         ),
         None => format!(
             "lookup table for recording {} declares no event schema version, so it is \
-             treated as older than this build's v{current}: re-render it with an \
-             orchestrator at v{current}, or re-record it.",
+             treated as older than this build's v{current}: if the recording is v{current}, \
+             re-render it with a runner at this deja revision; otherwise re-record it.",
             table.recording_id
         ),
     };
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!(
-            "{refusal} Refusing at load rather than missing wherever the two schemas \
+            "{refusal} Refusing at install rather than missing wherever the two schemas \
              encode an argument differently, which would present as a candidate regression."
         ),
     ))
@@ -4627,7 +4627,7 @@ mod tests {
     }
 
     /// A recording captured by a build with a different event schema is
-    /// refused at load, naming both versions. Its argument images were
+    /// refused when a candidate installs its table, naming both versions. Its argument images were
     /// encoded under another schema, so wherever the two encodings differ
     /// every key fails to compare, and the run presents as a regression in a
     /// candidate that changed nothing. A table that declares no version is
