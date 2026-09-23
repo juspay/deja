@@ -434,6 +434,13 @@ async fn v1_create_run(
     {
         return error_resp(400, &e);
     }
+    // A baseline is named by run id; a value that is not one would only be
+    // discovered when the report asks for the delta.
+    if let Some(against) = spec.delta_against.as_deref() {
+        if let Err(e) = against.parse::<RunId>() {
+            return error_resp(400, &format!("delta_against: {e}"));
+        }
+    }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
         Err(e) => return error_resp(500, &format!("create run: {e}")),
@@ -2024,15 +2031,20 @@ async fn v1_delta(
     axum::extract::Query(q): axum::extract::Query<DeltaQuery>,
 ) -> Response {
     let unavailable = |why: String| json_ok(serde_json::json!({ "unavailable": why }));
-    let against = match q
+    let y_params = run_params_for(&st, &id).await;
+    // The query names the baseline; without one, the run's own record does,
+    // when the pipeline that created it said what to measure it against.
+    let named = q
         .against
         .as_deref()
         .map(str::trim)
         .filter(|a| !a.is_empty())
-    {
+        .map(str::to_owned)
+        .or_else(|| y_params.as_ref().and_then(|p| p.delta_against.clone()));
+    let against = match named {
         None => {
             return unavailable(
-                "no baseline run named: pass ?against=<run id> of a run on the same tape"
+                "no baseline run named: pass ?against=<run id> of a run on the same tape, or create the run with delta_against"
                     .to_owned(),
             )
         }
@@ -2044,10 +2056,7 @@ async fn v1_delta(
     if *against == *id {
         return unavailable("a run measured against itself has no delta".to_owned());
     }
-    let (y_params, m_params) = (
-        run_params_for(&st, &id).await,
-        run_params_for(&st, &against).await,
-    );
+    let m_params = run_params_for(&st, &against).await;
     let tape = |p: &Option<deja_orchestrator::RunParams>| {
         p.as_ref()
             .and_then(|p| p.recording_group.clone().or_else(|| p.recording_id.clone()))
@@ -2628,6 +2637,8 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
                 system_under_test: None,

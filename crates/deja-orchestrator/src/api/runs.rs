@@ -495,6 +495,8 @@ mod tests {
     /// field it is about.
     fn replay_spec() -> RunSpec {
         RunSpec {
+            delta_against: None,
+            purpose: None,
             mode: RunMode::Replay,
             candidate_spec: CandidateSpec::PrebuiltImage {
                 image: "repo/router:abc123".to_owned(),

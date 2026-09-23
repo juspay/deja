@@ -424,6 +424,18 @@ pub struct RunSpec {
     /// namespace (hyperswitch) are untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scored_span_namespaces: Vec<String>,
+    /// For mode=replay: the run this one is to be measured against, three-way
+    /// with the tape as ancestor — main at the merge-base, replayed on the
+    /// same recording. Set by the pipeline that created both runs. The report
+    /// shows the delta beside the tape-relative verdict; nothing that decides
+    /// the tape-relative verdict reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_against: Option<String>,
+    /// Why the run exists, when it is not a candidate under test: `baseline`
+    /// for a replay of main that other runs are measured against. Displayed;
+    /// never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 impl RunSpec {
@@ -534,6 +546,10 @@ pub struct RunParams {
     pub scored_span_namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expectation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_against: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 impl RunParams {
@@ -561,6 +577,8 @@ impl RunParams {
             // nothing, for the same system.
             scored_span_namespaces: spec.effective_scored_span_namespaces(),
             expectation: expectation.map(str::to_owned),
+            delta_against: spec.delta_against.clone(),
+            purpose: spec.purpose.clone(),
         }
     }
 
@@ -1366,6 +1384,8 @@ mod run_params_tests {
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            delta_against: None,
+            purpose: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,
@@ -1388,6 +1408,24 @@ mod run_params_tests {
             ]),
             workload: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn a_run_records_what_it_is_measured_against_and_why_it_exists() {
+        let mut spec = replay_spec();
+        spec.delta_against = Some("rp-sbx-main-1".into());
+        spec.purpose = Some("baseline".into());
+        let params = RunParams::resolved(&spec, None);
+        assert_eq!(params.delta_against.as_deref(), Some("rp-sbx-main-1"));
+        assert_eq!(params.purpose.as_deref(), Some("baseline"));
+        let back = RunParams::from_stored(&params.to_json()).unwrap();
+        assert_eq!(back, params, "both fields survive the stored row");
+        let plain = RunParams::resolved(&replay_spec(), None).to_json();
+        assert!(
+            plain.get("delta_against").is_none(),
+            "absent fields are not written"
+        );
+        assert!(plain.get("purpose").is_none());
     }
 
     #[test]

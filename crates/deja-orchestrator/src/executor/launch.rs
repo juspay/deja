@@ -728,6 +728,8 @@ mod tests {
         Run {
             run_id: run_id.into(),
             spec: crate::RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
@@ -804,6 +806,8 @@ mod tests {
         let run = Run {
             run_id: "run-43".into(),
             spec: crate::RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: Some("prism".into()),

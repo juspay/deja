@@ -9,6 +9,7 @@ import { VerdictBanner } from "../components/Result";
 import { ConfidenceBadge, ConfidenceLadder, overallConfidence } from "../components/Confidence";
 import { KillRun } from "../components/KillRun";
 import UnifiedView from "../components/UnifiedView";
+import { BaselineNote, DeltaPanel } from "../components/DeltaSummary";
 import { Side, transportFailure } from "../lib/spine";
 
 /* ---------------------------------------------------------------- header --- */
@@ -724,8 +725,12 @@ export default function ReportPage() {
       </div>
 
       <RunHeader run={r} />
+      {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} />}
       <VerdictBanner result={result} />
-      {isReplay && scored && (
+      {isReplay && scored && runParams(r)?.delta_against && (
+        <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} />
+      )}
+      {isReplay && scored && !runParams(r)?.delta_against && (
         <p className="hint delta-link">
           This verdict is against the tape.{" "}
           <Link to={withDebug(`/r/${r.run_id}/delta`, debug)}>

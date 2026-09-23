@@ -34,6 +34,12 @@ export type RunParams = {
   correlation_filter?: string[];
   workload?: unknown;
   expectation?: string;
+  /** The run this one is measured against, three-way with the tape as
+   *  ancestor: main at the merge-base on the same recording. Set by the
+   *  pipeline that created both runs. */
+  delta_against?: string;
+  /** Why the run exists when it is not a candidate under test: `baseline`. */
+  purpose?: string;
 };
 
 /** The request a row carries, or null when it predates the record.

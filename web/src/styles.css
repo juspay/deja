@@ -1017,3 +1017,8 @@ main:has(.recintro) { max-width: 1440px; }
 .delta-unavailable { border: 1px dashed var(--border-strong); border-radius: var(--r-md); padding: var(--s4); color: var(--text-muted); }
 .delta-coverage b { color: var(--amber-fg); font-weight: 600; }
 .delta-legend { color: var(--text-faint); font-size: var(--fs-11); line-height: 1.6; max-width: 80ch; }
+.delta-panel { margin-bottom: var(--s4); }
+.delta-panel h2 { margin-top: 0; }
+.delta-baseline-note { border-left: 3px solid var(--purple); padding-left: var(--s3); margin: 0 0 var(--s3); }
+.delta-baseline-note b { color: var(--purple); }
+.delta-baseline-verdict { margin: calc(-1 * var(--s2)) 0 var(--s3); }
