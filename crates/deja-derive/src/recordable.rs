@@ -362,6 +362,7 @@ fn generate_async_method(
         build_args_json(&sig.inputs)
     };
     let result_json_expr = result_json_expr(opaque);
+    let compare_closure = compare_closure(enable_replay, &return_type);
     let replay_bound = if enable_replay {
         quote!(#return_type: ::serde::de::DeserializeOwned,)
     } else {
@@ -516,6 +517,7 @@ fn generate_async_method(
                 },
                 #reconstruct_closure,
                 move |__deja_result| { #result_json_expr },
+                #compare_closure,
             ))
         }
     }
@@ -561,6 +563,7 @@ fn generate_sync_method(
         build_args_json(&sig.inputs)
     };
     let result_json_expr = result_json_expr(opaque);
+    let compare_closure = compare_closure(enable_replay, &output_type_tokens(return_type));
     let where_clause = sync_where_clause(generics, enable_replay.then_some(return_type_for_bound));
     let where_clause = if enable_replay {
         where_clause
@@ -694,7 +697,27 @@ fn generate_sync_method(
                 || self.$inner.#method_ident(#(#delegation_args),*),
                 #reconstruct_closure,
                 |__deja_result| { #result_json_expr },
+                #compare_closure,
             )
+        }
+    }
+}
+
+/// The round-trip comparator handed to the dispatch seam, which compares each
+/// recorded value with its rebuilt copy. `None` for a record-only delegate,
+/// which declares no replay codec.
+fn compare_closure(enable_replay: bool, value_type: &TokenStream) -> TokenStream {
+    if enable_replay {
+        quote! {
+            ::core::option::Option::Some(
+                |__deja_a: &#value_type, __deja_b: &#value_type| ::deja_runtime::compare!(__deja_a, __deja_b)
+            )
+        }
+    } else {
+        quote! {
+            ::core::option::Option::None::<
+                fn(&#value_type, &#value_type) -> ::deja_runtime::round_trip::Comparison
+            >
         }
     }
 }

@@ -265,6 +265,7 @@ pub fn hash_seed(name: &'static str) -> DejaBuildHasher {
             ReconstructInput::Miss(miss) => Reconstructed::Synthesized(synthesize_keys(miss)),
         },
         |keys: &HashKeys| (capture_keys(keys), false),
+        Some(|a: &HashKeys, b: &HashKeys| crate::compare!(a, b)),
     );
     DejaBuildHasher { keys }
 }

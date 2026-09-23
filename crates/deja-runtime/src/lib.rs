@@ -44,6 +44,7 @@ pub mod correlation_layer;
 pub mod graph;
 pub mod hash_seed;
 pub mod replay;
+pub mod round_trip;
 pub mod synth;
 pub mod wire_capture;
 pub mod writer;
@@ -339,10 +340,8 @@ pub struct BoundaryEvent {
     /// boundary during replay. Lets the post-hoc tally pair recorded vs shadow
     /// events to classify [`ValueDiverged`](crate::DivergenceKind::ValueDiverged).
     pub provenance: Provenance,
-    /// Reconstructability of `result`: whether it round-trips losslessly, only
-    /// structurally, or is opaque. Inert in M1 (always [`Fidelity::Lossless`]);
-    /// carried so later stages can mark partial captures. Wire name pinned to
-    /// the `recon` wire name so current readers and writers agree.
+    /// Whether `result` rebuilds as the value it was captured from, as measured
+    /// by the recorder; see [`Fidelity`]. Wire name pinned to `recon`.
     #[serde(rename = "recon")]
     pub fidelity: Fidelity,
     /// Post-image of affected state after this operation, when explicitly
@@ -560,20 +559,29 @@ pub enum Provenance {
     Shadow,
 }
 
-/// Reconstructability of a captured `result`.
+/// Whether a captured `result` rebuilds as the value it was captured from.
 ///
-/// Inert in M1 (always [`Fidelity::Lossless`]); carried additively so later
-/// stages can flag captures that only round-trip structurally or not at all.
+/// Measured, not declared: the recorder rebuilds each value it records on a
+/// `Substitute` site through that site's own `reconstruct` and compares the two
+/// (see [`round_trip`]). Tapes recorded before the check existed say `lossless`
+/// on every event without having checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Fidelity {
-    /// Result round-trips byte-for-byte / value-for-value.
-    #[default]
+    /// Rebuilt, and equal to the value captured.
     Lossless,
     /// Result round-trips structurally but not losslessly.
     Structured,
-    /// Result cannot be reconstructed from the capture.
+    /// The capture does not rebuild: the site declares no replay codec, or its
+    /// codec failed on a value it recorded.
     Opaque,
+    /// Rebuilt, and DIFFERENT from the value captured: replay would hand the
+    /// service something the recording never saw.
+    Lossy,
+    /// Not checked: an `Execute` site, an error arm, or a type that offers
+    /// neither `PartialEq` nor `Serialize` to compare by.
+    #[default]
+    Unverified,
 }
 
 // ---------------------------------------------------------------------------
@@ -2144,6 +2152,8 @@ pub struct EventBuilder {
     /// Structural role stamped onto the emitted event (see [`BoundaryEvent::role`]).
     /// `None` by default; ingress recorders opt in via [`Self::with_role`].
     role: Option<&'static str>,
+    /// See [`BoundaryEvent::fidelity`].
+    fidelity: Fidelity,
 }
 
 /// Stable content digest over `(args, result)`, reusing the same canonical
@@ -2261,6 +2271,7 @@ impl EventBuilder {
             callsite_identity: None,
             semantics: BoundarySemantics::undeclared(),
             role: None,
+            fidelity: Fidelity::default(),
         }
     }
 
@@ -2283,6 +2294,12 @@ impl EventBuilder {
     /// (see [`BoundaryEvent::role`]); everything else leaves this unset.
     pub fn with_role(mut self, role: &'static str) -> Self {
         self.role = Some(role);
+        self
+    }
+
+    /// Stamp the measured round-trip fidelity of the result.
+    pub fn with_fidelity(mut self, fidelity: Fidelity) -> Self {
+        self.fidelity = fidelity;
         self
     }
 
@@ -2418,6 +2435,7 @@ impl EventBuilder {
             callsite_identity,
             semantics,
             role,
+            fidelity,
             ..
         } = self;
 
@@ -2485,7 +2503,7 @@ impl EventBuilder {
             event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
             callsite_identity,
             provenance: Provenance::default(),
-            fidelity: Fidelity::default(),
+            fidelity,
             result_image: (explicit_result_image).map(Payload::from),
             pre_image: (explicit_pre_image).map(Payload::from),
             read_set,
@@ -4227,12 +4245,13 @@ where
 /// [`Reconstructed::Synthesized`] from the miss arm, one that does not returns
 /// [`Reconstructed::NoValue`], and the seam stops on the latter exactly as the
 /// old default did.
-pub fn dispatch<T, A, F, C, R, O>(
+pub fn dispatch<T, A, F, C, R, O, S>(
     obs: CrossingObservation,
     args: A,
     run: F,
     reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4240,10 +4259,12 @@ where
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
     match runtime_mode() {
-        RuntimeMode::Disabled => record_only_path(obs, args, run, extract),
-        RuntimeMode::Record => record_only_path(obs, args, run, extract),
+        RuntimeMode::Disabled | RuntimeMode::Record => {
+            record_only_path(obs, args, run, reconstruct, extract, compare)
+        }
         RuntimeMode::Replay => {
             // Bind the structured args ONCE in replay mode. The same value feeds
             // the execute peek and the substitute lookup.
@@ -4285,6 +4306,99 @@ where
     }
 }
 
+/// What the round-trip check needs to know about a site, taken before the
+/// record path consumes its spec.
+#[derive(Clone, Copy)]
+struct RoundTripSite {
+    substitutes: bool,
+    boundary: &'static str,
+    method_name: &'static str,
+}
+
+impl RoundTripSite {
+    fn of(spec: &BoundarySpec) -> Self {
+        Self {
+            substitutes: crate::replay::replay_strategy_to_execute_mode(spec.replay_strategy)
+                == ExecuteMode::Lookup,
+            boundary: spec.boundary,
+            method_name: spec.method_name,
+        }
+    }
+}
+
+/// Rebuild the value this call just recorded, through the site's own
+/// `reconstruct`, and compare it with the original — the property replay
+/// depends on and nothing else checks. `compare` is `None` when the site
+/// declares no replay codec.
+fn round_trip_fidelity<T, C, S>(
+    site: RoundTripSite,
+    out: &T,
+    output: &RecordedOutput,
+    reconstruct: C,
+    compare: Option<S>,
+) -> Fidelity
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    if !site.substitutes || output.is_error {
+        return Fidelity::Unverified;
+    }
+    let Some(compare) = compare else {
+        return Fidelity::Opaque;
+    };
+    match reconstruct(ReconstructInput::Hit(output.result.clone())) {
+        Reconstructed::Value(rebuilt) => match compare(out, &rebuilt) {
+            round_trip::Comparison::Same => Fidelity::Lossless,
+            round_trip::Comparison::Different => Fidelity::Lossy,
+            round_trip::Comparison::Incomparable => Fidelity::Unverified,
+        },
+        Reconstructed::Synthesized(_) | Reconstructed::Failed(_) | Reconstructed::NoValue => {
+            Fidelity::Opaque
+        }
+    }
+}
+
+/// Capture `out`, measure its round trip, and hand both to `emit`, all inside
+/// the recorder's panic firewall.
+///
+/// A site that declares a codec and does not round-trip through it is a codec
+/// bug. A debug build — every test run — panics on it, outside the firewall so
+/// the test fails. A release recorder only stamps it on the event: recording
+/// never fails the service.
+fn finish_round_tripped<T, R, O, C, S>(
+    site: RoundTripSite,
+    out: &T,
+    extract: R,
+    reconstruct: C,
+    compare: Option<S>,
+    emit: impl FnOnce(RecordedOutput, Fidelity),
+) where
+    R: FnOnce(&T) -> O,
+    O: Into<RecordedOutput>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    let declares_codec = compare.is_some();
+    let fidelity = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let output = extract(out).into();
+        let fidelity = round_trip_fidelity(site, out, &output, reconstruct, compare);
+        emit(output, fidelity);
+        fidelity
+    }))
+    .ok();
+    if cfg!(debug_assertions)
+        && declares_codec
+        && matches!(fidelity, Some(Fidelity::Lossy | Fidelity::Opaque))
+    {
+        panic!(
+            "deja: `{}::{}` does not round-trip through its own codec ({:?}): replay would \
+             return a different value from the one this recording saw",
+            site.boundary, site.method_name, fidelity
+        );
+    }
+}
+
 /// The inactive / pure-record branch of [`dispatch`].
 ///
 /// Split out so the inactive fast path stays trivially the same shape as the
@@ -4292,13 +4406,23 @@ where
 /// `start_boundary_event_lazy`, which evaluates it ONLY when the recording hook
 /// is active. When nothing is recording, the hook short-circuits before `args`
 /// runs, so the inactive path serializes no arguments.
-fn record_only_path<T, A, F, R, O>(obs: CrossingObservation, args: A, run: F, extract: R) -> T
+fn record_only_path<T, A, F, C, R, O, S>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    compare: Option<S>,
+) -> T
 where
     A: FnOnce() -> serde_json::Value,
     F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let event = start_boundary_event_lazy_with_state(
         obs.caller,
         obs.spec,
@@ -4308,23 +4432,41 @@ where
         obs.state_capture,
     );
     let out = run();
-    finish_boundary_event(event, &out, &extract);
+    if let Some((hook, event)) = event {
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            compare,
+            |output, fidelity| {
+                event
+                    .with_fidelity(fidelity)
+                    .finish_recorded(&*hook, output);
+            },
+        );
+    }
     out
 }
 
-async fn record_only_path_async<T, A, Fut, F, R, O>(
+async fn record_only_path_async<T, A, Fut, F, C, R, O, S>(
     obs: CrossingObservation,
     args: A,
     run: F,
+    reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
     Fut: std::future::Future<Output = T>,
     F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let event = start_boundary_event_lazy_with_state(
         obs.caller,
         obs.spec,
@@ -4334,7 +4476,20 @@ where
         obs.state_capture,
     );
     let out = run().await;
-    finish_boundary_event(event, &out, &extract);
+    if let Some((hook, event)) = event {
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            compare,
+            |output, fidelity| {
+                event
+                    .with_fidelity(fidelity)
+                    .finish_recorded(&*hook, output);
+            },
+        );
+    }
     out
 }
 
@@ -4350,12 +4505,13 @@ where
 /// (`substitute_lookup`): it never awaits, so there is exactly ONE copy of the
 /// emit-before-stop ordering the observation's honesty depends on.
 #[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
-pub async fn dispatch_async<T, A, Fut, F, C, R, O>(
+pub async fn dispatch_async<T, A, Fut, F, C, R, O, S>(
     obs: CrossingObservation,
     args: A,
     run: F,
     reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4364,10 +4520,12 @@ where
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
     match runtime_mode() {
-        RuntimeMode::Disabled => record_only_path_async(obs, args, run, extract).await,
-        RuntimeMode::Record => record_only_path_async(obs, args, run, extract).await,
+        RuntimeMode::Disabled | RuntimeMode::Record => {
+            record_only_path_async(obs, args, run, reconstruct, extract, compare).await
+        }
         RuntimeMode::Replay => {
             let boundary_args: serde_json::Value = args();
 
@@ -4450,18 +4608,20 @@ pub struct DelegateObservation<'a> {
 /// to be moved, which forbids a borrowing args thunk; the macro therefore
 /// computes args eagerly only on the active path, exactly as before). Once called,
 /// this seam branches solely on the injected hook's [`RuntimeMode`].
-pub fn dispatch_with_hook<T, F, C, R, O>(
+pub fn dispatch_with_hook<T, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     args: serde_json::Value,
     run: F,
     reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     F: FnOnce() -> T,
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
     match obs.hook.process_mode() {
         RuntimeMode::Disabled => run(),
@@ -4470,7 +4630,7 @@ where
         // — the per-request gate lives here, never in process_mode.
         RuntimeMode::Record => {
             if obs.hook.capture_verdict().should_capture() {
-                delegate_record_path(obs, args, run, extract)
+                delegate_record_path(obs, args, run, reconstruct, extract, compare)
             } else {
                 run()
             }
@@ -4534,12 +4694,13 @@ where
 /// future; the macro wraps the whole call in `Box::pin`. `args` is the
 /// already-serialized image (see [`dispatch_with_hook`] for why the delegate
 /// computes it eagerly on the active path).
-pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O>(
+pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     args: serde_json::Value,
     run: F,
     reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     Fut: Future<Output = T>,
@@ -4547,13 +4708,14 @@ where
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
     match obs.hook.process_mode() {
         RuntimeMode::Disabled => run().await,
         // process_mode ROUTES; capture_verdict GATES the emit (see the sync path).
         RuntimeMode::Record => {
             if obs.hook.capture_verdict().should_capture() {
-                delegate_record_path_async(obs, args, run, extract).await
+                delegate_record_path_async(obs, args, run, reconstruct, extract, compare).await
             } else {
                 run().await
             }
@@ -4612,17 +4774,22 @@ where
     }
 }
 
-fn delegate_record_path<T, F, R, O>(
+fn delegate_record_path<T, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     boundary_args: serde_json::Value,
     run: F,
+    reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let builder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         EventBuilder::start_with_receiver(
             obs.hook,
@@ -4639,26 +4806,39 @@ where
     .ok();
     let out = run();
     if let Some(builder) = builder {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let output = extract(&out).into();
-            builder.finish_recorded(obs.hook, output);
-        }));
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            compare,
+            |output, fidelity| {
+                builder
+                    .with_fidelity(fidelity)
+                    .finish_recorded(obs.hook, output);
+            },
+        );
     }
     out
 }
 
-async fn delegate_record_path_async<T, Fut, F, R, O>(
+async fn delegate_record_path_async<T, Fut, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     boundary_args: serde_json::Value,
     run: F,
+    reconstruct: C,
     extract: R,
+    compare: Option<S>,
 ) -> T
 where
     Fut: std::future::Future<Output = T>,
     F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let builder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         EventBuilder::start_with_receiver(
             obs.hook,
@@ -4675,10 +4855,18 @@ where
     .ok();
     let out = run().await;
     if let Some(builder) = builder {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let output = extract(&out).into();
-            builder.finish_recorded(obs.hook, output);
-        }));
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            compare,
+            |output, fidelity| {
+                builder
+                    .with_fidelity(fidelity)
+                    .finish_recorded(obs.hook, output);
+            },
+        );
     }
     out
 }
@@ -5059,6 +5247,11 @@ mod tests {
 
     use super::*;
     use std::panic::Location;
+
+    /// The round-trip comparator for a test about routing, not codecs.
+    fn unchecked<T>() -> Option<fn(&T, &T) -> crate::round_trip::Comparison> {
+        None
+    }
 
     // -----------------------------------------------------------------------
     // DejaRecord — the one-stream wire shape (tag routes, fields stay flat).
@@ -6307,6 +6500,7 @@ mod tests {
                     ),
                 },
                 |v: &u64| (serde_json::json!(v), false),
+                unchecked(),
             );
             assert_eq!(out, 5, "{label}: the real block must have run");
         }
@@ -6461,6 +6655,7 @@ mod tests {
             || 7u64,
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 7);
     }
@@ -6476,6 +6671,7 @@ mod tests {
             || 42u64,
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 42);
         let recorded = hook
@@ -6541,6 +6737,7 @@ mod tests {
                     .with_result_image(result_image.clone())
                     .with_pre_image(pre_image.clone())
             },
+            unchecked(),
         );
         assert_eq!(out, live_result);
 
@@ -6586,6 +6783,7 @@ mod tests {
                 }
             }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 99, "returned the reconstructed recorded value");
         assert!(!ran.get(), "the real block must NOT run on a lookup hit");
@@ -6624,6 +6822,7 @@ mod tests {
                     }
                 }),
                 |r: &u64| (serde_json::json!(*r), false),
+                unchecked(),
             )
         }));
 
@@ -6657,6 +6856,7 @@ mod tests {
                 },
                 |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
                 |r: &u64| (serde_json::json!(*r), false),
+                unchecked(),
             )
         }));
 
@@ -6706,6 +6906,7 @@ mod tests {
                 }
             }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
 
         assert_eq!(out, 7);
@@ -6747,6 +6948,7 @@ mod tests {
             || Ok(RedisLikeValue::Null),
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             capture_redis_like,
+            unchecked(),
         );
         assert_eq!(recorded_out, Ok(RedisLikeValue::Null));
         let recorded_result = {
@@ -6780,6 +6982,7 @@ mod tests {
             || Ok(RedisLikeValue::Null),
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             capture_redis_like,
+            unchecked(),
         );
         assert_eq!(shadow_out, Ok(RedisLikeValue::Null));
         assert_eq!(
@@ -6809,6 +7012,7 @@ mod tests {
                 }
             }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
 
         assert_eq!(
@@ -6838,6 +7042,7 @@ mod tests {
             || async { 21u64 },
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         )
         .await;
         assert_eq!(out, 21);
@@ -6857,6 +7062,7 @@ mod tests {
                 }
             }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         )
         .await;
         assert_eq!(out, 100);
@@ -6896,6 +7102,7 @@ mod tests {
                 }
             }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         )
         .await;
 
@@ -6941,6 +7148,7 @@ mod tests {
             || 55u64,
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 55);
         assert!(
