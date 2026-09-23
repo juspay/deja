@@ -1007,6 +1007,19 @@ pub struct HarnessRoot {
     pub root: PathBuf,
 }
 
+/// Where each derived cache sits, named off the file it is built from. The
+/// handlers derive from a resolved path and the accessors from a run id; both
+/// go through these, so the artifact-cache sweep recognises what they write.
+pub fn behaviour_tree_cache_of(ledger: &std::path::Path) -> PathBuf {
+    ledger.with_extension("behaviour-tree.jsonl")
+}
+pub fn delta_cache_of(ledger: &std::path::Path) -> PathBuf {
+    ledger.with_extension("delta.json")
+}
+pub fn change_coverage_cache_of(observed: &std::path::Path) -> PathBuf {
+    observed.with_extension("change-coverage.json")
+}
+
 impl HarnessRoot {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
@@ -1060,17 +1073,24 @@ impl HarnessRoot {
             .join("runs")
             .join(format!("{run_id}.call-ledger.jsonl"))
     }
-    /// Record-side execution-graph nodes for a run, extracted from the recording
-    /// tape (span STRUCTURE only — no boundary payloads). Published as a run
-    /// artifact so the dashboard's `/graph` record side renders for in-pod runs
-    /// without copying the sensitive recording tape off the pod.
     /// The run as a behaviour tree (one address per line), the projection two
     /// runs on one tape are compared through. Named off the ledger it is
     /// built from.
     pub fn behaviour_tree_path(&self, run_id: &str) -> PathBuf {
-        self.call_ledger_path(run_id)
-            .with_extension("behaviour-tree.jsonl")
+        behaviour_tree_cache_of(&self.call_ledger_path(run_id))
     }
+    /// The cached delta document for a run measured against its baseline.
+    pub fn delta_cache_path(&self, run_id: &str) -> PathBuf {
+        delta_cache_of(&self.call_ledger_path(run_id))
+    }
+    /// The cached change-coverage document for a run.
+    pub fn change_coverage_path(&self, run_id: &str) -> PathBuf {
+        change_coverage_cache_of(&self.observed_path(run_id))
+    }
+    /// Record-side execution-graph nodes for a run, extracted from the recording
+    /// tape (span STRUCTURE only — no boundary payloads). Published as a run
+    /// artifact so the dashboard's `/graph` record side renders for in-pod runs
+    /// without copying the sensitive recording tape off the pod.
     pub fn record_graph_path(&self, run_id: &str) -> PathBuf {
         self.root
             .join("runs")
