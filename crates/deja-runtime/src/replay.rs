@@ -4580,6 +4580,60 @@ mod tests {
             .expect("a current-version table must still load");
     }
 
+    /// A recording captured by a build with a different event schema is
+    /// refused at load, naming both versions. Its argument images were
+    /// encoded under another schema, so wherever the two encodings differ
+    /// every key fails to compare, and the run presents as a regression in a
+    /// candidate that changed nothing. A table that declares no version is
+    /// treated as older than this build.
+    #[test]
+    fn a_recording_from_another_event_schema_is_refused_at_load() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tmp");
+        let load = |name: &str, body: String| {
+            let path = dir.path().join(name);
+            let mut file = std::fs::File::create(&path).expect("create");
+            write!(file, "{body}").expect("write");
+            LocalFileLookupSource::new(&path).load()
+        };
+        let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
+        let older = current - 1;
+
+        let message = load(
+            "older.json",
+            format!(
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{older},"entries":[]}}"#
+            ),
+        )
+        .expect_err("a recording from an older schema must be refused")
+        .to_string();
+        assert!(
+            message.contains(&format!("event schema v{older}"))
+                && message.contains(&format!("v{current}"))
+                && message.contains("re-record"),
+            "the refusal names both versions and the remedy: {message}"
+        );
+
+        let message = load(
+            "unversioned.json",
+            format!(r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"entries":[]}}"#),
+        )
+        .expect_err("a table that declares no schema version must be refused")
+        .to_string();
+        assert!(
+            message.contains("no event schema version") && message.contains(&format!("v{current}")),
+            "the refusal says what is missing: {message}"
+        );
+
+        load(
+            "current.json",
+            format!(
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{current},"entries":[]}}"#
+            ),
+        )
+        .expect("a recording from this build's schema must still load");
+    }
+
     /// One recorded call: the operation, the span it fired in, its
     /// operation-specific syntax hash, its arguments, and what it returned.
     type ClockRow<'a> = (&'a str, &'a str, u64, serde_json::Value, serde_json::Value);
