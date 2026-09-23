@@ -35,7 +35,9 @@ use super::ledger::CallRecord;
 /// 1: calls keyed positionally under their span.
 /// 2: calls keyed by the recorded event they paired to; the tree carries the
 ///    correlations the run drove.
-pub const CANON_VERSION: u32 = 2;
+/// 3: the tree carries the event schema versions its candidate captured
+///    under.
+pub const CANON_VERSION: u32 = 3;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,6 +127,29 @@ pub struct BehaviourTree {
     /// correlations both trees drove.
     #[serde(default)]
     pub correlations: BTreeSet<String>,
+    /// The event schema versions the candidate captured under, read off its
+    /// observed stream. The tree hashes observed args, whose encoding belongs
+    /// to the deja revision the candidate links, so two trees compare only
+    /// when these agree; otherwise an encoding change reads as behaviour.
+    #[serde(default)]
+    pub event_schema_versions: BTreeSet<u32>,
+}
+
+/// The event schema versions named in an observed stream. Every event carries
+/// the version its capture used; this reads the number without parsing the
+/// event, since the stream can run to megabytes.
+pub fn event_schema_versions(observed: &str) -> BTreeSet<u32> {
+    const KEY: &str = "\"event_schema_version\":";
+    observed
+        .lines()
+        .filter_map(|line| {
+            let rest = line[line.find(KEY)? + KEY.len()..].trim_start();
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        })
+        .collect()
 }
 
 /// The canonical form of an argument value: keys sorted, and a header list
@@ -352,6 +377,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
         entries,
         lanes,
         correlations,
+        event_schema_versions: BTreeSet::new(),
     }
 }
 
@@ -396,6 +422,7 @@ impl BehaviourTree {
                 "entries": self.entries.len(),
                 "lanes": self.lanes,
                 "correlations": self.correlations,
+                "event_schema_versions": self.event_schema_versions,
             })
             .to_string(),
         );
@@ -430,6 +457,10 @@ impl BehaviourTree {
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
             correlations: serde_json::from_value(head.get("correlations")?.clone()).ok()?,
+            event_schema_versions: serde_json::from_value(
+                head.get("event_schema_versions")?.clone(),
+            )
+            .ok()?,
         })
     }
 
@@ -674,5 +705,31 @@ mod tests {
             1,
             "the request was driven even though nothing in it is an address"
         );
+    }
+
+    #[test]
+    fn event_schema_versions_are_read_off_every_observed_line() {
+        let observed = concat!(
+            r#"{"record_kind":"boundary_event","event_schema_version":10,"args":{}}"#,
+            "\n",
+            r#"{"record_kind":"graph_node","node_id":1}"#,
+            "\n",
+            r#"{"event_schema_version": 9,"boundary":"redis"}"#,
+            "\n",
+            r#"{"args":"{\"event_schema_version\":3}","event_schema_version":10}"#,
+            "\n",
+        );
+        assert_eq!(
+            event_schema_versions(observed),
+            [9, 10].into_iter().collect::<BTreeSet<u32>>()
+        );
+    }
+
+    #[test]
+    fn a_tree_keeps_its_event_schemas_through_the_cache() {
+        let mut tree = build("r", &[], &[]);
+        tree.event_schema_versions = [10].into_iter().collect();
+        let back = BehaviourTree::from_jsonl(&tree.to_jsonl()).unwrap();
+        assert_eq!(back.event_schema_versions, tree.event_schema_versions);
     }
 }

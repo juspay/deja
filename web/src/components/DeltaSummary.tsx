@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, Delta, DeltaFamily, DeltaSideInfo, deltaFamily } from "../lib/api";
+import { api, Delta, DeltaFamily, DeltaSideInfo, deltaFamily, deltaUnavailable } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 
 /**
@@ -159,22 +159,20 @@ export function BaselineNote({ run }: { run: string }) {
 
 /**
  * The delta panel on a run's report: what this run changed relative to the
- * baseline it was created against. Pending while the baseline is still
- * running; the full address-level page is one link away.
+ * baseline it was created against. Pending while a side is still being
+ * scored, and polled only then; a refused pairing says so and stops. The
+ * full address-level page is one link away.
  */
 export function DeltaPanel({ runId, against }: { runId: string; against: string }) {
   const debug = useDebug();
   const delta = useQuery({
     queryKey: ["delta", runId, against],
     queryFn: () => api.delta(runId, against),
-    refetchInterval: (q) => {
-      const d = q.state.data;
-      // a baseline still being scored answers `unavailable`; keep asking
-      return d && "unavailable" in d ? 15000 : false;
-    },
+    // only a side still being scored can change the answer; a refusal is final
+    refetchInterval: (q) => (deltaUnavailable(q.state.data)?.pending ? 15000 : false),
   });
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
-  const why = delta.data && "unavailable" in delta.data ? delta.data.unavailable : null;
+  const unavailable = deltaUnavailable(delta.data);
   return (
     <section className="delta-panel">
       <h2>Against main</h2>
@@ -185,9 +183,9 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
       </p>
       {delta.isLoading && <p className="hint">comparing…</p>}
       {delta.error && <p className="err">{String(delta.error)}</p>}
-      {why && (
+      {unavailable && (
         <div className="delta-unavailable">
-          Delta pending: {why}
+          {unavailable.pending ? "Delta pending" : "No delta"}: {unavailable.why}
         </div>
       )}
       {d && (

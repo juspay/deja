@@ -9,6 +9,7 @@ import {
   DeltaSide,
   DeltaSideInfo,
   deltaFamily,
+  deltaUnavailable,
   RunSummaryRow,
 } from "../lib/api";
 import { candidateRef } from "../lib/result";
@@ -255,7 +256,7 @@ export default function DeltaPage() {
 
   const tape = run.data?.recording_id ?? null;
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
-  const unavailable = delta.data && "unavailable" in delta.data ? delta.data.unavailable : null;
+  const unavailable = deltaUnavailable(delta.data);
 
   const byFamily = React.useMemo(() => {
     const out: Record<DeltaFamily, DeltaRow[]> = { changed: [], introduced: [], resolved: [], inherited: [], clean: [] };
@@ -284,7 +285,11 @@ export default function DeltaPage() {
       )}
       {against && delta.isLoading && <p className="hint">comparing…</p>}
       {against && delta.error && <p className="err">{String(delta.error)}</p>}
-      {unavailable && <div className="delta-unavailable">No delta: {unavailable}</div>}
+      {unavailable && (
+        <div className="delta-unavailable">
+          {unavailable.pending ? "Delta pending" : "No delta"}: {unavailable.why}
+        </div>
+      )}
 
       {d && (
         <>

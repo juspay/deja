@@ -196,6 +196,15 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             m.canon_version, y.canon_version
         ));
     }
+    // The trees hash what each candidate captured, in the encoding of the
+    // deja it links. Across two encodings every affected address would read
+    // as changed behaviour, so the tape verdict is the one to read there.
+    if m.event_schema_versions != y.event_schema_versions {
+        return Err(format!(
+            "the candidates capture under different event schemas ({:?} and {:?}), so an encoding change would read as a behaviour change; read each run's tape verdict instead",
+            m.event_schema_versions, y.event_schema_versions
+        ));
+    }
     // The domain: requests both runs drove. A tree that names no correlations
     // drove nothing, and there is nothing to compare it on.
     let covered: BTreeSet<&String> = m.correlations.intersection(&y.correlations).collect();
@@ -418,6 +427,7 @@ mod tests {
             .into_iter()
             .collect(),
             correlations,
+            event_schema_versions: [10].into_iter().collect(),
         }
     }
     fn div(h: &str) -> Value {
@@ -595,5 +605,24 @@ mod tests {
         let mut y = tree("y", vec![]);
         y.canon_version += 1;
         assert!(three_way(&m, &y).is_err());
+    }
+
+    #[test]
+    fn candidates_on_different_event_schemas_do_not_compare() {
+        let at = |seq| Address::Status {
+            correlation: "c".into(),
+            request_sequence: seq,
+        };
+        let m = tree("m", vec![(at(0), Value::Reproduced)]);
+        let same = tree("y", vec![(at(0), Value::Reproduced)]);
+        assert!(
+            three_way(&m, &same).is_ok(),
+            "one schema on both sides compares"
+        );
+
+        let mut bumped = same.clone();
+        bumped.event_schema_versions = [11].into_iter().collect();
+        let why = three_way(&m, &bumped).err().unwrap();
+        assert!(why.contains("different event schemas"), "{why}");
     }
 }

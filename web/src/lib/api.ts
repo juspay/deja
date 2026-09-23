@@ -64,7 +64,7 @@ export type RunRow = {
   /** What the run changed relative to the baseline it was created against
    *  (params.delta_against): pass, fail, or pending while the baseline is
    *  still being scored. Absent for a run that names no baseline. */
-  delta_verdict?: "pass" | "fail" | "pending" | null;
+  delta_verdict?: "pass" | "fail" | "pending" | "refused" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;
@@ -812,7 +812,19 @@ export type Delta = {
   sides: { m: DeltaSideInfo; y: DeltaSideInfo };
 };
 
-export type DeltaResponse = Delta | { unavailable: string };
+/** Why there is no delta: `pending` clears on its own, `refused` never will. */
+export type DeltaUnavailable = { unavailable: string; unavailable_kind?: "pending" | "refused" };
+export type DeltaResponse = Delta | DeltaUnavailable;
+
+/**
+ * The unavailability a delta response carries, if any. A response that names
+ * no kind is read as refused, so nothing polls on an answer it cannot tell
+ * will change.
+ */
+export function deltaUnavailable(r: DeltaResponse | undefined): { why: string; pending: boolean } | null {
+  if (!r || !("unavailable" in r)) return null;
+  return { why: r.unavailable, pending: r.unavailable_kind === "pending" };
+}
 
 export function deltaFamily(b: DeltaBucket): DeltaFamily {
   if (b === "clean" || b === "changed") return b;

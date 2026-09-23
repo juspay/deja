@@ -419,8 +419,10 @@ impl Store {
         Ok(())
     }
 
-    /// The delta verdict, once the run's delta against its baseline has been
-    /// computed (or found pending). Idempotent; the newest computation wins.
+    /// The delta verdict: `pass` or `fail` once the run's delta against its
+    /// baseline is computed, else `pending` (a side is still running) or
+    /// `refused` (the pairing can never give one). Idempotent; the newest
+    /// computation wins.
     pub async fn set_delta_verdict(&self, run_id: &str, verdict: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE replay_runs SET delta_verdict = $2 WHERE run_id = $1")
             .bind(run_id)
@@ -432,7 +434,7 @@ impl Store {
 
     /// Every completed run created to be measured against `baseline_run_id`
     /// (`params.delta_against`), so their deltas can be settled when the
-    /// baseline's own result lands.
+    /// baseline finishes.
     pub async fn runs_measured_against(
         &self,
         baseline_run_id: &str,
