@@ -60,14 +60,15 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// # The enveloped form is the ONLY output, and that is load-bearing
 ///
 /// This returns a whole `LookupTable` — `{recording_id, policy_version,
-/// entries}` — and the orchestrator serializes it as one document. There is no
+/// event_schema_version, entries}` — and the orchestrator serializes it as one
+/// document. There is no
 /// JSONL writer anywhere in this crate, and there must not be one.
 ///
 /// The reason is [`deja::replay::check_policy_version`]. It refuses a table
 /// whose declared policy differs from the one this build implements, which is
 /// what stops a stale table degrading into a mass miss that presents as a total
 /// candidate regression. But the loader's JSONL fallback carries no envelope and
-/// therefore no declared version, so it TAKES the current version rather than
+/// therefore no declared versions, so it TAKES the current ones rather than
 /// refusing — sound only while nothing emits JSONL.
 ///
 /// Adding a JSONL writer here would silently remove the version guard from that

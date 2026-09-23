@@ -6283,6 +6283,42 @@ mod tests {
         card
     }
 
+    /// The scorer reads a run's lookup table for what the RECORDING held. Which
+    /// schema that recording was captured under is the replaying candidate's
+    /// question, not the scorer's, so a table from another schema still scores.
+    #[test]
+    fn the_scorer_reads_a_table_from_any_event_schema() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("lookup.json");
+        let mut table = serde_json::json!({
+            "recording_id": "rec-1",
+            "policy_version": deja::POLICY_VERSION,
+            "entries": [serde_json::to_value(seq_entry_method_res(
+                Some("c1"),
+                "db",
+                "find",
+                1,
+                serde_json::json!({"result": "Ok"}),
+            ))
+            .expect("entry")],
+        });
+        for schema in [
+            Some(deja::CURRENT_EVENT_SCHEMA_VERSION - 1),
+            Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+            None,
+        ] {
+            table["event_schema_version"] = serde_json::json!(schema);
+            std::fs::write(&path, table.to_string()).expect("write");
+            let mut warnings = Vec::new();
+            let loaded = load_table(&path, &mut warnings);
+            assert_eq!(
+                (loaded.entries.len(), warnings.len()),
+                (1, 0),
+                "schema {schema:?}: {warnings:?}"
+            );
+        }
+    }
+
     #[test]
     fn canon_presets_resolve_and_compare_their_declared_shapes() {
         let final_state = resolve_canon(Some(&deja::CanonRef::new("final_state")))

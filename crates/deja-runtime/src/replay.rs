@@ -1849,8 +1849,10 @@ fn check_policy_version(table: LookupTable) -> std::io::Result<LookupTable> {
 /// image is what its key hashes. Where two schemas encode a value differently —
 /// v10 marks a present `None` that v9 wrote as `null` — every such call misses,
 /// and the run presents as a regression in a candidate that changed nothing.
-/// Same reasoning, and same placement, as [`check_policy_version`]; this one is
-/// about the recording rather than the renderer.
+/// Same reasoning as [`check_policy_version`]; this one is about the
+/// recording rather than the renderer, so it runs where a candidate installs
+/// the table to replay against ([`LookupTableHook::from_source`]), not where a
+/// file is read: the scorer reads the same file and must not be refused.
 fn check_event_schema_version(table: LookupTable) -> std::io::Result<LookupTable> {
     let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
     let refusal = match table.event_schema_version {
@@ -1896,7 +1898,7 @@ impl LookupTableSource for LocalFileLookupSource {
         // function. A compact, one-line table misleads the other way: its JSONL
         // attempt reports a missing `key`, which is why this error leads.
         let enveloped_error = match serde_json::from_str::<LookupTable>(text) {
-            Ok(table) => return check_policy_version(table).and_then(check_event_schema_version),
+            Ok(table) => return check_policy_version(table),
             Err(error) => error,
         };
         let entries = text
@@ -2090,7 +2092,9 @@ impl LookupTableHook {
         S: LookupTableSource,
         K: ObservedCallSink + 'static,
     {
-        let table = source.load()?;
+        // Checked here rather than in the source: the scorer reads the same
+        // table for what the recording held, and that is valid under any schema.
+        let table = check_event_schema_version(source.load()?)?;
         let mut map = HashMap::with_capacity(table.entries.len());
         for entry in table.entries {
             map.insert(entry.key.clone(), entry);
@@ -4629,14 +4633,18 @@ mod tests {
     /// candidate that changed nothing. A table that declares no version is
     /// treated as older than this build.
     #[test]
-    fn a_recording_from_another_event_schema_is_refused_at_load() {
+    fn a_recording_from_another_event_schema_is_refused_at_install() {
         use std::io::Write;
         let dir = tempfile::tempdir().expect("tmp");
         let load = |name: &str, body: String| {
             let path = dir.path().join(name);
             let mut file = std::fs::File::create(&path).expect("create");
             write!(file, "{body}").expect("write");
-            LocalFileLookupSource::new(&path).load()
+            LookupTableHook::from_source(
+                LocalFileLookupSource::new(&path),
+                InMemoryObservedSink::new(),
+            )
+            .map(|_| ())
         };
         let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
         let older = current - 1;
