@@ -1898,8 +1898,8 @@ fn describe_registration(
             .to_owned(),
         Some(Ok(rows)) => match rows.into_iter().find(|(k, _)| k == kind) {
             Some((_, uri)) => format!(
-                "it is registered at {uri} but could not be pulled to this host — a fault in \
-                 fetching it, not a fact about the run"
+                "it is registered at {uri} but is not on this host — the pull failed or the \
+                 cached copy was evicted; a fault in serving it, not a fact about the run"
             ),
             // The index records uploads, not attempts: a run that never produced
             // this artifact and one whose upload failed look the same from here.
@@ -3866,10 +3866,10 @@ mod tests {
         assert!(reason.contains("COMPLETED"), "{reason}");
     }
 
-    /// Registered-but-absent is a fetch fault and says where the object is;
+    /// Registered-but-absent is a serving fault and says where the object is;
     /// a DIFFERENT kind registered for the run is not this one.
     #[test]
-    fn a_registered_artifact_that_is_absent_is_a_fetch_fault() {
+    fn a_registered_artifact_that_is_absent_is_a_serving_fault() {
         let rows = vec![
             (
                 "scorecard".to_owned(),
@@ -3882,7 +3882,7 @@ mod tests {
         ];
         let said = describe_registration(Some(Ok(rows.clone())), "call_ledger");
         assert!(said.contains("s3://b/runs/r/call_ledger.jsonl"), "{said}");
-        assert!(said.contains("could not be pulled"), "{said}");
+        assert!(said.contains("not on this host"), "{said}");
 
         let said = describe_registration(Some(Ok(rows)), "http_diffs");
         assert!(said.contains("never registered"), "{said}");
