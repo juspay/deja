@@ -1854,7 +1854,8 @@ impl LookupTableSource for LocalFileLookupSource {
         // table this build cannot read. That message reads as "the table is
         // empty" and sends the reader to the renderer, which is not where the
         // fault is. It cost two separate investigations before anyone read this
-        // function.
+        // function. A compact, one-line table misleads the other way: its JSONL
+        // attempt reports a missing `key`, which is why this error leads.
         let enveloped_error = match serde_json::from_str::<LookupTable>(text) {
             Ok(table) => return check_policy_version(table),
             Err(error) => error,
@@ -8272,6 +8273,34 @@ mod lookup_load_names_the_mismatch {
         assert!(
             msg.contains("as an enveloped table:"),
             "must surface the error that used to be discarded: {msg}"
+        );
+    }
+
+    /// The same skew, in the one-line form the orchestrator now writes.
+    ///
+    /// On one line the JSONL attempt no longer stops at `{`: it parses the
+    /// envelope as an entry and reports a missing `key`. That reads like a
+    /// malformed entry, so the enveloped error and the skew must still lead.
+    #[test]
+    fn a_version_skewed_compact_table_names_the_skew_first() {
+        let skewed = r#"{"recording_id":"rec-test","policy_version":1,"entries":[{"key":{"address":{"Sequence":7},"args_hash":"x","occurrence":0},"result":null,"source_event_global_sequence":1}]}"#;
+        let err = load_text("skewed-compact", skewed)
+            .expect_err("a shape this build cannot read must fail");
+        let msg = err.to_string();
+        let enveloped = msg
+            .find("as an enveloped table:")
+            .unwrap_or_else(|| panic!("must surface the enveloped error: {msg}"));
+        let jsonl = msg
+            .find("as JSONL:")
+            .unwrap_or_else(|| panic!("the JSONL attempt is attributed: {msg}"));
+        assert!(
+            enveloped < jsonl,
+            "the enveloped error leads, the JSONL one follows: {msg}"
+        );
+        assert!(msg.contains("expected u64"), "the real schema error: {msg}");
+        assert!(
+            msg.contains("VERSION SKEW"),
+            "must name version skew: {msg}"
         );
     }
 
