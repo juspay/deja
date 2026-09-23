@@ -553,9 +553,13 @@ pub(crate) fn build_with_inconclusive_into(
             // boundary would, unless there is no baseline to judge it against.
             if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
                 ("inconclusive_tail_gap", false)
-            } else if obs.absorbed {
-                // As the scorecard's novel-subtree arm: a miss the request
-                // survived is an absorbed miss wherever it lands.
+            } else if obs.absorbed
+                && tier_for(&obs.boundary) != Tier::Environmental
+                && !observed_miss_is_excused(obs)
+            {
+                // As the scorecard's novel-subtree arm, in its order: a miss the
+                // request survived is an absorbed miss wherever it lands, once
+                // it is neither an egress miss nor an excused one.
                 ("novel_absorbed", false)
             } else {
                 (

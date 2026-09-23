@@ -13352,18 +13352,16 @@ mod tests {
         );
         assert!(outcome.alignment.is_none());
     }
-    /// A miss the request survived is an absorbed miss wherever it lands. Inside
-    /// a subtree the recording never had, it is still a call that returned a
-    /// value the recording never held, so the correlation cannot read passed.
-    #[test]
-    fn an_absorbed_miss_inside_a_novel_subtree_is_still_absorbed() {
-        let corr = "novel-absorbed";
+
+    /// One graph-scored correlation whose novel subtree holds a single call
+    /// that missed and was absorbed, on `boundary`, as method `novel`.
+    fn absorbed_in_novel_subtree(corr: &str, boundary: &str) -> RunArtifacts {
         let result = serde_json::json!({"result": "Ok"});
-        let mut novel = obs("db", Some(corr), false, None, None);
+        let mut novel = obs(boundary, Some(corr), false, None, None);
         novel.method_name = "novel".to_owned();
         novel.graph_node_id = Some(15);
         novel.absorbed = true;
-        let artifacts = with_graphs(
+        with_graphs(
             art_with_events(
                 vec![seq_entry_method_res(
                     Some(corr),
@@ -13391,7 +13389,16 @@ mod tests {
                 graph_span(14, corr, None, 0, "request"),
                 graph_span(15, corr, Some(14), 1, "new-subtree"),
             ],
-        );
+        )
+    }
+
+    /// A miss the request survived is an absorbed miss wherever it lands. Inside
+    /// a subtree the recording never had, it is still a call that returned a
+    /// value the recording never held, so the correlation cannot read passed.
+    #[test]
+    fn an_absorbed_miss_inside_a_novel_subtree_is_still_absorbed() {
+        let corr = "novel-absorbed";
+        let artifacts = absorbed_in_novel_subtree(corr, "db");
         let card = detect(&artifacts);
         let outcome = card
             .per_correlation
@@ -13432,6 +13439,32 @@ mod tests {
             ("novel_absorbed", false),
             "the row the viewer routes on agrees with the scorecard"
         );
+    }
+
+    /// The ledger asks the scorecard's questions in the scorecard's order. An
+    /// egress or excused call is classified before absorption is asked about,
+    /// so its ledger row must not claim an absorbed miss the scorecard never
+    /// counted.
+    #[test]
+    fn the_ledger_classifies_an_absorbed_egress_or_excused_miss_as_the_scorecard_does() {
+        // An egress call, and a clock call whose outcome reads Substituted, as
+        // an observation from a runtime that predates the outcome field does.
+        for (boundary, kind) in [
+            ("http_outgoing", "EnvironmentalMiss"),
+            ("time", "DeterministicMiss"),
+        ] {
+            let artifacts = absorbed_in_novel_subtree("novel-early", boundary);
+            let card = detect(&artifacts);
+            assert_eq!(kind_count(&card, boundary, kind), 1, "{boundary}");
+            assert_eq!(card.summary.absorbed_misses, 0, "{boundary}");
+            let rows = build_ledger(&artifacts).expect("ledger builds");
+            let row = rows
+                .iter()
+                .find(|row| row.method_name == "novel")
+                .expect("the call has a ledger row");
+            assert_ne!(row.kind, "novel_absorbed", "{boundary}: {row:?}");
+            assert!(!row.blocking, "{boundary}: {row:?}");
+        }
     }
 
     #[test]
