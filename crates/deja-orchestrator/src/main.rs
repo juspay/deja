@@ -39,7 +39,9 @@ use axum::{
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
-use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunId, RunStatus};
+use deja_orchestrator::{
+    api::runs, artifact_kinds, divergence, HarnessRoot, Run, RunId, RunStatus,
+};
 use deja_store::Store;
 use sha2::{Digest, Sha256};
 
@@ -1542,15 +1544,9 @@ fn local_path_for_artifact_kind(
     run_id: &str,
     kind: &str,
 ) -> Option<std::path::PathBuf> {
-    Some(match kind {
-        "observed" => root.observed_path(run_id),
-        "http_diffs" => root.http_diff_path(run_id),
-        "lookup_table" => root.lookup_table_path(run_id),
-        "scorecard" => root.scorecard_path(run_id),
-        "call_ledger" => root.call_ledger_path(run_id),
-        "record_graph" => root.record_graph_path(run_id),
-        _ => return None,
-    })
+    artifact_kinds::served()
+        .find(|served| served.name == kind)
+        .map(|served| served.path(root, run_id))
 }
 
 /// Default ceiling on the hydrated-artifact cache. `DEJA_ARTIFACT_CACHE_MAX_BYTES`
@@ -1568,16 +1564,6 @@ fn artifact_cache_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_BYTES)
 }
 
-/// The kinds `hydrate_run_artifacts` copies down from the store.
-const HYDRATED_KINDS: [&str; 6] = [
-    "observed",
-    "http_diffs",
-    "lookup_table",
-    "scorecard",
-    "call_ledger",
-    "record_graph",
-];
-
 /// Caches the orchestrator derives from hydrated files and rebuilds on a miss.
 const DERIVED_CACHES: [&str; 3] = ["behaviour_tree", "delta", "change_coverage"];
 
@@ -1593,7 +1579,9 @@ fn cache_path_for_kind(root: &HarnessRoot, run_id: &str, kind: &str) -> Option<s
 }
 
 fn cache_kinds() -> impl Iterator<Item = &'static str> {
-    HYDRATED_KINDS.into_iter().chain(DERIVED_CACHES)
+    artifact_kinds::served()
+        .map(|kind| kind.name)
+        .chain(DERIVED_CACHES)
 }
 
 /// The directories the cache sweep looks in, asked of `cache_path_for_kind`
@@ -2241,14 +2229,14 @@ fn tree_sources(
     };
     let root = &st.root;
     let ledger = confined(root.call_ledger_path(id), &root.root.join("runs"))
-        .ok_or_else(|| absent("call_ledger", "call ledger"))?;
+        .ok_or_else(|| absent(artifact_kinds::CALL_LEDGER.name, "call ledger"))?;
     let diffs = confined(root.http_diff_path(id), &root.root.join("http-diffs"));
-    if diffs.is_none() && registered.is_some_and(|r| r.contains("http_diffs")) {
-        return Err(absent("http_diffs", "http diffs"));
+    if diffs.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::HTTP_DIFFS.name)) {
+        return Err(absent(artifact_kinds::HTTP_DIFFS.name, "http diffs"));
     }
     let observed = confined(root.observed_path(id), &root.root.join("observed"));
-    if observed.is_none() && registered.is_some_and(|r| r.contains("observed")) {
-        return Err(absent("observed", "observed stream"));
+    if observed.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::OBSERVED.name)) {
+        return Err(absent(artifact_kinds::OBSERVED.name, "observed stream"));
     }
     // beside the ledger it is built from, named off the confined ledger path:
     // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
@@ -2331,11 +2319,11 @@ async fn behaviour_tree_for(
             );
             move |path: &std::path::Path| -> &'static str {
                 if path == ledger {
-                    "call_ledger"
+                    artifact_kinds::CALL_LEDGER.name
                 } else if diffs.as_deref() == Some(path) {
-                    "http_diffs"
+                    artifact_kinds::HTTP_DIFFS.name
                 } else if observed.as_deref() == Some(path) {
-                    "observed"
+                    artifact_kinds::OBSERVED.name
                 } else {
                     ""
                 }

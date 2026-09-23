@@ -1291,27 +1291,6 @@ fn resolve_correlation_filter(
     Ok(())
 }
 
-/// Final stage (shared): score the run, report the verdict, register the
-/// The replay-run stream artifacts [`score_and_register`] publishes, as
-/// `(kind, s3-filename)`. One list so the sink loop and the DB-constraint
-/// coverage test stay in agreement. `observed` also carries the replay-side
-/// execution-graph nodes (`DejaRecord::GraphNode`).
-const REPLAY_STREAM_ARTIFACTS: [(&str, &str); 6] = [
-    ("lookup_table", "lookup_table.jsonl"),
-    ("observed", "observed.jsonl"),
-    ("http_diffs", "http_diffs.jsonl"),
-    ("scorecard", "scorecard.json"),
-    ("call_ledger", "call_ledger.jsonl"),
-    // The seed certificate is the run's own account of what seeding did —
-    // planned/materialized/failed per entry, with readback. It used to be
-    // registered with the runner pod's LOCAL path (never uploaded), so on k8s
-    // the one artifact that explains a seed-shaped divergence was unreadable
-    // the moment the pod died. It publishes like every other stream; the same
-    // prefix already carries the full lookup table, so this adds no new kind
-    // of egress.
-    ("seed_certificate", "seed-certificate.json"),
-];
-
 /// Where a run's replay artifacts are published so the dashboard can read them
 /// back AFTER the run. Compose/local: the orchestrator serves them from its own
 /// state dir, so the local path is enough. In-pod: the runner pod is ephemeral,
@@ -1540,6 +1519,7 @@ fn render_and_persist_lookup_table(
     Ok(table.entries.len())
 }
 
+/// Final stage (shared): score the run, report the verdict, register the
 /// replay artifacts (best-effort; absent files are skipped).
 fn score_and_register(
     root: &HarnessRoot,
@@ -1620,20 +1600,12 @@ fn score_and_register(
     // the run manifest index below. `observed` carries the replay-side
     // execution-graph nodes (`DejaRecord::GraphNode`) — no separate artifact.
     let mut index = serde_json::Map::new();
-    for (kind, filename) in REPLAY_STREAM_ARTIFACTS {
-        let path = match kind {
-            "lookup_table" => root.lookup_table_path(&run.run_id),
-            "observed" => root.observed_path(&run.run_id),
-            "http_diffs" => root.http_diff_path(&run.run_id),
-            "scorecard" => root.scorecard_path(&run.run_id),
-            "call_ledger" => root.call_ledger_path(&run.run_id),
-            "seed_certificate" => root.seed_certificate_path(&run.run_id),
-            _ => continue,
-        };
-        if let Some((uri, bytes)) = sink.publish(&run.run_id, filename, &path) {
-            ctx.artifact_uri(Some(recording_id), kind, &uri, Some(bytes));
+    for kind in crate::artifact_kinds::streamed() {
+        let path = kind.path(root, &run.run_id);
+        if let Some((uri, bytes)) = sink.publish(&run.run_id, kind.object, &path) {
+            ctx.artifact_uri(Some(recording_id), kind.name, &uri, Some(bytes));
             index.insert(
-                kind.to_owned(),
+                kind.name.to_owned(),
                 serde_json::json!({ "uri": uri, "bytes": bytes }),
             );
         }
@@ -1647,13 +1619,12 @@ fn score_and_register(
     // recording directly there, so this is belt-and-suspenders — but it keeps
     // both modes on one artifact contract.)
     if let Some(node_count) = record_graph_nodes {
-        let record_graph_path = root.record_graph_path(&run.run_id);
-        if let Some((uri, bytes)) =
-            sink.publish(&run.run_id, "record_graph.jsonl", &record_graph_path)
-        {
-            ctx.artifact_uri(Some(recording_id), "record_graph", &uri, Some(bytes));
+        let kind = &crate::artifact_kinds::RECORD_GRAPH;
+        let record_graph_path = kind.path(root, &run.run_id);
+        if let Some((uri, bytes)) = sink.publish(&run.run_id, kind.object, &record_graph_path) {
+            ctx.artifact_uri(Some(recording_id), kind.name, &uri, Some(bytes));
             index.insert(
-                "record_graph".to_owned(),
+                kind.name.to_owned(),
                 serde_json::json!({ "uri": uri, "bytes": bytes, "nodes": node_count }),
             );
         }
@@ -2612,7 +2583,7 @@ enum SeedReadbackStatus {
 
 impl SeedCertificate {
     const SCHEMA_VERSION: u16 = 1;
-    const KIND: &'static str = "seed_certificate";
+    const KIND: &'static str = crate::artifact_kinds::SEED_CERTIFICATE.name;
 
     fn new(recording_id: &str, run_id: &str, seed_db_enabled: bool) -> Self {
         Self {
@@ -5852,8 +5823,8 @@ mod tests {
         let mut kinds = std::collections::BTreeSet::new();
         // Both StoreCtx registration forms — the local path form and the
         // sink-published uri form — pass the kind as the 2nd arg. A call whose
-        // kind is a VARIABLE (the REPLAY_STREAM_ARTIFACTS loop) is skipped here;
-        // those kinds are added from the const below. (Markers are built with
+        // kind is a VARIABLE (the artifact-kind table's publish steps) is
+        // skipped here; those kinds are added from the table below. (Markers are built with
         // concat! so this scanner never matches its own source text.)
         for marker in [
             concat!("ctx", ".artifact("),
@@ -5874,8 +5845,12 @@ mod tests {
                 kinds.insert(after_quote[..end].to_owned());
             }
         }
-        // The stream artifacts are published from the const via a variable kind.
-        kinds.extend(REPLAY_STREAM_ARTIFACTS.iter().map(|(k, _)| (*k).to_owned()));
+        // The table's kinds are published through a variable kind.
+        kinds.extend(
+            crate::artifact_kinds::RUN_ARTIFACT_KINDS
+                .iter()
+                .map(|kind| kind.name.to_owned()),
+        );
         kinds
     }
 
