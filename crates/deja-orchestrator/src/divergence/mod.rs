@@ -4914,6 +4914,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 if let Some(correlation_id) = &obs.correlation_id {
                     tail_gap_correlations.insert(correlation_id.clone());
                 }
+            } else if obs.absorbed {
+                // A miss the request survived, wherever it lands, carried the
+                // correlation on a value the recording never held. Same
+                // classification as the `absorbed` arm below, so a novel subtree
+                // cannot turn it into a pass.
+                stats.bump_kind("NovelCallAbsorbed");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    *corr_absorbed.entry(correlation_id.clone()).or_insert(0) += 1;
+                }
+                *absorbed_sites.entry(call_site_label(obs)).or_insert(0) += 1;
             } else {
                 // Shown, not scored. A novel subtree is added work, at a coarser
                 // granularity than a novel call and of the same kind, so it is
@@ -13438,7 +13448,23 @@ mod tests {
             "a correlation that continued on a fabricated value is inconclusive: {}",
             card.verdict.reason
         );
+        assert!(
+            card.verdict.reason.contains("absorbed miss")
+                && card.verdict.reason.contains("db::novel"),
+            "the verdict names the site that absorbed it: {}",
+            card.verdict.reason
+        );
         assert!(card.counter_disagreements().is_empty());
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let row = rows
+            .iter()
+            .find(|row| row.method_name == "novel")
+            .expect("the absorbed call has a ledger row");
+        assert_eq!(
+            (row.kind.as_str(), row.blocking),
+            ("novel_absorbed", false),
+            "the row the viewer routes on agrees with the scorecard"
+        );
     }
 
     #[test]
