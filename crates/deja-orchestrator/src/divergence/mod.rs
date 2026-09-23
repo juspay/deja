@@ -13375,6 +13375,72 @@ mod tests {
         );
         assert!(outcome.alignment.is_none());
     }
+    /// A miss the request survived is an absorbed miss wherever it lands. Inside
+    /// a subtree the recording never had, it is still a call that returned a
+    /// value the recording never held, so the correlation cannot read passed.
+    #[test]
+    fn an_absorbed_miss_inside_a_novel_subtree_is_still_absorbed() {
+        let corr = "novel-absorbed";
+        let result = serde_json::json!({"result": "Ok"});
+        let mut novel = obs("db", Some(corr), false, None, None);
+        novel.method_name = "novel".to_owned();
+        novel.graph_node_id = Some(15);
+        novel.absorbed = true;
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "root",
+                    401,
+                    result.clone(),
+                )],
+                vec![
+                    graph_observed(corr, 14, 401, "root", serde_json::json!({}), result.clone()),
+                    novel,
+                ],
+                vec![http(corr, true, vec![])],
+                vec![graph_event(
+                    corr,
+                    401,
+                    4,
+                    "root",
+                    serde_json::json!({}),
+                    result,
+                )],
+            ),
+            vec![graph_span(4, corr, None, 0, "request")],
+            vec![
+                graph_span(14, corr, None, 0, "request"),
+                graph_span(15, corr, Some(14), 1, "new-subtree"),
+            ],
+        );
+        let card = detect(&artifacts);
+        let outcome = card
+            .per_correlation
+            .iter()
+            .find(|outcome| outcome.correlation_id == corr)
+            .expect("scored");
+        assert_eq!(
+            outcome.scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "the case under test is the graph tier's novel-subtree branch"
+        );
+        assert_eq!(
+            kind_count(&card, "db", "NovelSubtree") + kind_count(&card, "db", "NovelCallAbsorbed"),
+            1,
+            "one call, one classification"
+        );
+        assert_eq!(card.summary.absorbed_misses, 1);
+        assert_eq!(outcome.absorbed_misses, 1);
+        assert!(
+            !outcome.passed && outcome.inconclusive,
+            "a correlation that continued on a fabricated value is inconclusive: {}",
+            card.verdict.reason
+        );
+        assert!(card.counter_disagreements().is_empty());
+    }
+
     #[test]
     fn mixed_graph_and_flat_correlations_keep_weighted_accounting_independent() {
         let graph_corr = "mixed-graph";
