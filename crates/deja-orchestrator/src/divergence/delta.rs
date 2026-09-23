@@ -177,6 +177,17 @@ fn classify(tape_has: bool, m: &Side, y: &Side) -> Bucket {
     }
 }
 
+/// Whether a cached delta document is the one a request for `(y, m)` would
+/// compute now: the same two runs, built under the current rules. Both runs'
+/// trees are fixed once scored, so a current document never goes stale on
+/// its own; only a rule change retires it.
+pub fn cached_is_current(doc: &serde_json::Value, y: &str, m: &str, canon_version: u32) -> bool {
+    doc.get("y_run").and_then(|v| v.as_str()) == Some(y)
+        && doc.get("m_run").and_then(|v| v.as_str()) == Some(m)
+        && doc.get("canon_version").and_then(|v| v.as_u64()) == Some(u64::from(canon_version))
+        && doc.get("verdict").is_some()
+}
+
 /// Compare Y against M with the tape as ancestor.
 pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> {
     if m.canon_version != y.canon_version {
@@ -557,6 +568,25 @@ mod tests {
         let mut y = tree("y", vec![]);
         y.correlations = BTreeSet::new();
         assert!(three_way(&m, &y).is_err());
+    }
+
+    #[test]
+    fn a_cached_delta_is_current_only_for_its_own_runs_and_rules() {
+        let doc = serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}});
+        assert!(cached_is_current(&doc, "y", "m", CANON_VERSION));
+        assert!(
+            !cached_is_current(&doc, "y", "other", CANON_VERSION),
+            "a different baseline"
+        );
+        assert!(
+            !cached_is_current(&doc, "y", "m", CANON_VERSION + 1),
+            "a rule change retires it"
+        );
+        let pending = serde_json::json!({"unavailable": "baseline not scored"});
+        assert!(
+            !cached_is_current(&pending, "y", "m", CANON_VERSION),
+            "an unavailable answer is never cached as a delta"
+        );
     }
 
     #[test]

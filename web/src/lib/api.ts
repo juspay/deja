@@ -61,6 +61,10 @@ export type RunRow = {
   params: Partial<RunParams> & { [k: string]: unknown };
   state: string;
   verdict: "pass" | "fail" | "inconclusive" | null;
+  /** What the run changed relative to the baseline it was created against
+   *  (params.delta_against): pass, fail, or pending while the baseline is
+   *  still being scored. Absent for a run that names no baseline. */
+  delta_verdict?: "pass" | "fail" | "pending" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;

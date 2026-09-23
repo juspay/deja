@@ -1022,3 +1022,5 @@ main:has(.recintro) { max-width: 1440px; }
 .delta-baseline-note { border-left: 3px solid var(--purple); padding-left: var(--s3); margin: 0 0 var(--s3); }
 .delta-baseline-note b { color: var(--purple); }
 .delta-baseline-verdict { margin: calc(-1 * var(--s2)) 0 var(--s3); }
+.rl-result { display: inline-flex; gap: var(--s1); align-items: center; flex-wrap: wrap; }
+.chip.delta { font-size: var(--fs-11); }

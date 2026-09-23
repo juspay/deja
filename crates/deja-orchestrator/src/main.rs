@@ -693,6 +693,11 @@ async fn v1_ingest_run_event(
         if let Err(e) = apply_run_event(store, &run_id, &ev).await {
             eprintln!("deja-orchestrator: run-event store write failed for {run_id}: {e}");
         }
+        // A result landing is when a delta can be settled: this run's own,
+        // and those of the runs measured against it. Off the ingest path.
+        if matches!(ev, RunEvent::Result { .. }) {
+            tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
+        }
     }
     StatusCode::ACCEPTED.into_response()
 }
@@ -2032,6 +2037,7 @@ async fn v1_delta(
 ) -> Response {
     let unavailable = |why: String| json_ok(serde_json::json!({ "unavailable": why }));
     let y_params = run_params_for(&st, &id).await;
+    let declared = y_params.as_ref().and_then(|p| p.delta_against.clone());
     // The query names the baseline; without one, the run's own record does,
     // when the pipeline that created it said what to measure it against.
     let named = q
@@ -2040,7 +2046,7 @@ async fn v1_delta(
         .map(str::trim)
         .filter(|a| !a.is_empty())
         .map(str::to_owned)
-        .or_else(|| y_params.as_ref().and_then(|p| p.delta_against.clone()));
+        .or_else(|| declared.clone());
     let against = match named {
         None => {
             return unavailable(
@@ -2056,30 +2062,39 @@ async fn v1_delta(
     if *against == *id {
         return unavailable("a run measured against itself has no delta".to_owned());
     }
-    let m_params = run_params_for(&st, &against).await;
+    // The run's OWN delta — against the baseline it was created with — is
+    // cached beside its ledger and its verdict is written to the run row.
+    // Any other pairing is computed on the spot and kept nowhere.
+    let result = if declared.as_deref() == Some(&*against) {
+        delta_for_run(&st, &id, &against).await
+    } else {
+        delta_between(&st, &id, &against).await
+    };
+    match result {
+        Ok(body) => json_ok(body),
+        Err(why) => unavailable(why),
+    }
+}
+
+/// The delta of `y` against `m`: both trees, the three-way, and both sides'
+/// tape verdicts. `Err` says why there is none yet.
+async fn delta_between(st: &AppState, y_id: &str, m_id: &str) -> Result<serde_json::Value, String> {
+    let y_params = run_params_for(st, y_id).await;
+    let m_params = run_params_for(st, m_id).await;
     let tape = |p: &Option<deja_orchestrator::RunParams>| {
         p.as_ref()
             .and_then(|p| p.recording_group.clone().or_else(|| p.recording_id.clone()))
     };
     if let (Some(y_tape), Some(m_tape)) = (tape(&y_params), tape(&m_params)) {
         if y_tape != m_tape {
-            return unavailable(format!(
+            return Err(format!(
                 "the runs drove different tapes ({y_tape} and {m_tape}); a delta only holds between runs of one tape"
             ));
         }
     }
-    let y = match behaviour_tree_for(&st, &id).await {
-        Ok(t) => t,
-        Err(why) => return unavailable(why),
-    };
-    let m = match behaviour_tree_for(&st, &against).await {
-        Ok(t) => t,
-        Err(why) => return unavailable(why),
-    };
-    let delta = match divergence::delta::three_way(&m, &y) {
-        Ok(d) => d,
-        Err(why) => return unavailable(why),
-    };
+    let y = behaviour_tree_for(st, y_id).await?;
+    let m = behaviour_tree_for(st, m_id).await?;
+    let delta = divergence::delta::three_way(&m, &y)?;
     let verdict_of = |run: &str| -> serde_json::Value {
         confined(st.root.scorecard_path(run), &st.root.root.join("runs"))
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -2094,10 +2109,85 @@ async fn v1_delta(
     let mut body = serde_json::to_value(&delta).unwrap_or_default();
     body["tape"] = serde_json::json!(tape(&y_params).or_else(|| tape(&m_params)));
     body["sides"] = serde_json::json!({
-        "m": { "run": *against, "tape_verdict": verdict_of(&against), "candidate": candidate_of(&m_params) },
-        "y": { "run": *id, "tape_verdict": verdict_of(&id), "candidate": candidate_of(&y_params) },
+        "m": { "run": m_id, "tape_verdict": verdict_of(m_id), "candidate": candidate_of(&m_params) },
+        "y": { "run": y_id, "tape_verdict": verdict_of(y_id), "candidate": candidate_of(&y_params) },
     });
-    json_ok(body)
+    Ok(body)
+}
+
+/// The run's own delta, against the baseline named in its params: served
+/// from the cache beside its ledger when that holds the current answer,
+/// else computed, cached, and its verdict written to the run row. The cache
+/// is named off the confined ledger path, and read and written off the async
+/// worker, as the tree cache is.
+async fn delta_for_run(st: &AppState, y_id: &str, m_id: &str) -> Result<serde_json::Value, String> {
+    use divergence::behaviour_tree::CANON_VERSION;
+
+    let runs_dir = st.root.root.join("runs");
+    let cache = confined(st.root.call_ledger_path(y_id), &runs_dir)
+        .map(|ledger| ledger.with_extension("delta.json"));
+    if let Some(cache) = cache.clone() {
+        let (y, m) = (y_id.to_owned(), m_id.to_owned());
+        let cached = tokio::task::spawn_blocking(move || -> Option<serde_json::Value> {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&cache).ok()?).ok()?;
+            divergence::delta::cached_is_current(&doc, &y, &m, CANON_VERSION).then_some(doc)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(doc) = cached {
+            return Ok(doc);
+        }
+    }
+    let computed = delta_between(st, y_id, m_id).await;
+    // The row says pass, fail, or pending. Pending is written only once a
+    // computation was attempted and found nothing to compare yet, and is
+    // overwritten by the first real answer.
+    let verdict = match &computed {
+        Ok(body) => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "pending",
+        },
+        Err(_) => "pending",
+    };
+    if let Some(store) = &st.store {
+        if let Err(e) = store.set_delta_verdict(y_id, verdict).await {
+            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
+        }
+    }
+    if let (Ok(body), Some(cache)) = (&computed, cache) {
+        let text = body.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            divergence::behaviour_tree::write_atomic(&cache, text.as_bytes())
+        })
+        .await;
+    }
+    computed
+}
+
+/// Settle deltas when a run's result lands: the run's own, if it names a
+/// baseline, and the delta of every completed run that names THIS run as
+/// its baseline. Best-effort and off the request path; a delta that cannot
+/// be computed yet leaves the row at pending and is retried on the next
+/// result event or on the next view.
+async fn settle_deltas_for(st: AppState, run_id: String) {
+    if let Some(against) = run_params_for(&st, &run_id)
+        .await
+        .and_then(|p| p.delta_against)
+    {
+        let _ = delta_for_run(&st, &run_id, &against).await;
+    }
+    let Some(store) = st.store.clone() else {
+        return;
+    };
+    let Ok(dependents) = store.runs_measured_against(&run_id).await else {
+        return;
+    };
+    for dependent in dependents {
+        let _ = delta_for_run(&st, &dependent, &run_id).await;
+    }
 }
 
 /// The run's parameters: the live record on compose, the stored row on k8s.

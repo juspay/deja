@@ -355,6 +355,34 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
     }
 }
 
+/// Write `bytes` so that a concurrent reader sees either the previous file
+/// or the whole new one, never a prefix: the bytes go to a temporary sibling
+/// and are renamed onto `path`, which is atomic on POSIX. The sibling is
+/// removed if anything fails before the rename.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp-{}-{nanos}", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 impl BehaviourTree {
     /// One JSON object per line: the header, then every entry. The header
     /// says how many entries follow, so a reader can tell a whole file from a
@@ -406,31 +434,9 @@ impl BehaviourTree {
     }
 
     /// Write the tree so that a concurrent reader sees either the previous
-    /// file or the whole new one, never a prefix: the bytes go to a
-    /// temporary sibling and are renamed onto `path`, which is atomic on
-    /// POSIX. The sibling is removed if anything fails before the rename.
+    /// file or the whole new one, never a prefix.
     pub fn write_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::Write;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = path.with_extension(format!("tmp-{}-{nanos}", std::process::id()));
-        let written = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(self.to_jsonl().as_bytes())?;
-            file.sync_all()
-        })();
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        std::fs::rename(&tmp, path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
+        write_atomic(path, self.to_jsonl().as_bytes())
     }
 }
 
