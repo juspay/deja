@@ -6096,6 +6096,7 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
     let empty = || LookupTable {
         recording_id: String::new(),
         policy_version: 0,
+        event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: Vec::new(),
     };
     if !path.exists() {
@@ -6658,6 +6659,7 @@ mod tests {
             &LookupTable {
                 recording_id: "rec-ns".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
             },
         )
@@ -6741,6 +6743,7 @@ mod tests {
             &LookupTable {
                 recording_id: "rec-scope".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -6863,6 +6866,7 @@ mod tests {
             &LookupTable {
                 recording_id: recording_id.to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -7274,6 +7278,7 @@ mod tests {
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
             },
             observed,
@@ -8882,6 +8887,7 @@ mod tests {
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
             },
             observed,
@@ -10866,6 +10872,7 @@ mod tests {
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
             policy_version: deja::POLICY_VERSION,
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 seq_entry_method_res(
                     Some(corr),

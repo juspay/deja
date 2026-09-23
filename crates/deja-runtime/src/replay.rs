@@ -1078,6 +1078,12 @@ impl DejaHook for ReplayHook {
 pub struct LookupTable {
     pub recording_id: String,
     pub policy_version: u32,
+    /// The event schema the recording was captured under, read by the renderer
+    /// off the recording's own events. `None` from a renderer that predates
+    /// this field, or for a recording with no events; the loader treats either
+    /// as older than this build.
+    #[serde(default)]
+    pub event_schema_version: Option<u16>,
     pub entries: Vec<LookupEntry>,
 }
 
@@ -1837,6 +1843,39 @@ fn check_policy_version(table: LookupTable) -> std::io::Result<LookupTable> {
     ))
 }
 
+/// Refuse a recording captured under another event schema, naming both.
+///
+/// The schema decides what an argument's recorded image looks like, and the
+/// image is what its key hashes. Where two schemas encode a value differently —
+/// v10 marks a present `None` that v9 wrote as `null` — every such call misses,
+/// and the run presents as a regression in a candidate that changed nothing.
+/// Same reasoning, and same placement, as [`check_policy_version`]; this one is
+/// about the recording rather than the renderer.
+fn check_event_schema_version(table: LookupTable) -> std::io::Result<LookupTable> {
+    let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
+    let refusal = match table.event_schema_version {
+        Some(version) if version == current => return Ok(table),
+        Some(version) => format!(
+            "recording {} was captured under event schema v{version} but this build reads \
+             v{current}; re-record it with a build at v{current}.",
+            table.recording_id
+        ),
+        None => format!(
+            "lookup table for recording {} declares no event schema version, so it is \
+             treated as older than this build's v{current}: re-render it with an \
+             orchestrator at v{current}, or re-record it.",
+            table.recording_id
+        ),
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{refusal} Refusing at load rather than missing wherever the two schemas \
+             encode an argument differently, which would present as a candidate regression."
+        ),
+    ))
+}
+
 impl LookupTableSource for LocalFileLookupSource {
     fn load(&mut self) -> std::io::Result<LookupTable> {
         let bytes = std::fs::read(&self.path)?;
@@ -1857,7 +1896,7 @@ impl LookupTableSource for LocalFileLookupSource {
         // function. A compact, one-line table misleads the other way: its JSONL
         // attempt reports a missing `key`, which is why this error leads.
         let enveloped_error = match serde_json::from_str::<LookupTable>(text) {
-            Ok(table) => return check_policy_version(table),
+            Ok(table) => return check_policy_version(table).and_then(check_event_schema_version),
             Err(error) => error,
         };
         let entries = text
@@ -1882,7 +1921,7 @@ impl LookupTableSource for LocalFileLookupSource {
                 )
             })?;
         // A bare JSONL stream carries no envelope and therefore no declared
-        // version, so it is taken at the current version rather than refused.
+        // versions, so it is taken at the current ones rather than refused.
         //
         // That is sound only while nothing emits JSONL, which is a property of
         // the RENDERER rather than of this function: `render_lookup_table`
@@ -1894,6 +1933,7 @@ impl LookupTableSource for LocalFileLookupSource {
         Ok(LookupTable {
             recording_id: String::new(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         })
     }
@@ -4085,6 +4125,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry_with(
                     None,
@@ -4572,7 +4613,8 @@ mod tests {
         let mut ok = std::fs::File::create(&ok_path).expect("create");
         write!(
             ok,
-            r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"entries":[]}}"#
+            r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{},"entries":[]}}"#,
+            crate::CURRENT_EVENT_SCHEMA_VERSION
         )
         .expect("write");
         LocalFileLookupSource::new(&ok_path)
@@ -4679,6 +4721,7 @@ mod tests {
         LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
     }
@@ -4988,6 +5031,7 @@ mod tests {
         let (hook, handle) = hook_over(LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         });
         assert_eq!(
@@ -5081,6 +5125,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         };
         let observed = InMemoryObservedSink::new();
@@ -5180,6 +5225,7 @@ mod tests {
         LookupTable {
             recording_id: "rec-boundary".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
     }
@@ -5817,6 +5863,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry_with(
                     None,
@@ -5871,6 +5918,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![entry_with(
                 None,
                 explicit("find_pi"),
@@ -5910,6 +5958,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();
@@ -6111,6 +6160,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let hook =
@@ -6144,6 +6194,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let hook =
@@ -6199,6 +6250,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let inner =
@@ -6232,6 +6284,7 @@ mod tests {
             VecSource(Some(LookupTable {
                 recording_id: "r".to_owned(),
                 policy_version: POLICY_VERSION,
+                event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
             })),
             InMemoryObservedSink::new(),
@@ -8255,6 +8308,7 @@ redis\tcurrency\tusd
         let table = LookupTable {
             recording_id: "rec-shadow".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![entry_with(
                 None,
                 Locus::Unlocated,
@@ -8311,6 +8365,7 @@ redis\tcurrency\tusd
         let table = LookupTable {
             recording_id: "rec-novel".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();

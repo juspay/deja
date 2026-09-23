@@ -94,6 +94,10 @@ pub fn render_lookup_table(
     let mut entries = Vec::new();
     let (mut dbg_ok, mut dbg_skip): (u64, u64) = (0, 0);
     let mut dbg_first_err: Option<String> = None;
+    // Every schema the recording's events were captured under. The candidate
+    // refuses a table from another schema, so this is read off the events
+    // rather than assumed.
+    let mut schemas: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
 
     // Streams: `EntireSession` on a live recording is 171,234 events off a
     // 361 MB tape, so the renderer never holds the tape in memory.
@@ -105,6 +109,7 @@ pub fn render_lookup_table(
         let event = match item {
             TapeItem::Event(event) => {
                 dbg_ok += 1;
+                schemas.insert(event.event_schema_version);
                 *event
             }
             TapeItem::Malformed { error, excerpt, .. } => {
@@ -179,9 +184,22 @@ pub fn render_lookup_table(
             ),
         ));
     }
+    // A recording captured across builds of two schemas has no single encoding
+    // the candidate could match against, so it renders nothing.
+    if schemas.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "recording {} mixes event schemas {schemas:?}; its argument images were \
+                 encoded two ways, so no candidate matches all of them — re-record it",
+                recording.recording_id()
+            ),
+        ));
+    }
     Ok(LookupTable {
         recording_id: recording_id.to_owned(),
         policy_version,
+        event_schema_version: schemas.first().copied(),
         entries,
     })
 }
@@ -493,6 +511,34 @@ mod tests {
         assert!(
             err.to_string().contains("INCOMPLETE"),
             "error names the coverage hole: {err}"
+        );
+    }
+
+    /// The table declares the schema its recording was captured under, read off
+    /// the events rather than this build's own, so the candidate can refuse a
+    /// recording from another schema. A recording that mixes two renders
+    /// nothing.
+    #[test]
+    fn the_table_declares_the_schema_its_recording_was_captured_under() {
+        let current = deja::CURRENT_EVENT_SCHEMA_VERSION;
+        let older = current - 1;
+        let mut old = event("redis", 1, serde_json::Value::Null);
+        old["event_schema_version"] = serde_json::json!(older);
+
+        let (_dir, recording) = write_events(std::slice::from_ref(&old));
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        assert!(!table.entries.is_empty(), "the event rendered at all");
+        assert_eq!(table.event_schema_version, Some(older));
+
+        let (_mixed_dir, mixed) = write_events(&[old, event("redis", 2, serde_json::Value::Null)]);
+        let message = render_lookup_table(&mixed, "rec-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("mixes event schemas")
+                && message.contains(&older.to_string())
+                && message.contains(&current.to_string()),
+            "the refusal names both schemas: {message}"
         );
     }
 
