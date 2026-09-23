@@ -481,20 +481,16 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         },
     };
 
-    // The round-trip comparator: the recorder rebuilds each value it records
-    // through the site's reconstruct closure and compares the two. `None` for a
-    // record-only site, which declares no replay codec.
+    // The round-trip check: the recorder rebuilds each value it records
+    // through the site's reconstruct closure and compares the two, when the
+    // type offers a way to compare. A record-only site declares no codec.
     let compare_closure: TokenStream = match &capture_mode {
         CaptureMode::Debug => quote! {
-            ::std::option::Option::None::<
+            ::deja::__private::RoundTrip::<
                 fn(&#recon_ty, &#recon_ty) -> ::deja::__private::Comparison
-            >
+            >::RecordOnly
         },
-        _ => quote! {
-            ::std::option::Option::Some(
-                |__deja_a: &#recon_ty, __deja_b: &#recon_ty| ::deja::__private::compare!(__deja_a, __deja_b)
-            )
-        },
+        _ => quote! { ::deja::__private::round_trip!(#recon_ty) },
     };
 
     // ONE closure answers both halves of the lookup. The four capture-mode

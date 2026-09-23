@@ -11,25 +11,31 @@
 //! has to be of VALUES, and the strongest one available is chosen per type by
 //! autoref specialisation at the call site ([`compare!`](crate::compare)):
 //!
-//! 1. `PartialEq` — the type's own equality.
+//! 1. `PartialEq` — the type's own equality, which can see fields serialisation
+//!    does not carry.
 //! 2. `Serialize` — the serde data model, which is finer than JSON: it keeps
 //!    `Some` apart from its contents, a unit apart from `None`, a newtype apart
 //!    from its field and every integer width apart. [`fingerprint`] renders that
-//!    model exactly, with unordered collections sorted as [`crate::canonical`]
-//!    sorts them, so two equal values always render alike. This is the tier a
-//!    generic boundary reaches, since its codec already requires `Serialize`.
+//!    model exactly, maps in key order and sets sorted, so two equal values
+//!    always render alike. This is the tier a generic boundary reaches, since
+//!    its codec already requires `Serialize` — and it cannot see what
+//!    serialisation drops (`#[serde(skip)]`, a value that serialises masked).
 //! 3. A `Result` whose error offers neither — an `error_stack::Report`, which
 //!    most fallible boundaries return — compared by its `Ok` arm's serde image.
 //!    The recorder only checks values that are not errors, so the `Ok` arm is
 //!    the whole of what it compares.
 //! 4. None of these — the check cannot be made and says so.
 //!
+//! Which tier a type reaches is known where the type is concrete, so
+//! [`round_trip!`](crate::round_trip) decides it there: a type with nothing to
+//! compare by is never rebuilt, and pays nothing for the check.
+//!
 //! `Debug` is deliberately not a tier: a `HashMap` renders in hash order, so a
 //! difference would not mean the value changed.
 
 use serde::ser::{self, Serialize, Serializer};
 
-use crate::canonical::{is_unordered_map, is_unordered_sequence};
+use crate::canonical::is_unordered_sequence;
 
 /// The outcome of comparing a value with its rebuilt copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,34 +57,66 @@ impl Comparison {
     }
 }
 
-/// Receiver for the autoref-specialised comparison. Use [`compare!`](crate::compare).
-pub struct Compare<'a, T: ?Sized>(pub &'a T, pub &'a T);
+/// Receiver for the autoref-specialised comparison: a pair of values to
+/// compare, or none, which asks only whether the type can be compared at all.
+/// Use [`compare!`](crate::compare) and [`round_trip!`](crate::round_trip).
+///
+/// Each tier is implemented one reference level below the one above it, and
+/// both macros call through four references, so the first applicable tier in
+/// the order the module documents is the one method lookup reaches first.
+pub struct Compare<'a, T: ?Sized>(pub Option<(&'a T, &'a T)>);
+
+impl<T: ?Sized> Compare<'_, T> {
+    /// The pair-less receiver [`round_trip!`](crate::round_trip) probes with.
+    #[must_use]
+    pub const fn probe() -> Self {
+        Self(None)
+    }
+}
 
 pub trait CompareByEq {
+    fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
 impl<T: PartialEq + ?Sized> CompareByEq for &&&Compare<'_, T> {
+    fn deja_comparable(&self) -> bool {
+        true
+    }
     fn deja_compare(&self) -> Comparison {
-        Comparison::from_equal(self.0 == self.1)
+        match self.0 {
+            Some((a, b)) => Comparison::from_equal(a == b),
+            None => Comparison::Incomparable,
+        }
     }
 }
 
 pub trait CompareBySerde {
+    fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
 impl<T: Serialize + ?Sized> CompareBySerde for &&Compare<'_, T> {
+    fn deja_comparable(&self) -> bool {
+        true
+    }
     fn deja_compare(&self) -> Comparison {
-        by_fingerprint(self.0, self.1)
+        match self.0 {
+            Some((a, b)) => by_fingerprint(a, b),
+            None => Comparison::Incomparable,
+        }
     }
 }
 
 pub trait CompareOkArm {
+    fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
 impl<T: Serialize, E> CompareOkArm for &Compare<'_, Result<T, E>> {
+    fn deja_comparable(&self) -> bool {
+        true
+    }
     fn deja_compare(&self) -> Comparison {
-        match (self.0, self.1) {
-            (Ok(a), Ok(b)) => by_fingerprint(a, b),
+        match self.0 {
+            Some((Ok(a), Ok(b))) => by_fingerprint(a, b),
             _ => Comparison::Incomparable,
         }
     }
@@ -92,9 +130,13 @@ fn by_fingerprint<T: Serialize + ?Sized>(a: &T, b: &T) -> Comparison {
 }
 
 pub trait CompareNothing {
+    fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
 impl<T: ?Sized> CompareNothing for Compare<'_, T> {
+    fn deja_comparable(&self) -> bool {
+        false
+    }
     fn deja_compare(&self) -> Comparison {
         Comparison::Incomparable
     }
@@ -108,7 +150,35 @@ macro_rules! compare {
         use $crate::round_trip::{
             CompareByEq as _, CompareBySerde as _, CompareNothing as _, CompareOkArm as _,
         };
-        (&&&$crate::round_trip::Compare($a, $b)).deja_compare()
+        (&&&&$crate::round_trip::Compare(::core::option::Option::Some(($a, $b)))).deja_compare()
+    }};
+}
+
+/// What a site offers the recorder's round-trip check, decided where the
+/// site's type is concrete.
+pub enum RoundTrip<S> {
+    /// The site declares no replay codec: its capture is not meant to rebuild.
+    RecordOnly,
+    /// A codec, but a type with nothing to compare by: rebuilding would cost a
+    /// decode and learn nothing, so the check is skipped and says so.
+    Unverifiable,
+    /// Rebuild the recorded value and compare it with this.
+    Check(S),
+}
+
+/// The [`RoundTrip`] for a site returning `$ty` that declares a replay codec.
+#[macro_export]
+macro_rules! round_trip {
+    ($ty:ty) => {{
+        #[allow(unused_imports)]
+        use $crate::round_trip::{
+            CompareByEq as _, CompareBySerde as _, CompareNothing as _, CompareOkArm as _,
+        };
+        if (&&&&$crate::round_trip::Compare::<$ty>::probe()).deja_comparable() {
+            $crate::round_trip::RoundTrip::Check(|a: &$ty, b: &$ty| $crate::compare!(a, b))
+        } else {
+            $crate::round_trip::RoundTrip::Unverifiable
+        }
     }};
 }
 
@@ -138,19 +208,37 @@ fn join(tag: &str, mut parts: Vec<String>, unordered: bool) -> String {
     out
 }
 
+/// Carries whether the sequence about to be serialised is a set. A map needs
+/// no such bit: its entries are keyed, so every map renders in key order and
+/// equal maps render alike behind any wrapper — `Box`, `Arc`, `Secret`,
+/// `#[serde(flatten)]`, `serialize_with` — where a type name cannot be seen.
 struct Fingerprint {
     unordered: bool,
-    unordered_map: bool,
 }
 
 impl Fingerprint {
     fn for_type<T: ?Sized>() -> Self {
-        let name = std::any::type_name::<T>();
         Self {
-            unordered: is_unordered_sequence(name),
-            unordered_map: is_unordered_map(name),
+            unordered: is_set_behind_wrappers(std::any::type_name::<T>()),
         }
     }
+}
+
+/// A set, seen through the pointers that serialise as their contents. Unlike
+/// a map, a sequence cannot be sorted blind — a `Vec`'s order is its value —
+/// so a set behind any other wrapper still renders in its own order.
+fn is_set_behind_wrappers(type_name: &str) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "alloc::boxed::Box<",
+        "alloc::sync::Arc<",
+        "alloc::rc::Rc<",
+        "alloc::borrow::Cow<",
+    ];
+    let mut name = type_name.trim_start_matches('&');
+    while let Some(inner) = WRAPPERS.iter().find_map(|w| name.strip_prefix(w)) {
+        name = inner.trim_start_matches('&');
+    }
+    is_unordered_sequence(name)
 }
 
 type Error = serde_json::Error;
@@ -283,7 +371,7 @@ impl Serializer for Fingerprint {
         ))
     }
     fn serialize_map(self, _len: Option<usize>) -> Result<Parts, Error> {
-        Ok(Parts::new("m".to_owned(), self.unordered_map))
+        Ok(Parts::new("m".to_owned(), true))
     }
     fn serialize_struct(self, name: &'static str, _len: usize) -> Result<Parts, Error> {
         Ok(Parts::new(format!("st{}", part(name)), false))
@@ -386,10 +474,7 @@ impl ser::SerializeMap for Parts {
     type Ok = String;
     type Error = Error;
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
-        self.pending_key = Some(key.serialize(Fingerprint {
-            unordered: false,
-            unordered_map: false,
-        })?);
+        self.pending_key = Some(key.serialize(Fingerprint { unordered: false })?);
         Ok(())
     }
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
@@ -530,6 +615,94 @@ mod tests {
         assert_eq!(
             fallible::<u8>(&Err(Neither), &Err(Neither)),
             Comparison::Incomparable
+        );
+    }
+
+    /// A type with both is compared by its own equality, not by its serde
+    /// image: `PartialEq` is the stronger statement, since it can see fields
+    /// serialisation does not carry.
+    #[test]
+    fn partial_eq_outranks_the_serde_image() {
+        #[derive(serde::Serialize)]
+        struct AlwaysEqual(u8);
+        impl PartialEq for AlwaysEqual {
+            fn eq(&self, _: &Self) -> bool {
+                true
+            }
+        }
+        assert_eq!(
+            crate::compare!(&AlwaysEqual(1), &AlwaysEqual(2)),
+            Comparison::Same,
+            "PartialEq decided, although the serde images differ"
+        );
+        assert_eq!(crate::compare!(&-0.0_f64, &0.0_f64), Comparison::Same);
+    }
+
+    fn checks<S>(round_trip: RoundTrip<S>) -> bool {
+        matches!(round_trip, RoundTrip::Check(_))
+    }
+
+    /// Whether a type can be compared is decided where it is concrete, so a
+    /// site with nothing to compare by never pays for a rebuild.
+    #[test]
+    fn a_type_with_nothing_to_compare_by_is_never_rebuilt() {
+        #[derive(PartialEq)]
+        struct EqOnly;
+        struct Neither;
+        fn generic<T: Serialize>() -> bool {
+            checks(crate::round_trip!(T))
+        }
+        fn unbounded<T>() -> bool {
+            checks(crate::round_trip!(T))
+        }
+        assert!(checks(crate::round_trip!(EqOnly)));
+        assert!(checks(crate::round_trip!(Result<u8, Neither>)));
+        assert!(generic::<Neither2>());
+        assert!(!checks(crate::round_trip!(Neither)));
+        assert!(!checks(crate::round_trip!(Result<Neither, u8>)));
+        assert!(!unbounded::<u8>(), "an unbounded generic offers nothing");
+
+        #[derive(serde::Serialize)]
+        struct Neither2;
+    }
+
+    /// A map renders in key order behind any wrapper, and a set behind the
+    /// pointers that serialise as their contents, so two equal values can
+    /// never render differently and fail a debug build for nothing.
+    #[test]
+    fn equal_values_render_alike_behind_wrappers() {
+        #[derive(serde::Serialize)]
+        struct Flat {
+            #[serde(flatten)]
+            extra: HashMap<String, u32>,
+        }
+        let build = |forward: bool| -> (HashMap<String, u32>, HashSet<u32>) {
+            let mut order: Vec<u32> = (0..64).collect();
+            if !forward {
+                order.reverse();
+            }
+            (
+                order.iter().map(|i| (format!("k{i}"), *i)).collect(),
+                order.iter().copied().collect(),
+            )
+        };
+        let (map_a, set_a) = build(true);
+        let (map_b, set_b) = build(false);
+        assert_eq!(
+            fingerprint(&Box::new(map_a.clone())),
+            fingerprint(&Box::new(map_b.clone()))
+        );
+        assert_eq!(
+            fingerprint(&Flat { extra: map_a }),
+            fingerprint(&Flat { extra: map_b })
+        );
+        assert_eq!(
+            fingerprint(&Box::new(set_a.clone())),
+            fingerprint(&Box::new(set_b.clone()))
+        );
+        assert_eq!(
+            fingerprint(&Some(Box::new(set_a))),
+            fingerprint(&Some(Box::new(set_b)))
         );
     }
 }

@@ -703,21 +703,17 @@ fn generate_sync_method(
     }
 }
 
-/// The round-trip comparator handed to the dispatch seam, which compares each
-/// recorded value with its rebuilt copy. `None` for a record-only delegate,
-/// which declares no replay codec.
+/// The round-trip check handed to the dispatch seam, which compares each
+/// recorded value with its rebuilt copy when the type offers a way to. A
+/// record-only delegate declares no replay codec.
 fn compare_closure(enable_replay: bool, value_type: &TokenStream) -> TokenStream {
     if enable_replay {
-        quote! {
-            ::core::option::Option::Some(
-                |__deja_a: &#value_type, __deja_b: &#value_type| ::deja_runtime::compare!(__deja_a, __deja_b)
-            )
-        }
+        quote! { ::deja_runtime::round_trip!(#value_type) }
     } else {
         quote! {
-            ::core::option::Option::None::<
+            ::deja_runtime::round_trip::RoundTrip::<
                 fn(&#value_type, &#value_type) -> ::deja_runtime::round_trip::Comparison
-            >
+            >::RecordOnly
         }
     }
 }

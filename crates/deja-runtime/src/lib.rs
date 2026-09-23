@@ -568,7 +568,11 @@ pub enum Provenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Fidelity {
-    /// Rebuilt, and equal to the value captured.
+    /// Rebuilt, and equal to the value captured by the strongest comparison its
+    /// type offers (see [`round_trip`]): its own `PartialEq`, or else its serde
+    /// image. The second cannot see what serialisation does not carry — a
+    /// `#[serde(skip)]` field, a value that serialises masked — so for such a
+    /// type this says the serialised form survived, not the whole value.
     Lossless,
     /// Result round-trips structurally but not losslessly.
     Structured,
@@ -579,9 +583,13 @@ pub enum Fidelity {
     /// service something the recording never saw.
     Lossy,
     /// Not checked: an `Execute` site, an error arm, or a type that offers
-    /// neither `PartialEq` nor `Serialize` to compare by.
+    /// nothing to compare by.
     #[default]
     Unverified,
+    /// A verdict this build does not know, written by a newer one. Read so an
+    /// event is never dropped for it; never written.
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -4251,7 +4259,7 @@ pub fn dispatch<T, A, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4263,7 +4271,7 @@ where
 {
     match runtime_mode() {
         RuntimeMode::Disabled | RuntimeMode::Record => {
-            record_only_path(obs, args, run, reconstruct, extract, compare)
+            record_only_path(obs, args, run, reconstruct, extract, check)
         }
         RuntimeMode::Replay => {
             // Bind the structured args ONCE in replay mode. The same value feeds
@@ -4328,14 +4336,17 @@ impl RoundTripSite {
 
 /// Rebuild the value this call just recorded, through the site's own
 /// `reconstruct`, and compare it with the original — the property replay
-/// depends on and nothing else checks. `compare` is `None` when the site
-/// declares no replay codec.
+/// depends on and nothing else checks.
+///
+/// The rebuild reads the capture back from its JSON TEXT, as replay reads it
+/// from the tape: rebuilding from the in-memory value would hold, for example,
+/// an `f64` that the text form does not reproduce.
 fn round_trip_fidelity<T, C, S>(
     site: RoundTripSite,
     out: &T,
     output: &RecordedOutput,
     reconstruct: C,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> Fidelity
 where
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
@@ -4344,10 +4355,17 @@ where
     if !site.substitutes || output.is_error {
         return Fidelity::Unverified;
     }
-    let Some(compare) = compare else {
+    let compare = match check {
+        round_trip::RoundTrip::RecordOnly => return Fidelity::Opaque,
+        round_trip::RoundTrip::Unverifiable => return Fidelity::Unverified,
+        round_trip::RoundTrip::Check(compare) => compare,
+    };
+    let Ok(as_read) = serde_json::to_string(&output.result)
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text))
+    else {
         return Fidelity::Opaque;
     };
-    match reconstruct(ReconstructInput::Hit(output.result.clone())) {
+    match reconstruct(ReconstructInput::Hit(as_read)) {
         Reconstructed::Value(rebuilt) => match compare(out, &rebuilt) {
             round_trip::Comparison::Same => Fidelity::Lossless,
             round_trip::Comparison::Different => Fidelity::Lossy,
@@ -4359,19 +4377,24 @@ where
     }
 }
 
-/// Capture `out`, measure its round trip, and hand both to `emit`, all inside
-/// the recorder's panic firewall.
+/// Capture `out`, measure its round trip, and hand both to `emit`, inside the
+/// recorder's panic firewall.
+///
+/// The measurement has a firewall of its own: a `reconstruct` or comparison
+/// that panics is a site that does not rebuild, so it reads as opaque and the
+/// event is still written, rather than taking the event with it.
 ///
 /// A site that declares a codec and does not round-trip through it is a codec
-/// bug. A debug build — every test run — panics on it, outside the firewall so
-/// the test fails. A release recorder only stamps it on the event: recording
+/// bug. A debug build panics on it, outside the firewall, so every test that
+/// records through it fails; that includes a debug-built service with
+/// recording on. A release recorder only stamps it on the event: recording
 /// never fails the service.
 fn finish_round_tripped<T, R, O, C, S>(
     site: RoundTripSite,
     out: &T,
     extract: R,
     reconstruct: C,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
     emit: impl FnOnce(RecordedOutput, Fidelity),
 ) where
     R: FnOnce(&T) -> O,
@@ -4379,16 +4402,19 @@ fn finish_round_tripped<T, R, O, C, S>(
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
-    let declares_codec = compare.is_some();
+    let checks = matches!(check, round_trip::RoundTrip::Check(_));
     let fidelity = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let output = extract(out).into();
-        let fidelity = round_trip_fidelity(site, out, &output, reconstruct, compare);
+        let fidelity = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            round_trip_fidelity(site, out, &output, reconstruct, check)
+        }))
+        .unwrap_or(Fidelity::Opaque);
         emit(output, fidelity);
         fidelity
     }))
     .ok();
     if cfg!(debug_assertions)
-        && declares_codec
+        && checks
         && matches!(fidelity, Some(Fidelity::Lossy | Fidelity::Opaque))
     {
         panic!(
@@ -4412,7 +4438,7 @@ fn record_only_path<T, A, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4438,7 +4464,7 @@ where
             &out,
             &extract,
             reconstruct,
-            compare,
+            check,
             |output, fidelity| {
                 event
                     .with_fidelity(fidelity)
@@ -4455,7 +4481,7 @@ async fn record_only_path_async<T, A, Fut, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4482,7 +4508,7 @@ where
             &out,
             &extract,
             reconstruct,
-            compare,
+            check,
             |output, fidelity| {
                 event
                     .with_fidelity(fidelity)
@@ -4511,7 +4537,7 @@ pub async fn dispatch_async<T, A, Fut, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4524,7 +4550,7 @@ where
 {
     match runtime_mode() {
         RuntimeMode::Disabled | RuntimeMode::Record => {
-            record_only_path_async(obs, args, run, reconstruct, extract, compare).await
+            record_only_path_async(obs, args, run, reconstruct, extract, check).await
         }
         RuntimeMode::Replay => {
             let boundary_args: serde_json::Value = args();
@@ -4614,7 +4640,7 @@ pub fn dispatch_with_hook<T, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     F: FnOnce() -> T,
@@ -4630,7 +4656,7 @@ where
         // — the per-request gate lives here, never in process_mode.
         RuntimeMode::Record => {
             if obs.hook.capture_verdict().should_capture() {
-                delegate_record_path(obs, args, run, reconstruct, extract, compare)
+                delegate_record_path(obs, args, run, reconstruct, extract, check)
             } else {
                 run()
             }
@@ -4700,7 +4726,7 @@ pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     Fut: Future<Output = T>,
@@ -4715,7 +4741,7 @@ where
         // process_mode ROUTES; capture_verdict GATES the emit (see the sync path).
         RuntimeMode::Record => {
             if obs.hook.capture_verdict().should_capture() {
-                delegate_record_path_async(obs, args, run, reconstruct, extract, compare).await
+                delegate_record_path_async(obs, args, run, reconstruct, extract, check).await
             } else {
                 run().await
             }
@@ -4780,7 +4806,7 @@ fn delegate_record_path<T, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     F: FnOnce() -> T,
@@ -4811,7 +4837,7 @@ where
             &out,
             &extract,
             reconstruct,
-            compare,
+            check,
             |output, fidelity| {
                 builder
                     .with_fidelity(fidelity)
@@ -4828,7 +4854,7 @@ async fn delegate_record_path_async<T, Fut, F, C, R, O, S>(
     run: F,
     reconstruct: C,
     extract: R,
-    compare: Option<S>,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     Fut: std::future::Future<Output = T>,
@@ -4860,7 +4886,7 @@ where
             &out,
             &extract,
             reconstruct,
-            compare,
+            check,
             |output, fidelity| {
                 builder
                     .with_fidelity(fidelity)
@@ -5249,8 +5275,8 @@ mod tests {
     use std::panic::Location;
 
     /// The round-trip comparator for a test about routing, not codecs.
-    fn unchecked<T>() -> Option<fn(&T, &T) -> crate::round_trip::Comparison> {
-        None
+    fn unchecked<T>() -> crate::round_trip::RoundTrip<fn(&T, &T) -> crate::round_trip::Comparison> {
+        crate::round_trip::RoundTrip::Unverifiable
     }
 
     // -----------------------------------------------------------------------
@@ -5890,6 +5916,20 @@ mod tests {
         assert!(
             round_wire.get("fidelity").is_none(),
             "the Rust field name is not a wire alias"
+        );
+    }
+
+    /// A verdict from a newer build reads as `Unknown` rather than failing the
+    /// event, so the next verdict added never drops a tape's events on a
+    /// reader that predates it.
+    #[test]
+    fn a_fidelity_this_build_does_not_know_still_reads() {
+        let unknown: Fidelity =
+            serde_json::from_value(serde_json::json!("a_verdict_from_the_future")).expect("reads");
+        assert_eq!(unknown, Fidelity::Unknown);
+        assert_eq!(
+            serde_json::from_value::<Fidelity>(serde_json::json!("lossy")).expect("reads"),
+            Fidelity::Lossy
         );
     }
 
