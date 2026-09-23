@@ -205,6 +205,60 @@ macro_rules! compare {
     }};
 }
 
+/// The largest capture, as JSON text, the recorder rebuilds and compares.
+///
+/// The check runs inside the recording service, on every recorded call, and
+/// the costliest captures are the largest: a connector constraint graph is
+/// 140–290 KB and is read many times per request. Above this the capture is
+/// recorded `unverified`, and serialising it for the check stops here.
+pub const MAX_CHECKED_BYTES: usize = 64 * 1024;
+
+/// A text buffer that refuses to grow past a limit, and says whether it was
+/// the limit that stopped a write.
+pub struct BoundedText {
+    bytes: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl BoundedText {
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            overflowed: false,
+        }
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
+impl std::io::Write for BoundedText {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len() + data.len() > self.limit {
+            self.overflowed = true;
+            return Err(std::io::Error::other(
+                "capture exceeds the round-trip limit",
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// What a site offers the recorder's round-trip check, decided where the
 /// site's type is concrete.
 pub enum RoundTrip<S> {
@@ -836,32 +890,35 @@ mod tests {
         );
     }
 
-    /// A set the fingerprint cannot see — behind a wrapper that serialises
-    /// through its own `Serialize` — renders in iteration order. Two equal ones
-    /// must not read as different, so a difference in nothing but sequence
-    /// order is not called one; a difference in content still is.
+    /// A wrapper that serialises through its own `Serialize` hides whether its
+    /// sequence is a set, so equal sets behind it can render in two orders. A
+    /// difference in nothing but sequence order is therefore not called one;
+    /// a difference in content still is. `Vec`-backed so the two orders are
+    /// certain rather than left to a hasher.
     #[test]
     fn a_difference_in_nothing_but_order_is_not_called_one() {
-        struct Delegating(HashSet<u32>);
+        struct Delegating(Vec<u32>);
         impl Serialize for Delegating {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 serializer.collect_seq(self.0.iter())
             }
         }
-        let forward = Delegating((0..64).collect());
-        let backward = Delegating((0..64).rev().collect());
+        let forward = Delegating(vec![1, 2, 3]);
+        let backward = Delegating(vec![3, 2, 1]);
         assert_ne!(
-            crate::compare!(&forward, &backward),
-            Comparison::Different,
-            "equal sets behind a delegating wrapper"
+            fingerprint(&forward),
+            fingerprint(&backward),
+            "precondition: the two render differently, so the order-blind retry is reached"
         );
         assert_eq!(
-            crate::compare!(
-                &Delegating((0..64).collect()),
-                &Delegating((1..65).collect())
-            ),
+            crate::compare!(&forward, &backward),
+            Comparison::Incomparable,
+            "a difference in nothing but order is not called one"
+        );
+        assert_eq!(
+            crate::compare!(&Delegating(vec![1, 2, 3]), &Delegating(vec![1, 2, 4])),
             Comparison::Different,
-            "a set that lost a member is still different"
+            "a difference in content still is"
         );
     }
 

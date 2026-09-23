@@ -4340,7 +4340,9 @@ impl RoundTripSite {
 ///
 /// The rebuild reads the capture back from its JSON TEXT, as replay reads it
 /// from the tape: rebuilding from the in-memory value would hold, for example,
-/// an `f64` that the text form does not reproduce.
+/// an `f64` that the text form does not reproduce. A capture whose text runs
+/// past [`round_trip::MAX_CHECKED_BYTES`] is not checked: the serialisation
+/// stops there, so the check's cost on the recording path is bounded.
 fn round_trip_fidelity<T, C, S>(
     site: RoundTripSite,
     out: &T,
@@ -4360,9 +4362,15 @@ where
         round_trip::RoundTrip::Unverifiable => return Fidelity::Unverified,
         round_trip::RoundTrip::Check(compare) => compare,
     };
-    let Ok(as_read) = serde_json::to_string(&output.result)
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text))
-    else {
+    let mut text = round_trip::BoundedText::new(round_trip::MAX_CHECKED_BYTES);
+    if serde_json::to_writer(&mut text, &output.result).is_err() {
+        return if text.overflowed() {
+            Fidelity::Unverified
+        } else {
+            Fidelity::Opaque
+        };
+    }
+    let Ok(as_read) = serde_json::from_slice::<serde_json::Value>(text.bytes()) else {
         return Fidelity::Opaque;
     };
     match reconstruct(ReconstructInput::Hit(as_read)) {

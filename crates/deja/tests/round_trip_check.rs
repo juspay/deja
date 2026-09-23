@@ -116,6 +116,82 @@ fn delegating() -> Delegating {
     Delegating((0..64).collect())
 }
 
+/// A capture larger than the check's limit, from a codec that counts rebuilds.
+static LARGE_REBUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct LargeCodec;
+
+impl ReplayCodec for LargeCodec {
+    type Value = String;
+    fn capture(value: &String) -> (serde_json::Value, bool) {
+        (serde_json::json!(value), false)
+    }
+    fn reconstruct(recorded: serde_json::Value) -> Option<String> {
+        LARGE_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        recorded.as_str().map(str::to_owned)
+    }
+}
+
+#[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "large", codec = LargeCodec)]
+fn large(len: usize) -> String {
+    "x".repeat(len)
+}
+
+/// A sequence behind a wrapper that serialises through its own `Serialize`,
+/// rebuilt reversed: a difference in nothing but order, certain every run.
+struct Reordered(Vec<u32>);
+
+impl serde::Serialize for Reordered {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
+struct ReversingCodec;
+
+impl ReplayCodec for ReversingCodec {
+    type Value = Reordered;
+    fn capture(value: &Reordered) -> (serde_json::Value, bool) {
+        (serde_json::json!(value.0), false)
+    }
+    fn reconstruct(recorded: serde_json::Value) -> Option<Reordered> {
+        let mut items: Vec<u32> = serde_json::from_value(recorded).ok()?;
+        items.reverse();
+        Some(Reordered(items))
+    }
+}
+
+#[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "reordered", codec = ReversingCodec)]
+fn reordered() -> Reordered {
+    Reordered(vec![1, 2, 3])
+}
+
+/// The async record path, with a codec that loses information.
+#[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "halved_async", codec = HalvingCodec)]
+async fn halved_async(n: u64) -> u64 {
+    n
+}
+
+/// A single-poll executor: the record path never yields.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn raw() -> RawWaker {
+        fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        fn nop(_: *const ()) {}
+        RawWaker::new(std::ptr::null(), &RawWakerVTable::new(clone, nop, nop, nop))
+    }
+    // SAFETY: every vtable function is a no-op on a null pointer.
+    let waker = unsafe { Waker::from_raw(raw()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}
+
 /// A float whose JSON text does not read back as the same bits.
 #[deja::boundary(boundary = "imc", component = "RoundTrip", operation = "float", codec = SerdeCodec)]
 fn float(x: f64) -> f64 {
@@ -204,6 +280,14 @@ fn every_recorded_value_is_rebuilt_and_compared() {
     assert_eq!(uncomparable(7).0, 7);
     assert_eq!(float(0.5), 0.5);
     assert_eq!(delegating().0.len(), 64);
+    assert_eq!(reordered().0, [1, 2, 3]);
+    assert_eq!(large(8).len(), 8);
+    // A capture of 70 KiB: past the 64 KiB limit, fixed rather than derived
+    // from it, so a limit that stopped applying would show here.
+    let past_limit = 70 * 1024;
+    assert!(deja::__private::MAX_CHECKED_BYTES < past_limit);
+    assert_eq!(large(past_limit).len(), past_limit);
+    let async_lossy = std::panic::catch_unwind(|| block_on(halved_async(3)));
     let ok_as_err = std::panic::catch_unwind(|| erring(3));
     let lossy = std::panic::catch_unwind(|| halved(3));
     let reconstruct_panicked = std::panic::catch_unwind(|| panicking(3));
@@ -255,6 +339,26 @@ fn every_recorded_value_is_rebuilt_and_compared() {
     assert!(
         text_lossy.is_err(),
         "and a value the text changes fails a debug build"
+    );
+    assert_eq!(
+        fidelity_of(&events, "reordered"),
+        [Fidelity::Unverified],
+        "a difference in nothing but order is not lossy, and not a pass either"
+    );
+    assert_eq!(
+        fidelity_of(&events, "large"),
+        [Fidelity::Lossless, Fidelity::Unverified],
+        "a capture past the limit is not checked"
+    );
+    assert_eq!(
+        LARGE_REBUILDS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "and is never rebuilt; only the small one was"
+    );
+    assert_eq!(fidelity_of(&events, "halved_async"), [Fidelity::Lossy]);
+    assert!(
+        async_lossy.is_err(),
+        "the async record path fails a debug build too"
     );
     assert_eq!(
         fidelity_of(&events, "erring"),

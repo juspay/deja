@@ -2035,7 +2035,7 @@ pub mod __private {
     // compares each recorded value with its rebuilt copy.
     pub use deja_runtime::{
         compare, round_trip,
-        round_trip::{Comparison, RoundTrip},
+        round_trip::{Comparison, RoundTrip, MAX_CHECKED_BYTES},
     };
     // Declarative boundary model: the per-site `ReplayStrategy` enum selects
     // Execute or Substitute behavior, and `BoundarySemantics` is the descriptor
