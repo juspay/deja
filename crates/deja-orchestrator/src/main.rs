@@ -1673,16 +1673,22 @@ fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
 /// empty, never errors the request. No-op for compose runs — their artifacts are
 /// already local and their URIs are filesystem paths, not `s3://`.
 ///
-/// Returns the kinds the run registered, so a reader can tell an artifact that
-/// was never published from one that has not arrived; `None` without a store.
-async fn hydrate_run_artifacts(
-    st: &AppState,
-    run_id: &str,
-) -> Option<std::collections::BTreeSet<String>> {
+/// Returns what the run registered, so a reader can tell an artifact that was
+/// never published from one that has not arrived, and which of those can be
+/// pulled again; `None` without a store.
+async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> {
     let store = st.store.clone()?;
     let arts = store.list_artifacts(run_id).await.ok()?;
     let registered: std::collections::BTreeSet<String> =
         arts.iter().map(|art| art.kind.clone()).collect();
+    // Only an artifact that lives in S3 can be fetched a second time. A
+    // compose run's artifacts are registered under their local paths: the
+    // file on disk IS the artifact, and removing it would remove the only copy.
+    let pullable: std::collections::BTreeSet<String> = arts
+        .iter()
+        .filter(|art| deja_orchestrator::codebundle::parse_s3_uri(&art.uri).is_ok())
+        .map(|art| art.kind.clone())
+        .collect();
     let root = st.root.clone();
     let run_id = run_id.to_owned();
     // object_store's sync API blocks on its own runtime — run it off the async
@@ -1719,7 +1725,17 @@ async fn hydrate_run_artifacts(
         sweep_artifact_cache(&root, &run_id);
     })
     .await;
-    Some(registered)
+    Some(Hydrated {
+        registered,
+        pullable,
+    })
+}
+
+/// What a run's artifact registration says: every kind it published, and the
+/// subset held in S3 that the orchestrator can pull again.
+struct Hydrated {
+    registered: std::collections::BTreeSet<String>,
+    pullable: std::collections::BTreeSet<String>,
 }
 
 /// `GET /api/v1/runs/{id}/scorecard` — serve the divergence scorecard. Prefers
@@ -1770,14 +1786,18 @@ async fn run_disposition(st: &AppState, id: &str) -> (Option<String>, Option<Str
             return (Some(row.state), failure);
         }
     }
-    match runs::get(&st.root, id) {
-        Ok(run) => (
+    // The live record, read through the same containment check as every
+    // other file the delta handlers open.
+    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    match live {
+        Some(run) => (
             serde_json::to_value(run.status)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned)),
             run.failure_reason,
         ),
-        Err(_) => (None, None),
+        None => (None, None),
     }
 }
 
@@ -2254,7 +2274,9 @@ fn read_or_build_tree(
 ///
 /// A hydrated file that cannot be read whole (evicted by the cache sweep
 /// between hydration and read, or left torn by an older writer) is removed
-/// and fetched once more before the answer is given.
+/// and fetched once more before the answer is given — only when the run
+/// holds that artifact in S3. A file that is the artifact's only copy is
+/// never removed.
 async fn behaviour_tree_for(
     st: &AppState,
     id: &str,
@@ -2262,8 +2284,31 @@ async fn behaviour_tree_for(
     let (state, _) = run_disposition(st, id).await;
     let mut refetched = false;
     loop {
-        let registered = hydrate_run_artifacts(st, id).await;
-        let sources = tree_sources(st, id, registered.as_ref(), state.as_deref())?;
+        let hydrated = hydrate_run_artifacts(st, id).await;
+        let sources = tree_sources(
+            st,
+            id,
+            hydrated.as_ref().map(|h| &h.registered),
+            state.as_deref(),
+        )?;
+        let kind_of = {
+            let (ledger, diffs, observed) = (
+                sources.ledger.clone(),
+                sources.diffs.clone(),
+                sources.observed.clone(),
+            );
+            move |path: &std::path::Path| -> &'static str {
+                if path == ledger {
+                    "call_ledger"
+                } else if diffs.as_deref() == Some(path) {
+                    "http_diffs"
+                } else if observed.as_deref() == Some(path) {
+                    "observed"
+                } else {
+                    ""
+                }
+            }
+        };
         let run = id.to_owned();
         let read = tokio::task::spawn_blocking(move || read_or_build_tree(&run, &sources))
             .await
@@ -2275,14 +2320,21 @@ async fn behaviour_tree_for(
         let path = match &failure {
             ReadFailure::Missing(path) | ReadFailure::Unparsable { path, .. } => path.clone(),
         };
-        if registered.is_some() && !refetched {
+        let pullable = hydrated
+            .as_ref()
+            .is_some_and(|h| h.pullable.contains(kind_of(&path)));
+        if pullable && !refetched {
             let _ = std::fs::remove_file(&path);
             refetched = true;
             continue;
         }
         return Err(match failure {
-            ReadFailure::Missing(path) => Unavailable::Pending(format!(
+            ReadFailure::Missing(path) if pullable => Unavailable::Pending(format!(
                 "{} went missing while run {id}'s tree was read; it is fetched again on the next request",
+                path.display()
+            )),
+            ReadFailure::Missing(path) => Unavailable::Refused(format!(
+                "{} is not on this orchestrator and the run holds no copy to fetch, so run {id} has no behaviour to compare",
                 path.display()
             )),
             ReadFailure::Unparsable { path, line } => Unavailable::Refused(format!(
