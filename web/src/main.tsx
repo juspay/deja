@@ -21,6 +21,7 @@ import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
 import RunsPage from "./pages/RunsPage";
 import ReportPage from "./pages/ReportPage";
+import DeltaPage from "./pages/DeltaPage";
 import AuditPage from "./pages/AuditPage";
 
 const queryClient = new QueryClient({
@@ -93,6 +94,7 @@ const router = createBrowserRouter([
       { path: "/replays/new", element: <Navigate to="/" replace /> },
       { path: "/runs", element: <RunsPage /> },
       { path: "/r/:runId", element: <ReportPage /> },
+      { path: "/r/:runId/delta", element: <DeltaPage /> },
       { path: "/runs/:runId", element: <LegacyRunRedirect /> },
       { path: "/runs/:runId/scorecard", element: <LegacyRunRedirect /> },
       { path: "/recordings", element: <RecordingsPage /> },

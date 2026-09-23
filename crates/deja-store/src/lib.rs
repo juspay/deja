@@ -58,6 +58,10 @@ pub struct RunRow {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// What the run changed relative to the baseline it was created against:
+    /// 'pass' | 'fail' | 'pending'. None when it names no baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_verdict: Option<String>,
 }
 
 /// A run as the LIST renders it: every column except `scorecard`, plus the few
@@ -112,6 +116,8 @@ pub struct RunSummaryRow {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_verdict: Option<String>,
 }
 
 /// A run that has NOT reached a terminal state — the k8s reconciler's work
@@ -413,6 +419,37 @@ impl Store {
         Ok(())
     }
 
+    /// The delta verdict: `pass` or `fail` once the run's delta against its
+    /// baseline is computed, else `pending` (a side is still running) or
+    /// `refused` (the pairing can never give one). Idempotent; the newest
+    /// computation wins.
+    pub async fn set_delta_verdict(&self, run_id: &str, verdict: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE replay_runs SET delta_verdict = $2 WHERE run_id = $1")
+            .bind(run_id)
+            .bind(verdict)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every completed run created to be measured against `baseline_run_id`
+    /// (`params.delta_against`), so their deltas can be settled when the
+    /// baseline finishes.
+    pub async fn runs_measured_against(
+        &self,
+        baseline_run_id: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT run_id FROM replay_runs
+             WHERE params ->> 'delta_against' = $1 AND state = 'completed'
+             ORDER BY created_at",
+        )
+        .bind(baseline_run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
     pub async fn get_run(&self, run_id: &str) -> Result<Option<RunRow>, sqlx::Error> {
         let row = sqlx::query(RUN_SELECT)
             .bind(run_id)
@@ -446,7 +483,7 @@ impl Store {
                         'matched_correlations', scorecard #> '{summary,matched_correlations}'
                     ) END AS scorecard_digest,
                     failure, expectation, created_by, created_at,
-                    started_at, finished_at
+                    started_at, finished_at, delta_verdict
              FROM replay_runs ORDER BY created_at DESC LIMIT $1",
         )
         .bind(limit)
@@ -660,7 +697,8 @@ impl Store {
 
 const RUN_SELECT: &str =
     "SELECT run_id, mode, recording_id, candidate, candidate_sha256, params, state,
-        verdict, scorecard, failure, expectation, created_by, created_at, started_at, finished_at
+        verdict, scorecard, failure, expectation, created_by, created_at, started_at, finished_at,
+        delta_verdict
  FROM replay_runs WHERE run_id = $1";
 
 fn run_row(r: sqlx::postgres::PgRow) -> RunRow {
@@ -680,6 +718,7 @@ fn run_row(r: sqlx::postgres::PgRow) -> RunRow {
         created_at: r.get(12),
         started_at: r.get(13),
         finished_at: r.get(14),
+        delta_verdict: r.get(15),
     }
 }
 
@@ -700,6 +739,7 @@ fn run_summary_row(r: sqlx::postgres::PgRow) -> RunSummaryRow {
         created_at: r.get(12),
         started_at: r.get(13),
         finished_at: r.get(14),
+        delta_verdict: r.get(15),
     }
 }
 

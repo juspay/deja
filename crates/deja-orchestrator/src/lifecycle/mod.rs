@@ -6471,6 +6471,8 @@ mod tests {
         Run {
             run_id: "r1".into(),
             spec: RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Record,
                 system_under_test: None,
@@ -6544,6 +6546,8 @@ mod tests {
         Run {
             run_id: "run-backstop".into(),
             spec: RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,
@@ -7276,6 +7280,8 @@ mod tests {
         let run = Run {
             run_id: run_id.to_owned(),
             spec: RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
@@ -9261,6 +9267,8 @@ mod stage_timing {
         let mut run = Run {
             run_id: "run-timing".into(),
             spec: RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,

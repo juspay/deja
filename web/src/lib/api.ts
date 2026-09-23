@@ -34,6 +34,12 @@ export type RunParams = {
   correlation_filter?: string[];
   workload?: unknown;
   expectation?: string;
+  /** The run this one is measured against, three-way with the tape as
+   *  ancestor: main at the merge-base on the same recording. Set by the
+   *  pipeline that created both runs. */
+  delta_against?: string;
+  /** Why the run exists when it is not a candidate under test: `baseline`. */
+  purpose?: string;
 };
 
 /** The request a row carries, or null when it predates the record.
@@ -55,6 +61,10 @@ export type RunRow = {
   params: Partial<RunParams> & { [k: string]: unknown };
   state: string;
   verdict: "pass" | "fail" | "inconclusive" | null;
+  /** What the run changed relative to the baseline it was created against
+   *  (params.delta_against): pass, fail, or pending while the baseline is
+   *  still being scored. Absent for a run that names no baseline. */
+  delta_verdict?: "pass" | "fail" | "pending" | "refused" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;
@@ -474,6 +484,10 @@ export const api = {
   graph: (id: string) => request<RunGraph>(`/api/v1/runs/${id}/graph`),
   changeCoverage: (id: string) =>
     request<ChangeCoverageResponse>(`/api/v1/runs/${id}/change-coverage`),
+  delta: (id: string, against: string) =>
+    request<DeltaResponse>(
+      `/api/v1/runs/${id}/delta?against=${encodeURIComponent(against)}`,
+    ),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
   createRun: (spec: Record<string, unknown>) => {
@@ -714,3 +728,105 @@ export const recordingCorrelations = (id: string, limit = 1000, offset = 0) =>
   request<RecordingCorrelations>(
     `/api/v1/recordings/${encodeURIComponent(id)}/correlations?limit=${limit}&offset=${offset}`,
   );
+
+// ---------------------------------------------------------------------------
+// Behaviour delta — what a run changed relative to ANOTHER run of the same
+// tape, three-way against the tape. `GET /runs/{y}/delta?against={m}`.
+// Never part of the tape-relative verdict; shown beside it.
+
+export type DeltaAddress =
+  | {
+      kind: "call";
+      correlation: string;
+      span_path: string;
+      boundary: string;
+      operation: string;
+      /** The recorded event this call paired to; absent for a novel call. */
+      recorded_event?: number;
+      occurrence: number;
+    }
+  | { kind: "status"; correlation: string; request_sequence: number }
+  | { kind: "body"; correlation: string; json_path: string };
+
+/** What one side produced at an address: it reproduced the tape, never
+ *  reached the address, or produced something else (hashed). */
+export type DeltaSide = "tape" | "absent" | { hash: string };
+
+export type DeltaBucket =
+  | "clean"
+  | "inherited"
+  | "introduced"
+  | "resolved"
+  | "changed"
+  | "inherited_novel"
+  | "introduced_novel"
+  | "resolved_novel"
+  | "inherited_omission"
+  | "introduced_omission"
+  | "resolved_omission";
+
+export type DeltaFamily = "clean" | "inherited" | "introduced" | "resolved" | "changed";
+
+export type DeltaRow = {
+  address: DeltaAddress;
+  bucket: DeltaBucket;
+  m: DeltaSide;
+  y: DeltaSide;
+  blocking: boolean;
+  lane?: { connector: string; flow: string } | null;
+};
+
+export type DeltaLane = {
+  lane: { connector: string; flow: string };
+  requests: number;
+  buckets: Partial<Record<DeltaFamily, number>>;
+};
+
+export type DeltaSideInfo = {
+  run: string;
+  tape_verdict: { pass: boolean; inconclusive: boolean; reason: string } | null;
+  candidate: Record<string, unknown> | null;
+};
+
+export type Delta = {
+  m_run: string;
+  y_run: string;
+  canon_version: number;
+  verdict: {
+    pass: boolean;
+    introduced: number;
+    changed: number;
+    inherited: number;
+    resolved: number;
+    reason: string;
+  };
+  buckets: Partial<Record<DeltaBucket, number>>;
+  lanes: DeltaLane[];
+  rows: DeltaRow[];
+  clean: number;
+  /** Correlations both runs drove: the comparison's domain. */
+  covered_correlations: number;
+  /** Requests only one run drove; their addresses are outside every bucket. */
+  uncovered: { m_only: string[]; y_only: string[]; addresses: number };
+  tape: string | null;
+  sides: { m: DeltaSideInfo; y: DeltaSideInfo };
+};
+
+/** Why there is no delta: `pending` clears on its own, `refused` never will. */
+export type DeltaUnavailable = { unavailable: string; unavailable_kind?: "pending" | "refused" };
+export type DeltaResponse = Delta | DeltaUnavailable;
+
+/**
+ * The unavailability a delta response carries, if any. A response that names
+ * no kind is read as refused, so nothing polls on an answer it cannot tell
+ * will change.
+ */
+export function deltaUnavailable(r: DeltaResponse | undefined): { why: string; pending: boolean } | null {
+  if (!r || !("unavailable" in r)) return null;
+  return { why: r.unavailable, pending: r.unavailable_kind === "pending" };
+}
+
+export function deltaFamily(b: DeltaBucket): DeltaFamily {
+  if (b === "clean" || b === "changed") return b;
+  return b.split("_")[0] as DeltaFamily;
+}

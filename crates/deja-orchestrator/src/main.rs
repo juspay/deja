@@ -270,6 +270,8 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/http-diffs", get(v1_http_diffs))
         .route("/runs/{run_id}/graph", get(v1_graph))
         .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
+        .route("/runs/{run_id}/tree", get(v1_tree))
+        .route("/runs/{run_id}/delta", get(v1_delta))
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit));
@@ -437,6 +439,13 @@ async fn v1_create_run(
         deja_orchestrator::scope::check_requested_correlations(spec.correlation_filter.as_deref())
     {
         return error_resp(400, &e);
+    }
+    // A baseline is named by run id; a value that is not one would only be
+    // discovered when the report asks for the delta.
+    if let Some(against) = spec.delta_against.as_deref() {
+        if let Err(e) = against.parse::<RunId>() {
+            return error_resp(400, &format!("delta_against: {e}"));
+        }
     }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
@@ -689,6 +698,11 @@ async fn v1_ingest_run_event(
     if let Some(store) = &st.store {
         if let Err(e) = apply_run_event(store, &run_id, &ev).await {
             eprintln!("deja-orchestrator: run-event store write failed for {run_id}: {e}");
+        }
+        // This run's own delta, and those measured against it. Off the
+        // ingest path.
+        if settles_deltas(&ev) {
+            tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
         }
     }
     StatusCode::ACCEPTED.into_response()
@@ -1658,13 +1672,23 @@ fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
 /// orchestrator. Best-effort: a missing/failed artifact just leaves that view
 /// empty, never errors the request. No-op for compose runs — their artifacts are
 /// already local and their URIs are filesystem paths, not `s3://`.
-async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
-    let Some(store) = st.store.clone() else {
-        return;
-    };
-    let Ok(arts) = store.list_artifacts(run_id).await else {
-        return;
-    };
+///
+/// Returns what the run registered, so a reader can tell an artifact that was
+/// never published from one that has not arrived, and which of those can be
+/// pulled again; `None` without a store.
+async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> {
+    let store = st.store.clone()?;
+    let arts = store.list_artifacts(run_id).await.ok()?;
+    let registered: std::collections::BTreeSet<String> =
+        arts.iter().map(|art| art.kind.clone()).collect();
+    // Only an artifact that lives in S3 can be fetched a second time. A
+    // compose run's artifacts are registered under their local paths: the
+    // file on disk IS the artifact, and removing it would remove the only copy.
+    let pullable: std::collections::BTreeSet<String> = arts
+        .iter()
+        .filter(|art| deja_orchestrator::codebundle::parse_s3_uri(&art.uri).is_ok())
+        .map(|art| art.kind.clone())
+        .collect();
     let root = st.root.clone();
     let run_id = run_id.to_owned();
     // object_store's sync API blocks on its own runtime — run it off the async
@@ -1687,7 +1711,9 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
                     if let Some(parent) = local.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Err(e) = std::fs::write(&local, bytes) {
+                    // renamed into place: a concurrent view that finds the
+                    // path takes it as whole, so it must never see a prefix
+                    if let Err(e) = divergence::behaviour_tree::write_atomic(&local, &bytes) {
                         eprintln!("hydrate: write {}: {e}", local.display());
                     }
                 }
@@ -1699,6 +1725,17 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
         sweep_artifact_cache(&root, &run_id);
     })
     .await;
+    Some(Hydrated {
+        registered,
+        pullable,
+    })
+}
+
+/// What a run's artifact registration says: every kind it published, and the
+/// subset held in S3 that the orchestrator can pull again.
+struct Hydrated {
+    registered: std::collections::BTreeSet<String>,
+    pullable: std::collections::BTreeSet<String>,
 }
 
 /// `GET /api/v1/runs/{id}/scorecard` — serve the divergence scorecard. Prefers
@@ -1749,14 +1786,18 @@ async fn run_disposition(st: &AppState, id: &str) -> (Option<String>, Option<Str
             return (Some(row.state), failure);
         }
     }
-    match runs::get(&st.root, id) {
-        Ok(run) => (
+    // The live record, read through the same containment check as every
+    // other file the delta handlers open.
+    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    match live {
+        Some(run) => (
             serde_json::to_value(run.status)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned)),
             run.failure_reason,
         ),
-        Err(_) => (None, None),
+        None => (None, None),
     }
 }
 
@@ -2082,6 +2123,460 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
         }
     }
     json_ok_ser(&assessment)
+}
+
+/// Why a run has no behaviour tree, or a pair of runs no delta. The two kinds
+/// are different news: a pending answer clears on its own, so a reader may ask
+/// again; a refusal never will, and asking again only hides it.
+#[derive(Debug)]
+enum Unavailable {
+    Pending(String),
+    Refused(String),
+}
+
+impl Unavailable {
+    fn kind(&self) -> &'static str {
+        match self {
+            Unavailable::Pending(_) => "pending",
+            Unavailable::Refused(_) => "refused",
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let (Unavailable::Pending(why) | Unavailable::Refused(why)) = self;
+        serde_json::json!({ "unavailable": why, "unavailable_kind": self.kind() })
+    }
+}
+
+/// A file a tree is built from that could not be read whole.
+enum ReadFailure {
+    Missing(std::path::PathBuf),
+    Unparsable {
+        path: std::path::PathBuf,
+        line: usize,
+    },
+}
+
+/// Every line of `path` as a `T`, or the first line that is not one. A
+/// dropped line would build a short tree that reads as a whole one.
+fn read_jsonl_strict<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<Vec<T>, ReadFailure> {
+    let text =
+        std::fs::read_to_string(path).map_err(|_| ReadFailure::Missing(path.to_path_buf()))?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| {
+            serde_json::from_str(line).map_err(|_| ReadFailure::Unparsable {
+                path: path.to_path_buf(),
+                line: i + 1,
+            })
+        })
+        .collect()
+}
+
+/// The files a run's tree is read from, each resolved under its own directory.
+struct TreeSources {
+    ledger: std::path::PathBuf,
+    diffs: Option<std::path::PathBuf>,
+    observed: Option<std::path::PathBuf>,
+    cache: std::path::PathBuf,
+}
+
+/// Resolve a run's tree sources, or say why they are not all there. A source
+/// the run registered but that is not on disk has not arrived yet; one it
+/// never registered after it finished will never exist.
+fn tree_sources(
+    st: &AppState,
+    id: &str,
+    registered: Option<&std::collections::BTreeSet<String>>,
+    state: Option<&str>,
+) -> Result<TreeSources, Unavailable> {
+    let absent = |kind: &str, what: &str| {
+        match state {
+        _ if registered.is_some_and(|r| r.contains(kind)) => Unavailable::Pending(format!(
+            "run {id}'s {what} is published but has not reached the orchestrator yet"
+        )),
+        Some("completed" | "failed") => Unavailable::Refused(format!(
+            "run {id} finished without publishing its {what}, so it was never scored and has no behaviour to compare"
+        )),
+        Some(state) => Unavailable::Pending(format!(
+            "run {id} is still {state}; its {what} is published when it finishes"
+        )),
+        None => Unavailable::Refused(format!("run {id} could not be read")),
+    }
+    };
+    let root = &st.root;
+    let ledger = confined(root.call_ledger_path(id), &root.root.join("runs"))
+        .ok_or_else(|| absent("call_ledger", "call ledger"))?;
+    let diffs = confined(root.http_diff_path(id), &root.root.join("http-diffs"));
+    if diffs.is_none() && registered.is_some_and(|r| r.contains("http_diffs")) {
+        return Err(absent("http_diffs", "http diffs"));
+    }
+    let observed = confined(root.observed_path(id), &root.root.join("observed"));
+    if observed.is_none() && registered.is_some_and(|r| r.contains("observed")) {
+        return Err(absent("observed", "observed stream"));
+    }
+    // beside the ledger it is built from, named off the confined ledger path:
+    // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
+    let cache = ledger.with_extension("behaviour-tree.jsonl");
+    Ok(TreeSources {
+        ledger,
+        diffs,
+        observed,
+        cache,
+    })
+}
+
+/// The cached tree when it is current, else one built strictly from its
+/// sources and cached. Nothing short is ever built, so nothing short is
+/// ever cached.
+fn read_or_build_tree(
+    id: &str,
+    sources: &TreeSources,
+) -> Result<divergence::behaviour_tree::BehaviourTree, ReadFailure> {
+    use divergence::behaviour_tree::{self, BehaviourTree};
+
+    if let Some(tree) = std::fs::read_to_string(&sources.cache)
+        .ok()
+        .and_then(|t| BehaviourTree::from_jsonl(&t))
+        .filter(|t| t.canon_version == behaviour_tree::CANON_VERSION)
+    {
+        return Ok(tree);
+    }
+    let rows: Vec<divergence::ledger::CallRecord> = read_jsonl_strict(&sources.ledger)?;
+    let diffs: Vec<deja_kernel::HttpDiff> = match &sources.diffs {
+        Some(path) => read_jsonl_strict(path)?,
+        None => Vec::new(),
+    };
+    let event_schema_versions = match &sources.observed {
+        Some(path) => behaviour_tree::event_schema_versions(
+            &std::fs::read_to_string(path).map_err(|_| ReadFailure::Missing(path.clone()))?,
+        ),
+        None => Default::default(),
+    };
+    let mut tree = behaviour_tree::build(id, &rows, &diffs);
+    tree.event_schema_versions = event_schema_versions;
+    // renamed into place, so a concurrent reader never sees a prefix
+    let _ = tree.write_atomic(&sources.cache);
+    Ok(tree)
+}
+
+/// A run's behaviour tree: read from the cache beside its ledger when one is
+/// there, else built from the ledger, the http diffs and the observed stream,
+/// and cached. `Err` says whether one can still appear.
+///
+/// Every file is opened through a path that was resolved and confirmed to lie
+/// under its own directory, and the cache is named off the resolved ledger
+/// path rather than off the id, so no file is read or written at a path the
+/// id alone chose.
+///
+/// A hydrated file that cannot be read whole (evicted by the cache sweep
+/// between hydration and read, or left torn by an older writer) is removed
+/// and fetched once more before the answer is given — only when the run
+/// holds that artifact in S3. A file that is the artifact's only copy is
+/// never removed.
+async fn behaviour_tree_for(
+    st: &AppState,
+    id: &str,
+) -> Result<divergence::behaviour_tree::BehaviourTree, Unavailable> {
+    let (state, _) = run_disposition(st, id).await;
+    let mut refetched = false;
+    loop {
+        let hydrated = hydrate_run_artifacts(st, id).await;
+        let sources = tree_sources(
+            st,
+            id,
+            hydrated.as_ref().map(|h| &h.registered),
+            state.as_deref(),
+        )?;
+        let kind_of = {
+            let (ledger, diffs, observed) = (
+                sources.ledger.clone(),
+                sources.diffs.clone(),
+                sources.observed.clone(),
+            );
+            move |path: &std::path::Path| -> &'static str {
+                if path == ledger {
+                    "call_ledger"
+                } else if diffs.as_deref() == Some(path) {
+                    "http_diffs"
+                } else if observed.as_deref() == Some(path) {
+                    "observed"
+                } else {
+                    ""
+                }
+            }
+        };
+        let run = id.to_owned();
+        let read = tokio::task::spawn_blocking(move || read_or_build_tree(&run, &sources))
+            .await
+            .map_err(|e| Unavailable::Pending(format!("build behaviour tree of run {id}: {e}")))?;
+        let failure = match read {
+            Ok(tree) => return Ok(tree),
+            Err(failure) => failure,
+        };
+        let path = match &failure {
+            ReadFailure::Missing(path) | ReadFailure::Unparsable { path, .. } => path.clone(),
+        };
+        let pullable = hydrated
+            .as_ref()
+            .is_some_and(|h| h.pullable.contains(kind_of(&path)));
+        if pullable && !refetched {
+            let _ = std::fs::remove_file(&path);
+            refetched = true;
+            continue;
+        }
+        return Err(match failure {
+            ReadFailure::Missing(path) if pullable => Unavailable::Pending(format!(
+                "{} went missing while run {id}'s tree was read; it is fetched again on the next request",
+                path.display()
+            )),
+            ReadFailure::Missing(path) => Unavailable::Refused(format!(
+                "{} is not on this orchestrator and the run holds no copy to fetch, so run {id} has no behaviour to compare",
+                path.display()
+            )),
+            ReadFailure::Unparsable { path, line } => Unavailable::Refused(format!(
+                "line {line} of {} does not parse, so run {id}'s published artifact is not whole",
+                path.display()
+            )),
+        });
+    }
+}
+
+/// `GET /api/v1/runs/{id}/tree` — the run as a behaviour tree: every address
+/// the tape holds, with whether the run reproduced it and, when not, a hash of
+/// what it produced. `{unavailable, unavailable_kind}` when there is none.
+async fn v1_tree(State(st): State<AppState>, id: RunId) -> Response {
+    match behaviour_tree_for(&st, &id).await {
+        Ok(tree) => json_ok_ser(&tree),
+        Err(why) => json_ok(why.to_json()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeltaQuery {
+    /// The run to measure against: the baseline `M`. The path's run is `Y`.
+    against: Option<String>,
+}
+
+/// `GET /api/v1/runs/{id}/delta?against={run}` — what this run changed
+/// relative to another run of the same tape, three-way against the tape.
+/// Both runs' tape-relative verdicts ride along so a reader sees the two
+/// verdicts side by side. `{unavailable, unavailable_kind}` names why no
+/// delta can be computed, and whether one still can be: `pending` while a
+/// side is still being scored, `refused` for a pairing that never will.
+async fn v1_delta(
+    State(st): State<AppState>,
+    id: RunId,
+    axum::extract::Query(q): axum::extract::Query<DeltaQuery>,
+) -> Response {
+    let refused = |why: String| json_ok(Unavailable::Refused(why).to_json());
+    let y_params = run_params_for(&st, &id).await;
+    let declared = y_params.as_ref().and_then(|p| p.delta_against.clone());
+    // The query names the baseline; without one, the run's own record does,
+    // when the pipeline that created it said what to measure it against.
+    let named = q
+        .against
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_owned)
+        .or_else(|| declared.clone());
+    let against = match named {
+        None => {
+            return refused(
+                "no baseline run named: pass ?against=<run id> of a run on the same tape, or create the run with delta_against"
+                    .to_owned(),
+            )
+        }
+        Some(raw) => match raw.parse::<RunId>() {
+            Ok(id) => id,
+            Err(e) => return refused(format!("against is not a run id: {e}")),
+        },
+    };
+    if *against == *id {
+        return refused("a run measured against itself has no delta".to_owned());
+    }
+    // The run's OWN delta — against the baseline it was created with — is
+    // cached beside its ledger and its verdict is written to the run row.
+    // Any other pairing is computed on the spot and kept nowhere.
+    let result = if declared.as_deref() == Some(&*against) {
+        delta_for_run(&st, &id, &against).await
+    } else {
+        delta_between(&st, &id, &against).await
+    };
+    match result {
+        Ok(body) => json_ok(body),
+        Err(why) => json_ok(why.to_json()),
+    }
+}
+
+/// The delta of `y` against `m`: both trees, the three-way, and both sides'
+/// tape verdicts. `Err` says why there is none, and whether there can be.
+async fn delta_between(
+    st: &AppState,
+    y_id: &str,
+    m_id: &str,
+) -> Result<serde_json::Value, Unavailable> {
+    let y_params = run_params_for(st, y_id).await;
+    let m_params = run_params_for(st, m_id).await;
+    let tape = |p: &Option<deja_orchestrator::RunParams>| {
+        p.as_ref()
+            .and_then(|p| p.recording_group.clone().or_else(|| p.recording_id.clone()))
+    };
+    if let (Some(y_tape), Some(m_tape)) = (tape(&y_params), tape(&m_params)) {
+        if y_tape != m_tape {
+            return Err(Unavailable::Refused(format!(
+                "the runs drove different tapes ({y_tape} and {m_tape}); a delta only holds between runs of one tape"
+            )));
+        }
+    }
+    let y = behaviour_tree_for(st, y_id).await?;
+    let m = behaviour_tree_for(st, m_id).await?;
+    let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
+    let verdict_of = |run: &str| -> serde_json::Value {
+        confined(st.root.scorecard_path(run), &st.root.root.join("runs"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("verdict").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let candidate_of = |p: &Option<deja_orchestrator::RunParams>| {
+        p.as_ref()
+            .map(|p| serde_json::to_value(&p.candidate_spec).unwrap_or_default())
+    };
+    let mut body = serde_json::to_value(&delta).unwrap_or_default();
+    body["tape"] = serde_json::json!(tape(&y_params).or_else(|| tape(&m_params)));
+    body["sides"] = serde_json::json!({
+        "m": { "run": m_id, "tape_verdict": verdict_of(m_id), "candidate": candidate_of(&m_params) },
+        "y": { "run": y_id, "tape_verdict": verdict_of(y_id), "candidate": candidate_of(&y_params) },
+    });
+    Ok(body)
+}
+
+/// The run row's word for a delta result: `pass` or `fail` once computed,
+/// else the kind of unavailability, so a reader of the row can tell a delta
+/// still coming from one that never will.
+fn delta_verdict_word(result: &Result<serde_json::Value, Unavailable>) -> &'static str {
+    match result {
+        Ok(body) => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "refused",
+        },
+        Err(why) => why.kind(),
+    }
+}
+
+/// The run's own delta, against the baseline named in its params: served
+/// from the cache beside its ledger when that holds the current answer,
+/// else computed, cached, and its verdict written to the run row. The cache
+/// is named off the confined ledger path, and read and written off the async
+/// worker, as the tree cache is. Only a computed delta is cached.
+async fn delta_for_run(
+    st: &AppState,
+    y_id: &str,
+    m_id: &str,
+) -> Result<serde_json::Value, Unavailable> {
+    use divergence::behaviour_tree::CANON_VERSION;
+
+    let runs_dir = st.root.root.join("runs");
+    let cache = confined(st.root.call_ledger_path(y_id), &runs_dir)
+        .map(|ledger| ledger.with_extension("delta.json"));
+    if let Some(cache) = cache.clone() {
+        let (y, m) = (y_id.to_owned(), m_id.to_owned());
+        let cached = tokio::task::spawn_blocking(move || -> Option<serde_json::Value> {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&cache).ok()?).ok()?;
+            divergence::delta::cached_is_current(&doc, &y, &m, CANON_VERSION).then_some(doc)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(doc) = cached {
+            // The row is settled from the cache too: a column that was reset,
+            // or never written because the store was away, catches up on the
+            // next view rather than waiting for a recomputation.
+            record_delta_verdict(st, y_id, &Ok(doc.clone())).await;
+            return Ok(doc);
+        }
+    }
+    let computed = delta_between(st, y_id, m_id).await;
+    record_delta_verdict(st, y_id, &computed).await;
+    if let (Ok(body), Some(cache)) = (&computed, cache) {
+        let text = body.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            divergence::behaviour_tree::write_atomic(&cache, text.as_bytes())
+        })
+        .await;
+    }
+    computed
+}
+
+/// The run row's delta verdict, from a computed delta or the reason there is
+/// none. Idempotent; the newest answer wins.
+async fn record_delta_verdict(
+    st: &AppState,
+    y_id: &str,
+    computed: &Result<serde_json::Value, Unavailable>,
+) {
+    if let Some(store) = &st.store {
+        if let Err(e) = store
+            .set_delta_verdict(y_id, delta_verdict_word(computed))
+            .await
+        {
+            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
+        }
+    }
+}
+
+/// Whether ingesting `ev` settles deltas. A run's finish, not its result: the
+/// runner reports the result BEFORE it publishes the ledger and diffs a tree
+/// is read from, and finishes after.
+fn settles_deltas(ev: &deja_orchestrator::lifecycle::store_ctx::RunEvent) -> bool {
+    use deja_orchestrator::lifecycle::store_ctx::RunEvent;
+    matches!(ev, RunEvent::Finish { .. })
+}
+
+/// Settle deltas when a run finishes, which is after it has published
+/// everything a tree is read from: the run's own delta, if it names a
+/// baseline, and the delta of every run that names THIS run as its
+/// baseline. Best-effort and off the ingest path; a delta whose other side
+/// is still running is left pending and settled when that side finishes.
+async fn settle_deltas_for(st: AppState, run_id: String) {
+    if let Some(against) = run_params_for(&st, &run_id)
+        .await
+        .and_then(|p| p.delta_against)
+    {
+        let _ = delta_for_run(&st, &run_id, &against).await;
+    }
+    let Some(store) = st.store.clone() else {
+        return;
+    };
+    let Ok(dependents) = store.runs_measured_against(&run_id).await else {
+        return;
+    };
+    for dependent in dependents {
+        let _ = delta_for_run(&st, &dependent, &run_id).await;
+    }
+}
+
+/// The run's parameters: the live record on compose, the stored row on k8s.
+async fn run_params_for(st: &AppState, id: &str) -> Option<deja_orchestrator::RunParams> {
+    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    match live {
+        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        None => match &st.store {
+            Some(store) => match store.get_run(id).await {
+                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+                _ => None,
+            },
+            None => None,
+        },
+    }
 }
 
 /// `candidate` resolved, if it exists and lies under `base`; `None` otherwise.
@@ -2645,6 +3140,144 @@ mod tests {
         );
     }
 
+    const LEDGER_ROW: &str = r#"{"correlation_id":"c1","boundary":"redis","trait_name":"Cache","method_name":"get","kind":"matched","blocking":false}"#;
+
+    /// A compose run in `status`, with `ledger` as its call ledger if given.
+    fn run_with_ledger(
+        dir: &std::path::Path,
+        id: &str,
+        status: RunStatus,
+        ledger: Option<&str>,
+    ) -> AppState {
+        let st = test_state(dir);
+        let mut run = pending_run(id);
+        run.status = status;
+        deja_orchestrator::write_json(&st.root.run_path(id), &run).unwrap();
+        if let Some(ledger) = ledger {
+            std::fs::write(st.root.call_ledger_path(id), ledger).unwrap();
+        }
+        st
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A missing ledger is pending while the run can still publish one, and
+    /// refused once it has finished without one: only the first is worth
+    /// asking again about.
+    #[test]
+    fn a_missing_ledger_is_pending_until_the_run_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = run_with_ledger(dir.path(), "run-a", RunStatus::Running, None);
+        let finished = run_with_ledger(dir.path(), "run-b", RunStatus::Completed, None);
+        let rt = rt();
+        match rt.block_on(behaviour_tree_for(&running, "run-a")) {
+            Err(why @ Unavailable::Pending(_)) => assert_eq!(why.kind(), "pending"),
+            other => panic!("expected pending, got {other:?}"),
+        }
+        match rt.block_on(behaviour_tree_for(&finished, "run-b")) {
+            Err(why @ Unavailable::Refused(_)) => assert_eq!(why.kind(), "refused"),
+            other => panic!("expected refused, got {other:?}"),
+        }
+    }
+
+    /// A published artifact that has not been hydrated yet will arrive, so it
+    /// is pending even for a finished run.
+    #[test]
+    fn a_registered_but_absent_artifact_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = run_with_ledger(dir.path(), "run-c", RunStatus::Completed, Some(LEDGER_ROW));
+        let registered: std::collections::BTreeSet<String> = ["call_ledger", "http_diffs"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        match tree_sources(&st, "run-c", Some(&registered), Some("completed")) {
+            Err(Unavailable::Pending(why)) => assert!(why.contains("http diffs"), "{why}"),
+            Err(other) => panic!("expected pending, got {other:?}"),
+            Ok(_) => panic!("expected pending, got sources"),
+        }
+        assert!(
+            tree_sources(&st, "run-c", None, Some("completed")).is_ok(),
+            "unregistered diffs are simply none"
+        );
+    }
+
+    /// A ledger that does not parse whole builds nothing and caches nothing: a
+    /// short tree would read the addresses past the cut as reproduced.
+    #[test]
+    fn a_torn_ledger_builds_no_tree_and_caches_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let torn = format!("{LEDGER_ROW}\n{{\"correlation_id\":\"c2\",\"bound");
+        let st = run_with_ledger(dir.path(), "run-d", RunStatus::Completed, Some(&torn));
+        let cache = st
+            .root
+            .call_ledger_path("run-d")
+            .with_extension("behaviour-tree.jsonl");
+        match rt().block_on(behaviour_tree_for(&st, "run-d")) {
+            Err(Unavailable::Refused(why)) => assert!(why.contains("line 2"), "{why}"),
+            other => panic!("expected refused, got {other:?}"),
+        }
+        assert!(!cache.exists(), "nothing short is cached");
+
+        let whole = run_with_ledger(dir.path(), "run-e", RunStatus::Completed, Some(LEDGER_ROW));
+        let tree = rt().block_on(behaviour_tree_for(&whole, "run-e")).unwrap();
+        assert_eq!(tree.correlations.len(), 1);
+        assert!(whole
+            .root
+            .call_ledger_path("run-e")
+            .with_extension("behaviour-tree.jsonl")
+            .exists());
+    }
+
+    /// The tree records the event schema its candidate captured under, read
+    /// off the observed stream.
+    #[test]
+    fn the_tree_carries_the_candidates_event_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = run_with_ledger(dir.path(), "run-f", RunStatus::Completed, Some(LEDGER_ROW));
+        std::fs::write(
+            st.root.observed_path("run-f"),
+            r#"{"record_kind":"boundary_event","event_schema_version":10}"#,
+        )
+        .unwrap();
+        let tree = rt().block_on(behaviour_tree_for(&st, "run-f")).unwrap();
+        assert_eq!(tree.event_schema_versions, [10].into_iter().collect());
+    }
+
+    #[test]
+    fn the_row_says_which_kind_of_unavailable() {
+        let computed = |pass| Ok(serde_json::json!({ "verdict": { "pass": pass } }));
+        assert_eq!(delta_verdict_word(&computed(true)), "pass");
+        assert_eq!(delta_verdict_word(&computed(false)), "fail");
+        assert_eq!(
+            delta_verdict_word(&Err(Unavailable::Pending(String::new()))),
+            "pending"
+        );
+        assert_eq!(
+            delta_verdict_word(&Err(Unavailable::Refused(String::new()))),
+            "refused"
+        );
+    }
+
+    /// The runner reports its result before it publishes the ledger and diffs,
+    /// so settling on the result would always find nothing to compare.
+    #[test]
+    fn deltas_settle_on_finish_not_on_result() {
+        use deja_orchestrator::lifecycle::store_ctx::RunEvent;
+        assert!(settles_deltas(&RunEvent::Finish {
+            ok: true,
+            failure: None
+        }));
+        assert!(!settles_deltas(&RunEvent::Result {
+            verdict: Some("pass".to_owned()),
+            scorecard: None
+        }));
+    }
+
     fn test_state(dir: &std::path::Path) -> AppState {
         AppState {
             root: Arc::new(HarnessRoot::new(dir).unwrap()),
@@ -2660,6 +3293,8 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
                 system_under_test: None,

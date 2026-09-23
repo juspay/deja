@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::HarnessRoot;
 
+pub mod behaviour_tree;
+pub mod delta;
 pub mod ledger;
 pub mod span_shape;
 pub use ledger::CallRecord;
@@ -6655,6 +6657,8 @@ mod tests {
         namespaces: Vec<String>,
     ) -> crate::RunSpec {
         let spec = crate::RunSpec {
+            delta_against: None,
+            purpose: None,
             scored_span_namespaces: namespaces,
             mode: crate::RunMode::Replay,
             system_under_test: Some("prism".to_owned()),
@@ -6798,6 +6802,8 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    delta_against: None,
+                    purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
@@ -6918,6 +6924,8 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    delta_against: None,
+                    purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
@@ -7113,6 +7121,8 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    delta_against: None,
+                    purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,

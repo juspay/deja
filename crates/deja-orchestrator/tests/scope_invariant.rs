@@ -130,6 +130,8 @@ fn write_run(root: &HarnessRoot, run_id: &str, recording_id: &str, filter: Optio
     let run = Run {
         run_id: run_id.to_owned(),
         spec: RunSpec {
+            delta_against: None,
+            purpose: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,

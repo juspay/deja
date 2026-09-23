@@ -140,7 +140,17 @@ export default function RunsPage() {
                 title={`${r.run_id} · ${r.created_by} · ${t.full}`}
               >
                 <span className="rl-when">{t.short}</span>
-                <span className="rl-result"><ResultChip result={res} /></span>
+                <span className="rl-result">
+                  <ResultChip result={res} />
+                  {/* The second verdict, against main, when the run was created
+                      with a baseline. Its own chip: a pass here beside a fail
+                      there is the case the delta exists for. */}
+                  {r.delta_verdict && (
+                    <span className={`chip delta ${r.delta_verdict}`} title="against main at the merge-base">
+                      main: {r.delta_verdict}
+                    </span>
+                  )}
+                </span>
                 <span className="rl-cand mono" title={cand.full}>
                   {cand.label}
                   {/* Only a non-default system is worth a badge — every legacy
