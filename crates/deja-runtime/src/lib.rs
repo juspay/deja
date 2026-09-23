@@ -576,8 +576,8 @@ pub enum Fidelity {
     Lossless,
     /// Result round-trips structurally but not losslessly.
     Structured,
-    /// The capture does not rebuild: the site declares no replay codec, or its
-    /// codec failed on a value it recorded.
+    /// The capture does not rebuild: a `Substitute` site that declares no
+    /// replay codec, or a codec that failed or panicked on a value it recorded.
     Opaque,
     /// Rebuilt, and DIFFERENT from the value captured: replay would hand the
     /// service something the recording never saw.

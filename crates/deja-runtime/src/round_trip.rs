@@ -12,7 +12,9 @@
 //! autoref specialisation at the call site ([`compare!`](crate::compare)):
 //!
 //! 1. `PartialEq` — the type's own equality, which can see fields serialisation
-//!    does not carry.
+//!    does not carry. For a `Result` whose error has none, its `Ok` arm's
+//!    `PartialEq` (an `Ok` rebuilt as an `Err` is different; two `Err`s cannot
+//!    be compared).
 //! 2. `Serialize` — the serde data model, which is finer than JSON: it keeps
 //!    `Some` apart from its contents, a unit apart from `None`, a newtype apart
 //!    from its field and every integer width apart. [`fingerprint`] renders that
@@ -23,10 +25,9 @@
 //!    A set behind a wrapper that serialises through its own `Serialize` is
 //!    invisible to it and renders in iteration order, so two renderings that
 //!    differ in nothing but sequence order are not called different.
-//! 3. A `Result` whose error offers neither — an `error_stack::Report`, which
-//!    most fallible boundaries return — compared by its `Ok` arm, by that
-//!    arm's `PartialEq` or else its serde image. An `Ok` rebuilt as an `Err` is
-//!    different; two `Err`s cannot be compared.
+//! 3. A `Result` whose error cannot be serialised — an `error_stack::Report`,
+//!    which most fallible boundaries return — compared by its `Ok` arm's serde
+//!    image, with the same rule for mismatched arms.
 //! 4. None of these — the check cannot be made and says so.
 //!
 //! Which tier a type reaches is known where the type is concrete, so
@@ -35,6 +36,11 @@
 //!
 //! `Debug` is deliberately not a tier: a `HashMap` renders in hash order, so a
 //! difference would not mean the value changed.
+//!
+//! What the serde tier cannot see: an order written into a string (a map a
+//! `Serialize` impl renders as text) differs for equal values; a reordered
+//! `Vec` reads as incomparable, like a hidden set; and every map is compared in
+//! key order, so an insertion-ordered one a codec reordered reads as the same.
 
 use serde::ser::{self, Serialize, Serializer};
 
@@ -101,7 +107,7 @@ pub trait CompareBySerde {
     fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
-impl<T: Serialize + ?Sized> CompareBySerde for &&&Compare<'_, T> {
+impl<T: Serialize + ?Sized> CompareBySerde for &&Compare<'_, T> {
     fn deja_comparable(&self) -> bool {
         true
     }
@@ -130,7 +136,7 @@ pub trait CompareOkArmByEq {
     fn deja_comparable(&self) -> bool;
     fn deja_compare(&self) -> Comparison;
 }
-impl<T: PartialEq, E> CompareOkArmByEq for &&Compare<'_, Result<T, E>> {
+impl<T: PartialEq, E> CompareOkArmByEq for &&&Compare<'_, Result<T, E>> {
     fn deja_comparable(&self) -> bool {
         true
     }
@@ -675,6 +681,12 @@ mod tests {
             crate::compare!(&EqOnly(1), &EqOnly(2)),
             Comparison::Different
         );
+        // A `Result` whose whole value has `PartialEq` is compared as a whole,
+        // before its `Ok` arm: two different `Err`s are different.
+        assert_eq!(
+            crate::compare!(&Err::<u8, u8>(1), &Err(2)),
+            Comparison::Different
+        );
         assert_eq!(
             crate::compare!(&Neither, &Neither),
             Comparison::Incomparable
@@ -807,9 +819,19 @@ mod tests {
             }
         }
         struct Neither;
+        #[derive(serde::Serialize)]
+        struct SerialisableError;
         assert_eq!(
             crate::compare!(&Ok::<_, Neither>(AlwaysEqual(1)), &Ok(AlwaysEqual(2))),
             Comparison::Same
+        );
+        assert_eq!(
+            crate::compare!(
+                &Ok::<_, SerialisableError>(AlwaysEqual(1)),
+                &Ok(AlwaysEqual(2))
+            ),
+            Comparison::Same,
+            "and before the whole value's serde image, when the error has only that"
         );
     }
 
