@@ -1621,7 +1621,9 @@ fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
             if !meta.is_file() {
                 continue;
             }
-            let Ok(modified) = meta.modified() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
             total = total.saturating_add(meta.len());
             entries.push((modified, meta.len(), path));
         }
@@ -3193,15 +3195,17 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("kind dir")).expect("mkdir");
         std::fs::write(&path, vec![b'x'; bytes]).expect("write");
         let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age_secs);
-        let handle = std::fs::File::options().write(true).open(&path).expect("open");
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
         handle
             .set_times(std::fs::FileTimes::new().set_modified(when))
             .expect("set mtime");
     }
 
     fn present(root: &HarnessRoot, run_id: &str, kind: &str) -> bool {
-        super::local_path_for_artifact_kind(root, run_id, kind)
-            .is_some_and(|path| path.exists())
+        super::local_path_for_artifact_kind(root, run_id, kind).is_some_and(|path| path.exists())
     }
 
     /// A cache under budget is left entirely alone — the sweep is a ceiling, not
@@ -3217,7 +3221,10 @@ mod tests {
         hydrated(&root, "run-b", "observed", 1_000, 200);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1000000");
         super::sweep_artifact_cache(&root, "");
-        assert!(present(&root, "run-a", "observed"), "under budget, nothing goes");
+        assert!(
+            present(&root, "run-a", "observed"),
+            "under budget, nothing goes"
+        );
         assert!(present(&root, "run-b", "observed"));
     }
 
@@ -3237,8 +3244,14 @@ mod tests {
         // 3000 bytes present, budget 2500: exactly one file must go.
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "2500");
         super::sweep_artifact_cache(&root, "");
-        assert!(!present(&root, "oldest", "observed"), "the oldest is evicted");
-        assert!(present(&root, "middle", "observed"), "and the sweep then stops");
+        assert!(
+            !present(&root, "oldest", "observed"),
+            "the oldest is evicted"
+        );
+        assert!(
+            present(&root, "middle", "observed"),
+            "and the sweep then stops"
+        );
         assert!(present(&root, "newest", "observed"));
     }
 
@@ -3258,8 +3271,14 @@ mod tests {
         hydrated(&root, "other", "observed", 1_000, 999);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "500");
         super::sweep_artifact_cache(&root, "serving");
-        assert!(present(&root, "serving", "observed"), "the served run is kept");
-        assert!(!present(&root, "other", "observed"), "others go to make room");
+        assert!(
+            present(&root, "serving", "observed"),
+            "the served run is kept"
+        );
+        assert!(
+            !present(&root, "other", "observed"),
+            "others go to make room"
+        );
     }
 
     /// Every hydrated kind is swept, not only the big one. A kind added to
@@ -3271,12 +3290,26 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let root = HarnessRoot::new(dir.path()).unwrap();
-        for kind in ["observed", "http_diffs", "lookup_table", "scorecard", "call_ledger", "record_graph"] {
+        for kind in [
+            "observed",
+            "http_diffs",
+            "lookup_table",
+            "scorecard",
+            "call_ledger",
+            "record_graph",
+        ] {
             hydrated(&root, "run-x", kind, 1_000, 100);
         }
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
         super::sweep_artifact_cache(&root, "");
-        for kind in ["observed", "http_diffs", "lookup_table", "scorecard", "call_ledger", "record_graph"] {
+        for kind in [
+            "observed",
+            "http_diffs",
+            "lookup_table",
+            "scorecard",
+            "call_ledger",
+            "record_graph",
+        ] {
             assert!(!present(&root, "run-x", kind), "{kind} was not swept");
         }
     }
