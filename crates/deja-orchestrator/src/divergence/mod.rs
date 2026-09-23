@@ -4914,6 +4914,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 if let Some(correlation_id) = &obs.correlation_id {
                     tail_gap_correlations.insert(correlation_id.clone());
                 }
+            } else if obs.absorbed {
+                // A miss the request survived, wherever it lands, carried the
+                // correlation on a value the recording never held. Same
+                // classification as the `absorbed` arm below, so a novel subtree
+                // cannot turn it into a pass.
+                stats.bump_kind("NovelCallAbsorbed");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    *corr_absorbed.entry(correlation_id.clone()).or_insert(0) += 1;
+                }
+                *absorbed_sites.entry(call_site_label(obs)).or_insert(0) += 1;
             } else {
                 // Shown, not scored. A novel subtree is added work, at a coarser
                 // granularity than a novel call and of the same kind, so it is
@@ -13375,6 +13385,88 @@ mod tests {
         );
         assert!(outcome.alignment.is_none());
     }
+    /// A miss the request survived is an absorbed miss wherever it lands. Inside
+    /// a subtree the recording never had, it is still a call that returned a
+    /// value the recording never held, so the correlation cannot read passed.
+    #[test]
+    fn an_absorbed_miss_inside_a_novel_subtree_is_still_absorbed() {
+        let corr = "novel-absorbed";
+        let result = serde_json::json!({"result": "Ok"});
+        let mut novel = obs("db", Some(corr), false, None, None);
+        novel.method_name = "novel".to_owned();
+        novel.graph_node_id = Some(15);
+        novel.absorbed = true;
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "root",
+                    401,
+                    result.clone(),
+                )],
+                vec![
+                    graph_observed(corr, 14, 401, "root", serde_json::json!({}), result.clone()),
+                    novel,
+                ],
+                vec![http(corr, true, vec![])],
+                vec![graph_event(
+                    corr,
+                    401,
+                    4,
+                    "root",
+                    serde_json::json!({}),
+                    result,
+                )],
+            ),
+            vec![graph_span(4, corr, None, 0, "request")],
+            vec![
+                graph_span(14, corr, None, 0, "request"),
+                graph_span(15, corr, Some(14), 1, "new-subtree"),
+            ],
+        );
+        let card = detect(&artifacts);
+        let outcome = card
+            .per_correlation
+            .iter()
+            .find(|outcome| outcome.correlation_id == corr)
+            .expect("scored");
+        assert_eq!(
+            outcome.scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "the case under test is the graph tier's novel-subtree branch"
+        );
+        assert_eq!(
+            kind_count(&card, "db", "NovelSubtree") + kind_count(&card, "db", "NovelCallAbsorbed"),
+            1,
+            "one call, one classification"
+        );
+        assert_eq!(card.summary.absorbed_misses, 1);
+        assert_eq!(outcome.absorbed_misses, 1);
+        assert!(
+            !outcome.passed && outcome.inconclusive,
+            "a correlation that continued on a fabricated value is inconclusive: {}",
+            card.verdict.reason
+        );
+        assert!(
+            card.verdict.reason.contains("absorbed miss")
+                && card.verdict.reason.contains("db::novel"),
+            "the verdict names the site that absorbed it: {}",
+            card.verdict.reason
+        );
+        assert!(card.counter_disagreements().is_empty());
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let row = rows
+            .iter()
+            .find(|row| row.method_name == "novel")
+            .expect("the absorbed call has a ledger row");
+        assert_eq!(
+            (row.kind.as_str(), row.blocking),
+            ("novel_absorbed", false),
+            "the row the viewer routes on agrees with the scorecard"
+        );
+    }
+
     #[test]
     fn mixed_graph_and_flat_correlations_keep_weighted_accounting_independent() {
         let graph_corr = "mixed-graph";
