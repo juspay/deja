@@ -133,6 +133,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Sweep the hydrated-artifact cache at boot, not only on the next view.
+    // The cache is the reason this volume fills, so a deployment that fixes it
+    // should reclaim on restart rather than waiting for someone to open a run —
+    // which on a full volume is the one thing nobody can do.
+    sweep_artifact_cache(&root, "");
+
     // Optional Postgres store: dashboard state, stage history, audit. Runs
     // still execute without it (file-backed worker state); store-backed
     // surfaces return 503 until it is up (demo/lib.sh boots the orchestrator
@@ -1533,6 +1539,119 @@ fn local_path_for_artifact_kind(
     })
 }
 
+/// Default ceiling on the hydrated-artifact cache. `DEJA_ARTIFACT_CACHE_MAX_BYTES`
+/// overrides it; `0` disables the sweep entirely.
+///
+/// Sized well under the state volume so tapes under `recordings/`, run records
+/// and the seed work still have room: the cache is the part that grows without
+/// anyone deciding to grow it.
+const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn artifact_cache_max_bytes() -> u64 {
+    std::env::var("DEJA_ARTIFACT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_BYTES)
+}
+
+/// The directories `hydrate_run_artifacts` writes into.
+///
+/// Derived by asking `local_path_for_artifact_kind` for each kind and taking the
+/// parent, rather than naming directories here — a new artifact kind then joins
+/// the sweep by existing, instead of by someone remembering to add it to a list.
+fn artifact_cache_dirs(root: &HarnessRoot) -> Vec<std::path::PathBuf> {
+    const KINDS: [&str; 6] = [
+        "observed",
+        "http_diffs",
+        "lookup_table",
+        "scorecard",
+        "call_ledger",
+        "record_graph",
+    ];
+    let mut dirs: Vec<std::path::PathBuf> = KINDS
+        .iter()
+        .filter_map(|kind| local_path_for_artifact_kind(root, "_probe", kind))
+        .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Delete least-recently-modified hydrated artifacts until the cache is under
+/// budget.
+///
+/// Every file here is a copy of an `s3://` object that the run's artifact row
+/// still points at, so eviction costs a re-download on the next view and loses
+/// nothing. Without it the cache only ever grows: `hydrate_run_artifacts` skips
+/// a path that already exists and has no counterpart that removes one, so the
+/// volume fills in proportion to runs LOOKED AT rather than runs executed.
+///
+/// `keep` is the run being served right now — evicting its files between the
+/// write and the read would turn a view into an empty one.
+///
+/// Modification time is the ordering key, not access time: `relatime` makes
+/// atime unreliable and a hydrated file is written once and then only read.
+/// So this is least-recently-HYDRATED, which for a write-once cache is the same
+/// order.
+fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
+    let budget = artifact_cache_max_bytes();
+    if budget == 0 {
+        return;
+    }
+    let mut entries: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for dir in artifact_cache_dirs(root) {
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in listing.flatten() {
+            let path = entry.path();
+            // `keep` empty means keep nothing — every name `starts_with("")`,
+            // so without this the boot sweep would skip the entire cache and
+            // reclaim exactly zero bytes.
+            if !keep.is_empty()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(keep))
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            total = total.saturating_add(meta.len());
+            entries.push((modified, meta.len(), path));
+        }
+    }
+    if total <= budget {
+        return;
+    }
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    let mut freed: u64 = 0;
+    let mut removed = 0_usize;
+    for (_, size, path) in entries {
+        if total.saturating_sub(freed) <= budget {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            freed = freed.saturating_add(size);
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        eprintln!(
+            "artifact cache: evicted {removed} file(s), {freed} byte(s); \
+             {} of {budget} byte(s) remain",
+            total.saturating_sub(freed)
+        );
+    }
+}
+
 /// Pull a run's `s3://` artifacts down to the local paths the detail endpoints
 /// read (idempotent — a path already present is left alone). k8s runs publish
 /// artifacts to S3 (the pod is ephemeral); this makes them readable on the
@@ -1575,6 +1694,9 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
                 Err(e) => eprintln!("hydrate: {} <- {}: {e}", local.display(), art.uri),
             }
         }
+        // Sweep AFTER writing, and never the run just written: a view that
+        // hydrated its own files and then evicted them would render empty.
+        sweep_artifact_cache(&root, &run_id);
     })
     .await;
 }
@@ -3065,6 +3187,146 @@ mod tests {
             newest_first(vec![older, newer])[0],
             "run-1788680145151199733"
         );
+    }
+
+    /// Seed one hydrated artifact with a chosen size and modification time.
+    fn hydrated(root: &HarnessRoot, run_id: &str, kind: &str, bytes: usize, age_secs: u64) {
+        let path = super::local_path_for_artifact_kind(root, run_id, kind).expect("known kind");
+        std::fs::create_dir_all(path.parent().expect("kind dir")).expect("mkdir");
+        std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age_secs);
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    fn present(root: &HarnessRoot, run_id: &str, kind: &str) -> bool {
+        super::local_path_for_artifact_kind(root, run_id, kind).is_some_and(|path| path.exists())
+    }
+
+    /// A cache under budget is left entirely alone — the sweep is a ceiling, not
+    /// a scheduled deletion.
+    #[test]
+    fn a_cache_under_budget_loses_nothing() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "observed", 1_000, 100);
+        hydrated(&root, "run-b", "observed", 1_000, 200);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1000000");
+        super::sweep_artifact_cache(&root, "");
+        assert!(
+            present(&root, "run-a", "observed"),
+            "under budget, nothing goes"
+        );
+        assert!(present(&root, "run-b", "observed"));
+    }
+
+    /// Over budget, the OLDEST goes first and the sweep stops as soon as it is
+    /// under — not "delete everything old", which would throw away a cache that
+    /// is merely full.
+    #[test]
+    fn eviction_takes_the_oldest_first_and_stops_at_the_budget() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "oldest", "observed", 1_000, 100);
+        hydrated(&root, "middle", "observed", 1_000, 200);
+        hydrated(&root, "newest", "observed", 1_000, 300);
+        // 3000 bytes present, budget 2500: exactly one file must go.
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "2500");
+        super::sweep_artifact_cache(&root, "");
+        assert!(
+            !present(&root, "oldest", "observed"),
+            "the oldest is evicted"
+        );
+        assert!(
+            present(&root, "middle", "observed"),
+            "and the sweep then stops"
+        );
+        assert!(present(&root, "newest", "observed"));
+    }
+
+    /// The run being served survives even when it is the oldest thing there.
+    ///
+    /// `hydrate_run_artifacts` writes then sweeps, so without this the very
+    /// files a view just downloaded could be deleted before it reads them, and
+    /// the view would render empty on a cache that was merely full.
+    #[test]
+    fn the_run_being_served_is_never_evicted() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "serving", "observed", 4_000, 1);
+        hydrated(&root, "other", "observed", 1_000, 999);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "500");
+        super::sweep_artifact_cache(&root, "serving");
+        assert!(
+            present(&root, "serving", "observed"),
+            "the served run is kept"
+        );
+        assert!(
+            !present(&root, "other", "observed"),
+            "others go to make room"
+        );
+    }
+
+    /// Every hydrated kind is swept, not only the big one. A kind added to
+    /// `local_path_for_artifact_kind` joins the sweep by existing.
+    #[test]
+    fn every_hydrated_kind_is_swept() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        for kind in [
+            "observed",
+            "http_diffs",
+            "lookup_table",
+            "scorecard",
+            "call_ledger",
+            "record_graph",
+        ] {
+            hydrated(&root, "run-x", kind, 1_000, 100);
+        }
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::sweep_artifact_cache(&root, "");
+        for kind in [
+            "observed",
+            "http_diffs",
+            "lookup_table",
+            "scorecard",
+            "call_ledger",
+            "record_graph",
+        ] {
+            assert!(!present(&root, "run-x", kind), "{kind} was not swept");
+        }
+    }
+
+    /// Zero disables the sweep, so a deployment can turn it off without editing
+    /// the image.
+    #[test]
+    fn a_zero_budget_disables_the_sweep() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "observed", 10_000, 100);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "0");
+        super::sweep_artifact_cache(&root, "");
+        assert!(present(&root, "run-a", "observed"), "zero means no ceiling");
     }
 
     /// The substring trap, and why the predicate anchors. The custom
