@@ -1669,9 +1669,11 @@ fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
 /// Pull a run's `s3://` artifacts down to the local paths the detail endpoints
 /// read (idempotent — a path already present is left alone). k8s runs publish
 /// artifacts to S3 (the pod is ephemeral); this makes them readable on the
-/// orchestrator. Best-effort: a missing/failed artifact just leaves that view
-/// empty, never errors the request. No-op for compose runs — their artifacts are
-/// already local and their URIs are filesystem paths, not `s3://`.
+/// orchestrator. A failed pull leaves the path absent; the scorecard, calls and
+/// http-diffs endpoints then answer through `absent_artifact`, which says the
+/// artifact is registered but is not on this host, while `/graph` still reads
+/// an absent side as empty. No-op for compose runs — their artifacts are already
+/// local and their URIs are filesystem paths, not `s3://`.
 ///
 /// Returns what the run registered, so a reader can tell an artifact that was
 /// never published from one that has not arrived, and which of those can be
@@ -1738,30 +1740,41 @@ struct Hydrated {
     pullable: std::collections::BTreeSet<String>,
 }
 
-/// `GET /api/v1/runs/{id}/scorecard` — serve the divergence scorecard. Prefers
-/// the runner's PRECOMPUTED scorecard (a k8s recompute would need the recording,
-/// which isn't on the orchestrator); falls back to recomputing for compose.
+/// `GET /api/v1/runs/{id}/scorecard` — serve the scorecard the run published.
+///
+/// The API does not score. A run whose scorecard is not here gets a refusal
+/// naming why; a card built on this host from whatever inputs happened to be
+/// lying around would look like a judgement the run never made.
 async fn v1_scorecard(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
-    if let Ok(content) = std::fs::read_to_string(st.root.scorecard_path(&id)) {
-        if let Ok(card) = serde_json::from_str::<serde_json::Value>(&content) {
-            return json_ok(card);
+    let content = match std::fs::read_to_string(st.root.scorecard_path(&id)) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return absent_artifact(&st, &id, "scorecard").await;
+        }
+        Err(e) => return error_resp(500, &format!("scorecard: {e}")),
+    };
+    let mut card = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(card) => card,
+        Err(e) => {
+            return error_resp(
+                500,
+                &format!("scorecard: the published artifact does not parse: {e}"),
+            )
+        }
+    };
+    // A scorer that ingested nothing can only say so; which of the run's
+    // dispositions explains it is known here and not there.
+    if let Some(reason) = card.pointer_mut("/verdict/reason") {
+        if reason.as_str() == Some(divergence::NO_ARTIFACTS_REASON) {
+            let (state, failure) = run_disposition(&st, &id).await;
+            *reason = serde_json::Value::String(empty_scorecard_reason(
+                state.as_deref(),
+                failure.as_deref(),
+            ));
         }
     }
-    match divergence::scorecard(&st.root, &id) {
-        Ok(mut card) => {
-            // An empty scorecard has three possible causes and they are not the
-            // same news. The scorer can only report that nothing arrived; which
-            // cause applies is a fact about the RUN, and this is the one place
-            // that holds both.
-            if card.verdict.reason == divergence::NO_ARTIFACTS_REASON {
-                let (state, failure) = run_disposition(&st, &id).await;
-                card.verdict.reason = empty_scorecard_reason(state.as_deref(), failure.as_deref());
-            }
-            json_ok(serde_json::to_value(&card).unwrap_or_default())
-        }
-        Err(e) => error_resp(500, &format!("scorecard: {e}")),
-    }
+    json_ok(card)
 }
 
 /// The run's state and failure message, preferring the STORE row.
@@ -1801,102 +1814,193 @@ async fn run_disposition(st: &AppState, id: &str) -> (Option<String>, Option<Str
     }
 }
 
+/// Where a run stands, as the one thing both "empty" and "absent" answers name.
+enum Disposition<'a> {
+    Failed(Option<&'a str>),
+    Completed,
+    InProgress(&'a str),
+    Unknown,
+}
+
+impl<'a> Disposition<'a> {
+    fn of(state: Option<&'a str>, failure: Option<&'a str>) -> Self {
+        match state {
+            Some("failed") => Self::Failed(failure),
+            Some("completed") => Self::Completed,
+            Some(other) => Self::InProgress(other),
+            None => Self::Unknown,
+        }
+    }
+
+    fn named(&self) -> String {
+        match self {
+            Self::Failed(failure) => format!(
+                "the run FAILED — {}",
+                failure.unwrap_or("no failure message was recorded against the run")
+            ),
+            Self::Completed => "the run reports COMPLETED".to_owned(),
+            Self::InProgress(state) => format!("the run is still {state}"),
+            Self::Unknown => "the run itself could not be read".to_owned(),
+        }
+    }
+}
+
 /// Why a scorecard that judged nothing is empty, said in the run's own terms.
 ///
-/// [`divergence::detect`] is handed the artifacts and nothing else, so the most
-/// it can say is that none arrived. WHY none arrived is a property of the run,
-/// and the three answers are different news that must not arrive as one
-/// sentence:
-///
-///  - the run is still going, so artifacts may genuinely still appear;
-///  - the run is over and FAILED, so they never will — and the failure says why;
-///  - the run is over and COMPLETED yet ingested nothing, which is an anomaly in
-///    its own right and the loudest of the three, because a run that succeeded
-///    without comparing anything is a hole in the pipeline rather than a result.
-///
-/// The standing rule this serves: an empty result names which of its possible
-/// causes applies. This one previously named none of them, and said "yet" —
-/// which told a reader the artifacts were on their way for runs that had died
-/// an hour before.
+/// The scorer is handed the artifacts and nothing else, so the most it can say
+/// is that none arrived. Why none arrived is a property of the run: still
+/// going, so they may appear; FAILED, so they never will; or COMPLETED having
+/// ingested nothing, the loudest, because a run that succeeded without
+/// comparing anything is a hole in the pipeline rather than a result.
 fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String {
     let base = divergence::NO_ARTIFACTS_REASON;
-    match state {
-        Some("failed") => format!(
-            "{base}: the run FAILED before producing any — {}. Nothing was compared, so \
-             nothing here is evidence about the candidate",
-            failure.unwrap_or("no failure message was recorded against the run")
+    let disposition = Disposition::of(state, failure);
+    let consequence = match disposition {
+        Disposition::Failed(_) => {
+            "Nothing was compared, so nothing here is evidence about the candidate"
+        }
+        Disposition::Completed => {
+            "A run that finished without ingesting anything has not scored the candidate, \
+             and this scorecard must not be read as though it had"
+        }
+        Disposition::InProgress(_) => {
+            "This is a snapshot of a run in progress rather than a verdict on it"
+        }
+        Disposition::Unknown => "Whether more are coming is therefore unknown, not \"not yet\"",
+    };
+    format!("{base}: {}. {consequence}", disposition.named())
+}
+
+/// How the artifact index accounts for a `kind` this host does not have.
+async fn artifact_registration(st: &AppState, id: &str, kind: &str) -> String {
+    let listing = match &st.store {
+        None => None,
+        Some(store) => Some(
+            store
+                .list_artifacts(id)
+                .await
+                .map(|arts| arts.into_iter().map(|a| (a.kind, a.uri)).collect())
+                .map_err(|e| e.to_string()),
         ),
-        Some("completed") => format!(
-            "{base}, yet the run reports COMPLETED — a run that finished without ingesting \
-             anything has not scored the candidate, and this scorecard must not be read as \
-             though it had"
+    };
+    describe_registration(listing, kind)
+}
+
+/// The index's account of `kind`, from its listing of the run as
+/// `(kind, uri)` rows; `None` when the deployment has no store.
+fn describe_registration(
+    listing: Option<Result<Vec<(String, String)>, String>>,
+    kind: &str,
+) -> String {
+    match listing {
+        None => "this deployment has no artifact store, so the run's own files are the only \
+                 copy and this one was never written"
+            .to_owned(),
+        Some(Ok(rows)) => match rows.into_iter().find(|(k, _)| k == kind) {
+            Some((_, uri)) => format!(
+                "it is registered at {uri} but could not be pulled to this host — a fault in \
+                 fetching it, not a fact about the run"
+            ),
+            // The index records uploads, not attempts: a run that never produced
+            // this artifact and one whose upload failed look the same from here.
+            None => "the run never registered one — whether it was not produced or its \
+                     upload failed is not recorded here"
+                .to_owned(),
+        },
+        Some(Err(e)) => format!("the artifact index could not be read ({e})"),
+    }
+}
+
+/// The one answer every detail endpoint gives for an artifact that is not
+/// here: which artifact, what the index says about it, and where the run
+/// stands. 404 because the thing asked for does not exist on this host; the
+/// body says whether it ever will.
+async fn absent_artifact(st: &AppState, id: &str, kind: &str) -> Response {
+    let registration = artifact_registration(st, id, kind).await;
+    let (state, failure) = run_disposition(st, id).await;
+    let disposition = Disposition::of(state.as_deref(), failure.as_deref());
+    let consequence = match disposition {
+        Disposition::Failed(_) => "It will not arrive; the failure is the answer",
+        Disposition::Completed => {
+            "A completed run is expected to have published it, so this is a hole in the \
+             pipeline, not an empty result"
+        }
+        Disposition::InProgress(_) => "It may still arrive",
+        Disposition::Unknown => "Whether it will arrive is unknown",
+    };
+    error_resp(
+        404,
+        &format!(
+            "no {kind} artifact for {id}: {registration}; {}. {consequence}",
+            disposition.named()
         ),
-        Some(other) => format!(
-            "{base}: the run is still {other}, so this is a snapshot of a run in progress \
-             rather than a verdict on it"
-        ),
-        None => format!(
-            "{base}, and the run itself could not be read — whether more are coming is \
-             therefore unknown, not \"not yet\""
-        ),
+    )
+}
+
+/// A JSON-lines artifact, read so every non-blank line becomes a row or a
+/// counted drop. `Ok(None)` is absence; a line that will not parse refuses the
+/// whole artifact, because a truncated stream served as a whole one is
+/// indistinguishable from a complete answer.
+fn read_jsonl_artifact(
+    path: &std::path::Path,
+    kind: &str,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    use std::io::BufRead as _;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{kind}: {e}")),
+    };
+    let mut rows = Vec::new();
+    let mut unparseable = 0usize;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("{kind}: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(&line) {
+            Ok(row) => rows.push(row),
+            Err(_) => unparseable += 1,
+        }
+    }
+    if unparseable > 0 {
+        return Err(format!(
+            "{kind}: {unparseable} of {} lines could not be parsed; refusing to serve a \
+             partial artifact as a whole one",
+            rows.len() + unparseable
+        ));
+    }
+    Ok(Some(rows))
+}
+
+/// Serve a JSON-lines artifact the run published, or name why it is not here.
+async fn serve_jsonl_artifact(
+    st: &AppState,
+    id: &str,
+    kind: &str,
+    path: std::path::PathBuf,
+) -> Response {
+    hydrate_run_artifacts(st, id).await;
+    match read_jsonl_artifact(&path, kind) {
+        Ok(Some(rows)) => json_ok(serde_json::Value::Array(rows)),
+        Ok(None) => absent_artifact(st, id, kind).await,
+        Err(e) => error_resp(500, &e),
     }
 }
 
 /// `GET /api/v1/runs/{id}/calls` — the per-call divergence ledger (recorded vs
-/// observed, classified + located) that backs the interactive diff view. Prefers
-/// the runner's PRECOMPUTED ledger (a recompute needs the recording, absent on
-/// the orchestrator for k8s runs); falls back to recomputing for compose.
+/// observed, classified + located) that backs the interactive diff view, as the
+/// run published it. A published empty ledger is a run that made no calls.
 async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
-    hydrate_run_artifacts(&st, &id).await;
-    if let Ok(content) = std::fs::read_to_string(st.root.call_ledger_path(&id)) {
-        // Every line becomes a row or a NAMED drop. Dropping unparseable lines
-        // silently served a truncated ledger as a whole one, and served an
-        // empty one as a run that made no calls — the reader could not tell a
-        // partial artifact from a complete answer.
-        let mut rows: Vec<serde_json::Value> = Vec::new();
-        let mut unparseable = 0usize;
-        for line in content.lines().filter(|l| !l.trim().is_empty()) {
-            match serde_json::from_str(line) {
-                Ok(row) => rows.push(row),
-                Err(_) => unparseable += 1,
-            }
-        }
-        if unparseable > 0 {
-            return error_resp(
-                500,
-                &format!(
-                    "call ledger: {unparseable} of {} lines could not be parsed; \
-                     refusing to serve a partial ledger as a whole one",
-                    rows.len() + unparseable
-                ),
-            );
-        }
-        if !rows.is_empty() {
-            return json_ok(serde_json::Value::Array(rows));
-        }
-    }
-    // Falls through when the precomputed artifact is absent or held nothing.
-    // `call_ledger` refuses rather than returning an empty ledger when its own
-    // inputs are absent, so a 200 here means the run genuinely made no calls.
-    match divergence::call_ledger(&st.root, &id) {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => error_resp(500, &format!("call ledger: {e}")),
-    }
+    let path = st.root.call_ledger_path(&id);
+    serve_jsonl_artifact(&st, &id, "call_ledger", path).await
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
-/// (status + field-level body diff), parsed from the run's http-diff stream.
+/// (status + field-level body diff), from the run's published http-diff stream.
 async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
-    hydrate_run_artifacts(&st, &id).await;
-    let rows: Vec<serde_json::Value> = std::fs::read_to_string(st.root.http_diff_path(&id))
-        .map(|c| {
-            c.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    json_ok(serde_json::Value::Array(rows))
+    let path = st.root.http_diff_path(&id);
+    serve_jsonl_artifact(&st, &id, "http_diffs", path).await
 }
 
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
@@ -3505,18 +3609,18 @@ mod tests {
     // artifacts, silent about the run, and the "yet" told the reader more were
     // coming when the run had been dead for an hour.
 
-    /// THE SEAM. `detect` writes this reason and the scorecard endpoint matches
-    /// on it to decide whether to name the run's disposition. If the scorer's
-    /// wording drifts, the endpoint stops matching and the naming silently stops
-    /// happening — the exact producer/consumer split that keeps costing this
-    /// repo. Nothing else in the suite would notice, so this is the thing that
-    /// notices.
+    /// THE SEAM. The lifecycle's scorer writes this reason into the card it
+    /// publishes, and the scorecard endpoint matches on it to decide whether to
+    /// name the run's disposition. If the scorer's wording drifts, the endpoint
+    /// stops matching and the naming silently stops happening — the exact
+    /// producer/consumer split that keeps costing this repo.
     #[test]
     fn the_scorer_emits_exactly_the_reason_the_endpoint_matches_on() {
         let dir = tempfile::tempdir().unwrap();
         let root = HarnessRoot::new(dir.path()).unwrap();
         // No artifacts of any kind: the `nothing` arm of `detect`.
-        let card = deja_orchestrator::divergence::scorecard(&root, "run-with-nothing").unwrap();
+        let card =
+            deja_orchestrator::divergence::detect_and_score(&root, "run-with-nothing").unwrap();
         assert!(
             card.verdict.inconclusive,
             "an artifact-less run is not judgeable"
@@ -3595,6 +3699,211 @@ mod tests {
             assert!(reason.starts_with(base), "state {state:?}: {reason}");
         }
     }
+
+    // -- the API serves what the run published, and names what it did not ----
+    //
+    // Each detail endpoint has exactly three answers: the artifact parses and is
+    // served; it is absent and the response says why; it is present and will not
+    // parse, and the response refuses with a count. No endpoint computes an
+    // artifact the run did not publish.
+
+    fn run_in(state: &AppState, run_id: &str, status: RunStatus, failure: Option<&str>) {
+        let mut run = pending_run(run_id);
+        run.status = status;
+        run.failure_reason = failure.map(str::to_owned);
+        deja_orchestrator::write_json(&state.root.run_path(run_id), &run).unwrap();
+    }
+
+    async fn get_json(state: AppState, uri: String) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_router(state).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn error_of(body: &serde_json::Value) -> &str {
+        body.get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("expected an error body, got {body}"))
+    }
+
+    /// A failed run with no scorecard gets a refusal carrying the failure, not a
+    /// card synthesised to look like a judgement.
+    #[tokio::test]
+    async fn an_absent_scorecard_is_refused_with_the_runs_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(
+            &state,
+            "run-a",
+            RunStatus::Failed,
+            Some("session not found"),
+        );
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-a/scorecard".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("scorecard"), "names the artifact: {err}");
+        assert!(err.contains("FAILED"), "names the run's state: {err}");
+        assert!(
+            err.contains("session not found"),
+            "carries the failure: {err}"
+        );
+    }
+
+    /// Inputs on disk but no published ledger: the ledger is absent, not
+    /// rebuilt from those inputs inside the API process.
+    #[tokio::test]
+    async fn an_absent_ledger_is_not_rebuilt_from_inputs_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-b", RunStatus::Completed, None);
+        for path in [
+            state.root.lookup_table_path("run-b"),
+            state.root.observed_path("run-b"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-b/calls".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("call_ledger"), "names the artifact: {err}");
+        assert!(err.contains("COMPLETED"), "names the run's state: {err}");
+    }
+
+    /// A ledger the run published empty is a run that made no calls — a fact
+    /// about the run, served as one.
+    #[tokio::test]
+    async fn a_published_empty_ledger_is_a_run_that_made_no_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-c", RunStatus::Completed, None);
+        let path = state.root.call_ledger_path("run-c");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-c/calls".into()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// A missing http-diff stream used to answer `[]`, which reads as "this run
+    /// had no HTTP diffs".
+    #[tokio::test]
+    async fn an_absent_http_diff_stream_is_not_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-d", RunStatus::Running, None);
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-d/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("http_diffs"), "names the artifact: {err}");
+        assert!(
+            err.contains("still running"),
+            "names the run's state: {err}"
+        );
+    }
+
+    /// An unparseable line is counted and refused, not dropped from a stream
+    /// that is then served as whole.
+    #[tokio::test]
+    async fn an_unparseable_http_diff_line_is_refused_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-e", RunStatus::Completed, None);
+        let path = state.root.http_diff_path("run-e");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"correlation_id\":\"c1\"}\n{truncated\n").unwrap();
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-e/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("1 of 2"), "counts the drop: {err}");
+    }
+
+    /// The other polarity: a stream the run published empty is served empty.
+    #[tokio::test]
+    async fn a_published_empty_http_diff_stream_is_served_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-f", RunStatus::Completed, None);
+        let path = state.root.http_diff_path("run-f");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-f/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// A card the scorer PUBLISHED with nothing ingested still names the run's
+    /// disposition. Produced by `detect_and_score`, the lifecycle's own writer,
+    /// so this is the producer's wording meeting the endpoint's match.
+    #[tokio::test]
+    async fn a_published_empty_scorecard_names_the_runs_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-g", RunStatus::Completed, None);
+        deja_orchestrator::divergence::detect_and_score(&state.root, "run-g").unwrap();
+        assert!(
+            state.root.scorecard_path("run-g").exists(),
+            "precondition: the producer wrote the path the endpoint reads"
+        );
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-g/scorecard".into()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reason = body["verdict"]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("COMPLETED"), "{reason}");
+    }
+
+    /// Registered-but-absent is a fetch fault and says where the object is;
+    /// a DIFFERENT kind registered for the run is not this one.
+    #[test]
+    fn a_registered_artifact_that_is_absent_is_a_fetch_fault() {
+        let rows = vec![
+            (
+                "scorecard".to_owned(),
+                "s3://b/runs/r/scorecard.json".to_owned(),
+            ),
+            (
+                "call_ledger".to_owned(),
+                "s3://b/runs/r/call_ledger.jsonl".to_owned(),
+            ),
+        ];
+        let said = describe_registration(Some(Ok(rows.clone())), "call_ledger");
+        assert!(said.contains("s3://b/runs/r/call_ledger.jsonl"), "{said}");
+        assert!(said.contains("could not be pulled"), "{said}");
+
+        let said = describe_registration(Some(Ok(rows)), "http_diffs");
+        assert!(said.contains("never registered"), "{said}");
+        assert!(
+            said.contains("upload failed"),
+            "names the case it cannot rule out: {said}"
+        );
+    }
+
+    /// No store and an unreadable index are each their own answer.
+    #[test]
+    fn no_store_and_an_unreadable_index_are_named_apart() {
+        let said = describe_registration(None, "http_diffs");
+        assert!(said.contains("no artifact store"), "{said}");
+        let said = describe_registration(Some(Err("pool timed out".to_owned())), "http_diffs");
+        assert!(
+            said.contains("could not be read (pool timed out)"),
+            "{said}"
+        );
+    }
+
     // ---- grouping: a deployment and a day ----
 
     /// The group is derived from an id that already exists. Every recording ever

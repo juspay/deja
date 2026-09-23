@@ -208,9 +208,18 @@ fn every_artifact_a_scoped_run_produces_stays_inside_its_scope() {
     //    endpoint.
     let nodes = recording.graph_nodes().expect("scoped record graph");
 
-    // 3. The scorecard and the per-call ledger.
+    // 3. The scorecard and the per-call ledger, the ledger read back from the
+    //    file the scorer published rather than rebuilt.
     let card = divergence::detect_and_score(&root, run_id).expect("score");
-    let ledger = divergence::call_ledger(&root, run_id).expect("ledger");
+    let ledger: Vec<serde_json::Value> = std::fs::read_to_string(root.call_ledger_path(run_id))
+        .expect("the scorer publishes a ledger")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("ledger line"))
+        .collect();
+    assert!(
+        !ledger.is_empty(),
+        "precondition: a ledger with no rows cannot carry a foreign correlation"
+    );
 
     let in_scope: BTreeSet<String> = filter.iter().cloned().collect();
     let artifacts: Vec<(&str, serde_json::Value)> = vec![

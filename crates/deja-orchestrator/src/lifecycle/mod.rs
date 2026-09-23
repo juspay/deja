@@ -1308,7 +1308,8 @@ const REPLAY_STREAM_ARTIFACTS: [(&str, &str); 6] = [
     // the one artifact that explains a seed-shaped divergence was unreadable
     // the moment the pod died. It publishes like every other stream; the same
     // prefix already carries the full lookup table, so this adds no new kind
-    // of egress.
+    // of egress. Nothing in the orchestrator reads it back; it is published as
+    // the run's record of seeding, for the reader and for audit.
     ("seed_certificate", "seed-certificate.json"),
 ];
 
