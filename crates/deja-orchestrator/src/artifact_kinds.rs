@@ -123,10 +123,6 @@ pub const RUN_ARTIFACT_KINDS: [RunArtifactKind; 7] = [
     RECORD_GRAPH,
 ];
 
-pub fn named(name: &str) -> Option<&'static RunArtifactKind> {
-    RUN_ARTIFACT_KINDS.iter().find(|kind| kind.name == name)
-}
-
 /// The kinds the lifecycle's publish loop publishes.
 pub fn streamed() -> impl Iterator<Item = &'static RunArtifactKind> {
     RUN_ARTIFACT_KINDS
