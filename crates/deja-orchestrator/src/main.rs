@@ -135,12 +135,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // Sweep the hydrated-artifact cache at boot, not only on the next view.
-    // The cache is the reason this volume fills, so a deployment that fixes it
-    // should reclaim on restart rather than waiting for someone to open a run —
-    // which on a full volume is the one thing nobody can do.
-    sweep_artifact_cache(&root, "");
-
     // Optional Postgres store: dashboard state, stage history, audit. Runs
     // still execute without it (file-backed worker state); store-backed
     // surfaces return 503 until it is up (demo/lib.sh boots the orchestrator
@@ -176,6 +170,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Sweep the hydrated-artifact cache at boot, not only on the next view.
+    // The cache is the reason this volume fills, so a deployment that fixes it
+    // should reclaim on restart rather than waiting for someone to open a run —
+    // which on a full volume is the one thing nobody can do. After the
+    // executor, because only it says whether these files are a cache at all.
+    evict_cached_artifacts(&root, "", LocalArtifacts::of(&executor));
+
     let state = AppState {
         root: root.clone(),
         store,
@@ -1614,6 +1615,34 @@ fn cached_file_run(root: &HarnessRoot, path: &std::path::Path) -> Option<String>
     })
 }
 
+/// What the files in this deployment's artifact directories are. The paths
+/// are the same either way; which one applies is decided by the executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalArtifacts {
+    /// k8s: runs publish from the pod to S3, and the orchestrator hydrates
+    /// copies of those objects. Evicting one costs a re-download.
+    CopiesOfStore,
+    /// compose: the lifecycle runs in-process and registers local paths, and
+    /// nothing is hydrated. Evicting one deletes the artifact.
+    OnlyCopies,
+}
+
+impl LocalArtifacts {
+    fn of(executor: &ExecutorSelection) -> Self {
+        match executor {
+            ExecutorSelection::K8s(_) => Self::CopiesOfStore,
+            ExecutorSelection::Compose => Self::OnlyCopies,
+        }
+    }
+}
+
+/// Keep the artifact cache under budget, where these files are a cache.
+fn evict_cached_artifacts(root: &HarnessRoot, keep: &str, local: LocalArtifacts) {
+    if local == LocalArtifacts::CopiesOfStore {
+        sweep_artifact_cache(root, keep);
+    }
+}
+
 /// Delete least-recently-modified hydrated artifacts until the cache is under
 /// budget.
 ///
@@ -1713,6 +1742,7 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> 
         .collect();
     let root = st.root.clone();
     let run_id = run_id.to_owned();
+    let local = LocalArtifacts::of(&st.executor);
     // object_store's sync API blocks on its own runtime — run it off the async
     // worker so we never nest block_on inside tokio.
     let _ = tokio::task::spawn_blocking(move || {
@@ -1744,7 +1774,7 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> 
         }
         // Sweep AFTER writing, and never the run just written: a view that
         // hydrated its own files and then evicted them would render empty.
-        sweep_artifact_cache(&root, &run_id);
+        evict_cached_artifacts(&root, &run_id, local);
     })
     .await;
     Some(Hydrated {
@@ -4293,6 +4323,40 @@ mod tests {
             );
         }
         assert!(root.run_path("run-old").exists(), "the run record survives");
+    }
+
+    /// On compose the artifact directories hold the ONLY copy of each file:
+    /// the lifecycle ran in-process and registered local paths, and nothing
+    /// was hydrated. Evicting there is deletion, whatever the budget says.
+    #[test]
+    fn nothing_is_evicted_where_local_files_are_the_only_copies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-compose", "scorecard", 1_000, 10);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(
+            &root,
+            "",
+            super::LocalArtifacts::of(&ExecutorSelection::Compose),
+        );
+        assert!(
+            present(&root, "run-compose", "scorecard"),
+            "compose's only copy survives"
+        );
+    }
+
+    /// The other polarity: where local files are copies of stored objects, the
+    /// same fixture is evicted.
+    #[test]
+    fn copies_of_stored_objects_are_evicted_over_budget() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-k8s", "scorecard", 1_000, 10);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(!present(&root, "run-k8s", "scorecard"), "a copy is evicted");
     }
 
     /// `keep` protects one run, not every run whose id it prefixes.
