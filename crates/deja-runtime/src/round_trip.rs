@@ -14,7 +14,8 @@
 //! 1. `PartialEq` — the type's own equality, which can see fields serialisation
 //!    does not carry. For a `Result` whose error has none, its `Ok` arm's
 //!    `PartialEq` (an `Ok` rebuilt as an `Err` is different; two `Err`s cannot
-//!    be compared).
+//!    be compared — the recorder never compares an error arm, so this ranks
+//!    the `Ok` type's equality above the whole value's serde image at no cost).
 //! 2. `Serialize` — the serde data model, which is finer than JSON: it keeps
 //!    `Some` apart from its contents, a unit apart from `None`, a newtype apart
 //!    from its field and every integer width apart. [`fingerprint`] renders that
@@ -807,8 +808,8 @@ mod tests {
         );
     }
 
-    /// For a `Result` whose error offers nothing, the `Ok` arm is compared by
-    /// its own equality before its serde image.
+    /// For a `Result` whose error has no `PartialEq`, the `Ok` arm is compared
+    /// by its own equality before any serde image.
     #[test]
     fn the_ok_arms_partial_eq_outranks_its_serde_image() {
         #[derive(serde::Serialize)]
