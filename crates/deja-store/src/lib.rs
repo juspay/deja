@@ -433,7 +433,10 @@ impl Store {
     /// Every completed run created to be measured against `baseline_run_id`
     /// (`params.delta_against`), so their deltas can be settled when the
     /// baseline's own result lands.
-    pub async fn runs_measured_against(&self, baseline_run_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    pub async fn runs_measured_against(
+        &self,
+        baseline_run_id: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT run_id FROM replay_runs
              WHERE params ->> 'delta_against' = $1 AND state = 'completed'
