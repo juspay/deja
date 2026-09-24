@@ -70,11 +70,10 @@ pub fn identity_applies(value: &Value) -> bool {
     }
 }
 
-/// The lookup hash of a call's identity. In a domain of its own, so it never
-/// equals an exact-args hash by construction.
+/// The lookup hash of a call's identity. Identity keys are only ever looked up
+/// among identity entries, never beside exact ones.
 pub fn identity_args_hash(args: &Value) -> u64 {
-    let domain = crate::fnv1a_str(crate::FNV_OFFSET_BASIS, "deja.identity/1");
-    crate::replay::hash_value(domain, &identity_form(args))
+    crate::replay::hash_value(crate::FNV_OFFSET_BASIS, &identity_form(args))
 }
 
 /// `None` when `recorded` and `observed` are different calls. Otherwise what
@@ -151,8 +150,9 @@ fn form(value: &Value) -> Value {
 }
 
 /// A string that holds a JSON object or array, parsed. Anything else, a JSON
-/// scalar included, stays text.
-fn embedded_document(text: &str) -> Option<Value> {
+/// scalar included, stays text. Only a string that starts and ends like one is
+/// parsed at all.
+pub fn embedded_document(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     let bracketed = (trimmed.starts_with('{') && trimmed.ends_with('}'))
         || (trimmed.starts_with('[') && trimmed.ends_with(']'));
