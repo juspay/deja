@@ -47,6 +47,9 @@ tempfile = "3"
 error-stack = { version = "0.4", default-features = false }
 # Tests drive the runtime surface (hooks, dispatch, wire value types) directly.
 deja-runtime = { path = "../deja-runtime" }
+# A span-path locus needs a span, which needs a subscriber carrying deja's layer.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [lints.clippy]
 dbg_macro = "deny"

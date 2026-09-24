@@ -11,6 +11,8 @@
 //! Own test binary: `set_global_runtime_hook` is a one-shot `OnceLock`.
 #![allow(unused_braces)]
 
+use tracing_subscriber::prelude::*;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
@@ -76,6 +78,7 @@ async fn declared_insert(row: &str) -> Result<u64, DbError> {
     boundary = "db",
     component = "tests::macro_neutral_error",
     operation = "undeclared_insert",
+    site = "undeclared_insert",
     replay = Execute,
     codec = EnvelopeCodec,
     args = serde_json::json!({ "row": row }),
@@ -97,6 +100,23 @@ async fn undeclared_insert(row: &str) -> Result<u64, DbError> {
     neutral_error = is_unique,
 )]
 fn declared_sync_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+/// Declared neutral with no site, called inside a span: found by its span path,
+/// the way production calls are.
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "span_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+    neutral_error = is_unique,
+)]
+async fn span_insert(row: &str) -> Result<u64, DbError> {
     let _ = row;
     BODY_RUNS.fetch_add(1, Ordering::SeqCst);
     Ok(1)
@@ -161,6 +181,14 @@ fn site(name: &str) -> deja::Locus {
 
 #[test]
 fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
+    let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer::new());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // The span path the runtime computes for this span, so the recorded row is
+    // keyed where a call made inside it looks.
+    let span_path = {
+        let _span = tracing::info_span!("insert_process").entered();
+        deja::__private::current_span_path().expect("a span path inside a span")
+    };
     let unique = serde_json::json!({ "version": 1, "result": "Err", "kind": "UniqueViolation" });
     let other =
         serde_json::json!({ "version": 1, "result": "Err", "kind": "SerializationFailure" });
@@ -178,7 +206,13 @@ fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
             recorded("declared_insert", site("declared_insert"), "b", other),
             recorded(
                 "undeclared_insert",
-                deja::Locus::Unlocated,
+                site("undeclared_insert"),
+                "a",
+                unique.clone(),
+            ),
+            recorded(
+                "span_insert",
+                deja::Locus::SpanPath { path: span_path },
                 "a",
                 unique.clone(),
             ),
@@ -229,6 +263,17 @@ fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
         "the sync boundary did not run"
     );
 
+    // Declared, found by its span path, the production rank: served.
+    {
+        let _span = tracing::info_span!("insert_process").entered();
+        assert_eq!(block_on(span_insert("a")), Err(DbError::UniqueViolation));
+    }
+    assert_eq!(
+        BODY_RUNS.load(Ordering::SeqCst),
+        2,
+        "the span-path boundary did not run"
+    );
+
     // Declared, but its row is found only unlocated: run, not served.
     assert_eq!(block_on(unlocated_insert("a")), Ok(1));
     assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 3);
@@ -245,8 +290,9 @@ fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
         vec![
             ("declared_insert".to_owned(), Some(1), Served),
             ("declared_insert".to_owned(), Some(1), Shadow),
-            ("undeclared_insert".to_owned(), Some(3), Shadow),
+            ("undeclared_insert".to_owned(), Some(1), Shadow),
             ("declared_sync_insert".to_owned(), Some(1), Served),
+            ("span_insert".to_owned(), Some(2), Served),
             ("unlocated_insert".to_owned(), Some(3), Shadow),
         ],
         "every call found its own recorded row, and only those found at their site were served"

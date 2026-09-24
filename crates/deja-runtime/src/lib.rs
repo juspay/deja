@@ -4532,6 +4532,13 @@ pub fn serves_recorded_error(recorded: &serde_json::Value, site_declares_neutral
         && recorded.get("result").and_then(serde_json::Value::as_str) == Some("Err")
 }
 
+/// The resolution ranks a recorded error may be served from: a site the author
+/// declared (1) or the call's span path (2). Both find this call by where it
+/// is. An unlocated match (3) can hand one call another call's recorded value,
+/// and a served error is never compared afterwards, so a wrong one would go
+/// unseen. Anything else, no resolution included, runs the boundary.
+const SERVING_RANKS: [u8; 2] = [1, 2];
+
 /// Serve this call's own recorded error instead of running the boundary, when
 /// the site declared it state-neutral; otherwise hand the token back to run.
 ///
@@ -4540,13 +4547,6 @@ pub fn serves_recorded_error(recorded: &serde_json::Value, site_declares_neutral
 /// the peek found it by the call's site ([`SERVING_RANKS`]). A recorded value
 /// that does not rebuild, or that the site's predicate does not accept, falls
 /// through to running the boundary, never to a fail-stop.
-/// The resolution ranks a recorded error may be served from: a site the author
-/// declared (1) or the call's span path (2). Both find this call by where it
-/// is. An unlocated match (3) can hand one call another call's recorded value,
-/// and a served error is never compared afterwards, so a wrong one would go
-/// unseen. Anything else, no resolution included, runs the boundary.
-const SERVING_RANKS: [u8; 2] = [1, 2];
-
 // The token already moved by value into the observer; handing it back moves it
 // once more, where boxing it would allocate on every executed call.
 #[allow(clippy::result_large_err)]
