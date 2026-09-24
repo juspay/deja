@@ -9187,6 +9187,13 @@ mod tests {
         )
     }
 
+    /// A page whose script holds a document inside a quoted string.
+    fn quoted_embedding(quote: char, document: &str) -> serde_json::Value {
+        serde_json::Value::String(format!(
+            "<html><body><script>var s = {quote}{document}{quote};</script></body></html>"
+        ))
+    }
+
     /// What the embedded comparison still refuses. Each of these blocks on
     /// `main` and must keep blocking: the documents are only paired when
     /// everything around them is byte-identical, only objects are read as
@@ -9276,6 +9283,16 @@ mod tests {
                 "keys moved inside an array member: the JSON-body rule's narrowing",
                 page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
                 page_embedding(r#"{"m":[{"a":0,"b":1},{"a":5}]}"#, "Collect"),
+            ),
+            (
+                "a document inside a template literal: a quote in a value ends it",
+                quoted_embedding('`', r#"{"a":"`+x+`","m":["x","y"]}"#),
+                quoted_embedding('`', r#"{"m":["y","x"],"a":"`+x+`"}"#),
+            ),
+            (
+                "a document inside a single-quoted string",
+                quoted_embedding('\'', r#"{"a":"'","b":"-x-'","m":["x","y"]}"#),
+                quoted_embedding('\'', r#"{"b":"-x-'","a":"'","m":["y","x"]}"#),
             ),
             (
                 "a number was written differently",
