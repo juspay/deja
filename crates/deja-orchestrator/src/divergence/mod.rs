@@ -4067,6 +4067,15 @@ fn embedded_document_pairs(
     if baseline.text != candidate.text || baseline.documents.len() > MAX_EMBEDDED_DOCUMENTS {
         return None;
     }
+    // A document that opens a quoted string (`'…'`, a template literal) sits
+    // in a context a quote inside one of its values can end, so its order can
+    // change how the page parses. The texts are equal, so one side decides.
+    if baseline.text[..baseline.documents.len()]
+        .iter()
+        .any(|before| before.trim_end().ends_with(['\'', '"', '`']))
+    {
+        return None;
+    }
     // Read as JSON only where the documents differ in arrangement alone: the
     // same values as written, each keeping its spelling, and the same document
     // apart from array order. Not where a document holds markup: its order can
