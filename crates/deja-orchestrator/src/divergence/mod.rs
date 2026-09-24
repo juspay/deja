@@ -2229,6 +2229,14 @@ fn value_verdict(
     observed_sql: Option<&str>,
 ) -> ValueVerdict {
     if recorded == observed {
+        // JSON object equality ignores key order, so an object whose keys
+        // moved compares equal here. Arguably that is right: a JSON object has
+        // no order. It is named anyway, as the order-only difference a permuted
+        // array is, because a tolerance that leaves nothing behind cannot be
+        // shown to be working.
+        if json_key_order_differs(recorded, observed) {
+            return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
+        }
         return ValueVerdict::Equal;
     }
     if let Some(event) = event {
@@ -3827,6 +3835,25 @@ fn order_canonical_diff(
 /// the args and results of a matched call. Those were separate paths, and a
 /// permutation was absorbed in one and reported as a value divergence in the
 /// other, for no reason other than which code reached it first.
+/// Whether two values that are equal as JSON hold some object's keys in a
+/// different order. Only meaningful for equal values: it compares key order
+/// and recurses through objects and arrays, not values.
+fn json_key_order_differs(recorded: &serde_json::Value, observed: &serde_json::Value) -> bool {
+    match (recorded, observed) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            !a.keys().eq(b.keys())
+                || a.iter().any(|(key, value)| {
+                    b.get(key)
+                        .is_some_and(|other| json_key_order_differs(value, other))
+                })
+        }
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+            a.iter().zip(b).any(|(x, y)| json_key_order_differs(x, y))
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn json_order_only_difference(
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
