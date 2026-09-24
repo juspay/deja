@@ -3,7 +3,8 @@
 // COMPUTED FROM THE RUN OBJECT ALONE — `run.state`, `run.failure`, and the
 // scorecard the API embeds on the run row. Never from `api.scorecard()`.
 //
-// That endpoint SYNTHESISES a scorecard when no artifact exists. Verified live
+// That endpoint used to SYNTHESISE a scorecard when no artifact existed (it now
+// answers 404 naming the cause, but a row is still the one source). Verified live
 // on run-18c888854e44e86e (state=failed, "session not found under s3://…"):
 // `GET /runs/{id}/scorecard` returns 200 with
 //     correlation_scope: [3 ids]        <- looks like a scope was applied
