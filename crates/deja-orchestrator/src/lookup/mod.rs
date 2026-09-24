@@ -652,6 +652,111 @@ mod tests {
         assert_eq!(served, Some(serde_json::json!("served")));
     }
 
+    /// Several uncorrelated calls at one site: render `recorded` (args, result)
+    /// in order, then make the `observed` calls in order; what each was served.
+    fn replay_calls(
+        recorded: &[(serde_json::Value, &str)],
+        observed: &[serde_json::Value],
+    ) -> (Vec<Option<serde_json::Value>>, LookupTable) {
+        use deja::DejaHook;
+        let events: Vec<serde_json::Value> = recorded
+            .iter()
+            .enumerate()
+            .map(|(i, (args, result))| {
+                let mut e = event("redis", i as u64 + 1, serde_json::Value::Null);
+                e["correlation_id"] = serde_json::Value::Null;
+                e["args"] = args.clone();
+                e["result"] = serde_json::json!(result);
+                e
+            })
+            .collect();
+        let (_dir, recording) = write_events(&events);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let hook = deja::LookupTableHook::from_source(
+            TableSource(Some(table.clone())),
+            deja::InMemoryObservedSink::new(),
+        )
+        .expect("install");
+        let served = observed
+            .iter()
+            .map(|args| {
+                hook.try_replay_with_context(deja::ReplayLookup {
+                    boundary: "redis",
+                    trait_name: "T",
+                    method_name: "m",
+                    args,
+                    callsite_identity: None,
+                    caller_location: None,
+                })
+            })
+            .collect();
+        (served, table)
+    }
+
+    /// The exact lookup wins: a call that matches one recording exactly is
+    /// served that recording, not another with its identity.
+    #[test]
+    fn an_exact_match_wins_over_an_identity_match() {
+        let (served, _) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["b", "a"] }), "second"),
+            ],
+            &[serde_json::json!({ "ids": ["b", "a"] })],
+        );
+        assert_eq!(served, vec![Some(serde_json::json!("second"))]);
+    }
+
+    /// Identity occurrences advance on every call, hit or miss, as the
+    /// renderer's do on every event: the second call with this identity is
+    /// served the second recording even though the first hit exactly.
+    #[test]
+    fn identity_occurrences_advance_on_calls_the_exact_lookup_served() {
+        let (served, _) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["a", "b"] }), "second"),
+            ],
+            &[
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["b", "a"] }),
+            ],
+        );
+        assert_eq!(
+            served,
+            vec![
+                Some(serde_json::json!("first")),
+                Some(serde_json::json!("second"))
+            ]
+        );
+    }
+
+    /// The second lookup holds only the events another call could reach by
+    /// identity alone.
+    #[test]
+    fn identity_entries_are_written_only_where_identity_applies() {
+        let (_, table) = replay_calls(
+            &[
+                (serde_json::json!({ "id": 1, "n": [2, 1] }), "plain"),
+                (serde_json::json!({ "ids": ["a", "b"] }), "set"),
+            ],
+            &[],
+        );
+        assert!(!table.identity_entries.is_empty());
+        assert!(
+            table
+                .identity_entries
+                .iter()
+                .all(|e| e.source_event_global_sequence == 2),
+            "only the event holding a set: {:?}",
+            table
+                .identity_entries
+                .iter()
+                .map(|e| e.source_event_global_sequence)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// What identity still refuses: a changed member, a changed count, a
     /// string that is not a document, and a document sent as an object where
     /// the recording sent it as text.
