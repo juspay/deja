@@ -50,7 +50,7 @@ impl RunArtifactKind {
 
 pub const LOOKUP_TABLE: RunArtifactKind = RunArtifactKind {
     name: "lookup_table",
-    object: "lookup_table.jsonl",
+    object: "lookup_table.json",
     local_path: HarnessRoot::lookup_table_path,
     publish: Publish::Stream,
     served: true,
@@ -167,6 +167,18 @@ mod tests {
                 kind.name
             );
         }
+    }
+
+    /// The raw endpoint serves a `.jsonl` object as NDJSON. The lookup table is
+    /// one document written on one line, so under that name a line reader gets
+    /// one plausible record, the envelope, instead of an error.
+    #[test]
+    fn the_lookup_table_is_published_as_a_json_document() {
+        assert!(
+            LOOKUP_TABLE.object.ends_with(".json"),
+            "{} is one JSON document, not a line stream",
+            LOOKUP_TABLE.object
+        );
     }
 
     #[test]
