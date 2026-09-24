@@ -742,6 +742,12 @@ impl UnplantedPresence {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn names(&self, correlation: &str, key: &str) -> bool {
+        self.0
+            .contains(&(correlation.to_owned(), canonical_key(key)))
+    }
+
     /// Whether `event`, recorded in `correlation`, read a key the seeder could
     /// not plant.
     pub fn read_by(&self, correlation: Option<&str>, event: Option<&deja::BoundaryEvent>) -> bool {
@@ -4812,12 +4818,6 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                         continue;
                     }
                 }
-                // The args-aligned execute divergence is the ORIGIN of a
-                // total-derivative cascade: the candidate ran the REAL boundary
-                // (typically a READ) and got a value differing from the recorded
-                // baseline (e.g. re-keyed read 0.10 -> 0.20). Tag it distinctly
-                // (`ValueDivergedOrigin`) so the UI can tell the CAUSE (this read)
-                // from the CONSEQUENCE (a downstream write paired args-free below).
                 // The seeder recorded that it could not plant a key this call's
                 // recorded event read: the result differs because the row is
                 // missing, so the divergence is the missing seed's. Only here —
@@ -4838,6 +4838,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     }
                     continue;
                 }
+                // The args-aligned execute divergence is the ORIGIN of a
+                // total-derivative cascade: the candidate ran the REAL boundary
+                // (typically a READ) and got a value differing from the recorded
+                // baseline (e.g. re-keyed read 0.10 -> 0.20). Tag it distinctly
+                // (`ValueDivergedOrigin`) so the UI can tell the CAUSE (this read)
+                // from the CONSEQUENCE (a downstream write paired args-free below).
                 stats.bump_kind("ValueDivergedOrigin");
                 value_divergences += 1;
                 blocking_side_effect += 1;

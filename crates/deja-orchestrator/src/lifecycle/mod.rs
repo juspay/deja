@@ -5963,6 +5963,43 @@ mod tests {
         }
     }
 
+    /// The seam between the writer of the seed certificate and the scorer that
+    /// reads it: a presence skip written here must reach the scorer's
+    /// evidence. Both sides name the fields by string, so a rename on either
+    /// would otherwise switch the scorer's demotion off with every test green.
+    #[test]
+    fn the_scorer_reads_a_presence_skip_the_lifecycle_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-seam";
+        let mut certificate = super::SeedCertificate::new("rec-1", run_id, true);
+        let outcome = super::SeedDbOutcome::skipped_for(
+            super::NoSeedableRows::RecordedPresence,
+            "query-fallback",
+            &query_key(),
+        );
+        certificate.push(
+            super::SeedCertificateEntry::new(
+                &Some("c1".to_owned()),
+                &presence_entry(),
+                None,
+                None,
+                outcome.status,
+                outcome.readback,
+            )
+            .with_skip_reason(outcome.skip_reason),
+        );
+        crate::write_json(&root.seed_certificate_path(run_id), &certificate).unwrap();
+
+        let art = crate::divergence::load_artifacts(&root, run_id).unwrap();
+        assert!(
+            art.unplanted_presence.names("c1", &query_key()),
+            "the scorer must see the skip the lifecycle wrote: {:?}",
+            art.unplanted_presence
+        );
+        assert!(!art.unplanted_presence.names("c2", &query_key()));
+    }
+
     fn certificate_entry_for(outcome: super::SeedDbOutcome) -> serde_json::Value {
         let entry = super::SeedCertificateEntry::new(
             &Some("c1".to_owned()),
