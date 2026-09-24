@@ -3908,6 +3908,10 @@ const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
 /// A page carrying more documents than this compares as text.
 const MAX_EMBEDDED_DOCUMENTS: usize = 16;
 
+/// A document nested deeper than this compares as text: the structural
+/// comparison costs size times depth squared.
+const MAX_EMBEDDED_DEPTH: usize = 32;
+
 /// A non-JSON text split into the JSON objects embedded in it and the text
 /// around them. A document starts at a `{` that begins a complete JSON object
 /// and runs to that object's end; any other brace stays text.
@@ -9106,6 +9110,15 @@ mod tests {
         assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
+    /// `{"d":{"d":…{"m":array}…}}`, `depth` objects deep.
+    fn nested(depth: usize, array: &str) -> String {
+        format!(
+            "{}{{\"m\":{array}}}{}",
+            "{\"d\":".repeat(depth - 1),
+            "}".repeat(depth - 1)
+        )
+    }
+
     /// What the embedded comparison still refuses. Each of these blocks on
     /// `main` and must keep blocking: the documents are only paired when
     /// everything around them is byte-identical, only objects are read as
@@ -9139,6 +9152,21 @@ mod tests {
                 "an escape changed: bytes a script reads",
                 page_embedding(r#"{"m":["a","b"],"s":"<\/script>"}"#, "Collect"),
                 page_embedding(r#"{"m":["b","a"],"s":"</script>"}"#, "Collect"),
+            ),
+            (
+                "a null moved to another object",
+                page_embedding(r#"{"m":["a","b"],"a":null,"b":{"z":1}}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"b":{"a":null,"z":1}}"#, "Collect"),
+            ),
+            (
+                "a null moved to another array",
+                page_embedding(r#"{"m":["a","b"],"a":[null],"b":[]}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"a":[],"b":[null]}"#, "Collect"),
+            ),
+            (
+                "a document nested deeper than a page is read for",
+                page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["a","b"]"#), "Collect"),
+                page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["b","a"]"#), "Collect"),
             ),
             (
                 "a number was written differently",
@@ -9188,13 +9216,11 @@ mod tests {
                 "{name}: still blocks"
             );
             assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
-            if name != "a value inside the document changed" {
-                assert_eq!(
-                    kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
-                    0,
-                    "{name}: not read through an embedded document"
-                );
-            }
+            assert_eq!(
+                kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+                0,
+                "{name}: not read through an embedded document"
+            );
         }
     }
 
