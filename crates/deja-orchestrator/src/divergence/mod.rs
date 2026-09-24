@@ -15311,4 +15311,78 @@ mod tests {
             assert!(card.verdict.pass, "{}", card.verdict.reason);
         }
     }
+
+    /// A call the replay stopped at: resolved nothing, and fail-stopped the task
+    /// it ran in. On `db` a miss is charged to nothing, so only the stop itself
+    /// can keep its correlation from passing.
+    fn stopped_obs(corr: Option<&str>) -> ObservedCall {
+        let mut stopped = obs("db", corr, false, None, None);
+        stopped.method_name = "stopped".to_owned();
+        stopped.outcome = deja::SubstituteOutcome::Stopped;
+        stopped
+    }
+
+    /// A correlation whose replay fail-stopped a call cannot read passed, even
+    /// when its response matched. The measured case: the stop happened in a
+    /// forked background task, after the response was sent, so nothing the
+    /// response carried shows it. What the stop meant is not decided here, only
+    /// that a verdict of "matched" cannot stand beside it.
+    #[test]
+    fn a_correlation_whose_replay_stopped_a_call_is_not_passed() {
+        let card = detect(&art(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![
+                obs("db", Some("c1"), true, Some(1), Some(1)),
+                stopped_obs(Some("c1")),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert!(
+            c1.http_status_match && c1.http_body_match && c1.side_effect_divergences == 0,
+            "precondition: nothing else keeps c1 from passing"
+        );
+        assert!(!c1.passed, "a stopped call cannot sit inside a pass");
+        assert!(c1.inconclusive, "and it is not a divergence either");
+        assert_eq!(card.summary.matched_correlations, 0);
+        assert!(
+            !card.verdict.pass && card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            card.verdict.reason.contains("stopped"),
+            "the verdict says why: {}",
+            card.verdict.reason
+        );
+    }
+
+    /// A stop does not soften a real divergence: blocking wins, at the
+    /// correlation and the run, exactly as it does over an absorbed miss.
+    #[test]
+    fn a_stopped_call_does_not_turn_a_divergence_into_inconclusive() {
+        let card = detect(&art(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![
+                obs("db", Some("c1"), true, Some(1), Some(1)),
+                stopped_obs(Some("c1")),
+            ],
+            vec![http("c1", false, vec![])],
+        ));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert!(!c1.passed && !c1.inconclusive, "blocking wins");
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+    }
 }
