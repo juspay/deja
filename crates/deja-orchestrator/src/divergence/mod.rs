@@ -6293,7 +6293,7 @@ mod tests {
         let path = dir.path().join("lookup.json");
         let mut table = serde_json::json!({
             "recording_id": "rec-1",
-            "policy_version": deja::LEGACY_POLICY_VERSION,
+            "policy_version": deja::POLICY_VERSION,
             "entries": [serde_json::to_value(seq_entry_method_res(
                 Some("c1"),
                 "db",
@@ -6695,7 +6695,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: "rec-ns".to_owned(),
-                policy_version: deja::LEGACY_POLICY_VERSION,
+                policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
             },
@@ -6779,7 +6779,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: "rec-scope".to_owned(),
-                policy_version: deja::LEGACY_POLICY_VERSION,
+                policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
@@ -6902,7 +6902,7 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: recording_id.to_owned(),
-                policy_version: deja::LEGACY_POLICY_VERSION,
+                policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
@@ -7314,7 +7314,7 @@ mod tests {
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: deja::LEGACY_POLICY_VERSION,
+                policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
             },
@@ -8923,7 +8923,7 @@ mod tests {
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: deja::LEGACY_POLICY_VERSION,
+                policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
             },
@@ -10908,7 +10908,7 @@ mod tests {
 
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
-            policy_version: deja::LEGACY_POLICY_VERSION,
+            policy_version: deja::POLICY_VERSION,
             event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 seq_entry_method_res(

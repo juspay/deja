@@ -1117,7 +1117,7 @@ mod shared_value {
 }
 
 /// A lookup table with each distinct result stored once
-/// ([`POLICY_VERSION`]); entries point at their result by index.
+/// ([`SHARED_RESULTS_POLICY_VERSION`]); entries point at their result by index.
 ///
 /// The legacy form repeats a result in every entry that recorded it, once per
 /// address rank and again for every identical read, so its size tracked the
@@ -1132,6 +1132,44 @@ pub struct SharedResultsTable {
     pub event_schema_version: Option<u16>,
     pub results: Vec<serde_json::Value>,
     pub entries: Vec<SharedResultsEntry>,
+    /// The one-result-per-entry table this was written from, when it is
+    /// written beside one. The loader serves this form only if the table
+    /// beside it still matches, so a file left from another run is never
+    /// read in its place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_digest: Option<LegacyDigest>,
+}
+
+/// Length and FNV-1a of a one-result-per-entry table's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyDigest {
+    pub len: u64,
+    pub fnv1a: u64,
+}
+
+impl LegacyDigest {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            fnv1a: crate::fnv1a_bytes(crate::FNV_OFFSET_BASIS, bytes),
+        }
+    }
+
+    /// The same digest of a file, read in pieces rather than held whole.
+    fn of_file(path: &Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut buffer = vec![0u8; 1 << 16];
+        let (mut len, mut fnv1a) = (0u64, crate::FNV_OFFSET_BASIS);
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(Self { len, fnv1a });
+            }
+            len += read as u64;
+            fnv1a = crate::fnv1a_bytes(fnv1a, &buffer[..read]);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1142,10 +1180,11 @@ pub struct SharedResultsEntry {
 }
 
 impl SharedResultsTable {
-    /// Store each distinct result once. Two results are the same when their
-    /// serialized bytes are, so the value served is byte-for-byte the value
-    /// recorded.
-    pub fn from_table(table: &LookupTable) -> Result<Self, serde_json::Error> {
+    /// Store each distinct result once, stamped with the digest of
+    /// `legacy_bytes`, the serialized `table` it is written beside. Two results
+    /// are the same when their serialized bytes are, so the value served is
+    /// byte-for-byte the value recorded.
+    pub fn from_table(table: &LookupTable, legacy_bytes: &[u8]) -> Result<Self, serde_json::Error> {
         let mut results = Vec::new();
         let mut by_pointer: HashMap<*const serde_json::Value, usize> = HashMap::new();
         let mut by_bytes: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -1172,10 +1211,11 @@ impl SharedResultsTable {
         }
         Ok(Self {
             recording_id: table.recording_id.clone(),
-            policy_version: POLICY_VERSION,
+            policy_version: SHARED_RESULTS_POLICY_VERSION,
             event_schema_version: table.event_schema_version,
             results,
             entries,
+            legacy_digest: Some(LegacyDigest::of(legacy_bytes)),
         })
     }
 
@@ -1204,7 +1244,7 @@ impl SharedResultsTable {
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok(LookupTable {
             recording_id: self.recording_id,
-            policy_version: self.policy_version,
+            policy_version: POLICY_VERSION,
             event_schema_version: self.event_schema_version,
             entries,
         })
@@ -1945,19 +1985,18 @@ impl LocalFileLookupSource {
     }
 }
 
-/// The table format this build writes: each distinct result stored once
-/// ([`SharedResultsTable`]).
+/// The matching policy this build implements, and the version a
+/// one-result-per-entry table declares.
 ///
 /// Bumped to 2 by the identity/locus split: a version-1 table addresses calls by
 /// an `Locus` carrying identity inside some of its variants, and its keys
-/// cannot be compared against the ones this build stamps. Bumped to 3 by the
-/// shared-results form, whose keys are stamped exactly as version 2's; the
-/// bump is what makes a loader that reads only version 2 refuse it.
-pub const POLICY_VERSION: u32 = 3;
+/// cannot be compared against the ones this build stamps.
+pub const POLICY_VERSION: u32 = 2;
 
-/// The legacy format, one result per entry. A candidate on an older pin reads
-/// only this, so the legacy table is stamped with it however new the writer.
-pub const LEGACY_POLICY_VERSION: u32 = 2;
+/// The version a [`SharedResultsTable`] declares. Its keys are stamped exactly
+/// as [`POLICY_VERSION`]'s; the different number is what makes a loader that
+/// knows only the one-result-per-entry form refuse it.
+pub const SHARED_RESULTS_POLICY_VERSION: u32 = 3;
 
 /// Refuse a table this build cannot match against, naming both versions.
 ///
@@ -1973,14 +2012,16 @@ pub const LEGACY_POLICY_VERSION: u32 = 2;
 /// Keyed on the DECLARED version, never on sniffing the shape: a table whose
 /// entries happen to deserialize is not thereby matchable.
 fn check_policy_version(table: LookupTable) -> std::io::Result<LookupTable> {
-    if table.policy_version == POLICY_VERSION || table.policy_version == LEGACY_POLICY_VERSION {
+    if table.policy_version == POLICY_VERSION
+        || table.policy_version == SHARED_RESULTS_POLICY_VERSION
+    {
         return Ok(table);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!(
             "lookup table declares matching policy version {} but this build \
-             reads {LEGACY_POLICY_VERSION} and {POLICY_VERSION}; the recording must be re-rendered. \
+             reads {POLICY_VERSION} and {SHARED_RESULTS_POLICY_VERSION}; the recording must be re-rendered. \
              Refusing at load rather than mismatching every key, which would \
              present as a total candidate regression.",
             table.policy_version
@@ -2026,11 +2067,24 @@ fn check_event_schema_version(table: LookupTable) -> std::io::Result<LookupTable
 impl LookupTableSource for LocalFileLookupSource {
     fn load(&mut self) -> std::io::Result<LookupTable> {
         let sibling = shared_results_path(&self.path);
-        let path = if sibling.is_file() {
-            sibling
-        } else {
-            self.path.clone()
-        };
+        if sibling.is_file() {
+            match shared_beside(&sibling, &self.path) {
+                Ok(table) => {
+                    eprintln!(
+                        "deja replay: lookup table loaded from {}",
+                        sibling.display()
+                    );
+                    self.loaded_from = Some(sibling);
+                    return check_policy_version(table);
+                }
+                Err(why) => eprintln!(
+                    "deja replay: not using {}: {why}; reading {} instead",
+                    sibling.display(),
+                    self.path.display()
+                ),
+            }
+        }
+        let path = self.path.clone();
         let bytes = std::fs::read(&path)?;
         eprintln!("deja replay: lookup table loaded from {}", path.display());
         self.loaded_from = Some(path.clone());
@@ -2042,12 +2096,12 @@ impl LookupTableSource for LocalFileLookupSource {
             policy_version: u32,
         }
         if let Ok(Declared { policy_version }) = serde_json::from_slice::<Declared>(&bytes) {
-            if policy_version == POLICY_VERSION {
+            if policy_version == SHARED_RESULTS_POLICY_VERSION {
                 let shared: SharedResultsTable = serde_json::from_slice(&bytes).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "lookup table at {} declares policy version {POLICY_VERSION} \
+                            "lookup table at {} declares policy version {SHARED_RESULTS_POLICY_VERSION} \
                                  but is not a shared-results table: {e}",
                             path.display()
                         ),
@@ -2107,11 +2161,35 @@ impl LookupTableSource for LocalFileLookupSource {
         // does not say which schema it was recorded under.
         Ok(LookupTable {
             recording_id: String::new(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: None,
             entries,
         })
     }
+}
+
+/// The shared form beside `table_path`, if it was written for the table that
+/// is there now; otherwise why not.
+fn shared_beside(sibling: &Path, table_path: &Path) -> Result<LookupTable, String> {
+    let bytes = std::fs::read(sibling).map_err(|e| format!("unreadable ({e})"))?;
+    let shared: SharedResultsTable =
+        serde_json::from_slice(&bytes).map_err(|e| format!("not a shared-results table ({e})"))?;
+    if shared.policy_version != SHARED_RESULTS_POLICY_VERSION {
+        return Err(format!("declares policy version {}", shared.policy_version));
+    }
+    let Some(stamped) = shared.legacy_digest else {
+        return Err("it does not say which table it was written from".to_owned());
+    };
+    let found =
+        LegacyDigest::of_file(table_path).map_err(|e| format!("cannot read the table ({e})"))?;
+    if found != stamped {
+        return Err(format!(
+            "it was written from a {}-byte table with FNV-1a {:016x}, and the table there is {} \
+             bytes with {:016x}",
+            stamped.len, stamped.fnv1a, found.len, found.fnv1a
+        ));
+    }
+    shared.into_table().map_err(|e| e.to_string())
 }
 
 /// In-memory `ObservedCallSink` for tests and standalone harness use.
@@ -2221,18 +2299,18 @@ impl ObservedCallSink for FileObservedSink {
     }
 }
 
-/// In-process side-effect player driven by a frozen `LookupTable`.
-///
-/// Does NOT run a cascade and does NOT classify divergences. It looks up a key
-/// by (correlation, boundary, trait, method, occurrence) — with optional
-/// `callsite_identity_id` fallback — emits an `ObservedCall`, and returns the
-/// result if found.
 /// What the hook keeps per key: the key is the map's, not repeated here.
 struct HookEntry {
     result: std::sync::Arc<serde_json::Value>,
     source_event_global_sequence: u64,
 }
 
+/// In-process side-effect player driven by a frozen `LookupTable`.
+///
+/// Does NOT run a cascade and does NOT classify divergences. It looks up a key
+/// by (correlation, boundary, trait, method, occurrence) — with optional
+/// `callsite_identity_id` fallback — emits an `ObservedCall`, and returns the
+/// result if found.
 pub struct LookupTableHook {
     table: HashMap<LookupKey, HookEntry>,
     /// Per-correlation request_sequence counter; bumps on each lookup. Feeds
@@ -4313,7 +4391,7 @@ mod tests {
         // differ — so resolution is keyed by *what* was called, not *when*.
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry_with(
@@ -4802,7 +4880,7 @@ mod tests {
         let mut ok = std::fs::File::create(&ok_path).expect("create");
         write!(
             ok,
-            r#"{{"recording_id":"rec-1","policy_version":{LEGACY_POLICY_VERSION},"event_schema_version":{},"entries":[]}}"#,
+            r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{},"entries":[]}}"#,
             crate::CURRENT_EVENT_SCHEMA_VERSION
         )
         .expect("write");
@@ -4838,7 +4916,7 @@ mod tests {
         let message = load(
             "older.json",
             format!(
-                r#"{{"recording_id":"rec-1","policy_version":{LEGACY_POLICY_VERSION},"event_schema_version":{older},"entries":[]}}"#
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{older},"entries":[]}}"#
             ),
         )
         .expect_err("a recording from an older schema must be refused")
@@ -4852,7 +4930,7 @@ mod tests {
 
         let message = load(
             "unversioned.json",
-            format!(r#"{{"recording_id":"rec-1","policy_version":{LEGACY_POLICY_VERSION},"entries":[]}}"#),
+            format!(r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"entries":[]}}"#),
         )
         .expect_err("a table that declares no schema version must be refused")
         .to_string();
@@ -4864,7 +4942,7 @@ mod tests {
         let message = load(
             "newer.json",
             format!(
-                r#"{{"recording_id":"rec-1","policy_version":{LEGACY_POLICY_VERSION},"event_schema_version":{newer},"entries":[]}}"#
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{newer},"entries":[]}}"#
             ),
         )
         .expect_err("a recording from a newer schema must be refused too")
@@ -4901,7 +4979,7 @@ mod tests {
         load(
             "current.json",
             format!(
-                r#"{{"recording_id":"rec-1","policy_version":{LEGACY_POLICY_VERSION},"event_schema_version":{current},"entries":[]}}"#
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{current},"entries":[]}}"#
             ),
         )
         .expect("a recording from this build's schema must still load");
@@ -4951,7 +5029,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
@@ -5261,7 +5339,7 @@ mod tests {
             .collect();
         let (hook, handle) = hook_over(LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         });
@@ -5355,7 +5433,7 @@ mod tests {
         }
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         };
@@ -5455,7 +5533,7 @@ mod tests {
         }
         LookupTable {
             recording_id: "rec-boundary".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
@@ -6093,7 +6171,7 @@ mod tests {
         let args = serde_json::json!({});
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry_with(
@@ -6148,7 +6226,7 @@ mod tests {
         let recorded_args = serde_json::json!({ "id": "pi_recorded" });
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![entry_with(
                 None,
@@ -6188,7 +6266,7 @@ mod tests {
     fn lookup_table_hook_record_emits_observed_http_finalizer_only() {
         let empty = LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
@@ -6390,7 +6468,7 @@ mod tests {
     fn declared_execute_is_honored_on_any_replay_hook() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
@@ -6424,7 +6502,7 @@ mod tests {
     fn declared_knob_drives_routing() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
@@ -6480,7 +6558,7 @@ mod tests {
     fn declared_execute_routes_through_runtime_hook_wrapper() {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
@@ -6514,7 +6592,7 @@ mod tests {
         let inner_default = LookupTableHook::from_source(
             VecSource(Some(LookupTable {
                 recording_id: "r".to_owned(),
-                policy_version: LEGACY_POLICY_VERSION,
+                policy_version: POLICY_VERSION,
                 event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
             })),
@@ -8538,7 +8616,7 @@ redis\tcurrency\tusd
     fn hook_execute_shadow_emits_observation_with_real_result() {
         let table = LookupTable {
             recording_id: "rec-shadow".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![entry_with(
                 None,
@@ -8595,7 +8673,7 @@ redis\tcurrency\tusd
         // Empty table → NO recorded baseline for the candidate's extra call.
         let table = LookupTable {
             recording_id: "rec-novel".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
@@ -8814,7 +8892,7 @@ redis\tcurrency\tusd
 
 #[cfg(test)]
 mod lookup_load_names_the_mismatch {
-    use super::{LocalFileLookupSource, LookupTableSource, LEGACY_POLICY_VERSION, POLICY_VERSION};
+    use super::{LocalFileLookupSource, LookupTableSource, POLICY_VERSION};
 
     fn load_text(name: &str, text: &str) -> std::io::Result<super::LookupTable> {
         let dir = std::env::temp_dir().join(format!("deja-lookup-{}", std::process::id()));
@@ -8901,7 +8979,7 @@ mod lookup_load_names_the_mismatch {
             1,
             "the entry must survive the fallback"
         );
-        assert_eq!(table.policy_version, LEGACY_POLICY_VERSION);
+        assert_eq!(table.policy_version, POLICY_VERSION);
     }
 
     /// A genuinely empty file must still report emptiness — so the new message
@@ -8920,7 +8998,7 @@ mod shared_results {
 
     use super::{
         shared_results_path, LocalFileLookupSource, Locus, LookupEntry, LookupKey, LookupTable,
-        LookupTableSource, SharedResultsTable, LEGACY_POLICY_VERSION, POLICY_VERSION,
+        LookupTableSource, SharedResultsTable, POLICY_VERSION, SHARED_RESULTS_POLICY_VERSION,
     };
 
     fn entry(occurrence: u32, result: Arc<serde_json::Value>) -> LookupEntry {
@@ -8947,7 +9025,7 @@ mod shared_results {
         let graph = || Arc::new(serde_json::json!({"nodes": [1, 2, 3], "edges": [[1, 2]]}));
         LookupTable {
             recording_id: "rec-1".to_owned(),
-            policy_version: LEGACY_POLICY_VERSION,
+            policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry(0, graph()),
@@ -8960,9 +9038,9 @@ mod shared_results {
 
     fn write_both(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("run-1.jsonl");
-        let legacy = legacy_table();
-        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let shared = SharedResultsTable::from_table(&legacy).unwrap();
+        let legacy = serde_json::to_vec(&legacy_table()).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        let shared = SharedResultsTable::from_table(&legacy_table(), &legacy).unwrap();
         std::fs::write(
             shared_results_path(&path),
             serde_json::to_vec(&shared).unwrap(),
@@ -8971,14 +9049,102 @@ mod shared_results {
         path
     }
 
+    fn shared_of_legacy() -> SharedResultsTable {
+        let legacy = serde_json::to_vec(&legacy_table()).unwrap();
+        SharedResultsTable::from_table(&legacy_table(), &legacy).unwrap()
+    }
+
+    /// Once no legacy table is written, the shared form is the table itself,
+    /// with nothing beside it to be checked against.
+    #[test]
+    fn a_shared_form_at_the_table_path_loads_as_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run-1.jsonl");
+        let mut shared = shared_of_legacy();
+        shared.legacy_digest = None;
+        std::fs::write(&path, serde_json::to_vec(&shared).unwrap()).unwrap();
+        let mut source = LocalFileLookupSource::new(&path);
+        let table = source.load().unwrap();
+        assert_eq!(source.loaded_from(), Some(path.as_path()));
+        assert!(Arc::ptr_eq(
+            &table.entries[0].result,
+            &table.entries[2].result
+        ));
+    }
+
+    /// A shared file left beside a table it was not written for is not
+    /// served: the loader says why and reads the table itself.
+    #[test]
+    fn a_shared_file_written_for_another_table_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_both(dir.path());
+        let mut other = legacy_table();
+        other.recording_id = "rec-2".to_owned();
+        other.entries[3].result = Arc::new(serde_json::json!("OTHER"));
+        std::fs::write(&path, serde_json::to_vec(&other).unwrap()).unwrap();
+
+        let mut source = LocalFileLookupSource::new(&path);
+        let table = source.load().unwrap();
+        assert_eq!(source.loaded_from(), Some(path.as_path()));
+        assert_eq!(table.recording_id, "rec-2");
+        assert_eq!(*table.entries[3].result, serde_json::json!("OTHER"));
+    }
+
+    /// The same, when the replaced table happens to be exactly as long: the
+    /// digest, not the length, is what tells them apart.
+    #[test]
+    fn a_shared_file_for_a_table_of_the_same_length_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_both(dir.path());
+        let mut other = legacy_table();
+        other.entries[3].result = Arc::new(serde_json::json!("othex"));
+        let bytes = serde_json::to_vec(&other).unwrap();
+        assert_eq!(bytes.len() as u64, std::fs::metadata(&path).unwrap().len());
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut source = LocalFileLookupSource::new(&path);
+        let table = source.load().unwrap();
+        assert_eq!(source.loaded_from(), Some(path.as_path()));
+        assert_eq!(*table.entries[3].result, serde_json::json!("othex"));
+    }
+
+    /// A shared file that does not parse, or carries no stamp, is passed over
+    /// for the table rather than failing the load.
+    #[test]
+    fn an_unusable_shared_file_is_passed_over_for_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_both(dir.path());
+        let sibling = shared_results_path(&path);
+        let full = std::fs::read(&sibling).unwrap();
+        std::fs::write(&sibling, &full[..full.len() / 2]).unwrap();
+        let mut source = LocalFileLookupSource::new(&path);
+        source.load().unwrap();
+        assert_eq!(
+            source.loaded_from(),
+            Some(path.as_path()),
+            "a truncated file"
+        );
+
+        let mut unstamped: serde_json::Value = serde_json::from_slice(&full).unwrap();
+        unstamped.as_object_mut().unwrap().remove("legacy_digest");
+        std::fs::write(&sibling, serde_json::to_vec(&unstamped).unwrap()).unwrap();
+        let mut source = LocalFileLookupSource::new(&path);
+        source.load().unwrap();
+        assert_eq!(
+            source.loaded_from(),
+            Some(path.as_path()),
+            "an unstamped file"
+        );
+    }
+
     /// The shared form holds each distinct result once, and loading it gives
     /// every entry that recorded it the same allocation.
     #[test]
     fn a_shared_results_table_loads_one_copy_of_each_result() {
-        let shared = SharedResultsTable::from_table(&legacy_table()).unwrap();
+        let shared = shared_of_legacy();
         assert_eq!(shared.results.len(), 2, "two distinct values");
         assert_eq!(shared.entries.len(), 4);
-        assert_eq!(shared.policy_version, POLICY_VERSION);
+        assert_eq!(shared.policy_version, SHARED_RESULTS_POLICY_VERSION);
 
         let dir = tempfile::tempdir().unwrap();
         let path = write_both(dir.path());
@@ -9002,6 +9168,10 @@ mod shared_results {
             );
         }
         assert_eq!(table.event_schema_version, expected.event_schema_version);
+        assert_eq!(
+            table.policy_version, POLICY_VERSION,
+            "held as a one-result-per-entry table"
+        );
     }
 
     /// Without the shared form, the legacy table loads as before: one value per
@@ -9014,7 +9184,7 @@ mod shared_results {
         let mut source = LocalFileLookupSource::new(&path);
         let table = source.load().unwrap();
         assert_eq!(source.loaded_from(), Some(path.as_path()));
-        assert_eq!(table.policy_version, LEGACY_POLICY_VERSION);
+        assert_eq!(table.policy_version, POLICY_VERSION);
         assert!(!Arc::ptr_eq(
             &table.entries[0].result,
             &table.entries[1].result
@@ -9026,10 +9196,10 @@ mod shared_results {
     /// a version that loader refuses.
     #[test]
     fn a_legacy_only_loader_cannot_read_the_shared_form() {
-        let shared = SharedResultsTable::from_table(&legacy_table()).unwrap();
+        let shared = shared_of_legacy();
         let text = serde_json::to_string(&shared).unwrap();
         assert!(serde_json::from_str::<LookupTable>(&text).is_err());
-        assert_ne!(shared.policy_version, LEGACY_POLICY_VERSION);
+        assert_ne!(shared.policy_version, POLICY_VERSION);
     }
 
     /// Sharing a result in memory does not change what a legacy entry looks
@@ -9047,7 +9217,7 @@ mod shared_results {
     fn the_schema_check_applies_to_the_shared_form() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_both(dir.path());
-        let mut shared = SharedResultsTable::from_table(&legacy_table()).unwrap();
+        let mut shared = shared_of_legacy();
         shared.event_schema_version = Some(crate::CURRENT_EVENT_SCHEMA_VERSION - 1);
         std::fs::write(
             shared_results_path(&path),
@@ -9071,7 +9241,7 @@ mod shared_results {
     /// An entry that points past the results is refused rather than served.
     #[test]
     fn an_entry_pointing_past_its_results_is_refused() {
-        let mut shared = SharedResultsTable::from_table(&legacy_table()).unwrap();
+        let mut shared = shared_of_legacy();
         shared.entries[3].result_index = 9;
         let err = shared.into_table().unwrap_err().to_string();
         assert!(err.contains("result 9 of 2"), "{err}");

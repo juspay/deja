@@ -77,10 +77,9 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// prevent. If a streaming form is ever needed, give it an envelope carrying
 /// `policy_version` first.
 ///
-/// The rendered table is stamped with [`deja::LEGACY_POLICY_VERSION`], the
-/// one-result-per-entry format every candidate pin reads, rather than a version
-/// the caller chooses. [`deja::POLICY_VERSION`] names the shared-results form,
-/// written beside it from this table; both carry keys stamped the same way.
+/// The rendered table is stamped with [`deja::POLICY_VERSION`], the version
+/// THIS BUILD implements and the one-result-per-entry form every candidate pin
+/// reads, rather than a version the caller chooses.
 ///
 /// It used to be a parameter, and every caller passed a literal `1`. That makes
 /// the declared version a claim about the caller's intent instead of a fact
@@ -91,7 +90,7 @@ pub fn render_lookup_table(
     recording: &ScopedRecording,
     recording_id: &str,
 ) -> io::Result<LookupTable> {
-    let policy_version = deja::LEGACY_POLICY_VERSION;
+    let policy_version = deja::POLICY_VERSION;
     // Shared occurrence assigner — advanced for every rank on every event, in
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();

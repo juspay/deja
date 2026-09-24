@@ -133,7 +133,7 @@ fn substitute_miss_returns_on_miss_value_in_replay() {
     // Empty lookup table → every lookup misses.
     let table = deja::LookupTable {
         recording_id: "graceful-miss-test".to_string(),
-        policy_version: deja::LEGACY_POLICY_VERSION,
+        policy_version: deja::POLICY_VERSION,
         event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![],
     };

@@ -133,7 +133,7 @@ fn install_replay_hook() {
     ONCE.call_once(|| {
         let table = deja::LookupTable {
             recording_id: "macro-on-miss-test".to_string(),
-            policy_version: deja::LEGACY_POLICY_VERSION,
+            policy_version: deja::POLICY_VERSION,
             event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
