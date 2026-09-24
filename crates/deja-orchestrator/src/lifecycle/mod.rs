@@ -3839,9 +3839,10 @@ fn seedable_rows(
             },
             serde_json::Value::Object(_) => NoSeedableRows::NotRows { values: 1 },
             serde_json::Value::Bool(true) => NoSeedableRows::RecordedPresence,
-            serde_json::Value::Number(count) if count.as_u64().is_some() => {
-                NoSeedableRows::RecordedCount(count.as_u64().unwrap_or_default())
-            }
+            serde_json::Value::Number(count) => count.as_u64().map_or_else(
+                || NoSeedableRows::RecordedScalar(count.to_string()),
+                NoSeedableRows::RecordedCount,
+            ),
             scalar => NoSeedableRows::RecordedScalar(scalar.to_string()),
         });
     }
@@ -5769,7 +5770,13 @@ mod tests {
     /// Other scalars assert nothing about rows.
     #[test]
     fn other_scalars_are_not_rows_and_claim_nothing() {
-        for value in [serde_json::json!(false), serde_json::json!("done")] {
+        // A count is a non-negative integer; anything else is not one.
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!("done"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
             let why = why_none(&query_key(), recorded_ok(value.clone(), "other"));
             assert_eq!(
                 why,
