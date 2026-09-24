@@ -15372,8 +15372,8 @@ mod tests {
     /// equal as JSON, and the comparison used to return `Equal` before any
     /// rule saw them, so a reordering was invisible: not blocking, and not
     /// counted either. That is the one outcome that cannot show a tolerance
-    /// working. It is now named as an order-only difference, exactly as a
-    /// permuted array is.
+    /// working. It is now counted and named under its own kind, apart from a
+    /// permuted array, which a strict array order would turn into a divergence.
     #[test]
     fn an_object_whose_keys_moved_is_named_rather_than_silently_equal() {
         // Each case moves keys at one place only, so each part of the check is
@@ -15405,7 +15405,16 @@ mod tests {
             );
 
             let card = scored_matched_call(None, recorded, observed);
-            assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1, "{name}");
+            assert_eq!(
+                kind_count(&card, "db", "ObjectKeyOrderAbsorbed"),
+                1,
+                "{name}: counted under its own kind"
+            );
+            assert_eq!(
+                kind_count(&card, "db", "ValueCanonAbsorbed"),
+                0,
+                "{name}: and not as an array-order absorption"
+            );
             let db = &card.per_boundary["db"];
             assert_eq!(
                 db.matched + db.diverged,
@@ -15433,6 +15442,7 @@ mod tests {
     fn an_object_in_the_same_order_is_equal_and_names_nothing() {
         let value = db_envelope(serde_json::json!({"a": 1, "b": 2}));
         let card = scored_matched_call(None, value.clone(), value);
+        assert_eq!(kind_count(&card, "db", "ObjectKeyOrderAbsorbed"), 0);
         assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
         assert!(card.verdict.pass);
     }
@@ -15445,6 +15455,7 @@ mod tests {
             db_envelope(serde_json::json!({"a": 1, "b": 2})),
             db_envelope(serde_json::json!({"b": 3, "a": 1})),
         );
+        assert_eq!(kind_count(&card, "db", "ObjectKeyOrderAbsorbed"), 0);
         assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
         assert!(!card.verdict.pass, "{}", card.verdict.reason);
     }
