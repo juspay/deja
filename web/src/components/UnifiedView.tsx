@@ -19,6 +19,7 @@ import { useSystems } from "../lib/systems";
 import { JsonView, ValuePair } from "./JsonView";
 import { JsonDiff } from "./JsonDiff";
 import { ConfidenceBadge, levelForRank } from "./Confidence";
+import { evidenceOf } from "../lib/evidence";
 
 /* ------------------------------------------------------------------ layout --
  *
@@ -1026,12 +1027,17 @@ export default function UnifiedView({
     return m;
   }, [scorecard]);
 
+  const evidence = React.useMemo(
+    () =>
+      evidenceOf({ data: calls.data, error: calls.error }, { data: https.data, error: https.error }),
+    [calls.data, calls.error, https.data, https.error],
+  );
   const model = React.useMemo(
     () =>
-      buildSpine(calls.data ?? [], graph.data, https.data ?? [], spanShapes, {
+      buildSpine(evidence.calls, graph.data, evidence.https, spanShapes, {
         promoteInternal: showLattice,
       }),
-    [calls.data, graph.data, https.data, spanShapes, showLattice],
+    [evidence, graph.data, spanShapes, showLattice],
   );
 
   const boundaryNotes = React.useMemo(() => {
@@ -1099,7 +1105,12 @@ export default function UnifiedView({
 
   if (calls.isLoading || https.isLoading || graph.isLoading)
     return <p className="hint">loading execution…</p>;
-  if (calls.error) return <p className="err">{String(calls.error)}</p>;
+  if (evidence.blocking) return <p className="err">{evidence.blocking}</p>;
+  const evidenceBanner = evidence.notes.map((note) => (
+    <p className="err" key={note}>
+      {note}
+    </p>
+  ));
   // The tree below is spined on the call ledger, so it renders without the
   // graph — but a missing graph changes what the view can claim (no span
   // durations, no hidden-span counts), and silence here once let a wholly
@@ -1118,11 +1129,13 @@ export default function UnifiedView({
       </p>
     ) : null;
   if (model.cases.length === 0)
-    return (
+    return evidence.complete ? (
       <p className="hint">
         No reconciled calls and no response diffs were published for this run, so there is no
         execution to compare. That is a statement about the artifacts, not about the candidate.
       </p>
+    ) : (
+      <>{evidenceBanner}</>
     );
   if (!active) return null;
 
@@ -1132,6 +1145,7 @@ export default function UnifiedView({
 
   return (
     <div className="uv">
+      {evidenceBanner}
       {graphBanner}
       <div className="uvtabs">
         {model.cases.map((c) => {
