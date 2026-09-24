@@ -29,12 +29,13 @@ diesel = { version = "~2.2.10", default-features = false, features = [
 # exact version hyperswitch resolves (0.2.1; diesel with default-features off,
 # no libpq linkage) so the helper bounds mirror its combinators one-to-one.
 async-bb8-diesel = "0.2.1"
+serde_json = "1"
 
 [dev-dependencies]
 # Real-postgres round-trip test (ignored by default; needs a reachable
 # database): the full `postgres` feature links libpq and provides
 # `PgConnection` to wrap.
-diesel = { version = "~2.2.10", features = ["postgres"] }
+diesel = { version = "~2.2.10", features = ["postgres", "serde_json"] }
 tempfile = "3"
 # Pool-path tests: they mirror hyperswitch's execution stack exactly (it drives
 # diesel through async-bb8-diesel over a bb8 pool), so the pairing is proven
