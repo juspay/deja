@@ -1509,13 +1509,63 @@ fn render_and_persist_lookup_table(
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
 ) -> Result<usize, String> {
+    // `None` is the check disabled (`0` in the environment).
+    let max_bytes =
+        lookup_table_budget_from(std::env::var("DEJA_LOOKUP_TABLE_MAX_BYTES").ok().as_deref())
+            .unwrap_or(u64::MAX);
+    persist_lookup_table_within(root, run_id, recording, recording_id, max_bytes)
+}
+
+/// The largest lookup table, in compact bytes, a run hands its candidate.
+///
+/// The candidate parses the whole table at boot, so its size, not the number
+/// of correlations, is what runs out of memory. This is the largest table seen
+/// to complete at a 1536 MiB candidate limit; the smallest seen to be killed
+/// was about 95 MB. Between the two is unmeasured, so this is the proven-safe
+/// edge, not the limit.
+pub const DEFAULT_LOOKUP_TABLE_MAX_BYTES: u64 = 70_000_000;
+
+/// `DEJA_LOOKUP_TABLE_MAX_BYTES` read as a budget: unset or unparseable keeps
+/// the default, and `0` disables the check.
+fn lookup_table_budget_from(raw: Option<&str>) -> Option<u64> {
+    match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(max) => Some(max),
+        None => Some(DEFAULT_LOOKUP_TABLE_MAX_BYTES),
+    }
+}
+
+/// Render, then refuse a table over `max_bytes` before anything can load it.
+fn persist_lookup_table_within(
+    root: &HarnessRoot,
+    run_id: &str,
+    recording: &crate::scope::ScopedRecording,
+    recording_id: &str,
+    max_bytes: u64,
+) -> Result<usize, String> {
     let table = crate::lookup::render_lookup_table(recording, recording_id)
         .map_err(|e| format!("render lookup table: {e}"))?;
     // Compact, not pretty: the candidate holds this whole file in one buffer at
-    // boot, and indentation made it about 2.5x its content.
-    serde_json::to_vec(&table)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(root.lookup_table_path(run_id), bytes))
+    // boot, and indentation made it about 2.5x its content. The budget is in
+    // these bytes.
+    let bytes = serde_json::to_vec(&table).map_err(|e| format!("write lookup table: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        let correlations = table
+            .entries
+            .iter()
+            .map(|e| e.key.correlation_id.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        return Err(format!(
+            "the lookup table for this run is {} bytes across {correlations} correlation(s), \
+             over the {max_bytes}-byte budget (DEJA_LOOKUP_TABLE_MAX_BYTES). The candidate \
+             loads the whole table at boot and tables this size have been killed for memory \
+             rather than replayed. Table bytes, not the correlation count, bound a run: split \
+             the correlation filter into smaller runs.",
+            bytes.len()
+        ));
+    }
+    std::fs::write(root.lookup_table_path(run_id), bytes)
         .map_err(|e| format!("write lookup table: {e}"))?;
     if table.entries.is_empty() {
         return Err("rendered lookup table is empty".to_string());
@@ -5832,15 +5882,12 @@ mod tests {
         );
     }
 
-    /// The table the candidate reads is written without whitespace, and the
-    /// candidate's own loader still reads it back whole.
-    ///
-    /// Pretty-printing put every element of a byte array on its own indented
-    /// line, which made the file roughly 2.5x its content. The candidate reads
-    /// the whole file into one buffer that coexists with the parsed table at
-    /// boot, so that whitespace was resident for no reason.
-    #[test]
-    fn the_lookup_table_is_written_compact_and_loads_back() {
+    /// A three-event recording on disk, opened at whole-session scope.
+    fn three_event_recording() -> (
+        tempfile::TempDir,
+        crate::HarnessRoot,
+        crate::scope::ScopedRecording,
+    ) {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let root = crate::HarnessRoot::new(dir.path()).unwrap();
@@ -5882,7 +5929,19 @@ mod tests {
             crate::scope::RunScope::entire_session(),
         )
         .unwrap();
+        (dir, root, recording)
+    }
 
+    /// The table the candidate reads is written without whitespace, and the
+    /// candidate's own loader still reads it back whole.
+    ///
+    /// Pretty-printing put every element of a byte array on its own indented
+    /// line, which made the file roughly 2.5x its content. The candidate reads
+    /// the whole file into one buffer that coexists with the parsed table at
+    /// boot, so that whitespace was resident for no reason.
+    #[test]
+    fn the_lookup_table_is_written_compact_and_loads_back() {
+        let (_dir, root, recording) = three_event_recording();
         let entries =
             super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1").unwrap();
         assert!(entries > 0, "the fixture renders entries");
@@ -5906,6 +5965,60 @@ mod tests {
                 .iter()
                 .any(|e| e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })),
             "results survive the compact encoding"
+        );
+    }
+
+    /// A table over the budget fails the run before the candidate boots, and
+    /// says what to do about it.
+    #[test]
+    fn an_oversized_lookup_table_fails_the_run_before_the_candidate_boots() {
+        let (_dir, root, recording) = three_event_recording();
+        let err = super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 16)
+            .expect_err("a table over the budget is refused");
+        for needle in ["bytes", "16", "DEJA_LOOKUP_TABLE_MAX_BYTES", "split"] {
+            assert!(err.contains(needle), "the refusal names `{needle}`: {err}");
+        }
+        assert!(
+            !root.lookup_table_path("run-1").exists(),
+            "a refused table is not left where the candidate would load it"
+        );
+    }
+
+    /// The same table under a budget it fits is written as before.
+    #[test]
+    fn a_lookup_table_within_the_budget_is_written() {
+        let (_dir, root, recording) = three_event_recording();
+        super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 1 << 20)
+            .expect("a table under the budget is written");
+        let len = std::fs::metadata(root.lookup_table_path("run-1"))
+            .unwrap()
+            .len();
+        assert!(
+            len > 16,
+            "the fixture table is larger than the refusal test's budget"
+        );
+        super::persist_lookup_table_within(&root, "run-2", &recording, "rec-1", len)
+            .expect("a table exactly at the budget is written");
+    }
+
+    /// The budget comes from the environment when it says something usable.
+    #[test]
+    fn the_lookup_table_budget_reads_its_override() {
+        assert_eq!(
+            super::lookup_table_budget_from(None),
+            Some(super::DEFAULT_LOOKUP_TABLE_MAX_BYTES)
+        );
+        assert_eq!(super::lookup_table_budget_from(Some("123")), Some(123));
+        assert_eq!(super::lookup_table_budget_from(Some(" 123 ")), Some(123));
+        assert_eq!(
+            super::lookup_table_budget_from(Some("0")),
+            None,
+            "0 disables"
+        );
+        assert_eq!(
+            super::lookup_table_budget_from(Some("70MB")),
+            Some(super::DEFAULT_LOOKUP_TABLE_MAX_BYTES),
+            "an unparseable value keeps the default rather than disabling the guard"
         );
     }
 
