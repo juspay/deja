@@ -2602,6 +2602,11 @@ struct SeedCertificateEntry {
     /// entries and for entries the seeder never got as far as rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mechanism: Option<SeedEntryMechanism>,
+    /// Why a DB entry yielded no row to seed, as a field a rule can match on
+    /// rather than a sentence it would have to parse. Absent when rows were
+    /// found, and on certificates written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skip_reason: Option<NoSeedableRows>,
 }
 
 /// How one DB seed entry's rows were materialized. A `Failed` entry carries
@@ -2744,12 +2749,18 @@ impl SeedCertificateEntry {
             materialization,
             readback,
             mechanism: None,
+            skip_reason: None,
         }
     }
 
     /// Attach the DB materialization split (see [`SeedEntryMechanism`]).
     fn with_mechanism(mut self, mechanism: Option<SeedEntryMechanism>) -> Self {
         self.mechanism = mechanism;
+        self
+    }
+
+    fn with_skip_reason(mut self, skip_reason: Option<NoSeedableRows>) -> Self {
+        self.skip_reason = skip_reason;
         self
     }
 
@@ -2796,6 +2807,7 @@ impl SeedCertificateEntry {
             materialization: SeedMaterializationStatus::NotAPrecondition,
             readback: SeedReadback::not_run(why),
             mechanism: None,
+            skip_reason: None,
         }
     }
 }
@@ -3038,7 +3050,8 @@ fn materialize_seed_plan(
                             outcome.status,
                             outcome.readback,
                         )
-                        .with_mechanism(outcome.mechanism),
+                        .with_mechanism(outcome.mechanism)
+                        .with_skip_reason(outcome.skip_reason),
                     );
                 }
                 "db" => certificate.push(SeedCertificateEntry::new(
@@ -3130,17 +3143,7 @@ fn seed_db(
     };
     let rows = match seedable_rows(&target, image, envelope, catalog) {
         Ok(rows) => rows,
-        Err(why) => {
-            let message = format!(
-                "seed_db {} key {} carried no seedable row payload: {why}; skipping",
-                target.kind, key
-            );
-            eprintln!("lifecycle: {message}");
-            return SeedDbOutcome::unrendered(
-                SeedMaterializationStatus::Skipped,
-                SeedReadback::not_run(message),
-            );
-        }
+        Err(why) => return SeedDbOutcome::skipped_for(why, target.kind, key),
     };
 
     // Split rows by seeding mechanism: a row carrying a COPY-eligible
@@ -3278,6 +3281,7 @@ struct SeedDbOutcome {
     status: SeedMaterializationStatus,
     readback: SeedReadback,
     mechanism: Option<SeedEntryMechanism>,
+    skip_reason: Option<NoSeedableRows>,
 }
 
 impl SeedDbOutcome {
@@ -3288,6 +3292,20 @@ impl SeedDbOutcome {
             status,
             readback,
             mechanism: None,
+            skip_reason: None,
+        }
+    }
+
+    /// A DB entry whose recording gave no row to seed, and why.
+    fn skipped_for(why: NoSeedableRows, kind: &str, key: &str) -> Self {
+        let message =
+            format!("seed_db {kind} key {key} carried no seedable row payload: {why}; skipping");
+        eprintln!("lifecycle: {message}");
+        Self {
+            status: SeedMaterializationStatus::Skipped,
+            readback: SeedReadback::not_run(message),
+            mechanism: None,
+            skip_reason: Some(why),
         }
     }
 
@@ -3300,6 +3318,7 @@ impl SeedDbOutcome {
             status,
             readback,
             mechanism: Some(mechanism),
+            skip_reason: None,
         }
     }
 }
@@ -3833,7 +3852,8 @@ impl DbSeedTarget {
 /// about the recording, and only some make the skip correct: a recorded
 /// absence is the precondition, while a recorded `true` or a non-zero count
 /// asserts rows the seeder has no content for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "cause", content = "detail", rename_all = "snake_case")]
 enum NoSeedableRows {
     RecordedError,
     RecordedAbsence,
@@ -5830,6 +5850,76 @@ mod tests {
             assert_eq!(why, super::NoSeedableRows::RecordedAbsence, "{value}");
             assert!(why.to_string().contains("absence is the precondition"));
         }
+    }
+
+    fn presence_entry() -> deja::SeedEntry {
+        deja::SeedEntry {
+            boundary: "db".to_owned(),
+            key: query_key(),
+            value: recorded_ok(serde_json::json!(true), "bool"),
+            image: None,
+            method: Some("generic_delete".to_owned()),
+            origin: deja::SeedOrigin::Recording,
+            source_sequence: 7,
+        }
+    }
+
+    fn certificate_entry_for(outcome: super::SeedDbOutcome) -> serde_json::Value {
+        let entry = super::SeedCertificateEntry::new(
+            &Some("c1".to_owned()),
+            &presence_entry(),
+            None,
+            None,
+            outcome.status,
+            outcome.readback,
+        )
+        .with_mechanism(outcome.mechanism)
+        .with_skip_reason(outcome.skip_reason);
+        serde_json::to_value(entry).unwrap()
+    }
+
+    /// A rule keyed on why a seed was skipped matches this field, not the
+    /// sentence beside it.
+    #[test]
+    fn a_skip_carries_its_cause_as_a_field() {
+        let outcome = super::SeedDbOutcome::skipped_for(
+            super::NoSeedableRows::RecordedPresence,
+            "query-fallback",
+            &query_key(),
+        );
+        let entry = certificate_entry_for(outcome);
+        assert_eq!(entry["materialization"], "skipped");
+        assert_eq!(
+            entry["skip_reason"],
+            serde_json::json!({"cause": "recorded_presence"})
+        );
+        let message = entry["readback"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("asserts a row"), "{message}");
+    }
+
+    #[test]
+    fn a_count_skip_serializes_its_detail() {
+        let outcome =
+            super::SeedDbOutcome::skipped_for(super::NoSeedableRows::RecordedCount(0), "row", "k");
+        let entry = certificate_entry_for(outcome);
+        assert_eq!(
+            entry["skip_reason"],
+            serde_json::json!({"cause": "recorded_count", "detail": 0})
+        );
+    }
+
+    /// Certificates written before the field existed still parse, as no skip
+    /// reason, and an entry that found rows writes no such key at all.
+    #[test]
+    fn a_certificate_without_the_field_still_parses_and_rows_add_none() {
+        let outcome = super::SeedDbOutcome::unrendered(
+            super::SeedMaterializationStatus::Unsupported,
+            super::SeedReadback::unsupported("opaque key"),
+        );
+        let entry = certificate_entry_for(outcome);
+        assert!(entry.get("skip_reason").is_none(), "{entry}");
+        let parsed: super::SeedCertificateEntry = serde_json::from_value(entry).unwrap();
+        assert_eq!(parsed.skip_reason, None);
     }
 
     /// A count's meaning is its value: zero rows is absence recorded, more is
