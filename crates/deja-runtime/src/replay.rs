@@ -1155,6 +1155,28 @@ impl LegacyDigest {
         }
     }
 
+    /// The digest of `value`'s compact serialization, computed as it is
+    /// written rather than from a buffer holding it.
+    pub fn of_serialized<T: Serialize>(value: &T) -> serde_json::Result<Self> {
+        struct Fold(LegacyDigest);
+        impl std::io::Write for Fold {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.len += bytes.len() as u64;
+                self.0.fnv1a = crate::fnv1a_bytes(self.0.fnv1a, bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut fold = Fold(Self {
+            len: 0,
+            fnv1a: crate::FNV_OFFSET_BASIS,
+        });
+        serde_json::to_writer(&mut fold, value)?;
+        Ok(fold.0)
+    }
+
     /// The same digest of a file, read in pieces rather than held whole.
     fn of_file(path: &Path) -> std::io::Result<Self> {
         use std::io::Read;
