@@ -3072,24 +3072,20 @@ fn seed_db(
             );
         }
     };
-    let rows = image
-        .and_then(|image| db_row_images_from_typed_payload(&target.table, image, catalog))
-        .unwrap_or_else(|| {
-            db_seed_value(envelope)
-                .map(|value| target.filter_rows(db_row_images(&target.table, &value, catalog)))
-                .unwrap_or_default()
-        });
-    if rows.is_empty() {
-        let message = format!(
-            "seed_db {} key {} carried no seedable row payload; skipping",
-            target.kind, key
-        );
-        eprintln!("lifecycle: {message}");
-        return SeedDbOutcome::unrendered(
-            SeedMaterializationStatus::Skipped,
-            SeedReadback::not_run(message),
-        );
-    }
+    let rows = match seedable_rows(&target, image, envelope, catalog) {
+        Ok(rows) => rows,
+        Err(why) => {
+            let message = format!(
+                "seed_db {} key {} carried no seedable row payload: {why}; skipping",
+                target.kind, key
+            );
+            eprintln!("lifecycle: {message}");
+            return SeedDbOutcome::unrendered(
+                SeedMaterializationStatus::Skipped,
+                SeedReadback::not_run(message),
+            );
+        }
+    };
 
     // Split rows by seeding mechanism: a row carrying a COPY-eligible
     // physical wire image seeds through binary COPY (the store parses its own
@@ -3775,6 +3771,84 @@ impl DbSeedTarget {
             .filter(|row| db_row_matches_filter(row, filter))
             .collect()
     }
+}
+
+/// Why a db seed entry yielded no row to materialize. These are different facts
+/// about the recording, and only some make the skip correct: a recorded
+/// absence is the precondition, while a recorded scalar asserts a row the
+/// seeder has no content for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoSeedableRows {
+    RecordedError,
+    RecordedAbsence,
+    RecordedScalar(String),
+    NotRows { values: usize },
+    NoRowWithKey { rows: usize },
+}
+
+impl std::fmt::Display for NoSeedableRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordedError => {
+                write!(
+                    f,
+                    "the recorded call returned an error, so there is no row to seed"
+                )
+            }
+            Self::RecordedAbsence => {
+                write!(
+                    f,
+                    "the recording returned no row, so absence is the precondition"
+                )
+            }
+            Self::RecordedScalar(value) => write!(
+                f,
+                "the recording returned {value}, which asserts a row without carrying one; \
+                 the precondition is presence and nothing here can materialize it"
+            ),
+            Self::NotRows { values } => write!(
+                f,
+                "the recording returned {values} value(s), none of them a row of this table"
+            ),
+            Self::NoRowWithKey { rows } => write!(
+                f,
+                "the recording returned {rows} row(s), none with the keyed identity"
+            ),
+        }
+    }
+}
+
+/// The rows a recorded db result gives to seed, or why it gives none.
+fn seedable_rows(
+    target: &DbSeedTarget,
+    image: Option<&serde_json::Value>,
+    envelope: &serde_json::Value,
+    catalog: &DbCatalog,
+) -> Result<Vec<DbRowImage>, NoSeedableRows> {
+    if let Some(rows) =
+        image.and_then(|image| db_row_images_from_typed_payload(&target.table, image, catalog))
+    {
+        return Ok(rows);
+    }
+    let value = db_seed_value(envelope).ok_or(NoSeedableRows::RecordedError)?;
+    let rows = db_row_images(&target.table, &value, catalog);
+    if rows.is_empty() {
+        return Err(match &value {
+            serde_json::Value::Null => NoSeedableRows::RecordedAbsence,
+            serde_json::Value::Array(items) if items.is_empty() => NoSeedableRows::RecordedAbsence,
+            serde_json::Value::Array(items) => NoSeedableRows::NotRows {
+                values: items.len(),
+            },
+            serde_json::Value::Object(_) => NoSeedableRows::NotRows { values: 1 },
+            scalar => NoSeedableRows::RecordedScalar(scalar.to_string()),
+        });
+    }
+    let recorded = rows.len();
+    let rows = target.filter_rows(rows);
+    if rows.is_empty() {
+        return Err(NoSeedableRows::NoRowWithKey { rows: recorded });
+    }
+    Ok(rows)
 }
 
 fn db_seed_target_from_key(key: &str) -> Option<DbSeedTarget> {
@@ -5621,6 +5695,109 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+    // -- a skipped db seed says which kind of nothing it carried -------------
+
+    fn seed_target(key: &str) -> super::DbSeedTarget {
+        super::db_seed_target_from_key(key).expect("a typed db key")
+    }
+
+    fn recorded_ok(value: serde_json::Value, type_name: &str) -> serde_json::Value {
+        serde_json::to_value(deja::value::DejaDatabaseResult::ok(value, type_name)).unwrap()
+    }
+
+    fn why_none(key: &str, envelope: serde_json::Value) -> super::NoSeedableRows {
+        super::seedable_rows(
+            &seed_target(key),
+            None,
+            &envelope,
+            &super::DbCatalog::default(),
+        )
+        .expect_err("no seedable rows")
+    }
+
+    fn query_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!(["pro_1"]),
+        )
+    }
+
+    /// `users.id = 1`, the row key the seed-key tests below already use.
+    const ROW_KEY: &str = "deja:state:v1:db_row:7573657273:6964:31";
+
+    /// The bug the old message buried: a DELETE's `Ok(true)` asserts a row
+    /// existed and carries none of it. It must not read like an empty set.
+    #[test]
+    fn a_recorded_bool_is_presence_without_content_not_absence() {
+        let why = why_none(&query_key(), recorded_ok(serde_json::json!(true), "bool"));
+        assert_eq!(
+            why,
+            super::NoSeedableRows::RecordedScalar("true".to_owned())
+        );
+        let said = why.to_string();
+        assert!(said.contains("asserts a row"), "{said}");
+        assert!(!said.contains("absence"), "{said}");
+    }
+
+    /// The fifteen correct skips: an empty set or no row is absence recorded.
+    #[test]
+    fn a_recorded_empty_set_or_null_is_absence() {
+        for value in [serde_json::json!([]), serde_json::Value::Null] {
+            let why = why_none(&query_key(), recorded_ok(value.clone(), "Vec<Row>"));
+            assert_eq!(why, super::NoSeedableRows::RecordedAbsence, "{value}");
+            assert!(why.to_string().contains("absence is the precondition"));
+        }
+    }
+
+    #[test]
+    fn a_recorded_error_seeds_nothing_and_says_so() {
+        let envelope = serde_json::to_value(deja::value::DejaDatabaseResult {
+            version: deja::value::DejaDatabaseResult::VERSION,
+            payload: deja::value::DejaDatabaseResultPayload::Err {
+                kind: "NotFound".to_owned(),
+                message: "no row".to_owned(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            why_none(&query_key(), envelope),
+            super::NoSeedableRows::RecordedError
+        );
+    }
+
+    #[test]
+    fn values_that_are_not_rows_are_counted() {
+        let why = why_none(
+            &query_key(),
+            recorded_ok(serde_json::json!([1, 2]), "Vec<i64>"),
+        );
+        assert_eq!(why, super::NoSeedableRows::NotRows { values: 2 });
+    }
+
+    /// A row key whose identity is not among the recorded rows.
+    #[test]
+    fn rows_without_the_keyed_identity_are_counted() {
+        let rows = serde_json::json!([{"id": 2}, {"id": 3}]);
+        let why = why_none(ROW_KEY, recorded_ok(rows, "Vec<User>"));
+        assert_eq!(why, super::NoSeedableRows::NoRowWithKey { rows: 2 });
+    }
+
+    /// The control: a recorded row still seeds, and the keyed one is kept.
+    #[test]
+    fn a_recorded_row_still_seeds() {
+        let rows = serde_json::json!([{"id": 2}, {"id": 1}]);
+        let seeded = super::seedable_rows(
+            &seed_target(ROW_KEY),
+            None,
+            &recorded_ok(rows, "Vec<User>"),
+            &super::DbCatalog::default(),
+        )
+        .unwrap();
+        assert_eq!(seeded.len(), 1);
+    }
+
     /// The rendered lookup table must not outlive the stage that writes it.
     ///
     /// It is over a gigabyte of owned structures, and the stage bodies that
