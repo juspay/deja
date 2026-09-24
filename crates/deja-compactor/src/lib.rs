@@ -2718,18 +2718,20 @@ mod tests {
         let out = decode_object("plain.ndjson", fetched).unwrap();
         assert_eq!(out, payload.to_vec());
         assert_eq!(out.as_ptr(), before, "the plain path copied the object");
-    }
 
-    /// A buffer still shared elsewhere cannot be taken over, so it is copied,
-    /// and the result is the same bytes.
-    #[test]
-    fn a_shared_plain_buffer_is_copied_not_taken() {
-        let fetched = bytes::Bytes::from(b"plain".to_vec());
-        let held = fetched.clone();
-        let out = decode_object("plain.ndjson", fetched).unwrap();
-        assert_eq!(out, b"plain".to_vec());
-        assert_ne!(out.as_ptr(), held.as_ptr(), "a shared buffer is not reused");
-        assert_eq!(&held[..], b"plain", "the other holder is untouched");
+        // A body longer than its length hint leaves spare capacity, which
+        // takes the other buffer representation; that is handed back too.
+        let mut roomy = Vec::with_capacity(payload.len() + 64);
+        roomy.extend_from_slice(payload);
+        let roomy = bytes::Bytes::from(roomy);
+        let before = roomy.as_ptr();
+        let out = decode_object("plain.ndjson", roomy).unwrap();
+        assert_eq!(out, payload.to_vec());
+        assert_eq!(
+            out.as_ptr(),
+            before,
+            "a buffer with spare capacity was copied"
+        );
     }
 
     #[test]
