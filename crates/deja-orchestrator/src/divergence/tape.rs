@@ -100,6 +100,14 @@ impl Tape {
             .map(|mut seals| {
                 seals.sort();
                 seals
+            })
+            // Seals vouch for the tape only if they name every member and no
+            // other; a partial list is not trusted as a whole one.
+            .filter(|seals: &Vec<(String, String)>| {
+                seals
+                    .iter()
+                    .map(|(recording, _)| recording)
+                    .eq(members.iter())
             });
         Ok(Self {
             members,
@@ -154,6 +162,21 @@ mod tests {
         assert!(same_tape("y", Some(&a), "m", Some(&b)).is_err());
     }
 
+    /// Seals that do not cover exactly the members cannot vouch for the tape:
+    /// equal seals over different member lists must not pass.
+    #[test]
+    fn seals_that_do_not_cover_the_members_are_not_trusted() {
+        let y = json!({
+            "members": ["rec-a", "rec-b"], "correlations": 10,
+            "member_seals": [{"recording_id": "rec-a", "seal_id": "s1"}],
+        });
+        let m = json!({
+            "members": ["rec-a", "rec-c"], "correlations": 10,
+            "member_seals": [{"recording_id": "rec-a", "seal_id": "s1"}],
+        });
+        assert!(same_tape("run-Y", Some(&y), "run-M", Some(&m)).is_err());
+    }
+
     /// A manifest from before seals were addressed carries an empty id; two
     /// empty ids are not a match, so the counts decide.
     #[test]
@@ -180,11 +203,11 @@ mod tests {
     #[test]
     fn a_run_with_no_report_refuses_on_either_side() {
         let a = sealed(&[("rec-a", "s1")], 10);
-        let err = same_tape("y", None, "m", Some(&a)).unwrap_err();
-        assert!(err.contains("y"), "{err}");
-        let err = same_tape("y", Some(&a), "m", None).unwrap_err();
-        assert!(err.contains("m"), "{err}");
-        assert!(same_tape("y", None, "m", None).is_err());
+        let err = same_tape("run-Y", None, "run-M", Some(&a)).unwrap_err();
+        assert!(err.contains("run run-Y has no ingest report"), "{err}");
+        let err = same_tape("run-Y", Some(&a), "run-M", None).unwrap_err();
+        assert!(err.contains("run run-M has no ingest report"), "{err}");
+        assert!(same_tape("run-Y", None, "run-M", None).is_err());
     }
 
     /// Two reports that both name no members and agree on the count must still
