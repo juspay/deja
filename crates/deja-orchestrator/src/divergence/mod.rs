@@ -12280,6 +12280,41 @@ mod tests {
         assert!(changed[0].blocking);
     }
 
+    /// A pair's request is judged by the identity its address uses, so the
+    /// diff and the lookup cannot disagree: the same members in another order
+    /// are the same request, counted under the identity kinds.
+    #[test]
+    fn a_paired_request_is_judged_by_its_identity() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "ids": ["a", "b"] })),
+            serde_json::json!({ "ids": ["b", "a"] }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "storage", "ValueCanonAbsorbed"), 0);
+
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# })),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 1);
+    }
+
+    /// What identity refuses, the pair's diff refuses too: numbers are data,
+    /// so a reordered numeric array is a different request.
+    #[test]
+    fn a_paired_request_identity_refuses_is_not_absorbed_by_the_diff() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "bytes": [1, 2, 3] })),
+            serde_json::json!({ "bytes": [3, 1, 2] }),
+        ));
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(kind_count(&card, "storage", "ValueCanonAbsorbed"), 0);
+        assert!(!card.verdict.pass);
+    }
+
     /// A pair whose recorded request the tape does not hold cannot be shown to
     /// have sent what the recording sent, and is not assumed to have.
     #[test]
