@@ -567,7 +567,23 @@ async fn list_keys(
     Ok(keys)
 }
 
-async fn get_decoded(store: &DynStore, key: &object_store::path::Path) -> Result<Vec<u8>, String> {
+/// Fetch and decompress one object, reporting BOTH sizes.
+///
+/// The fetched length is the bytes that came off the wire, already in hand and
+/// otherwise dropped one line later. `list_keys` discards each `ObjectMeta`
+/// and keeps only the location, so nothing downstream of a listing knows what
+/// an object weighs — `readiness_of` does still hold metas for the objects IT
+/// reads, but those are the newest per instance, not the set compaction reads,
+/// so it cannot answer for a whole landing.
+///
+/// Reporting it is what makes a compression ratio computable at all. The
+/// decompressed side has always been recorded, so a reader can size a memory
+/// budget from history but cannot predict one from a listing — which is
+/// precisely what every "decide before reading" proposal needs.
+async fn get_decoded(
+    store: &DynStore,
+    key: &object_store::path::Path,
+) -> Result<(Vec<u8>, u64), String> {
     let bytes = store
         .get(key)
         .await
@@ -575,7 +591,8 @@ async fn get_decoded(store: &DynStore, key: &object_store::path::Path) -> Result
         .bytes()
         .await
         .map_err(|e| format!("s3 read {key}: {e}"))?;
-    decode_object(key.as_ref(), &bytes)
+    let fetched = bytes.len() as u64;
+    Ok((decode_object(key.as_ref(), &bytes)?, fetched))
 }
 
 /// Decode an object's compression by extension, with a magic-byte fallback:
@@ -837,7 +854,11 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
 pub fn get_object_decoded(cfg: &S3Config, key: &str) -> Result<Vec<u8>, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(get_decoded(&store, &object_store::path::Path::from(key)))
+    rt.block_on(async {
+        get_decoded(&store, &object_store::path::Path::from(key))
+            .await
+            .map(|(decoded, _)| decoded)
+    })
 }
 
 /// Upload raw bytes to `key` (no compression). Used to stage a candidate
@@ -1237,7 +1258,7 @@ async fn readiness_of(
     let mut instances: BTreeSet<String> = newest_per_instance.keys().cloned().collect();
     let mut with_eof: BTreeSet<String> = BTreeSet::new();
     for (key_instance, meta) in &to_scan {
-        let data = get_decoded(store, &meta.location).await?;
+        let (data, _) = get_decoded(store, &meta.location).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
@@ -1467,7 +1488,8 @@ async fn session_lines(
 ) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     for part in &manifest.data_parts {
-        let data = get_decoded(store, &object_store::path::Path::from(part.key.as_str())).await?;
+        let (data, _) =
+            get_decoded(store, &object_store::path::Path::from(part.key.as_str())).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
@@ -1532,6 +1554,17 @@ pub enum Compaction {
         /// reports bytes only when it refuses can never supply it: the
         /// recordings that seal ARE the distribution.
         landing_bytes_read: u64,
+        /// Compressed bytes fetched for the same landing — the other half of
+        /// the ratio.
+        ///
+        /// A pass decides what it can hold by MEASURING as it reads, which
+        /// costs a refused recording up to the budget in fetching before it is
+        /// refused. Every proposal to decide that from a listing instead needs
+        /// a compression ratio, and no ratio has ever been recorded: this side
+        /// of it was discarded in `list_keys` and never reached a ledger row.
+        /// Recording it here does not change any decision today; it is what
+        /// makes the decision measurable when someone wants to.
+        landing_bytes_fetched: u64,
         /// See `RefusedTooLarge::shared_prefix`. Carried here for the same
         /// reason: without it `landing_bytes_read` for a straddling session
         /// reads as that recording's size when it is the whole partition's.
@@ -1545,6 +1578,16 @@ pub enum Compaction {
     RefusedTooLarge {
         budget_bytes: u64,
         read_bytes: u64,
+        /// Stored bytes fetched before the ceiling was hit — a lower bound on
+        /// the landing, exactly as `read_bytes` is.
+        ///
+        /// Reported even though the recording did not seal, because the ratio
+        /// over the objects actually read is a REAL ratio for those objects
+        /// even when the size is only a floor. The sealed population would be
+        /// a biased estimator here: a decision taken from a listing is judged
+        /// on the recordings it would refuse, and those are precisely the ones
+        /// absent from the sealed set.
+        fetched_bytes: u64,
         objects_read: usize,
         objects_total: usize,
         /// Whether the bytes read belong to this recording ALONE.
@@ -1737,9 +1780,14 @@ async fn compact_session_inner(
     // shape and the unbudgeted path is the same code the budgeted path takes.
     let budget = max_landing_bytes.unwrap_or(u64::MAX);
     let mut read_bytes = 0u64;
+    let mut fetched_bytes = 0u64;
     for (read, key) in keys.iter().enumerate() {
-        let chunk = get_decoded(store, key).await?;
+        let (chunk, fetched) = get_decoded(store, key).await?;
         read_bytes += chunk.len() as u64;
+        // Accumulated beside the decompressed total so a sealed recording
+        // reports BOTH. One number sizes a budget; the pair is what makes a
+        // ratio, and a ratio is what any decision taken from a LISTING needs.
+        fetched_bytes += fetched;
         chunks.push(chunk);
         // Checked after the push, so `read_bytes` is what is actually held
         // rather than what is about to be.
@@ -1753,6 +1801,7 @@ async fn compact_session_inner(
             return Ok(Compaction::RefusedTooLarge {
                 budget_bytes: budget,
                 read_bytes,
+                fetched_bytes,
                 objects_read: read + 1,
                 objects_total: keys.len(),
                 shared_prefix: location.shared,
@@ -1795,6 +1844,7 @@ async fn compact_session_inner(
         merge: collated.merge.clone(),
         manifest: Box::new(write_seal(store, session_id, collated, landing_objects).await?),
         landing_bytes_read: read_bytes,
+        landing_bytes_fetched: fetched_bytes,
         shared_prefix: location.shared,
     })
 }
@@ -4416,6 +4466,90 @@ mod tests {
         m
     }
 
+    /// The two byte totals are DIFFERENT NUMBERS, and only a compressed
+    /// landing can show it.
+    ///
+    /// Every other fixture in this crate is stored plain, so `fetched` and
+    /// `read` are equal by construction and any assertion relating them is
+    /// satisfied by either field. That is not a small gap: wiring `read_bytes`
+    /// into the fetched slot, or accumulating the decompressed length in the
+    /// loop, both produce a seal that looks correct in every plain fixture and
+    /// reports a compression ratio of exactly 1.0 for every recording forever.
+    /// A ratio nobody can distinguish from "not measured" is worse than an
+    /// absent field, because it will be divided by.
+    ///
+    /// The third assertion is the one the doc comment on `get_decoded` claims
+    /// and nothing else checks: what compaction reports as fetched is what the
+    /// LISTING says those objects weigh. That is the number a future
+    /// decide-before-reading gate would key on, so the two must agree.
+    #[test]
+    fn a_gzip_landing_reports_what_was_fetched_apart_from_what_was_held() {
+        use futures::TryStreamExt as _;
+        let store = memory();
+        let lines: Vec<String> = (0..40)
+            .map(|n| envelope_for("s1", "i1", n, Some("c1")))
+            .collect();
+        let payload = lines.join("\n").into_bytes();
+        let mut gz = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+        let key = format!("{DEFAULT_RECORDING_ROOT}/session=s1/inst=i1/part-0.log.gz");
+        block(put(&store, &key, gz.clone())).unwrap();
+
+        let listed: u64 = block(async {
+            store
+                .list(Some(&object_store::path::Path::from(
+                    DEFAULT_RECORDING_ROOT,
+                )))
+                .map_ok(|m| m.size as u64)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .sum()
+        });
+
+        match block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            None,
+        ))
+        .unwrap()
+        {
+            Compaction::Sealed {
+                landing_bytes_read,
+                landing_bytes_fetched,
+                ..
+            } => {
+                assert_eq!(
+                    landing_bytes_read,
+                    payload.len() as u64,
+                    "held = the decompressed payload"
+                );
+                assert_eq!(
+                    landing_bytes_fetched,
+                    gz.len() as u64,
+                    "fetched = the bytes actually stored"
+                );
+                assert_eq!(
+                    landing_bytes_fetched, listed,
+                    "fetched must equal what a LISTING reports for the same objects — \
+                     that equality is the whole point of recording it"
+                );
+                assert!(
+                    landing_bytes_fetched < landing_bytes_read,
+                    "gzip must shrink this payload, or the fixture proves nothing"
+                );
+            }
+            other => panic!("expected a seal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_session_across_two_dates_reads_only_its_own_partitions() {
         // The straddle case, which sandbox showed is the real cost. A session
@@ -4457,6 +4591,7 @@ mod tests {
             Compaction::Sealed {
                 manifest,
                 landing_bytes_read,
+                landing_bytes_fetched,
                 shared_prefix,
                 ..
             } => {
@@ -4472,6 +4607,15 @@ mod tests {
                 assert!(
                     landing_bytes_read < 5_000,
                     "read {landing_bytes_read} bytes; the neighbour was not touched"
+                );
+                // These fixtures are stored PLAIN, so the two sides are equal
+                // here by construction and equality can prove nothing about
+                // which one was measured. Only non-zero is checked; the
+                // separation is pinned by the gzip test below, which is the
+                // only fixture where the two numbers can differ.
+                assert!(
+                    landing_bytes_fetched > 0,
+                    "the fetched side must be measured, not defaulted to zero"
                 );
             }
             other => panic!("expected a seal, got {other:?}"),
