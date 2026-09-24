@@ -4631,6 +4631,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    // Resolved calls whose args were read by identity to find their recording,
+    // by call site, kind and path; and resolved calls whose args are another
+    // call under identity, which neither lookup can have served.
+    let mut args_identity_seen: BTreeMap<(String, &'static str, String), u64> = BTreeMap::new();
+    let mut identity_unconfirmed_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
     // Race evidence needs to be discovered before HTTP body classification:
@@ -4743,6 +4748,36 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if graph_identity_skew(graph_plan, obs).is_some() {
             stats.note_kind("IdentitySkew");
             identity_skews += 1;
+        }
+        // Read off the row itself: the exact lookup cannot serve args whose
+        // arrays moved or whose embedded documents were rewritten, so a
+        // resolved call that differs that way was served by its identity.
+        if let Some(event) = obs
+            .source_event_global_sequence
+            .and_then(|seq| events_by_seq.get(&seq).copied())
+        {
+            match deja::identity::identity_differences(&event.args, &obs.args) {
+                Some(changes) => {
+                    for change in changes {
+                        let kind = match change {
+                            deja::identity::IdentityChange::ArrayOrder(_) => "ArgsOrderAbsorbed",
+                            deja::identity::IdentityChange::DocumentText(_) => {
+                                "ArgsDocumentAbsorbed"
+                            }
+                        };
+                        stats.note_kind(kind);
+                        *args_identity_seen
+                            .entry((call_site_label(obs), kind, change.path().to_owned()))
+                            .or_insert(0) += 1;
+                    }
+                }
+                None => {
+                    stats.note_kind("ArgsIdentityUnconfirmed");
+                    *identity_unconfirmed_seen
+                        .entry(call_site_label(obs))
+                        .or_insert(0) += 1;
+                }
+            }
         }
         {
             // The recorded baseline was found (args still aligned). Under lookup
@@ -5685,6 +5720,25 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // subtracted: a difference that stopped counting is still a difference that
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
+    for ((call_site, kind, path), calls) in &args_identity_seen {
+        let what = if *kind == "ArgsOrderAbsorbed" {
+            "held the array at"
+        } else {
+            "held the JSON document at"
+        };
+        warnings.push(format!(
+            "matched call {call_site} {what} {path} in another order on {calls} call(s) and was \
+             served its recording by the args' identity, not their exact form. The members are \
+             the same; any added, removed or altered member would still miss"
+        ));
+    }
+    for (call_site, calls) in &identity_unconfirmed_seen {
+        warnings.push(format!(
+            "matched call {call_site} resolved on {calls} call(s) with args whose identity differs \
+             from the recorded event it was served; neither lookup can serve that, so the table \
+             and the recording disagree"
+        ));
+    }
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
         let by = if *source == "default" {
             "no clause asserts an order for it, and order carries no meaning unless one does"
