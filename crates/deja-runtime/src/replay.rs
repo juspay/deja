@@ -2587,12 +2587,12 @@ pub enum NotPreconditionReason {
     /// A prior event in this correlation WROTE the key; the read observes the
     /// post-write value, not a precondition.
     ReadAfterWrite,
-    /// This correlation CREATED rows in the table and neither the create nor
-    /// the read names which rows, so a read-back cannot be told from a read of
-    /// a pre-existing row and every read of the table is declined.
+    /// This correlation CREATED rows in the table and the create or the read
+    /// names no rows, so the read cannot be told from a read-back of a created
+    /// row and is declined.
     SelfCreatedTable,
-    /// The read returned a row this correlation CREATED; seeding it would
-    /// collide with the replayed create.
+    /// The read returned a row this correlation CREATED, which its replayed
+    /// create rebuilds; seeding this key would collide with it.
     SelfCreatedRow,
     /// A delete that found NO key. The reply proves absence, so there is
     /// nothing to seed — and seeding the reply as a value would create the key.
@@ -3218,7 +3218,13 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                             || returned.is_empty()
                         {
                             Some(NotPreconditionReason::SelfCreatedTable)
+                        } else if matches!(StateKey::parse(key), Ok(StateKey::DbRow { .. })) {
+                            // A row key seeds only its own row. A row this correlation
+                            // created never gets here: the create wrote that exact key,
+                            // so the read was declined above as a read after a write.
+                            None
                         } else if returned.iter().any(|row| created_rows.contains(row)) {
+                            // A query fingerprint seeds every row the read returned.
                             Some(NotPreconditionReason::SelfCreatedRow)
                         } else {
                             None
@@ -7547,23 +7553,26 @@ mod tests {
         );
     }
 
-    /// A read returning a created row among others is declined whole: its
-    /// query fingerprint would seed the created row too.
+    /// A read returning a created row among others: its query fingerprint
+    /// would seed the created row too, so it is declined; the other row's own
+    /// key seeds only that row, which the correlation did not create.
     #[test]
-    fn a_read_that_returns_any_created_row_is_declined_whole() {
+    fn a_read_returning_a_created_row_declines_its_fingerprint_not_the_other_row() {
         let (read, query, rows) = address_read(&["add_shipping", "add_billing"]);
         let plan = build_seed_plan(&[address_insert(&["add_shipping"]), read], Some("c1"));
-        for key in rows.iter().chain(std::iter::once(&query)) {
-            assert!(!plan.contains("db", key), "{key} was seeded");
-        }
+        assert!(!plan.contains("db", &query));
+        assert!(
+            !plan.contains("db", &rows[0]),
+            "the created row is not seeded"
+        );
+        assert!(
+            plan.contains("db", &rows[1]),
+            "the row it did not create is"
+        );
         let declined: Vec<_> = plan.non_precondition_reads().collect();
         assert!(
-            declined.contains(&(
-                "db",
-                rows[1].as_str(),
-                NotPreconditionReason::SelfCreatedRow
-            )),
-            "the uncreated row is declined for the created one beside it: {declined:?}"
+            declined.contains(&("db", query.as_str(), NotPreconditionReason::SelfCreatedRow)),
+            "{declined:?}"
         );
     }
 
