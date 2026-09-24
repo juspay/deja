@@ -37,7 +37,9 @@ use super::ledger::CallRecord;
 ///    correlations the run drove.
 /// 3: the tree carries the event schema versions its candidate captured
 ///    under.
-pub const CANON_VERSION: u32 = 3;
+/// 4: a JSON document carried inside a string is canonicalised as structure,
+///    so the sending process's map order inside it is not behaviour.
+pub const CANON_VERSION: u32 = 4;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -159,8 +161,25 @@ pub fn event_schema_versions(observed: &str) -> BTreeSet<u32> {
 /// Header NAMES are lowercased, in the sort and in the output, so a case-only
 /// difference between two runs hashes identically. HTTP header names are
 /// case-insensitive, so the wire treats them as the same header too.
+///
+/// A string that holds a JSON document — the connector-request echo a service
+/// returns to its caller is one, serialised from a map whose iteration order
+/// is the process's, not the code's — is canonicalised as that document, so
+/// two runs that sent the same headers in a different order hash the same.
+/// The result is wrapped, so a document sent as a string never hashes equal
+/// to the same document sent as an object; that difference is real.
 fn canonical(v: &serde_json::Value) -> serde_json::Value {
     match v {
+        serde_json::Value::String(text) if looks_like_json(text) => {
+            match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(doc @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+                    let mut wrapped = serde_json::Map::new();
+                    wrapped.insert("$json".to_owned(), canonical(&doc));
+                    serde_json::Value::Object(wrapped)
+                }
+                _ => v.clone(),
+            }
+        }
         serde_json::Value::Object(map) => {
             // insert in key order: with `preserve_order` the map keeps
             // insertion order, so the order of insertion is the wire order
@@ -203,6 +222,13 @@ fn canonical(v: &serde_json::Value) -> serde_json::Value {
         }
         other => other.clone(),
     }
+}
+
+/// Cheap test before parsing: only a string that starts and ends like a JSON
+/// object or array is tried.
+fn looks_like_json(text: &str) -> bool {
+    let t = text.trim();
+    (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))
 }
 
 fn is_pair_list(v: &serde_json::Value) -> bool {
@@ -519,6 +545,33 @@ mod tests {
         let c =
             serde_json::json!({"url": "https://api.x.com/v1", "headers": [["a", "1"], ["b", "3"]]});
         assert_ne!(hash_of(&a), hash_of(&c), "a header VALUE is behaviour");
+    }
+
+    #[test]
+    fn a_json_document_inside_a_string_hashes_by_structure() {
+        // the connector-request echo, as two processes serialised it: the
+        // same headers, in each process's own map order
+        let main = serde_json::json!({"value": r#"{"url":"https://x/v1","method":"POST","headers":{"X-Api-Key":"k","via":"HyperSwitch","Content-Type":"application/json"},"body":"a=1"}"#});
+        let pr = serde_json::json!({"value": r#"{"url":"https://x/v1","method":"POST","headers":{"Content-Type":"application/json","X-Api-Key":"k","via":"HyperSwitch"},"body":"a=1"}"#});
+        assert_eq!(
+            hash_of(&main),
+            hash_of(&pr),
+            "map order inside the echo is not behaviour"
+        );
+        let other = serde_json::json!({"value": r#"{"url":"https://x/v1","method":"POST","headers":{"Content-Type":"application/json","X-Api-Key":"k2","via":"HyperSwitch"},"body":"a=1"}"#});
+        assert_ne!(
+            hash_of(&main),
+            hash_of(&other),
+            "a header value inside the echo is behaviour"
+        );
+        let as_object = serde_json::json!({"value": {"url":"https://x/v1","method":"POST","headers":{"Content-Type":"application/json","X-Api-Key":"k","via":"HyperSwitch"},"body":"a=1"}});
+        assert_ne!(
+            hash_of(&main),
+            hash_of(&as_object),
+            "a document sent as text is not the document sent as an object"
+        );
+        let not_json = serde_json::json!({"value": "{not json"});
+        assert_eq!(hash_of(&not_json), hash_of(&not_json.clone()));
     }
 
     #[test]
