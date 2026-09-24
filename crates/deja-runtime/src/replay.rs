@@ -1078,6 +1078,12 @@ impl DejaHook for ReplayHook {
 pub struct LookupTable {
     pub recording_id: String,
     pub policy_version: u32,
+    /// The event schema the recording was captured under, read by the renderer
+    /// off the recording's own events. `None` from a renderer that predates
+    /// this field, for a recording with no events, or for a JSONL table, which
+    /// carries no envelope; a candidate installing the table refuses all three.
+    #[serde(default)]
+    pub event_schema_version: Option<u16>,
     pub entries: Vec<LookupEntry>,
 }
 
@@ -1837,6 +1843,41 @@ fn check_policy_version(table: LookupTable) -> std::io::Result<LookupTable> {
     ))
 }
 
+/// Refuse a recording captured under another event schema, naming both.
+///
+/// The schema decides what an argument's recorded image looks like, and the
+/// image is what its key hashes. Where two schemas encode a value differently —
+/// v10 marks a present `None` that v9 wrote as `null` — every such call misses,
+/// and the run presents as a regression in a candidate that changed nothing.
+/// Same reasoning as [`check_policy_version`]; this one is about the
+/// recording rather than the renderer, so it runs where a candidate installs
+/// the table to replay against ([`LookupTableHook::from_source`]), not where a
+/// file is read: the scorer reads the same file and must not be refused.
+fn check_event_schema_version(table: LookupTable) -> std::io::Result<LookupTable> {
+    let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
+    let refusal = match table.event_schema_version {
+        Some(version) if version == current => return Ok(table),
+        Some(version) => format!(
+            "recording {} was captured under event schema v{version} but this build reads \
+             v{current}; re-record it with a build at v{current}.",
+            table.recording_id
+        ),
+        None => format!(
+            "lookup table for recording {} declares no event schema version, so it is \
+             treated as older than this build's v{current}: if the recording is v{current}, \
+             re-render it with a runner at this deja revision; otherwise re-record it.",
+            table.recording_id
+        ),
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{refusal} Refusing at install rather than missing wherever the two schemas \
+             encode an argument differently, which would present as a candidate regression."
+        ),
+    ))
+}
+
 impl LookupTableSource for LocalFileLookupSource {
     fn load(&mut self) -> std::io::Result<LookupTable> {
         let bytes = std::fs::read(&self.path)?;
@@ -1882,18 +1923,16 @@ impl LookupTableSource for LocalFileLookupSource {
                 )
             })?;
         // A bare JSONL stream carries no envelope and therefore no declared
-        // version, so it is taken at the current version rather than refused.
-        //
-        // That is sound only while nothing emits JSONL, which is a property of
-        // the RENDERER rather than of this function: `render_lookup_table`
-        // returns an enveloped table and the orchestrator has no JSONL writer.
-        // The assumption is stated at that end too, because this is where it
-        // would fail and there is where it would be broken — anyone adding a
-        // JSONL writer removes the version guard from this path without
-        // touching this file.
+        // versions. Its matching policy is taken at the current one rather than
+        // refused, which is sound only while nothing emits JSONL — a property of
+        // the RENDERER, stated at that end too, since that is where it would be
+        // broken. Its event schema is left undeclared: unknown is not current,
+        // so a candidate installing it refuses it as it refuses any table that
+        // does not say which schema it was recorded under.
         Ok(LookupTable {
             recording_id: String::new(),
             policy_version: POLICY_VERSION,
+            event_schema_version: None,
             entries,
         })
     }
@@ -2050,7 +2089,9 @@ impl LookupTableHook {
         S: LookupTableSource,
         K: ObservedCallSink + 'static,
     {
-        let table = source.load()?;
+        // Checked here rather than in the source: the scorer reads the same
+        // table for what the recording held, and that is valid under any schema.
+        let table = check_event_schema_version(source.load()?)?;
         let mut map = HashMap::with_capacity(table.entries.len());
         for entry in table.entries {
             map.insert(entry.key.clone(), entry);
@@ -4085,6 +4126,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry_with(
                     None,
@@ -4572,12 +4614,109 @@ mod tests {
         let mut ok = std::fs::File::create(&ok_path).expect("create");
         write!(
             ok,
-            r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"entries":[]}}"#
+            r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{},"entries":[]}}"#,
+            crate::CURRENT_EVENT_SCHEMA_VERSION
         )
         .expect("write");
         LocalFileLookupSource::new(&ok_path)
             .load()
             .expect("a current-version table must still load");
+    }
+
+    /// A recording captured by a build with a different event schema is
+    /// refused when a candidate installs its table, naming both versions. Its argument images were
+    /// encoded under another schema, so wherever the two encodings differ
+    /// every key fails to compare, and the run presents as a regression in a
+    /// candidate that changed nothing. A table that declares no version is
+    /// treated as older than this build.
+    #[test]
+    fn a_recording_from_another_event_schema_is_refused_at_install() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tmp");
+        let load = |name: &str, body: String| {
+            let path = dir.path().join(name);
+            let mut file = std::fs::File::create(&path).expect("create");
+            write!(file, "{body}").expect("write");
+            LookupTableHook::from_source(
+                LocalFileLookupSource::new(&path),
+                InMemoryObservedSink::new(),
+            )
+            .map(|_| ())
+        };
+        let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
+        let older = current - 1;
+        let newer = current + 1;
+
+        let message = load(
+            "older.json",
+            format!(
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{older},"entries":[]}}"#
+            ),
+        )
+        .expect_err("a recording from an older schema must be refused")
+        .to_string();
+        assert!(
+            message.contains(&format!("event schema v{older}"))
+                && message.contains(&format!("v{current}"))
+                && message.contains("re-record"),
+            "the refusal names both versions and the remedy: {message}"
+        );
+
+        let message = load(
+            "unversioned.json",
+            format!(r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"entries":[]}}"#),
+        )
+        .expect_err("a table that declares no schema version must be refused")
+        .to_string();
+        assert!(
+            message.contains("no event schema version") && message.contains(&format!("v{current}")),
+            "the refusal says what is missing: {message}"
+        );
+
+        let message = load(
+            "newer.json",
+            format!(
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{newer},"entries":[]}}"#
+            ),
+        )
+        .expect_err("a recording from a newer schema must be refused too")
+        .to_string();
+        assert!(
+            message.contains(&format!("event schema v{newer}")),
+            "the refusal names the newer version: {message}"
+        );
+
+        let entry = serde_json::to_string(&LookupEntry {
+            key: LookupKey {
+                correlation_id: None,
+                bucket_id: None,
+                boundary: "db".to_owned(),
+                component: "T".to_owned(),
+                operation: "m".to_owned(),
+                fork_seq: 0,
+                locus: Locus::Unlocated,
+                args_hash: 0,
+                occurrence: 0,
+            },
+            result: serde_json::json!("v"),
+            source_event_global_sequence: 1,
+        })
+        .expect("entry");
+        let message = load("unenveloped.jsonl", entry)
+            .expect_err("a JSONL table declares no schema, so it must be refused")
+            .to_string();
+        assert!(
+            message.contains("no event schema version"),
+            "unknown is not current: {message}"
+        );
+
+        load(
+            "current.json",
+            format!(
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{current},"entries":[]}}"#
+            ),
+        )
+        .expect("a recording from this build's schema must still load");
     }
 
     /// One recorded call: the operation, the span it fired in, its
@@ -4625,6 +4764,7 @@ mod tests {
         LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
     }
@@ -4934,6 +5074,7 @@ mod tests {
         let (hook, handle) = hook_over(LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         });
         assert_eq!(
@@ -5027,6 +5168,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         };
         let observed = InMemoryObservedSink::new();
@@ -5126,6 +5268,7 @@ mod tests {
         LookupTable {
             recording_id: "rec-boundary".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
     }
@@ -5763,6 +5906,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 entry_with(
                     None,
@@ -5817,6 +5961,7 @@ mod tests {
         let table = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![entry_with(
                 None,
                 explicit("find_pi"),
@@ -5856,6 +6001,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "rec-1".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();
@@ -6057,6 +6203,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let hook =
@@ -6090,6 +6237,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let hook =
@@ -6145,6 +6293,7 @@ mod tests {
         let empty = LookupTable {
             recording_id: "r".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let inner =
@@ -6178,6 +6327,7 @@ mod tests {
             VecSource(Some(LookupTable {
                 recording_id: "r".to_owned(),
                 policy_version: POLICY_VERSION,
+                event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
             })),
             InMemoryObservedSink::new(),
@@ -8201,6 +8351,7 @@ redis\tcurrency\tusd
         let table = LookupTable {
             recording_id: "rec-shadow".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![entry_with(
                 None,
                 Locus::Unlocated,
@@ -8257,6 +8408,7 @@ redis\tcurrency\tusd
         let table = LookupTable {
             recording_id: "rec-novel".to_owned(),
             policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
         };
         let observed = InMemoryObservedSink::new();

@@ -222,6 +222,7 @@ async fn replay_lookup_hit_with_unreconstructable_result_fail_stops_before_real_
     let table = LookupTable {
         recording_id: "malformed-substitute-hit".to_owned(),
         policy_version: deja_runtime::replay::POLICY_VERSION,
+        event_schema_version: Some(deja_runtime::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![LookupEntry {
             key: LookupKey {
                 correlation_id: None,
@@ -344,6 +345,7 @@ async fn replay_execute_delegate_runs_real_impl_and_emits_shadow_observation() {
     let table = LookupTable {
         recording_id: "execute-delegate-recording".to_owned(),
         policy_version: deja_runtime::replay::POLICY_VERSION,
+        event_schema_version: Some(deja_runtime::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![LookupEntry {
             key: LookupKey {
                 correlation_id: None,

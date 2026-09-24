@@ -872,6 +872,7 @@ mod tests {
         deja::LookupTable {
             recording_id: "rec".to_owned(),
             policy_version: deja::POLICY_VERSION,
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
     }

@@ -35,6 +35,7 @@ fn substitute_miss_fail_stops_in_replay() {
     let table = deja::LookupTable {
         recording_id: "fail-stop-test".to_string(),
         policy_version: deja::POLICY_VERSION,
+        event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![],
     };
     let dir = tempfile::tempdir().expect("tempdir");

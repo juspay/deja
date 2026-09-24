@@ -6122,6 +6122,8 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
     let empty = || LookupTable {
         recording_id: String::new(),
         policy_version: 0,
+        // No table was read, so no schema is known; the scorer never consults it.
+        event_schema_version: None,
         entries: Vec::new(),
     };
     if !path.exists() {
@@ -6306,6 +6308,42 @@ mod tests {
             disagreements.join("; ")
         );
         card
+    }
+
+    /// The scorer reads a run's lookup table for what the RECORDING held. Which
+    /// schema that recording was captured under is the replaying candidate's
+    /// question, not the scorer's, so a table from another schema still scores.
+    #[test]
+    fn the_scorer_reads_a_table_from_any_event_schema() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("lookup.json");
+        let mut table = serde_json::json!({
+            "recording_id": "rec-1",
+            "policy_version": deja::POLICY_VERSION,
+            "entries": [serde_json::to_value(seq_entry_method_res(
+                Some("c1"),
+                "db",
+                "find",
+                1,
+                serde_json::json!({"result": "Ok"}),
+            ))
+            .expect("entry")],
+        });
+        for schema in [
+            Some(deja::CURRENT_EVENT_SCHEMA_VERSION - 1),
+            Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+            None,
+        ] {
+            table["event_schema_version"] = serde_json::json!(schema);
+            std::fs::write(&path, table.to_string()).expect("write");
+            let mut warnings = Vec::new();
+            let loaded = load_table(&path, &mut warnings);
+            assert_eq!(
+                (loaded.entries.len(), warnings.len()),
+                (1, 0),
+                "schema {schema:?}: {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -6684,6 +6722,7 @@ mod tests {
             &LookupTable {
                 recording_id: "rec-ns".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
             },
         )
@@ -6767,6 +6806,7 @@ mod tests {
             &LookupTable {
                 recording_id: "rec-scope".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -6889,6 +6929,7 @@ mod tests {
             &LookupTable {
                 recording_id: recording_id.to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
@@ -7300,6 +7341,7 @@ mod tests {
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
             },
             observed,
@@ -8908,6 +8950,7 @@ mod tests {
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
                 policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
             },
             observed,
@@ -10892,6 +10935,7 @@ mod tests {
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
             policy_version: deja::POLICY_VERSION,
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 seq_entry_method_res(
                     Some(corr),
