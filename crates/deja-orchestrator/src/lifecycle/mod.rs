@@ -1671,7 +1671,12 @@ fn shared_results_bytes(table: &deja::LookupTable, legacy: &[u8]) -> Result<Vec<
         .map_err(|e| format!("build shared-results table: {e}"))?;
     let bytes =
         serde_json::to_vec(&shared).map_err(|e| format!("write shared-results table: {e}"))?;
-    expands_to(shared, legacy)?;
+    drop(shared);
+    // The bytes about to be written, read back, so the check covers what a
+    // candidate will parse rather than the struct that produced it.
+    let written: deja::SharedResultsTable = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("read back shared-results table: {e}"))?;
+    expands_to(written, legacy)?;
     Ok(bytes)
 }
 
