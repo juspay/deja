@@ -4514,6 +4514,19 @@ mod tests {
             local_path_for_artifact_kind(&root, "run-1", "call_ledger").is_some(),
             "a kind the API reads is still hydrated"
         );
+        // Old copies are swept where hydration used to put them.
+        assert_eq!(
+            cache_path_for_kind(&root, "run-1", "lookup_table"),
+            Some(artifact_kinds::LOOKUP_TABLE.path(&root, "run-1")),
+            "the sweep looks for old copies where they are"
+        );
+        // Hydration asks the served-only seam, not the sweep's, which also
+        // answers for the lookup table.
+        let needle = format!(
+            "let Some(local) = {}(&root, &run_id, &art.kind)",
+            "local_path_for_artifact_kind"
+        );
+        assert_eq!(include_str!("main.rs").matches(&needle).count(), 1);
     }
 
     /// Every hydrated kind is swept, not only the big one. A kind added to the

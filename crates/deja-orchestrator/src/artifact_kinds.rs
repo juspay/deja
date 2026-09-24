@@ -25,8 +25,9 @@ pub enum Publish {
 pub enum Bound {
     /// Hydrated onto the orchestrator and evicted by its artifact-cache budget.
     CacheBudget,
-    /// Never hydrated: on k8s it exists only in the ephemeral runner pod, and
-    /// the published object is the record.
+    /// Not hydrated: on k8s it exists only in the ephemeral runner pod, and
+    /// the published object is the record. Copies hydrated before a kind moved
+    /// here are swept as no-longer-hydrated cache.
     RunnerPod,
 }
 
@@ -37,7 +38,8 @@ pub struct RunArtifactKind {
     pub object: &'static str,
     pub local_path: fn(&HarnessRoot, &str) -> PathBuf,
     pub publish: Publish,
-    /// Hydrated from the store and served by the API.
+    /// Hydrated onto the orchestrator so its detail endpoints can read a local
+    /// copy. `/raw` serves every kind from its URI either way.
     pub served: bool,
     pub bound: Bound,
 }
