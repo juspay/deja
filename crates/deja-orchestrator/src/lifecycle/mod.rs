@@ -791,7 +791,11 @@ fn drive_replay(
     // candidate's LocalFileLookupSource and the divergence detector).
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
     let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
-    ctx.log("rendering lookup table", &rendered);
+    ctx.log("rendering lookup table", &rendered.report);
+    let suspect = schema_suspect(&recording_id, rendered.event_schema_version);
+    if let Some(note) = &suspect {
+        ctx.log("rendering lookup table", note);
+    }
 
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
@@ -831,7 +835,8 @@ fn drive_replay(
     wait_health(
         &format!("http://127.0.0.1:{}/health", demo.replay_port),
         Duration::from_secs(240),
-    )?;
+    )
+    .map_err(|e| with_suspect(e, suspect.as_deref()))?;
 
     set_stage(
         root,
@@ -1497,17 +1502,17 @@ pub fn extract_record_graph(
 /// through scoring. Scoring then re-reads the very file written here into a
 /// second, independent copy, because `load_artifacts` takes a path and knows
 /// nothing about a caller that already has one. Both copies were resident at
-/// the same time, for the whole run, to no purpose. Returning a count means the
+/// the same time, for the whole run, to no purpose. Returning a summary means the
 /// caller cannot hold the first one even by accident.
 fn render_and_persist_lookup_table(
     root: &HarnessRoot,
     run_id: &str,
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
-) -> Result<String, String> {
+) -> Result<RenderedTable, String> {
     let raw = std::env::var(LOOKUP_TABLE_MAX_BYTES_ENV).ok();
     let (max_bytes, budget) = describe_lookup_table_budget(raw.as_deref());
-    let (entries, bytes) = persist_lookup_table_within(
+    let (entries, bytes, event_schema_version) = persist_lookup_table_within(
         root,
         run_id,
         recording,
@@ -1515,9 +1520,47 @@ fn render_and_persist_lookup_table(
         max_bytes.unwrap_or(u64::MAX),
     )
     .map_err(|e| format!("{e} Budget in force: {budget}."))?;
-    Ok(format!(
-        "{entries} entries rendered, {bytes} bytes compact; budget {budget}"
+    Ok(RenderedTable {
+        report: format!("{entries} entries rendered, {bytes} bytes compact; budget {budget}"),
+        event_schema_version,
+    })
+}
+
+/// What a caller may know about the table it rendered, and nothing it could
+/// hold the table by.
+#[derive(Debug)]
+struct RenderedTable {
+    /// The line the run log records for the render.
+    report: String,
+    event_schema_version: Option<u16>,
+}
+
+/// The cause to suspect when a recording's schema is not the one this runner
+/// writes. A candidate on a deja pin at this runner's schema refuses such a
+/// table at boot, before its logger starts, so the only symptom the runner sees
+/// is a health check that times out. The runner cannot know the candidate's
+/// pin, so this names a suspect rather than refusing.
+fn schema_suspect(recording_id: &str, schema: Option<u16>) -> Option<String> {
+    let current = deja::CURRENT_EVENT_SCHEMA_VERSION;
+    let recorded = match schema {
+        Some(version) if version == current => return None,
+        Some(version) => format!("event schema v{version}"),
+        None => "no declared event schema".to_owned(),
+    };
+    Some(format!(
+        "recording {recording_id} has {recorded} and this runner writes v{current}: a \
+         candidate on a deja pin at v{current} refuses it at boot, before its logger starts \
+         (the refusal is on the candidate container's stderr), and the recording must be \
+         re-recorded"
     ))
+}
+
+/// A health-check failure, with the suspected cause attached when there is one.
+fn with_suspect(error: String, suspect: Option<&str>) -> String {
+    match suspect {
+        Some(suspect) => format!("{error}; suspected cause: {suspect}"),
+        None => error,
+    }
 }
 
 /// Read by the runner, which renders the table; set it on the replay Job
@@ -1571,7 +1614,7 @@ fn persist_lookup_table_within(
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
     max_bytes: u64,
-) -> Result<(usize, u64), String> {
+) -> Result<(usize, u64, Option<u16>), String> {
     let table = crate::lookup::render_lookup_table(recording, recording_id)
         .map_err(|e| format!("render lookup table: {e}"))?;
     // Compact, not pretty: the candidate holds this whole file in one buffer at
@@ -1601,7 +1644,7 @@ fn persist_lookup_table_within(
     if table.entries.is_empty() {
         return Err("rendered lookup table is empty".to_string());
     }
-    Ok((table.entries.len(), size))
+    Ok((table.entries.len(), size, table.event_schema_version))
 }
 
 /// Final stage (shared): score the run, report the verdict, register the
@@ -1844,7 +1887,11 @@ pub fn drive_replay_in_pod(
 
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
     let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
-    ctx.log("rendering lookup table", &rendered);
+    ctx.log("rendering lookup table", &rendered.report);
+    let suspect = schema_suspect(&recording_id, rendered.event_schema_version);
+    if let Some(note) = &suspect {
+        ctx.log("rendering lookup table", note);
+    }
 
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
@@ -1995,7 +2042,8 @@ pub fn drive_replay_in_pod(
         .health_url
         .clone()
         .unwrap_or_else(|| format!("http://127.0.0.1:{}/health", opts.candidate_port));
-    wait_health(&health_url, Duration::from_secs(240))?;
+    wait_health(&health_url, Duration::from_secs(240))
+        .map_err(|e| with_suspect(e, suspect.as_deref()))?;
     run_kernel(
         &opts.kernel_bin,
         opts.candidate_port,
@@ -6176,7 +6224,7 @@ mod tests {
     #[test]
     fn the_lookup_table_is_written_compact_and_loads_back() {
         let (_dir, root, recording) = three_event_recording();
-        let (entries, _) =
+        let (entries, _, _) =
             super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
                 .unwrap();
         assert!(entries > 0, "the fixture renders entries");
@@ -6263,7 +6311,7 @@ mod tests {
         std::env::set_var(super::LOOKUP_TABLE_MAX_BYTES_ENV, "0");
         let report = super::render_and_persist_lookup_table(&root, "run-2", &recording, "rec-1");
         std::env::remove_var(super::LOOKUP_TABLE_MAX_BYTES_ENV);
-        let report = report.expect("0 disables the check");
+        let report = report.expect("0 disables the check").report;
         assert!(
             report.contains("bytes compact") && report.contains("disables it"),
             "a written table reports its size and the budget in force: {report}"
@@ -6314,9 +6362,35 @@ mod tests {
         assert_eq!(
             calls, 1,
             "the renderer is reached from exactly one place in this module, the body of \
-             `persist_lookup_table_within`, which returns a count so that no caller can \
+             `persist_lookup_table_within`, which returns a summary so that no caller can \
              hold the table; {calls} call sites means a stage body is binding it again"
         );
+    }
+
+    /// A recording from another schema, or none, names the cause a candidate's
+    /// silent boot refusal would otherwise hide behind a health timeout; a
+    /// recording from this runner's schema names nothing.
+    #[test]
+    fn a_recording_from_another_schema_names_the_suspect_behind_a_health_timeout() {
+        let current = deja::CURRENT_EVENT_SCHEMA_VERSION;
+        assert_eq!(schema_suspect("rec", Some(current)), None);
+        for (schema, says) in [
+            (Some(current - 1), format!("event schema v{}", current - 1)),
+            (Some(current + 1), format!("event schema v{}", current + 1)),
+            (None, "no declared event schema".to_owned()),
+        ] {
+            let suspect = schema_suspect("rec", schema).expect("a suspect");
+            assert!(
+                suspect.contains(&says) && suspect.contains(&format!("v{current}")),
+                "{suspect}"
+            );
+            let failure = with_suspect(
+                "candidate not healthy within timeout".to_owned(),
+                Some(&suspect),
+            );
+            assert!(failure.starts_with("candidate not healthy") && failure.contains(&suspect));
+        }
+        assert_eq!(with_suspect("unchanged".to_owned(), None), "unchanged");
     }
 
     /// The probe is the instrument every memory measurement here is read

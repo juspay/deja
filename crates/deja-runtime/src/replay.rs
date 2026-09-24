@@ -1080,8 +1080,8 @@ pub struct LookupTable {
     pub policy_version: u32,
     /// The event schema the recording was captured under, read by the renderer
     /// off the recording's own events. `None` from a renderer that predates
-    /// this field, or for a recording with no events; a candidate installing
-    /// the table treats either as older than this build.
+    /// this field, for a recording with no events, or for a JSONL table, which
+    /// carries no envelope; a candidate installing the table refuses all three.
     #[serde(default)]
     pub event_schema_version: Option<u16>,
     pub entries: Vec<LookupEntry>,
@@ -1923,19 +1923,16 @@ impl LookupTableSource for LocalFileLookupSource {
                 )
             })?;
         // A bare JSONL stream carries no envelope and therefore no declared
-        // versions, so it is taken at the current ones rather than refused.
-        //
-        // That is sound only while nothing emits JSONL, which is a property of
-        // the RENDERER rather than of this function: `render_lookup_table`
-        // returns an enveloped table and the orchestrator has no JSONL writer.
-        // The assumption is stated at that end too, because this is where it
-        // would fail and there is where it would be broken — anyone adding a
-        // JSONL writer removes the version guard from this path without
-        // touching this file.
+        // versions. Its matching policy is taken at the current one rather than
+        // refused, which is sound only while nothing emits JSONL — a property of
+        // the RENDERER, stated at that end too, since that is where it would be
+        // broken. Its event schema is left undeclared: unknown is not current,
+        // so a candidate installing it refuses it as it refuses any table that
+        // does not say which schema it was recorded under.
         Ok(LookupTable {
             recording_id: String::new(),
             policy_version: POLICY_VERSION,
-            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
+            event_schema_version: None,
             entries,
         })
     }
@@ -4648,6 +4645,7 @@ mod tests {
         };
         let current = crate::CURRENT_EVENT_SCHEMA_VERSION;
         let older = current - 1;
+        let newer = current + 1;
 
         let message = load(
             "older.json",
@@ -4673,6 +4671,27 @@ mod tests {
         assert!(
             message.contains("no event schema version") && message.contains(&format!("v{current}")),
             "the refusal says what is missing: {message}"
+        );
+
+        let message = load(
+            "newer.json",
+            format!(
+                r#"{{"recording_id":"rec-1","policy_version":{POLICY_VERSION},"event_schema_version":{newer},"entries":[]}}"#
+            ),
+        )
+        .expect_err("a recording from a newer schema must be refused too")
+        .to_string();
+        assert!(
+            message.contains(&format!("event schema v{newer}")),
+            "the refusal names the newer version: {message}"
+        );
+
+        let message = load("unenveloped.jsonl", String::new())
+            .expect_err("a JSONL table declares no schema, so it must be refused")
+            .to_string();
+        assert!(
+            message.contains("no event schema version"),
+            "unknown is not current: {message}"
         );
 
         load(

@@ -68,8 +68,9 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// whose declared policy differs from the one this build implements, which is
 /// what stops a stale table degrading into a mass miss that presents as a total
 /// candidate regression. But the loader's JSONL fallback carries no envelope and
-/// therefore no declared versions, so it TAKES the current ones rather than
-/// refusing — sound only while nothing emits JSONL.
+/// therefore no declared versions: it TAKES the current matching policy rather
+/// than refusing — sound only while nothing emits JSONL — and leaves the event
+/// schema undeclared, which a candidate refuses.
 ///
 /// Adding a JSONL writer here would silently remove the version guard from that
 /// path, and the failure mode is precisely the one the refusal exists to
