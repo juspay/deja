@@ -568,6 +568,112 @@ mod tests {
         );
     }
 
+    struct TableSource(Option<LookupTable>);
+    impl deja::LookupTableSource for TableSource {
+        fn load(&mut self) -> io::Result<LookupTable> {
+            Ok(self.0.take().expect("loaded once"))
+        }
+    }
+
+    /// Render a recording holding one uncorrelated call with `recorded` args,
+    /// install it in a candidate's hook, and make the same call with
+    /// `observed` args: the value served, and the call the candidate observed.
+    fn replay_one_call(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> (Option<serde_json::Value>, Vec<deja::ObservedCall>) {
+        use deja::DejaHook;
+        let mut recorded_event = event("redis", 1, serde_json::Value::Null);
+        recorded_event["correlation_id"] = serde_json::Value::Null;
+        recorded_event["args"] = recorded;
+        recorded_event["result"] = serde_json::json!("served");
+        let (_dir, recording) = write_events(&[recorded_event]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let calls = sink.handle();
+        let hook =
+            deja::LookupTableHook::from_source(TableSource(Some(table)), sink).expect("install");
+        let served = hook.try_replay_with_context(deja::ReplayLookup {
+            boundary: "redis",
+            trait_name: "T",
+            method_name: "m",
+            args: &observed,
+            callsite_identity: None,
+            caller_location: None,
+        });
+        let calls = calls.lock().unwrap().clone();
+        (served, calls)
+    }
+
+    /// The same call with its array in another order is the same call. The
+    /// diff has always tolerated the order; the address did not, so the call
+    /// missed and the replay stopped. The address now agrees with the diff.
+    #[test]
+    fn a_call_whose_array_arrived_in_another_order_is_served_its_recording() {
+        let (served, _) = replay_one_call(
+            serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
+            serde_json::json!({ "ids": ["c", "a", "b"], "q": 1 }),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+    }
+
+    /// A string that holds a JSON document is the same call when the document
+    /// is the same, whatever order its keys were written in.
+    #[test]
+    fn a_call_whose_embedded_document_was_written_in_another_order_is_served() {
+        let (served, _) = replay_one_call(
+            serde_json::json!({ "body": r#"{"a":1,"b":[1,2]}"# }),
+            serde_json::json!({ "body": r#"{"b":[2,1],"a":1}"# }),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+    }
+
+    /// What identity still refuses: a changed member, a changed count, a
+    /// string that is not a document, and a document sent as an object where
+    /// the recording sent it as text.
+    #[test]
+    fn a_call_that_differs_in_anything_but_order_still_misses() {
+        let (served, _) = replay_one_call(
+            serde_json::json!({ "ids": ["a", "b"] }),
+            serde_json::json!({ "ids": ["a", "b"] }),
+        );
+        assert_eq!(
+            served,
+            Some(serde_json::json!("served")),
+            "control: the fixture serves a call that matches"
+        );
+        for (name, recorded, observed) in [
+            (
+                "a member changed",
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["a", "c"] }),
+            ),
+            (
+                "a member was dropped",
+                serde_json::json!({ "ids": ["a", "a", "b"] }),
+                serde_json::json!({ "ids": ["a", "b"] }),
+            ),
+            (
+                "a value inside the document changed",
+                serde_json::json!({ "body": r#"{"a":1}"# }),
+                serde_json::json!({ "body": r#"{"a":2}"# }),
+            ),
+            (
+                "text is not a document",
+                serde_json::json!({ "body": "b a" }),
+                serde_json::json!({ "body": "a b" }),
+            ),
+            (
+                "a document as text is not the document as an object",
+                serde_json::json!({ "body": r#"{"a":1}"# }),
+                serde_json::json!({ "body": { "a": 1 } }),
+            ),
+        ] {
+            let (served, _) = replay_one_call(recorded, observed);
+            assert_eq!(served, None, "{name}");
+        }
+    }
+
     #[test]
     fn a_lexical_path_no_longer_earns_its_own_rank() {
         // Rank 4 (`LexicalPath`) is GONE. It resolved zero calls in 155,419
