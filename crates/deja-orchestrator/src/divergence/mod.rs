@@ -2167,6 +2167,9 @@ enum ValueCanonSource {
     Recorder,
     /// No clause: order carries no meaning unless a path says otherwise (#102).
     Default,
+    /// An object's keys in a different order. A JSON object has no order, so
+    /// this stays absorbed whatever becomes of `Default`.
+    ObjectKeys,
 }
 
 impl ValueCanonSource {
@@ -2174,6 +2177,7 @@ impl ValueCanonSource {
         match self {
             Self::Recorder => "recorder",
             Self::Default => "default",
+            Self::ObjectKeys => "object_keys",
         }
     }
 }
@@ -2231,11 +2235,10 @@ fn value_verdict(
     if recorded == observed {
         // JSON object equality ignores key order, so an object whose keys
         // moved compares equal here. Arguably that is right: a JSON object has
-        // no order. It is named anyway, as the order-only difference a permuted
-        // array is, because a tolerance that leaves nothing behind cannot be
-        // shown to be working.
+        // no order. It is named anyway, under its own label, because a
+        // tolerance that leaves nothing behind cannot be shown to be working.
         if json_key_order_differs(recorded, observed) {
-            return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
+            return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::ObjectKeys));
         }
         return ValueVerdict::Equal;
     }
@@ -3835,6 +3838,13 @@ fn order_canonical_diff(
 /// the args and results of a matched call. Those were separate paths, and a
 /// permutation was absorbed in one and reported as a value divergence in the
 /// other, for no reason other than which code reached it first.
+pub(crate) fn json_order_only_difference(
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> bool {
+    recorded != observed && bag_canon(recorded) == bag_canon(observed)
+}
+
 /// Whether two values that are equal as JSON hold some object's keys in a
 /// different order. Only meaningful for equal values: it compares key order
 /// and recurses through objects and arrays, not values.
@@ -3852,13 +3862,6 @@ fn json_key_order_differs(recorded: &serde_json::Value, observed: &serde_json::V
         }
         _ => false,
     }
-}
-
-pub(crate) fn json_order_only_difference(
-    recorded: &serde_json::Value,
-    observed: &serde_json::Value,
-) -> bool {
-    recorded != observed && bag_canon(recorded) == bag_canon(observed)
 }
 
 fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
@@ -5596,6 +5599,14 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
+        if *source == "object_keys" {
+            warnings.push(format!(
+                "matched call {call_site} held an object's keys in a different order on {calls} \
+                 call(s) and was not counted: the keys and values are identical, and a JSON \
+                 object has no order"
+            ));
+            continue;
+        }
         let by = if *source == "default" {
             "no clause asserts an order for it, and order carries no meaning unless one does"
                 .to_owned()
