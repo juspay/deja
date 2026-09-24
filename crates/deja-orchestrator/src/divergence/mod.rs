@@ -3915,10 +3915,12 @@ const MAX_EMBEDDED_DOCUMENTS: usize = 16;
 struct EmbeddedDocuments<'a> {
     text: Vec<&'a str>,
     documents: Vec<serde_json::Value>,
+    /// Each document as written.
+    written: Vec<&'a str>,
 }
 
 fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
-    let (mut pieces, mut documents) = (Vec::new(), Vec::new());
+    let (mut pieces, mut documents, mut written) = (Vec::new(), Vec::new(), Vec::new());
     let (mut piece_start, mut cursor) = (0, 0);
     while let Some(offset) = text[cursor..].find('{') {
         let start = cursor + offset;
@@ -3929,6 +3931,7 @@ fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
                 pieces.push(&text[piece_start..start]);
                 documents.push(document);
                 cursor = start + stream.byte_offset();
+                written.push(&text[start..cursor]);
                 piece_start = cursor;
             }
             _ => cursor = start + 1,
@@ -3938,7 +3941,56 @@ fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
     EmbeddedDocuments {
         text: pieces,
         documents,
+        written,
     }
+}
+
+/// The lexemes of a JSON text as written, sorted: strings with their escapes,
+/// numbers as spelled, literals, and punctuation. Two documents with the same
+/// lexemes differ at most in arrangement, so an escape, a number's spelling or
+/// a dropped member, which parsing would hide, still shows.
+fn written_lexemes(json: &str) -> Vec<&str> {
+    let bytes = json.as_bytes();
+    let (mut lexemes, mut at) = (Vec::new(), 0);
+    while at < bytes.len() {
+        let start = at;
+        match bytes[at] {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                at += 1;
+                continue;
+            }
+            b'"' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                at += 1;
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => at += 1,
+            _ => {
+                while at < bytes.len()
+                    && !matches!(
+                        bytes[at],
+                        b' ' | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'{'
+                            | b'}'
+                            | b'['
+                            | b']'
+                            | b':'
+                            | b','
+                            | b'"'
+                    )
+                {
+                    at += 1;
+                }
+            }
+        }
+        lexemes.push(&json[start..at.min(bytes.len())]);
+    }
+    lexemes.sort_unstable();
+    lexemes
 }
 
 /// The embedded documents of two texts, paired, when everything around them
@@ -3954,7 +4006,16 @@ fn embedded_document_pairs(
         return None;
     }
     let (baseline, candidate) = (embedded_documents(baseline), embedded_documents(candidate));
-    if baseline.text != candidate.text {
+    if baseline.text != candidate.text || baseline.documents.len() > MAX_EMBEDDED_DOCUMENTS {
+        return None;
+    }
+    // Read as JSON only where the documents differ in arrangement alone.
+    if baseline
+        .written
+        .iter()
+        .zip(&candidate.written)
+        .any(|(b, c)| written_lexemes(b) != written_lexemes(c))
+    {
         return None;
     }
     Some(
