@@ -5994,8 +5994,7 @@ mod tests {
         let art = crate::divergence::load_artifacts(&root, run_id).unwrap();
         assert!(
             art.unplanted_presence.names("c1", &query_key()),
-            "the scorer must see the skip the lifecycle wrote: {:?}",
-            art.unplanted_presence
+            "the scorer must see the skip the lifecycle wrote"
         );
         assert!(!art.unplanted_presence.names("c2", &query_key()));
     }
