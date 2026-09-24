@@ -3750,15 +3750,24 @@ impl DbSeedTarget {
 
 /// Why a db seed entry yielded no row to materialize. These are different facts
 /// about the recording, and only some make the skip correct: a recorded
-/// absence is the precondition, while a recorded scalar asserts a row the
-/// seeder has no content for.
+/// absence is the precondition, while a recorded `true` or a non-zero count
+/// asserts rows the seeder has no content for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NoSeedableRows {
     RecordedError,
     RecordedAbsence,
+    /// `Ok(true)`: a DELETE that removed a row. Zero rows is `NotFound`.
+    RecordedPresence,
+    /// An UPDATE or COUNT result. Zero is absence recorded; more asserts rows.
+    RecordedCount(u64),
+    /// Any other scalar: not a row, and no claim about one.
     RecordedScalar(String),
-    NotRows { values: usize },
-    NoRowWithKey { rows: usize },
+    NotRows {
+        values: usize,
+    },
+    NoRowWithKey {
+        rows: usize,
+    },
 }
 
 impl std::fmt::Display for NoSeedableRows {
@@ -3776,11 +3785,25 @@ impl std::fmt::Display for NoSeedableRows {
                     "the recording returned no row, so absence is the precondition"
                 )
             }
-            Self::RecordedScalar(value) => write!(
+            Self::RecordedPresence => write!(
                 f,
-                "the recording returned {value}, which asserts a row without carrying one; \
+                "the recording returned true, which asserts a row without carrying one; \
                  the precondition is presence and nothing here can materialize it"
             ),
+            Self::RecordedCount(0) => {
+                write!(
+                    f,
+                    "the recording counted no rows, so absence is the precondition"
+                )
+            }
+            Self::RecordedCount(rows) => write!(
+                f,
+                "the recording counted {rows} row(s) without carrying them; the precondition \
+                 is their presence and nothing here can materialize it"
+            ),
+            Self::RecordedScalar(value) => {
+                write!(f, "the recording returned {value}, which is not a row")
+            }
             Self::NotRows { values } => write!(
                 f,
                 "the recording returned {values} value(s), none of them a row of this table"
@@ -3815,6 +3838,10 @@ fn seedable_rows(
                 values: items.len(),
             },
             serde_json::Value::Object(_) => NoSeedableRows::NotRows { values: 1 },
+            serde_json::Value::Bool(true) => NoSeedableRows::RecordedPresence,
+            serde_json::Value::Number(count) if count.as_u64().is_some() => {
+                NoSeedableRows::RecordedCount(count.as_u64().unwrap_or_default())
+            }
             scalar => NoSeedableRows::RecordedScalar(scalar.to_string()),
         });
     }
@@ -5707,10 +5734,7 @@ mod tests {
     #[test]
     fn a_recorded_bool_is_presence_without_content_not_absence() {
         let why = why_none(&query_key(), recorded_ok(serde_json::json!(true), "bool"));
-        assert_eq!(
-            why,
-            super::NoSeedableRows::RecordedScalar("true".to_owned())
-        );
+        assert_eq!(why, super::NoSeedableRows::RecordedPresence);
         let said = why.to_string();
         assert!(said.contains("asserts a row"), "{said}");
         assert!(!said.contains("absence"), "{said}");
@@ -5724,6 +5748,41 @@ mod tests {
             assert_eq!(why, super::NoSeedableRows::RecordedAbsence, "{value}");
             assert!(why.to_string().contains("absence is the precondition"));
         }
+    }
+
+    /// A count's meaning is its value: zero rows is absence recorded, more is
+    /// rows asserted and not carried. Neither is the delete's `true`.
+    #[test]
+    fn a_recorded_count_says_absence_at_zero_and_presence_above_it() {
+        let zero = why_none(&query_key(), recorded_ok(serde_json::json!(0), "usize"));
+        assert_eq!(zero, super::NoSeedableRows::RecordedCount(0));
+        assert!(
+            zero.to_string().contains("absence is the precondition"),
+            "{zero}"
+        );
+        let three = why_none(&query_key(), recorded_ok(serde_json::json!(3), "usize"));
+        assert_eq!(three, super::NoSeedableRows::RecordedCount(3));
+        assert!(three.to_string().contains("3 row(s)"), "{three}");
+        assert!(!three.to_string().contains("absence"), "{three}");
+    }
+
+    /// Other scalars assert nothing about rows.
+    #[test]
+    fn other_scalars_are_not_rows_and_claim_nothing() {
+        for value in [serde_json::json!(false), serde_json::json!("done")] {
+            let why = why_none(&query_key(), recorded_ok(value.clone(), "other"));
+            assert_eq!(
+                why,
+                super::NoSeedableRows::RecordedScalar(value.to_string())
+            );
+            let said = why.to_string();
+            assert!(
+                !said.contains("absence") && !said.contains("presence"),
+                "{said}"
+            );
+        }
+        let object = why_none(&query_key(), recorded_ok(serde_json::json!({}), "Unit"));
+        assert_eq!(object, super::NoSeedableRows::NotRows { values: 1 });
     }
 
     #[test]
@@ -5770,6 +5829,42 @@ mod tests {
             &super::DbCatalog::default(),
         )
         .unwrap();
+        assert_eq!(seeded.len(), 1);
+        let id = seeded[0]
+            .columns
+            .iter()
+            .find(|column| column.metadata.name == "id")
+            .map(|column| column.value.clone());
+        assert_eq!(
+            id,
+            Some(serde_json::json!(1)),
+            "the keyed row is the one kept"
+        );
+    }
+
+    /// A typed row image is seeded ahead of the envelope, even when the
+    /// envelope alone would have said absence.
+    #[test]
+    fn a_typed_image_is_seeded_ahead_of_the_envelope() {
+        let image = deja::db::DbRowImage::new(
+            "users",
+            vec![deja::db::DbColumnImage {
+                wire: None,
+                name: "id".into(),
+                type_oid: None,
+                type_name: Some("int8".into()),
+                nullable: None,
+                value: serde_json::json!(1),
+            }],
+        )
+        .to_value();
+        let seeded = super::seedable_rows(
+            &seed_target(ROW_KEY),
+            Some(&image),
+            &recorded_ok(serde_json::json!([]), "Vec<User>"),
+            &super::DbCatalog::default(),
+        )
+        .expect("the typed image carries the row");
         assert_eq!(seeded.len(), 1);
     }
 
