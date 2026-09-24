@@ -2569,6 +2569,29 @@ async fn delta_between(
             )));
         }
     }
+    // One name is not one tape: a recording re-seals as it grows, so two runs
+    // of one group can have read different content. What each run actually
+    // read decides, and a run whose tape cannot be read refuses rather than
+    // passing unchecked.
+    if st.store.is_none() {
+        return Err(Unavailable::Refused(
+            "a delta needs the run store to read what each run's ingest report says it scored"
+                .to_owned(),
+        ));
+    }
+    let y_report = ingest_report_for(st, y_id)
+        .await
+        .map_err(Unavailable::Pending)?;
+    let m_report = ingest_report_for(st, m_id)
+        .await
+        .map_err(Unavailable::Pending)?;
+    divergence::tape::same_tape(y_id, y_report.as_ref(), m_id, m_report.as_ref()).map_err(
+        |why| {
+            Unavailable::Refused(format!(
+                "{why}; a delta only holds between runs of one tape"
+            ))
+        },
+    )?;
     let y = behaviour_tree_for(st, y_id).await?;
     let m = behaviour_tree_for(st, m_id).await?;
     let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
@@ -2782,6 +2805,57 @@ async fn v1_run_artifacts(State(st): State<AppState>, id: RunId) -> Response {
     }
 }
 
+/// A registered artifact's bytes: an `s3://` uri (k8s run) is fetched from S3,
+/// anything else (compose run) is read as a local path. The error carries the
+/// HTTP status the raw endpoint answers with.
+async fn artifact_bytes(uri: &str) -> Result<Vec<u8>, (u16, String)> {
+    if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(uri) {
+        let fetch = tokio::task::spawn_blocking(move || {
+            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+            cfg.bucket = bucket;
+            deja_compactor::get_object_decoded(&cfg, &key)
+        })
+        .await;
+        match fetch {
+            Ok(Ok(b)) => Ok(b),
+            Ok(Err(e)) => Err((502, format!("artifact fetch from s3: {e}"))),
+            Err(e) => Err((500, format!("artifact fetch task: {e}"))),
+        }
+    } else {
+        std::fs::read(uri).map_err(|e| (404, format!("artifact file unreadable: {e}")))
+    }
+}
+
+/// The `ingest_report` a run published, parsed. `Ok(None)` when the run
+/// registered none, or there is no store to ask; `Err` when one exists but
+/// cannot be read, which is a fault to retry rather than an answer.
+async fn ingest_report_for(
+    st: &AppState,
+    run_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(store) = &st.store else {
+        return Ok(None);
+    };
+    let artifacts = store
+        .list_artifacts(run_id)
+        .await
+        .map_err(|e| format!("list artifacts of run {run_id}: {e}"))?;
+    // `list_artifacts` also matches on recording id, so the run is checked here.
+    let Some(report) = artifacts
+        .into_iter()
+        .filter(|a| a.kind == "ingest_report" && a.run_id.as_deref() == Some(run_id))
+        .max_by_key(|a| a.id)
+    else {
+        return Ok(None);
+    };
+    let bytes = artifact_bytes(&report.uri)
+        .await
+        .map_err(|(_, e)| format!("ingest report of run {run_id}: {e}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("ingest report of run {run_id} is not JSON: {e}"))
+}
+
 /// `GET /api/v1/artifacts/{id}/raw` — stream a registered artifact file.
 /// HTML renders inline (the embedded visualization); JSONL downloads as ndjson.
 async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
@@ -2801,24 +2875,9 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
     } else {
         "application/x-ndjson"
     };
-    // s3:// artifact (k8s run) → fetch from S3; else a local path (compose run).
-    let bytes = if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(&art.uri) {
-        let fetch = tokio::task::spawn_blocking(move || {
-            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
-            cfg.bucket = bucket;
-            deja_compactor::get_object_decoded(&cfg, &key)
-        })
-        .await;
-        match fetch {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return error_resp(502, &format!("artifact fetch from s3: {e}")),
-            Err(e) => return error_resp(500, &format!("artifact fetch task: {e}")),
-        }
-    } else {
-        match std::fs::read(&art.uri) {
-            Ok(b) => b,
-            Err(e) => return error_resp(404, &format!("artifact file unreadable: {e}")),
-        }
+    let bytes = match artifact_bytes(&art.uri).await {
+        Ok(b) => b,
+        Err((status, msg)) => return error_resp(status, &msg),
     };
     (
         StatusCode::OK,

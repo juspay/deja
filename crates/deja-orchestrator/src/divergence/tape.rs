@@ -13,15 +13,108 @@ use serde_json::Value;
 
 /// `Ok` when `y` and `m` scored the same tape, `Err` naming why not.
 ///
-/// Accepts every pair for now, which is what the delta does today: it
-/// compares recording names only.
+/// A missing report, or one without `members`, refuses: the tape it scored
+/// cannot be established, and an unestablished tape must not pass for a
+/// matching one. When both runs recorded seals, the seals decide — a
+/// `seal_id` addresses the sealed content, so equal ids are equal tapes.
+/// Otherwise the members and the correlation count decide, which cannot see a
+/// re-seal that changed content without changing the count.
 pub fn same_tape(
-    _y_id: &str,
-    _y_report: Option<&Value>,
-    _m_id: &str,
-    _m_report: Option<&Value>,
+    y_id: &str,
+    y_report: Option<&Value>,
+    m_id: &str,
+    m_report: Option<&Value>,
 ) -> Result<(), String> {
+    let y = Tape::of(y_id, y_report)?;
+    let m = Tape::of(m_id, m_report)?;
+    // Deliberately not a refusal when only one side has seals. Every run from
+    // before seals were recorded has none, so refusing here would refuse every
+    // delta against existing work. Such a pair falls back to members and
+    // count, which misses one case: equal members and equal counts over
+    // different content. Absence is still refused above, in `Tape::of`.
+    if let (Some(y_seals), Some(m_seals)) = (&y.seals, &m.seals) {
+        if y_seals != m_seals {
+            return Err(format!(
+                "the runs scored different seals: {y_id} read {}, {m_id} read {}",
+                describe(y_seals),
+                describe(m_seals)
+            ));
+        }
+        return Ok(());
+    }
+    if y.members != m.members || y.correlations != m.correlations {
+        return Err(format!(
+            "the runs scored different tapes: {y_id} read {} correlation(s) of [{}], \
+             {m_id} read {} of [{}]",
+            y.correlations,
+            y.members.join(", "),
+            m.correlations,
+            m.members.join(", ")
+        ));
+    }
     Ok(())
+}
+
+/// What a run's ingest report says it read.
+struct Tape {
+    /// Sorted, so member order does not decide equality.
+    members: Vec<String>,
+    correlations: u64,
+    /// Sorted `(recording_id, seal_id)`, or `None` when the report predates
+    /// seal recording or a member carries no seal.
+    seals: Option<Vec<(String, String)>>,
+}
+
+impl Tape {
+    fn of(run_id: &str, report: Option<&Value>) -> Result<Self, String> {
+        let report = report.ok_or_else(|| {
+            format!("run {run_id} has no ingest report, so the tape it scored is unknown")
+        })?;
+        let mut members: Vec<String> = report
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("run {run_id}'s ingest report names no members"))?
+            .iter()
+            .map(|m| m.as_str().map(str::to_owned))
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("run {run_id}'s ingest report has a non-string member"))?;
+        members.sort();
+        let correlations = report
+            .get("correlations")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("run {run_id}'s ingest report has no correlation count"))?;
+        let seals = report
+            .get("member_seals")
+            .and_then(Value::as_array)
+            .filter(|seals| !seals.is_empty())
+            .and_then(|seals| {
+                seals
+                    .iter()
+                    .map(|s| {
+                        let recording = s.get("recording_id")?.as_str()?;
+                        let seal = s.get("seal_id")?.as_str().filter(|id| !id.is_empty())?;
+                        Some((recording.to_owned(), seal.to_owned()))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(|mut seals| {
+                seals.sort();
+                seals
+            });
+        Ok(Self {
+            members,
+            correlations,
+            seals,
+        })
+    }
+}
+
+fn describe(seals: &[(String, String)]) -> String {
+    seals
+        .iter()
+        .map(|(recording, seal)| format!("{recording}@{seal}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
