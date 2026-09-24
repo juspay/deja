@@ -9090,6 +9090,22 @@ mod tests {
         );
     }
 
+    /// Whitespace between a document's lexemes is formatting, and an escaped
+    /// quote stays inside its string: both are read through.
+    #[test]
+    fn an_embedded_document_is_read_through_whitespace_and_escaped_quotes() {
+        let card = embedded_card(
+            page_embedding(r#"{"m":["a\"b","c"],"k":1}"#, "Collect"),
+            page_embedding(r#"{ "k": 1, "m": ["c", "a\"b"] }"#, "Collect"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
     /// What the embedded comparison still refuses. Each of these blocks on
     /// `main` and must keep blocking: the documents are only paired when
     /// everything around them is byte-identical, only objects are read as
