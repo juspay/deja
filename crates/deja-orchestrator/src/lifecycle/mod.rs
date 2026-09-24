@@ -1548,10 +1548,11 @@ fn schema_suspect(recording_id: &str, schema: Option<u16>) -> Option<String> {
         None => "no declared event schema".to_owned(),
     };
     Some(format!(
-        "recording {recording_id} has {recorded} and this runner writes v{current}: a \
-         candidate on a deja pin at v{current} refuses it at boot, before its logger starts \
-         (the refusal is on the candidate container's stderr), and the recording must be \
-         re-recorded"
+        "recording {recording_id} has {recorded} and this runner writes v{current}. If the \
+         candidate's deja pin is at v{current}, it refuses this recording at boot, before its \
+         logger starts (the refusal is on the candidate container's stderr), and the recording \
+         must be re-recorded; a candidate on an older pin is not affected, and times out for \
+         some other reason"
     ))
 }
 

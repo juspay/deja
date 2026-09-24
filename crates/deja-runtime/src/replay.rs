@@ -4686,7 +4686,23 @@ mod tests {
             "the refusal names the newer version: {message}"
         );
 
-        let message = load("unenveloped.jsonl", String::new())
+        let entry = serde_json::to_string(&LookupEntry {
+            key: LookupKey {
+                correlation_id: None,
+                bucket_id: None,
+                boundary: "db".to_owned(),
+                component: "T".to_owned(),
+                operation: "m".to_owned(),
+                fork_seq: 0,
+                locus: Locus::Unlocated,
+                args_hash: 0,
+                occurrence: 0,
+            },
+            result: serde_json::json!("v"),
+            source_event_global_sequence: 1,
+        })
+        .expect("entry");
+        let message = load("unenveloped.jsonl", entry)
             .expect_err("a JSONL table declares no schema, so it must be refused")
             .to_string();
         assert!(

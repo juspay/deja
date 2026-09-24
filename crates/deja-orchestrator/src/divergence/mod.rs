@@ -6096,7 +6096,8 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
     let empty = || LookupTable {
         recording_id: String::new(),
         policy_version: 0,
-        event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+        // No table was read, so no schema is known; the scorer never consults it.
+        event_schema_version: None,
         entries: Vec::new(),
     };
     if !path.exists() {
