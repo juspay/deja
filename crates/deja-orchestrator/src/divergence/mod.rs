@@ -3903,7 +3903,10 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
 }
 
 /// Larger bodies are not scanned for embedded documents; they compare as text.
-const MAX_EMBEDDED_SCAN_BYTES: usize = 256 * 1024;
+const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
+
+/// A page carrying more documents than this compares as text.
+const MAX_EMBEDDED_DOCUMENTS: usize = 16;
 
 /// A non-JSON text split into the JSON objects embedded in it and the text
 /// around them. A document starts at a `{` that begins a complete JSON object
@@ -9054,6 +9057,42 @@ mod tests {
                 "the number of documents differs",
                 page_embedding(permuted_a, "Collect"),
                 page_embedding(&format!("{permuted_b}; var more = {{\"k\":1}}"), "Collect"),
+            ),
+            (
+                "an escape changed: bytes a script reads",
+                page_embedding(r#"{"m":["a","b"],"s":"<\/script>"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"s":"</script>"}"#, "Collect"),
+            ),
+            (
+                "a number was written differently",
+                page_embedding(r#"{"m":["a","b"],"n":1.0}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":1.00}"#, "Collect"),
+            ),
+            (
+                "a number beyond a float's precision changed",
+                page_embedding(r#"{"m":["a","b"],"n":12345678901234567890123}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":12345678901234567890124}"#, "Collect"),
+            ),
+            (
+                "a duplicate key was dropped",
+                page_embedding(r#"{"m":["a","b"],"n":1,"n":2}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":2}"#, "Collect"),
+            ),
+            (
+                "a null member was dropped",
+                page_embedding(r#"{"m":["a","b"],"n":null}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"]}"#, "Collect"),
+            ),
+            (
+                "more documents than a page is read for",
+                page_embedding(
+                    &vec![permuted_a; MAX_EMBEDDED_DOCUMENTS + 1].join(";"),
+                    "Collect",
+                ),
+                page_embedding(
+                    &vec![permuted_b; MAX_EMBEDDED_DOCUMENTS + 1].join(";"),
+                    "Collect",
+                ),
             ),
             (
                 "a body over the scan limit compares as text",
