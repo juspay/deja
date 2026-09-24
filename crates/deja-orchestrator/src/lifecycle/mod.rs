@@ -2766,7 +2766,12 @@ impl SeedCertificateEntry {
                 "not a precondition: the read observes this correlation's own prior write of the key"
             }
             deja::NotPreconditionReason::SelfCreatedTable => {
-                "not a precondition: this correlation creates the table's rows itself on replay"
+                "not a precondition: this correlation created rows in this table and the \
+                 create or the read names no rows, so this read cannot be told from a read-back"
+            }
+            deja::NotPreconditionReason::SelfCreatedRow => {
+                "not a precondition: the read returned a row this correlation created, which its \
+                 replayed create rebuilds; seeding this key would collide with it"
             }
             deja::NotPreconditionReason::DeleteProvedAbsence => {
                 "not a precondition: the delete found no key, so the recording proves absence"
