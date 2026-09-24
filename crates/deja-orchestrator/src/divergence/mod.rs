@@ -11989,7 +11989,9 @@ mod tests {
     /// a novel call no longer self-flags seed_gap) and NO recorded twin to pair
     /// with must be a BLOCKING NovelCall — the extra-call catch. Before the fix the
     /// peek set seed_gap=true for this case, so the tally swallowed it as a
-    /// non-blocking InconclusiveSeedGap (verdict PASS, catch masked).
+    /// non-blocking InconclusiveSeedGap, which then scored as a pass and masked
+    /// the catch. (A seed gap now forces an inconclusive verdict; it never
+    /// passes.)
     #[test]
     fn novel_execute_call_without_seed_gap_is_a_novel_call_not_a_seed_gap() {
         // Build the observation exactly as the FIXED execute-shadow path emits it:
