@@ -2254,6 +2254,9 @@ enum ValueAbsorption {
     /// the recording's by construction, so it is not compared; it is counted,
     /// so a run shows how many calls it did not re-run.
     ServedRecordedError,
+    /// A paired request whose args have the recorded call's identity: an array
+    /// in another order, or an embedded document written in another order.
+    ArgsIdentity,
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
@@ -2272,18 +2275,41 @@ enum ValueVerdict {
 /// it — so a pair whose arguments agree missed its address by position alone,
 /// and is a match whatever it got back.
 ///
-/// The comparison is the one every value goes through ([`value_verdict`]): an
-/// order-only permutation, a recorder-declared clause and replay-local database
-/// infrastructure are absorbed here exactly as they are anywhere else.
+/// Order is judged by the identity the lookup address uses
+/// ([`deja::identity`]), so the diff and the address cannot disagree: a request
+/// whose identity is the recording's is absorbed and counted, and one whose
+/// identity differs is never forgiven as order by the diff alone. A
+/// recorder-declared clause and replay-local database infrastructure are
+/// absorbed as they are anywhere else ([`value_verdict`]).
+/// The kind a call read by its args' identity is counted under.
+fn args_identity_kind(change: &deja::identity::IdentityChange) -> &'static str {
+    match change {
+        deja::identity::IdentityChange::ArrayOrder(_) => "ArgsOrderAbsorbed",
+        deja::identity::IdentityChange::DocumentText(_) => "ArgsDocumentAbsorbed",
+    }
+}
+
 fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
     let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
-    value_verdict(
+    let identity = deja::identity::identity_differences(&recorded, &call.args);
+    if identity.as_ref().is_some_and(|changes| !changes.is_empty()) {
+        return ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity);
+    }
+    let verdict = value_verdict(
         &call.boundary,
         &recorded,
         &call.args,
         twin,
         call.args.get("sql").and_then(serde_json::Value::as_str),
-    )
+    );
+    match verdict {
+        ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default))
+            if identity.is_none() =>
+        {
+            ValueVerdict::Diverged
+        }
+        other => other,
+    }
 }
 
 fn value_verdict(
@@ -4759,12 +4785,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             match deja::identity::identity_differences(&event.args, &obs.args) {
                 Some(changes) => {
                     for change in changes {
-                        let kind = match change {
-                            deja::identity::IdentityChange::ArrayOrder(_) => "ArgsOrderAbsorbed",
-                            deja::identity::IdentityChange::DocumentText(_) => {
-                                "ArgsDocumentAbsorbed"
-                            }
-                        };
+                        let kind = args_identity_kind(&change);
                         stats.note_kind(kind);
                         *args_identity_seen
                             .entry((call_site_label(obs), kind, change.path().to_owned()))
@@ -4954,6 +4975,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
+            }
+            if let ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity) = verdict {
+                let recorded = twin_event.map_or(serde_json::Value::Null, |e| e.args.to_value());
+                for change in
+                    deja::identity::identity_differences(&recorded, &obs.args).unwrap_or_default()
+                {
+                    let kind = args_identity_kind(&change);
+                    stats.note_kind(kind);
+                    *args_identity_seen
+                        .entry((call_site_label(obs), kind, change.path().to_owned()))
+                        .or_insert(0) += 1;
+                }
             }
             let value_diverged = pairing.changed(
                 observed_index,
