@@ -6999,7 +6999,7 @@ mod tests {
                 args_hash: 0,
                 occurrence: 0,
             },
-            result,
+            result: std::sync::Arc::new(result),
             source_event_global_sequence: src,
         }
     }
@@ -7024,7 +7024,7 @@ mod tests {
                 args_hash: 0,
                 occurrence: 0,
             },
-            result,
+            result: std::sync::Arc::new(result),
             source_event_global_sequence: src,
         }
     }

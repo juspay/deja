@@ -6247,7 +6247,7 @@ mod tests {
             table
                 .entries
                 .iter()
-                .any(|e| e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })),
+                .any(|e| *e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })),
             "results survive the compact encoding"
         );
     }

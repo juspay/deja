@@ -858,13 +858,13 @@ mod tests {
             };
             entries.push(deja::LookupEntry {
                 key: key(Locus::Unlocated),
-                result: ev.result.to_value(),
+                result: std::sync::Arc::new(ev.result.to_value()),
                 source_event_global_sequence: ev.global_sequence,
             });
             if let Some(path) = spans.get(&ev.global_sequence) {
                 entries.push(deja::LookupEntry {
                     key: key(Locus::SpanPath { path: path.clone() }),
-                    result: ev.result.to_value(),
+                    result: std::sync::Arc::new(ev.result.to_value()),
                     source_event_global_sequence: ev.global_sequence,
                 });
             }

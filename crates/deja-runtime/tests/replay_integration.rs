@@ -238,7 +238,7 @@ async fn replay_lookup_hit_with_unreconstructable_result_fail_stops_before_real_
                 args_hash: canonical_args_hash(&args),
                 occurrence: 0,
             },
-            result: serde_json::json!("not-a-Result-u64-String"),
+            result: std::sync::Arc::new(serde_json::json!("not-a-Result-u64-String")),
             source_event_global_sequence: 0,
         }],
     };
@@ -361,7 +361,7 @@ async fn replay_execute_delegate_runs_real_impl_and_emits_shadow_observation() {
                 args_hash: canonical_args_hash(&args),
                 occurrence: 0,
             },
-            result: serde_json::json!({"Ok": 42}),
+            result: std::sync::Arc::new(serde_json::json!({"Ok": 42})),
             source_event_global_sequence: 0,
         }],
     };
