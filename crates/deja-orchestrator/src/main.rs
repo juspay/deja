@@ -2593,6 +2593,23 @@ async fn delta_between(
             )));
         }
     }
+    // One name is not one tape: a recording re-seals as it grows, so two runs
+    // of one group can have read different content. What each run actually
+    // read decides, and a run whose tape cannot be read refuses rather than
+    // passing unchecked.
+    if st.store.is_none() {
+        return Err(Unavailable::Refused(
+            "a delta needs the run store to read what each run's ingest report says it scored"
+                .to_owned(),
+        ));
+    }
+    let y_report = tape_report(st, y_id).await?;
+    let m_report = tape_report(st, m_id).await?;
+    divergence::tape::same_tape(y_id, Some(&y_report), m_id, Some(&m_report)).map_err(|why| {
+        Unavailable::Refused(format!(
+            "{why}; a delta only holds between runs of one tape"
+        ))
+    })?;
     let y = behaviour_tree_for(st, y_id).await?;
     let m = behaviour_tree_for(st, m_id).await?;
     let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
@@ -2806,6 +2823,118 @@ async fn v1_run_artifacts(State(st): State<AppState>, id: RunId) -> Response {
     }
 }
 
+/// A registered artifact's bytes: an `s3://` uri (k8s run) is fetched from S3,
+/// anything else (compose run) is read as a local path. The error carries the
+/// HTTP status the raw endpoint answers with.
+async fn artifact_bytes(uri: &str) -> Result<Vec<u8>, (u16, String)> {
+    if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(uri) {
+        let fetch = tokio::task::spawn_blocking(move || {
+            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+            cfg.bucket = bucket;
+            deja_compactor::get_object_decoded(&cfg, &key)
+        })
+        .await;
+        match fetch {
+            Ok(Ok(b)) => Ok(b),
+            Ok(Err(e)) => Err((502, format!("artifact fetch from s3: {e}"))),
+            Err(e) => Err((500, format!("artifact fetch task: {e}"))),
+        }
+    } else {
+        std::fs::read(uri).map_err(|e| (404, format!("artifact file unreadable: {e}")))
+    }
+}
+
+/// A run's ingest report, or what its absence means for a delta.
+async fn tape_report(st: &AppState, run_id: &str) -> Result<serde_json::Value, Unavailable> {
+    match ingest_report_for(st, run_id).await {
+        Ok(report) => Ok(report),
+        Err(gap) => {
+            let (state, _) = run_disposition(st, run_id).await;
+            Err(report_gap(run_id, state.as_deref(), gap))
+        }
+    }
+}
+
+/// Why a run's ingest report could not be read.
+#[derive(Debug)]
+enum ReportGap {
+    /// The run registered no report.
+    NotRegistered,
+    /// A report was registered but its object is no longer there: the
+    /// artifact bucket expires objects, and a compose run's file can be removed.
+    Gone,
+    /// The object is there but is not a report.
+    Corrupt(String),
+    /// It could not be read this time, which may pass.
+    Unreadable(String),
+}
+
+/// What a missing report means for a delta: refused when it cannot appear,
+/// pending when it still can. A run that has not ingested yet has no report,
+/// which is a wait, not a mismatch.
+fn report_gap(run_id: &str, state: Option<&str>, gap: ReportGap) -> Unavailable {
+    match gap {
+        ReportGap::NotRegistered => match state {
+            Some("completed" | "failed") | None => Unavailable::Refused(format!(
+                "run {run_id} has no ingest report, so the tape it scored is unknown"
+            )),
+            Some(state) => Unavailable::Pending(format!(
+                "run {run_id} is still {state}; its ingest report is published when it ingests"
+            )),
+        },
+        ReportGap::Gone => Unavailable::Refused(format!(
+            "run {run_id}'s ingest report is registered but no longer stored \
+             (the artifact bucket expires objects), so the tape it scored is unknown"
+        )),
+        ReportGap::Corrupt(e) => {
+            Unavailable::Refused(format!("run {run_id}'s ingest report is not JSON: {e}"))
+        }
+        ReportGap::Unreadable(e) => Unavailable::Pending(format!(
+            "run {run_id}'s ingest report could not be read: {e}"
+        )),
+    }
+}
+
+/// The `ingest_report` a run published, parsed.
+async fn ingest_report_for(st: &AppState, run_id: &str) -> Result<serde_json::Value, ReportGap> {
+    let Some(store) = &st.store else {
+        return Err(ReportGap::NotRegistered);
+    };
+    let artifacts = store
+        .list_artifacts(run_id)
+        .await
+        .map_err(|e| ReportGap::Unreadable(format!("list artifacts: {e}")))?;
+    // `list_artifacts` also matches on recording id, so the run is checked here.
+    let Some(report) = artifacts
+        .into_iter()
+        .filter(|a| a.kind == "ingest_report" && a.run_id.as_deref() == Some(run_id))
+        .max_by_key(|a| a.id)
+    else {
+        return Err(ReportGap::NotRegistered);
+    };
+    let bytes = match artifact_bytes(&report.uri).await {
+        Ok(bytes) => bytes,
+        Err(_) if artifact_is_gone(&report.uri).await => return Err(ReportGap::Gone),
+        Err((_, e)) => return Err(ReportGap::Unreadable(e)),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| ReportGap::Corrupt(e.to_string()))
+}
+
+/// Whether a registered artifact's object is definitely absent — a not-found
+/// from the store, or a missing local file — as opposed to unreachable.
+async fn artifact_is_gone(uri: &str) -> bool {
+    match deja_orchestrator::codebundle::parse_s3_uri(uri) {
+        Ok((bucket, key)) => tokio::task::spawn_blocking(move || {
+            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+            cfg.bucket = bucket;
+            deja_compactor::object_exists(&cfg, &key)
+        })
+        .await
+        .is_ok_and(|exists| matches!(exists, Ok(false))),
+        Err(_) => !std::path::Path::new(uri).exists(),
+    }
+}
+
 /// `GET /api/v1/artifacts/{id}/raw` — stream a registered artifact file.
 /// HTML renders inline (the embedded visualization); JSONL downloads as ndjson.
 async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
@@ -2819,24 +2948,9 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
         Err(e) => return error_resp(500, &format!("get artifact: {e}")),
     };
     let content_type = artifact_kinds::served_content_type(&art.kind, &art.uri);
-    // s3:// artifact (k8s run) → fetch from S3; else a local path (compose run).
-    let bytes = if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(&art.uri) {
-        let fetch = tokio::task::spawn_blocking(move || {
-            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
-            cfg.bucket = bucket;
-            deja_compactor::get_object_decoded(&cfg, &key)
-        })
-        .await;
-        match fetch {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return error_resp(502, &format!("artifact fetch from s3: {e}")),
-            Err(e) => return error_resp(500, &format!("artifact fetch task: {e}")),
-        }
-    } else {
-        match std::fs::read(&art.uri) {
-            Ok(b) => b,
-            Err(e) => return error_resp(404, &format!("artifact file unreadable: {e}")),
-        }
+    let bytes = match artifact_bytes(&art.uri).await {
+        Ok(b) => b,
+        Err((status, msg)) => return error_resp(status, &msg),
     };
     (
         StatusCode::OK,
@@ -4037,6 +4151,66 @@ mod tests {
     }
 
     // ---- identity: the revision the envelopes claim ----
+
+    fn refused(u: &super::Unavailable) -> Option<&str> {
+        match u {
+            super::Unavailable::Refused(why) => Some(why),
+            super::Unavailable::Pending(_) => None,
+        }
+    }
+
+    /// A baseline that has not ingested yet has no report: that is a wait,
+    /// not a mismatch, and must not read as "never".
+    #[test]
+    fn a_missing_report_on_an_unfinished_run_is_pending() {
+        for state in ["queued", "seeding", "running", "resolving"] {
+            let gap = super::report_gap("run-M", Some(state), super::ReportGap::NotRegistered);
+            assert!(
+                refused(&gap).is_none(),
+                "{state} must be pending, got {gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_report_on_a_finished_or_unknown_run_is_refused() {
+        for state in [Some("completed"), Some("failed"), None] {
+            let gap = super::report_gap("run-M", state, super::ReportGap::NotRegistered);
+            let why = refused(&gap).unwrap_or_default();
+            assert!(
+                why.contains("run run-M has no ingest report"),
+                "{state:?}: {gap:?}"
+            );
+        }
+    }
+
+    /// An expired object never comes back, so it refuses whatever the run's
+    /// state; a transient read failure does not.
+    #[test]
+    fn a_gone_report_refuses_and_an_unreadable_one_waits() {
+        let gone = super::report_gap("run-M", Some("completed"), super::ReportGap::Gone);
+        assert!(
+            refused(&gone)
+                .unwrap_or_default()
+                .contains("no longer stored"),
+            "{gone:?}"
+        );
+        let corrupt = super::report_gap(
+            "run-M",
+            Some("completed"),
+            super::ReportGap::Corrupt("eof".into()),
+        );
+        assert!(
+            refused(&corrupt).unwrap_or_default().contains("not JSON"),
+            "{corrupt:?}"
+        );
+        let flaky = super::report_gap(
+            "run-M",
+            Some("completed"),
+            super::ReportGap::Unreadable("503".into()),
+        );
+        assert!(refused(&flaky).is_none(), "{flaky:?}");
+    }
 
     fn manifest_with_codes(shas: &[Option<&str>]) -> deja_compactor::SessionManifest {
         let code: Vec<serde_json::Value> = shas

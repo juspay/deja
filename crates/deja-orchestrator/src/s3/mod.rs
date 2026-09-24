@@ -69,6 +69,13 @@ pub struct IngestReport {
     /// in a log is not something a consumer can check. Empty for a single
     /// recording and for a group that was pulled whole.
     pub excluded_members: Vec<String>,
+    /// Which seal of each member this pull read, in `members` order.
+    ///
+    /// A recording is sealed on quiet and re-sealed as it grows, so its name
+    /// does not identify the content a run scored; its `seal_id` does, being a
+    /// content address. Two runs are comparable only when these agree. Empty
+    /// when the pull did not go through sealed manifests.
+    pub member_seals: Vec<MemberSeal>,
     pub landing_objects: usize,
     pub lines_in: usize,
     pub duplicates_dropped: usize,
@@ -101,6 +108,30 @@ pub struct IngestReport {
     /// whose numbering is already the tape's and is written untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renumbered: Vec<StreamRenumbering>,
+}
+
+/// The seal one member of a pull was read from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemberSeal {
+    pub recording_id: String,
+    pub seal_id: String,
+    pub correlations: usize,
+    pub events: usize,
+    pub landing_objects: usize,
+    pub sealed_unix_ms: u64,
+}
+
+impl MemberSeal {
+    fn of(manifest: &deja_compactor::SessionManifest) -> Self {
+        Self {
+            recording_id: manifest.session_id.clone(),
+            seal_id: manifest.seal_id.clone(),
+            correlations: manifest.counts.correlations,
+            events: manifest.counts.events,
+            landing_objects: manifest.counts.landing_objects,
+            sealed_unix_ms: manifest.created_unix_ms,
+        }
+    }
 }
 
 impl IngestReport {
@@ -999,7 +1030,11 @@ impl PullTally {
         }
     }
 
-    fn finish(self, members: Vec<String>) -> IngestReport {
+    fn finish(
+        self,
+        members: Vec<String>,
+        manifests: &[deja_compactor::SessionManifest],
+    ) -> IngestReport {
         IngestReport {
             // One member names its own session root. Several share only the
             // prefix every session lives under, and saying that is both true
@@ -1010,6 +1045,7 @@ impl PullTally {
             },
             members,
             excluded_members: Vec::new(),
+            member_seals: manifests.iter().map(MemberSeal::of).collect(),
             landing_objects: self.landing_objects,
             lines_in: self.lines_in,
             duplicates_dropped: self.duplicates_dropped,
@@ -1153,7 +1189,10 @@ pub fn pull_recordings(
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
 
-    let report = tally.finish(recording_ids.iter().map(|id| (*id).to_owned()).collect());
+    let report = tally.finish(
+        recording_ids.iter().map(|id| (*id).to_owned()).collect(),
+        &manifests,
+    );
     report.report();
     Ok((report, manifests))
 }
@@ -1321,6 +1360,7 @@ pub fn pull_recording_from_prefix(
         members: vec![resolved.clone()],
         // One session, resolved whole: nothing was left out.
         excluded_members: Vec::new(),
+        member_seals: Vec::new(),
         landing_objects: session_objects,
         lines_in: collated.lines_in,
         duplicates_dropped: collated.drops.duplicates,
@@ -1611,11 +1651,11 @@ mod tests {
     /// as a path: a value-shape change hiding inside an unchanged type.
     #[test]
     fn the_prefix_stays_a_path_and_members_says_how_many() {
-        let one = PullTally::default().finish(vec!["rec-a".to_owned()]);
+        let one = PullTally::default().finish(vec!["rec-a".to_owned()], &[]);
         assert_eq!(one.prefix, "sessions/v1/rec-a", "one member names its root");
         assert_eq!(one.members, vec!["rec-a".to_owned()]);
 
-        let many = PullTally::default().finish(vec!["rec-a".to_owned(), "rec-b".to_owned()]);
+        let many = PullTally::default().finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &[]);
         assert_eq!(
             many.prefix, "sessions/v1",
             "a selection names the root they share, not a count"
@@ -1650,7 +1690,7 @@ mod tests {
             a_member(&[at_boundary("i2", 0, "c2", 0, "http_incoming")]),
         );
 
-        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()]);
+        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &[]);
         assert_eq!(report.landing_objects, 8, "3 + 5");
         assert_eq!(report.correlations, 6, "2 + 4");
         assert_eq!(report.events_out, 3, "2 + 1");
@@ -1659,6 +1699,47 @@ mod tests {
             report.duplicates_dropped, 3,
             "the members' own sealed duplicates, 1 + 2, carried through"
         );
+    }
+
+    fn sealed_as(
+        session_id: &str,
+        seal_id: &str,
+        correlations: usize,
+    ) -> deja_compactor::SessionManifest {
+        serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "session_id": session_id,
+            "status": "sealed",
+            "seal_id": seal_id,
+            "capture_mode": "session",
+            "envelope_schema_versions": [1],
+            "event_schema_versions": [1],
+            "code": [],
+            "instances": [],
+            "counts": {
+                "landing_objects": 3, "lines_in": 9, "events": 7,
+                "duplicates_dropped": 0, "correlations": correlations
+            },
+            "data_parts": [],
+            "created_unix_ms": 42
+        }))
+        .expect("a well-formed manifest")
+    }
+
+    /// The report names the seal each member was read from, in member order:
+    /// the name alone does not identify the content once a recording re-seals.
+    #[test]
+    fn a_pull_records_the_seal_each_member_was_read_from() {
+        let manifests = [sealed_as("rec-a", "aaaa", 2), sealed_as("rec-b", "bbbb", 5)];
+        let report =
+            PullTally::default().finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &manifests);
+        let seals: Vec<_> = report
+            .member_seals
+            .iter()
+            .map(|s| (s.recording_id.as_str(), s.seal_id.as_str(), s.correlations))
+            .collect();
+        assert_eq!(seals, [("rec-a", "aaaa", 2), ("rec-b", "bbbb", 5)]);
+        assert_eq!(report.member_seals[0].sealed_unix_ms, 42);
     }
 
     /// Correlations from different members both survive into admission. They
@@ -1681,7 +1762,7 @@ mod tests {
         // union rather than a single member surviving.
         assert_eq!(tally.per_correlation.len(), 2, "both correlations held");
 
-        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()]);
+        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &[]);
         assert_eq!(
             report.delivery.correlations_checked, 2,
             "admission saw both members' correlations, not just the last"
@@ -1792,6 +1873,7 @@ mod tests {
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
             excluded_members: Vec::new(),
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in,
@@ -1821,6 +1903,7 @@ mod tests {
         let report = IngestReport {
             members: vec!["rec-sealed".to_owned()],
             excluded_members: vec!["rec-still-open".to_owned()],
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 0,
@@ -1853,6 +1936,7 @@ mod tests {
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
             excluded_members: Vec::new(),
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 139_916,

@@ -48,6 +48,7 @@ pub mod behaviour_tree;
 pub mod delta;
 pub mod ledger;
 pub mod span_shape;
+pub mod tape;
 pub use ledger::CallRecord;
 
 /// Boundaries whose live calls cannot run in the harness (egress is blocked).

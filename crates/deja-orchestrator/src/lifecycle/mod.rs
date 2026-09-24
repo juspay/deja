@@ -7276,6 +7276,7 @@ mod tests {
         let report = crate::s3::IngestReport {
             members: vec!["rec-fixture".to_owned()],
             excluded_members: Vec::new(),
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 16258,
