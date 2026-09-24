@@ -15311,4 +15311,96 @@ mod tests {
             assert!(card.verdict.pass, "{}", card.verdict.reason);
         }
     }
+
+    /// The keys of every object in `value`, in the order they are held, so a
+    /// test can show two equal objects are held in different orders.
+    fn key_orders(value: &serde_json::Value) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        let mut stack = vec![value];
+        while let Some(value) = stack.pop() {
+            match value {
+                serde_json::Value::Object(map) => {
+                    out.push(map.keys().cloned().collect());
+                    stack.extend(map.values());
+                }
+                serde_json::Value::Array(items) => stack.extend(items),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Two objects holding the same keys and values in a different order are
+    /// equal as JSON, and the comparison used to return `Equal` before any
+    /// rule saw them, so a reordering was invisible: not blocking, and not
+    /// counted either. That is the one outcome that cannot show a tolerance
+    /// working. It is now named as an order-only difference, exactly as a
+    /// permuted array is.
+    #[test]
+    fn an_object_whose_keys_moved_is_named_rather_than_silently_equal() {
+        // Each case moves keys at one place only, so each part of the check is
+        // shown on its own: the top level, a nested object, an object in an array.
+        for (name, recorded, observed) in [
+            (
+                "top level",
+                serde_json::json!({"a": 1, "b": 2}),
+                serde_json::json!({"b": 2, "a": 1}),
+            ),
+            (
+                "nested object",
+                serde_json::json!({"a": 1, "b": {"x": 1, "y": 2}}),
+                serde_json::json!({"a": 1, "b": {"y": 2, "x": 1}}),
+            ),
+            (
+                "object in an array",
+                serde_json::json!([{"x": 1, "y": 2}]),
+                serde_json::json!([{"y": 2, "x": 1}]),
+            ),
+        ] {
+            let recorded = db_envelope(recorded);
+            let observed = db_envelope(observed);
+            assert_eq!(recorded, observed, "{name}: precondition, equal as JSON");
+            assert_ne!(
+                key_orders(&recorded),
+                key_orders(&observed),
+                "{name}: precondition, held in different orders"
+            );
+
+            let card = scored_matched_call(None, recorded, observed);
+            assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1, "{name}");
+            let db = &card.per_boundary["db"];
+            assert_eq!(
+                db.matched + db.diverged,
+                1,
+                "{name}: one call, counted once"
+            );
+            assert!(card.verdict.pass, "{name}: absorbed, not blocking");
+            assert!(
+                card.warnings.iter().any(|w| w.contains("ordering alone")),
+                "{name}: and named: {:?}",
+                card.warnings
+            );
+        }
+    }
+
+    /// The same keys in the same order are simply equal: nothing is named.
+    #[test]
+    fn an_object_in_the_same_order_is_equal_and_names_nothing() {
+        let value = db_envelope(serde_json::json!({"a": 1, "b": 2}));
+        let card = scored_matched_call(None, value.clone(), value);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(card.verdict.pass);
+    }
+
+    /// A reordering beside a changed value is a divergence, not an ordering.
+    #[test]
+    fn a_reordered_object_with_a_changed_value_still_diverges() {
+        let card = scored_matched_call(
+            None,
+            db_envelope(serde_json::json!({"a": 1, "b": 2})),
+            db_envelope(serde_json::json!({"b": 3, "a": 1})),
+        );
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+    }
 }
