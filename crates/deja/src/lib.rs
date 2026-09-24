@@ -2023,16 +2023,16 @@ pub mod __private {
     // subsumed by `dispatch`).
     #[allow(deprecated)]
     pub use deja_runtime::{
-        boundary_execute_mode, current_span_path, dispatch, dispatch_async,
-        execute_shadow_observe_boundary, execute_shadow_peek_boundary, fail_stop_absent_executor,
-        fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
-        next_boundary_occurrence, observation_is_active, record_boundary_async,
-        record_boundary_async_lazy, record_boundary_sync, record_boundary_sync_lazy,
-        replay_boundary, replay_is_active, runtime_mode, stable_callsite_hash,
-        substitute_observe_boundary, substitute_peek_boundary, BoundarySpec, CallsiteIdentity,
-        CallsiteSource, CrossingObservation, ExecuteMode, ExecuteShadowToken, ReconstructInput,
-        Reconstructed, RecordedOutput, RuntimeMode, SubstituteOutcome, SubstitutePeek,
-        SubstituteToken,
+        boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_serving,
+        dispatch_serving, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
+        fail_stop_absent_executor, fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss,
+        finish_boundary_event, next_boundary_occurrence, observation_is_active,
+        record_boundary_async, record_boundary_async_lazy, record_boundary_sync,
+        record_boundary_sync_lazy, replay_boundary, replay_is_active, runtime_mode,
+        stable_callsite_hash, substitute_observe_boundary, substitute_peek_boundary, BoundarySpec,
+        CallsiteIdentity, CallsiteSource, CrossingObservation, ExecuteMode, ExecuteShadowToken,
+        ReconstructInput, Reconstructed, RecordedOutput, RuntimeMode, SubstituteOutcome,
+        SubstitutePeek, SubstituteToken,
     };
     // The round-trip comparator every dispatch call passes: the recorder
     // compares each recorded value with its rebuilt copy.

@@ -557,6 +557,10 @@ pub enum Provenance {
     /// Shadow capture from an execute-mode dispatch running the real boundary.
     #[serde(rename = "execute_shadow")]
     Shadow,
+    /// An execute-mode dispatch that served this call's own recorded error
+    /// instead of re-running it, because the site declared that error
+    /// state-neutral (see [`serves_recorded_error`]).
+    ServedRecordedError,
 }
 
 /// Whether a captured `result` rebuilds as the value it was captured from.
@@ -1000,6 +1004,17 @@ impl ExecuteShadowToken {
     ) -> crate::replay::ObservedCall {
         self.observed.observed_result = Some(observed_result);
         self.observed
+    }
+
+    /// The recorded result the peek resolved for THIS call, if it found one.
+    pub fn recorded_result(&self) -> Option<&serde_json::Value> {
+        self.observed.recorded_result.as_ref()
+    }
+
+    /// Mark the call as served from its recorded result rather than re-run.
+    fn served(mut self) -> Self {
+        self.observed.provenance = Provenance::ServedRecordedError;
+        self
     }
 }
 
@@ -4253,13 +4268,22 @@ where
 /// [`Reconstructed::Synthesized`] from the miss arm, one that does not returns
 /// [`Reconstructed::NoValue`], and the seam stops on the latter exactly as the
 /// old default did.
-pub fn dispatch<T, A, F, C, R, O, S>(
+///
+/// `neutral` is the site's declaration that an error it recorded changed no
+/// state, as a predicate over the rebuilt value. When it is `Some` and this
+/// call's own recorded result is such an error, an `Execute` site returns that
+/// error instead of re-running (see [`serves_recorded_error`]). The recorded
+/// run's statement failed and wrote nothing; re-running it here could succeed
+/// and write a row the recording never had, so serving the error is what keeps
+/// the replay's state the recording's. `Substitute` sites ignore it.
+pub fn dispatch_serving<T, A, F, C, R, O, S, P>(
     obs: CrossingObservation,
     args: A,
     run: F,
     reconstruct: C,
     extract: R,
     check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4268,6 +4292,7 @@ where
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
     S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match runtime_mode() {
         RuntimeMode::Disabled | RuntimeMode::Record => {
@@ -4287,6 +4312,20 @@ where
                         &boundary_args,
                         Some(&obs.identity),
                     ) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        #[allow(deprecated)]
+                                        execute_shadow_observe_boundary(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run();
                         // Serialization of the live output runs UNGUARDED: a
                         // panicking `extract` is a code bug and must propagate —
@@ -4312,6 +4351,35 @@ where
             }
         }
     }
+}
+
+/// [`dispatch_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub fn dispatch<T, A, F, C, R, O, S>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
 }
 
 /// What the round-trip check needs to know about a site, taken before the
@@ -4464,6 +4532,42 @@ pub fn serves_recorded_error(recorded: &serde_json::Value, site_declares_neutral
         && recorded.get("result").and_then(serde_json::Value::as_str) == Some("Err")
 }
 
+/// Serve this call's own recorded error instead of running the boundary, when
+/// the site declared it state-neutral; otherwise hand the token back to run.
+///
+/// Reads only the row the execute peek already resolved for THIS call through
+/// its correlation, so nothing is borrowed from another request. A recorded
+/// value that does not rebuild, or that the site's predicate does not accept,
+/// falls through to running the boundary, never to a fail-stop.
+// The token already moved by value into the observer; handing it back moves it
+// once more, where boxing it would allocate on every executed call.
+#[allow(clippy::result_large_err)]
+fn serve_or_run<T, C, P>(
+    token: ExecuteShadowToken,
+    neutral: Option<P>,
+    reconstruct: C,
+    emit: impl FnOnce(ExecuteShadowToken, serde_json::Value),
+) -> Result<T, ExecuteShadowToken>
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    P: FnOnce(&T) -> bool,
+{
+    let recorded = match token.recorded_result() {
+        Some(recorded) if serves_recorded_error(recorded, neutral.is_some()) => recorded.clone(),
+        _ => return Err(token),
+    };
+    let Some(neutral) = neutral else {
+        return Err(token);
+    };
+    match reconstruct(ReconstructInput::Hit(recorded.clone())) {
+        Reconstructed::Value(value) if neutral(&value) => {
+            emit(token.served(), recorded);
+            Ok(value)
+        }
+        _ => Err(token),
+    }
+}
+
 /// The inactive / pure-record branch of [`dispatch`].
 ///
 /// Split out so the inactive fast path stays trivially the same shape as the
@@ -4570,13 +4674,14 @@ where
 /// (`substitute_lookup`): it never awaits, so there is exactly ONE copy of the
 /// emit-before-stop ordering the observation's honesty depends on.
 #[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
-pub async fn dispatch_async<T, A, Fut, F, C, R, O, S>(
+pub async fn dispatch_async_serving<T, A, Fut, F, C, R, O, S, P>(
     obs: CrossingObservation,
     args: A,
     run: F,
     reconstruct: C,
     extract: R,
     check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
@@ -4586,6 +4691,7 @@ where
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
     S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match runtime_mode() {
         RuntimeMode::Disabled | RuntimeMode::Record => {
@@ -4602,6 +4708,20 @@ where
                         &boundary_args,
                         Some(&obs.identity),
                     ) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        #[allow(deprecated)]
+                                        execute_shadow_observe_boundary(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run().await;
                         // Serialization of the live output runs UNGUARDED: a
                         // panicking `extract` is a code bug and must propagate —
@@ -4627,6 +4747,37 @@ where
             }
         }
     }
+}
+
+/// [`dispatch_async_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub async fn dispatch_async<T, A, Fut, F, C, R, O, S>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_async_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -4673,13 +4824,14 @@ pub struct DelegateObservation<'a> {
 /// to be moved, which forbids a borrowing args thunk; the macro therefore
 /// computes args eagerly only on the active path, exactly as before). Once called,
 /// this seam branches solely on the injected hook's [`RuntimeMode`].
-pub fn dispatch_with_hook<T, F, C, R, O, S>(
+pub fn dispatch_with_hook_serving<T, F, C, R, O, S, P>(
     obs: DelegateObservation<'_>,
     args: serde_json::Value,
     run: F,
     reconstruct: C,
     extract: R,
     check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     F: FnOnce() -> T,
@@ -4687,6 +4839,7 @@ where
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
     S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match obs.hook.process_mode() {
         RuntimeMode::Disabled => run(),
@@ -4712,6 +4865,19 @@ where
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
                     }) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        obs.hook.execute_shadow_observe(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run();
                         // Serialization runs UNGUARDED (a panicking `extract` is a
                         // code bug and must propagate); only the delegate observer
@@ -4754,12 +4920,9 @@ where
     }
 }
 
-/// Async twin of [`dispatch_with_hook`] for `async` delegate methods (which the
-/// macro returns as `Pin<Box<dyn Future>>`). The `run` thunk yields the inner
-/// future; the macro wraps the whole call in `Box::pin`. `args` is the
-/// already-serialized image (see [`dispatch_with_hook`] for why the delegate
-/// computes it eagerly on the active path).
-pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O, S>(
+/// [`dispatch_with_hook_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub fn dispatch_with_hook<T, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     args: serde_json::Value,
     run: F,
@@ -4768,12 +4931,45 @@ pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O, S>(
     check: round_trip::RoundTrip<S>,
 ) -> T
 where
+    F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_with_hook_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
+}
+
+/// Async twin of [`dispatch_with_hook`] for `async` delegate methods (which the
+/// macro returns as `Pin<Box<dyn Future>>`). The `run` thunk yields the inner
+/// future; the macro wraps the whole call in `Box::pin`. `args` is the
+/// already-serialized image (see [`dispatch_with_hook`] for why the delegate
+/// computes it eagerly on the active path).
+pub async fn dispatch_async_with_hook_serving<T, Fut, F, C, R, O, S, P>(
+    obs: DelegateObservation<'_>,
+    args: serde_json::Value,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
+) -> T
+where
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
     S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match obs.hook.process_mode() {
         RuntimeMode::Disabled => run().await,
@@ -4797,6 +4993,19 @@ where
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
                     }) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        obs.hook.execute_shadow_observe(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run().await;
                         // Serialization runs UNGUARDED (a panicking `extract` is a
                         // code bug and must propagate); only the delegate observer
@@ -4837,6 +5046,36 @@ where
             }
         }
     }
+}
+
+/// [`dispatch_async_with_hook_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O, S>(
+    obs: DelegateObservation<'_>,
+    args: serde_json::Value,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_async_with_hook_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
+    .await
 }
 
 fn delegate_record_path<T, F, C, R, O, S>(
@@ -6595,6 +6834,10 @@ mod tests {
         // Observations the test asserts on.
         recorded: Mutex<Vec<BoundaryEvent>>,
         shadow_observed: Mutex<Vec<serde_json::Value>>,
+        /// What the execute peek resolves as this call's recorded result.
+        shadow_recorded: Option<serde_json::Value>,
+        /// The provenance of each observation the seam emitted.
+        shadow_provenance: Mutex<Vec<crate::Provenance>>,
     }
 
     impl FakeHook {
@@ -6605,6 +6848,8 @@ mod tests {
                 execute: false,
                 recorded: Mutex::new(Vec::new()),
                 shadow_observed: Mutex::new(Vec::new()),
+                shadow_recorded: None,
+                shadow_provenance: Mutex::new(Vec::new()),
             }
         }
     }
@@ -6670,7 +6915,7 @@ mod tests {
                 graph_node_id: None,
                 synthesized: false,
                 real_impl_will_fail: false,
-                recorded_result: None,
+                recorded_result: self.shadow_recorded.clone(),
                 observed_result: None,
                 provenance: crate::Provenance::Shadow,
                 seed_gap: false,
@@ -6682,7 +6927,8 @@ mod tests {
             token: ExecuteShadowToken,
             observed_result: serde_json::Value,
         ) {
-            let _ = token;
+            let call = token.into_observed(observed_result.clone());
+            self.shadow_provenance.lock().unwrap().push(call.provenance);
             self.shadow_observed.lock().unwrap().push(observed_result);
         }
     }
@@ -6715,6 +6961,122 @@ mod tests {
             caller: Location::caller(),
             identity: test_identity(),
             receiver: None,
+        }
+    }
+
+    /// An execute-mode hook whose peek resolves `recorded` for the call.
+    fn executing_with(recorded: serde_json::Value) -> FakeHook {
+        let mut hook = FakeHook::new(true);
+        hook.execute = true;
+        hook.shadow_recorded = Some(recorded);
+        hook
+    }
+
+    fn execute_spec() -> BoundarySpec {
+        let mut spec = BoundarySpec::new("db", "T", "m");
+        spec.replay_strategy = ReplayStrategy::Execute;
+        spec
+    }
+
+    fn unique_violation() -> serde_json::Value {
+        serde_json::json!({ "kind": "UniqueViolation", "result": "Err", "version": 1 })
+    }
+
+    fn rebuild_kind(input: ReconstructInput<'_>) -> Reconstructed<Result<u64, String>> {
+        match input {
+            ReconstructInput::Hit(v) if v["result"] == "Err" => {
+                Reconstructed::Value(Err(v["kind"].as_str().unwrap().to_owned()))
+            }
+            _ => Reconstructed::NoValue,
+        }
+    }
+
+    fn is_unique(out: &Result<u64, String>) -> bool {
+        matches!(out, Err(kind) if kind == "UniqueViolation")
+    }
+
+    /// The delegate seam serves a declared-neutral recorded error without
+    /// running the boundary, and says so in what it emits.
+    #[test]
+    fn the_delegate_seam_serves_a_declared_neutral_recorded_error() {
+        let hook = executing_with(unique_violation());
+        let ran = std::cell::Cell::new(false);
+        let out = dispatch_with_hook_serving(
+            delegate_obs_with_spec(&hook, execute_spec()),
+            serde_json::json!({}),
+            || {
+                ran.set(true);
+                Ok(1u64)
+            },
+            rebuild_kind,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            unchecked(),
+            Some(is_unique),
+        );
+        assert_eq!(out, Err("UniqueViolation".to_owned()));
+        assert!(!ran.get(), "the boundary did not run");
+        assert_eq!(
+            *hook.shadow_provenance.lock().unwrap(),
+            vec![crate::Provenance::ServedRecordedError]
+        );
+        assert_eq!(
+            *hook.shadow_observed.lock().unwrap(),
+            vec![unique_violation()]
+        );
+    }
+
+    /// The async delegate seam does the same.
+    #[test]
+    fn the_async_delegate_seam_serves_a_declared_neutral_recorded_error() {
+        let hook = executing_with(unique_violation());
+        let ran = std::cell::Cell::new(false);
+        let out = block_on_ready(dispatch_async_with_hook_serving(
+            delegate_obs_with_spec(&hook, execute_spec()),
+            serde_json::json!({}),
+            || {
+                ran.set(true);
+                async { Ok(1u64) }
+            },
+            rebuild_kind,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            unchecked(),
+            Some(is_unique),
+        ));
+        assert_eq!(out, Err("UniqueViolation".to_owned()));
+        assert!(!ran.get(), "the boundary did not run");
+        assert_eq!(
+            *hook.shadow_provenance.lock().unwrap(),
+            vec![crate::Provenance::ServedRecordedError]
+        );
+    }
+
+    /// Without a declaration the same recorded error is re-run, as today.
+    #[test]
+    fn the_delegate_seam_without_a_declaration_runs_the_boundary() {
+        let hook = executing_with(unique_violation());
+        let out = dispatch_with_hook(
+            delegate_obs_with_spec(&hook, execute_spec()),
+            serde_json::json!({}),
+            || Ok::<u64, String>(1),
+            rebuild_kind,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            unchecked(),
+        );
+        assert_eq!(out, Ok(1));
+        assert_eq!(
+            *hook.shadow_provenance.lock().unwrap(),
+            vec![crate::Provenance::Shadow]
+        );
+    }
+
+    /// Poll a future that never waits to completion.
+    fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut fut = std::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("the seam awaited something in a test"),
         }
     }
 
@@ -7711,5 +8073,185 @@ mod serves_recorded_error_tests {
                 "{other:?} must not be read as Err"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod serve_or_run_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::{serve_or_run, ExecuteShadowToken, Provenance, ReconstructInput, Reconstructed};
+
+    /// The envelope a `process_tracker` insert recorded on 2026-09-23 when the
+    /// row already existed: `ResultCodec`'s discriminator plus the error kind.
+    fn unique_violation() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "UniqueViolation",
+            "message": "duplicate key value violates unique constraint \"process_tracker_pkey\"",
+            "result": "Err",
+            "version": 1
+        })
+    }
+
+    fn recorded_ok() -> serde_json::Value {
+        serde_json::json!({ "result": "Ok", "value": 7, "version": 1 })
+    }
+
+    /// A token as the execute peek hands it over, carrying `recorded`.
+    fn token(recorded: Option<serde_json::Value>) -> ExecuteShadowToken {
+        ExecuteShadowToken::new(crate::replay::ObservedCall {
+            outcome: crate::SubstituteOutcome::default(),
+            correlation_id: Some("c-1".to_owned()),
+            boundary: "db".to_owned(),
+            role: None,
+            trait_name: "diesel_models::query::generics".to_owned(),
+            method_name: "generic_insert".to_owned(),
+            args: serde_json::json!({}),
+            resolved: recorded.is_some(),
+            resolved_rank: None,
+            source_event_global_sequence: Some(2972),
+            timestamp_ns: 0,
+            end_timestamp_ns: None,
+            task_id: None,
+            parent_task_id: None,
+            task_bucket: None,
+            bucket_id: None,
+            fork_seq: 0,
+            call_file: None,
+            call_line: None,
+            call_column: None,
+            span_path: None,
+            graph_node_id: None,
+            synthesized: false,
+            real_impl_will_fail: false,
+            seed_gap: recorded.is_none(),
+            recorded_result: recorded,
+            observed_result: None,
+            provenance: Provenance::Shadow,
+            absorbed: false,
+        })
+    }
+
+    /// How the site's codec rebuilds an envelope: the error arm keeps the kind.
+    fn rebuild(input: ReconstructInput<'_>) -> Reconstructed<Result<u64, String>> {
+        match input {
+            ReconstructInput::Hit(v) if v["result"] == "Err" => {
+                Reconstructed::Value(Err(v["kind"].as_str().unwrap().to_owned()))
+            }
+            ReconstructInput::Hit(v) => Reconstructed::Value(Ok(v["value"].as_u64().unwrap())),
+            ReconstructInput::Miss(_) => Reconstructed::NoValue,
+        }
+    }
+
+    fn unique(out: &Result<u64, String>) -> bool {
+        matches!(out, Err(kind) if kind == "UniqueViolation")
+    }
+
+    /// What was emitted, and with which provenance.
+    type Emitted = RefCell<Vec<(Provenance, serde_json::Value)>>;
+
+    fn emit_into(emitted: &Emitted) -> impl FnOnce(ExecuteShadowToken, serde_json::Value) + '_ {
+        move |token, value| {
+            let call = token.into_observed(value.clone());
+            emitted.borrow_mut().push((call.provenance, value));
+        }
+    }
+
+    /// The case this exists for: a recorded unique violation the site declares
+    /// state-neutral is served, and the observation says it was served, with
+    /// the recorded value as what the candidate returned.
+    #[test]
+    fn a_declared_neutral_recorded_error_is_served_and_named() {
+        let emitted = Emitted::default();
+        let served = serve_or_run(
+            token(Some(unique_violation())),
+            Some(unique),
+            rebuild,
+            emit_into(&emitted),
+        );
+        assert_eq!(served.ok(), Some(Err("UniqueViolation".to_owned())));
+        assert_eq!(
+            emitted.into_inner(),
+            vec![(Provenance::ServedRecordedError, unique_violation())]
+        );
+    }
+
+    /// An error the site's predicate does not accept runs: re-running it is
+    /// how a candidate that no longer fails that way shows it.
+    #[test]
+    fn an_error_the_site_does_not_declare_neutral_runs() {
+        let emitted = Emitted::default();
+        let mut other = unique_violation();
+        other["kind"] = serde_json::json!("SerializationFailure");
+        let ran = serve_or_run(
+            token(Some(other)),
+            Some(unique),
+            rebuild,
+            emit_into(&emitted),
+        );
+        assert!(ran.is_err(), "handed back to run");
+        assert!(
+            emitted.into_inner().is_empty(),
+            "nothing emitted before running"
+        );
+    }
+
+    /// A site that declares nothing runs, and does no extra work: the recorded
+    /// value is not even rebuilt.
+    #[test]
+    fn an_undeclared_site_runs_without_rebuilding() {
+        let rebuilt = Cell::new(0);
+        let ran = serve_or_run(
+            token(Some(unique_violation())),
+            None::<fn(&Result<u64, String>) -> bool>,
+            |input| {
+                rebuilt.set(rebuilt.get() + 1);
+                rebuild(input)
+            },
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+        assert_eq!(rebuilt.get(), 0);
+    }
+
+    /// A recorded success runs, even at a site that declared an error neutral,
+    /// and its predicate is never asked.
+    #[test]
+    fn a_recorded_success_runs() {
+        let asked = Cell::new(0);
+        let ran = serve_or_run(
+            token(Some(recorded_ok())),
+            Some(|out: &Result<u64, String>| {
+                asked.set(asked.get() + 1);
+                unique(out)
+            }),
+            rebuild,
+            |_, _| panic!("a recorded success is not served"),
+        );
+        assert!(ran.is_err());
+        assert_eq!(asked.get(), 0);
+    }
+
+    /// A recorded error that does not rebuild runs rather than stopping.
+    #[test]
+    fn a_recorded_error_that_does_not_rebuild_runs() {
+        let ran = serve_or_run(
+            token(Some(unique_violation())),
+            Some(unique),
+            |_| Reconstructed::Failed("codec refused".to_owned()),
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+    }
+
+    /// With no recorded row for this call there is nothing of its own to
+    /// serve, so it runs.
+    #[test]
+    fn a_call_with_no_recorded_row_runs() {
+        let ran = serve_or_run(token(None), Some(unique), rebuild, |_, _| {
+            panic!("nothing is emitted for a call that runs")
+        });
+        assert!(ran.is_err());
     }
 }
