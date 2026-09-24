@@ -5912,9 +5912,19 @@ mod tests {
     /// reason, and an entry that found rows writes no such key at all.
     #[test]
     fn a_certificate_without_the_field_still_parses_and_rows_add_none() {
-        let outcome = super::SeedDbOutcome::unrendered(
-            super::SeedMaterializationStatus::Unsupported,
-            super::SeedReadback::unsupported("opaque key"),
+        let outcome = super::SeedDbOutcome::rendered(
+            super::SeedMaterializationStatus::Materialized,
+            super::SeedReadback::matched(
+                serde_json::json!({"id": 1}),
+                serde_json::json!({"id": 1}),
+            ),
+            super::SeedEntryMechanism {
+                table: "users".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
         );
         let entry = certificate_entry_for(outcome);
         assert!(entry.get("skip_reason").is_none(), "{entry}");
