@@ -77,8 +77,10 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// prevent. If a streaming form is ever needed, give it an envelope carrying
 /// `policy_version` first.
 ///
-/// The rendered table is stamped with [`deja::POLICY_VERSION`] — the version
-/// THIS BUILD implements — rather than a version the caller chooses.
+/// The rendered table is stamped with [`deja::LEGACY_POLICY_VERSION`], the
+/// one-result-per-entry format every candidate pin reads, rather than a version
+/// the caller chooses. [`deja::POLICY_VERSION`] names the shared-results form,
+/// written beside it from this table; both carry keys stamped the same way.
 ///
 /// It used to be a parameter, and every caller passed a literal `1`. That makes
 /// the declared version a claim about the caller's intent instead of a fact
@@ -89,7 +91,7 @@ pub fn render_lookup_table(
     recording: &ScopedRecording,
     recording_id: &str,
 ) -> io::Result<LookupTable> {
-    let policy_version = deja::POLICY_VERSION;
+    let policy_version = deja::LEGACY_POLICY_VERSION;
     // Shared occurrence assigner — advanced for every rank on every event, in
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();
@@ -147,6 +149,8 @@ pub fn render_lookup_table(
             .or(event.task_bucket.as_deref())
             .unwrap_or("root");
         let fork_seq = event.fork_seq.unwrap_or(0);
+        // One value per event, shared by the entry for each of its ranks.
+        let result = std::sync::Arc::new(event.result.to_value());
         for key in stamper.stamp(
             event.correlation_id.as_deref(),
             Some(bucket_id),
@@ -157,7 +161,7 @@ pub fn render_lookup_table(
         ) {
             entries.push(LookupEntry {
                 key,
-                result: event.result.to_value(),
+                result: std::sync::Arc::clone(&result),
                 source_event_global_sequence: event.global_sequence,
             });
         }
@@ -261,6 +265,27 @@ mod tests {
             "replay_strategy": "substitute",
             "callsite_identity": identity
         })
+    }
+
+    /// The rendered table is the legacy format every candidate pin reads, and
+    /// an event's entries, one per rank, share its one recorded value. The
+    /// version is a literal: a candidate on an older pin accepts exactly 2.
+    #[test]
+    fn the_renderer_writes_the_legacy_format_with_one_value_per_event() {
+        let (_dir, recording) = write_events(&[event("redis", 0, serde_json::Value::Null)]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        assert_eq!(table.policy_version, 2);
+        assert!(
+            table.entries.len() >= 2,
+            "the fixture renders several ranks"
+        );
+        assert!(
+            table
+                .entries
+                .windows(2)
+                .all(|pair| std::sync::Arc::ptr_eq(&pair[0].result, &pair[1].result)),
+            "an event's rank entries share one value"
+        );
     }
 
     /// The lookup table IS the substitution material the candidate replays

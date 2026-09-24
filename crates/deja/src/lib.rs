@@ -40,8 +40,9 @@ pub use deja_runtime::replay::{
     canonical_args_hash, loci_for, CallIdentity, FileObservedSink, InMemoryObservedSink,
     KeyStamper, LocalFileLookupSource, Locus, LookupEntry, LookupKey, LookupTable, LookupTableHook,
     LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
-    POLICY_VERSION,
+    LEGACY_POLICY_VERSION, POLICY_VERSION,
 };
+pub use deja_runtime::replay::{shared_results_path, SharedResultsEntry, SharedResultsTable};
 /// Re-export the generic seed-plan pipeline (pure builder, diverged-read
 /// classification, ambient template) so the harness materializes seeds from
 /// explicit event read/write captures.

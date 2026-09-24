@@ -858,20 +858,20 @@ mod tests {
             };
             entries.push(deja::LookupEntry {
                 key: key(Locus::Unlocated),
-                result: ev.result.to_value(),
+                result: std::sync::Arc::new(ev.result.to_value()),
                 source_event_global_sequence: ev.global_sequence,
             });
             if let Some(path) = spans.get(&ev.global_sequence) {
                 entries.push(deja::LookupEntry {
                     key: key(Locus::SpanPath { path: path.clone() }),
-                    result: ev.result.to_value(),
+                    result: std::sync::Arc::new(ev.result.to_value()),
                     source_event_global_sequence: ev.global_sequence,
                 });
             }
         }
         deja::LookupTable {
             recording_id: "rec".to_owned(),
-            policy_version: deja::POLICY_VERSION,
+            policy_version: deja::LEGACY_POLICY_VERSION,
             event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
         }
