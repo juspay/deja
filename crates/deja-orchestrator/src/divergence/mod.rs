@@ -3949,6 +3949,15 @@ fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
     }
 }
 
+/// How many objects and arrays deep a value nests.
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// The lexemes of a JSON text as written, sorted: strings with their escapes,
 /// numbers as spelled, literals, and punctuation. Two documents with the same
 /// lexemes differ at most in arrangement, so an escape, a number's spelling or
@@ -4013,13 +4022,22 @@ fn embedded_document_pairs(
     if baseline.text != candidate.text || baseline.documents.len() > MAX_EMBEDDED_DOCUMENTS {
         return None;
     }
-    // Read as JSON only where the documents differ in arrangement alone.
-    if baseline
+    // Read as JSON only where the documents differ in arrangement alone: the
+    // same lexemes as written, and the same document apart from array order,
+    // with a null and a missing member kept apart. Anything else, a changed
+    // value included, keeps the whole-page comparison.
+    let arrangement_only = baseline
         .written
         .iter()
         .zip(&candidate.written)
-        .any(|(b, c)| written_lexemes(b) != written_lexemes(c))
-    {
+        .zip(baseline.documents.iter().zip(&candidate.documents))
+        .all(|((bw, cw), (b, c))| {
+            json_depth(b) <= MAX_EMBEDDED_DEPTH
+                && json_depth(c) <= MAX_EMBEDDED_DEPTH
+                && written_lexemes(bw) == written_lexemes(cw)
+                && bag_canon(b) == bag_canon(c)
+        });
+    if !arrangement_only {
         return None;
     }
     Some(
@@ -5890,8 +5908,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     for (path, responses) in &embedded_document_paths_seen {
         warnings.push(format!(
             "response body {path} is not JSON but carries JSON documents; on {responses} \
-             response(s) the text around them was identical and they were compared as JSON, at \
-             {path}.~embedded[n]. Text that differs outside a document still blocks"
+             response(s) the text around them was identical and the documents differed only in \
+             arrangement, so they were compared as JSON at {path}.~embedded[n]: key order and \
+             whitespace were ignored, and array order was judged as in a JSON body. Any other \
+             difference keeps the whole-page comparison and blocks"
         ));
     }
     // Two sources describing one path differently. Absorbed by neither, on
