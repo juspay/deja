@@ -1568,23 +1568,39 @@ fn artifact_cache_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_BYTES)
 }
 
-/// The directories `hydrate_run_artifacts` writes into.
-///
-/// Derived by asking `local_path_for_artifact_kind` for each kind and taking the
-/// parent, rather than naming directories here — a new artifact kind then joins
-/// the sweep by existing, instead of by someone remembering to add it to a list.
+/// The kinds `hydrate_run_artifacts` copies down from the store.
+const HYDRATED_KINDS: [&str; 6] = [
+    "observed",
+    "http_diffs",
+    "lookup_table",
+    "scorecard",
+    "call_ledger",
+    "record_graph",
+];
+
+/// Caches the orchestrator derives from hydrated files and rebuilds on a miss.
+const DERIVED_CACHES: [&str; 3] = ["behaviour_tree", "delta", "change_coverage"];
+
+/// Where the cache sweep may find a file of `kind` for `run_id`: a hydrated
+/// copy, or a cache derived from one. Nothing else is cache.
+fn cache_path_for_kind(root: &HarnessRoot, run_id: &str, kind: &str) -> Option<std::path::PathBuf> {
+    match kind {
+        "behaviour_tree" => Some(root.behaviour_tree_path(run_id)),
+        "delta" => Some(root.delta_cache_path(run_id)),
+        "change_coverage" => Some(root.change_coverage_path(run_id)),
+        _ => local_path_for_artifact_kind(root, run_id, kind),
+    }
+}
+
+fn cache_kinds() -> impl Iterator<Item = &'static str> {
+    HYDRATED_KINDS.into_iter().chain(DERIVED_CACHES)
+}
+
+/// The directories the cache sweep looks in, asked of `cache_path_for_kind`
+/// rather than named here.
 fn artifact_cache_dirs(root: &HarnessRoot) -> Vec<std::path::PathBuf> {
-    const KINDS: [&str; 6] = [
-        "observed",
-        "http_diffs",
-        "lookup_table",
-        "scorecard",
-        "call_ledger",
-        "record_graph",
-    ];
-    let mut dirs: Vec<std::path::PathBuf> = KINDS
-        .iter()
-        .filter_map(|kind| local_path_for_artifact_kind(root, "_probe", kind))
+    let mut dirs: Vec<std::path::PathBuf> = cache_kinds()
+        .filter_map(|kind| cache_path_for_kind(root, "_probe", kind))
         .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
         .collect();
     dirs.sort();
@@ -1592,12 +1608,31 @@ fn artifact_cache_dirs(root: &HarnessRoot) -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// The run whose cache file `path` is, or `None` when it is not one.
+///
+/// A path is cache only if `cache_path_for_kind` would produce exactly it for
+/// some run and kind. Those directories also hold run records, seed
+/// certificates, notes and manifests, which are not copies of anything; a
+/// directory is not a category.
+fn cached_file_run(root: &HarnessRoot, path: &std::path::Path) -> Option<String> {
+    const MARK: &str = "\u{1}";
+    let name = path.file_name()?.to_str()?;
+    cache_kinds().find_map(|kind| {
+        let template = cache_path_for_kind(root, MARK, kind)?;
+        let (prefix, suffix) = template.file_name()?.to_str()?.split_once(MARK)?;
+        let run_id = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+        (cache_path_for_kind(root, run_id, kind).as_deref() == Some(path))
+            .then(|| run_id.to_owned())
+    })
+}
+
 /// Delete least-recently-modified hydrated artifacts until the cache is under
 /// budget.
 ///
-/// Every file here is a copy of an `s3://` object that the run's artifact row
-/// still points at, so eviction costs a re-download on the next view and loses
-/// nothing. Without it the cache only ever grows: `hydrate_run_artifacts` skips
+/// Only files `cached_file_run` recognises are counted or deleted. Each is a
+/// copy of an `s3://` object that the run's artifact row still points at, or a
+/// cache derived from one, so eviction costs a re-download or a rebuild on the
+/// next view and loses nothing. Without it the cache only ever grows: `hydrate_run_artifacts` skips
 /// a path that already exists and has no counterpart that removes one, so the
 /// volume fills in proportion to runs LOOKED AT rather than runs executed.
 ///
@@ -1621,14 +1656,11 @@ fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
         };
         for entry in listing.flatten() {
             let path = entry.path();
-            // `keep` empty means keep nothing — every name `starts_with("")`,
-            // so without this the boot sweep would skip the entire cache and
-            // reclaim exactly zero bytes.
-            if !keep.is_empty()
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(keep))
-            {
+            let Some(run_id) = cached_file_run(root, &path) else {
+                continue;
+            };
+            // `keep` empty means keep nothing: the boot sweep protects no run.
+            if !keep.is_empty() && run_id == keep {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
@@ -2032,7 +2064,7 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
         );
     };
     let ledger_path = confined(st.root.call_ledger_path(&id), &runs_dir);
-    let cache = observed_path.with_extension("change-coverage.json");
+    let cache = deja_orchestrator::change_coverage_cache_of(&observed_path);
     if let Ok(cached) = std::fs::read_to_string(&cache) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
             return json_ok(value);
@@ -2220,7 +2252,7 @@ fn tree_sources(
     }
     // beside the ledger it is built from, named off the confined ledger path:
     // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
-    let cache = ledger.with_extension("behaviour-tree.jsonl");
+    let cache = deja_orchestrator::behaviour_tree_cache_of(&ledger);
     Ok(TreeSources {
         ledger,
         diffs,
@@ -2484,7 +2516,7 @@ async fn delta_for_run(
 
     let runs_dir = st.root.root.join("runs");
     let cache = confined(st.root.call_ledger_path(y_id), &runs_dir)
-        .map(|ledger| ledger.with_extension("delta.json"));
+        .map(|ledger| deja_orchestrator::delta_cache_of(&ledger));
     if let Some(cache) = cache.clone() {
         let (y, m) = (y_id.to_owned(), m_id.to_owned());
         let cached = tokio::task::spawn_blocking(move || -> Option<serde_json::Value> {
@@ -3841,6 +3873,149 @@ mod tests {
 
     fn present(root: &HarnessRoot, run_id: &str, kind: &str) -> bool {
         super::local_path_for_artifact_kind(root, run_id, kind).is_some_and(|path| path.exists())
+    }
+
+    /// Seed a file that is NOT a hydrated artifact, with a chosen age.
+    fn resident(path: &std::path::Path, bytes: usize, age_secs: u64) {
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(path, vec![b'x'; bytes]).expect("write");
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    /// The files that share a directory with hydrated artifacts and are not
+    /// copies of anything: the run record is the only copy of a run's progress,
+    /// and the ingest endpoint refuses every event for a run without one.
+    fn residents(root: &HarnessRoot, run_id: &str) -> Vec<std::path::PathBuf> {
+        vec![
+            root.run_path(run_id),
+            root.seed_certificate_path(run_id),
+            root.record_graph_note_path(run_id),
+            root.root
+                .join("runs")
+                .join(format!("{run_id}.manifest.json")),
+        ]
+    }
+
+    /// THE bug: at boot nothing is protected, the budget forces eviction, and
+    /// the oldest files in `runs/` are run records. Only the hydrated copy may go.
+    #[test]
+    fn the_boot_sweep_deletes_only_hydrated_copies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        for path in residents(&root, "run-old") {
+            resident(&path, 1_000, 10);
+        }
+        hydrated(&root, "run-cached", "scorecard", 1_000, 100);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::sweep_artifact_cache(&root, "");
+        // Vacuity guard: the sweep really did evict.
+        assert!(
+            !present(&root, "run-cached", "scorecard"),
+            "precondition: the budget forced eviction"
+        );
+        for path in residents(&root, "run-old") {
+            assert!(path.exists(), "the sweep deleted {}", path.display());
+        }
+    }
+
+    /// A name is not enough: `runs/<id>.jsonl` has the file name an observed
+    /// stream would have, in a directory observed streams never live in.
+    #[test]
+    fn a_hydrated_name_in_the_wrong_directory_is_not_cache() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let stray = root.root.join("runs").join("run-x.jsonl");
+        resident(&stray, 1_000, 10);
+        hydrated(&root, "run-cached", "scorecard", 1_000, 100);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::sweep_artifact_cache(&root, "");
+        assert!(!present(&root, "run-cached", "scorecard"), "precondition");
+        assert!(stray.exists(), "only the seam's exact path is cache");
+    }
+
+    /// Files that are not cache do not count toward the cache's budget. The
+    /// run record is the NEWEST file here, so a sweep that counted it would
+    /// evict both cached files to make room for it, and delete nothing it
+    /// should not; only the count tells the two apart.
+    #[test]
+    fn only_cache_counts_toward_the_budget() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "call_ledger", 1_000, 50);
+        hydrated(&root, "run-b", "call_ledger", 1_000, 100);
+        resident(&root.run_path("run-big"), 10_000, 200);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1500");
+        super::sweep_artifact_cache(&root, "");
+        assert!(
+            !present(&root, "run-a", "call_ledger"),
+            "precondition: 2,000 cached bytes over a 1,500 budget evicts the oldest"
+        );
+        assert!(
+            present(&root, "run-b", "call_ledger"),
+            "1,000 cached bytes remain, under budget: the record's bytes are not cache"
+        );
+        assert!(
+            root.run_path("run-big").exists(),
+            "a run record is not cache"
+        );
+    }
+
+    /// The caches the orchestrator derives beside hydrated files are cache too:
+    /// the behaviour tree is written when a run finishes, so leaving it out
+    /// would grow the volume with every run executed.
+    #[test]
+    fn derived_caches_are_swept_and_the_record_beside_them_is_not() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let derived = [
+            root.behaviour_tree_path("run-old"),
+            root.delta_cache_path("run-old"),
+            root.change_coverage_path("run-old"),
+        ];
+        for path in &derived {
+            resident(path, 1_000, 10);
+        }
+        resident(&root.run_path("run-old"), 1_000, 5);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::sweep_artifact_cache(&root, "");
+        for path in &derived {
+            assert!(
+                !path.exists(),
+                "a derived cache was left: {}",
+                path.display()
+            );
+        }
+        assert!(root.run_path("run-old").exists(), "the run record survives");
+    }
+
+    /// `keep` protects one run, not every run whose id it prefixes.
+    #[test]
+    fn keep_protects_exactly_the_run_it_names() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "scorecard", 1_000, 10);
+        hydrated(&root, "run-ab", "scorecard", 1_000, 20);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::sweep_artifact_cache(&root, "run-a");
+        assert!(
+            present(&root, "run-a", "scorecard"),
+            "the served run is kept"
+        );
+        assert!(
+            !present(&root, "run-ab", "scorecard"),
+            "a run whose id merely starts with it is not"
+        );
     }
 
     /// A cache under budget is left entirely alone — the sweep is a ceiling, not
