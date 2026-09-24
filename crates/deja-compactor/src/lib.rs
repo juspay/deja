@@ -2343,8 +2343,9 @@ where
         for jump in &merge.backward_jumps {
             eprintln!(
                 "compactor: merge window of {MERGE_WINDOW} was beaten on instance {} — \
-                 gseq {} arrived after {} (run {}, output position {}); the seal is still \
-                 written, in the order the merge produced",
+                 gseq {} arrived after {} (run {}, output position {}); the events were \
+                 re-sorted into seal order before coverage was derived, so the seal is \
+                 written in seal order",
                 jump.instance_id, jump.arrived_gseq, jump.previous_gseq, jump.from_run, jump.at
             );
         }
