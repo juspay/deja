@@ -177,7 +177,7 @@ fn a_bound_array_keeps_its_order_as_an_array() {
         .expect("keyed");
     assert_ne!(left, right);
     let items = |image: &serde_json::Value| {
-        let mut items: Vec<String> = image["binds"][0]
+        let mut items: Vec<String> = image["binds"]["$1"]
             .as_array()
             .expect("an array bind captures as an array")
             .iter()
@@ -199,11 +199,11 @@ fn a_custom_enum_and_an_array_of_one_capture_without_a_connection() {
         attempt::statuses.eq(vec![Status::Charged, Status::Failed]),
     ));
     let image = capture_query_with(Some(&key), &query).binds.expect("keyed");
-    let binds = image["binds"].as_array().expect("binds");
-    assert!(binds[0]
+    let binds = &image["binds"];
+    assert!(binds["$1"]
         .as_str()
         .is_some_and(|leaf| leaf.starts_with(DIGEST_PREFIX)));
-    assert_eq!(binds[1].as_array().map(Vec::len), Some(2));
+    assert_eq!(binds["$2"].as_array().map(Vec::len), Some(2));
     let other = capture_query_with(
         Some(&key),
         &diesel::update(attempt::table.filter(attempt::id.eq("a_1"))).set((
@@ -253,9 +253,9 @@ fn a_null_bind_captures_as_null() {
     let image = capture_query_with(Some(&key()), &query)
         .binds
         .expect("keyed");
-    assert!(image["binds"][0].is_null(), "{image}");
+    assert!(image["binds"]["$1"].is_null(), "{image}");
     assert!(
-        image["binds"][1].is_string(),
+        image["binds"]["$2"].is_string(),
         "the id bind is still captured: {image}"
     );
 }
@@ -270,7 +270,7 @@ fn a_host_scalar_is_never_decoded_as_an_array() {
         .binds
         .expect("keyed");
     assert!(
-        image["binds"][0]
+        image["binds"]["$1"]
             .as_str()
             .is_some_and(|leaf| leaf.starts_with(DIGEST_PREFIX)),
         "{image}"
@@ -289,7 +289,7 @@ fn an_array_of_nullable_jsonb_keeps_each_document_and_each_null() {
     let image = capture_query_with(Some(&key), &docs(vec![Some(routing(["ach", "eft"])), None]))
         .binds
         .expect("keyed");
-    let items = image["binds"][0].as_array().expect("an array");
+    let items = image["binds"]["$1"].as_array().expect("an array");
     assert_eq!(items.len(), 2);
     assert!(
         items[0]["pre_routing_results"]["ach"].is_object(),
@@ -314,7 +314,7 @@ fn a_json_bind_is_decoded_as_a_document() {
         .binds
         .expect("keyed");
     assert_eq!(
-        image["binds"][0]["k"].as_array().map(Vec::len),
+        image["binds"]["$1"]["k"].as_array().map(Vec::len),
         Some(2),
         "{image}"
     );
@@ -362,4 +362,37 @@ fn a_bind_that_does_not_serialize_keeps_the_statement_and_no_operand() {
         !text.contains("secret-value-9") && !text.contains("pay_secret_1"),
         "{text}"
     );
+}
+
+/// Which placeholder a value fills is part of the query. The binds are keyed by
+/// placeholder rather than listed, so an array rule that forgives order can
+/// never make two values traded between placeholders read as one query.
+#[test]
+fn values_traded_between_placeholders_are_a_different_query() {
+    let key = key();
+    let set = |email: &str, id: &str| {
+        diesel::update(attempt::table.filter(attempt::id.eq(id.to_owned())))
+            .set(attempt::email.eq(email.to_owned()))
+    };
+    let left = capture_query_with(Some(&key), &set("x", "y"))
+        .binds
+        .expect("keyed");
+    let right = capture_query_with(Some(&key), &set("y", "x"))
+        .binds
+        .expect("keyed");
+    let binds = |image: &serde_json::Value| image["binds"].as_object().cloned().expect("an object");
+    assert_eq!(
+        binds(&left).keys().collect::<Vec<_>>(),
+        ["$1", "$2"],
+        "one key per placeholder, in placeholder order"
+    );
+    let mut left_values: Vec<_> = binds(&left).values().map(ToString::to_string).collect();
+    let mut right_values: Vec<_> = binds(&right).values().map(ToString::to_string).collect();
+    left_values.sort();
+    right_values.sort();
+    assert_eq!(
+        left_values, right_values,
+        "premise: the same values, traded"
+    );
+    assert_ne!(left, right);
 }

@@ -24,7 +24,8 @@ pub struct CapturedQuery {
     /// The statement. With a key, the statement alone, never its operands;
     /// without one, diesel's debug rendering, binds included.
     pub sql: String,
-    /// The bind image `{"key_id", "binds": [..]}`, one entry per bind in order,
+    /// The bind image `{"key_id", "binds": {"$1": .., "$2": ..}}`, keyed by the
+    /// placeholder each value fills,
     /// or `{"key_id", "capture_failed"}` naming the step that failed. `None`
     /// without a key.
     pub binds: Option<serde_json::Value>,
@@ -51,12 +52,22 @@ pub fn capture_query_with<Q: QueryFragment<Pg>>(
             sql,
             binds: Some(serde_json::json!({
                 "key_id": key.id(),
+                // Keyed by placeholder, not listed: a bind's position is part
+                // of what the statement means, and an object is compared and
+                // hashed by key, so no rule that forgives array order can make
+                // `$1`/`$2` swapped read as the same query.
                 "binds": collector
                     .binds
                     .iter()
                     .zip(&collector.metadata)
-                    .map(|(bytes, metadata)| decode_bind(key, bytes.as_deref(), metadata))
-                    .collect::<Vec<_>>(),
+                    .enumerate()
+                    .map(|(index, (bytes, metadata))| {
+                        (
+                            format!("${}", index + 1),
+                            decode_bind(key, bytes.as_deref(), metadata),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
             })),
         },
         // Capture never fails the query, and a failure writes no operands:
