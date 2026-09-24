@@ -790,12 +790,8 @@ fn drive_replay(
     // Render the lookup table (whole-document JSON; round-trips through both the
     // candidate's LocalFileLookupSource and the divergence detector).
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table_entries =
-        render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
-    ctx.log(
-        "rendering lookup table",
-        &format!("{table_entries} entries rendered"),
-    );
+    let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
+    ctx.log("rendering lookup table", &rendered);
 
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
@@ -1508,22 +1504,53 @@ fn render_and_persist_lookup_table(
     run_id: &str,
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
-) -> Result<usize, String> {
-    // `None` is the check disabled (`0` in the environment).
-    let max_bytes =
-        lookup_table_budget_from(std::env::var("DEJA_LOOKUP_TABLE_MAX_BYTES").ok().as_deref())
-            .unwrap_or(u64::MAX);
-    persist_lookup_table_within(root, run_id, recording, recording_id, max_bytes)
+) -> Result<String, String> {
+    let raw = std::env::var(LOOKUP_TABLE_MAX_BYTES_ENV).ok();
+    let (max_bytes, budget) = describe_lookup_table_budget(raw.as_deref());
+    let (entries, bytes) = persist_lookup_table_within(
+        root,
+        run_id,
+        recording,
+        recording_id,
+        max_bytes.unwrap_or(u64::MAX),
+    )
+    .map_err(|e| format!("{e} Budget in force: {budget}."))?;
+    Ok(format!(
+        "{entries} entries rendered, {bytes} bytes compact; budget {budget}"
+    ))
 }
+
+/// Read by the runner, which renders the table; set it on the replay Job
+/// template, beside the candidate's memory limit. Not forwarded from the
+/// orchestrator.
+pub const LOOKUP_TABLE_MAX_BYTES_ENV: &str = "DEJA_LOOKUP_TABLE_MAX_BYTES";
 
 /// The largest lookup table, in compact bytes, a run hands its candidate.
 ///
 /// The candidate parses the whole table at boot, so its size, not the number
-/// of correlations, is what runs out of memory. This is the largest table seen
-/// to complete at a 1536 MiB candidate limit; the smallest seen to be killed
-/// was about 95 MB. Between the two is unmeasured, so this is the proven-safe
-/// edge, not the limit.
+/// of correlations, is what runs out of memory. This is just under the largest
+/// table seen to complete at a 1536 MiB candidate limit, and well under the
+/// smallest estimated to have been killed; between the two is unmeasured, so
+/// this is the proven-safe edge, not the limit.
 pub const DEFAULT_LOOKUP_TABLE_MAX_BYTES: u64 = 70_000_000;
+
+/// The budget in force and a sentence saying what decided it, so a value that
+/// did not take effect is visible in the run log.
+fn describe_lookup_table_budget(raw: Option<&str>) -> (Option<u64>, String) {
+    let budget = lookup_table_budget_from(raw);
+    let said = match (raw, budget) {
+        (None, _) => format!("{DEFAULT_LOOKUP_TABLE_MAX_BYTES} bytes (default)"),
+        (Some(v), None) => format!("none ({LOOKUP_TABLE_MAX_BYTES_ENV}={v} disables it)"),
+        (Some(v), Some(max)) if v.trim().parse::<u64>().is_ok() => {
+            format!("{max} bytes ({LOOKUP_TABLE_MAX_BYTES_ENV}={v})")
+        }
+        (Some(v), Some(max)) => format!(
+            "{max} bytes (default; {LOOKUP_TABLE_MAX_BYTES_ENV}={v:?} is not a byte count and \
+             was ignored)"
+        ),
+    };
+    (budget, said)
+}
 
 /// `DEJA_LOOKUP_TABLE_MAX_BYTES` read as a budget: unset or unparseable keeps
 /// the default, and `0` disables the check.
@@ -1536,13 +1563,14 @@ fn lookup_table_budget_from(raw: Option<&str>) -> Option<u64> {
 }
 
 /// Render, then refuse a table over `max_bytes` before anything can load it.
+/// Returns the entry count and the table's compact size.
 fn persist_lookup_table_within(
     root: &HarnessRoot,
     run_id: &str,
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
     max_bytes: u64,
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
     let table = crate::lookup::render_lookup_table(recording, recording_id)
         .map_err(|e| format!("render lookup table: {e}"))?;
     // Compact, not pretty: the candidate holds this whole file in one buffer at
@@ -1558,19 +1586,21 @@ fn persist_lookup_table_within(
             .len();
         return Err(format!(
             "the lookup table for this run is {} bytes across {correlations} correlation(s), \
-             over the {max_bytes}-byte budget (DEJA_LOOKUP_TABLE_MAX_BYTES). The candidate \
-             loads the whole table at boot and tables this size have been killed for memory \
-             rather than replayed. Table bytes, not the correlation count, bound a run: split \
-             the correlation filter into smaller runs.",
+             over the {max_bytes}-byte budget. The candidate loads the whole table at boot \
+             and tables this size have been killed for memory rather than replayed. Table \
+             bytes, not the correlation count, bound a run: replay these correlations as \
+             several smaller runs, each naming a correlation filter. The budget is \
+             {LOOKUP_TABLE_MAX_BYTES_ENV} on the replay Job's runner container.",
             bytes.len()
         ));
     }
+    let size = bytes.len() as u64;
     std::fs::write(root.lookup_table_path(run_id), bytes)
         .map_err(|e| format!("write lookup table: {e}"))?;
     if table.entries.is_empty() {
         return Err("rendered lookup table is empty".to_string());
     }
-    Ok(table.entries.len())
+    Ok((table.entries.len(), size))
 }
 
 /// Final stage (shared): score the run, report the verdict, register the
@@ -1812,12 +1842,8 @@ pub fn drive_replay_in_pod(
         .map_err(|e| format!("open recording {recording_id}: {e}"))?;
 
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table_entries =
-        render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
-    ctx.log(
-        "rendering lookup table",
-        &format!("{table_entries} entries rendered"),
-    );
+    let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
+    ctx.log("rendering lookup table", &rendered);
 
     set_status(root, run, RunStatus::Building, None);
     ctx.run_state("building");
@@ -5942,8 +5968,9 @@ mod tests {
     #[test]
     fn the_lookup_table_is_written_compact_and_loads_back() {
         let (_dir, root, recording) = three_event_recording();
-        let entries =
-            super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1").unwrap();
+        let (entries, _) =
+            super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
+                .unwrap();
         assert!(entries > 0, "the fixture renders entries");
 
         let bytes = std::fs::read(root.lookup_table_path("run-1")).unwrap();
@@ -5975,7 +6002,12 @@ mod tests {
         let (_dir, root, recording) = three_event_recording();
         let err = super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 16)
             .expect_err("a table over the budget is refused");
-        for needle in ["bytes", "16", "DEJA_LOOKUP_TABLE_MAX_BYTES", "split"] {
+        for needle in [
+            "bytes",
+            "16",
+            super::LOOKUP_TABLE_MAX_BYTES_ENV,
+            "smaller runs",
+        ] {
             assert!(err.contains(needle), "the refusal names `{needle}`: {err}");
         }
         assert!(
@@ -5999,6 +6031,50 @@ mod tests {
         );
         super::persist_lookup_table_within(&root, "run-2", &recording, "rec-1", len)
             .expect("a table exactly at the budget is written");
+    }
+
+    /// Held by any test that sets the budget variable.
+    static LOOKUP_TABLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The run path reads the budget from the variable the refusal names.
+    #[test]
+    fn the_run_path_enforces_the_budget_it_names() {
+        let _env = LOOKUP_TABLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_dir, root, recording) = three_event_recording();
+
+        std::env::set_var(super::LOOKUP_TABLE_MAX_BYTES_ENV, "16");
+        let err = super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1")
+            .expect_err("a 16-byte budget from the environment is enforced");
+        assert!(
+            err.contains(super::LOOKUP_TABLE_MAX_BYTES_ENV) && err.contains("16 bytes"),
+            "the refusal names the variable that set its budget: {err}"
+        );
+
+        std::env::set_var(super::LOOKUP_TABLE_MAX_BYTES_ENV, "0");
+        let report = super::render_and_persist_lookup_table(&root, "run-2", &recording, "rec-1");
+        std::env::remove_var(super::LOOKUP_TABLE_MAX_BYTES_ENV);
+        let report = report.expect("0 disables the check");
+        assert!(
+            report.contains("bytes compact") && report.contains("disables it"),
+            "a written table reports its size and the budget in force: {report}"
+        );
+    }
+
+    /// An override that did not take effect says so.
+    #[test]
+    fn an_unparseable_budget_is_named_in_the_run_log() {
+        let (max, said) = super::describe_lookup_table_budget(Some("70MB"));
+        assert_eq!(max, Some(super::DEFAULT_LOOKUP_TABLE_MAX_BYTES));
+        assert!(
+            said.contains("\"70MB\"") && said.contains("ignored"),
+            "the raw value and that it was ignored: {said}"
+        );
+        let (_, said) = super::describe_lookup_table_budget(None);
+        assert!(said.contains("default"), "{said}");
+        let (_, said) = super::describe_lookup_table_budget(Some("123"));
+        assert!(said.starts_with("123 bytes"), "{said}");
     }
 
     /// The budget comes from the environment when it says something usable.
@@ -6030,7 +6106,7 @@ mod tests {
         assert_eq!(
             calls, 1,
             "the renderer is reached from exactly one place in this module, the body of \
-             `render_and_persist_lookup_table`, which returns a count so that no caller can \
+             `persist_lookup_table_within`, which returns a count so that no caller can \
              hold the table; {calls} call sites means a stage body is binding it again"
         );
     }
