@@ -1734,12 +1734,8 @@ fn persist_lookup_table_within(
     })
 }
 
-/// The shared-results form of `table`, whose serialization is `legacy`, after
-/// proving it expands back to exactly those bytes.
-fn shared_results_bytes(table: &deja::LookupTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
-    finish_shared(build_shared(table, legacy)?, legacy)
-}
-
+/// The shared-results form of `table`, stamped with the digest of `legacy`,
+/// the table's serialization. Not yet checked: see [`finish_shared`].
 fn build_shared(
     table: &deja::LookupTable,
     legacy: &[u8],
@@ -6413,14 +6409,16 @@ mod tests {
         let (_dir, _root, recording) = three_event_recording();
         let table = render(&recording, "rec-1").unwrap();
         let legacy = serde_json::to_vec(&table).unwrap();
-        super::shared_results_bytes(&table, &legacy).expect("a table and its own bytes agree");
+        super::finish_shared(super::build_shared(&table, &legacy).unwrap(), &legacy)
+            .expect("a table and its own bytes agree");
 
         // Built against bytes that are not this table's: refused at the call
         // the write goes through, not only by the check on its own.
         let mut other = legacy.clone();
         let at = other.len() - 3;
         other[at] ^= 1;
-        let err = super::shared_results_bytes(&table, &other).unwrap_err();
+        let err =
+            super::finish_shared(super::build_shared(&table, &other).unwrap(), &other).unwrap_err();
         assert!(err.contains("does not expand"), "{err}");
 
         // A result changed to one exactly as long: the digest, not the length,
