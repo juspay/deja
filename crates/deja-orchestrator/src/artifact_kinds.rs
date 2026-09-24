@@ -131,6 +131,25 @@ pub fn streamed() -> impl Iterator<Item = &'static RunArtifactKind> {
         .filter(|kind| kind.publish == Publish::Stream)
 }
 
+/// The content type the raw endpoint serves an artifact as.
+///
+/// Decided by its kind, not by the URI it was registered under: a compose run
+/// registers the local path, and runs published before a rename keep their old
+/// object name, so the extension on the URI can say the wrong thing.
+pub fn served_content_type(kind: &str, uri: &str) -> &'static str {
+    let name = RUN_ARTIFACT_KINDS
+        .iter()
+        .find(|k| k.name == kind)
+        .map_or(uri, |k| k.object);
+    if kind == "visualization_html" {
+        "text/html; charset=utf-8"
+    } else if name.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/x-ndjson"
+    }
+}
+
 /// The kinds hydrated onto the orchestrator and served by the API.
 pub fn served() -> impl Iterator<Item = &'static RunArtifactKind> {
     RUN_ARTIFACT_KINDS.iter().filter(|kind| kind.served)
@@ -169,15 +188,32 @@ mod tests {
         }
     }
 
-    /// The raw endpoint serves a `.jsonl` object as NDJSON. The lookup table is
-    /// one document written on one line, so under that name a line reader gets
-    /// one plausible record, the envelope, instead of an error.
+    /// The lookup table is one document on one line. Served as NDJSON, a line
+    /// reader gets one plausible record, the envelope, instead of an error;
+    /// that must hold for a compose run's local path and an old `.jsonl`
+    /// object as much as for a new one.
     #[test]
-    fn the_lookup_table_is_published_as_a_json_document() {
-        assert!(
-            LOOKUP_TABLE.object.ends_with(".json"),
-            "{} is one JSON document, not a line stream",
-            LOOKUP_TABLE.object
+    fn the_lookup_table_is_served_as_a_json_document_whatever_its_uri() {
+        for uri in [
+            "s3://bucket/replay-runs/run-1/lookup_table.json",
+            "s3://bucket/replay-runs/run-1/lookup_table.jsonl",
+            "/workspace/state/lookup-tables/run-1.jsonl",
+        ] {
+            assert_eq!(
+                served_content_type(LOOKUP_TABLE.name, uri),
+                "application/json",
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            served_content_type(CALL_LEDGER.name, "/state/ledgers/run-1.jsonl"),
+            "application/x-ndjson",
+            "a line stream stays NDJSON"
+        );
+        assert_eq!(
+            served_content_type("some_future_kind", "s3://b/x.json"),
+            "application/json",
+            "a kind outside the table falls back to its URI"
         );
     }
 

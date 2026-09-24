@@ -2811,13 +2811,7 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
         Ok(None) => return error_resp(404, "artifact not found"),
         Err(e) => return error_resp(500, &format!("get artifact: {e}")),
     };
-    let content_type = if art.kind == "visualization_html" {
-        "text/html; charset=utf-8"
-    } else if art.uri.ends_with(".json") {
-        "application/json"
-    } else {
-        "application/x-ndjson"
-    };
+    let content_type = artifact_kinds::served_content_type(&art.kind, &art.uri);
     // s3:// artifact (k8s run) → fetch from S3; else a local path (compose run).
     let bytes = if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(&art.uri) {
         let fetch = tokio::task::spawn_blocking(move || {
@@ -4476,6 +4470,22 @@ mod tests {
         assert!(
             !present(&root, "other", "observed"),
             "others go to make room"
+        );
+    }
+
+    /// The raw endpoint takes its content type from the kind table, so a
+    /// compose run's local path and an old object name are served by what the
+    /// artifact is. No store-backed test reaches the endpoint, so the seam is
+    /// held against the source. The needle is assembled so this test does not
+    /// count itself.
+    #[test]
+    fn the_raw_endpoint_serves_by_kind() {
+        let source = include_str!("main.rs");
+        let needle = format!("artifact_kinds::{}(&art.kind", "served_content_type");
+        assert_eq!(
+            source.matches(&needle).count(),
+            1,
+            "v1_artifact_raw decides its content type through the kind table"
         );
     }
 
