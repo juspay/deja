@@ -5403,7 +5403,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         ));
     }
     // A truncated recording tail is reported and does NOT fail the verdict — but
-    // it does not pass either, so unlike a seed gap it forces `inconclusive`.
+    // it does not pass either, so, like a seed gap, it forces `inconclusive`.
     if inconclusive_tail_gaps > 0 {
         reasons.push(format!(
             "{inconclusive_tail_gaps} inconclusive tail-gap call(s) across \
@@ -11395,6 +11395,26 @@ mod tests {
         assert!(!c1.passed, "the correlation is not a pass either");
         assert!(c1.inconclusive);
         assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// A seed gap makes its OWN correlation inconclusive, not the others: a
+    /// clean correlation beside it still passes and is still counted.
+    #[test]
+    fn a_seed_gap_leaves_other_correlations_passing() {
+        let card = detect(&art(
+            vec![],
+            vec![seed_gap_obs()],
+            vec![http("c1", true, vec![]), http("c2", true, vec![])],
+        ));
+        let c2 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c2")
+            .expect("c2 scored");
+        assert!(c2.passed, "a clean correlation beside a seed gap passes");
+        assert!(!c2.inconclusive);
+        assert_eq!(card.summary.matched_correlations, 1);
+        assert!(card.verdict.inconclusive, "the run still cannot tell");
     }
 
     /// Blocking still wins: a seed gap beside a real divergence is a failure,
