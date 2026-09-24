@@ -15403,8 +15403,15 @@ mod tests {
             );
             assert!(card.verdict.pass, "{name}: absorbed, not blocking");
             assert!(
-                card.warnings.iter().any(|w| w.contains("ordering alone")),
-                "{name}: and named: {:?}",
+                card.warnings
+                    .iter()
+                    .any(|w| w.contains("held an object's keys in a different order")),
+                "{name}: and named as a key reorder, not an array permutation: {:?}",
+                card.warnings
+            );
+            assert!(
+                !card.warnings.iter().any(|w| w.contains("ordering alone")),
+                "{name}: the array-permutation wording is not reused: {:?}",
                 card.warnings
             );
         }
