@@ -3910,6 +3910,210 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
         && bag_canon(&row.baseline) == bag_canon(&row.candidate)
 }
 
+/// Larger bodies are not scanned for embedded documents; they compare as text.
+const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
+
+/// A page carrying more documents than this compares as text.
+const MAX_EMBEDDED_DOCUMENTS: usize = 16;
+
+/// A document nested deeper than this compares as text: the structural
+/// comparison costs size times depth squared.
+const MAX_EMBEDDED_DEPTH: usize = 32;
+
+/// A non-JSON text split into the JSON objects embedded in it and the text
+/// around them. A document starts at a `{` that begins a complete JSON object
+/// and runs to that object's end; any other brace stays text.
+#[derive(Debug, PartialEq)]
+struct EmbeddedDocuments<'a> {
+    text: Vec<&'a str>,
+    documents: Vec<serde_json::Value>,
+    /// Each document as written.
+    written: Vec<&'a str>,
+}
+
+fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
+    let (mut pieces, mut documents, mut written) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut piece_start, mut cursor) = (0, 0);
+    while let Some(offset) = text[cursor..].find('{') {
+        let start = cursor + offset;
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(document)) => {
+                pieces.push(&text[piece_start..start]);
+                documents.push(document);
+                cursor = start + stream.byte_offset();
+                written.push(&text[start..cursor]);
+                piece_start = cursor;
+            }
+            _ => cursor = start + 1,
+        }
+    }
+    pieces.push(&text[piece_start..]);
+    EmbeddedDocuments {
+        text: pieces,
+        documents,
+        written,
+    }
+}
+
+/// How many objects and arrays deep a value nests.
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The lexemes of a JSON text as written, in order: strings with their
+/// escapes, numbers as spelled, literals, and punctuation.
+fn written_lexemes(json: &str) -> Vec<&str> {
+    let bytes = json.as_bytes();
+    let (mut lexemes, mut at) = (Vec::new(), 0);
+    while at < bytes.len() {
+        let start = at;
+        match bytes[at] {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                at += 1;
+                continue;
+            }
+            b'"' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                at += 1;
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => at += 1,
+            _ => {
+                while at < bytes.len()
+                    && !matches!(
+                        bytes[at],
+                        b' ' | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'{'
+                            | b'}'
+                            | b'['
+                            | b']'
+                            | b':'
+                            | b','
+                            | b'"'
+                    )
+                {
+                    at += 1;
+                }
+            }
+        }
+        lexemes.push(&json[start..at.min(bytes.len())]);
+    }
+    lexemes
+}
+
+/// A JSON text as written, with its arrangement taken out: every value keeps
+/// its exact spelling (escapes, number forms, duplicate keys, a null), and
+/// only the order of object members and of array members is canonical. Two
+/// documents with the same written form differ in arrangement alone.
+fn written_form(json: &str) -> String {
+    fn value(lexemes: &mut std::iter::Peekable<std::vec::IntoIter<&str>>) -> String {
+        match lexemes.next() {
+            Some("{") => {
+                let mut members = Vec::new();
+                while let Some(&next) = lexemes.peek() {
+                    if next == "}" {
+                        lexemes.next();
+                        break;
+                    }
+                    if next == "," {
+                        lexemes.next();
+                        continue;
+                    }
+                    let key = lexemes.next().unwrap_or_default();
+                    lexemes.next(); // ':'
+                    members.push(format!("{key}:{}", value(lexemes)));
+                }
+                members.sort();
+                format!("{{{}}}", members.join(","))
+            }
+            Some("[") => {
+                let mut members = Vec::new();
+                while let Some(&next) = lexemes.peek() {
+                    if next == "]" {
+                        lexemes.next();
+                        break;
+                    }
+                    if next == "," {
+                        lexemes.next();
+                        continue;
+                    }
+                    members.push(value(lexemes));
+                }
+                members.sort();
+                format!("[{}]", members.join(","))
+            }
+            Some(scalar) => scalar.to_owned(),
+            None => String::new(),
+        }
+    }
+    value(&mut written_lexemes(json).into_iter().peekable())
+}
+
+/// The embedded documents of two texts, paired, when everything around them
+/// is byte-identical. Pairing is positional only because the surrounding text
+/// is equal: the k-th document on one side sits exactly where the k-th sits on
+/// the other. `None` when anything else differs, which includes two differing
+/// texts with no document in them.
+fn embedded_document_pairs(
+    baseline: &str,
+    candidate: &str,
+) -> Option<Vec<(serde_json::Value, serde_json::Value)>> {
+    if baseline.len().max(candidate.len()) > MAX_EMBEDDED_SCAN_BYTES {
+        return None;
+    }
+    let (baseline, candidate) = (embedded_documents(baseline), embedded_documents(candidate));
+    if baseline.text != candidate.text || baseline.documents.len() > MAX_EMBEDDED_DOCUMENTS {
+        return None;
+    }
+    // A document that opens a quoted string (`'…'`, a template literal) sits
+    // in a context a quote inside one of its values can end, so its order can
+    // change how the page parses. The texts are equal, so one side decides.
+    if baseline.text[..baseline.documents.len()]
+        .iter()
+        .any(|before| before.trim_end().ends_with(['\'', '"', '`']))
+    {
+        return None;
+    }
+    // Read as JSON only where the documents differ in arrangement alone: the
+    // same values as written, each keeping its spelling, and the same document
+    // apart from array order. Not where a document holds markup: its order can
+    // change where the page's parser ends a script. Anything else keeps the
+    // whole-page comparison.
+    let arrangement_only = baseline
+        .written
+        .iter()
+        .zip(&candidate.written)
+        .zip(baseline.documents.iter().zip(&candidate.documents))
+        .all(|((bw, cw), (b, c))| {
+            json_depth(b) <= MAX_EMBEDDED_DEPTH
+                && json_depth(c) <= MAX_EMBEDDED_DEPTH
+                && !bw.contains('<')
+                && !cw.contains('<')
+                && written_form(bw) == written_form(cw)
+                && bag_canon(b) == bag_canon(c)
+        });
+    if !arrangement_only {
+        return None;
+    }
+    Some(
+        baseline
+            .documents
+            .into_iter()
+            .zip(candidate.documents)
+            .collect(),
+    )
+}
+
 /// The response's body difference, recomputed with array order handled
 /// structurally and held to the kernel's findings. `None` when the run predates
 /// full bodies being recorded alongside the diff, in which case the kernel's own
@@ -3920,8 +4124,29 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
 fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
-    order_canonical_diff(baseline, candidate, "$", &mut rows);
+    // A non-JSON body carrying JSON documents is compared as those documents,
+    // when the text around them is identical. Only at the root: a JSON body is
+    // never re-scanned.
+    let embedded = match (baseline, candidate) {
+        (serde_json::Value::String(b), serde_json::Value::String(c)) if b != c => {
+            embedded_document_pairs(b, c)
+        }
+        _ => None,
+    };
+    let embedded_document_paths = match &embedded {
+        Some(pairs) => {
+            for (index, (b, c)) in pairs.iter().enumerate() {
+                order_canonical_diff(b, c, &format!("$.~embedded[{index}]"), &mut rows);
+            }
+            vec!["$".to_owned()]
+        }
+        None => {
+            order_canonical_diff(baseline, candidate, "$", &mut rows);
+            Vec::new()
+        }
+    };
     let mut reconciled = reconciled_with_kernel(rows, &diff.body_diff);
+    reconciled.embedded_document_paths = embedded_document_paths;
     // The invariant holds in BOTH directions: the recompute may re-shape the
     // kernel's findings and may not invent one — and may not erase one either.
     // A kernel row that no surviving recompute row speaks about was not
@@ -3937,6 +4162,12 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
                 .rows
                 .iter()
                 .any(|row| paths_overlap(&row.json_path, &found.json_path))
+                // A text read as its embedded documents is spoken for by that
+                // reading, including when the documents are equal as JSON.
+                && !reconciled
+                    .embedded_document_paths
+                    .iter()
+                    .any(|path| path_covers(path, &found.json_path))
         })
         .cloned()
         .collect();
@@ -3958,6 +4189,8 @@ struct Reconciliation {
     /// same. Named, never silently dropped: a run that leans on that judgment on
     /// every response must not read identically to one whose bodies agreed.
     kernel_equivalent_paths: Vec<String>,
+    /// Texts that were compared as the JSON documents embedded in them.
+    embedded_document_paths: Vec<String>,
 }
 
 /// Is a difference reported at `inner` the same difference as, or part of, one
@@ -4031,6 +4264,7 @@ fn reconciled_with_kernel(
     Reconciliation {
         rows,
         kernel_equivalent_paths,
+        embedded_document_paths: Vec::new(),
     }
 }
 
@@ -4053,6 +4287,10 @@ struct HttpBodyClassification {
     /// same — an encoded value whose serialisation order differed, or a path the
     /// run's body allowlist covers. Named and NOT counted as blocking.
     kernel_equivalent_paths: Vec<String>,
+    /// Texts compared as the JSON documents embedded in them. Named and NOT
+    /// counted as blocking; what differs inside the documents is classified
+    /// like any other row.
+    embedded_document_paths: Vec<String>,
 }
 
 /// A JSON path reduced to the form a declaration is written in: every array
@@ -4127,6 +4365,10 @@ fn classify_http_body_diff(
     classification.kernel_equivalent_paths = reconciled
         .as_ref()
         .map(|r| r.kernel_equivalent_paths.clone())
+        .unwrap_or_default();
+    classification.embedded_document_paths = reconciled
+        .as_ref()
+        .map(|r| r.embedded_document_paths.clone())
         .unwrap_or_default();
     for body in rows {
         // Existing explicit absorptions retain precedence over schema
@@ -5210,6 +5452,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // same. Not counted, but SAID: a suite that leans on that judgment on every
     // response must not read identically to one whose bodies agreed.
     let mut kernel_equivalent_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut embedded_document_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -5270,6 +5513,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 stats.note_kind("OrderNondeterministicWarning");
                 order_nondeterminism_warnings += 1;
                 *kernel_equivalent_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.embedded_document_paths {
+                stats.note_kind("EmbeddedJsonCompared");
+                *embedded_document_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -5724,6 +5971,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              counted: the kernel, which alone reads an encoded value as the document it carries \
              and alone applies the run's body allowlist, judged the region the same. A member \
              added, removed or altered inside it would still block"
+        ));
+    }
+    for (path, responses) in &embedded_document_paths_seen {
+        warnings.push(format!(
+            "response body {path} is not JSON but carries JSON documents; on {responses} \
+             response(s) the text around them was identical and the documents differed only in \
+             arrangement, so they were compared as JSON at {path}.~embedded[n]: key order and \
+             whitespace were ignored, and array order was judged as in a JSON body. Any other \
+             difference keeps the whole-page comparison and blocks"
         ));
     }
     // Two sources describing one path differently. Absorbed by neither, on
@@ -8886,6 +9142,263 @@ mod tests {
             "warnings: {:?}",
             card.warnings
         );
+    }
+
+    /// A page shaped like the collect-link page: a style block whose braces
+    /// are not JSON, and a script that assigns one embedded document.
+    fn page_embedding(document: &str, heading: &str) -> serde_json::Value {
+        serde_json::Value::String(format!(
+            "<!DOCTYPE html>\n<html><head><style>\nbody {{ height: 100%; }}\n\
+             @media only screen {{ .main {{ min-width: 300px; }} }}\n</style></head>\n\
+             <body><h1>{heading}</h1><div id=\"collect\"></div>\n\
+             <script>window.__DETAILS = {document}\n// @ts-check\nvar widgets = null;\n\
+             function mount() {{ return widgets; }}</script></body></html>"
+        ))
+    }
+
+    fn embedded_card(recorded: serde_json::Value, replayed: serde_json::Value) -> Scorecard {
+        detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]))
+    }
+
+    /// An HTML page embedding a JSON document whose arrays were permuted is
+    /// compared as JSON inside the page: the permutation is absorbed and
+    /// named at the document's own path, and the page is counted as read
+    /// through an embedded document.
+    #[test]
+    fn an_embedded_document_whose_arrays_moved_is_compared_as_json() {
+        let card = embedded_card(
+            page_embedding(
+                r##"{"theme":"#4285F4","enabled_payment_methods":[{"payment_method":"card","payment_method_types":["debit","credit"]},{"payment_method":"bank_transfer","payment_method_types":["bacs","ach","sepa"]}]}"##,
+                "Collect",
+            ),
+            page_embedding(
+                r##"{"theme":"#4285F4","enabled_payment_methods":[{"payment_method":"card","payment_method_types":["credit","debit"]},{"payment_method":"bank_transfer","payment_method_types":["sepa","ach","bacs"]}]}"##,
+                "Collect",
+            ),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("$.~embedded[0].enabled_payment_methods")),
+            "the absorption is named inside the document: {:?}",
+            card.warnings
+        );
+    }
+
+    /// Keys in another order inside an embedded document are the same
+    /// document: compared as JSON, counted, not blocking.
+    #[test]
+    fn an_embedded_document_whose_keys_moved_is_compared_as_json() {
+        let card = embedded_card(
+            page_embedding(r#"{"a":1,"b":{"x":1,"y":2}}"#, "Collect"),
+            page_embedding(r#"{"b":{"y":2,"x":1},"a":1}"#, "Collect"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("embedded")),
+            "and it is said: {:?}",
+            card.warnings
+        );
+    }
+
+    /// Whitespace between a document's lexemes is formatting, and an escaped
+    /// quote stays inside its string: both are read through.
+    #[test]
+    fn an_embedded_document_is_read_through_whitespace_and_escaped_quotes() {
+        let card = embedded_card(
+            page_embedding(r#"{"m":["a\"b","c"],"k":1}"#, "Collect"),
+            page_embedding(r#"{ "k": 1, "m": ["c", "a\"b"] }"#, "Collect"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// `{"d":{"d":…{"m":array}…}}`, `depth` objects deep.
+    fn nested(depth: usize, array: &str) -> String {
+        format!(
+            "{}{{\"m\":{array}}}{}",
+            "{\"d\":".repeat(depth - 1),
+            "}".repeat(depth - 1)
+        )
+    }
+
+    /// A page whose script holds a document inside a quoted string.
+    fn quoted_embedding(quote: char, document: &str) -> serde_json::Value {
+        serde_json::Value::String(format!(
+            "<html><body><script>var s = {quote}{document}{quote};</script></body></html>"
+        ))
+    }
+
+    /// What the embedded comparison still refuses. Each of these blocks on
+    /// `main` and must keep blocking: the documents are only paired when
+    /// everything around them is byte-identical, only objects are read as
+    /// documents, and a JSON body is never re-scanned.
+    #[test]
+    fn an_embedded_document_is_not_compared_when_anything_else_differs() {
+        let permuted_a = r#"{"m":["a","b"]}"#;
+        let permuted_b = r#"{"m":["b","a"]}"#;
+        for (name, recorded, replayed) in [
+            (
+                "text around the document differs",
+                page_embedding(permuted_a, "Collect"),
+                page_embedding(permuted_b, "Collected"),
+            ),
+            (
+                "a value inside the document changed",
+                page_embedding(r#"{"m":["a","b"],"n":1}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":2}"#, "Collect"),
+            ),
+            (
+                "an embedded top-level array is code, not a document",
+                page_embedding(r#"["a","b"]"#, "Collect"),
+                page_embedding(r#"["b","a"]"#, "Collect"),
+            ),
+            (
+                "the number of documents differs",
+                page_embedding(permuted_a, "Collect"),
+                page_embedding(&format!("{permuted_b}; var more = {{\"k\":1}}"), "Collect"),
+            ),
+            (
+                "an escape changed: bytes a script reads",
+                page_embedding(r#"{"m":["a","b"],"s":"<\/script>"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"s":"</script>"}"#, "Collect"),
+            ),
+            (
+                "a null moved to another object",
+                page_embedding(r#"{"m":["a","b"],"a":null,"b":{"z":1}}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"b":{"a":null,"z":1}}"#, "Collect"),
+            ),
+            (
+                "a null moved to another array",
+                page_embedding(r#"{"m":["a","b"],"a":[null],"b":[]}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"a":[],"b":[null]}"#, "Collect"),
+            ),
+            (
+                "a document nested deeper than a page is read for",
+                page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["a","b"]"#), "Collect"),
+                page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["b","a"]"#), "Collect"),
+            ),
+            (
+                "an escape moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":"a\/b","y":"a/b"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":"a/b","y":"a\/b"}"#, "Collect"),
+            ),
+            (
+                "a unicode escape moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":"\u0061","y":"a"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":"a","y":"\u0061"}"#, "Collect"),
+            ),
+            (
+                "a number's spelling moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":1.0,"y":1.00}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":1.00,"y":1.0}"#, "Collect"),
+            ),
+            (
+                "a negative zero moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":-0.0,"y":0.0}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":0.0,"y":-0.0}"#, "Collect"),
+            ),
+            (
+                "a duplicate key moved to another object",
+                page_embedding(
+                    r#"{"m":["a","b"],"k":{"a":1,"a":2},"j":{"a":3}}"#,
+                    "Collect",
+                ),
+                page_embedding(
+                    r#"{"m":["b","a"],"k":{"a":2},"j":{"a":1,"a":3}}"#,
+                    "Collect",
+                ),
+            ),
+            (
+                "markup inside a document: order can change how the page parses",
+                page_embedding(r#"{"a":"</script>","c":"<img>"}"#, "Collect"),
+                page_embedding(r#"{"c":"<img>","a":"</script>"}"#, "Collect"),
+            ),
+            (
+                "keys moved inside an array member: the JSON-body rule's narrowing",
+                page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
+                page_embedding(r#"{"m":[{"a":0,"b":1},{"a":5}]}"#, "Collect"),
+            ),
+            (
+                "a document inside a template literal: a quote in a value ends it",
+                quoted_embedding('`', r#"{"a":"`+x+`","m":["x","y"]}"#),
+                quoted_embedding('`', r#"{"m":["y","x"],"a":"`+x+`"}"#),
+            ),
+            (
+                "a document inside a single-quoted string",
+                quoted_embedding('\'', r#"{"a":"'","b":"-x-'","m":["x","y"]}"#),
+                quoted_embedding('\'', r#"{"b":"-x-'","a":"'","m":["y","x"]}"#),
+            ),
+            (
+                "a number was written differently",
+                page_embedding(r#"{"m":["a","b"],"n":1.0}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":1.00}"#, "Collect"),
+            ),
+            (
+                "a number beyond a float's precision changed",
+                page_embedding(r#"{"m":["a","b"],"n":12345678901234567890123}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":12345678901234567890124}"#, "Collect"),
+            ),
+            (
+                "a duplicate key was dropped",
+                page_embedding(r#"{"m":["a","b"],"n":1,"n":2}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":2}"#, "Collect"),
+            ),
+            (
+                "a null member was dropped",
+                page_embedding(r#"{"m":["a","b"],"n":null}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"]}"#, "Collect"),
+            ),
+            (
+                "more documents than a page is read for",
+                page_embedding(
+                    &vec![permuted_a; MAX_EMBEDDED_DOCUMENTS + 1].join(";"),
+                    "Collect",
+                ),
+                page_embedding(
+                    &vec![permuted_b; MAX_EMBEDDED_DOCUMENTS + 1].join(";"),
+                    "Collect",
+                ),
+            ),
+            (
+                "a body over the scan limit compares as text",
+                page_embedding(permuted_a, &"x".repeat(MAX_EMBEDDED_SCAN_BYTES)),
+                page_embedding(permuted_b, &"x".repeat(MAX_EMBEDDED_SCAN_BYTES)),
+            ),
+            (
+                "a JSON body is never re-scanned",
+                serde_json::json!({ "html": page_embedding(permuted_a, "Collect") }),
+                serde_json::json!({ "html": page_embedding(permuted_b, "Collect") }),
+            ),
+        ] {
+            let card = embedded_card(recorded, replayed);
+            assert!(
+                kind_count(&card, "http_incoming", "BodyMismatch") >= 1,
+                "{name}: still blocks"
+            );
+            assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
+            assert_eq!(
+                kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+                0,
+                "{name}: not read through an embedded document"
+            );
+        }
     }
 
     #[test]
