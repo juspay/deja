@@ -5256,6 +5256,22 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         }
     }
 
+    // Calls the replay stopped at. A stop means the task it ran in fail-stopped,
+    // so whatever came after it in that task never ran; when that task was a
+    // forked background one, the response had already gone and still matches.
+    // What the stop meant is not judged here — only that "matched" cannot stand
+    // beside it, so it makes its correlation, and the run, at least unjudgeable.
+    let mut corr_stopped: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut stopped_calls = 0u64;
+    for call in &art.observed {
+        if call.outcome == deja::SubstituteOutcome::Stopped {
+            stopped_calls += 1;
+            if let Some(correlation_id) = call.correlation_id.as_deref() {
+                *corr_stopped.entry(correlation_id).or_insert(0) += 1;
+            }
+        }
+    }
+
     // --- per-correlation outcomes --------------------------------------------
     let mut per_correlation = Vec::new();
     let mut matched_correlations = 0u64;
@@ -5286,7 +5302,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         let inconclusive = !has_blocking
             && (tail_gap_correlations.contains(corr)
                 || corr_absorbed.get(corr).is_some_and(|&n| n > 0)
-                || corr_seed_gaps.get(corr).is_some_and(|&n| n > 0));
+                || corr_seed_gaps.get(corr).is_some_and(|&n| n > 0)
+                || corr_stopped.get(corr.as_str()).is_some_and(|&n| n > 0));
         let passed = *status_match
             && *body_match
             && side_effect_divergences == 0
@@ -5395,6 +5412,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              declared value the recording did not hold"
         ));
     }
+    if stopped_calls > 0 {
+        reasons.push(format!(
+            "{stopped_calls} call(s) stopped by a replay fail-stop: the task each ran in \
+             ended there, so its correlation has not been shown to match, whatever its \
+             response looked like"
+        ));
+    }
     // Seed gaps are reported and do not fail the verdict — a missing baseline
     // is not a divergence — but they force it inconclusive (below).
     if inconclusive_seed_gaps > 0 {
@@ -5441,6 +5465,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let blocking_reasons = reasons.len()
         - usize::from(novel_calls > 0)
         - usize::from(absorbed_misses > 0)
+        - usize::from(stopped_calls > 0)
         - usize::from(identity_skews > 0)
         - usize::from(inconclusive_seed_gaps > 0)
         - usize::from(inconclusive_tail_gaps > 0)
@@ -5470,7 +5495,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         || ((inconclusive_races > 0
             || inconclusive_tail_gaps > 0
             || absorbed_misses > 0
-            || inconclusive_seed_gaps > 0)
+            || inconclusive_seed_gaps > 0
+            || stopped_calls > 0)
             && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
@@ -15381,6 +15407,32 @@ mod tests {
         assert!(!c1.passed && !c1.inconclusive, "blocking wins");
         assert!(
             !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+    }
+
+    /// A stop outside any correlation still keeps the run from passing: the
+    /// replay fail-stopped a task, so the run did not happen as recorded,
+    /// whichever request it belonged to.
+    #[test]
+    fn an_uncorrelated_stop_keeps_the_run_from_passing() {
+        let card = detect(&art(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![
+                obs("db", Some("c1"), true, Some(1), Some(1)),
+                stopped_obs(None),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert!(c1.passed, "c1 itself stopped nothing");
+        assert!(
+            !card.verdict.pass && card.verdict.inconclusive,
             "{}",
             card.verdict.reason
         );
