@@ -9273,6 +9273,11 @@ mod tests {
                 page_embedding(r#"{"c":"<img>","a":"</script>"}"#, "Collect"),
             ),
             (
+                "keys moved inside an array member: the JSON-body rule's narrowing",
+                page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
+                page_embedding(r#"{"m":[{"a":0,"b":1},{"a":5}]}"#, "Collect"),
+            ),
+            (
                 "a number was written differently",
                 page_embedding(r#"{"m":["a","b"],"n":1.0}"#, "Collect"),
                 page_embedding(r#"{"m":["b","a"],"n":1.00}"#, "Collect"),
