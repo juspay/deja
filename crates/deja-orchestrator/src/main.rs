@@ -1650,9 +1650,10 @@ impl LocalArtifacts {
 /// Only files `cached_file_run` recognises for this deployment are counted or
 /// deleted. Each is a copy of an `s3://` object that the run's artifact row
 /// still points at, or a cache derived from one, so eviction costs a
-/// re-download or a rebuild on the next view and loses nothing. Without it the cache only ever grows: `hydrate_run_artifacts` skips
-/// a path that already exists and has no counterpart that removes one, so the
-/// volume fills in proportion to runs LOOKED AT rather than runs executed.
+/// re-download or a rebuild on the next view and loses nothing. Without it the
+/// cache only ever grows: `hydrate_run_artifacts` skips a path that already
+/// exists and has no counterpart that removes one, so the volume fills in
+/// proportion to runs LOOKED AT rather than runs executed.
 ///
 /// `keep` is the run being served right now — evicting its files between the
 /// write and the read would turn a view into an empty one.
@@ -1798,10 +1799,10 @@ struct Hydrated {
 /// lying around would look like a judgement the run never made.
 async fn v1_scorecard(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
-    let content = match std::fs::read_to_string(st.root.scorecard_path(&id)) {
+    let content = match std::fs::read_to_string(artifact_kinds::SCORECARD.path(&st.root, &id)) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return absent_artifact(&st, &id, "scorecard").await;
+            return absent_artifact(&st, &id, artifact_kinds::SCORECARD.name).await;
         }
         Err(e) => return error_resp(500, &format!("scorecard: {e}")),
     };
@@ -2028,13 +2029,12 @@ fn read_jsonl_artifact(
 async fn serve_jsonl_artifact(
     st: &AppState,
     id: &str,
-    kind: &str,
-    path: std::path::PathBuf,
+    kind: &artifact_kinds::RunArtifactKind,
 ) -> Response {
     hydrate_run_artifacts(st, id).await;
-    match read_jsonl_artifact(&path, kind) {
+    match read_jsonl_artifact(&kind.path(&st.root, id), kind.name) {
         Ok(Some(rows)) => json_ok(serde_json::Value::Array(rows)),
-        Ok(None) => absent_artifact(st, id, kind).await,
+        Ok(None) => absent_artifact(st, id, kind.name).await,
         Err(e) => error_resp(500, &e),
     }
 }
@@ -2043,15 +2043,13 @@ async fn serve_jsonl_artifact(
 /// observed, classified + located) that backs the interactive diff view, as the
 /// run published it. A published empty ledger is a run that made no calls.
 async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
-    let path = st.root.call_ledger_path(&id);
-    serve_jsonl_artifact(&st, &id, "call_ledger", path).await
+    serve_jsonl_artifact(&st, &id, &artifact_kinds::CALL_LEDGER).await
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
 /// (status + field-level body diff), from the run's published http-diff stream.
 async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
-    let path = st.root.http_diff_path(&id);
-    serve_jsonl_artifact(&st, &id, "http_diffs", path).await
+    serve_jsonl_artifact(&st, &id, &artifact_kinds::HTTP_DIFFS).await
 }
 
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution

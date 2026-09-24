@@ -5905,8 +5905,9 @@ mod tests {
         // Both StoreCtx registration forms — the local path form and the
         // sink-published uri form — pass the kind as the 2nd arg. A call whose
         // kind is a VARIABLE (the artifact-kind table's publish steps) is
-        // skipped here; those kinds are added from the table below. (Markers are built with
-        // concat! so this scanner never matches its own source text.)
+        // skipped here; those kinds are added from the table below. (Markers
+        // are built with concat! so this scanner never matches its own source
+        // text.)
         for marker in [
             concat!("ctx", ".artifact("),
             concat!("ctx", ".artifact_uri("),

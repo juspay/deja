@@ -90,7 +90,8 @@ pub const CALL_LEDGER: RunArtifactKind = RunArtifactKind {
 };
 /// The run's own account of what seeding did, per entry, with readback. It was
 /// once registered under the pod's local path and never uploaded, so on k8s it
-/// was unreadable the moment the pod died. The scorer reads the local copy
+/// was unreadable the moment the pod died. It publishes beside the full lookup
+/// table, so it adds no new kind of egress. The scorer reads the local copy
 /// while scoring; nothing in the API reads the published one back. It is kept
 /// for the reader and for audit.
 pub const SEED_CERTIFICATE: RunArtifactKind = RunArtifactKind {
