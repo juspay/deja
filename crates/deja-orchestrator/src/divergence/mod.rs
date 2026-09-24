@@ -710,9 +710,68 @@ impl Scorecard {
 // Detection
 // ---------------------------------------------------------------------------
 
+/// Keys the seeder planned and could not plant because the recording asserted
+/// a row it did not carry (`recorded_presence` in the seed certificate), per
+/// correlation. A divergence at one of them describes the missing seed, not
+/// the candidate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnplantedPresence(BTreeSet<(String, String)>);
+
+impl UnplantedPresence {
+    /// From a seed certificate's JSON. Only a skipped db entry whose cause is
+    /// `recorded_presence` counts; every other skip, and every planted entry,
+    /// is left to judge its divergence as before.
+    pub fn from_certificate(cert: &serde_json::Value) -> Self {
+        Self(
+            cert["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| {
+                    e["boundary"] == "db"
+                        && e["materialization"] == "skipped"
+                        && e["skip_reason"]["cause"] == "recorded_presence"
+                })
+                .filter_map(|e| {
+                    Some((
+                        e["correlation_id"].as_str()?.to_owned(),
+                        canonical_key(e["logical_key"].as_str()?),
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn names(&self, correlation: &str, key: &str) -> bool {
+        self.0
+            .contains(&(correlation.to_owned(), canonical_key(key)))
+    }
+
+    /// Whether `event`, recorded in `correlation`, read a key the seeder could
+    /// not plant.
+    pub fn read_by(&self, correlation: Option<&str>, event: Option<&deja::BoundaryEvent>) -> bool {
+        let (Some(correlation), Some(event)) = (correlation, event) else {
+            return false;
+        };
+        !self.0.is_empty()
+            && event.read_set.iter().any(|key| {
+                self.0
+                    .contains(&(correlation.to_owned(), canonical_key(key)))
+            })
+    }
+}
+
+fn canonical_key(key: &str) -> String {
+    deja::StateKey::parse(key)
+        .map(|state_key| state_key.to_wire())
+        .unwrap_or_else(|_| key.to_owned())
+}
+
 /// The artifact streams a run produces, loaded into memory.
 pub struct RunArtifacts {
     pub run_id: String,
+    pub unplanted_presence: UnplantedPresence,
     pub recording_id: Option<String>,
     pub table: LookupTable,
     pub observed: Vec<ObservedCall>,
@@ -4759,6 +4818,26 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                         continue;
                     }
                 }
+                // The seeder recorded that it could not plant a key this call's
+                // recorded event read: the result differs because the row is
+                // missing, so the divergence is the missing seed's. Only here —
+                // a paired call's divergence is a changed request, which no
+                // missing seed explains.
+                if art.unplanted_presence.read_by(
+                    obs.correlation_id.as_deref(),
+                    obs.source_event_global_sequence
+                        .and_then(|seq| events_by_seq.get(&seq).copied()),
+                ) {
+                    stats.bump_kind("InconclusiveSeedGap");
+                    inconclusive_seed_gaps += 1;
+                    if let Some(corr) = &obs.correlation_id {
+                        *corr_seed_gaps.entry(corr.clone()).or_insert(0) += 1;
+                    }
+                    if let Some(seq) = obs.source_event_global_sequence {
+                        consumed.insert(seq);
+                    }
+                    continue;
+                }
                 // The args-aligned execute divergence is the ORIGIN of a
                 // total-derivative cascade: the candidate ran the REAL boundary
                 // (typically a READ) and got a value differing from the recorded
@@ -5840,8 +5919,10 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     // that fact reaches the same page as the verdict it re-frames. Parsed
     // loosely (the certificate is the lifecycle's type, this is a reader) —
     // absence of the file, an old shape, or zero failures all mean no warning.
+    let mut unplanted_presence = UnplantedPresence::default();
     if let Ok(text) = std::fs::read_to_string(root.seed_certificate_path(run_id)) {
         if let Ok(cert) = serde_json::from_str::<serde_json::Value>(&text) {
+            unplanted_presence = UnplantedPresence::from_certificate(&cert);
             let failed = cert["summary"]["failed"].as_u64().unwrap_or(0);
             if failed > 0 {
                 let mut tables: Vec<String> = cert["entries"]
@@ -5982,6 +6063,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 
     Ok(RunArtifacts {
         run_id: run_id.to_owned(),
+        unplanted_presence,
         recording_id,
         table,
         observed,
@@ -6094,6 +6176,7 @@ pub(crate) fn build_ledger_into(
         &idempotent_delete,
         &inconclusive_race,
         &tail_gap,
+        &art.unplanted_presence,
         graph_plan,
         sink,
     )
@@ -7334,6 +7417,7 @@ mod tests {
         http: Vec<HttpDiff>,
     ) -> RunArtifacts {
         RunArtifacts {
+            unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
             run_id: "run-1".to_owned(),
@@ -8943,6 +9027,7 @@ mod tests {
         assert!(!card.verdict.pass, "real status drift must still block");
 
         let rows = build_ledger(&RunArtifacts {
+            unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
@@ -11000,6 +11085,7 @@ mod tests {
             }],
         )];
         let art = RunArtifacts {
+            unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
             run_id: run_id.to_owned(),
@@ -12547,6 +12633,240 @@ mod tests {
             vec![http(corr, true, vec![])],
             vec![insert_event, update_event],
         ))
+    }
+
+    // -- route C: a divergence at a key the seeder could not plant -----------
+
+    fn unplanted_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!(["pro_1"]),
+        )
+    }
+
+    fn certificate(entries: serde_json::Value) -> UnplantedPresence {
+        UnplantedPresence::from_certificate(&serde_json::json!({ "entries": entries }))
+    }
+
+    fn cert_entry(corr: &str, materialization: &str, cause: Option<&str>) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "correlation_id": corr,
+            "boundary": "db",
+            "logical_key": unplanted_key(),
+            "materialization": materialization,
+        });
+        if let Some(cause) = cause {
+            entry["skip_reason"] = serde_json::json!({ "cause": cause });
+        }
+        entry
+    }
+
+    /// A recorded `Ok(true)` DELETE whose replay found nothing to delete: the
+    /// shape the seeder cannot plant a row for.
+    fn unplanted_delete(evidence: UnplantedPresence) -> (Scorecard, Vec<CallRecord>) {
+        let corr = "c1";
+        let seq = 5;
+        let recorded = serde_json::json!({"result": "Ok", "value": true, "type_name": "bool"});
+        let observed = serde_json::json!({"result": "Err", "kind": "NotFound", "message": "none"});
+        let mut event = db_read_ev(
+            corr,
+            "business_profile",
+            seq,
+            serde_json::json!({}),
+            100,
+            110,
+            "root",
+            0,
+        );
+        event.method_name = "generic_delete".to_owned();
+        event.read_set = vec![unplanted_key()];
+        let mut a = art_with_events(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "generic_delete",
+                seq,
+                recorded.clone(),
+            )],
+            vec![exec_obs_method(
+                "db",
+                Some(corr),
+                "generic_delete",
+                true,
+                Some(seq),
+                Some(recorded),
+                observed,
+            )],
+            vec![http(corr, true, vec![])],
+            vec![event],
+        );
+        a.unplanted_presence = evidence;
+        let card = detect(&a);
+        let rows = build_ledger(&a).unwrap();
+        (card, rows)
+    }
+
+    fn assert_blocking_divergence(card: &Scorecard, rows: &[CallRecord]) {
+        assert_eq!(card.summary.value_divergences, 1, "{}", card.verdict.reason);
+        assert_eq!(card.summary.inconclusive_seed_gaps, 0);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == "value_diverged" && r.blocking),
+            "{rows:?}"
+        );
+    }
+
+    /// The seeder recorded that it could not plant this key: the divergence is
+    /// the missing seed's, so it is a seed gap, and the verdict cannot tell.
+    #[test]
+    fn unplanted_presence_makes_its_divergence_a_seed_gap() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c1",
+            "skipped",
+            Some("recorded_presence")
+        )])));
+        assert_eq!(card.summary.value_divergences, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.inconclusive_seed_gaps, 1);
+        assert!(
+            card.verdict.inconclusive && !card.verdict.pass,
+            "{}",
+            card.verdict.reason
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.kind == "inconclusive_seed_gap")
+            .expect("a seed-gap row");
+        assert!(!row.blocking);
+        assert!(!rows.iter().any(|r| r.kind == "value_diverged"), "{rows:?}");
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1");
+        assert!(
+            c1.inconclusive && !c1.passed,
+            "the correlation cannot tell either"
+        );
+        assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// No certificate, or an old one: nothing to go on, so nothing demotes.
+    #[test]
+    fn unplanted_nothing_without_a_certificate_entry() {
+        let (card, rows) = unplanted_delete(UnplantedPresence::default());
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A skip for any other cause is not this fact.
+    #[test]
+    fn unplanted_only_for_recorded_presence() {
+        for cause in ["recorded_absence", "recorded_count", "recorded_scalar"] {
+            let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+                "c1",
+                "skipped",
+                Some(cause)
+            )])));
+            assert_blocking_divergence(&card, &rows);
+        }
+    }
+
+    /// A key the seeder did plant stays the candidate's to answer for.
+    #[test]
+    fn unplanted_never_for_a_planted_key() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c1",
+            "materialized",
+            None
+        )])));
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A planted key stays the candidate's even if an inconsistent certificate
+    /// also names a presence cause against it.
+    #[test]
+    fn unplanted_never_for_a_planted_key_whatever_the_cause_says() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c1",
+            "materialized",
+            Some("recorded_presence")
+        )])));
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A paired divergence is a changed REQUEST: the candidate sent another
+    /// statement to its recorded twin. A seed the harness could not plant does
+    /// not explain that, so it stays the candidate's even at an unplanted key.
+    #[test]
+    fn unplanted_never_excuses_a_changed_request() {
+        let corr = "c1";
+        let seq = 8;
+        let recorded = serde_json::json!({"result": "Ok", "value": true, "type_name": "bool"});
+        let observed = serde_json::json!({"result": "Err", "kind": "NotFound", "message": "none"});
+        let sql = "DELETE FROM business_profile WHERE profile_id = $1";
+        let mut event = db_read_ev(
+            corr,
+            "business_profile",
+            seq,
+            serde_json::json!({}),
+            100,
+            110,
+            "root",
+            0,
+        );
+        event.method_name = "generic_delete".to_owned();
+        event.read_set = vec![unplanted_key()];
+        event.result = recorded.clone().into();
+        event.args =
+            serde_json::json!({"table": "business_profile", "sql": sql, "inputs": ["pro_1"]})
+                .into();
+        let mut replayed = exec_obs_method(
+            "db",
+            Some(corr),
+            "generic_delete",
+            false,
+            None,
+            None,
+            observed,
+        );
+        replayed.seed_gap = false;
+        replayed.args =
+            serde_json::json!({"table": "business_profile", "sql": sql, "inputs": ["pro_2"]});
+        let replayed = with_span(replayed, "root>delete_profile");
+        let mut a = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "generic_delete", seq, recorded),
+                span_entry(Some(corr), seq, "root>delete_profile"),
+            ],
+            vec![replayed],
+            vec![http(corr, true, vec![])],
+            vec![event],
+        );
+        a.unplanted_presence = certificate(serde_json::json!([cert_entry(
+            "c1",
+            "skipped",
+            Some("recorded_presence")
+        )]));
+        let card = detect(&a);
+        let rows = build_ledger(&a).unwrap();
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// The same key in ANOTHER correlation is another request's precondition.
+    #[test]
+    fn unplanted_is_per_correlation() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c2",
+            "skipped",
+            Some("recorded_presence")
+        )])));
+        assert_blocking_divergence(&card, &rows);
     }
 
     #[test]

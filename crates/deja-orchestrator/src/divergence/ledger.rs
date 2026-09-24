@@ -330,6 +330,7 @@ pub(crate) fn build_with_inconclusive(
         idempotent_delete_demote,
         inconclusive_race,
         tail_gap,
+        &super::UnplantedPresence::default(),
         None,
         &mut |row| {
             rows.push(row);
@@ -355,6 +356,7 @@ pub(crate) fn build_with_inconclusive_into(
     idempotent_delete_demote: &HashSet<u64>,
     inconclusive_race: &InconclusiveRaceEvidence,
     tail_gap: &TailGapEvidence,
+    unplanted: &super::UnplantedPresence,
     plan: Option<&GraphScoringPlan>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -420,6 +422,8 @@ pub(crate) fn build_with_inconclusive_into(
                 (kind, false)
             } else if seq.is_some_and(|s| inconclusive_race.contains(&s)) {
                 ("inconclusive_race".to_owned(), false)
+            } else if unplanted.read_by(obs.correlation_id.as_deref(), source_event) {
+                ("inconclusive_seed_gap".to_owned(), false)
             } else {
                 ("value_diverged".to_owned(), true)
             };
@@ -697,6 +701,7 @@ pub(crate) fn build_with_plan_into(
     idempotent_delete_demote: &HashSet<u64>,
     inconclusive_race: &InconclusiveRaceEvidence,
     tail_gap: &TailGapEvidence,
+    unplanted: &super::UnplantedPresence,
     plan: &GraphScoringPlan,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -711,6 +716,7 @@ pub(crate) fn build_with_plan_into(
         idempotent_delete_demote,
         inconclusive_race,
         tail_gap,
+        unplanted,
         Some(plan),
         sink,
     )
