@@ -13353,46 +13353,89 @@ mod tests {
         );
         assert!(outcome.alignment.is_none());
     }
+
+    /// One graph-scored correlation whose novel subtree holds a single call
+    /// that missed and was absorbed, on `boundary`, as method `novel`. With
+    /// `after_teardown`, the correlation's recording ends at its API-lock
+    /// release, which the candidate reproduces before the absorbed call, and
+    /// the tape runs on for another correlation: the tail-gap shape.
+    fn absorbed_in_novel_subtree(corr: &str, boundary: &str, after_teardown: bool) -> RunArtifacts {
+        let result = serde_json::json!({"result": "Ok"});
+        let lock = serde_json::json!({"key": "API_LOCK_merchant_1_payments_pay_x"});
+        let mut novel = obs(boundary, Some(corr), false, None, None);
+        novel.method_name = "novel".to_owned();
+        novel.graph_node_id = Some(15);
+        novel.absorbed = true;
+        let mut entries = vec![seq_entry_method_res(
+            Some(corr),
+            "db",
+            "root",
+            401,
+            result.clone(),
+        )];
+        let mut observed = vec![graph_observed(
+            corr,
+            14,
+            401,
+            "root",
+            serde_json::json!({}),
+            result.clone(),
+        )];
+        let mut events = vec![graph_event(
+            corr,
+            401,
+            4,
+            "root",
+            serde_json::json!({}),
+            result.clone(),
+        )];
+        let mut http_diffs = vec![http(corr, true, vec![])];
+        if after_teardown {
+            entries.push(seq_entry_method_res(
+                Some(corr),
+                "redis",
+                "delete_key",
+                402,
+                result.clone(),
+            ));
+            entries.push(seq_entry_method_res(
+                Some("later"),
+                "db",
+                "m",
+                403,
+                result.clone(),
+            ));
+            let mut teardown =
+                graph_observed(corr, 14, 402, "delete_key", lock.clone(), result.clone());
+            teardown.boundary = "redis".to_owned();
+            observed.push(teardown);
+            let mut teardown_event = graph_event(corr, 402, 4, "delete_key", lock, result.clone());
+            teardown_event.boundary = "redis".to_owned();
+            events.push(teardown_event);
+            events.push(tail_ev(403, "later", "db", "m", serde_json::json!({})));
+            http_diffs.push(http("later", true, vec![]));
+        }
+        observed.push(novel);
+        if after_teardown {
+            observed.push(obs("db", Some("later"), true, Some(1), Some(403)));
+        }
+        with_graphs(
+            art_with_events(entries, observed, http_diffs, events),
+            vec![graph_span(4, corr, None, 0, "request")],
+            vec![
+                graph_span(14, corr, None, 0, "request"),
+                graph_span(15, corr, Some(14), 1, "new-subtree"),
+            ],
+        )
+    }
+
     /// A miss the request survived is an absorbed miss wherever it lands. Inside
     /// a subtree the recording never had, it is still a call that returned a
     /// value the recording never held, so the correlation cannot read passed.
     #[test]
     fn an_absorbed_miss_inside_a_novel_subtree_is_still_absorbed() {
         let corr = "novel-absorbed";
-        let result = serde_json::json!({"result": "Ok"});
-        let mut novel = obs("db", Some(corr), false, None, None);
-        novel.method_name = "novel".to_owned();
-        novel.graph_node_id = Some(15);
-        novel.absorbed = true;
-        let artifacts = with_graphs(
-            art_with_events(
-                vec![seq_entry_method_res(
-                    Some(corr),
-                    "db",
-                    "root",
-                    401,
-                    result.clone(),
-                )],
-                vec![
-                    graph_observed(corr, 14, 401, "root", serde_json::json!({}), result.clone()),
-                    novel,
-                ],
-                vec![http(corr, true, vec![])],
-                vec![graph_event(
-                    corr,
-                    401,
-                    4,
-                    "root",
-                    serde_json::json!({}),
-                    result,
-                )],
-            ),
-            vec![graph_span(4, corr, None, 0, "request")],
-            vec![
-                graph_span(14, corr, None, 0, "request"),
-                graph_span(15, corr, Some(14), 1, "new-subtree"),
-            ],
-        );
+        let artifacts = absorbed_in_novel_subtree(corr, "db", false);
         let card = detect(&artifacts);
         let outcome = card
             .per_correlation
@@ -13433,6 +13476,56 @@ mod tests {
             ("novel_absorbed", false),
             "the row the viewer routes on agrees with the scorecard"
         );
+    }
+
+    /// The ledger asks the scorecard's questions in the scorecard's order. An
+    /// egress or excused call is classified before absorption is asked about,
+    /// so its ledger row must not claim an absorbed miss the scorecard never
+    /// counted.
+    #[test]
+    fn the_ledger_classifies_an_absorbed_egress_or_excused_miss_as_the_scorecard_does() {
+        // An egress call, and a clock call whose outcome reads Substituted, as
+        // an observation from a runtime that predates the outcome field does.
+        for (boundary, kind) in [
+            ("http_outgoing", "EnvironmentalMiss"),
+            ("time", "DeterministicMiss"),
+        ] {
+            let artifacts = absorbed_in_novel_subtree("novel-early", boundary, false);
+            let card = detect(&artifacts);
+            assert_eq!(kind_count(&card, boundary, kind), 1, "{boundary}");
+            assert_eq!(card.summary.absorbed_misses, 0, "{boundary}");
+            let rows = build_ledger(&artifacts).expect("ledger builds");
+            let row = rows
+                .iter()
+                .find(|row| row.method_name == "novel")
+                .expect("the call has a ledger row");
+            assert_eq!(row.kind, "novel_subtree", "{boundary}: {row:?}");
+            assert!(!row.blocking, "{boundary}: {row:?}");
+        }
+    }
+
+    /// Past the point where the recording stopped, there is no baseline, so the
+    /// tail gap is decided before absorption in both the scorecard and the
+    /// ledger: a call nothing could have recorded is inconclusive on its own
+    /// account, not an absorbed miss.
+    #[test]
+    fn a_tail_gap_is_decided_before_absorption_in_a_novel_subtree() {
+        let artifacts = absorbed_in_novel_subtree("novel-tail", "db", true);
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "InconclusiveTailGap"),
+            1,
+            "{:?}",
+            card.verdict
+        );
+        assert_eq!(card.summary.absorbed_misses, 0);
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let row = rows
+            .iter()
+            .find(|row| row.method_name == "novel")
+            .expect("the call has a ledger row");
+        assert_eq!(row.kind, "inconclusive_tail_gap", "{row:?}");
+        assert!(!row.blocking, "{row:?}");
     }
 
     #[test]
