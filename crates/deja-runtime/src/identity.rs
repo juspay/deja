@@ -248,6 +248,20 @@ mod tests {
         );
     }
 
+    /// A reordering inside an array member is reported where it happened,
+    /// not at the array holding it.
+    #[test]
+    fn a_nested_reordering_is_named_at_its_own_path() {
+        let (r, o) = (
+            json!({"g": [["a", "b"], "c"]}),
+            json!({"g": [["b", "a"], "c"]}),
+        );
+        assert_eq!(
+            identity_differences(&r, &o),
+            Some(vec![IdentityChange::ArrayOrder("$.g[0]".to_owned())])
+        );
+    }
+
     /// Key order is not identity and is never reported.
     #[test]
     fn object_key_order_is_neither_identity_nor_reported() {

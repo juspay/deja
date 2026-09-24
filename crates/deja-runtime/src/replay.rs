@@ -9236,6 +9236,34 @@ mod shared_results {
         );
     }
 
+    /// The shared form carries the second lookup too, from the same pool.
+    #[test]
+    fn a_shared_results_table_carries_the_identity_entries() {
+        let mut table = legacy_table();
+        table.identity_entries = vec![entry(9, Arc::new(serde_json::json!("other")))];
+        let bytes = serde_json::to_vec(&table).unwrap();
+        let shared = SharedResultsTable::from_table(&table, &bytes).unwrap();
+        assert_eq!(
+            shared.results.len(),
+            2,
+            "the identity entry shares the pool"
+        );
+        let loaded = shared.into_table().unwrap();
+        assert_eq!(loaded.identity_entries.len(), 1);
+        assert_eq!(
+            loaded.identity_entries[0].key,
+            table.identity_entries[0].key
+        );
+        assert_eq!(
+            *loaded.identity_entries[0].result,
+            serde_json::json!("other")
+        );
+        assert!(Arc::ptr_eq(
+            &loaded.identity_entries[0].result,
+            &loaded.entries[3].result
+        ));
+    }
+
     /// The shared form holds each distinct result once, and loading it gives
     /// every entry that recorded it the same allocation.
     #[test]
