@@ -2587,9 +2587,13 @@ pub enum NotPreconditionReason {
     /// A prior event in this correlation WROTE the key; the read observes the
     /// post-write value, not a precondition.
     ReadAfterWrite,
-    /// This correlation CREATED rows in the table; seeding a later read-back
-    /// would collide with the replayed create.
+    /// This correlation CREATED rows in the table and the create or the read
+    /// names no rows, so the read cannot be told from a read-back of a created
+    /// row and is declined.
     SelfCreatedTable,
+    /// The read returned a row this correlation CREATED, which its replayed
+    /// create rebuilds; seeding this key would collide with it.
+    SelfCreatedRow,
     /// A delete that found NO key. The reply proves absence, so there is
     /// nothing to seed — and seeding the reply as a value would create the key.
     DeleteProvedAbsence,
@@ -2865,6 +2869,20 @@ fn db_table_for_state_key(key: &str) -> Option<String> {
         .and_then(|state_key| state_key.db_table().map(str::to_owned))
 }
 
+/// The row keys among `keys` that name a row of `table`, canonical.
+fn db_row_keys_of_table<'a>(
+    keys: &'a [String],
+    table: &'a str,
+) -> impl Iterator<Item = String> + 'a {
+    keys.iter()
+        .filter_map(move |key| match StateKey::parse(key) {
+            Ok(StateKey::DbRow {
+                table: row_table, ..
+            }) if row_table == table => Some(canonical_state_key_wire(key)),
+            _ => None,
+        })
+}
+
 fn db_read_table(event: &BoundaryEvent, key: &str) -> Option<String> {
     db_table_for_state_key(key).or_else(|| db_event_table(event))
 }
@@ -3099,17 +3117,26 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     // A key is "pristine" until the correlation first WRITES it; only reads
     // before the first write to a key describe the precondition.
     let mut written: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    // Tables this correlation has explicitly CREATED rows into, by
-    // `(boundary, table)`. Typed DB keys (`StateKey::DbRow` / `StateKey::DbQuery`)
-    // carry table identity directly; CREATE events also carry a structured DB
+    // What this correlation has explicitly CREATED, so its later reads of those
+    // rows are not seeded: it reconstructs them via its own replayed writes, and
+    // a seeded copy would collide with the replayed INSERT. Typed DB keys carry
+    // table identity directly; CREATE events also carry a structured DB
     // args/request envelope with `"table"`. We deliberately do NOT mine legacy
-    // opaque `"{table}:{sql}"` strings or method names for table identity anymore.
+    // opaque `"{table}:{sql}"` strings or method names for table identity.
     //
-    // Once a correlation CREATES rows in a table, we stop seeding its subsequent
-    // reads of that table: it reconstructs its own rows via its writes on replay.
-    // UPDATE/DELETE mutate PRE-EXISTING rows, which remain genuine preconditions
-    // to seed. Built in event order, so a read BEFORE any create still seeds.
+    // The precondition is per ROW: a read of a row an earlier correlation made
+    // is still a precondition even after this one inserted into the same table.
+    // So a create's declared row keys are recorded, and a read is declined when
+    // a row it returned is one of them. Where either side declares no row
+    // identity, a read-back cannot be told from a read of a pre-existing row,
+    // and the whole table is declined as before. UPDATE/DELETE mutate
+    // PRE-EXISTING rows, which remain genuine preconditions to seed. Built in
+    // event order, so a read BEFORE any create still seeds.
+    let mut created_rows: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let mut created_tables: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut unidentified_created_tables: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
     // The last image observed for each row so far, so an RMW event can seed the
     // state its row was in BEFORE it (see `preferred_seed_image`). Updated
@@ -3142,9 +3169,9 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         // issued a separate SELECT. If we marked the write before seeding, that
         // pre-image read would be declined as "already written", the pre-existing row
         // would never materialize into the correlation's schema, and the replayed
-        // UPDATE would hit an empty table. `created_tables` still skips reads of a
-        // table this correlation created (it reconstructs those via its own replayed
-        // create), so create-then-update of the same table is unaffected.
+        // UPDATE would hit an empty table. A read of a row this correlation created
+        // is still declined (it reconstructs those via its own replayed create), so
+        // create-then-update of the same row is unaffected.
         if event.is_error {
             // A not-found and a real failure are indistinguishable here: the
             // error carries the service's own error type, not a meaning deja
@@ -3176,16 +3203,34 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     );
                     continue;
                 }
-                // Don't seed a read of a table this correlation has already created
-                // rows in (it would collide with the replayed INSERT).
+                // Don't seed a read of rows this correlation already created (it
+                // would collide with the replayed INSERT).
                 if event.boundary == "db" {
                     if let Some(table) = db_read_table(event, key) {
-                        if created_tables.contains(&(event.boundary.clone(), table)) {
-                            plan.note_non_precondition(
-                                &event.boundary,
-                                &canonical_key,
-                                NotPreconditionReason::SelfCreatedTable,
-                            );
+                        let table_key = (event.boundary.clone(), table);
+                        let returned: Vec<(String, String)> =
+                            db_row_keys_of_table(&event.read_set, &table_key.1)
+                                .map(|row| (event.boundary.clone(), row))
+                                .collect();
+                        let declined = if !created_tables.contains(&table_key) {
+                            None
+                        } else if unidentified_created_tables.contains(&table_key)
+                            || returned.is_empty()
+                        {
+                            Some(NotPreconditionReason::SelfCreatedTable)
+                        } else if matches!(StateKey::parse(key), Ok(StateKey::DbRow { .. })) {
+                            // A row key seeds only its own row. A row this correlation
+                            // created never gets here: the create wrote that exact key,
+                            // so the read was declined above as a read after a write.
+                            None
+                        } else if returned.iter().any(|row| created_rows.contains(row)) {
+                            // A query fingerprint seeds every row the read returned.
+                            Some(NotPreconditionReason::SelfCreatedRow)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = declined {
+                            plan.note_non_precondition(&event.boundary, &canonical_key, reason);
                             continue;
                         }
                     }
@@ -3272,8 +3317,8 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         }
         // THEN mark this event's writes: subsequent reads of these keys observe the
         // post-write value (no longer a precondition), and a create additionally
-        // declines later read-backs of the whole table (they'd collide with the
-        // replayed create).
+        // declines later read-backs of the rows it created (they'd collide with the
+        // replayed create), or of the whole table when it names no rows.
         // A write that FAILED wrote nothing, so it must not mark its keys: a
         // later read of one is still a precondition. Marking costs a missing
         // row and a divergence charged to an innocent candidate; not marking
@@ -3289,9 +3334,16 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
         if let Some(key) = redis_args_key(event, key_prefix.as_deref()) {
             touched.insert((event.boundary.clone(), key));
         }
-        if event.boundary == "db" && is_db_create_event(event) {
+        // A create that failed created nothing, like the write marking above.
+        if event.boundary == "db" && is_db_create_event(event) && !event.is_error {
             if let Some(table) = db_created_table(event) {
-                created_tables.insert((event.boundary.clone(), table));
+                let rows: Vec<String> = db_row_keys_of_table(&event.write_set, &table).collect();
+                let table_key = (event.boundary.clone(), table);
+                if rows.is_empty() {
+                    unidentified_created_tables.insert(table_key.clone());
+                }
+                created_rows.extend(rows.into_iter().map(|row| (event.boundary.clone(), row)));
+                created_tables.insert(table_key);
             }
         }
         // This event's rows become the latest observed state for anything
@@ -7334,8 +7386,8 @@ mod tests {
     }
 
     /// But an UPDATE of a table this correlation explicitly declared as created
-    /// is NOT seeded — it reconstructs its own rows via the replayed CREATE, so
-    /// create-then-update of the same table stays unaffected by the reorder.
+    /// is NOT seeded when the create names no rows: a read-back cannot be told
+    /// from a pre-existing row, so the whole table is declined.
     #[test]
     fn seed_plan_skips_update_of_explicitly_declared_created_table() {
         let insert_key = test_db_query_key(
@@ -7378,6 +7430,201 @@ mod tests {
             !plan.contains("db", update_key.as_str()),
             "an UPDATE of an explicitly-created table must not seed (reconstructed via CREATE)"
         );
+    }
+
+    // -- a self-created table declines the rows it created, not the table ----
+
+    fn address_row_key(id: &str) -> String {
+        StateKey::DbRow {
+            table: "address".to_owned(),
+            key: vec![("address_id".to_owned(), id.to_owned())],
+        }
+        .to_wire()
+    }
+
+    /// An INSERT into `address` that declares the row it created, as
+    /// `recorded_output` does on the write axis.
+    fn address_insert(created: &[&str]) -> BoundaryEvent {
+        let query = test_db_query_key(
+            "generic_insert",
+            "address",
+            "INSERT INTO \"address\" VALUES (…)",
+        );
+        let rows: Vec<String> = created.iter().map(|id| address_row_key(id)).collect();
+        let mut write_set: Vec<&str> = vec![query.as_str()];
+        write_set.extend(rows.iter().map(String::as_str));
+        let result: Vec<serde_json::Value> = created
+            .iter()
+            .map(|id| serde_json::json!({"address_id": id}))
+            .collect();
+        let mut create = state_event(
+            0,
+            Some("c1"),
+            "db",
+            "generic_insert",
+            serde_json::json!({"table": "address"}),
+            serde_json::Value::Array(result),
+            &[],
+            &write_set,
+            false,
+        );
+        create.declaration =
+            Some(crate::BoundaryDeclaration::default().operation(crate::OperationKind::Create));
+        create
+    }
+
+    /// A read of `address` returning `returned`, declaring each returned row's
+    /// key and its query fingerprint, as `recorded_output` does on the read axis.
+    fn address_read(returned: &[&str]) -> (BoundaryEvent, String, Vec<String>) {
+        let query = test_db_query_key(
+            "generic_find_one_core",
+            "address",
+            "SELECT * FROM \"address\" WHERE address_id = $1",
+        );
+        let rows: Vec<String> = returned.iter().map(|id| address_row_key(id)).collect();
+        let mut read_set: Vec<&str> = rows.iter().map(String::as_str).collect();
+        read_set.push(query.as_str());
+        let result: Vec<serde_json::Value> = returned
+            .iter()
+            .map(|id| serde_json::json!({"address_id": id}))
+            .collect();
+        let read = state_event(
+            1,
+            Some("c1"),
+            "db",
+            "generic_find_one_core",
+            serde_json::json!({"table": "address"}),
+            serde_json::Value::Array(result),
+            &read_set,
+            &[],
+            false,
+        );
+        (read, query, rows)
+    }
+
+    /// THE bug: the correlation inserts its shipping address and then reads a
+    /// billing address an earlier correlation created. That row is a
+    /// precondition; declining it because the table was written left the
+    /// replayed read with nothing to find.
+    #[test]
+    fn a_read_of_another_row_of_a_self_created_table_is_seeded() {
+        let (read, query, rows) = address_read(&["add_billing"]);
+        let plan = build_seed_plan(&[address_insert(&["add_shipping"]), read], Some("c1"));
+        assert!(
+            plan.contains("db", &rows[0]),
+            "the pre-existing row is seeded"
+        );
+        assert!(
+            plan.contains("db", &query),
+            "and so is its query fingerprint"
+        );
+        assert!(
+            plan.non_precondition_reads()
+                .all(|(_, _, reason)| !matches!(
+                    reason,
+                    NotPreconditionReason::SelfCreatedTable | NotPreconditionReason::SelfCreatedRow
+                )),
+            "nothing is declined as self-created"
+        );
+    }
+
+    /// The property the rule exists for: a read-back of a row this correlation
+    /// created is still declined, or the seeded row collides with the replayed
+    /// INSERT. Its row key is the one the INSERT wrote, so it is declined as a
+    /// read after a write; its query fingerprint is declined as self-created.
+    #[test]
+    fn a_read_back_of_a_created_row_is_still_declined() {
+        let (read, query, rows) = address_read(&["add_shipping"]);
+        let plan = build_seed_plan(&[address_insert(&["add_shipping"]), read], Some("c1"));
+        assert!(!plan.contains("db", &rows[0]));
+        assert!(!plan.contains("db", &query));
+        let declined: Vec<_> = plan.non_precondition_reads().collect();
+        assert!(
+            declined.contains(&(
+                "db",
+                rows[0].as_str(),
+                NotPreconditionReason::ReadAfterWrite
+            )),
+            "{declined:?}"
+        );
+        assert!(
+            declined.contains(&("db", query.as_str(), NotPreconditionReason::SelfCreatedRow)),
+            "{declined:?}"
+        );
+    }
+
+    /// A read returning a created row among others: its query fingerprint
+    /// would seed the created row too, so it is declined; the other row's own
+    /// key seeds only that row, which the correlation did not create.
+    #[test]
+    fn a_read_returning_a_created_row_declines_its_fingerprint_not_the_other_row() {
+        let (read, query, rows) = address_read(&["add_shipping", "add_billing"]);
+        let plan = build_seed_plan(&[address_insert(&["add_shipping"]), read], Some("c1"));
+        assert!(!plan.contains("db", &query));
+        assert!(
+            !plan.contains("db", &rows[0]),
+            "the created row is not seeded"
+        );
+        assert!(
+            plan.contains("db", &rows[1]),
+            "the row it did not create is"
+        );
+        let declined: Vec<_> = plan.non_precondition_reads().collect();
+        assert!(
+            declined.contains(&("db", query.as_str(), NotPreconditionReason::SelfCreatedRow)),
+            "{declined:?}"
+        );
+    }
+
+    /// A create that declared no row identity: nothing tells a read-back from
+    /// a read of a pre-existing row, so the table is declined as before.
+    #[test]
+    fn a_create_without_row_identity_still_declines_the_table() {
+        let (read, _, rows) = address_read(&["add_billing"]);
+        let plan = build_seed_plan(&[address_insert(&[]), read], Some("c1"));
+        assert!(!plan.contains("db", &rows[0]));
+        assert!(plan.non_precondition_reads().any(|entry| entry
+            == (
+                "db",
+                rows[0].as_str(),
+                NotPreconditionReason::SelfCreatedTable
+            )));
+    }
+
+    /// A create that failed created nothing, so it declines nothing.
+    #[test]
+    fn a_failed_create_declines_nothing() {
+        let mut failed = address_insert(&[]);
+        failed.is_error = true;
+        let (read, _, rows) = address_read(&["add_billing"]);
+        let plan = build_seed_plan(&[failed, read], Some("c1"));
+        assert!(plan.contains("db", &rows[0]));
+    }
+
+    /// An UPDATE of a different, pre-existing row after a create seeds that
+    /// row's pre-image: the create did not make it.
+    #[test]
+    fn an_update_of_another_row_after_a_create_seeds_its_pre_image() {
+        let (mut update, _, rows) = address_read(&["add_billing"]);
+        update.method_name = "generic_update_with_results".to_owned();
+        update.write_set = update.read_set.clone();
+        let plan = build_seed_plan(&[address_insert(&["add_shipping"]), update], Some("c1"));
+        assert!(plan.contains("db", &rows[0]));
+    }
+
+    /// A read that declares no row identity cannot be told apart either.
+    #[test]
+    fn a_read_without_row_identity_after_a_create_is_still_declined() {
+        let (mut read, query, _) = address_read(&["add_billing"]);
+        read.read_set.retain(|key| key == &query);
+        let plan = build_seed_plan(&[address_insert(&["add_shipping"]), read], Some("c1"));
+        assert!(!plan.contains("db", &query));
+        assert!(plan.non_precondition_reads().any(|entry| entry
+            == (
+                "db",
+                query.as_str(),
+                NotPreconditionReason::SelfCreatedTable
+            )));
     }
 
     #[test]
