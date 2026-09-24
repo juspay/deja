@@ -3958,10 +3958,8 @@ fn json_depth(value: &serde_json::Value) -> usize {
     }
 }
 
-/// The lexemes of a JSON text as written, sorted: strings with their escapes,
-/// numbers as spelled, literals, and punctuation. Two documents with the same
-/// lexemes differ at most in arrangement, so an escape, a number's spelling or
-/// a dropped member, which parsing would hide, still shows.
+/// The lexemes of a JSON text as written, in order: strings with their
+/// escapes, numbers as spelled, literals, and punctuation.
 fn written_lexemes(json: &str) -> Vec<&str> {
     let bytes = json.as_bytes();
     let (mut lexemes, mut at) = (Vec::new(), 0);
@@ -4002,8 +4000,55 @@ fn written_lexemes(json: &str) -> Vec<&str> {
         }
         lexemes.push(&json[start..at.min(bytes.len())]);
     }
-    lexemes.sort_unstable();
     lexemes
+}
+
+/// A JSON text as written, with its arrangement taken out: every value keeps
+/// its exact spelling (escapes, number forms, duplicate keys, a null), and
+/// only the order of object members and of array members is canonical. Two
+/// documents with the same written form differ in arrangement alone.
+fn written_form(json: &str) -> String {
+    fn value<'a>(lexemes: &mut std::iter::Peekable<std::vec::IntoIter<&'a str>>) -> String {
+        match lexemes.next() {
+            Some("{") => {
+                let mut members = Vec::new();
+                while let Some(&next) = lexemes.peek() {
+                    if next == "}" {
+                        lexemes.next();
+                        break;
+                    }
+                    if next == "," {
+                        lexemes.next();
+                        continue;
+                    }
+                    let key = lexemes.next().unwrap_or_default();
+                    lexemes.next(); // ':'
+                    members.push(format!("{key}:{}", value(lexemes)));
+                }
+                members.sort();
+                format!("{{{}}}", members.join(","))
+            }
+            Some("[") => {
+                let mut members = Vec::new();
+                while let Some(&next) = lexemes.peek() {
+                    if next == "]" {
+                        lexemes.next();
+                        break;
+                    }
+                    if next == "," {
+                        lexemes.next();
+                        continue;
+                    }
+                    members.push(value(lexemes));
+                }
+                members.sort();
+                format!("[{}]", members.join(","))
+            }
+            Some(scalar) => scalar.to_owned(),
+            None => String::new(),
+        }
+    }
+    value(&mut written_lexemes(json).into_iter().peekable())
 }
 
 /// The embedded documents of two texts, paired, when everything around them
@@ -4023,9 +4068,10 @@ fn embedded_document_pairs(
         return None;
     }
     // Read as JSON only where the documents differ in arrangement alone: the
-    // same lexemes as written, and the same document apart from array order,
-    // with a null and a missing member kept apart. Anything else, a changed
-    // value included, keeps the whole-page comparison.
+    // same values as written, each keeping its spelling, and the same document
+    // apart from array order. Not where a document holds markup: its order can
+    // change where the page's parser ends a script. Anything else keeps the
+    // whole-page comparison.
     let arrangement_only = baseline
         .written
         .iter()
@@ -4034,7 +4080,9 @@ fn embedded_document_pairs(
         .all(|((bw, cw), (b, c))| {
             json_depth(b) <= MAX_EMBEDDED_DEPTH
                 && json_depth(c) <= MAX_EMBEDDED_DEPTH
-                && written_lexemes(bw) == written_lexemes(cw)
+                && !bw.contains('<')
+                && !cw.contains('<')
+                && written_form(bw) == written_form(cw)
                 && bag_canon(b) == bag_canon(c)
         });
     if !arrangement_only {
