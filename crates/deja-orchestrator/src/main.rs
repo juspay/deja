@@ -39,7 +39,9 @@ use axum::{
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
-use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunId, RunStatus};
+use deja_orchestrator::{
+    api::runs, artifact_kinds, divergence, HarnessRoot, Run, RunId, RunStatus,
+};
 use deja_store::Store;
 use sha2::{Digest, Sha256};
 
@@ -133,11 +135,29 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let executor = match ExecutorSelection::from_env() {
+        Ok(e) => {
+            match &e {
+                ExecutorSelection::Compose => eprintln!("deja-orchestrator: executor = compose"),
+                ExecutorSelection::K8s(k) => eprintln!(
+                    "deja-orchestrator: executor = k8s (jobs ns {}, template {}/{})",
+                    k.cfg.jobs_namespace, k.cfg.template_namespace, k.cfg.template_configmap
+                ),
+            }
+            Arc::new(e)
+        }
+        Err(err) => {
+            eprintln!("deja-orchestrator: executor config failed: {err}");
+            std::process::exit(1);
+        }
+    };
     // Sweep the hydrated-artifact cache at boot, not only on the next view.
     // The cache is the reason this volume fills, so a deployment that fixes it
     // should reclaim on restart rather than waiting for someone to open a run —
-    // which on a full volume is the one thing nobody can do.
-    sweep_artifact_cache(&root, "");
+    // which on a full volume is the one thing nobody can do. After the
+    // executor, because only it says whether these files are a cache at all, and
+    // before the store, whose migration lock has no timeout.
+    evict_cached_artifacts(&root, "", LocalArtifacts::of(&executor));
 
     // Optional Postgres store: dashboard state, stage history, audit. Runs
     // still execute without it (file-backed worker state); store-backed
@@ -156,22 +176,6 @@ async fn main() {
                  start it with: docker compose -p deja-orchestrator -f demo/docker-compose.orchestrator.yml up -d"
             );
             None
-        }
-    };
-    let executor = match ExecutorSelection::from_env() {
-        Ok(e) => {
-            match &e {
-                ExecutorSelection::Compose => eprintln!("deja-orchestrator: executor = compose"),
-                ExecutorSelection::K8s(k) => eprintln!(
-                    "deja-orchestrator: executor = k8s (jobs ns {}, template {}/{})",
-                    k.cfg.jobs_namespace, k.cfg.template_namespace, k.cfg.template_configmap
-                ),
-            }
-            Arc::new(e)
-        }
-        Err(err) => {
-            eprintln!("deja-orchestrator: executor config failed: {err}");
-            std::process::exit(1);
         }
     };
     let state = AppState {
@@ -1542,15 +1546,9 @@ fn local_path_for_artifact_kind(
     run_id: &str,
     kind: &str,
 ) -> Option<std::path::PathBuf> {
-    Some(match kind {
-        "observed" => root.observed_path(run_id),
-        "http_diffs" => root.http_diff_path(run_id),
-        "lookup_table" => root.lookup_table_path(run_id),
-        "scorecard" => root.scorecard_path(run_id),
-        "call_ledger" => root.call_ledger_path(run_id),
-        "record_graph" => root.record_graph_path(run_id),
-        _ => return None,
-    })
+    artifact_kinds::served()
+        .find(|served| served.name == kind)
+        .map(|served| served.path(root, run_id))
 }
 
 /// Default ceiling on the hydrated-artifact cache. `DEJA_ARTIFACT_CACHE_MAX_BYTES`
@@ -1568,16 +1566,6 @@ fn artifact_cache_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_BYTES)
 }
 
-/// The kinds `hydrate_run_artifacts` copies down from the store.
-const HYDRATED_KINDS: [&str; 6] = [
-    "observed",
-    "http_diffs",
-    "lookup_table",
-    "scorecard",
-    "call_ledger",
-    "record_graph",
-];
-
 /// Caches the orchestrator derives from hydrated files and rebuilds on a miss.
 const DERIVED_CACHES: [&str; 3] = ["behaviour_tree", "delta", "change_coverage"];
 
@@ -1592,14 +1580,19 @@ fn cache_path_for_kind(root: &HarnessRoot, run_id: &str, kind: &str) -> Option<s
     }
 }
 
-fn cache_kinds() -> impl Iterator<Item = &'static str> {
-    HYDRATED_KINDS.into_iter().chain(DERIVED_CACHES)
+/// What counts as cache here. Derived caches always do: they are rebuilt on a
+/// miss. Hydrated kinds do only where they are copies of stored objects.
+fn cache_kinds(local: LocalArtifacts) -> impl Iterator<Item = &'static str> {
+    artifact_kinds::served()
+        .filter(move |_| local == LocalArtifacts::CopiesOfStore)
+        .map(|kind| kind.name)
+        .chain(DERIVED_CACHES)
 }
 
 /// The directories the cache sweep looks in, asked of `cache_path_for_kind`
 /// rather than named here.
-fn artifact_cache_dirs(root: &HarnessRoot) -> Vec<std::path::PathBuf> {
-    let mut dirs: Vec<std::path::PathBuf> = cache_kinds()
+fn artifact_cache_dirs(root: &HarnessRoot, local: LocalArtifacts) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = cache_kinds(local)
         .filter_map(|kind| cache_path_for_kind(root, "_probe", kind))
         .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
         .collect();
@@ -1614,10 +1607,14 @@ fn artifact_cache_dirs(root: &HarnessRoot) -> Vec<std::path::PathBuf> {
 /// some run and kind. Those directories also hold run records, seed
 /// certificates, notes and manifests, which are not copies of anything; a
 /// directory is not a category.
-fn cached_file_run(root: &HarnessRoot, path: &std::path::Path) -> Option<String> {
+fn cached_file_run(
+    root: &HarnessRoot,
+    path: &std::path::Path,
+    local: LocalArtifacts,
+) -> Option<String> {
     const MARK: &str = "\u{1}";
     let name = path.file_name()?.to_str()?;
-    cache_kinds().find_map(|kind| {
+    cache_kinds(local).find_map(|kind| {
         let template = cache_path_for_kind(root, MARK, kind)?;
         let (prefix, suffix) = template.file_name()?.to_str()?.split_once(MARK)?;
         let run_id = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
@@ -1626,15 +1623,37 @@ fn cached_file_run(root: &HarnessRoot, path: &std::path::Path) -> Option<String>
     })
 }
 
+/// What the files in this deployment's artifact directories are. The paths
+/// are the same either way; which one applies is decided by the executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalArtifacts {
+    /// k8s: runs publish from the pod to S3, and the orchestrator hydrates
+    /// copies of those objects. Evicting one costs a re-download.
+    CopiesOfStore,
+    /// compose: the lifecycle runs in-process and registers local paths, and
+    /// nothing is hydrated. Evicting a hydrated-kind file deletes the artifact.
+    OnlyCopies,
+}
+
+impl LocalArtifacts {
+    fn of(executor: &ExecutorSelection) -> Self {
+        match executor {
+            ExecutorSelection::K8s(_) => Self::CopiesOfStore,
+            ExecutorSelection::Compose => Self::OnlyCopies,
+        }
+    }
+}
+
 /// Delete least-recently-modified hydrated artifacts until the cache is under
 /// budget.
 ///
-/// Only files `cached_file_run` recognises are counted or deleted. Each is a
-/// copy of an `s3://` object that the run's artifact row still points at, or a
-/// cache derived from one, so eviction costs a re-download or a rebuild on the
-/// next view and loses nothing. Without it the cache only ever grows: `hydrate_run_artifacts` skips
-/// a path that already exists and has no counterpart that removes one, so the
-/// volume fills in proportion to runs LOOKED AT rather than runs executed.
+/// Only files `cached_file_run` recognises for this deployment are counted or
+/// deleted. Each is a copy of an `s3://` object that the run's artifact row
+/// still points at, or a cache derived from one, so eviction costs a
+/// re-download or a rebuild on the next view and loses nothing. Without it the
+/// cache only ever grows: `hydrate_run_artifacts` skips a path that already
+/// exists and has no counterpart that removes one, so the volume fills in
+/// proportion to runs LOOKED AT rather than runs executed.
 ///
 /// `keep` is the run being served right now — evicting its files between the
 /// write and the read would turn a view into an empty one.
@@ -1643,20 +1662,20 @@ fn cached_file_run(root: &HarnessRoot, path: &std::path::Path) -> Option<String>
 /// atime unreliable and a hydrated file is written once and then only read.
 /// So this is least-recently-HYDRATED, which for a write-once cache is the same
 /// order.
-fn sweep_artifact_cache(root: &HarnessRoot, keep: &str) {
+fn evict_cached_artifacts(root: &HarnessRoot, keep: &str, local: LocalArtifacts) {
     let budget = artifact_cache_max_bytes();
     if budget == 0 {
         return;
     }
     let mut entries: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = Vec::new();
     let mut total: u64 = 0;
-    for dir in artifact_cache_dirs(root) {
+    for dir in artifact_cache_dirs(root, local) {
         let Ok(listing) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in listing.flatten() {
             let path = entry.path();
-            let Some(run_id) = cached_file_run(root, &path) else {
+            let Some(run_id) = cached_file_run(root, &path, local) else {
                 continue;
             };
             // `keep` empty means keep nothing: the boot sweep protects no run.
@@ -1725,6 +1744,7 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> 
         .collect();
     let root = st.root.clone();
     let run_id = run_id.to_owned();
+    let local_files = LocalArtifacts::of(&st.executor);
     // object_store's sync API blocks on its own runtime — run it off the async
     // worker so we never nest block_on inside tokio.
     let _ = tokio::task::spawn_blocking(move || {
@@ -1756,7 +1776,7 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> 
         }
         // Sweep AFTER writing, and never the run just written: a view that
         // hydrated its own files and then evicted them would render empty.
-        sweep_artifact_cache(&root, &run_id);
+        evict_cached_artifacts(&root, &run_id, local_files);
     })
     .await;
     Some(Hydrated {
@@ -1779,10 +1799,10 @@ struct Hydrated {
 /// lying around would look like a judgement the run never made.
 async fn v1_scorecard(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
-    let content = match std::fs::read_to_string(st.root.scorecard_path(&id)) {
+    let content = match std::fs::read_to_string(artifact_kinds::SCORECARD.path(&st.root, &id)) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return absent_artifact(&st, &id, "scorecard").await;
+            return absent_artifact(&st, &id, artifact_kinds::SCORECARD.name).await;
         }
         Err(e) => return error_resp(500, &format!("scorecard: {e}")),
     };
@@ -2009,13 +2029,12 @@ fn read_jsonl_artifact(
 async fn serve_jsonl_artifact(
     st: &AppState,
     id: &str,
-    kind: &str,
-    path: std::path::PathBuf,
+    kind: &artifact_kinds::RunArtifactKind,
 ) -> Response {
     hydrate_run_artifacts(st, id).await;
-    match read_jsonl_artifact(&path, kind) {
+    match read_jsonl_artifact(&kind.path(&st.root, id), kind.name) {
         Ok(Some(rows)) => json_ok(serde_json::Value::Array(rows)),
-        Ok(None) => absent_artifact(st, id, kind).await,
+        Ok(None) => absent_artifact(st, id, kind.name).await,
         Err(e) => error_resp(500, &e),
     }
 }
@@ -2024,15 +2043,13 @@ async fn serve_jsonl_artifact(
 /// observed, classified + located) that backs the interactive diff view, as the
 /// run published it. A published empty ledger is a run that made no calls.
 async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
-    let path = st.root.call_ledger_path(&id);
-    serve_jsonl_artifact(&st, &id, "call_ledger", path).await
+    serve_jsonl_artifact(&st, &id, &artifact_kinds::CALL_LEDGER).await
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
 /// (status + field-level body diff), from the run's published http-diff stream.
 async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
-    let path = st.root.http_diff_path(&id);
-    serve_jsonl_artifact(&st, &id, "http_diffs", path).await
+    serve_jsonl_artifact(&st, &id, &artifact_kinds::HTTP_DIFFS).await
 }
 
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
@@ -2345,14 +2362,14 @@ fn tree_sources(
     };
     let root = &st.root;
     let ledger = confined(root.call_ledger_path(id), &root.root.join("runs"))
-        .ok_or_else(|| absent("call_ledger", "call ledger"))?;
+        .ok_or_else(|| absent(artifact_kinds::CALL_LEDGER.name, "call ledger"))?;
     let diffs = confined(root.http_diff_path(id), &root.root.join("http-diffs"));
-    if diffs.is_none() && registered.is_some_and(|r| r.contains("http_diffs")) {
-        return Err(absent("http_diffs", "http diffs"));
+    if diffs.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::HTTP_DIFFS.name)) {
+        return Err(absent(artifact_kinds::HTTP_DIFFS.name, "http diffs"));
     }
     let observed = confined(root.observed_path(id), &root.root.join("observed"));
-    if observed.is_none() && registered.is_some_and(|r| r.contains("observed")) {
-        return Err(absent("observed", "observed stream"));
+    if observed.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::OBSERVED.name)) {
+        return Err(absent(artifact_kinds::OBSERVED.name, "observed stream"));
     }
     // beside the ledger it is built from, named off the confined ledger path:
     // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
@@ -2435,11 +2452,11 @@ async fn behaviour_tree_for(
             );
             move |path: &std::path::Path| -> &'static str {
                 if path == ledger {
-                    "call_ledger"
+                    artifact_kinds::CALL_LEDGER.name
                 } else if diffs.as_deref() == Some(path) {
-                    "http_diffs"
+                    artifact_kinds::HTTP_DIFFS.name
                 } else if observed.as_deref() == Some(path) {
-                    "observed"
+                    artifact_kinds::OBSERVED.name
                 } else {
                     ""
                 }
@@ -4223,7 +4240,7 @@ mod tests {
         }
         hydrated(&root, "run-cached", "scorecard", 1_000, 100);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         // Vacuity guard: the sweep really did evict.
         assert!(
             !present(&root, "run-cached", "scorecard"),
@@ -4245,7 +4262,7 @@ mod tests {
         resident(&stray, 1_000, 10);
         hydrated(&root, "run-cached", "scorecard", 1_000, 100);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         assert!(!present(&root, "run-cached", "scorecard"), "precondition");
         assert!(stray.exists(), "only the seam's exact path is cache");
     }
@@ -4263,7 +4280,7 @@ mod tests {
         hydrated(&root, "run-b", "call_ledger", 1_000, 100);
         resident(&root.run_path("run-big"), 10_000, 200);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1500");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         assert!(
             !present(&root, "run-a", "call_ledger"),
             "precondition: 2,000 cached bytes over a 1,500 budget evicts the oldest"
@@ -4296,7 +4313,7 @@ mod tests {
         }
         resident(&root.run_path("run-old"), 1_000, 5);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         for path in &derived {
             assert!(
                 !path.exists(),
@@ -4305,6 +4322,68 @@ mod tests {
             );
         }
         assert!(root.run_path("run-old").exists(), "the run record survives");
+    }
+
+    /// On compose the hydrated-kind files are the ONLY copy: the lifecycle ran
+    /// in-process and registered local paths, and nothing was hydrated.
+    /// Evicting those is deletion, whatever the budget says. A derived cache
+    /// beside them is rebuilt on a miss, so it still goes.
+    #[test]
+    fn compose_evicts_derived_caches_and_never_its_only_copies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-compose", "scorecard", 1_000, 10);
+        let tree = root.behaviour_tree_path("run-compose");
+        resident(&tree, 1_000, 5);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(
+            &root,
+            "",
+            super::LocalArtifacts::of(&ExecutorSelection::Compose),
+        );
+        assert!(!tree.exists(), "a derived cache is evicted on compose too");
+        assert!(
+            present(&root, "run-compose", "scorecard"),
+            "compose's only copy survives"
+        );
+    }
+
+    /// The k8s executor says the local files are copies of stored objects.
+    #[test]
+    fn a_k8s_executor_holds_copies_of_stored_objects() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sa = tempfile::tempdir().unwrap();
+        std::fs::write(sa.path().join("ca.crt"), "ca").unwrap();
+        std::fs::write(sa.path().join("namespace"), "ns\n").unwrap();
+        std::fs::write(sa.path().join("token"), "tok").unwrap();
+        std::env::set_var("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+        std::env::set_var("KUBERNETES_SERVICE_PORT", "443");
+        let incluster = InClusterConfig::from_env_at(sa.path());
+        std::env::remove_var("KUBERNETES_SERVICE_HOST");
+        std::env::remove_var("KUBERNETES_SERVICE_PORT");
+        let k8s = ExecutorSelection::K8s(Box::new(K8sExecutor {
+            incluster: incluster.expect("in-cluster config from a fixture SA root"),
+            cfg: K8sExecutorConfig::from_env(),
+            scheduler_capacity: 0,
+        }));
+        assert_eq!(
+            super::LocalArtifacts::of(&k8s),
+            super::LocalArtifacts::CopiesOfStore
+        );
+    }
+
+    /// The other polarity: where local files are copies of stored objects, the
+    /// same fixture is evicted.
+    #[test]
+    fn copies_of_stored_objects_are_evicted_over_budget() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-k8s", "scorecard", 1_000, 10);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(!present(&root, "run-k8s", "scorecard"), "a copy is evicted");
     }
 
     /// `keep` protects one run, not every run whose id it prefixes.
@@ -4316,7 +4395,7 @@ mod tests {
         hydrated(&root, "run-a", "scorecard", 1_000, 10);
         hydrated(&root, "run-ab", "scorecard", 1_000, 20);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
-        super::sweep_artifact_cache(&root, "run-a");
+        super::evict_cached_artifacts(&root, "run-a", super::LocalArtifacts::CopiesOfStore);
         assert!(
             present(&root, "run-a", "scorecard"),
             "the served run is kept"
@@ -4339,7 +4418,7 @@ mod tests {
         hydrated(&root, "run-a", "observed", 1_000, 100);
         hydrated(&root, "run-b", "observed", 1_000, 200);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1000000");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         assert!(
             present(&root, "run-a", "observed"),
             "under budget, nothing goes"
@@ -4362,7 +4441,7 @@ mod tests {
         hydrated(&root, "newest", "observed", 1_000, 300);
         // 3000 bytes present, budget 2500: exactly one file must go.
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "2500");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         assert!(
             !present(&root, "oldest", "observed"),
             "the oldest is evicted"
@@ -4389,7 +4468,7 @@ mod tests {
         hydrated(&root, "serving", "observed", 4_000, 1);
         hydrated(&root, "other", "observed", 1_000, 999);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "500");
-        super::sweep_artifact_cache(&root, "serving");
+        super::evict_cached_artifacts(&root, "serving", super::LocalArtifacts::CopiesOfStore);
         assert!(
             present(&root, "serving", "observed"),
             "the served run is kept"
@@ -4400,8 +4479,8 @@ mod tests {
         );
     }
 
-    /// Every hydrated kind is swept, not only the big one. A kind added to
-    /// `local_path_for_artifact_kind` joins the sweep by existing.
+    /// Every hydrated kind is swept, not only the big one. A kind added to the
+    /// artifact-kind table as served joins the sweep by existing.
     #[test]
     fn every_hydrated_kind_is_swept() {
         // The budget is read from the process environment, which every test in
@@ -4420,7 +4499,7 @@ mod tests {
             hydrated(&root, "run-x", kind, 1_000, 100);
         }
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         for kind in [
             "observed",
             "http_diffs",
@@ -4444,7 +4523,7 @@ mod tests {
         let root = HarnessRoot::new(dir.path()).unwrap();
         hydrated(&root, "run-a", "observed", 10_000, 100);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "0");
-        super::sweep_artifact_cache(&root, "");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
         assert!(present(&root, "run-a", "observed"), "zero means no ceiling");
     }
 
