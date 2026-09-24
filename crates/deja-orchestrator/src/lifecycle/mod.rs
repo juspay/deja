@@ -1534,7 +1534,11 @@ fn render_and_persist_lookup_table(
 ) -> Result<usize, String> {
     let table = crate::lookup::render_lookup_table(recording, recording_id)
         .map_err(|e| format!("render lookup table: {e}"))?;
-    write_json(&root.lookup_table_path(run_id), &table)
+    // Compact, not pretty: the candidate holds this whole file in one buffer at
+    // boot, and indentation made it about 2.5x its content.
+    serde_json::to_vec(&table)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(root.lookup_table_path(run_id), bytes))
         .map_err(|e| format!("write lookup table: {e}"))?;
     if table.entries.is_empty() {
         return Err("rendered lookup table is empty".to_string());
@@ -5679,6 +5683,83 @@ mod tests {
             super::empty_group_error("g", "bkt", "landing/v1", 1, &["rec-open".to_owned()])
                 .is_none(),
             "one sealed member is enough to replay"
+        );
+    }
+
+    /// The table the candidate reads is written without whitespace, and the
+    /// candidate's own loader still reads it back whole.
+    ///
+    /// Pretty-printing put every element of a byte array on its own indented
+    /// line, which made the file roughly 2.5x its content. The candidate reads
+    /// the whole file into one buffer that coexists with the parsed table at
+    /// boot, so that whitespace was resident for no reason.
+    #[test]
+    fn the_lookup_table_is_written_compact_and_loads_back() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let tape = crate::scope::TapeSlot::for_write(&root, "rec-1");
+        std::fs::create_dir_all(tape.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&tape).unwrap();
+        for seq in 0..3u64 {
+            let event = serde_json::json!({
+                "record_kind": "boundary_event",
+                "global_sequence": seq,
+                "request_sequence": seq,
+                "correlation_id": "c-1",
+                "timestamp_ns": 0,
+                "recording_run_id": "r",
+                "boundary": "db",
+                "trait_name": "T",
+                "method_name": "m",
+                "call_file": "x.rs",
+                "call_line": 10,
+                "call_column": 4,
+                "request": null,
+                "args": { "k": seq },
+                "response": null,
+                "result": { "inner": [118, 49, 58], "id": seq },
+                "is_error": false,
+                "duration_us": 0,
+                "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                "provenance": "recorded",
+                "recon": "lossless",
+                "replay_strategy": "substitute",
+                "callsite_identity": null
+            });
+            writeln!(f, "{event}").unwrap();
+        }
+        drop(f);
+        let recording = crate::scope::ScopedRecording::open(
+            &root,
+            "rec-1",
+            crate::scope::RunScope::entire_session(),
+        )
+        .unwrap();
+
+        let entries =
+            super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1").unwrap();
+        assert!(entries > 0, "the fixture renders entries");
+
+        let bytes = std::fs::read(root.lookup_table_path("run-1")).unwrap();
+        assert!(
+            !bytes.contains(&b'\n'),
+            "the lookup table must be written compact, found a newline in {} bytes",
+            bytes.len()
+        );
+        let mut source = deja::LocalFileLookupSource::new(root.lookup_table_path("run-1"));
+        let table = deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(
+            table.entries.len(),
+            entries,
+            "the candidate loads every entry"
+        );
+        assert!(
+            table
+                .entries
+                .iter()
+                .any(|e| e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })),
+            "results survive the compact encoding"
         );
     }
 
