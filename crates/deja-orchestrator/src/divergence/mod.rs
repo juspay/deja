@@ -12098,6 +12098,99 @@ mod tests {
         )
     }
 
+    /// A resolved call at seq 7 whose recorded args are `recorded` and whose
+    /// candidate sent `observed`.
+    fn resolved_with_args(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> RunArtifacts {
+        let mut call = exec_obs(
+            "storage",
+            Some("c1"),
+            true,
+            Some(7),
+            Some(serde_json::json!("v")),
+            serde_json::json!("v"),
+        );
+        call.args = observed;
+        let mut event = omitted_ev(7, "storage", Some("c1"));
+        event.args = recorded.into();
+        art_with_events(
+            vec![seq_entry_res(
+                Some("c1"),
+                "storage",
+                7,
+                serde_json::json!("v"),
+            )],
+            vec![call],
+            vec![http("c1", true, vec![])],
+            vec![event],
+        )
+    }
+
+    /// A call served because its identity matched, not its exact args, says
+    /// so: counted under its own kind, the path named, nothing blocking.
+    #[test]
+    fn a_call_served_by_its_identity_is_counted_and_named() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
+            serde_json::json!({ "q": 1, "ids": ["c", "a", "b"] }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("$.ids")),
+            "the path is named: {:?}",
+            card.warnings
+        );
+
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// Equal args, and args that differ only in key order, are nothing to
+    /// report: the exact lookup served them.
+    #[test]
+    fn a_call_served_by_its_exact_args_reports_no_identity() {
+        for (recorded, observed) in [
+            (
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["a", "b"] }),
+            ),
+            (
+                serde_json::json!({ "a": 1, "b": 2 }),
+                serde_json::json!({ "b": 2, "a": 1 }),
+            ),
+        ] {
+            let card = detect(&resolved_with_args(recorded, observed));
+            assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 0);
+            assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 0);
+            assert_eq!(kind_count(&card, "storage", "ArgsIdentityUnconfirmed"), 0);
+            assert!(card.verdict.pass, "{}", card.verdict.reason);
+        }
+    }
+
+    /// A resolved call whose args are a different call under identity cannot
+    /// have been served by either lookup. It is named, never passed silently.
+    #[test]
+    fn a_resolved_call_whose_args_are_another_call_is_named() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "ids": ["a", "b"] }),
+            serde_json::json!({ "ids": ["a", "c"] }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsIdentityUnconfirmed"), 1);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("identity")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
     /// A call that missed its address but sent what the recording sent — the same
     /// arguments at a shifted position — is paired and matched: never a
     /// Novel+Omitted split.
