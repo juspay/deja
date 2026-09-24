@@ -75,6 +75,9 @@
 //! feature-off/observation-off posture), `load` captures nothing and allocates
 //! nothing beyond the wrapped cursor.
 
+mod bind_capture;
+pub use bind_capture::{capture_query, capture_query_with, CapturedQuery, UNBUILDABLE_STATEMENT};
+
 use std::sync::Arc;
 
 use diesel::connection::{
