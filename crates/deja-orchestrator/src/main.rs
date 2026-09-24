@@ -1576,6 +1576,7 @@ fn cache_path_for_kind(root: &HarnessRoot, run_id: &str, kind: &str) -> Option<s
         "behaviour_tree" => Some(root.behaviour_tree_path(run_id)),
         "delta" => Some(root.delta_cache_path(run_id)),
         "change_coverage" => Some(root.change_coverage_path(run_id)),
+        "lookup_table" => Some(root.lookup_table_path(run_id)),
         _ => local_path_for_artifact_kind(root, run_id, kind),
     }
 }
@@ -1584,10 +1585,16 @@ fn cache_path_for_kind(root: &HarnessRoot, run_id: &str, kind: &str) -> Option<s
 /// miss. Hydrated kinds do only where they are copies of stored objects.
 fn cache_kinds(local: LocalArtifacts) -> impl Iterator<Item = &'static str> {
     artifact_kinds::served()
-        .filter(move |_| local == LocalArtifacts::CopiesOfStore)
         .map(|kind| kind.name)
+        .chain(NO_LONGER_HYDRATED)
+        .filter(move |_| local == LocalArtifacts::CopiesOfStore)
         .chain(DERIVED_CACHES)
 }
+
+/// Kinds that were hydrated once and no longer are. Copies pulled before the
+/// change are still on the volume, and nothing will pull them again, so the
+/// sweep keeps evicting them.
+const NO_LONGER_HYDRATED: [&str; 1] = ["lookup_table"];
 
 /// The directories the cache sweep looks in, asked of `cache_path_for_kind`
 /// rather than named here.
@@ -4178,7 +4185,7 @@ mod tests {
 
     /// Seed one hydrated artifact with a chosen size and modification time.
     fn hydrated(root: &HarnessRoot, run_id: &str, kind: &str, bytes: usize, age_secs: u64) {
-        let path = super::local_path_for_artifact_kind(root, run_id, kind).expect("known kind");
+        let path = super::cache_path_for_kind(root, run_id, kind).expect("known kind");
         std::fs::create_dir_all(path.parent().expect("kind dir")).expect("mkdir");
         std::fs::write(&path, vec![b'x'; bytes]).expect("write");
         let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age_secs);
@@ -4192,7 +4199,7 @@ mod tests {
     }
 
     fn present(root: &HarnessRoot, run_id: &str, kind: &str) -> bool {
-        super::local_path_for_artifact_kind(root, run_id, kind).is_some_and(|path| path.exists())
+        super::cache_path_for_kind(root, run_id, kind).is_some_and(|path| path.exists())
     }
 
     /// Seed a file that is NOT a hydrated artifact, with a chosen age.
@@ -4328,6 +4335,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = HarnessRoot::new(dir.path()).unwrap();
         hydrated(&root, "run-compose", "scorecard", 1_000, 10);
+        hydrated(&root, "run-compose", "lookup_table", 1_000, 10);
         let tree = root.behaviour_tree_path("run-compose");
         resident(&tree, 1_000, 5);
         std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
@@ -4337,10 +4345,12 @@ mod tests {
             super::LocalArtifacts::of(&ExecutorSelection::Compose),
         );
         assert!(!tree.exists(), "a derived cache is evicted on compose too");
-        assert!(
-            present(&root, "run-compose", "scorecard"),
-            "compose's only copy survives"
-        );
+        for kind in ["scorecard", "lookup_table"] {
+            assert!(
+                present(&root, "run-compose", kind),
+                "compose's only copy of {kind} survives"
+            );
+        }
     }
 
     /// The k8s executor says the local files are copies of stored objects.
@@ -4486,6 +4496,23 @@ mod tests {
             source.matches(&needle).count(),
             1,
             "v1_artifact_raw decides its content type through the kind table"
+        );
+    }
+
+    /// Viewing a run does not pull its lookup table. Only scoring reads it,
+    /// and scoring runs in the replay pod; `/raw` fetches the published object
+    /// by its URI. Hydration skips a kind with no local path here.
+    #[test]
+    fn viewing_a_run_does_not_pull_its_lookup_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        assert!(
+            local_path_for_artifact_kind(&root, "run-1", "lookup_table").is_none(),
+            "no API path reads the orchestrator's copy of the lookup table"
+        );
+        assert!(
+            local_path_for_artifact_kind(&root, "run-1", "call_ledger").is_some(),
+            "a kind the API reads is still hydrated"
         );
     }
 

@@ -48,13 +48,15 @@ impl RunArtifactKind {
     }
 }
 
+/// Read only by scoring, in the replay pod. The API streams the published
+/// object by URI and never reads a local copy, so it is not hydrated.
 pub const LOOKUP_TABLE: RunArtifactKind = RunArtifactKind {
     name: "lookup_table",
     object: "lookup_table.json",
     local_path: HarnessRoot::lookup_table_path,
     publish: Publish::Stream,
-    served: true,
-    bound: Bound::CacheBudget,
+    served: false,
+    bound: Bound::RunnerPod,
 };
 pub const OBSERVED: RunArtifactKind = RunArtifactKind {
     name: "observed",
