@@ -8846,6 +8846,126 @@ mod tests {
         );
     }
 
+    /// A page shaped like the collect-link page: a style block whose braces
+    /// are not JSON, and a script that assigns one embedded document.
+    fn page_embedding(document: &str, heading: &str) -> serde_json::Value {
+        serde_json::Value::String(format!(
+            "<!DOCTYPE html>\n<html><head><style>\nbody {{ height: 100%; }}\n\
+             @media only screen {{ .main {{ min-width: 300px; }} }}\n</style></head>\n\
+             <body><h1>{heading}</h1><div id=\"collect\"></div>\n\
+             <script>window.__DETAILS = {document}\n// @ts-check\nvar widgets = null;\n\
+             function mount() {{ return widgets; }}</script></body></html>"
+        ))
+    }
+
+    fn embedded_card(recorded: serde_json::Value, replayed: serde_json::Value) -> Scorecard {
+        detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]))
+    }
+
+    /// An HTML page embedding a JSON document whose arrays were permuted is
+    /// compared as JSON inside the page: the permutation is absorbed and
+    /// named at the document's own path, and the page is counted as read
+    /// through an embedded document.
+    #[test]
+    fn an_embedded_document_whose_arrays_moved_is_compared_as_json() {
+        let card = embedded_card(
+            page_embedding(
+                r##"{"theme":"#4285F4","enabled_payment_methods":[{"payment_method":"card","payment_method_types":["debit","credit"]},{"payment_method":"bank_transfer","payment_method_types":["bacs","ach","sepa"]}]}"##,
+                "Collect",
+            ),
+            page_embedding(
+                r##"{"theme":"#4285F4","enabled_payment_methods":[{"payment_method":"card","payment_method_types":["credit","debit"]},{"payment_method":"bank_transfer","payment_method_types":["sepa","ach","bacs"]}]}"##,
+                "Collect",
+            ),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("$.~embedded[0].enabled_payment_methods")),
+            "the absorption is named inside the document: {:?}",
+            card.warnings
+        );
+    }
+
+    /// Keys in another order inside an embedded document are the same
+    /// document: compared as JSON, counted, not blocking.
+    #[test]
+    fn an_embedded_document_whose_keys_moved_is_compared_as_json() {
+        let card = embedded_card(
+            page_embedding(r#"{"a":1,"b":{"x":1,"y":2}}"#, "Collect"),
+            page_embedding(r#"{"b":{"y":2,"x":1},"a":1}"#, "Collect"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("embedded")),
+            "and it is said: {:?}",
+            card.warnings
+        );
+    }
+
+    /// What the embedded comparison still refuses. Each of these blocks on
+    /// `main` and must keep blocking: the documents are only paired when
+    /// everything around them is byte-identical, only objects are read as
+    /// documents, and a JSON body is never re-scanned.
+    #[test]
+    fn an_embedded_document_is_not_compared_when_anything_else_differs() {
+        let permuted_a = r#"{"m":["a","b"]}"#;
+        let permuted_b = r#"{"m":["b","a"]}"#;
+        for (name, recorded, replayed) in [
+            (
+                "text around the document differs",
+                page_embedding(permuted_a, "Collect"),
+                page_embedding(permuted_b, "Collected"),
+            ),
+            (
+                "a value inside the document changed",
+                page_embedding(r#"{"m":["a","b"],"n":1}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":2}"#, "Collect"),
+            ),
+            (
+                "an embedded top-level array is code, not a document",
+                page_embedding(r#"["a","b"]"#, "Collect"),
+                page_embedding(r#"["b","a"]"#, "Collect"),
+            ),
+            (
+                "the number of documents differs",
+                page_embedding(permuted_a, "Collect"),
+                page_embedding(&format!("{permuted_b}; var more = {{\"k\":1}}"), "Collect"),
+            ),
+            (
+                "a JSON body is never re-scanned",
+                serde_json::json!({ "html": page_embedding(permuted_a, "Collect") }),
+                serde_json::json!({ "html": page_embedding(permuted_b, "Collect") }),
+            ),
+        ] {
+            let card = embedded_card(recorded, replayed);
+            assert!(
+                kind_count(&card, "http_incoming", "BodyMismatch") >= 1,
+                "{name}: still blocks"
+            );
+            assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
+            if name != "a value inside the document changed" {
+                assert_eq!(
+                    kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+                    0,
+                    "{name}: not read through an embedded document"
+                );
+            }
+        }
+    }
+
     #[test]
     fn scorer_does_not_treat_script_text_as_form_inputs() {
         let baseline = r#"<!DOCTYPE html><html><body><form><script>const fields = ['<input type="hidden" name="a" value="1">', '<input type="hidden" name="b" value="2">'];</script><input type="hidden" name="token" value="abc"></form></body></html>"#;
