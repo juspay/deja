@@ -75,6 +75,12 @@ async fn a_cached_absence_replays_as_a_hit_and_a_miss_as_a_miss() {
 
     let events = read_events(record_dir.path()).expect("read");
     assert_eq!(events.len(), 2, "both reads are on the tape");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.fidelity == deja_runtime::Fidelity::Lossless),
+        "the recorder rebuilt both values and found them unchanged"
+    );
     assert_ne!(
         events[0].result, events[1].result,
         "the hit and the miss must not record as the same value"

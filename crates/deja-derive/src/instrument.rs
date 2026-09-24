@@ -481,6 +481,18 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         },
     };
 
+    // The round-trip check: the recorder rebuilds each value it records
+    // through the site's reconstruct closure and compares the two, when the
+    // type offers a way to compare. A record-only site declares no codec.
+    let compare_closure: TokenStream = match &capture_mode {
+        CaptureMode::Debug => quote! {
+            ::deja::__private::RoundTrip::<
+                fn(&#recon_ty, &#recon_ty) -> ::deja::__private::Comparison
+            >::RecordOnly
+        },
+        _ => quote! { ::deja::__private::round_trip!(#recon_ty) },
+    };
+
     // ONE closure answers both halves of the lookup. The four capture-mode
     // closures above stay exactly as they were — they are the HIT arm — and are
     // wrapped here rather than each growing a miss branch of its own.
@@ -539,7 +551,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                                 move || async move #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-
+                                #compare_closure,
                             ).await
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -574,7 +586,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                                 move || async move { #block.await },
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-
+                                #compare_closure,
                             ))
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -606,7 +618,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                                 || #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-
+                                #compare_closure,
                             )
                         }
                         ::std::result::Result::Err(_) => { #block }

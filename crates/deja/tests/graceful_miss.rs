@@ -96,6 +96,9 @@ async fn read_config(operation: &'static str, key: &str) -> Result<u64, String> 
             Ok(n) => (json!({ "Ok": n }), false),
             Err(e) => (json!({ "Err": e }), true),
         },
+        // The round-trip check: the recorder rebuilds each recorded value
+        // through the closure above and compares it with the original.
+        deja::__private::round_trip!(Result<u64, String>),
     )
     .await
 }
