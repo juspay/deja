@@ -1578,7 +1578,9 @@ fn render_suspect(recording_id: &str, rendered: &RenderedTable) -> Option<String
     let shared_only = rendered.shared_only.then(|| {
         "only the shared-results lookup table was written, because the one-result-per-entry \
          table was over the budget: a candidate on a deja pin from before shared-results tables \
-         cannot read it and refuses to boot, naming the table on its stderr"
+         cannot read it and refuses to boot, naming the table on its stderr. Run it on a \
+         candidate whose pin reads shared-results tables, or split its correlation filter into \
+         smaller runs whose tables fit the budget"
             .to_owned()
     });
     let parts: Vec<String> = [
@@ -1663,8 +1665,11 @@ fn lookup_table_budget_from(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Render, then refuse a table over `max_bytes` before anything can load it.
-/// Returns the entry count and the table's compact size.
+/// Render, then write the one-result-per-entry table and its shared form, or
+/// only the shared form when the table is over `max_bytes` and the shared form
+/// is not, or refuse when both are over. The same budget bounds both forms: it
+/// was measured on the one-result-per-entry form and is conservative for the
+/// shared one, which has not been measured against a candidate's limit.
 fn persist_lookup_table_within(
     root: &HarnessRoot,
     run_id: &str,
@@ -1678,12 +1683,16 @@ fn persist_lookup_table_within(
     // boot, and indentation made it about 2.5x its content. The budget is in
     // these bytes.
     let bytes = serde_json::to_vec(&table).map_err(|e| format!("write lookup table: {e}"))?;
-    let shared = shared_results_bytes(&table, &bytes)?;
     // Over the budget, a candidate that reads only the one-result-per-entry
     // table would be killed loading it; a candidate that reads the shared form
     // loads that instead. So only the shared form is written, if it fits.
     let shared_only = bytes.len() as u64 > max_bytes;
-    if shared_only && shared.len() as u64 > max_bytes {
+    let shared_table = build_shared(&table, &bytes)?;
+    // Sized without being written out, so a refusal costs no more than this.
+    let shared_len = deja::LegacyDigest::of_serialized(&shared_table)
+        .map_err(|e| format!("size shared-results table: {e}"))?
+        .len;
+    if shared_only && shared_len > max_bytes {
         let correlations = table
             .entries
             .iter()
@@ -1697,11 +1706,11 @@ fn persist_lookup_table_within(
              bytes, not the correlation count, bound a run: replay these correlations as \
              several smaller runs, each naming a correlation filter. The budget is \
              {LOOKUP_TABLE_MAX_BYTES_ENV} on the replay Job's runner container. Its \
-             shared-results form, {} bytes, is over the budget too.",
-            bytes.len(),
-            shared.len()
+             shared-results form, {shared_len} bytes, is over the budget too.",
+            bytes.len()
         ));
     }
+    let shared = finish_shared(shared_table, &bytes)?;
     let legacy_bytes = bytes.len() as u64;
     let path = root.lookup_table_path(run_id);
     if shared_only {
@@ -1728,8 +1737,19 @@ fn persist_lookup_table_within(
 /// The shared-results form of `table`, whose serialization is `legacy`, after
 /// proving it expands back to exactly those bytes.
 fn shared_results_bytes(table: &deja::LookupTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
-    let shared = deja::SharedResultsTable::from_table(table, legacy)
-        .map_err(|e| format!("build shared-results table: {e}"))?;
+    finish_shared(build_shared(table, legacy)?, legacy)
+}
+
+fn build_shared(
+    table: &deja::LookupTable,
+    legacy: &[u8],
+) -> Result<deja::SharedResultsTable, String> {
+    deja::SharedResultsTable::from_table(table, legacy)
+        .map_err(|e| format!("build shared-results table: {e}"))
+}
+
+/// Serialize `shared`, then prove the bytes expand to `legacy`.
+fn finish_shared(shared: deja::SharedResultsTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
     let bytes =
         serde_json::to_vec(&shared).map_err(|e| format!("write shared-results table: {e}"))?;
     drop(shared);
@@ -6565,6 +6585,68 @@ mod tests {
                 && rendered.report.contains(&sizes.shared_bytes.to_string()),
             "{}",
             rendered.report
+        );
+    }
+
+    /// A table exactly at the budget is written in both forms, whichever form
+    /// is larger: only a table over it is written shared-only.
+    #[test]
+    fn a_table_at_the_budget_is_written_in_both_forms() {
+        for (name, (_dir, root, recording)) in [
+            ("distinct results", three_event_recording()),
+            ("repeated results", repeated_result_recording()),
+        ] {
+            let sizes =
+                super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                    .unwrap();
+            let written = super::persist_lookup_table_within(
+                &root,
+                "run-1",
+                &recording,
+                "rec-1",
+                sizes.legacy_bytes,
+            )
+            .unwrap_or_else(|e| panic!("{name}: a table at the budget is written: {e}"));
+            assert!(!written.shared_only, "{name}");
+            let path = root.lookup_table_path("run-1");
+            assert!(
+                deja::shared_results_path(&path).exists(),
+                "{name}: the shared form beside it"
+            );
+            assert!(
+                serde_json::from_slice::<deja::LookupTable>(&std::fs::read(&path).unwrap()).is_ok(),
+                "{name}: the table itself is the one-result-per-entry form"
+            );
+        }
+    }
+
+    /// Both drive paths hand the runner the render's suspects, not only the
+    /// schema's. No test reaches a drive path, so this holds them at the source.
+    #[test]
+    fn both_drive_paths_take_the_render_suspect() {
+        let needle = format!(
+            "let suspect = {}(&recording_id, &rendered);",
+            "render_suspect"
+        );
+        assert_eq!(include_str!("mod.rs").matches(&needle).count(), 2);
+    }
+
+    /// Both suspects, when both apply, are named together.
+    #[test]
+    fn a_schema_suspect_and_a_shared_only_render_are_named_together() {
+        let rendered = super::RenderedTable {
+            report: String::new(),
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION - 1),
+            shared_only: true,
+        };
+        let suspect = super::render_suspect("rec", &rendered).unwrap();
+        assert!(
+            suspect.contains("event schema") && suspect.contains("only the shared-results"),
+            "{suspect}"
+        );
+        assert!(
+            suspect.contains("smaller runs"),
+            "names a remedy: {suspect}"
         );
     }
 
