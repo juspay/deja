@@ -4637,6 +4637,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // diverge" but "how much of what it did ran on values the recording never
     // held".
     let mut corr_absorbed: BTreeMap<String, u64> = BTreeMap::new();
+    // Seed gaps per correlation: a correlation carrying one rests on a call
+    // whose precondition was never established, so it cannot be a pass.
+    let mut corr_seed_gaps: BTreeMap<String, u64> = BTreeMap::new();
     // Absorbed misses per CALL SITE, for the verdict's reason line. A count
     // with no location is not an explanation: a run can carry hundreds from one
     // uncovered seam, and "412 absorbed miss(es)" reads the same as a broken
@@ -4952,6 +4955,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // inconclusive rather than a false Novel — see InconclusiveSeedGap.
             stats.bump_kind("InconclusiveSeedGap");
             inconclusive_seed_gaps += 1;
+            if let Some(corr) = &obs.correlation_id {
+                *corr_seed_gaps.entry(corr.clone()).or_insert(0) += 1;
+            }
         } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
             // Last resort before charging the candidate: the recording for this
             // correlation stopped at request teardown and this call comes after
@@ -5279,7 +5285,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             !*status_match || !*body_match || side_effect_divergences > 0 || !span_shape_clean;
         let inconclusive = !has_blocking
             && (tail_gap_correlations.contains(corr)
-                || corr_absorbed.get(corr).is_some_and(|&n| n > 0));
+                || corr_absorbed.get(corr).is_some_and(|&n| n > 0)
+                || corr_seed_gaps.get(corr).is_some_and(|&n| n > 0));
         let passed = *status_match
             && *body_match
             && side_effect_divergences == 0
@@ -5388,15 +5395,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              declared value the recording did not hold"
         ));
     }
-    // Seed gaps are reported but do NOT by themselves fail the verdict — a
-    // missing baseline is inconclusive, not a divergence.
+    // Seed gaps are reported and do not fail the verdict — a missing baseline
+    // is not a divergence — but they force it inconclusive (below).
     if inconclusive_seed_gaps > 0 {
         reasons.push(format!(
             "{inconclusive_seed_gaps} inconclusive seed gap(s) (non-blocking)"
         ));
     }
     // A truncated recording tail is reported and does NOT fail the verdict — but
-    // it does not pass either, so unlike a seed gap it forces `inconclusive`.
+    // it does not pass either, so, like a seed gap, it forces `inconclusive`.
     if inconclusive_tail_gaps > 0 {
         reasons.push(format!(
             "{inconclusive_tail_gaps} inconclusive tail-gap call(s) across \
@@ -5444,8 +5451,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // A tail gap joins a race in forcing INCONCLUSIVE rather than merely
     // declining to block: the candidate's post-response work went unrecorded, so
     // a run carrying one has not been shown to be clean and must never report a
-    // pass. A seed gap deliberately does not do this — its missing baseline is a
-    // single call's, not a whole correlation's unjudged tail.
+    // pass. A seed gap joins them: its missing baseline is one call's rather than
+    // a whole tail, which is why it does not block, but a verdict resting on a
+    // call whose precondition was never established cannot tell, so it is not
+    // a pass either.
     // An absorbed miss joins them, and for the tail gap's exact reason. It is
     // deliberately NOT a blocking term — an absorbed miss is an added call the
     // process survived, so it cannot cost more than an unabsorbed one, which
@@ -5458,7 +5467,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // continued on a declared value the recording did not hold" beside
     // `pass: true`.
     let inconclusive = nothing
-        || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0 || absorbed_misses > 0)
+        || ((inconclusive_races > 0
+            || inconclusive_tail_gaps > 0
+            || absorbed_misses > 0
+            || inconclusive_seed_gaps > 0)
             && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
@@ -11346,32 +11358,82 @@ mod tests {
         assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
+    fn seed_gap_obs() -> ObservedCall {
+        // Execute-mode State call that ran the real boundary but found NO
+        // recorded baseline and no args-free twin to pair with.
+        exec_obs(
+            "storage",
+            Some("c1"),
+            false,
+            None,
+            None, // seed gap
+            serde_json::json!("fresh"),
+        )
+    }
+
+    /// A call whose precondition could not be established leaves its
+    /// correlation's verdict resting on an untested call: that is "cannot
+    /// tell", never "passed". Non-blocking, and inconclusive at both levels.
     #[test]
-    fn execute_seed_gap_is_inconclusive_not_blocking() {
-        // Execute-mode State call ran the real boundary but found NO recorded
-        // baseline AND no args-free twin to pair with → InconclusiveSeedGap, which
-        // is reported but does NOT fail the verdict.
+    fn a_seed_gap_is_inconclusive_never_a_pass() {
         let card = detect(&art(
             vec![], // nothing recorded → no twin to pair
-            vec![exec_obs(
-                "storage",
-                Some("c1"),
-                false,
-                None,
-                None, // seed gap
-                serde_json::json!("fresh"),
-            )],
+            vec![seed_gap_obs()],
             vec![http("c1", true, vec![])],
         ));
         assert_eq!(card.summary.inconclusive_seed_gaps, 1);
         assert_eq!(card.summary.value_divergences, 0);
         assert_eq!(card.summary.novel_calls, 0, "seed gap is not a Novel");
-        assert!(
-            card.verdict.pass,
-            "seed gap is non-blocking: {}",
-            card.verdict.reason
-        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert!(card.verdict.inconclusive, "{}", card.verdict.reason);
         assert!(card.verdict.reason.contains("seed gap"));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 scored");
+        assert!(!c1.passed, "the correlation is not a pass either");
+        assert!(c1.inconclusive);
+        assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// A seed gap makes its OWN correlation inconclusive, not the others: a
+    /// clean correlation beside it still passes and is still counted.
+    #[test]
+    fn a_seed_gap_leaves_other_correlations_passing() {
+        let card = detect(&art(
+            vec![],
+            vec![seed_gap_obs()],
+            vec![http("c1", true, vec![]), http("c2", true, vec![])],
+        ));
+        let c2 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c2")
+            .expect("c2 scored");
+        assert!(c2.passed, "a clean correlation beside a seed gap passes");
+        assert!(!c2.inconclusive);
+        assert_eq!(card.summary.matched_correlations, 1);
+        assert!(card.verdict.inconclusive, "the run still cannot tell");
+    }
+
+    /// Blocking still wins: a seed gap beside a real divergence is a failure,
+    /// not a "cannot tell".
+    #[test]
+    fn a_seed_gap_beside_a_divergence_is_still_a_failure() {
+        let card = detect(&art(
+            vec![],
+            vec![seed_gap_obs()],
+            vec![http("c1", false, vec![])],
+        ));
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert!(!card.verdict.inconclusive, "{}", card.verdict.reason);
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 scored");
+        assert!(!c1.inconclusive, "a divergence is not a cannot-tell");
     }
 
     // -----------------------------------------------------------------------
