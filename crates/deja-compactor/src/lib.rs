@@ -592,26 +592,28 @@ async fn get_decoded(
         .await
         .map_err(|e| format!("s3 read {key}: {e}"))?;
     let fetched = bytes.len() as u64;
-    Ok((decode_object(key.as_ref(), &bytes)?, fetched))
+    Ok((decode_object(key.as_ref(), bytes)?, fetched))
 }
 
 /// Decode an object's compression by extension, with a magic-byte fallback:
 /// `.zst` = the deja session layout; `.gz`/gzip-magic = deployed Vector
 /// aggregators configured with `compression: gzip` (whose extension is a
 /// Vector default we don't control).
-fn decode_object(key: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn decode_object(key: &str, bytes: bytes::Bytes) -> Result<Vec<u8>, String> {
     if key.ends_with(".zst") {
-        return zstd::stream::decode_all(std::io::Cursor::new(bytes))
+        return zstd::stream::decode_all(std::io::Cursor::new(&bytes[..]))
             .map_err(|e| format!("zstd {key}: {e}"));
     }
     if key.ends_with(".gz") || bytes.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
-        let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
+        let mut decoder = flate2::read::MultiGzDecoder::new(&bytes[..]);
         std::io::Read::read_to_end(&mut decoder, &mut out)
             .map_err(|e| format!("gzip {key}: {e}"))?;
         return Ok(out);
     }
-    Ok(bytes.to_vec())
+    // Takes the fetched buffer over when nothing else holds it, rather than
+    // holding the object twice while copying it.
+    Ok(Vec::from(bytes))
 }
 
 /// Upload one object. Small bodies go up as a single PUT; large ones are
@@ -1458,7 +1460,7 @@ async fn correlation_index_of(
             .await
             .map_err(|e| format!("s3 read {path}: {e}"))?,
     };
-    let data = decode_object(path.as_ref(), &bytes)?;
+    let data = decode_object(path.as_ref(), bytes)?;
     let mut rows = Vec::with_capacity(manifest.counts.correlations);
     for line in data.split(|&b| b == b'\n') {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -2701,6 +2703,35 @@ mod tests {
         );
     }
 
+    /// A plain object is handed back in the buffer it was fetched into, not
+    /// copied: a copy held the whole object twice until the caller's write
+    /// finished. The fetched buffer is built the way object_store builds a
+    /// multi-chunk body, and its address is taken before the call.
+    #[test]
+    fn a_plain_object_is_returned_in_its_fetched_buffer() {
+        let payload = b"{\"a\":1}\n{\"b\":2}\n";
+        let mut fetched = Vec::with_capacity(payload.len());
+        fetched.extend_from_slice(payload);
+        let fetched = bytes::Bytes::from(fetched);
+        let before = fetched.as_ptr();
+
+        let out = decode_object("plain.ndjson", fetched).unwrap();
+        assert_eq!(out, payload.to_vec());
+        assert_eq!(out.as_ptr(), before, "the plain path copied the object");
+    }
+
+    /// A buffer still shared elsewhere cannot be taken over, so it is copied,
+    /// and the result is the same bytes.
+    #[test]
+    fn a_shared_plain_buffer_is_copied_not_taken() {
+        let fetched = bytes::Bytes::from(b"plain".to_vec());
+        let held = fetched.clone();
+        let out = decode_object("plain.ndjson", fetched).unwrap();
+        assert_eq!(out, b"plain".to_vec());
+        assert_ne!(out.as_ptr(), held.as_ptr(), "a shared buffer is not reused");
+        assert_eq!(&held[..], b"plain", "the other holder is untouched");
+    }
+
     #[test]
     fn decode_object_handles_gzip_zstd_and_plain() {
         let payload = b"{\"a\":1}\n{\"b\":2}\n";
@@ -2715,23 +2746,23 @@ mod tests {
             enc.finish().unwrap();
         }
         assert_eq!(
-            decode_object("2026/07/10/x.log.gz", &gz).unwrap(),
+            decode_object("2026/07/10/x.log.gz", gz.clone().into()).unwrap(),
             payload.to_vec()
         );
         assert_eq!(
-            decode_object("2026/07/10/x.log", &gz).unwrap(),
+            decode_object("2026/07/10/x.log", gz.into()).unwrap(),
             payload.to_vec(),
             "gzip magic sniff must decode extension-less keys"
         );
 
         let zst = zstd_encode(payload).unwrap();
         assert_eq!(
-            decode_object("sessions/v1/s/data/part-00000.ndjsonl.zst", &zst).unwrap(),
+            decode_object("sessions/v1/s/data/part-00000.ndjsonl.zst", zst.into()).unwrap(),
             payload.to_vec()
         );
 
         assert_eq!(
-            decode_object("plain.ndjson", payload).unwrap(),
+            decode_object("plain.ndjson", bytes::Bytes::from_static(payload)).unwrap(),
             payload.to_vec()
         );
     }

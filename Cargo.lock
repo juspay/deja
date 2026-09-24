@@ -549,6 +549,7 @@ name = "deja-compactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "config",
  "flate2",
  "futures",
