@@ -61,16 +61,17 @@ pub fn runtime_mode_is_disabled() -> bool {
 pub use deja_runtime::hash_seed::{
     hash_seed, DejaBuildHasher, DejaHasher, HashKeys, SeededHashMap, SeededHashSet,
 };
+/// Deterministic values derived from a Substitute miss — the sanctioned way to
+/// total the recording's partial function without invalidating the experiment.
+/// See the module docs for the property ordering (determinism first, honesty
+/// last) and why non-collision is the one that is easy to skip and expensive to.
+pub use deja_runtime::identity;
 /// Row identity is read from the schema that owns it, never listed here: the
 /// statement, the registry it feeds, and the lookup consumers use.
 pub use deja_runtime::replay::{
     register_table_identity, table_identity_columns, table_identity_is_registered,
     TABLE_IDENTITY_SQL,
 };
-/// Deterministic values derived from a Substitute miss — the sanctioned way to
-/// total the recording's partial function without invalidating the experiment.
-/// See the module docs for the property ordering (determinism first, honesty
-/// last) and why non-collision is the one that is easy to skip and expensive to.
 pub use deja_runtime::synth;
 /// Re-export the correlation-propagation tracing layer, which mirrors the ingress
 /// `request_id` span field into deja-context so spawned-task boundary events

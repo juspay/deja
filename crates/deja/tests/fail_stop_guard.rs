@@ -93,6 +93,7 @@ fn fail_stop_is_contained_at_the_guard_and_never_runs_the_boundary() {
         policy_version: deja::POLICY_VERSION,
         event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![],
+        identity_entries: Vec::new(),
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("lookup.json");

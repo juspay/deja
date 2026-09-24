@@ -95,6 +95,12 @@ pub fn render_lookup_table(
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();
     let mut entries = Vec::new();
+    // The second lookup, by identity. Its stamper advances for every event, as
+    // the candidate's does for every call; entries are written only for an
+    // event another call could reach by identity alone, since otherwise the
+    // first lookup already addresses every call that could.
+    let mut identity_stamper = KeyStamper::new();
+    let mut identity_entries = Vec::new();
     let (mut dbg_ok, mut dbg_skip): (u64, u64) = (0, 0);
     let mut dbg_first_err: Option<String> = None;
     // Every schema the recording's events were captured under. The candidate
@@ -164,6 +170,23 @@ pub fn render_lookup_table(
                 source_event_global_sequence: event.global_sequence,
             });
         }
+        let identity_keys = identity_stamper.stamp(
+            event.correlation_id.as_deref(),
+            Some(bucket_id),
+            fork_seq,
+            identity,
+            &loci,
+            deja::identity::identity_args_hash(&event.args),
+        );
+        if deja::identity::identity_applies(&event.args) {
+            for key in identity_keys {
+                identity_entries.push(LookupEntry {
+                    key,
+                    result: std::sync::Arc::clone(&result),
+                    source_event_global_sequence: event.global_sequence,
+                });
+            }
+        }
     }
 
     // Permanent guard: dropping unparseable events here silently mutilates the
@@ -206,6 +229,7 @@ pub fn render_lookup_table(
         policy_version,
         event_schema_version: schemas.first().copied(),
         entries,
+        identity_entries,
     })
 }
 
@@ -622,8 +646,8 @@ mod tests {
     #[test]
     fn a_call_whose_embedded_document_was_written_in_another_order_is_served() {
         let (served, _) = replay_one_call(
-            serde_json::json!({ "body": r#"{"a":1,"b":[1,2]}"# }),
-            serde_json::json!({ "body": r#"{"b":[2,1],"a":1}"# }),
+            serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
         );
         assert_eq!(served, Some(serde_json::json!("served")));
     }

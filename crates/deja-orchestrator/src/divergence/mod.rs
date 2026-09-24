@@ -6219,6 +6219,7 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
         // No table was read, so no schema is known; the scorer never consults it.
         event_schema_version: None,
         entries: Vec::new(),
+        identity_entries: Vec::new(),
     };
     if !path.exists() {
         return empty();
@@ -6818,6 +6819,7 @@ mod tests {
                 policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -6906,6 +6908,7 @@ mod tests {
                     seq_entry(Some("c-drop"), "db", 2),
                     seq_entry(None, "db", 3),
                 ],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -7028,6 +7031,7 @@ mod tests {
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
                 ],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -7438,6 +7442,7 @@ mod tests {
                 policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
+                identity_entries: Vec::new(),
             },
             observed,
             http_diffs: http,
@@ -9079,6 +9084,7 @@ mod tests {
                 policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
+                identity_entries: Vec::new(),
             },
             observed,
             http_diffs: vec![http(corr, true, vec![])],
@@ -11091,6 +11097,7 @@ mod tests {
                     raced_result.clone(),
                 ),
             ],
+            identity_entries: Vec::new(),
         };
         let observed = vec![
             exec_obs(

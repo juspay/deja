@@ -1085,6 +1085,13 @@ pub struct LookupTable {
     #[serde(default)]
     pub event_schema_version: Option<u16>,
     pub entries: Vec<LookupEntry>,
+    /// The second lookup: events keyed by the hash of their args' identity
+    /// form ([`crate::identity`]), for the events whose identity differs from
+    /// their exact args. Consulted only when `entries` misses. A candidate
+    /// that predates it ignores it, so `entries` is unchanged by it and the
+    /// policy version does not move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_entries: Vec<LookupEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1132,6 +1139,8 @@ pub struct SharedResultsTable {
     pub event_schema_version: Option<u16>,
     pub results: Vec<serde_json::Value>,
     pub entries: Vec<SharedResultsEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_entries: Vec<SharedResultsEntry>,
     /// The one-result-per-entry table this was written from, when it is
     /// written beside one. The loader serves this form only if the table
     /// beside it still matches, so a file left from another run is never
@@ -1210,33 +1219,40 @@ impl SharedResultsTable {
         let mut results = Vec::new();
         let mut by_pointer: HashMap<*const serde_json::Value, usize> = HashMap::new();
         let mut by_bytes: HashMap<Vec<u8>, usize> = HashMap::new();
-        let mut entries = Vec::with_capacity(table.entries.len());
-        for entry in &table.entries {
-            let pointer = std::sync::Arc::as_ptr(&entry.result);
-            let result_index = match by_pointer.get(&pointer) {
-                Some(&index) => index,
-                None => {
-                    let bytes = serde_json::to_vec(&*entry.result)?;
-                    let index = *by_bytes.entry(bytes).or_insert_with(|| {
-                        results.push((*entry.result).clone());
-                        results.len() - 1
+        let mut share =
+            |from: &[LookupEntry]| -> Result<Vec<SharedResultsEntry>, serde_json::Error> {
+                let mut entries = Vec::with_capacity(from.len());
+                for entry in from {
+                    let pointer = std::sync::Arc::as_ptr(&entry.result);
+                    let result_index = match by_pointer.get(&pointer) {
+                        Some(&index) => index,
+                        None => {
+                            let bytes = serde_json::to_vec(&*entry.result)?;
+                            let index = *by_bytes.entry(bytes).or_insert_with(|| {
+                                results.push((*entry.result).clone());
+                                results.len() - 1
+                            });
+                            by_pointer.insert(pointer, index);
+                            index
+                        }
+                    };
+                    entries.push(SharedResultsEntry {
+                        key: entry.key.clone(),
+                        result_index,
+                        source_event_global_sequence: entry.source_event_global_sequence,
                     });
-                    by_pointer.insert(pointer, index);
-                    index
                 }
+                Ok(entries)
             };
-            entries.push(SharedResultsEntry {
-                key: entry.key.clone(),
-                result_index,
-                source_event_global_sequence: entry.source_event_global_sequence,
-            });
-        }
+        let entries = share(&table.entries)?;
+        let identity_entries = share(&table.identity_entries)?;
         Ok(Self {
             recording_id: table.recording_id.clone(),
             policy_version: SHARED_RESULTS_POLICY_VERSION,
             event_schema_version: table.event_schema_version,
             results,
             entries,
+            identity_entries,
             legacy_digest: Some(LegacyDigest::of(legacy_bytes)),
         })
     }
@@ -1246,29 +1262,32 @@ impl SharedResultsTable {
         let results: Vec<std::sync::Arc<serde_json::Value>> =
             self.results.into_iter().map(std::sync::Arc::new).collect();
         let count = results.len();
-        let entries = self
-            .entries
-            .into_iter()
-            .map(|entry| match results.get(entry.result_index) {
-                Some(result) => Ok(LookupEntry {
-                    key: entry.key,
-                    result: std::sync::Arc::clone(result),
-                    source_event_global_sequence: entry.source_event_global_sequence,
-                }),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "lookup table entry points at result {} of {count}",
-                        entry.result_index
-                    ),
-                )),
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let unshare = |from: Vec<SharedResultsEntry>| {
+            from.into_iter()
+                .map(|entry| match results.get(entry.result_index) {
+                    Some(result) => Ok(LookupEntry {
+                        key: entry.key,
+                        result: std::sync::Arc::clone(result),
+                        source_event_global_sequence: entry.source_event_global_sequence,
+                    }),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "lookup table entry points at result {} of {count}",
+                            entry.result_index
+                        ),
+                    )),
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        };
+        let entries = unshare(self.entries)?;
+        let identity_entries = unshare(self.identity_entries)?;
         Ok(LookupTable {
             recording_id: self.recording_id,
             policy_version: POLICY_VERSION,
             event_schema_version: self.event_schema_version,
             entries,
+            identity_entries,
         })
     }
 }
@@ -1782,7 +1801,9 @@ fn hash_request_body(hash: u64, map: &serde_json::Map<String, serde_json::Value>
 /// A captured body's bytes as text — the `text` member when the capture kept
 /// one, otherwise decoded from `raw_bytes`. `None` when neither is present or
 /// the bytes are not UTF-8.
-fn request_body_text(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+pub(crate) fn request_body_text(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
     if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
         return Some(text.to_owned());
     }
@@ -2188,6 +2209,7 @@ impl LookupTableSource for LocalFileLookupSource {
             policy_version: POLICY_VERSION,
             event_schema_version: None,
             entries,
+            identity_entries: Vec::new(),
         })
     }
 }
@@ -2337,6 +2359,12 @@ struct HookEntry {
 /// result if found.
 pub struct LookupTableHook {
     table: HashMap<LookupKey, HookEntry>,
+    /// The table's second lookup, by identity; see [`LookupTable::identity_entries`].
+    identity_table: HashMap<LookupKey, HookEntry>,
+    /// Occurrences over identity hashes. Advanced on every call whenever the
+    /// table has a second lookup, in lockstep with the renderer, which
+    /// advances it for every event.
+    identity_stamper: Mutex<KeyStamper>,
     /// Shared occurrence assigner; advanced for every rank on every call so its
     /// numbering stays in lockstep with the renderer's. It once also fed rank
     /// 6, a positional `Sequence` locus since removed, which never produced a
@@ -2376,18 +2404,23 @@ impl LookupTableHook {
         // Checked here rather than in the source: the scorer reads the same
         // table for what the recording held, and that is valid under any schema.
         let table = check_event_schema_version(source.load()?)?;
-        let mut map = HashMap::with_capacity(table.entries.len());
-        for entry in table.entries {
-            map.insert(
-                entry.key,
-                HookEntry {
-                    result: entry.result,
-                    source_event_global_sequence: entry.source_event_global_sequence,
-                },
-            );
-        }
+        let index = |entries: Vec<LookupEntry>| {
+            let mut map = HashMap::with_capacity(entries.len());
+            for entry in entries {
+                map.insert(
+                    entry.key,
+                    HookEntry {
+                        result: entry.result,
+                        source_event_global_sequence: entry.source_event_global_sequence,
+                    },
+                );
+            }
+            map
+        };
         Ok(Self {
-            table: map,
+            table: index(table.entries),
+            identity_table: index(table.identity_entries),
+            identity_stamper: Mutex::new(KeyStamper::new()),
             stamper: Mutex::new(KeyStamper::new()),
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
@@ -2472,6 +2505,33 @@ impl LookupTableHook {
             if let Some(entry) = self.table.get(key) {
                 hit = Some((entry, key.locus.rank()));
                 break;
+            }
+        }
+
+        // The second lookup, by the args' identity form: the same call with an
+        // array in another order, or a document written in another order. Not
+        // the arg-tolerant fallback refused below: a call is served here only
+        // when its identity is the recorded call's, never when an argument
+        // changed. Its occurrences advance on every call, hit or miss.
+        if !self.identity_table.is_empty() {
+            let identity_keys = match self.identity_stamper.lock() {
+                Ok(mut stamper) => stamper.stamp(
+                    correlation_id.as_deref(),
+                    bucket_id.as_deref(),
+                    fork_seq,
+                    identity,
+                    &loci,
+                    crate::identity::identity_args_hash(query.args),
+                ),
+                Err(_) => Vec::new(),
+            };
+            if hit.is_none() {
+                for key in &identity_keys {
+                    if let Some(entry) = self.identity_table.get(key) {
+                        hit = Some((entry, key.locus.rank()));
+                        break;
+                    }
+                }
             }
         }
 
@@ -4435,6 +4495,7 @@ mod tests {
                     9,
                 ),
             ],
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -5056,6 +5117,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
+            identity_entries: Vec::new(),
         }
     }
 
@@ -5366,6 +5428,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
+            identity_entries: Vec::new(),
         });
         assert_eq!(
             ask(&hook, "time", "date_time::now", &identity, &none),
@@ -5460,6 +5523,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -5560,6 +5624,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries,
+            identity_entries: Vec::new(),
         }
     }
 
@@ -6215,6 +6280,7 @@ mod tests {
                     2,
                 ),
             ],
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -6260,6 +6326,7 @@ mod tests {
                 serde_json::json!({ "Ok": "row_recorded" }),
                 1,
             )],
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -6293,6 +6360,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -6495,6 +6563,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
+            identity_entries: Vec::new(),
         };
         let hook =
             LookupTableHook::from_source(VecSource(Some(empty)), InMemoryObservedSink::new())
@@ -6529,6 +6598,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
+            identity_entries: Vec::new(),
         };
         let hook =
             LookupTableHook::from_source(VecSource(Some(empty)), InMemoryObservedSink::new())
@@ -6585,6 +6655,7 @@ mod tests {
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
+            identity_entries: Vec::new(),
         };
         let inner =
             LookupTableHook::from_source(VecSource(Some(empty)), InMemoryObservedSink::new())
@@ -6619,6 +6690,7 @@ mod tests {
                 policy_version: POLICY_VERSION,
                 event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
+                identity_entries: Vec::new(),
             })),
             InMemoryObservedSink::new(),
         )
@@ -8650,6 +8722,7 @@ redis\tcurrency\tusd
                 serde_json::json!(2), // recorded baseline result
                 7,
             )],
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -8700,6 +8773,7 @@ redis\tcurrency\tusd
             policy_version: POLICY_VERSION,
             event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![],
+            identity_entries: Vec::new(),
         };
         let observed = InMemoryObservedSink::new();
         let handle = observed.handle();
@@ -9057,6 +9131,7 @@ mod shared_results {
                 entry(2, graph()),
                 entry(3, Arc::new(serde_json::json!("other"))),
             ],
+            identity_entries: Vec::new(),
         }
     }
 
