@@ -380,19 +380,39 @@ fn values_traded_between_placeholders_are_a_different_query() {
     let right = capture_query_with(Some(&key), &set("y", "x"))
         .binds
         .expect("keyed");
-    let binds = |image: &serde_json::Value| image["binds"].as_object().cloned().expect("an object");
+    // Read the values whatever the binds' shape, so the property below, not a
+    // shape check, is what fails if the binds go back to being a list.
+    let values = |image: &serde_json::Value| -> Vec<String> {
+        let mut values: Vec<String> = match &image["binds"] {
+            serde_json::Value::Object(map) => map.values().map(ToString::to_string).collect(),
+            serde_json::Value::Array(items) => items.iter().map(ToString::to_string).collect(),
+            other => panic!("binds is neither an object nor a list: {other}"),
+        };
+        values.sort();
+        values
+    };
     assert_eq!(
-        binds(&left).keys().collect::<Vec<_>>(),
-        ["$1", "$2"],
-        "one key per placeholder, in placeholder order"
-    );
-    let mut left_values: Vec<_> = binds(&left).values().map(ToString::to_string).collect();
-    let mut right_values: Vec<_> = binds(&right).values().map(ToString::to_string).collect();
-    left_values.sort();
-    right_values.sort();
-    assert_eq!(
-        left_values, right_values,
+        values(&left),
+        values(&right),
         "premise: the same values, traded"
     );
-    assert_ne!(left, right);
+    // The scorer forgives array order by sorting every array before it compares.
+    // The two images must still differ under that rule.
+    assert_ne!(sort_every_array(&left), sort_every_array(&right));
+}
+
+fn sort_every_array(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            let mut items: Vec<_> = items.iter().map(sort_every_array).collect();
+            items.sort_by_key(ToString::to_string);
+            serde_json::Value::Array(items)
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), sort_every_array(item)))
+                .collect(),
+        ),
+        scalar => scalar.clone(),
+    }
 }
