@@ -2249,6 +2249,11 @@ enum ValueAbsorption {
     /// the candidate: a replay-local SERIAL, an error's diagnostic text, an
     /// `UPDATE … RETURNING` whose returned rows the statement itself explains.
     DbInfrastructure,
+    /// The candidate served this call's own recorded error instead of running
+    /// it, because the site declared that error state-neutral. The value is
+    /// the recording's by construction, so it is not compared; it is counted,
+    /// so a run shows how many calls it did not re-run.
+    ServedRecordedError,
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
@@ -2329,6 +2334,9 @@ fn observed_value_verdict(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
 ) -> Option<ValueVerdict> {
+    if obs.resolved && obs.provenance == deja::Provenance::ServedRecordedError {
+        return Some(ValueVerdict::Absorbed(ValueAbsorption::ServedRecordedError));
+    }
     if !obs.resolved || obs.provenance != deja::Provenance::Shadow {
         return None;
     }
@@ -4753,6 +4761,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
+            }
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::ServedRecordedError)) = verdict {
+                stats.note_kind("ServedRecordedError");
             }
             let diverged = matches!(verdict, Some(ValueVerdict::Diverged));
             if diverged {
@@ -8000,6 +8011,37 @@ mod tests {
             db.matched,
             db.diverged
         );
+    }
+
+    /// A call the candidate served from its own recorded error is counted
+    /// under its own name, once, and blocks nothing: never silent, never a
+    /// divergence.
+    #[test]
+    fn a_served_recorded_error_is_counted_by_name_and_does_not_diverge() {
+        let unique =
+            serde_json::json!({ "version": 1, "result": "Err", "kind": "UniqueViolation" });
+        let mut event = db_read_declaring("");
+        event.correlation_id = Some("c1".to_owned());
+        event.global_sequence = 1;
+        event.declaration = None;
+        let mut served = exec_obs(
+            "db",
+            Some("c1"),
+            true,
+            Some(1),
+            Some(unique.clone()),
+            unique,
+        );
+        served.provenance = deja::Provenance::ServedRecordedError;
+        let card = detect(&art_with_events(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![served],
+            vec![],
+            vec![event],
+        ));
+        assert_eq!(kind_count(&card, "db", "ServedRecordedError"), 1);
+        let db = &card.per_boundary["db"];
+        assert_eq!((db.matched, db.diverged), (1, 0));
     }
 
     fn value_canon_warning(card: &Scorecard) -> Option<&String> {

@@ -1,0 +1,300 @@
+//! `#[deja::boundary(neutral_error = ...)]` through the macro and the global
+//! seam: a replayed `Execute` site whose recorded call failed with an error the
+//! site declares state-neutral returns that recorded error instead of running,
+//! and one that declares nothing runs as it always has.
+//!
+//! Why: the recorded run's insert failed and wrote no row. Running it again on
+//! replay can succeed and write a row the recording never had, so every later
+//! statement in that request runs against a different database. Serving the
+//! recorded error writes nothing, as the recording did.
+//!
+//! Own test binary: `set_global_runtime_hook` is a one-shot `OnceLock`.
+#![allow(unused_braces)]
+
+use tracing_subscriber::prelude::*;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum DbError {
+    UniqueViolation,
+    SerializationFailure,
+}
+
+/// The envelope shape deja's `ResultCodec` writes: a `result` discriminator,
+/// and the error's kind. That discriminator is all deja reads.
+struct EnvelopeCodec;
+
+impl deja::codec::ReplayCodec for EnvelopeCodec {
+    type Value = Result<u64, DbError>;
+
+    fn capture(value: &Self::Value) -> (serde_json::Value, bool) {
+        match value {
+            Ok(v) => (
+                serde_json::json!({ "version": 1, "result": "Ok", "value": v }),
+                false,
+            ),
+            Err(e) => (
+                serde_json::json!({ "version": 1, "result": "Err", "kind": e }),
+                true,
+            ),
+        }
+    }
+
+    fn reconstruct(recorded: serde_json::Value) -> Option<Self::Value> {
+        match recorded.get("result")?.as_str()? {
+            "Ok" => Some(Ok(recorded.get("value")?.as_u64()?)),
+            "Err" => Some(Err(
+                serde_json::from_value(recorded.get("kind")?.clone()).ok()?
+            )),
+            _ => None,
+        }
+    }
+}
+
+fn is_unique(out: &Result<u64, DbError>) -> bool {
+    matches!(out, Err(DbError::UniqueViolation))
+}
+
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "declared_insert",
+    site = "declared_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+    neutral_error = is_unique,
+)]
+async fn declared_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "undeclared_insert",
+    site = "undeclared_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+)]
+async fn undeclared_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "declared_sync_insert",
+    site = "declared_sync_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+    neutral_error = is_unique,
+)]
+fn declared_sync_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+/// Declared neutral with no site, called inside a span: found by its span path,
+/// the way production calls are.
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "span_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+    neutral_error = is_unique,
+)]
+async fn span_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+/// Declared neutral but with no site, so its recorded row can be found only by
+/// the unlocated rank. That rank can hand one call another call's row, so it
+/// runs.
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "unlocated_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+    neutral_error = is_unique,
+)]
+async fn unlocated_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let std::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// This call's recorded row, at `locus`.
+fn recorded(
+    operation: &str,
+    locus: deja::Locus,
+    row: &str,
+    result: serde_json::Value,
+) -> deja::LookupEntry {
+    deja::LookupEntry {
+        key: deja::LookupKey {
+            correlation_id: None,
+            bucket_id: Some("root".to_owned()),
+            fork_seq: 0,
+            boundary: "db".to_owned(),
+            component: "tests::macro_neutral_error".to_owned(),
+            operation: operation.to_owned(),
+            locus,
+            args_hash: deja::canonical_args_hash(&serde_json::json!({ "row": row })),
+            occurrence: 0,
+        },
+        result: std::sync::Arc::new(result),
+        source_event_global_sequence: 1,
+    }
+}
+
+fn site(name: &str) -> deja::Locus {
+    deja::Locus::DeclaredSite(name.to_owned())
+}
+
+#[test]
+fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
+    let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer::new());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // The span path the runtime computes for this span, so the recorded row is
+    // keyed where a call made inside it looks.
+    let span_path = {
+        let _span = tracing::info_span!("insert_process").entered();
+        deja::__private::current_span_path().expect("a span path inside a span")
+    };
+    let unique = serde_json::json!({ "version": 1, "result": "Err", "kind": "UniqueViolation" });
+    let other =
+        serde_json::json!({ "version": 1, "result": "Err", "kind": "SerializationFailure" });
+    let table = deja::LookupTable {
+        recording_id: "neutral-error-test".to_owned(),
+        policy_version: deja::POLICY_VERSION,
+        event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+        entries: vec![
+            recorded(
+                "declared_insert",
+                site("declared_insert"),
+                "a",
+                unique.clone(),
+            ),
+            recorded("declared_insert", site("declared_insert"), "b", other),
+            recorded(
+                "undeclared_insert",
+                site("undeclared_insert"),
+                "a",
+                unique.clone(),
+            ),
+            recorded(
+                "span_insert",
+                deja::Locus::SpanPath { path: span_path },
+                "a",
+                unique.clone(),
+            ),
+            recorded(
+                "declared_sync_insert",
+                site("declared_sync_insert"),
+                "a",
+                unique.clone(),
+            ),
+            recorded("unlocated_insert", deja::Locus::Unlocated, "a", unique),
+        ],
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lookup.json");
+    std::fs::write(&path, serde_json::to_vec(&table).expect("serialize table"))
+        .expect("write table");
+    let sink = deja::InMemoryObservedSink::new();
+    let calls = sink.handle();
+    let hook = deja::LookupTableHook::from_source(deja::LocalFileLookupSource::new(path), sink)
+        .expect("hook");
+    deja::set_global_runtime_hook(Some(deja::RuntimeHook::LookupReplay(hook)))
+        .expect("install runtime hook");
+
+    // Declared, found at its site, the declared kind: served, not run.
+    assert_eq!(
+        block_on(declared_insert("a")),
+        Err(DbError::UniqueViolation)
+    );
+    assert_eq!(
+        BODY_RUNS.load(Ordering::SeqCst),
+        0,
+        "the boundary did not run"
+    );
+
+    // Declared, but the recorded error is another kind: run, as today.
+    assert_eq!(block_on(declared_insert("b")), Ok(1));
+    assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 1);
+
+    // Undeclared: the same recorded error runs, as today.
+    assert_eq!(block_on(undeclared_insert("a")), Ok(1));
+    assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 2);
+
+    // The sync seam serves as the async one does.
+    assert_eq!(declared_sync_insert("a"), Err(DbError::UniqueViolation));
+    assert_eq!(
+        BODY_RUNS.load(Ordering::SeqCst),
+        2,
+        "the sync boundary did not run"
+    );
+
+    // Declared, found by its span path, the production rank: served.
+    {
+        let _span = tracing::info_span!("insert_process").entered();
+        assert_eq!(block_on(span_insert("a")), Err(DbError::UniqueViolation));
+    }
+    assert_eq!(
+        BODY_RUNS.load(Ordering::SeqCst),
+        2,
+        "the span-path boundary did not run"
+    );
+
+    // Declared, but its row is found only unlocated: run, not served.
+    assert_eq!(block_on(unlocated_insert("a")), Ok(1));
+    assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 3);
+
+    let seen: Vec<_> = calls
+        .lock()
+        .expect("observed calls")
+        .iter()
+        .map(|c| (c.method_name.clone(), c.resolved_rank, c.provenance))
+        .collect();
+    use deja::Provenance::{ServedRecordedError as Served, Shadow};
+    assert_eq!(
+        seen,
+        vec![
+            ("declared_insert".to_owned(), Some(1), Served),
+            ("declared_insert".to_owned(), Some(1), Shadow),
+            ("undeclared_insert".to_owned(), Some(1), Shadow),
+            ("declared_sync_insert".to_owned(), Some(1), Served),
+            ("span_insert".to_owned(), Some(2), Served),
+            ("unlocated_insert".to_owned(), Some(3), Shadow),
+        ],
+        "every call found its own recorded row, and only those found at their site were served"
+    );
+}

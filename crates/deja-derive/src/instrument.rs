@@ -148,23 +148,42 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // gave and launders the divergence into a false pass. Egress stays fail-stop;
     // the declaration site, which knows its own return type, decides.
     let on_miss_expr = args.on_miss;
+    let neutral_error_expr = args.neutral_error;
+    let execute_declared = match args.replay.as_ref() {
+        Some(id) => id == "Execute",
+        None => matches!(preset, Preset::Redis),
+    };
+    // A `Substitute` site already returns whatever was recorded, error or not,
+    // and never re-runs; a `neutral_error` there would do nothing, which reads
+    // as protection it is not.
+    if neutral_error_expr.is_some() && !execute_declared {
+        return syn::Error::new_spanned(
+            &sig.ident,
+            "`neutral_error` decides whether an `Execute` site re-runs a recorded \
+             error; a `Substitute` site never re-runs. Declare `replay = Execute` or drop \
+             `neutral_error`",
+        )
+        .to_compile_error();
+    }
+    let (dispatch_async_fn, dispatch_fn, neutral_arg) = match &neutral_error_expr {
+        Some(expr) => (
+            quote!(dispatch_async_serving),
+            quote!(dispatch_serving),
+            quote!(::std::option::Option::Some(#expr),),
+        ),
+        None => (quote!(dispatch_async), quote!(dispatch), quote!()),
+    };
     // `on_miss` under Execute would be dead code: the Execute branch either runs
     // live behind a shadow token or fail-stops on an unavailable one, and never
     // reaches the Substitute-miss arm. A declaration that does nothing is a
     // silent skip, so reject it here rather than let it read as protection.
-    if on_miss_expr.is_some() {
-        let execute_declared = match args.replay.as_ref() {
-            Some(id) => id == "Execute",
-            None => matches!(preset, Preset::Redis),
-        };
-        if execute_declared {
-            return syn::Error::new_spanned(
-                &sig.ident,
-                "`on_miss` applies to the Substitute-miss branch, which an `Execute` \
-                 site never reaches; declare `replay = Substitute` or drop `on_miss`",
-            )
-            .to_compile_error();
-        }
+    if on_miss_expr.is_some() && execute_declared {
+        return syn::Error::new_spanned(
+            &sig.ident,
+            "`on_miss` applies to the Substitute-miss branch, which an `Execute` \
+             site never reaches; declare `replay = Substitute` or drop `on_miss`",
+        )
+        .to_compile_error();
     }
 
     let state_read = args.state_read;
@@ -545,13 +564,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
 
-                            ::deja::__private::dispatch_async(
+                            ::deja::__private::#dispatch_async_fn(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
                                 #compare_closure,
+                                #neutral_arg
                             ).await
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -580,13 +600,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
 
-                            ::std::boxed::Box::pin(::deja::__private::dispatch_async(
+                            ::std::boxed::Box::pin(::deja::__private::#dispatch_async_fn(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move { #block.await },
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
                                 #compare_closure,
+                                #neutral_arg
                             ))
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -612,13 +633,14 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
 
-                            ::deja::__private::dispatch(
+                            ::deja::__private::#dispatch_fn(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 || #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
                                 #compare_closure,
+                                #neutral_arg
                             )
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -1233,6 +1255,15 @@ pub struct InstrumentArgs {
     /// `__deja_result`; the marker is built only when the expression mentions
     /// it, so a miss value that needs no attribution costs no args clone.
     pub on_miss: Option<Expr>,
+    /// STATE-NEUTRAL RECORDED ERROR. `neutral_error = <predicate>`: a closure
+    /// over the boundary's rebuilt return value that says whether a recorded
+    /// error is one that changed no state (a unique violation wrote no row).
+    /// When it holds, an `Execute` site returns this call's own recorded error
+    /// in replay instead of re-running, so the replay does not write a row the
+    /// recording never wrote. Only an `Execute` site re-runs, so it is refused
+    /// on any other. On a generic return type the closure needs its parameter
+    /// annotated (`|out: &Captured<StorageResult<R>>| ...`), or a named fn.
+    pub neutral_error: Option<Expr>,
     pub state_read: Option<Expr>,
     pub state_write: Option<Expr>,
     pub state_touch: Option<Expr>,
@@ -1305,6 +1336,7 @@ impl Parse for InstrumentArgs {
                         "result" => args.result = Some(input.parse()?),
                         "codec" => args.codec = Some(input.parse()?),
                         "on_miss" => args.on_miss = Some(input.parse()?),
+                        "neutral_error" => args.neutral_error = Some(input.parse()?),
                         "state_read" => args.state_read = Some(input.parse()?),
                         "state_write" => args.state_write = Some(input.parse()?),
                         "state_touch" => args.state_touch = Some(input.parse()?),
@@ -1670,6 +1702,47 @@ mod tests {
 
     /// `on_miss` under Execute would never fire. A declaration that does nothing
     /// reads as protection, so it is rejected instead of silently ignored.
+    /// `neutral_error` decides whether an `Execute` site re-runs; a
+    /// `Substitute` site never re-runs, so a declaration there would do
+    /// nothing and is refused.
+    #[test]
+    fn neutral_error_on_a_substitute_site_is_a_build_error() {
+        let expand = |args| {
+            generate(
+                parse_args(args),
+                parse_fn(quote!(
+                    async fn insert(row: String) -> Result<u64, String> {
+                        Ok(1)
+                    }
+                )),
+            )
+            .to_string()
+        };
+        let refused = expand(quote!(
+            boundary = "db",
+            replay = Substitute,
+            neutral_error = |_| true
+        ));
+        assert!(
+            refused.contains("compile_error") && refused.contains("neutral_error"),
+            "{refused}"
+        );
+
+        let declared = expand(quote!(
+            boundary = "db",
+            replay = Execute,
+            neutral_error = |_| true
+        ));
+        assert!(!declared.contains("compile_error"), "{declared}");
+        assert!(declared.contains("dispatch_async_serving"), "{declared}");
+
+        let undeclared = expand(quote!(boundary = "db", replay = Execute));
+        assert!(
+            !undeclared.contains("dispatch_async_serving"),
+            "{undeclared}"
+        );
+    }
+
     #[test]
     fn on_miss_on_an_execute_site_is_a_build_error() {
         let expanded = generate(

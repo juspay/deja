@@ -101,7 +101,7 @@ pub struct CallRecord {
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | novel | novel_absorbed | inconclusive_seed_gap |
+    /// matched | recovered | served_recorded_error | novel | novel_absorbed | inconclusive_seed_gap |
     /// inconclusive_tail_gap | omitted | environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
     /// identity_skew | pruned_subtree | novel_subtree
@@ -542,7 +542,10 @@ pub(crate) fn build_with_inconclusive_into(
         let (kind, blocking) = if obs.resolved {
             consumed.extend(obs.source_event_global_sequence);
             let recovered = obs.resolved_rank == Some(POSITIONAL_FALLBACK_RANK);
-            if skewed {
+            if obs.provenance == deja::Provenance::ServedRecordedError {
+                // Named, not "matched": the candidate did not run this call.
+                ("served_recorded_error", false)
+            } else if skewed {
                 ("identity_skew", false)
             } else {
                 (if recovered { "recovered" } else { "matched" }, false)
@@ -1071,6 +1074,25 @@ mod tests {
              blocking: {gap_row:?}"
         );
         assert_ne!(gap_row.kind, "novel");
+    }
+
+    /// A call the candidate served from its own recorded error is named on
+    /// its row, not reported as a match, and blocks nothing.
+    #[test]
+    fn a_served_recorded_error_is_named_on_its_row() {
+        let events = vec![event(1, "db", Some("c1"))];
+        let mut served = obs("db", Some("c1"), true, Some(2), Some(1));
+        served.provenance = deja::Provenance::ServedRecordedError;
+        let rows = build(
+            &events,
+            &[served],
+            &table_for(&events, &HashMap::new()),
+            &HashSet::new(),
+        );
+        let named = find(&rows, "served_recorded_error");
+        assert_eq!(named.len(), 1, "{rows:?}");
+        assert!(!named[0].blocking);
+        assert!(find(&rows, "matched").is_empty());
     }
 
     #[test]
