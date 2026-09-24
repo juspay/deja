@@ -1512,7 +1512,7 @@ fn render_and_persist_lookup_table(
 ) -> Result<RenderedTable, String> {
     let raw = std::env::var(LOOKUP_TABLE_MAX_BYTES_ENV).ok();
     let (max_bytes, budget) = describe_lookup_table_budget(raw.as_deref());
-    let (entries, bytes, event_schema_version) = persist_lookup_table_within(
+    let (entries, bytes, shared_bytes, event_schema_version) = persist_lookup_table_within(
         root,
         run_id,
         recording,
@@ -1521,7 +1521,14 @@ fn render_and_persist_lookup_table(
     )
     .map_err(|e| format!("{e} Budget in force: {budget}."))?;
     Ok(RenderedTable {
-        report: format!("{entries} entries rendered, {bytes} bytes compact; budget {budget}"),
+        report: format!(
+            "{entries} entries rendered; one-result-per-entry table {bytes} bytes compact \
+             (compared against the budget, {budget}); shared-results table {shared_bytes} \
+             bytes (information only){}",
+            resident_fact()
+                .map(|fact| format!("; runner {fact}"))
+                .unwrap_or_default()
+        ),
         event_schema_version,
     })
 }
@@ -1615,7 +1622,7 @@ fn persist_lookup_table_within(
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
     max_bytes: u64,
-) -> Result<(usize, u64, Option<u16>), String> {
+) -> Result<(usize, u64, u64, Option<u16>), String> {
     let table = crate::lookup::render_lookup_table(recording, recording_id)
         .map_err(|e| format!("render lookup table: {e}"))?;
     // Compact, not pretty: the candidate holds this whole file in one buffer at
@@ -1640,12 +1647,49 @@ fn persist_lookup_table_within(
         ));
     }
     let size = bytes.len() as u64;
-    std::fs::write(root.lookup_table_path(run_id), bytes)
-        .map_err(|e| format!("write lookup table: {e}"))?;
+    let shared = shared_results_bytes(&table, &bytes)?;
+    let path = root.lookup_table_path(run_id);
+    let sibling = deja::shared_results_path(&path);
+    std::fs::write(&path, bytes).map_err(|e| format!("write lookup table: {e}"))?;
+    crate::divergence::behaviour_tree::write_atomic(&sibling, &shared)
+        .map_err(|e| format!("write shared-results table: {e}"))?;
     if table.entries.is_empty() {
         return Err("rendered lookup table is empty".to_string());
     }
-    Ok((table.entries.len(), size, table.event_schema_version))
+    Ok((
+        table.entries.len(),
+        size,
+        shared.len() as u64,
+        table.event_schema_version,
+    ))
+}
+
+/// The shared-results form of `table`, whose serialization is `legacy`, after
+/// proving it expands back to exactly those bytes.
+fn shared_results_bytes(table: &deja::LookupTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
+    let shared = deja::SharedResultsTable::from_table(table, legacy)
+        .map_err(|e| format!("build shared-results table: {e}"))?;
+    let bytes =
+        serde_json::to_vec(&shared).map_err(|e| format!("write shared-results table: {e}"))?;
+    expands_to(shared, legacy)?;
+    Ok(bytes)
+}
+
+/// Refuse a shared-results table that does not expand to the table it was
+/// written from. A candidate reads one and the scorer may read the other, so
+/// they must be the same table, not merely both plausible.
+fn expands_to(shared: deja::SharedResultsTable, legacy: &[u8]) -> Result<(), String> {
+    let expanded = shared.into_table().map_err(|e| e.to_string())?;
+    let got = deja::LegacyDigest::of_serialized(&expanded).map_err(|e| e.to_string())?;
+    let want = deja::LegacyDigest::of(legacy);
+    if got != want {
+        return Err(format!(
+            "the shared-results table does not expand to the table it was written from \
+             ({} bytes, FNV-1a {:016x}, against {} bytes, {:016x}); neither is written",
+            got.len, got.fnv1a, want.len, want.fnv1a
+        ));
+    }
+    Ok(())
 }
 
 /// Final stage (shared): score the run, report the verdict, register the
@@ -6225,7 +6269,7 @@ mod tests {
     #[test]
     fn the_lookup_table_is_written_compact_and_loads_back() {
         let (_dir, root, recording) = three_event_recording();
-        let (entries, _, _) =
+        let (entries, _, _, _) =
             super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
                 .unwrap();
         assert!(entries > 0, "the fixture renders entries");
@@ -6250,6 +6294,78 @@ mod tests {
                 .any(|e| *e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })),
             "results survive the compact encoding"
         );
+    }
+
+    /// The shared-results table is written beside the table, and it is what
+    /// the candidate's own loader reads: writer and loader agree on its name.
+    #[test]
+    fn the_shared_table_is_written_beside_the_table_and_is_what_a_candidate_loads() {
+        let (_dir, root, recording) = three_event_recording();
+        let (entries, _, shared_bytes, _) =
+            super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        let path = root.lookup_table_path("run-1");
+        let sibling = deja::shared_results_path(&path);
+        assert_eq!(std::fs::metadata(&sibling).unwrap().len(), shared_bytes);
+        let mut source = deja::LocalFileLookupSource::new(&path);
+        let table = deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(source.loaded_from(), Some(sibling.as_path()));
+        assert_eq!(table.entries.len(), entries);
+        assert!(table
+            .entries
+            .iter()
+            .any(|e| *e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })));
+    }
+
+    /// A shared-results table that does not expand to the table it was built
+    /// from is refused rather than written.
+    #[test]
+    fn a_shared_table_that_does_not_expand_to_its_table_is_refused() {
+        use crate::lookup::render_lookup_table as render;
+        let (_dir, _root, recording) = three_event_recording();
+        let table = render(&recording, "rec-1").unwrap();
+        let legacy = serde_json::to_vec(&table).unwrap();
+        super::shared_results_bytes(&table, &legacy).expect("a table and its own bytes agree");
+
+        // Built against bytes that are not this table's: refused at the call
+        // the write goes through, not only by the check on its own.
+        let mut other = legacy.clone();
+        let at = other.len() - 3;
+        other[at] ^= 1;
+        let err = super::shared_results_bytes(&table, &other).unwrap_err();
+        assert!(err.contains("does not expand"), "{err}");
+
+        // A result changed to one exactly as long: the digest, not the length,
+        // refuses it.
+        let mut shared = deja::SharedResultsTable::from_table(&table, &legacy).unwrap();
+        let first = serde_json::to_string(&shared.results[0]).unwrap();
+        let swapped = first.replacen("118", "119", 1);
+        assert_eq!(first.len(), swapped.len());
+        shared.results[0] = serde_json::from_str(&swapped).unwrap();
+        let err = super::expands_to(shared, &legacy).unwrap_err();
+        assert!(err.contains("does not expand"), "{err}");
+    }
+
+    /// A shared file left at the path by an earlier write is replaced.
+    #[test]
+    fn a_stale_shared_file_is_replaced() {
+        let (_dir, root, recording) = three_event_recording();
+        let path = root.lookup_table_path("run-1");
+        let sibling = deja::shared_results_path(&path);
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&sibling, b"left from an earlier run").unwrap();
+        super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX).unwrap();
+        let mut source = deja::LocalFileLookupSource::new(&path);
+        deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(source.loaded_from(), Some(sibling.as_path()));
+    }
+
+    /// A table refused for its size leaves no shared-results table either.
+    #[test]
+    fn a_refused_table_writes_no_shared_table() {
+        let (_dir, root, recording) = three_event_recording();
+        super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 16).unwrap_err();
+        assert!(!deja::shared_results_path(&root.lookup_table_path("run-1")).exists());
     }
 
     /// A table over the budget fails the run before the candidate boots, and
@@ -6314,7 +6430,10 @@ mod tests {
         std::env::remove_var(super::LOOKUP_TABLE_MAX_BYTES_ENV);
         let report = report.expect("0 disables the check").report;
         assert!(
-            report.contains("bytes compact") && report.contains("disables it"),
+            report.contains("bytes compact")
+                && report.contains("disables it")
+                && report.contains("compared against the budget")
+                && report.contains("information only"),
             "a written table reports its size and the budget in force: {report}"
         );
     }
