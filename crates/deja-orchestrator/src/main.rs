@@ -2605,11 +2605,12 @@ async fn delta_between(
     }
     let y_report = tape_report(st, y_id).await?;
     let m_report = tape_report(st, m_id).await?;
-    divergence::tape::same_tape(y_id, Some(&y_report), m_id, Some(&m_report)).map_err(|why| {
+    let refuse = |why: String| {
         Unavailable::Refused(format!(
             "{why}; a delta only holds between runs of one tape"
         ))
-    })?;
+    };
+    divergence::tape::same_tape(y_id, Some(&y_report), m_id, Some(&m_report)).map_err(refuse)?;
     let y = behaviour_tree_for(st, y_id).await?;
     let m = behaviour_tree_for(st, m_id).await?;
     let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
@@ -2625,6 +2626,9 @@ async fn delta_between(
             .map(|p| serde_json::to_value(&p.candidate_spec).unwrap_or_default())
     };
     let mut body = serde_json::to_value(&delta).unwrap_or_default();
+    // Recorded in the body so a cached copy shows it passed the check.
+    divergence::tape::record_tape_check(&mut body, y_id, Some(&y_report), m_id, Some(&m_report))
+        .map_err(refuse)?;
     body["tape"] = serde_json::json!(tape(&y_params).or_else(|| tape(&m_params)));
     body["sides"] = serde_json::json!({
         "m": { "run": m_id, "tape_verdict": verdict_of(m_id), "candidate": candidate_of(&m_params) },
@@ -4157,6 +4161,45 @@ mod tests {
             super::Unavailable::Refused(why) => Some(why),
             super::Unavailable::Pending(_) => None,
         }
+    }
+
+    /// A run's own delta cached before the tape check existed must not be
+    /// served: the view goes to the computation. Without a store that refuses
+    /// before reading a report, which is what is asserted. A checked copy is
+    /// served, so the refusal is not the cache failing to be read.
+    #[tokio::test]
+    async fn a_cached_delta_is_served_only_once_its_tape_was_checked() {
+        use divergence::behaviour_tree::CANON_VERSION;
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
+        let ledger = st.root.call_ledger_path("run-Y");
+        std::fs::write(&ledger, "").unwrap();
+        let cache = deja_orchestrator::delta_cache_of(&ledger);
+        let mut doc = serde_json::json!({
+            "y_run": "run-Y", "m_run": "run-M", "canon_version": CANON_VERSION,
+            "verdict": {"pass": true},
+        });
+
+        std::fs::write(&cache, doc.to_string()).unwrap();
+        let served = super::delta_for_run(&st, "run-Y", "run-M").await;
+        let why = served.as_ref().err().and_then(refused);
+        assert!(
+            why.is_some_and(|w| w.contains("ingest report")),
+            "an unchecked cached delta was served: {served:?}"
+        );
+
+        let report = serde_json::json!({"members": ["rec-a"], "correlations": 3});
+        divergence::tape::record_tape_check(
+            &mut doc,
+            "run-Y",
+            Some(&report),
+            "run-M",
+            Some(&report),
+        )
+        .unwrap();
+        std::fs::write(&cache, doc.to_string()).unwrap();
+        let served = super::delta_for_run(&st, "run-Y", "run-M").await;
+        assert_eq!(served.ok(), Some(doc));
     }
 
     /// A baseline that has not ingested yet has no report: that is a wait,

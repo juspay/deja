@@ -55,6 +55,39 @@ pub fn same_tape(
     Ok(())
 }
 
+/// Where a delta document records the tape check it passed.
+const TAPE_CHECK: &str = "tape_check";
+
+/// Check that `y` and `m` scored the same tape and record what each read in
+/// `doc`, so a cached copy of `doc` shows the check it passed.
+pub fn record_tape_check(
+    doc: &mut Value,
+    y_id: &str,
+    y_report: Option<&Value>,
+    m_id: &str,
+    m_report: Option<&Value>,
+) -> Result<(), String> {
+    same_tape(y_id, y_report, m_id, m_report)?;
+    let y = Tape::of(y_id, y_report)?;
+    let m = Tape::of(m_id, m_report)?;
+    doc[TAPE_CHECK] = serde_json::json!({ "y": y.to_json(y_id), "m": m.to_json(m_id) });
+    Ok(())
+}
+
+/// Whether `doc` records a passed tape check for `y` against `m`. A delta
+/// computed before the check existed has none, and must be recomputed rather
+/// than served. The recorded sides are checked again, which reads nothing:
+/// a run's ingest report does not change once written, so what was recorded
+/// is what a fresh check would read.
+pub fn has_tape_check(doc: &Value, y_id: &str, m_id: &str) -> bool {
+    let side = |s: &str, run: &str| {
+        doc.get(TAPE_CHECK)
+            .and_then(|c| c.get(s))
+            .filter(|t| t.get("run").and_then(Value::as_str) == Some(run))
+    };
+    same_tape(y_id, side("y", y_id), m_id, side("m", m_id)).is_ok()
+}
+
 /// What a run's ingest report says it read.
 struct Tape {
     /// Sorted, so member order does not decide equality.
@@ -123,6 +156,22 @@ impl Tape {
             members,
             correlations,
             seals,
+        })
+    }
+}
+
+impl Tape {
+    /// In the ingest report's own shape, so a recorded side reads as one.
+    fn to_json(&self, run_id: &str) -> Value {
+        let seals = self.seals.as_deref().unwrap_or_default();
+        serde_json::json!({
+            "run": run_id,
+            "members": self.members,
+            "correlations": self.correlations,
+            "member_seals": seals
+                .iter()
+                .map(|(recording, seal)| serde_json::json!({"recording_id": recording, "seal_id": seal}))
+                .collect::<Vec<_>>(),
         })
     }
 }
@@ -282,6 +331,73 @@ mod tests {
         assert!(same_tape("y", Some(&a), "m", Some(&short)).is_err());
         let other = counted(&["rec-a", "rec-c"], 1341);
         assert!(same_tape("y", Some(&a), "m", Some(&other)).is_err());
+    }
+
+    /// A refused pair records nothing, so no cached copy of it can carry a
+    /// check it did not pass.
+    #[test]
+    fn a_refused_pair_records_no_tape_check() {
+        let early = sealed(&[("rec-a", "s1")], 2);
+        let late = sealed(&[("rec-a", "s2")], 78);
+        let mut doc = json!({"verdict": {"pass": true}});
+        assert!(record_tape_check(&mut doc, "y", Some(&late), "m", Some(&early)).is_err());
+        assert_eq!(doc, json!({"verdict": {"pass": true}}));
+        assert!(!has_tape_check(&doc, "y", "m"));
+    }
+
+    #[test]
+    fn a_passed_check_records_what_each_side_read() {
+        let a = sealed(&[("rec-a", "s1")], 10);
+        let mut doc = json!({});
+        record_tape_check(&mut doc, "run-Y", Some(&a), "run-M", Some(&a)).unwrap();
+        assert!(has_tape_check(&doc, "run-Y", "run-M"));
+        for (side, run) in [("y", "run-Y"), ("m", "run-M")] {
+            assert_eq!(
+                doc[TAPE_CHECK][side],
+                json!({
+                    "run": run, "members": ["rec-a"], "correlations": 10,
+                    "member_seals": [{"recording_id": "rec-a", "seal_id": "s1"}],
+                })
+            );
+        }
+    }
+
+    fn side(run: &str, seal: &str) -> Value {
+        json!({"run": run, "members": ["rec-a"], "correlations": 1,
+               "member_seals": [{"recording_id": "rec-a", "seal_id": seal}]})
+    }
+
+    /// Only a check for both sides counts, and a side that names no members
+    /// is no check.
+    #[test]
+    fn a_partial_tape_check_is_no_check() {
+        let (y, m) = (side("y", "s1"), side("m", "s1"));
+        assert!(!has_tape_check(&json!({TAPE_CHECK: {"y": y}}), "y", "m"));
+        assert!(!has_tape_check(&json!({TAPE_CHECK: {"m": m}}), "y", "m"));
+        let empty = json!({"run": "m", "members": [], "correlations": 0});
+        assert!(!has_tape_check(
+            &json!({TAPE_CHECK: {"y": y, "m": empty}}),
+            "y",
+            "m"
+        ));
+        assert!(has_tape_check(
+            &json!({TAPE_CHECK: {"y": y, "m": m}}),
+            "y",
+            "m"
+        ));
+    }
+
+    /// A recorded check vouches only for its own pair, and only if what it
+    /// recorded still agrees: a block naming other runs, or two sides that
+    /// read different seals, is no check.
+    #[test]
+    fn a_recorded_check_is_checked_again() {
+        let (y, m) = (side("y", "s1"), side("m", "s1"));
+        let doc = json!({TAPE_CHECK: {"y": y, "m": m}});
+        assert!(!has_tape_check(&doc, "y", "other"));
+        assert!(!has_tape_check(&doc, "other", "m"));
+        let split = json!({TAPE_CHECK: {"y": y, "m": side("m", "s2")}});
+        assert!(!has_tape_check(&split, "y", "m"));
     }
 
     #[test]

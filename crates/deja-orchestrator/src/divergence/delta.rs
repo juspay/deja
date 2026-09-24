@@ -178,14 +178,16 @@ fn classify(tape_has: bool, m: &Side, y: &Side) -> Bucket {
 }
 
 /// Whether a cached delta document is the one a request for `(y, m)` would
-/// compute now: the same two runs, built under the current rules. Both runs'
-/// trees are fixed once scored, so a current document never goes stale on
-/// its own; only a rule change retires it.
+/// compute now: the same two runs, built under the current rules, having
+/// passed the tape check. Both runs' trees are fixed once scored, so a
+/// current document never goes stale on its own; only a rule change retires
+/// it.
 pub fn cached_is_current(doc: &serde_json::Value, y: &str, m: &str, canon_version: u32) -> bool {
     doc.get("y_run").and_then(|v| v.as_str()) == Some(y)
         && doc.get("m_run").and_then(|v| v.as_str()) == Some(m)
         && doc.get("canon_version").and_then(|v| v.as_u64()) == Some(u64::from(canon_version))
         && doc.get("verdict").is_some()
+        && super::tape::has_tape_check(doc, y, m)
 }
 
 /// Compare Y against M with the tape as ancestor.
@@ -580,9 +582,33 @@ mod tests {
         assert!(three_way(&m, &y).is_err());
     }
 
+    fn checked(doc: serde_json::Value) -> serde_json::Value {
+        let report = serde_json::json!({"members": ["rec-a"], "correlations": 3});
+        let mut doc = doc;
+        super::super::tape::record_tape_check(&mut doc, "y", Some(&report), "m", Some(&report))
+            .unwrap();
+        doc
+    }
+
+    /// A delta cached before the tape check existed was never checked, so it
+    /// must be recomputed, not served and its verdict re-written.
+    #[test]
+    fn a_cached_delta_without_a_tape_check_is_not_current() {
+        let unchecked = serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}});
+        assert!(!cached_is_current(&unchecked, "y", "m", CANON_VERSION));
+        assert!(cached_is_current(
+            &checked(unchecked),
+            "y",
+            "m",
+            CANON_VERSION
+        ));
+    }
+
     #[test]
     fn a_cached_delta_is_current_only_for_its_own_runs_and_rules() {
-        let doc = serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}});
+        let doc = checked(
+            serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}}),
+        );
         assert!(cached_is_current(&doc, "y", "m", CANON_VERSION));
         assert!(
             !cached_is_current(&doc, "y", "other", CANON_VERSION),
