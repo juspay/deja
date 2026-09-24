@@ -4536,9 +4536,17 @@ pub fn serves_recorded_error(recorded: &serde_json::Value, site_declares_neutral
 /// the site declared it state-neutral; otherwise hand the token back to run.
 ///
 /// Reads only the row the execute peek already resolved for THIS call through
-/// its correlation, so nothing is borrowed from another request. A recorded
-/// value that does not rebuild, or that the site's predicate does not accept,
-/// falls through to running the boundary, never to a fail-stop.
+/// its correlation, so nothing is borrowed from another request, and only when
+/// the peek found it by the call's site ([`SERVING_RANKS`]). A recorded value
+/// that does not rebuild, or that the site's predicate does not accept, falls
+/// through to running the boundary, never to a fail-stop.
+/// The resolution ranks a recorded error may be served from: a site the author
+/// declared (1) or the call's span path (2). Both find this call by where it
+/// is. An unlocated match (3) can hand one call another call's recorded value,
+/// and a served error is never compared afterwards, so a wrong one would go
+/// unseen. Anything else, no resolution included, runs the boundary.
+const SERVING_RANKS: [u8; 2] = [1, 2];
+
 // The token already moved by value into the observer; handing it back moves it
 // once more, where boxing it would allocate on every executed call.
 #[allow(clippy::result_large_err)]
@@ -4552,6 +4560,9 @@ where
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     P: FnOnce(&T) -> bool,
 {
+    if !matches!(token.observed.resolved_rank, Some(rank) if SERVING_RANKS.contains(&rank)) {
+        return Err(token);
+    }
     let recorded = match token.recorded_result() {
         Some(recorded) if serves_recorded_error(recorded, neutral.is_some()) => recorded.clone(),
         _ => return Err(token),
@@ -6836,6 +6847,8 @@ mod tests {
         shadow_observed: Mutex<Vec<serde_json::Value>>,
         /// What the execute peek resolves as this call's recorded result.
         shadow_recorded: Option<serde_json::Value>,
+        /// The rank that resolution was found at.
+        shadow_rank: Option<u8>,
         /// The provenance of each observation the seam emitted.
         shadow_provenance: Mutex<Vec<crate::Provenance>>,
     }
@@ -6849,6 +6862,7 @@ mod tests {
                 recorded: Mutex::new(Vec::new()),
                 shadow_observed: Mutex::new(Vec::new()),
                 shadow_recorded: None,
+                shadow_rank: None,
                 shadow_provenance: Mutex::new(Vec::new()),
             }
         }
@@ -6899,7 +6913,7 @@ mod tests {
                 method_name: query.method_name.to_string(),
                 args: query.args.clone(),
                 resolved: false,
-                resolved_rank: None,
+                resolved_rank: self.shadow_rank,
                 source_event_global_sequence: None,
                 timestamp_ns: now_ns(),
                 end_timestamp_ns: None,
@@ -6969,6 +6983,7 @@ mod tests {
         let mut hook = FakeHook::new(true);
         hook.execute = true;
         hook.shadow_recorded = Some(recorded);
+        hook.shadow_rank = Some(2);
         hook
     }
 
@@ -8098,8 +8113,14 @@ mod serve_or_run_tests {
         serde_json::json!({ "result": "Ok", "value": 7, "version": 1 })
     }
 
-    /// A token as the execute peek hands it over, carrying `recorded`.
+    /// A token as the execute peek hands it over, carrying `recorded`, found
+    /// at the call's span path.
     fn token(recorded: Option<serde_json::Value>) -> ExecuteShadowToken {
+        let rank = recorded.as_ref().map(|_| 2);
+        token_at(recorded, rank)
+    }
+
+    fn token_at(recorded: Option<serde_json::Value>, rank: Option<u8>) -> ExecuteShadowToken {
         ExecuteShadowToken::new(crate::replay::ObservedCall {
             outcome: crate::SubstituteOutcome::default(),
             correlation_id: Some("c-1".to_owned()),
@@ -8109,7 +8130,7 @@ mod serve_or_run_tests {
             method_name: "generic_insert".to_owned(),
             args: serde_json::json!({}),
             resolved: recorded.is_some(),
-            resolved_rank: None,
+            resolved_rank: rank,
             source_event_global_sequence: Some(2972),
             timestamp_ns: 0,
             end_timestamp_ns: None,
@@ -8243,6 +8264,46 @@ mod serve_or_run_tests {
             |_, _| panic!("nothing is emitted for a call that runs"),
         );
         assert!(ran.is_err());
+    }
+
+    /// A recorded error found only by the unlocated rank runs: that rank can
+    /// hand this call another call's recorded value.
+    #[test]
+    fn an_error_found_only_unlocated_runs() {
+        let ran = serve_or_run(
+            token_at(Some(unique_violation()), Some(3)),
+            Some(unique),
+            rebuild,
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+    }
+
+    /// A recorded error with no resolution rank at all runs: nothing says
+    /// whose row it is.
+    #[test]
+    fn an_error_with_no_resolution_rank_runs() {
+        let ran = serve_or_run(
+            token_at(Some(unique_violation()), None),
+            Some(unique),
+            rebuild,
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+    }
+
+    /// A declared site's own recorded error is served.
+    #[test]
+    fn an_error_found_at_a_declared_site_is_served() {
+        let emitted = Emitted::default();
+        let served = serve_or_run(
+            token_at(Some(unique_violation()), Some(1)),
+            Some(unique),
+            rebuild,
+            emit_into(&emitted),
+        );
+        assert!(served.is_ok());
+        assert_eq!(emitted.into_inner().len(), 1);
     }
 
     /// With no recorded row for this call there is nothing of its own to

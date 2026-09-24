@@ -60,6 +60,7 @@ fn is_unique(out: &Result<u64, DbError>) -> bool {
     boundary = "db",
     component = "tests::macro_neutral_error",
     operation = "declared_insert",
+    site = "declared_insert",
     replay = Execute,
     codec = EnvelopeCodec,
     args = serde_json::json!({ "row": row }),
@@ -89,12 +90,31 @@ async fn undeclared_insert(row: &str) -> Result<u64, DbError> {
     boundary = "db",
     component = "tests::macro_neutral_error",
     operation = "declared_sync_insert",
+    site = "declared_sync_insert",
     replay = Execute,
     codec = EnvelopeCodec,
     args = serde_json::json!({ "row": row }),
     neutral_error = is_unique,
 )]
 fn declared_sync_insert(row: &str) -> Result<u64, DbError> {
+    let _ = row;
+    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(1)
+}
+
+/// Declared neutral but with no site, so its recorded row can be found only by
+/// the unlocated rank. That rank can hand one call another call's row, so it
+/// runs.
+#[deja::boundary(
+    boundary = "db",
+    component = "tests::macro_neutral_error",
+    operation = "unlocated_insert",
+    replay = Execute,
+    codec = EnvelopeCodec,
+    args = serde_json::json!({ "row": row }),
+    neutral_error = is_unique,
+)]
+async fn unlocated_insert(row: &str) -> Result<u64, DbError> {
     let _ = row;
     BODY_RUNS.fetch_add(1, Ordering::SeqCst);
     Ok(1)
@@ -111,8 +131,13 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// This call's recorded row, at the address every call carries.
-fn recorded(operation: &str, row: &str, result: serde_json::Value) -> deja::LookupEntry {
+/// This call's recorded row, at `locus`.
+fn recorded(
+    operation: &str,
+    locus: deja::Locus,
+    row: &str,
+    result: serde_json::Value,
+) -> deja::LookupEntry {
     deja::LookupEntry {
         key: deja::LookupKey {
             correlation_id: None,
@@ -121,7 +146,7 @@ fn recorded(operation: &str, row: &str, result: serde_json::Value) -> deja::Look
             boundary: "db".to_owned(),
             component: "tests::macro_neutral_error".to_owned(),
             operation: operation.to_owned(),
-            locus: deja::Locus::Unlocated,
+            locus,
             args_hash: deja::canonical_args_hash(&serde_json::json!({ "row": row })),
             occurrence: 0,
         },
@@ -130,8 +155,12 @@ fn recorded(operation: &str, row: &str, result: serde_json::Value) -> deja::Look
     }
 }
 
+fn site(name: &str) -> deja::Locus {
+    deja::Locus::DeclaredSite(name.to_owned())
+}
+
 #[test]
-fn a_declared_neutral_recorded_error_is_served_and_an_undeclared_one_runs() {
+fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
     let unique = serde_json::json!({ "version": 1, "result": "Err", "kind": "UniqueViolation" });
     let other =
         serde_json::json!({ "version": 1, "result": "Err", "kind": "SerializationFailure" });
@@ -140,10 +169,26 @@ fn a_declared_neutral_recorded_error_is_served_and_an_undeclared_one_runs() {
         policy_version: deja::POLICY_VERSION,
         event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![
-            recorded("declared_insert", "a", unique.clone()),
-            recorded("declared_insert", "b", other),
-            recorded("undeclared_insert", "a", unique.clone()),
-            recorded("declared_sync_insert", "a", unique),
+            recorded(
+                "declared_insert",
+                site("declared_insert"),
+                "a",
+                unique.clone(),
+            ),
+            recorded("declared_insert", site("declared_insert"), "b", other),
+            recorded(
+                "undeclared_insert",
+                deja::Locus::Unlocated,
+                "a",
+                unique.clone(),
+            ),
+            recorded(
+                "declared_sync_insert",
+                site("declared_sync_insert"),
+                "a",
+                unique.clone(),
+            ),
+            recorded("unlocated_insert", deja::Locus::Unlocated, "a", unique),
         ],
     };
     let dir = tempfile::tempdir().expect("tempdir");
@@ -157,7 +202,7 @@ fn a_declared_neutral_recorded_error_is_served_and_an_undeclared_one_runs() {
     deja::set_global_runtime_hook(Some(deja::RuntimeHook::LookupReplay(hook)))
         .expect("install runtime hook");
 
-    // Declared, and the recorded error is the declared kind: served, not run.
+    // Declared, found at its site, the declared kind: served, not run.
     assert_eq!(
         block_on(declared_insert("a")),
         Err(DbError::UniqueViolation)
@@ -184,32 +229,26 @@ fn a_declared_neutral_recorded_error_is_served_and_an_undeclared_one_runs() {
         "the sync boundary did not run"
     );
 
-    let provenance: Vec<_> = calls
+    // Declared, but its row is found only unlocated: run, not served.
+    assert_eq!(block_on(unlocated_insert("a")), Ok(1));
+    assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 3);
+
+    let seen: Vec<_> = calls
         .lock()
         .expect("observed calls")
         .iter()
-        .map(|c| (c.method_name.clone(), c.resolved, c.provenance))
+        .map(|c| (c.method_name.clone(), c.resolved_rank, c.provenance))
         .collect();
+    use deja::Provenance::{ServedRecordedError as Served, Shadow};
     assert_eq!(
-        provenance,
+        seen,
         vec![
-            (
-                "declared_insert".to_owned(),
-                true,
-                deja::Provenance::ServedRecordedError
-            ),
-            ("declared_insert".to_owned(), true, deja::Provenance::Shadow),
-            (
-                "undeclared_insert".to_owned(),
-                true,
-                deja::Provenance::Shadow
-            ),
-            (
-                "declared_sync_insert".to_owned(),
-                true,
-                deja::Provenance::ServedRecordedError
-            ),
+            ("declared_insert".to_owned(), Some(1), Served),
+            ("declared_insert".to_owned(), Some(1), Shadow),
+            ("undeclared_insert".to_owned(), Some(3), Shadow),
+            ("declared_sync_insert".to_owned(), Some(1), Served),
+            ("unlocated_insert".to_owned(), Some(3), Shadow),
         ],
-        "each call's own recorded row was found, and only the served one says so"
+        "every call found its own recorded row, and only those found at their site were served"
     );
 }
