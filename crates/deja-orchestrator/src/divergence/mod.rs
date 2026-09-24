@@ -3902,6 +3902,67 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
         && bag_canon(&row.baseline) == bag_canon(&row.candidate)
 }
 
+/// Larger bodies are not scanned for embedded documents; they compare as text.
+const MAX_EMBEDDED_SCAN_BYTES: usize = 256 * 1024;
+
+/// A non-JSON text split into the JSON objects embedded in it and the text
+/// around them. A document starts at a `{` that begins a complete JSON object
+/// and runs to that object's end; any other brace stays text.
+#[derive(Debug, PartialEq)]
+struct EmbeddedDocuments<'a> {
+    text: Vec<&'a str>,
+    documents: Vec<serde_json::Value>,
+}
+
+fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
+    let (mut pieces, mut documents) = (Vec::new(), Vec::new());
+    let (mut piece_start, mut cursor) = (0, 0);
+    while let Some(offset) = text[cursor..].find('{') {
+        let start = cursor + offset;
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(document)) => {
+                pieces.push(&text[piece_start..start]);
+                documents.push(document);
+                cursor = start + stream.byte_offset();
+                piece_start = cursor;
+            }
+            _ => cursor = start + 1,
+        }
+    }
+    pieces.push(&text[piece_start..]);
+    EmbeddedDocuments {
+        text: pieces,
+        documents,
+    }
+}
+
+/// The embedded documents of two texts, paired, when everything around them
+/// is byte-identical. Pairing is positional only because the surrounding text
+/// is equal: the k-th document on one side sits exactly where the k-th sits on
+/// the other. `None` when anything else differs, which includes two differing
+/// texts with no document in them.
+fn embedded_document_pairs(
+    baseline: &str,
+    candidate: &str,
+) -> Option<Vec<(serde_json::Value, serde_json::Value)>> {
+    if baseline.len().max(candidate.len()) > MAX_EMBEDDED_SCAN_BYTES {
+        return None;
+    }
+    let (baseline, candidate) = (embedded_documents(baseline), embedded_documents(candidate));
+    if baseline.text != candidate.text {
+        return None;
+    }
+    Some(
+        baseline
+            .documents
+            .into_iter()
+            .zip(candidate.documents)
+            .collect(),
+    )
+}
+
 /// The response's body difference, recomputed with array order handled
 /// structurally and held to the kernel's findings. `None` when the run predates
 /// full bodies being recorded alongside the diff, in which case the kernel's own
@@ -3912,8 +3973,29 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
 fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
-    order_canonical_diff(baseline, candidate, "$", &mut rows);
+    // A non-JSON body carrying JSON documents is compared as those documents,
+    // when the text around them is identical. Only at the root: a JSON body is
+    // never re-scanned.
+    let embedded = match (baseline, candidate) {
+        (serde_json::Value::String(b), serde_json::Value::String(c)) if b != c => {
+            embedded_document_pairs(b, c)
+        }
+        _ => None,
+    };
+    let embedded_document_paths = match &embedded {
+        Some(pairs) => {
+            for (index, (b, c)) in pairs.iter().enumerate() {
+                order_canonical_diff(b, c, &format!("$.~embedded[{index}]"), &mut rows);
+            }
+            vec!["$".to_owned()]
+        }
+        None => {
+            order_canonical_diff(baseline, candidate, "$", &mut rows);
+            Vec::new()
+        }
+    };
     let mut reconciled = reconciled_with_kernel(rows, &diff.body_diff);
+    reconciled.embedded_document_paths = embedded_document_paths;
     // The invariant holds in BOTH directions: the recompute may re-shape the
     // kernel's findings and may not invent one — and may not erase one either.
     // A kernel row that no surviving recompute row speaks about was not
@@ -3929,6 +4011,12 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
                 .rows
                 .iter()
                 .any(|row| paths_overlap(&row.json_path, &found.json_path))
+                // A text read as its embedded documents is spoken for by that
+                // reading, including when the documents are equal as JSON.
+                && !reconciled
+                    .embedded_document_paths
+                    .iter()
+                    .any(|path| path_covers(path, &found.json_path))
         })
         .cloned()
         .collect();
@@ -3950,6 +4038,8 @@ struct Reconciliation {
     /// same. Named, never silently dropped: a run that leans on that judgment on
     /// every response must not read identically to one whose bodies agreed.
     kernel_equivalent_paths: Vec<String>,
+    /// Texts that were compared as the JSON documents embedded in them.
+    embedded_document_paths: Vec<String>,
 }
 
 /// Is a difference reported at `inner` the same difference as, or part of, one
@@ -4023,6 +4113,7 @@ fn reconciled_with_kernel(
     Reconciliation {
         rows,
         kernel_equivalent_paths,
+        embedded_document_paths: Vec::new(),
     }
 }
 
@@ -4045,6 +4136,10 @@ struct HttpBodyClassification {
     /// same — an encoded value whose serialisation order differed, or a path the
     /// run's body allowlist covers. Named and NOT counted as blocking.
     kernel_equivalent_paths: Vec<String>,
+    /// Texts compared as the JSON documents embedded in them. Named and NOT
+    /// counted as blocking; what differs inside the documents is classified
+    /// like any other row.
+    embedded_document_paths: Vec<String>,
 }
 
 /// A JSON path reduced to the form a declaration is written in: every array
@@ -4119,6 +4214,10 @@ fn classify_http_body_diff(
     classification.kernel_equivalent_paths = reconciled
         .as_ref()
         .map(|r| r.kernel_equivalent_paths.clone())
+        .unwrap_or_default();
+    classification.embedded_document_paths = reconciled
+        .as_ref()
+        .map(|r| r.embedded_document_paths.clone())
         .unwrap_or_default();
     for body in rows {
         // Existing explicit absorptions retain precedence over schema
@@ -5199,6 +5298,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // same. Not counted, but SAID: a suite that leans on that judgment on every
     // response must not read identically to one whose bodies agreed.
     let mut kernel_equivalent_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut embedded_document_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -5259,6 +5359,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 stats.note_kind("OrderNondeterministicWarning");
                 order_nondeterminism_warnings += 1;
                 *kernel_equivalent_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.embedded_document_paths {
+                stats.note_kind("EmbeddedJsonCompared");
+                *embedded_document_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -5713,6 +5817,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              counted: the kernel, which alone reads an encoded value as the document it carries \
              and alone applies the run's body allowlist, judged the region the same. A member \
              added, removed or altered inside it would still block"
+        ));
+    }
+    for (path, responses) in &embedded_document_paths_seen {
+        warnings.push(format!(
+            "response body {path} is not JSON but carries JSON documents; on {responses} \
+             response(s) the text around them was identical and they were compared as JSON, at \
+             {path}.~embedded[n]. Text that differs outside a document still blocks"
         ));
     }
     // Two sources describing one path differently. Absorbed by neither, on
@@ -8943,6 +9054,11 @@ mod tests {
                 "the number of documents differs",
                 page_embedding(permuted_a, "Collect"),
                 page_embedding(&format!("{permuted_b}; var more = {{\"k\":1}}"), "Collect"),
+            ),
+            (
+                "a body over the scan limit compares as text",
+                page_embedding(permuted_a, &"x".repeat(MAX_EMBEDDED_SCAN_BYTES)),
+                page_embedding(permuted_b, &"x".repeat(MAX_EMBEDDED_SCAN_BYTES)),
             ),
             (
                 "a JSON body is never re-scanned",
