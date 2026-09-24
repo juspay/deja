@@ -4008,7 +4008,7 @@ fn written_lexemes(json: &str) -> Vec<&str> {
 /// only the order of object members and of array members is canonical. Two
 /// documents with the same written form differ in arrangement alone.
 fn written_form(json: &str) -> String {
-    fn value<'a>(lexemes: &mut std::iter::Peekable<std::vec::IntoIter<&'a str>>) -> String {
+    fn value(lexemes: &mut std::iter::Peekable<std::vec::IntoIter<&str>>) -> String {
         match lexemes.next() {
             Some("{") => {
                 let mut members = Vec::new();
