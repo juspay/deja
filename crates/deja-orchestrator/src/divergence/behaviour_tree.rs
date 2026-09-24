@@ -289,7 +289,12 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 .unwrap_or_else(|| "∅".to_owned())
         };
         let value = match row.kind.as_str() {
-            "matched" | "recovered" | "identity_skew" | "deterministic" => Value::Reproduced,
+            // A served call returned exactly the value the recording holds.
+            "matched"
+            | "recovered"
+            | "identity_skew"
+            | "deterministic"
+            | "served_recorded_error" => Value::Reproduced,
             "omitted" | "pruned_subtree" => Value::Absent,
             "novel" | "novel_subtree" | "environmental" | "novel_absorbed" => Value::Novel {
                 hash: observed_hash(),
@@ -519,6 +524,32 @@ mod tests {
         let c =
             serde_json::json!({"url": "https://api.x.com/v1", "headers": [["a", "1"], ["b", "3"]]});
         assert_ne!(hash_of(&a), hash_of(&c), "a header VALUE is behaviour");
+    }
+
+    /// A call served from its own recorded error reproduced the recording, so
+    /// the delta page does not show it as a change.
+    #[test]
+    fn a_served_recorded_error_is_reproduced_behaviour() {
+        let args = serde_json::json!({"sql": "INSERT INTO process_tracker"});
+        let rows = vec![row(
+            "served_recorded_error",
+            "c1",
+            "request>insert",
+            Some(10),
+            args,
+        )];
+        let tree = build("run", &rows, &[]);
+        let calls: Vec<_> = tree
+            .entries
+            .iter()
+            .filter(|e| matches!(e.address, Address::Call { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            matches!(calls[0].value, Value::Reproduced),
+            "{:?}",
+            calls[0]
+        );
     }
 
     #[test]

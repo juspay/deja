@@ -1261,7 +1261,8 @@ pub struct InstrumentArgs {
     /// When it holds, an `Execute` site returns this call's own recorded error
     /// in replay instead of re-running, so the replay does not write a row the
     /// recording never wrote. Only an `Execute` site re-runs, so it is refused
-    /// on any other.
+    /// on any other. On a generic return type the closure needs its parameter
+    /// annotated (`|out: &Captured<StorageResult<R>>| ...`), or a named fn.
     pub neutral_error: Option<Expr>,
     pub state_read: Option<Expr>,
     pub state_write: Option<Expr>,

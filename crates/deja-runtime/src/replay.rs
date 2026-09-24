@@ -1445,8 +1445,8 @@ pub struct LookupKey {
 /// — yet the detector must attribute every call, hit or miss, to a boundary.
 /// `resolved_rank` records which [`Locus::rank`] won, so the detector can
 /// report how much of a run leans on its weakest matches. This runtime emits
-/// 1, 2, 3 or 5; rank 6, a positional match it no longer produces, is still
-/// read by the orchestrator when it scores older artifacts.
+/// 1, 2, 3 or 5. Rank 6, a positional match, never produced a match in any
+/// measured run; the orchestrator still reads it when scoring older artifacts.
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
@@ -2339,8 +2339,9 @@ pub struct LookupTableHook {
     table: HashMap<LookupKey, HookEntry>,
     /// Shared occurrence assigner; advanced for every rank on every call so its
     /// numbering stays in lockstep with the renderer's. It once also fed rank
-    /// 6, a positional `Sequence` locus this runtime no longer emits; the
-    /// orchestrator still reads rank 6 when it scores older artifacts.
+    /// 6, a positional `Sequence` locus since removed, which never produced a
+    /// match in any measured run; the orchestrator still reads rank 6 when it
+    /// scores older artifacts.
     stamper: Mutex<KeyStamper>,
     /// Per-correlation global-event counter; sourced from `next_global_sequence`.
     global_counter: std::sync::atomic::AtomicU64,
