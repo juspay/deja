@@ -2167,9 +2167,6 @@ enum ValueCanonSource {
     Recorder,
     /// No clause: order carries no meaning unless a path says otherwise (#102).
     Default,
-    /// An object's keys in a different order. A JSON object has no order, so
-    /// this stays absorbed whatever becomes of `Default`.
-    ObjectKeys,
 }
 
 impl ValueCanonSource {
@@ -2177,7 +2174,6 @@ impl ValueCanonSource {
         match self {
             Self::Recorder => "recorder",
             Self::Default => "default",
-            Self::ObjectKeys => "object_keys",
         }
     }
 }
@@ -2193,6 +2189,9 @@ enum ValueAbsorption {
     /// the candidate: a replay-local SERIAL, an error's diagnostic text, an
     /// `UPDATE … RETURNING` whose returned rows the statement itself explains.
     DbInfrastructure,
+    /// Values equal as JSON with some object's keys in another order. Apart
+    /// from `Canon`: a JSON object has no order, so no strict flip reaches it.
+    ObjectKeyOrder,
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
@@ -2238,7 +2237,7 @@ fn value_verdict(
         // no order. It is named anyway, under its own label, because a
         // tolerance that leaves nothing behind cannot be shown to be working.
         if json_key_order_differs(recorded, observed) {
-            return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::ObjectKeys));
+            return ValueVerdict::Absorbed(ValueAbsorption::ObjectKeyOrder);
         }
         return ValueVerdict::Equal;
     }
@@ -4593,6 +4592,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    // Matched calls whose values were equal but held some object's keys in
+    // another order, by call site. A kind of their own (`ObjectKeyOrderAbsorbed`).
+    let mut object_key_order_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
     // Race evidence needs to be discovered before HTTP body classification:
@@ -4722,6 +4724,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
+                    .or_insert(0) += 1;
+            }
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::ObjectKeyOrder)) = verdict {
+                stats.note_kind("ObjectKeyOrderAbsorbed");
+                *object_key_order_seen
+                    .entry(call_site_label(obs))
                     .or_insert(0) += 1;
             }
             let diverged = matches!(verdict, Some(ValueVerdict::Diverged));
@@ -4857,6 +4865,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
+                    .or_insert(0) += 1;
+            }
+            if let ValueVerdict::Absorbed(ValueAbsorption::ObjectKeyOrder) = verdict {
+                stats.note_kind("ObjectKeyOrderAbsorbed");
+                *object_key_order_seen
+                    .entry(call_site_label(obs))
                     .or_insert(0) += 1;
             }
             let value_diverged = pairing.changed(
@@ -5599,14 +5613,6 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
-        if *source == "object_keys" {
-            warnings.push(format!(
-                "matched call {call_site} held an object's keys in a different order on {calls} \
-                 call(s) and was not counted: the keys and values are identical, and a JSON \
-                 object has no order"
-            ));
-            continue;
-        }
         let by = if *source == "default" {
             "no clause asserts an order for it, and order carries no meaning unless one does"
                 .to_owned()
@@ -5617,6 +5623,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "matched call {call_site} differed by ordering alone on {calls} call(s) and was not \
              counted: {by}. The members are identical as a multiset, so any added, removed or \
              altered member would still block"
+        ));
+    }
+    for (call_site, calls) in &object_key_order_seen {
+        warnings.push(format!(
+            "matched call {call_site} held an object's keys in a different order on {calls} \
+             call(s) and was not counted: the keys and values are identical, and a JSON object \
+             has no order"
         ));
     }
     for ((path, source), responses) in &canon_absorbed_seen {
@@ -11963,6 +11976,29 @@ mod tests {
         let changed: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
         assert_eq!(changed.len(), 1, "{rows:?}");
         assert!(changed[0].blocking);
+    }
+
+    /// A paired call whose request differs only in an object's key order sent
+    /// the same request: a recovered match, with the reorder counted apart.
+    #[test]
+    fn a_paired_call_whose_request_keys_moved_is_a_match_counted_as_a_key_reorder() {
+        let recorded = serde_json::json!({"value": 1, "other": 2});
+        let observed = serde_json::json!({"other": 2, "value": 1});
+        assert_ne!(
+            key_orders(&recorded),
+            key_orders(&observed),
+            "precondition: held in different orders"
+        );
+        let card = detect(&paired_write(Some(recorded), observed));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        let kinds: u64 = card
+            .per_boundary
+            .values()
+            .map(|b| b.kinds.get("ObjectKeyOrderAbsorbed").copied().unwrap_or(0))
+            .sum();
+        assert_eq!(kinds, 1, "{:?}", card.per_boundary);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
     /// A pair whose recorded request the tape does not hold cannot be shown to
