@@ -1528,11 +1528,12 @@ pub const LOOKUP_TABLE_MAX_BYTES_ENV: &str = "DEJA_LOOKUP_TABLE_MAX_BYTES";
 /// The largest lookup table, in compact bytes, a run hands its candidate.
 ///
 /// The candidate parses the whole table at boot, so its size, not the number
-/// of correlations, is what runs out of memory. This is just under the largest
-/// table seen to complete at a 1536 MiB candidate limit, and well under the
-/// smallest estimated to have been killed; between the two is unmeasured, so
-/// this is the proven-safe edge, not the limit.
-pub const DEFAULT_LOOKUP_TABLE_MAX_BYTES: u64 = 70_000_000;
+/// of correlations, is what runs out of memory. In the bytes this writer
+/// produces, the largest table measured to complete at a 1536 MiB candidate
+/// limit was 72.30 MB and the smallest measured to be killed 96.49 MB. This is
+/// the first, rounded up to the next 100 KB: the band between them is
+/// unmeasured, so this is the proven-safe edge, not the limit.
+pub const DEFAULT_LOOKUP_TABLE_MAX_BYTES: u64 = 72_300_000;
 
 /// The budget in force and a sentence saying what decided it, so a value that
 /// did not take effect is visible in the run log.
