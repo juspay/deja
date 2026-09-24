@@ -562,8 +562,8 @@ async fn get_decoded(
         .bytes()
         .await
         .map_err(|e| format!("s3 read {key}: {e}"))?;
-    let compressed = bytes.len() as u64;
-    Ok((decode_object(key.as_ref(), &bytes)?, compressed))
+    let fetched = bytes.len() as u64;
+    Ok((decode_object(key.as_ref(), &bytes)?, fetched))
 }
 
 /// Decode an object's compression by extension, with a magic-byte fallback:

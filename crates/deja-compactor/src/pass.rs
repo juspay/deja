@@ -197,8 +197,7 @@ impl std::fmt::Display for Row {
                 write!(
                     f,
                     "{verb} ({correlations} correlation(s), {landing_objects} landing object(s), \
-                     {landing_bytes_read} decompressed from {landing_bytes_fetched} compressed \
-                     byte(s){whose})"
+                     {landing_bytes_read} byte(s) held from {landing_bytes_fetched} fetched{whose})"
                 )?;
                 if !instances_without_eof.is_empty() {
                     write!(
@@ -220,13 +219,13 @@ impl std::fmt::Display for Row {
                 budget_bytes,
                 read_bytes,
                 objects_read,
-                fetched_bytes: _,
+                fetched_bytes,
                 objects_total,
                 shared_prefix,
             } => {
                 write!(
                     f,
-                    "DROPPED too_large — {read_bytes} decompressed byte(s) past a {budget_bytes} \
+                    "DROPPED too_large — {read_bytes} byte(s) held from {fetched_bytes} fetched, past a {budget_bytes} \
                      byte budget at object {objects_read} of {objects_total}; nothing was written \
                      and it will not seal in this container until compaction stops holding the \
                      whole landing"
@@ -998,8 +997,9 @@ mod tests {
                     Outcome::TooLarge {
                         budget_bytes: 536_870_912,
                         read_bytes: 561_616_085,
-                        // Stored, from the real refusal this fixture copies:
-                        // 18 of 67 objects, so both figures are floors.
+                        // Illustrative, not measured: no fetched figure exists for this
+                        // refusal, so it is set equal to read_bytes (an uncompressed
+                        // landing). This test does not assert on it.
                         fetched_bytes: 561_616_085,
                         objects_read: 18,
                         objects_total: 67,
@@ -1039,6 +1039,24 @@ mod tests {
         assert!(!both.clean(), "a failure still fails the pass");
         let t = both.totals();
         assert_eq!((t.dropped, t.refused, t.failed), (2, 1, 1));
+    }
+
+    #[test]
+    fn a_refusal_line_says_what_the_landing_cost_to_fetch() {
+        let refused = row(
+            "r1",
+            Outcome::TooLarge {
+                budget_bytes: 1_000,
+                read_bytes: 4_321,
+                fetched_bytes: 987,
+                objects_read: 2,
+                objects_total: 5,
+                shared_prefix: false,
+            },
+        );
+        let line = refused.to_string();
+        assert!(line.contains("4321 byte(s) held"), "{line}");
+        assert!(line.contains("from 987 fetched"), "{line}");
     }
 
     #[test]
