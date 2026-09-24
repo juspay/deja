@@ -60,8 +60,8 @@ struct Tape {
     /// Sorted, so member order does not decide equality.
     members: Vec<String>,
     correlations: u64,
-    /// Sorted `(recording_id, seal_id)`, or `None` when the report predates
-    /// seal recording or a member carries no seal.
+    /// Sorted `(recording_id, seal_id)`, naming exactly the members, or `None`
+    /// when the report predates seal recording or a member carries no seal.
     seals: Option<Vec<(String, String)>>,
 }
 
@@ -78,6 +78,9 @@ impl Tape {
             .map(|m| m.as_str().map(str::to_owned))
             .collect::<Option<_>>()
             .ok_or_else(|| format!("run {run_id}'s ingest report has a non-string member"))?;
+        if members.is_empty() {
+            return Err(format!("run {run_id}'s ingest report names no members"));
+        }
         members.sort();
         let correlations = report
             .get("correlations")
@@ -100,15 +103,22 @@ impl Tape {
             .map(|mut seals| {
                 seals.sort();
                 seals
-            })
-            // Seals vouch for the tape only if they name every member and no
-            // other; a partial list is not trusted as a whole one.
-            .filter(|seals: &Vec<(String, String)>| {
-                seals
-                    .iter()
-                    .map(|(recording, _)| recording)
-                    .eq(members.iter())
             });
+        // Seals vouch for the tape only if they name every member once and no
+        // other. A list that does not is refused rather than set aside: set
+        // aside, it would let the counts accept a pair whose seals already
+        // disagree.
+        if let Some(seals) = &seals {
+            if !seals
+                .iter()
+                .map(|(recording, _)| recording)
+                .eq(members.iter())
+            {
+                return Err(format!(
+                    "run {run_id}'s ingest report has seals that do not name exactly its members"
+                ));
+            }
+        }
         Ok(Self {
             members,
             correlations,
@@ -174,7 +184,48 @@ mod tests {
             "members": ["rec-a", "rec-c"], "correlations": 10,
             "member_seals": [{"recording_id": "rec-a", "seal_id": "s1"}],
         });
-        assert!(same_tape("run-Y", Some(&y), "run-M", Some(&m)).is_err());
+        let err = same_tape("run-Y", Some(&y), "run-M", Some(&m)).unwrap_err();
+        assert!(
+            err.contains("seals that do not name exactly its members"),
+            "{err}"
+        );
+    }
+
+    /// The coverage cases a length comparison would pass: a wrong name at the
+    /// right count, and a duplicated name.
+    #[test]
+    fn seals_must_name_exactly_the_members() {
+        let wrong_name = json!({
+            "members": ["rec-a", "rec-b"], "correlations": 10,
+            "member_seals": [
+                {"recording_id": "rec-a", "seal_id": "s1"},
+                {"recording_id": "rec-z", "seal_id": "s2"},
+            ],
+        });
+        let duplicated = json!({
+            "members": ["rec-a", "rec-b"], "correlations": 10,
+            "member_seals": [
+                {"recording_id": "rec-a", "seal_id": "s1"},
+                {"recording_id": "rec-a", "seal_id": "s1"},
+            ],
+        });
+        let good = sealed(&[("rec-a", "s1"), ("rec-b", "s2")], 10);
+        for bad in [&wrong_name, &duplicated] {
+            let err = same_tape("run-Y", Some(bad), "run-M", Some(&good)).unwrap_err();
+            assert!(
+                err.contains("run run-Y's ingest report has seals that do not name exactly"),
+                "{err}"
+            );
+        }
+    }
+
+    /// An empty member list says nothing about what was read, even when both
+    /// sides agree on it.
+    #[test]
+    fn an_empty_member_list_refuses() {
+        let empty = json!({"members": [], "correlations": 0});
+        let err = same_tape("run-Y", Some(&empty), "run-M", Some(&empty)).unwrap_err();
+        assert!(err.contains("names no members"), "{err}");
     }
 
     /// A manifest from before seals were addressed carries an empty id; two
@@ -188,8 +239,11 @@ mod tests {
 
     #[test]
     fn one_seal_is_one_tape() {
+        // Unequal counts, so only the seals can make these one tape: the count
+        // fallback would refuse, and a broken seal comparison cannot hide
+        // behind it.
         let a = sealed(&[("rec-a", "s1"), ("rec-b", "s2")], 40);
-        let b = sealed(&[("rec-b", "s2"), ("rec-a", "s1")], 40);
+        let b = sealed(&[("rec-b", "s2"), ("rec-a", "s1")], 41);
         assert_eq!(same_tape("y", Some(&a), "m", Some(&b)), Ok(()));
     }
 

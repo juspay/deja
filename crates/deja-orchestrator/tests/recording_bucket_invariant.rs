@@ -25,13 +25,14 @@ fn expected() -> BTreeMap<&'static str, (usize, &'static str)> {
         (
             "src/main.rs",
             (
-                5,
+                6,
                 "three recording readers that overwrite the bucket from `scan_scope` \
                  (the listing, its correlations sibling, and the listing's manifest \
                  enrichment, which must use the SCANNED bucket or it looks for a \
                  prism recording's seal in hyperswitch-art and reports every row \
-                 unsealed), and two that take the bucket from a parsed `s3://` \
-                 artifact URI",
+                 unsealed), and three that take the bucket from a parsed `s3://` \
+                 artifact URI (hydration, the raw fetch, and the delta's check that an \
+                 expired ingest report is gone)",
             ),
         ),
         (

@@ -2579,19 +2579,13 @@ async fn delta_between(
                 .to_owned(),
         ));
     }
-    let y_report = ingest_report_for(st, y_id)
-        .await
-        .map_err(Unavailable::Pending)?;
-    let m_report = ingest_report_for(st, m_id)
-        .await
-        .map_err(Unavailable::Pending)?;
-    divergence::tape::same_tape(y_id, y_report.as_ref(), m_id, m_report.as_ref()).map_err(
-        |why| {
-            Unavailable::Refused(format!(
-                "{why}; a delta only holds between runs of one tape"
-            ))
-        },
-    )?;
+    let y_report = tape_report(st, y_id).await?;
+    let m_report = tape_report(st, m_id).await?;
+    divergence::tape::same_tape(y_id, Some(&y_report), m_id, Some(&m_report)).map_err(|why| {
+        Unavailable::Refused(format!(
+            "{why}; a delta only holds between runs of one tape"
+        ))
+    })?;
     let y = behaviour_tree_for(st, y_id).await?;
     let m = behaviour_tree_for(st, m_id).await?;
     let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
@@ -2826,34 +2820,95 @@ async fn artifact_bytes(uri: &str) -> Result<Vec<u8>, (u16, String)> {
     }
 }
 
-/// The `ingest_report` a run published, parsed. `Ok(None)` when the run
-/// registered none, or there is no store to ask; `Err` when one exists but
-/// cannot be read, which is a fault to retry rather than an answer.
-async fn ingest_report_for(
-    st: &AppState,
-    run_id: &str,
-) -> Result<Option<serde_json::Value>, String> {
+/// A run's ingest report, or what its absence means for a delta.
+async fn tape_report(st: &AppState, run_id: &str) -> Result<serde_json::Value, Unavailable> {
+    match ingest_report_for(st, run_id).await {
+        Ok(report) => Ok(report),
+        Err(gap) => {
+            let (state, _) = run_disposition(st, run_id).await;
+            Err(report_gap(run_id, state.as_deref(), gap))
+        }
+    }
+}
+
+/// Why a run's ingest report could not be read.
+#[derive(Debug)]
+enum ReportGap {
+    /// The run registered no report.
+    NotRegistered,
+    /// A report was registered but its object is no longer there: the
+    /// artifact bucket expires objects, and a compose run's file can be removed.
+    Gone,
+    /// The object is there but is not a report.
+    Corrupt(String),
+    /// It could not be read this time, which may pass.
+    Unreadable(String),
+}
+
+/// What a missing report means for a delta: refused when it cannot appear,
+/// pending when it still can. A run that has not ingested yet has no report,
+/// which is a wait, not a mismatch.
+fn report_gap(run_id: &str, state: Option<&str>, gap: ReportGap) -> Unavailable {
+    match gap {
+        ReportGap::NotRegistered => match state {
+            Some("completed" | "failed") | None => Unavailable::Refused(format!(
+                "run {run_id} has no ingest report, so the tape it scored is unknown"
+            )),
+            Some(state) => Unavailable::Pending(format!(
+                "run {run_id} is still {state}; its ingest report is published when it ingests"
+            )),
+        },
+        ReportGap::Gone => Unavailable::Refused(format!(
+            "run {run_id}'s ingest report is registered but no longer stored \
+             (the artifact bucket expires objects), so the tape it scored is unknown"
+        )),
+        ReportGap::Corrupt(e) => {
+            Unavailable::Refused(format!("run {run_id}'s ingest report is not JSON: {e}"))
+        }
+        ReportGap::Unreadable(e) => Unavailable::Pending(format!(
+            "run {run_id}'s ingest report could not be read: {e}"
+        )),
+    }
+}
+
+/// The `ingest_report` a run published, parsed.
+async fn ingest_report_for(st: &AppState, run_id: &str) -> Result<serde_json::Value, ReportGap> {
     let Some(store) = &st.store else {
-        return Ok(None);
+        return Err(ReportGap::NotRegistered);
     };
     let artifacts = store
         .list_artifacts(run_id)
         .await
-        .map_err(|e| format!("list artifacts of run {run_id}: {e}"))?;
+        .map_err(|e| ReportGap::Unreadable(format!("list artifacts: {e}")))?;
     // `list_artifacts` also matches on recording id, so the run is checked here.
     let Some(report) = artifacts
         .into_iter()
         .filter(|a| a.kind == "ingest_report" && a.run_id.as_deref() == Some(run_id))
         .max_by_key(|a| a.id)
     else {
-        return Ok(None);
+        return Err(ReportGap::NotRegistered);
     };
-    let bytes = artifact_bytes(&report.uri)
+    let bytes = match artifact_bytes(&report.uri).await {
+        Ok(bytes) => bytes,
+        Err(_) if artifact_is_gone(&report.uri).await => return Err(ReportGap::Gone),
+        Err((_, e)) => return Err(ReportGap::Unreadable(e)),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| ReportGap::Corrupt(e.to_string()))
+}
+
+/// Whether a registered artifact's object is definitely absent — a not-found
+/// from the store, or a missing local file — as opposed to unreachable.
+async fn artifact_is_gone(uri: &str) -> bool {
+    match deja_orchestrator::codebundle::parse_s3_uri(uri) {
+        Ok((bucket, key)) => tokio::task::spawn_blocking(move || {
+            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+            cfg.bucket = bucket;
+            deja_compactor::object_exists(&cfg, &key)
+        })
         .await
-        .map_err(|(_, e)| format!("ingest report of run {run_id}: {e}"))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| format!("ingest report of run {run_id} is not JSON: {e}"))
+        .is_ok_and(|exists| matches!(exists, Ok(false))),
+        Err(_) => !std::path::Path::new(uri).exists(),
+    }
 }
 
 /// `GET /api/v1/artifacts/{id}/raw` — stream a registered artifact file.
@@ -4078,6 +4133,66 @@ mod tests {
     }
 
     // ---- identity: the revision the envelopes claim ----
+
+    fn refused(u: &super::Unavailable) -> Option<&str> {
+        match u {
+            super::Unavailable::Refused(why) => Some(why),
+            super::Unavailable::Pending(_) => None,
+        }
+    }
+
+    /// A baseline that has not ingested yet has no report: that is a wait,
+    /// not a mismatch, and must not read as "never".
+    #[test]
+    fn a_missing_report_on_an_unfinished_run_is_pending() {
+        for state in ["queued", "seeding", "running", "resolving"] {
+            let gap = super::report_gap("run-M", Some(state), super::ReportGap::NotRegistered);
+            assert!(
+                refused(&gap).is_none(),
+                "{state} must be pending, got {gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_report_on_a_finished_or_unknown_run_is_refused() {
+        for state in [Some("completed"), Some("failed"), None] {
+            let gap = super::report_gap("run-M", state, super::ReportGap::NotRegistered);
+            let why = refused(&gap).unwrap_or_default();
+            assert!(
+                why.contains("run run-M has no ingest report"),
+                "{state:?}: {gap:?}"
+            );
+        }
+    }
+
+    /// An expired object never comes back, so it refuses whatever the run's
+    /// state; a transient read failure does not.
+    #[test]
+    fn a_gone_report_refuses_and_an_unreadable_one_waits() {
+        let gone = super::report_gap("run-M", Some("completed"), super::ReportGap::Gone);
+        assert!(
+            refused(&gone)
+                .unwrap_or_default()
+                .contains("no longer stored"),
+            "{gone:?}"
+        );
+        let corrupt = super::report_gap(
+            "run-M",
+            Some("completed"),
+            super::ReportGap::Corrupt("eof".into()),
+        );
+        assert!(
+            refused(&corrupt).unwrap_or_default().contains("not JSON"),
+            "{corrupt:?}"
+        );
+        let flaky = super::report_gap(
+            "run-M",
+            Some("completed"),
+            super::ReportGap::Unreadable("503".into()),
+        );
+        assert!(refused(&flaky).is_none(), "{flaky:?}");
+    }
 
     fn manifest_with_codes(shas: &[Option<&str>]) -> deja_compactor::SessionManifest {
         let code: Vec<serde_json::Value> = shas
