@@ -792,7 +792,7 @@ fn drive_replay(
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
     let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
     ctx.log("rendering lookup table", &rendered.report);
-    let suspect = schema_suspect(&recording_id, rendered.event_schema_version);
+    let suspect = render_suspect(&recording_id, &rendered);
     if let Some(note) = &suspect {
         ctx.log("rendering lookup table", note);
     }
@@ -1512,7 +1512,7 @@ fn render_and_persist_lookup_table(
 ) -> Result<RenderedTable, String> {
     let raw = std::env::var(LOOKUP_TABLE_MAX_BYTES_ENV).ok();
     let (max_bytes, budget) = describe_lookup_table_budget(raw.as_deref());
-    let (entries, bytes, shared_bytes, event_schema_version) = persist_lookup_table_within(
+    let persisted = persist_lookup_table_within(
         root,
         run_id,
         recording,
@@ -1520,17 +1520,46 @@ fn render_and_persist_lookup_table(
         max_bytes.unwrap_or(u64::MAX),
     )
     .map_err(|e| format!("{e} Budget in force: {budget}."))?;
-    Ok(RenderedTable {
-        report: format!(
-            "{entries} entries rendered; one-result-per-entry table {bytes} bytes compact \
+    let Persisted {
+        entries,
+        legacy_bytes,
+        shared_bytes,
+        shared_only,
+        ..
+    } = persisted;
+    let runner = resident_fact()
+        .map(|fact| format!("; runner {fact}"))
+        .unwrap_or_default();
+    let report = if shared_only {
+        format!(
+            "{entries} entries rendered; one-result-per-entry table {legacy_bytes} bytes \
+             compact, over the budget ({budget}), so only the shared-results table was written, \
+             {shared_bytes} bytes, within that budget{runner}"
+        )
+    } else {
+        format!(
+            "{entries} entries rendered; one-result-per-entry table {legacy_bytes} bytes compact \
              (compared against the budget, {budget}); shared-results table {shared_bytes} \
-             bytes (information only){}",
-            resident_fact()
-                .map(|fact| format!("; runner {fact}"))
-                .unwrap_or_default()
-        ),
-        event_schema_version,
+             bytes (information only){runner}"
+        )
+    };
+    Ok(RenderedTable {
+        report,
+        event_schema_version: persisted.event_schema_version,
+        shared_only,
     })
+}
+
+/// What the render wrote.
+#[derive(Debug)]
+struct Persisted {
+    entries: usize,
+    legacy_bytes: u64,
+    shared_bytes: u64,
+    event_schema_version: Option<u16>,
+    /// The one-result-per-entry table was over the budget, so only the
+    /// shared-results table was written, at the table's own path.
+    shared_only: bool,
 }
 
 /// What a caller may know about the table it rendered, and nothing it could
@@ -1540,6 +1569,28 @@ struct RenderedTable {
     /// The line the run log records for the render.
     report: String,
     event_schema_version: Option<u16>,
+    shared_only: bool,
+}
+
+/// Everything the render gives the runner to suspect if the candidate then
+/// never becomes healthy.
+fn render_suspect(recording_id: &str, rendered: &RenderedTable) -> Option<String> {
+    let shared_only = rendered.shared_only.then(|| {
+        "only the shared-results lookup table was written, because the one-result-per-entry \
+         table was over the budget: a candidate on a deja pin from before shared-results tables \
+         cannot read it and refuses to boot, naming the table on its stderr. Run it on a \
+         candidate whose pin reads shared-results tables, or split its correlation filter into \
+         smaller runs whose tables fit the budget"
+            .to_owned()
+    });
+    let parts: Vec<String> = [
+        schema_suspect(recording_id, rendered.event_schema_version),
+        shared_only,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join("; and "))
 }
 
 /// The cause to suspect when a recording's schema is not the one this runner
@@ -1614,22 +1665,34 @@ fn lookup_table_budget_from(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Render, then refuse a table over `max_bytes` before anything can load it.
-/// Returns the entry count and the table's compact size.
+/// Render, then write the one-result-per-entry table and its shared form, or
+/// only the shared form when the table is over `max_bytes` and the shared form
+/// is not, or refuse when both are over. The same budget bounds both forms: it
+/// was measured on the one-result-per-entry form and is conservative for the
+/// shared one, which has not been measured against a candidate's limit.
 fn persist_lookup_table_within(
     root: &HarnessRoot,
     run_id: &str,
     recording: &crate::scope::ScopedRecording,
     recording_id: &str,
     max_bytes: u64,
-) -> Result<(usize, u64, u64, Option<u16>), String> {
+) -> Result<Persisted, String> {
     let table = crate::lookup::render_lookup_table(recording, recording_id)
         .map_err(|e| format!("render lookup table: {e}"))?;
     // Compact, not pretty: the candidate holds this whole file in one buffer at
     // boot, and indentation made it about 2.5x its content. The budget is in
     // these bytes.
     let bytes = serde_json::to_vec(&table).map_err(|e| format!("write lookup table: {e}"))?;
-    if bytes.len() as u64 > max_bytes {
+    // Over the budget, a candidate that reads only the one-result-per-entry
+    // table would be killed loading it; a candidate that reads the shared form
+    // loads that instead. So only the shared form is written, if it fits.
+    let shared_only = bytes.len() as u64 > max_bytes;
+    let shared_table = build_shared(&table, &bytes)?;
+    // Sized without being written out, so a refusal costs no more than this.
+    let shared_len = deja::LegacyDigest::of_serialized(&shared_table)
+        .map_err(|e| format!("size shared-results table: {e}"))?
+        .len;
+    if shared_only && shared_len > max_bytes {
         let correlations = table
             .entries
             .iter()
@@ -1642,33 +1705,47 @@ fn persist_lookup_table_within(
              and tables this size have been killed for memory rather than replayed. Table \
              bytes, not the correlation count, bound a run: replay these correlations as \
              several smaller runs, each naming a correlation filter. The budget is \
-             {LOOKUP_TABLE_MAX_BYTES_ENV} on the replay Job's runner container.",
+             {LOOKUP_TABLE_MAX_BYTES_ENV} on the replay Job's runner container. Its \
+             shared-results form, {shared_len} bytes, is over the budget too.",
             bytes.len()
         ));
     }
-    let size = bytes.len() as u64;
-    let shared = shared_results_bytes(&table, &bytes)?;
+    let shared = finish_shared(shared_table, &bytes)?;
+    let legacy_bytes = bytes.len() as u64;
     let path = root.lookup_table_path(run_id);
-    let sibling = deja::shared_results_path(&path);
-    std::fs::write(&path, bytes).map_err(|e| format!("write lookup table: {e}"))?;
-    crate::divergence::behaviour_tree::write_atomic(&sibling, &shared)
-        .map_err(|e| format!("write shared-results table: {e}"))?;
+    if shared_only {
+        drop(bytes);
+        crate::divergence::behaviour_tree::write_atomic(&path, &shared)
+            .map_err(|e| format!("write shared-results table: {e}"))?;
+    } else {
+        std::fs::write(&path, bytes).map_err(|e| format!("write lookup table: {e}"))?;
+        crate::divergence::behaviour_tree::write_atomic(&deja::shared_results_path(&path), &shared)
+            .map_err(|e| format!("write shared-results table: {e}"))?;
+    }
     if table.entries.is_empty() {
         return Err("rendered lookup table is empty".to_string());
     }
-    Ok((
-        table.entries.len(),
-        size,
-        shared.len() as u64,
-        table.event_schema_version,
-    ))
+    Ok(Persisted {
+        entries: table.entries.len(),
+        legacy_bytes,
+        shared_bytes: shared.len() as u64,
+        event_schema_version: table.event_schema_version,
+        shared_only,
+    })
 }
 
-/// The shared-results form of `table`, whose serialization is `legacy`, after
-/// proving it expands back to exactly those bytes.
-fn shared_results_bytes(table: &deja::LookupTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
-    let shared = deja::SharedResultsTable::from_table(table, legacy)
-        .map_err(|e| format!("build shared-results table: {e}"))?;
+/// The shared-results form of `table`, stamped with the digest of `legacy`,
+/// the table's serialization. Not yet checked: see [`finish_shared`].
+fn build_shared(
+    table: &deja::LookupTable,
+    legacy: &[u8],
+) -> Result<deja::SharedResultsTable, String> {
+    deja::SharedResultsTable::from_table(table, legacy)
+        .map_err(|e| format!("build shared-results table: {e}"))
+}
+
+/// Serialize `shared`, then prove the bytes expand to `legacy`.
+fn finish_shared(shared: deja::SharedResultsTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
     let bytes =
         serde_json::to_vec(&shared).map_err(|e| format!("write shared-results table: {e}"))?;
     drop(shared);
@@ -1938,7 +2015,7 @@ pub fn drive_replay_in_pod(
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
     let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
     ctx.log("rendering lookup table", &rendered.report);
-    let suspect = schema_suspect(&recording_id, rendered.event_schema_version);
+    let suspect = render_suspect(&recording_id, &rendered);
     if let Some(note) = &suspect {
         ctx.log("rendering lookup table", note);
     }
@@ -6310,9 +6387,10 @@ mod tests {
     #[test]
     fn the_lookup_table_is_written_compact_and_loads_back() {
         let (_dir, root, recording) = three_event_recording();
-        let (entries, _, _, _) =
+        let entries =
             super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
-                .unwrap();
+                .unwrap()
+                .entries;
         assert!(entries > 0, "the fixture renders entries");
 
         let bytes = std::fs::read(root.lookup_table_path("run-1")).unwrap();
@@ -6342,9 +6420,10 @@ mod tests {
     #[test]
     fn the_shared_table_is_written_beside_the_table_and_is_what_a_candidate_loads() {
         let (_dir, root, recording) = three_event_recording();
-        let (entries, _, shared_bytes, _) =
+        let persisted =
             super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
                 .unwrap();
+        let (entries, shared_bytes) = (persisted.entries, persisted.shared_bytes);
         let path = root.lookup_table_path("run-1");
         let sibling = deja::shared_results_path(&path);
         assert_eq!(std::fs::metadata(&sibling).unwrap().len(), shared_bytes);
@@ -6366,14 +6445,16 @@ mod tests {
         let (_dir, _root, recording) = three_event_recording();
         let table = render(&recording, "rec-1").unwrap();
         let legacy = serde_json::to_vec(&table).unwrap();
-        super::shared_results_bytes(&table, &legacy).expect("a table and its own bytes agree");
+        super::finish_shared(super::build_shared(&table, &legacy).unwrap(), &legacy)
+            .expect("a table and its own bytes agree");
 
         // Built against bytes that are not this table's: refused at the call
         // the write goes through, not only by the check on its own.
         let mut other = legacy.clone();
         let at = other.len() - 3;
         other[at] ^= 1;
-        let err = super::shared_results_bytes(&table, &other).unwrap_err();
+        let err =
+            super::finish_shared(super::build_shared(&table, &other).unwrap(), &other).unwrap_err();
         assert!(err.contains("does not expand"), "{err}");
 
         // A result changed to one exactly as long: the digest, not the length,
@@ -6407,6 +6488,214 @@ mod tests {
         let (_dir, root, recording) = three_event_recording();
         super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 16).unwrap_err();
         assert!(!deja::shared_results_path(&root.lookup_table_path("run-1")).exists());
+    }
+
+    /// Three events that recorded the same large value, the shape that makes
+    /// a one-result-per-entry table big and its shared form small.
+    fn repeated_result_recording() -> (
+        tempfile::TempDir,
+        crate::HarnessRoot,
+        crate::scope::ScopedRecording,
+    ) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let tape = crate::scope::TapeSlot::for_write(&root, "rec-1");
+        std::fs::create_dir_all(tape.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&tape).unwrap();
+        for seq in 0..3u64 {
+            let event = serde_json::json!({
+                "record_kind": "boundary_event", "global_sequence": seq, "request_sequence": seq,
+                "correlation_id": "c-1", "timestamp_ns": 0, "recording_run_id": "r",
+                "boundary": "imc", "trait_name": "T", "method_name": "m",
+                "call_file": "x.rs", "call_line": 10, "call_column": 4,
+                "request": null, "args": { "k": seq }, "response": null,
+                "result": { "graph": "g".repeat(4096) },
+                "is_error": false, "duration_us": 0,
+                "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                "provenance": "recorded", "recon": "lossless", "replay_strategy": "substitute",
+                "callsite_identity": null
+            });
+            writeln!(f, "{event}").unwrap();
+        }
+        drop(f);
+        let recording = crate::scope::ScopedRecording::open(
+            &root,
+            "rec-1",
+            crate::scope::RunScope::entire_session(),
+        )
+        .unwrap();
+        (dir, root, recording)
+    }
+
+    /// Over the budget, only the shared form is written, at the table's own
+    /// path, when it fits: a candidate that reads it runs, and one that reads
+    /// only the one-result-per-entry form cannot parse it and refuses to boot.
+    #[test]
+    fn over_the_budget_only_the_shared_form_is_written_at_the_table_path() {
+        let (_dir, root, recording) = repeated_result_recording();
+        let sizes =
+            super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        assert!(
+            sizes.shared_bytes < sizes.legacy_bytes,
+            "the fixture's shared form is smaller"
+        );
+        assert!(!sizes.shared_only);
+
+        let written = super::persist_lookup_table_within(
+            &root,
+            "run-1",
+            &recording,
+            "rec-1",
+            sizes.shared_bytes,
+        )
+        .expect("a table whose shared form fits is written");
+        assert!(written.shared_only);
+        let path = root.lookup_table_path("run-1");
+        assert!(
+            !deja::shared_results_path(&path).exists(),
+            "nothing beside it"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, sizes.shared_bytes);
+        assert!(
+            serde_json::from_slice::<deja::LookupTable>(&bytes).is_err(),
+            "a loader that knows only the one-result-per-entry form cannot parse it"
+        );
+        let mut source = deja::LocalFileLookupSource::new(&path);
+        let table = deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(source.loaded_from(), Some(path.as_path()));
+        assert_eq!(table.entries.len(), written.entries);
+    }
+
+    /// When the shared form is over the budget too, the run is refused and
+    /// the refusal names both sizes.
+    #[test]
+    fn a_table_whose_shared_form_is_over_the_budget_too_is_refused() {
+        let (_dir, root, recording) = repeated_result_recording();
+        let sizes =
+            super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        let err = super::persist_lookup_table_within(
+            &root,
+            "run-1",
+            &recording,
+            "rec-1",
+            sizes.shared_bytes - 1,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(&sizes.legacy_bytes.to_string())
+                && err.contains(&sizes.shared_bytes.to_string()),
+            "{err}"
+        );
+        assert!(!root.lookup_table_path("run-1").exists());
+    }
+
+    /// The run log says when only the shared form was written, with both sizes.
+    #[test]
+    fn the_run_log_says_when_only_the_shared_form_was_written() {
+        let _env = LOOKUP_TABLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_dir, root, recording) = repeated_result_recording();
+        let sizes =
+            super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        std::env::set_var(
+            super::LOOKUP_TABLE_MAX_BYTES_ENV,
+            sizes.shared_bytes.to_string(),
+        );
+        let rendered = super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1");
+        std::env::remove_var(super::LOOKUP_TABLE_MAX_BYTES_ENV);
+        let rendered = rendered.unwrap();
+        assert!(rendered.shared_only);
+        assert!(
+            rendered
+                .report
+                .contains("only the shared-results table was written")
+                && rendered.report.contains(&sizes.legacy_bytes.to_string())
+                && rendered.report.contains(&sizes.shared_bytes.to_string()),
+            "{}",
+            rendered.report
+        );
+    }
+
+    /// A table exactly at the budget is written in both forms, whichever form
+    /// is larger: only a table over it is written shared-only.
+    #[test]
+    fn a_table_at_the_budget_is_written_in_both_forms() {
+        for (name, (_dir, root, recording)) in [
+            ("distinct results", three_event_recording()),
+            ("repeated results", repeated_result_recording()),
+        ] {
+            let sizes =
+                super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                    .unwrap();
+            let written = super::persist_lookup_table_within(
+                &root,
+                "run-1",
+                &recording,
+                "rec-1",
+                sizes.legacy_bytes,
+            )
+            .unwrap_or_else(|e| panic!("{name}: a table at the budget is written: {e}"));
+            assert!(!written.shared_only, "{name}");
+            let path = root.lookup_table_path("run-1");
+            assert!(
+                deja::shared_results_path(&path).exists(),
+                "{name}: the shared form beside it"
+            );
+            assert!(
+                serde_json::from_slice::<deja::LookupTable>(&std::fs::read(&path).unwrap()).is_ok(),
+                "{name}: the table itself is the one-result-per-entry form"
+            );
+        }
+    }
+
+    /// Both drive paths hand the runner the render's suspects, not only the
+    /// schema's. No test reaches a drive path, so this holds them at the source.
+    #[test]
+    fn both_drive_paths_take_the_render_suspect() {
+        let needle = format!(
+            "let suspect = {}(&recording_id, &rendered);",
+            "render_suspect"
+        );
+        assert_eq!(include_str!("mod.rs").matches(&needle).count(), 2);
+    }
+
+    /// Both suspects, when both apply, are named together.
+    #[test]
+    fn a_schema_suspect_and_a_shared_only_render_are_named_together() {
+        let rendered = super::RenderedTable {
+            report: String::new(),
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION - 1),
+            shared_only: true,
+        };
+        let suspect = super::render_suspect("rec", &rendered).unwrap();
+        assert!(
+            suspect.contains("event schema") && suspect.contains("only the shared-results"),
+            "{suspect}"
+        );
+        assert!(
+            suspect.contains("smaller runs"),
+            "names a remedy: {suspect}"
+        );
+    }
+
+    /// A candidate that never becomes healthy after a shared-only render is
+    /// told why it may not have been able to read the table.
+    #[test]
+    fn a_shared_only_render_is_a_named_suspect() {
+        let rendered = |shared_only| super::RenderedTable {
+            report: String::new(),
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+            shared_only,
+        };
+        let suspect = super::render_suspect("rec", &rendered(true)).expect("a suspect");
+        assert!(suspect.contains("only the shared-results"), "{suspect}");
+        assert_eq!(super::render_suspect("rec", &rendered(false)), None);
     }
 
     /// A table over the budget fails the run before the candidate boots, and

@@ -36,7 +36,9 @@
 //!                            not exactly this set. Unset = record-only, no gate
 //!   DEJA_S3_*                recording source credentials (see deja-compactor)
 //!   DEJA_LOOKUP_TABLE_MAX_BYTES  largest lookup table (compact bytes) this run hands
-//!                            its candidate; unset = the default, 0 = no check
+//!                            its candidate, in either form: over it, only the
+//!                            shared-results form is written if that fits; unset =
+//!                            the default, 0 = no check
 
 use deja_orchestrator::lifecycle::{drive_replay_in_pod, InPodOptions, StoreCtx};
 use deja_orchestrator::{HarnessRoot, Run, RunMode, RunSpec, RunStatus};
