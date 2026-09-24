@@ -9189,6 +9189,42 @@ mod tests {
                 page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["b","a"]"#), "Collect"),
             ),
             (
+                "an escape moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":"a\/b","y":"a/b"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":"a/b","y":"a\/b"}"#, "Collect"),
+            ),
+            (
+                "a unicode escape moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":"\u0061","y":"a"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":"a","y":"\u0061"}"#, "Collect"),
+            ),
+            (
+                "a number's spelling moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":1.0,"y":1.00}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":1.00,"y":1.0}"#, "Collect"),
+            ),
+            (
+                "a negative zero moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":-0.0,"y":0.0}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":0.0,"y":-0.0}"#, "Collect"),
+            ),
+            (
+                "a duplicate key moved to another object",
+                page_embedding(
+                    r#"{"m":["a","b"],"k":{"a":1,"a":2},"j":{"a":3}}"#,
+                    "Collect",
+                ),
+                page_embedding(
+                    r#"{"m":["b","a"],"k":{"a":2},"j":{"a":1,"a":3}}"#,
+                    "Collect",
+                ),
+            ),
+            (
+                "markup inside a document: order can change how the page parses",
+                page_embedding(r#"{"a":"</script>","c":"<img>"}"#, "Collect"),
+                page_embedding(r#"{"c":"<img>","a":"</script>"}"#, "Collect"),
+            ),
+            (
                 "a number was written differently",
                 page_embedding(r#"{"m":["a","b"],"n":1.0}"#, "Collect"),
                 page_embedding(r#"{"m":["b","a"],"n":1.00}"#, "Collect"),
