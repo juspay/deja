@@ -352,6 +352,11 @@ pub struct Summary {
     /// that inheritance.
     #[serde(default)]
     pub seed_gap_cascade_correlations: u64,
+    /// The calls those correlations did not run, counted rather than inferred:
+    /// the cascade can over-apply to a concurrent task's omissions, never to a
+    /// pass, and this is the number that shows by how much.
+    #[serde(default)]
+    pub seed_gap_cascade_calls: u64,
     /// Calls that could not be conclusively classified because the RECORDING for
     /// their correlation stops at request teardown — the recorder releases the
     /// correlation at the API-lock release, so the post-response work the request
@@ -6157,6 +6162,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
             seed_gap_cascade_correlations,
+            seed_gap_cascade_calls,
             inconclusive_tail_gaps,
             inconclusive_races,
             missing_scored_spans,
@@ -13541,6 +13547,41 @@ mod tests {
         assert!(!card.verdict.pass, "{}", card.verdict.reason);
         assert!(!c1(&card).passed, "the correlation is not a pass");
         assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// Why the run-level cascade term is redundant today: a cascade's origin
+    /// is always booked as a seed gap by the first pass, which already forces
+    /// the run inconclusive. If a new demotion ever reaches the origin first,
+    /// this fails, and the run-level term has become load-bearing.
+    #[test]
+    fn cascade_origin_is_booked_as_a_seed_gap() {
+        for (card, rows) in [
+            gap_then_unreached(),
+            cascade_card(
+                vec![
+                    recorded_at(5, Some(unplanted_key_n(1))),
+                    recorded_at(7, None),
+                    recorded_at(9, Some(unplanted_key_n(2))),
+                ],
+                vec![replayed_at(5, true), replayed_at(9, true)],
+                &[1, 2],
+            ),
+        ] {
+            assert!(
+                card.summary.seed_gap_cascade_correlations > 0,
+                "precondition: a cascade"
+            );
+            let origin = rows
+                .iter()
+                .find(|r| r.source_event_global_sequence == Some(5))
+                .expect("the origin row");
+            assert_eq!(origin.kind, "inconclusive_seed_gap", "{rows:?}");
+            assert!(
+                card.summary.inconclusive_seed_gaps >= card.summary.seed_gap_cascade_correlations
+            );
+        }
+        let (card, _) = gap_then_unreached();
+        assert_eq!(card.summary.seed_gap_cascade_calls, 2);
     }
 
     /// A real divergence before the seed gap: the candidate may have caused
