@@ -115,14 +115,17 @@ pub struct DeltaVerdict {
     pub changed: usize,
     pub inherited: usize,
     pub resolved: usize,
-    /// Requests with at least one address in the family: the unit the tape
-    /// verdict counts in, so the two verdicts read in the same numbers.
+    /// Requests with at least one BLOCKING address in the family: the ones
+    /// that decide `pass`, in the unit the tape verdict counts in.
     #[serde(default)]
     pub introduced_requests: usize,
+    /// Requests with at least one BLOCKING address in the family.
     #[serde(default)]
     pub changed_requests: usize,
+    /// Requests with ANY address in the family, blocking or not.
     #[serde(default)]
     pub inherited_requests: usize,
+    /// Requests with ANY address in the family, blocking or not.
     #[serde(default)]
     pub resolved_requests: usize,
     pub reason: String,
@@ -154,8 +157,10 @@ pub struct Delta {
     /// Correlations both runs drove: the comparison's domain.
     pub covered_correlations: usize,
     pub uncovered: Uncovered,
-    /// Bucket family → requests with at least one address in it, over the
-    /// covered requests. `clean` counts requests with no other family.
+    /// Bucket family → requests with ANY address in it, blocking or not, over
+    /// the covered requests; so `requests["introduced"]` can exceed
+    /// `verdict.introduced_requests`, which counts blocking addresses only.
+    /// `clean` counts requests with no other family.
     #[serde(default)]
     pub requests: BTreeMap<String, usize>,
     /// The lane of every covered request, clean ones included, so a reader
@@ -212,6 +217,8 @@ pub fn cached_is_current(doc: &serde_json::Value, y: &str, m: &str, canon_versio
         && doc.get("m_run").and_then(|v| v.as_str()) == Some(m)
         && doc.get("canon_version").and_then(|v| v.as_u64()) == Some(u64::from(canon_version))
         && doc.get("verdict").is_some()
+        // A delta cached before request counts existed lacks them; recompute it.
+        && doc.get("requests").is_some()
         && super::tape::has_tape_check(doc, y, m)
 }
 
@@ -612,6 +619,55 @@ mod tests {
         assert_eq!(d.lanes[0].requests_by_family.get("changed"), Some(&1));
     }
 
+    /// Three requests, so every request count can tell a request from an
+    /// address and a blocking address from any address. `c` has a blocking
+    /// introduced address and an inherited one; `d` a NON-blocking introduced
+    /// address and two inherited ones; `e` is clean.
+    #[test]
+    fn request_counts_say_which_filter_they_use() {
+        let mut m = tree(
+            "m",
+            vec![
+                (call("c", 0), Value::Reproduced),
+                (call("c", 1), div("v2")),
+                (call("d", 0), Value::Reproduced),
+                (call("d", 1), div("v2")),
+                (call("d", 2), div("v2")),
+                (call("e", 0), Value::Reproduced),
+            ],
+        );
+        let mut y = tree(
+            "y",
+            vec![
+                (call("c", 0), div("v9")),
+                (call("c", 1), div("v2")),
+                (call("d", 0), div("v9")),
+                (call("d", 1), div("v2")),
+                (call("d", 2), div("v2")),
+                (call("e", 0), Value::Reproduced),
+            ],
+        );
+        for tree in [&mut m, &mut y] {
+            for entry in &mut tree.entries {
+                if entry.address == call("d", 0) {
+                    entry.blocking = false;
+                }
+            }
+        }
+        let d = three_way(&m, &y).unwrap();
+        assert_eq!(d.covered_correlations, 3, "precondition: three requests");
+        // blocking only: `d`'s introduced address does not count
+        assert_eq!(d.verdict.introduced_requests, 1);
+        assert_eq!(d.verdict.changed_requests, 0);
+        // any address: both `c` and `d` carry an introduced one
+        assert_eq!(d.requests.get("introduced"), Some(&2));
+        // requests, not addresses: three inherited addresses in two requests
+        assert_eq!(d.verdict.inherited, 3);
+        assert_eq!(d.verdict.inherited_requests, 2);
+        assert_eq!(d.requests.get("inherited"), Some(&2));
+        assert_eq!(d.requests.get("clean"), Some(&1), "`e` alone is clean");
+    }
+
     #[test]
     fn the_same_run_twice_is_a_passing_delta_however_far_it_left_the_tape() {
         let entries = vec![(call("c", 0), div("v2")), (call("c", 1), Value::Absent)];
@@ -718,7 +774,7 @@ mod tests {
     /// must be recomputed, not served and its verdict re-written.
     #[test]
     fn a_cached_delta_without_a_tape_check_is_not_current() {
-        let unchecked = serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}});
+        let unchecked = serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}, "requests": {}});
         assert!(!cached_is_current(&unchecked, "y", "m", CANON_VERSION));
         assert!(cached_is_current(
             &checked(unchecked),
@@ -728,10 +784,25 @@ mod tests {
         ));
     }
 
+    /// A delta cached before the request counts existed has none of them, and
+    /// the panel would fill them with zeros and fallbacks. It is recomputed,
+    /// not served, without bumping the canon version, which would also retire
+    /// every behaviour tree.
+    #[test]
+    fn a_cached_delta_without_request_counts_is_not_current() {
+        let old = checked(
+            serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}}),
+        );
+        assert!(!cached_is_current(&old, "y", "m", CANON_VERSION));
+        let mut current = old;
+        current["requests"] = serde_json::json!({});
+        assert!(cached_is_current(&current, "y", "m", CANON_VERSION));
+    }
+
     #[test]
     fn a_cached_delta_is_current_only_for_its_own_runs_and_rules() {
         let doc = checked(
-            serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}}),
+            serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}, "requests": {}}),
         );
         assert!(cached_is_current(&doc, "y", "m", CANON_VERSION));
         assert!(

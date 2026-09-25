@@ -831,7 +831,12 @@ export type Delta = {
 };
 
 /** Why there is no delta: `pending` clears on its own, `refused` never will. */
-export type DeltaUnavailable = { unavailable: string; unavailable_kind?: "pending" | "refused" };
+export type DeltaUnavailable = {
+  unavailable: string;
+  /** `tape_mismatch`: the two runs read different tapes. A refusal, and a
+   *  data-integrity warning rather than "not applicable". */
+  unavailable_kind?: "pending" | "refused" | "tape_mismatch";
+};
 export type DeltaResponse = Delta | DeltaUnavailable;
 
 /**
@@ -839,9 +844,15 @@ export type DeltaResponse = Delta | DeltaUnavailable;
  * no kind is read as refused, so nothing polls on an answer it cannot tell
  * will change.
  */
-export function deltaUnavailable(r: DeltaResponse | undefined): { why: string; pending: boolean } | null {
+export function deltaUnavailable(
+  r: DeltaResponse | undefined,
+): { why: string; pending: boolean; tapeMismatch: boolean } | null {
   if (!r || !("unavailable" in r)) return null;
-  return { why: r.unavailable, pending: r.unavailable_kind === "pending" };
+  return {
+    why: r.unavailable,
+    pending: r.unavailable_kind === "pending",
+    tapeMismatch: r.unavailable_kind === "tape_mismatch",
+  };
 }
 
 export function deltaFamily(b: DeltaBucket): DeltaFamily {

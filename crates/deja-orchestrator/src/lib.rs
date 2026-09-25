@@ -1459,6 +1459,13 @@ mod run_params_tests {
             "absent fields are not written"
         );
         assert!(plain.get("purpose").is_none());
+        assert!(
+            plain.get("label").is_none(),
+            "an unlabelled run serialises as before"
+        );
+        // The spec is persisted too, inside every run record.
+        let spec = serde_json::to_value(replay_spec()).unwrap();
+        assert!(spec.get("label").is_none(), "nor does an unlabelled spec");
     }
 
     #[test]

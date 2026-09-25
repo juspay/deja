@@ -1,5 +1,5 @@
 import React from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
   api,
@@ -15,6 +15,7 @@ import {
 } from "../lib/api";
 import { candidateRef } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
+import { comparedDiffs, pollPending, readState, sealLine } from "../lib/deltaPanel";
 
 /**
  * "Compared with main": what a pull request's run changed relative to main
@@ -206,8 +207,9 @@ function Facts({ d, prRun, mainRun }: { d: Delta; prRun?: RunRow; mainRun?: RunR
         <span className="v mono">{d.tape ?? prRun?.recording_id ?? "—"}</span>
         <span className="s">
           {d.covered_correlations} requests both runs drove
-          {notCompared > 0 && ` · ${notCompared} only one drove, not compared`}
+          {notCompared > 0 && ` · ${notCompared} driven by only one run (or the recording grew between them), not compared`}
         </span>
+        <span className="s mono">{sealLine(d)}</span>
       </div>
       <div className="fact">
         <b>compared</b>
@@ -285,15 +287,22 @@ function Fold({ title, count, open, children }: { title: string; count?: string;
   );
 }
 
-function Matrix({ d, reqs }: { d: Delta; reqs: Req[] }) {
+function Matrix({ d, reqs, mainKnown }: { d: Delta; reqs: Req[]; mainKnown: boolean }) {
   const total = d.covered_correlations;
   const { recVsMain, recVsPr, mainVsPr } = counts(reqs);
   const fieldsWhere = (pred: (f: Req["fields"][number]) => boolean) =>
     reqs.reduce((a, r) => a + r.fields.filter(pred).length, 0);
   const statusesWhere = (pred: (r: Req) => boolean) => reqs.filter(pred).length;
   const word = (i: DeltaSideInfo) => (!i.tape_verdict ? "unscored" : i.tape_verdict.pass ? "reproduced" : "diverged");
-  const cell = (x: number, hot: boolean) => <td className={`num ${x ? (hot ? "hot" : "") : "zero"}`}>{x}</td>;
-  const row = (k: string, requests: number, fields: number, statuses: number, verdict: React.ReactNode, hot: boolean) => (
+  // null: main's response diffs are not known, so a count would be a guess
+  const cell = (x: number | null, hot: boolean) =>
+    x === null ? (
+      <td className="num" title="main's response diffs could not be read">—</td>
+    ) : (
+      <td className={`num ${x ? (hot ? "hot" : "") : "zero"}`}>{x}</td>
+    );
+  const onMain = (x: number) => (mainKnown ? x : null);
+  const row = (k: string, requests: number, fields: number | null, statuses: number | null, verdict: React.ReactNode, hot: boolean) => (
     <tr>
       <td className="k">{k}</td>
       <td className={`num ${requests ? (hot ? "hot" : "") : "zero"}`}>{requests} of {total}</td>
@@ -308,9 +317,9 @@ function Matrix({ d, reqs }: { d: Delta; reqs: Req[] }) {
         <tr><th></th><th className="num">requests differing</th><th className="num">response fields</th><th className="num">response statuses</th><th>verdict</th></tr>
       </thead>
       <tbody>
-        {row("recording → main", recVsMain, fieldsWhere((f) => f.main !== SAME_AS_RECORDING && f.main !== undefined), statusesWhere((r) => r.status[1] !== null && r.status[1] !== r.status[0]), `${word(d.sides.m)} · main's own run against the recording`, true)}
+        {row("recording → main", recVsMain, onMain(fieldsWhere((f) => f.main !== SAME_AS_RECORDING && f.main !== undefined)), onMain(statusesWhere((r) => r.status[1] !== null && r.status[1] !== r.status[0])), `${word(d.sides.m)} · main's own run against the recording`, true)}
         {row("recording → this PR", recVsPr, fieldsWhere((f) => f.pr !== SAME_AS_RECORDING), statusesWhere((r) => r.status[2] !== r.status[0]), `${word(d.sides.y)} · the banner above`, true)}
-        {row("main → this PR", mainVsPr, d.verdict.introduced + d.verdict.changed + d.verdict.resolved, statusesWhere((r) => r.status[1] !== null && r.status[1] !== r.status[2]),
+        {row("main → this PR", mainVsPr, d.verdict.introduced + d.verdict.changed + d.verdict.resolved, onMain(statusesWhere((r) => r.status[1] !== null && r.status[1] !== r.status[2])),
           <span className={`rchip ${d.verdict.pass ? "good" : "bad"}`}>{d.verdict.pass ? "nothing new" : "changed by this PR"}</span>, !d.verdict.pass)}
       </tbody>
     </table>
@@ -673,7 +682,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
   const delta = useQuery({
     queryKey: ["delta", runId, against],
     queryFn: () => api.delta(runId, against),
-    refetchInterval: (q) => (deltaUnavailable(q.state.data)?.pending ? 15000 : false),
+    refetchInterval: (q) => (pollPending(q.state.data, q.state.dataUpdateCount) ? 15000 : false),
   });
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
   const unavailable = deltaUnavailable(delta.data);
@@ -681,26 +690,61 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
   const mainRun = useQuery({ queryKey: ["run", against], queryFn: () => api.run(against) });
   const prDiffs = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId), enabled: !!d });
   const mainDiffs = useQuery({ queryKey: ["httpdiffs", against], queryFn: () => api.httpDiffs(against), enabled: !!d });
+  const prRead = readState({ data: prDiffs.data, error: prDiffs.error });
+  const mainRead = readState({ data: mainDiffs.data, error: mainDiffs.error });
   const reqs = React.useMemo(
-    () => (d && prDiffs.data ? joinRequests(d, prDiffs.data, mainDiffs.data ?? []) : []),
-    [d, prDiffs.data, mainDiffs.data],
+    () =>
+      d && prDiffs.data && !prDiffs.error
+        ? joinRequests(d, comparedDiffs(d, prDiffs.data), mainDiffs.error ? [] : mainDiffs.data ?? [])
+        : [],
+    [d, prDiffs.data, prDiffs.error, mainDiffs.data, mainDiffs.error],
   );
+  const deltaUpdates = useQueryClient().getQueryState(["delta", runId, against])?.dataUpdateCount ?? 0;
+  const stillPolling = pollPending(delta.data, deltaUpdates);
   const mainSha = against.split("-")[2] ?? against;
   return (
     <section className="delta-panel">
       <h2>Compared with main</h2>
       {delta.isLoading && <p className="hint">comparing…</p>}
       {delta.error && <p className="err">{String(delta.error)}</p>}
-      {unavailable && <div className="delta-unavailable">{unavailable.pending ? "Delta pending" : "No delta"}: {unavailable.why}</div>}
+      {unavailable &&
+        (unavailable.tapeMismatch ? (
+          <div className="delta-unavailable warn">
+            <b>Not comparable</b>: {unavailable.why}. The two runs scored different recordings, so neither can be read
+            against the other.
+          </div>
+        ) : (
+          <div className="delta-unavailable">
+            {unavailable.pending
+              ? stillPolling
+                ? "Delta pending"
+                : "Delta still pending after ten minutes; reload to check again"
+              : "No delta"}
+            : {unavailable.why}
+          </div>
+        ))}
       {d && (
         <>
           <Facts d={d} prRun={prRun.data} mainRun={mainRun.data} />
-          <Headline d={d} reqs={reqs} />
-          {prDiffs.isLoading && <p className="hint">loading the responses…</p>}
-          {reqs.length > 0 && (
+          {prRead.state === "failed" ? (
+            <p className="err">
+              This PR's response diffs could not be read, so the panel cannot say which requests differ: {prRead.reason}
+            </p>
+          ) : prRead.state === "pending" ? (
+            <p className="hint">loading the responses…</p>
+          ) : (
+            <Headline d={d} reqs={reqs} />
+          )}
+          {mainRead.state === "failed" && (
+            <p className="err">
+              Main's response diffs could not be read, so its field and status columns are unknown (—): {mainRead.reason}
+            </p>
+          )}
+          {mainRead.state === "pending" && prRead.state === "ok" && <p className="hint">loading main's responses…</p>}
+          {prRead.state === "ok" && reqs.length > 0 && (
             <>
               <Fold title="The three comparisons, in numbers" count="requests, then what differed inside them" open>
-                <Matrix d={d} reqs={reqs} />
+                <Matrix d={d} reqs={reqs} mainKnown={mainRead.state === "ok"} />
               </Fold>
               <Tiles d={d} reqs={reqs} />
               <Fold title="By connector and flow" count="requests per outcome; fields in parentheses" open>
