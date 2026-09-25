@@ -163,9 +163,9 @@ fn form_fields_same(
 /// under XOR either; addition is used there too, so there is one combiner.
 pub fn element_hash(value: &Value) -> u64 {
     const NULL: u64 = 0x6e75_6c6c;
-    const ARRAY: u64 = 0x6172_7261_79;
+    const ARRAY: u64 = 0x0061_7272_6179;
     const OBJECT: u64 = 0x6f62_6a65_6374;
-    const DOCUMENT: u64 = 0x646f_63;
+    const DOCUMENT: u64 = 0x0064_6f63;
     const FORM: u64 = 0x666f_726d;
     const BODY: u64 = 0x626f_6479;
     let tagged = |tag: u64, inner: u64| finalise(tag ^ inner.rotate_left(17));
@@ -173,12 +173,12 @@ pub fn element_hash(value: &Value) -> u64 {
         Value::Null => finalise(NULL),
         Value::Bool(b) => finalise(0x626f_6f6c ^ u64::from(*b)),
         Value::Number(n) => tagged(
-            0x6e75_6d,
+            0x006e_756d,
             crate::fnv1a_str(crate::FNV_OFFSET_BASIS, &n.to_string()),
         ),
         Value::String(text) => match embedded_document(text) {
             Some(document) => tagged(DOCUMENT, element_hash(&document)),
-            None => tagged(0x7374_72, crate::fnv1a_str(crate::FNV_OFFSET_BASIS, text)),
+            None => tagged(0x0073_7472, crate::fnv1a_str(crate::FNV_OFFSET_BASIS, text)),
         },
         Value::Object(map) if is_form_request_body(map) => {
             let text = crate::replay::request_body_text(map).unwrap_or_default();
