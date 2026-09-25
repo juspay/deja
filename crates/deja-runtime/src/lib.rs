@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 pub mod canonical;
-pub mod capture_key;
 pub mod correlation_layer;
 pub mod graph;
 pub mod hash_seed;
