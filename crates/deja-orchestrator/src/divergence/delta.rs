@@ -514,7 +514,7 @@ mod tests {
         }
     }
     fn tree(run: &str, entries: Vec<(Address, Value)>) -> BehaviourTree {
-        let correlations = entries
+        let correlations: BTreeSet<String> = entries
             .iter()
             .map(|(a, _)| a.correlation().to_owned())
             .chain(std::iter::once("c".to_owned()))
@@ -530,15 +530,19 @@ mod tests {
                     blocking: true,
                 })
                 .collect(),
-            lanes: [(
-                "c".to_owned(),
-                Lane {
-                    connector: "paypal".into(),
-                    flow: "sync".into(),
-                },
-            )]
-            .into_iter()
-            .collect(),
+            // one lane for every request, so per-lane request counts are one row
+            lanes: correlations
+                .iter()
+                .map(|c: &String| {
+                    (
+                        c.clone(),
+                        Lane {
+                            connector: "paypal".into(),
+                            flow: "sync".into(),
+                        },
+                    )
+                })
+                .collect(),
             correlations,
             event_schema_versions: [10].into_iter().collect(),
         }
@@ -565,6 +569,12 @@ mod tests {
                 (call("c", 7), Value::Absent),     // resolved omission
                 (novel("c", 0), nov("n")),         // inherited novel
                 (novel("c", 1), nov("n")),         // resolved novel
+                // a second request, so request counts differ from address counts
+                (call("d", 0), div("v2")), // changed
+                (call("d", 1), div("v2")), // changed
+                (call("d", 2), div("v2")), // resolved
+                // a third, clean one
+                (call("e", 0), Value::Reproduced),
             ],
         );
         let y = tree(
@@ -580,11 +590,15 @@ mod tests {
                 (call("c", 7), Value::Reproduced),
                 (novel("c", 0), nov("n")),
                 (novel("c", 2), nov("q")), // introduced novel
+                (call("d", 0), div("v3")),
+                (call("d", 1), div("v3")),
+                (call("d", 2), Value::Reproduced),
+                (call("e", 0), Value::Reproduced),
             ],
         );
         let d = three_way(&m, &y).unwrap();
         let by = |a: Address| d.rows.iter().find(|r| r.address == a).map(|r| r.bucket);
-        assert_eq!(d.clean, 1);
+        assert_eq!(d.clean, 2, "c0 and e0");
         assert_eq!(by(call("c", 1)), Some(Bucket::Inherited));
         assert_eq!(by(call("c", 2)), Some(Bucket::Introduced));
         assert_eq!(by(call("c", 3)), Some(Bucket::Resolved));
@@ -596,27 +610,28 @@ mod tests {
         assert_eq!(by(novel("c", 1)), Some(Bucket::ResolvedNovel));
         assert_eq!(by(novel("c", 2)), Some(Bucket::IntroducedNovel));
         assert!(!d.verdict.pass);
-        assert_eq!((d.verdict.introduced, d.verdict.changed), (3, 1));
+        assert_eq!((d.verdict.introduced, d.verdict.changed), (3, 3));
         assert_eq!(d.rows[0].bucket, Bucket::Changed, "flagged rows come first");
-        assert_eq!(d.lanes[0].requests, 1);
+        assert_eq!(d.lanes[0].requests, 3);
         assert_eq!(
             d.rows.len() + d.clean,
-            11,
+            15,
             "every address lands in exactly one place"
         );
         assert_eq!(d.uncovered.addresses, 0);
-        // one request carries every bucket: in requests it is 1 everywhere
+        // Three requests: `c` carries every bucket, `d` two changed addresses and
+        // one resolved, `e` none. Each request count now differs from the
+        // address count it could be confused with.
         assert_eq!(
             (d.verdict.introduced_requests, d.verdict.changed_requests),
-            (1, 1)
+            (1, 2),
+            "3 changed addresses in 2 requests"
         );
+        assert_eq!((d.verdict.resolved, d.verdict.resolved_requests), (4, 2));
         assert_eq!(d.requests.get("inherited"), Some(&1));
-        assert_eq!(
-            d.requests.get("clean"),
-            Some(&0),
-            "the request has other families too"
-        );
-        assert_eq!(d.lanes[0].requests_by_family.get("changed"), Some(&1));
+        assert_eq!(d.requests.get("clean"), Some(&1), "`e` alone");
+        assert_eq!(d.lanes[0].requests_by_family.get("changed"), Some(&2));
+        assert_eq!(d.lanes[0].requests_by_family.get("clean"), Some(&1));
     }
 
     /// Three requests, so every request count can tell a request from an
