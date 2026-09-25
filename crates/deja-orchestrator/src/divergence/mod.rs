@@ -346,9 +346,10 @@ pub struct Summary {
     /// divergence. Substitute hits do not contribute seed gaps.
     #[serde(default)]
     pub inconclusive_seed_gaps: u64,
-    /// Correlations with calls that never ran because a seed gap cut them off,
-    /// so they are inconclusive rather than failed: how much of the verdict
-    /// rests on that inheritance.
+    /// Correlations with calls that never ran because a seed gap cut them off.
+    /// Those calls are inconclusive rather than blocking; a correlation that
+    /// also diverged elsewhere still fails. How much of the verdict rests on
+    /// that inheritance.
     #[serde(default)]
     pub seed_gap_cascade_correlations: u64,
     /// Calls that could not be conclusively classified because the RECORDING for
@@ -772,11 +773,12 @@ impl UnplantedPresence {
 /// that never ran were cut off by the missing seed, not by the candidate, so
 /// they inherit its inconclusive status instead of blocking.
 ///
-/// "First divergence" is judged in replay order over every call that could be
-/// one: a resolved call whose value diverged, or any unresolved call, whatever
-/// it is later classified as. Counting a tolerated or absorbed call as a
-/// divergence errs toward keeping the rows below blocking, never toward
-/// excusing them.
+/// "First divergence" is the earliest, by recorded sequence, among the calls
+/// that ran and diverged, however they are later classified; and any call the
+/// candidate added before it in the replay, whatever it is later classified
+/// as, refuses the cascade. Both err toward keeping the rows below blocking,
+/// never toward excusing them. The scorecard and the ledger each build this
+/// from the same artifacts, so they agree.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SeedGapCascade(BTreeMap<String, u64>);
 
@@ -787,27 +789,43 @@ impl SeedGapCascade {
             .iter()
             .map(|ev| (ev.global_sequence, ev))
             .collect();
-        let mut decided: HashSet<&str> = HashSet::new();
-        let mut starts = BTreeMap::new();
-        for obs in &art.observed {
-            let Some(corr) = obs.correlation_id.as_deref() else {
+        // Per correlation: the earliest divergence among the calls that ran,
+        // by RECORDED sequence (replay order can interleave under
+        // concurrency), and whether a call the candidate added came before it
+        // in the replay.
+        struct First {
+            seq: u64,
+            stream_index: usize,
+        }
+        let mut first: HashMap<&str, First> = HashMap::new();
+        for (stream_index, obs) in art.observed.iter().enumerate() {
+            let (Some(corr), true) = (obs.correlation_id.as_deref(), obs.resolved) else {
                 continue;
             };
-            if observed_is_ingress(obs) || decided.contains(corr) {
+            let Some(seq) = obs.source_event_global_sequence else {
+                continue;
+            };
+            if observed_is_ingress(obs) || !observed_value_diverged(obs, by_seq.get(&seq).copied())
+            {
                 continue;
             }
-            let event = obs
-                .source_event_global_sequence
-                .and_then(|seq| by_seq.get(&seq).copied());
-            let diverges = !obs.resolved || observed_value_diverged(obs, event);
-            if !diverges {
+            if first.get(corr).is_none_or(|f| seq < f.seq) {
+                first.insert(corr, First { seq, stream_index });
+            }
+        }
+        let mut starts = BTreeMap::new();
+        for (corr, f) in first {
+            let event = by_seq.get(&f.seq).copied();
+            if !art.unplanted_presence.read_by(Some(corr), event) {
                 continue;
             }
-            decided.insert(corr);
-            if obs.resolved && art.unplanted_presence.read_by(Some(corr), event) {
-                if let Some(seq) = obs.source_event_global_sequence {
-                    starts.insert(corr.to_owned(), seq);
-                }
+            // Any call the candidate added before the gap, whatever it is later
+            // classified as, may be what stopped the request: no cascade.
+            let added_before = art.observed[..f.stream_index].iter().any(|o| {
+                !o.resolved && !observed_is_ingress(o) && o.correlation_id.as_deref() == Some(corr)
+            });
+            if !added_before {
+                starts.insert(corr.to_owned(), f.seq);
             }
         }
         Self(starts)
@@ -5916,6 +5934,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             || inconclusive_tail_gaps > 0
             || absorbed_misses > 0
             || inconclusive_seed_gaps > 0
+            || seed_gap_cascade_calls > 0
             || stopped_calls > 0)
             && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
@@ -13549,6 +13568,55 @@ mod tests {
                 .all(|r| r.kind != "inconclusive_seed_gap_cascade"),
             "{rows:?}"
         );
+    }
+
+    /// Replay order is not recorded order under concurrency: a call recorded
+    /// BEFORE the gap that diverged but was replayed after it still comes
+    /// first, and refuses the cascade.
+    #[test]
+    fn cascade_first_divergence_is_by_recorded_order_not_replay_order() {
+        let (card, rows) = cascade_card(
+            vec![
+                recorded_at(3, None),
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true), replayed_at(3, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 0);
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+        assert!(
+            rows.iter()
+                .all(|r| r.kind != "inconclusive_seed_gap_cascade"),
+            "{rows:?}"
+        );
+    }
+
+    /// A call the candidate added before the gap may be what stopped the
+    /// request: no cascade.
+    #[test]
+    fn cascade_refused_after_a_call_the_candidate_added() {
+        let mut added = exec_obs_method(
+            "db",
+            Some("c1"),
+            "generic_insert",
+            false,
+            None,
+            None,
+            DELETE_OK(),
+        );
+        added.seed_gap = false;
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![added, replayed_at(5, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 0);
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
     }
 
     /// Only calls recorded AFTER the gap inherit: one before it was reachable.
