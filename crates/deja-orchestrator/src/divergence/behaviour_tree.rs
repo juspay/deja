@@ -321,11 +321,19 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             | "identity_skew"
             | "deterministic"
             | "served_recorded_error" => Value::Reproduced,
-            "omitted" | "pruned_subtree" => Value::Absent,
+            // A call a seed gap cut off never ran: absent, like any omission.
+            // The scorecard decides who it is charged to, not the tree.
+            "omitted" | "pruned_subtree" | "inconclusive_seed_gap_cascade" => Value::Absent,
             "novel" | "novel_subtree" | "environmental" | "novel_absorbed" => Value::Novel {
                 hash: observed_hash(),
             },
-            k if k.starts_with("inconclusive") || k.starts_with("schema_default") => continue,
+            // Left out of the tree by name, not by prefix: a new kind must opt in
+            // here, or it reads as diverged rather than silently vanishing and
+            // being read by a delta as reproduced.
+            "inconclusive_race"
+            | "inconclusive_seed_gap"
+            | "inconclusive_tail_gap"
+            | "schema_default" => continue,
             _ => Value::Diverged {
                 hash: observed_hash(),
             },
@@ -603,6 +611,49 @@ mod tests {
         );
         let not_json = serde_json::json!({"value": "{not json"});
         assert_eq!(hash_of(&not_json), hash_of(&not_json.clone()));
+    }
+
+    /// A call a seed gap cut off never ran: it is absent in the tree, as any
+    /// omission is, so a delta cannot read it as reproduced. Blame is the
+    /// scorecard's business, not the tree's.
+    #[test]
+    fn a_call_cut_off_by_a_seed_gap_is_absent_not_reproduced() {
+        let span = "request>x";
+        let args = serde_json::json!({"url": "u"});
+        let rows = vec![row(
+            "inconclusive_seed_gap_cascade",
+            "c1",
+            span,
+            Some(20),
+            args,
+        )];
+        let tree = build("run", &rows, &[]);
+        let call = tree
+            .entries
+            .iter()
+            .find(|e| matches!(e.address, Address::Call { .. }))
+            .expect("the cut-off call is an address in the tree");
+        assert!(matches!(call.value, Value::Absent));
+    }
+
+    /// A kind this tree does not know is never dropped: it reads as diverged,
+    /// which a reader sees, rather than vanishing into "reproduced".
+    #[test]
+    fn an_unknown_inconclusive_kind_is_not_dropped() {
+        let rows = vec![row(
+            "inconclusive_something_new",
+            "c1",
+            "request>x",
+            Some(20),
+            serde_json::json!({}),
+        )];
+        let tree = build("run", &rows, &[]);
+        let call = tree
+            .entries
+            .iter()
+            .find(|e| matches!(e.address, Address::Call { .. }))
+            .expect("an unknown kind stays in the tree");
+        assert!(matches!(call.value, Value::Diverged { .. }));
     }
 
     #[test]
