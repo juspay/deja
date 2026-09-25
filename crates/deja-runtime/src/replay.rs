@@ -352,9 +352,6 @@ pub fn db_row_state_key(table: &str, row: &serde_json::Value) -> Option<StateKey
     })
 }
 
-/// Extract all row-exact DB state keys carried by a structured DB `Ok` value or
-/// row/object array. Non-row shapes and rows without pragmatic PK columns are
-/// ignored; callers can fall back to [`db_query_state_key`].
 /// Row keys a statement names, from its query text and its bind values in
 /// position order: one per equality predicate on the table's first key column,
 /// completed by the other key columns' bound values. Empty unless EVERY key
@@ -521,25 +518,35 @@ fn run_row_images(events: &[BoundaryEvent]) -> RunRowImages {
     rows
 }
 
-/// The latest image of the row a presence-only delete removed, recorded before
-/// it, and the sequence it came from: the state the row was actually in when
-/// the delete ran.
-fn borrowed_image(event: &BoundaryEvent, rows: &RunRowImages) -> Option<(u64, serde_json::Value)> {
+/// The row a presence-only delete removed, named by its statement: the key of
+/// a row the recording asserted without carrying.
+fn presence_row_key(event: &BoundaryEvent) -> Option<String> {
     if !db_result_asserts_presence(event) {
         return None;
     }
     let args = event.args.to_value();
     let table = db_table_from_event_args(&args)?;
-    let sql = args.get("sql")?.as_str()?;
-    let key = statement_row_key(table, sql)?;
+    statement_row_key(table, args.get("sql")?.as_str()?)
+}
+
+/// The latest image of a row recorded before `before`, and the sequence it came
+/// from: the state the row was actually in at that point.
+fn latest_image_before(
+    rows: &RunRowImages,
+    key: &str,
+    before: u64,
+) -> Option<(u64, serde_json::Value)> {
     // The row key names its table, so an image of another table never matches.
-    rows.get(&key)?
+    rows.get(key)?
         .iter()
-        .filter(|(seq, _)| *seq < event.global_sequence)
+        .filter(|(seq, _)| *seq < before)
         .max_by_key(|(seq, _)| *seq)
         .cloned()
 }
 
+/// Extract all row-exact DB state keys carried by a structured DB `Ok` value or
+/// row/object array. Non-row shapes and rows without pragmatic PK columns are
+/// ignored; callers can fall back to [`db_query_state_key`].
 pub fn db_row_state_keys(table: &str, value: &serde_json::Value) -> Vec<StateKey> {
     fn visit(table: &str, value: &serde_json::Value, keys: &mut Vec<StateKey>) {
         if let Some(key) = db_row_state_key(table, value) {
@@ -3146,13 +3153,11 @@ impl SeedPlan {
     pub fn upsert(&mut self, entry: SeedEntry) {
         let k = (entry.boundary.clone(), entry.key.clone());
         match self.entries.get(&k) {
-            // Recording always wins over Ambient; Recording-over-Recording keeps
-            // the FIRST recorded value within the correlation (the precondition
-            // the correlation observed before it began mutating the key).
-            Some(existing)
-                if existing.origin == SeedOrigin::Recording
-                    && entry.origin == SeedOrigin::Ambient => {}
-            Some(existing) if existing.origin == SeedOrigin::Recording => {}
+            // A recording-derived entry (recorded or borrowed) always wins over
+            // Ambient, and over a later recorded value: the FIRST is the
+            // precondition the correlation observed before it began mutating
+            // the key.
+            Some(existing) if existing.origin != SeedOrigin::Ambient => {}
             _ => {
                 self.entries.insert(k, entry);
             }
@@ -3665,8 +3670,8 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     // AFTER each event is planned, so an event never sees its own image.
     let mut observed_rows: ObservedRowImages = std::collections::HashMap::new();
     // Every row image in the run, across its correlations, for a presence-only
-    // delete to borrow its row from.
-    let run_rows = run_row_images(events);
+    // delete to borrow its row from. Built on the first such delete.
+    let mut run_rows: Option<RunRowImages> = None;
     // How this recording spells a physical redis key, so a delete that declares
     // no read set can still name the key it proves existed.
     // A delete-only correlation shows no read, so the rest of the run's
@@ -3784,9 +3789,20 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                 let (image, origin) =
                     match preferred_seed_image(event, &canonical_key, &observed_rows) {
                         Some(image) => (Some(image), SeedOrigin::Recording),
-                        None => match borrowed_image(event, &run_rows) {
-                            Some((global_sequence, row)) => {
-                                (Some(row), SeedOrigin::Borrowed { global_sequence })
+                        None => match presence_row_key(event) {
+                            // The correlation's own earlier image of the row is
+                            // what its own read plants: use it, never a rival.
+                            Some(row_key) if observed_rows.contains_key(&row_key) => {
+                                (observed_rows.get(&row_key).cloned(), SeedOrigin::Recording)
+                            }
+                            Some(row_key) => {
+                                let rows = run_rows.get_or_insert_with(|| run_row_images(events));
+                                match latest_image_before(rows, &row_key, event.global_sequence) {
+                                    Some((global_sequence, row)) => {
+                                        (Some(row), SeedOrigin::Borrowed { global_sequence })
+                                    }
+                                    None => (None, SeedOrigin::Recording),
+                                }
                             }
                             None => (None, SeedOrigin::Recording),
                         },
@@ -9351,6 +9367,62 @@ redis\tcurrency\tusd
                 debug_bind_values(r#"["a", ["b", "c"]]"#),
                 None,
                 "a Vec bind renders as a JSON array and is refused, not used as a key"
+            );
+        }
+
+        #[test]
+        fn the_correlations_own_earlier_image_wins_over_a_later_rival() {
+            let events = [
+                imaged(
+                    2,
+                    "b",
+                    row_image("business_profile", "profile_id", "pro_1", "own"),
+                ),
+                imaged(
+                    3,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_1", "rival"),
+                ),
+                delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT),
+            ];
+            let entry = planted(&events);
+            assert_eq!(
+                entry.image,
+                Some(row_image("business_profile", "profile_id", "pro_1", "own")),
+                "the image its own read plants, so two entries never disagree on one row"
+            );
+            assert_eq!(entry.origin, SeedOrigin::Recording);
+        }
+
+        #[test]
+        fn ambient_never_overwrites_a_borrowed_entry() {
+            let entry = |origin| SeedEntry {
+                boundary: "db".to_owned(),
+                key: "k".to_owned(),
+                value: serde_json::json!(true),
+                image: None,
+                method: None,
+                origin,
+                source_sequence: 1,
+            };
+            let borrowed = SeedOrigin::Borrowed { global_sequence: 3 };
+            for later in [SeedOrigin::Ambient, SeedOrigin::Recording] {
+                let mut plan = SeedPlan::new();
+                plan.upsert(entry(borrowed));
+                plan.upsert(entry(later));
+                assert_eq!(
+                    plan.resolve("db", "k").unwrap().origin,
+                    borrowed,
+                    "{later:?}"
+                );
+            }
+            let mut plan = SeedPlan::new();
+            plan.upsert(entry(SeedOrigin::Ambient));
+            plan.upsert(entry(borrowed));
+            assert_eq!(
+                plan.resolve("db", "k").unwrap().origin,
+                borrowed,
+                "a borrow replaces ambient"
             );
         }
 
