@@ -331,6 +331,7 @@ pub(crate) fn build_with_inconclusive(
         inconclusive_race,
         tail_gap,
         &super::UnplantedPresence::default(),
+        &super::SeedGapCascade::default(),
         None,
         &mut |row| {
             rows.push(row);
@@ -357,6 +358,7 @@ pub(crate) fn build_with_inconclusive_into(
     inconclusive_race: &InconclusiveRaceEvidence,
     tail_gap: &TailGapEvidence,
     unplanted: &super::UnplantedPresence,
+    cascade: &super::SeedGapCascade,
     plan: Option<&GraphScoringPlan>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -660,6 +662,8 @@ pub(crate) fn build_with_inconclusive_into(
             &ev.boundary,
             ev.role.as_deref(),
         );
+        // Cut off by the correlation's seed gap, mirroring the scorecard.
+        let cascaded = blocking && cascade.covers(ev.correlation_id.as_deref(), ev.global_sequence);
         sink(CallRecord {
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
@@ -667,8 +671,15 @@ pub(crate) fn build_with_inconclusive_into(
             boundary: ev.boundary.clone(),
             trait_name: ev.trait_name.clone(),
             method_name: ev.method_name.clone(),
-            kind: if pruned { "pruned_subtree" } else { "omitted" }.to_owned(),
-            blocking,
+            kind: if cascaded {
+                "inconclusive_seed_gap_cascade"
+            } else if pruned {
+                "pruned_subtree"
+            } else {
+                "omitted"
+            }
+            .to_owned(),
+            blocking: blocking && !cascaded,
             origin: false,
             stopped: false,
             resolved_rank: None,
@@ -705,6 +716,7 @@ pub(crate) fn build_with_plan_into(
     inconclusive_race: &InconclusiveRaceEvidence,
     tail_gap: &TailGapEvidence,
     unplanted: &super::UnplantedPresence,
+    cascade: &super::SeedGapCascade,
     plan: &GraphScoringPlan,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -720,6 +732,7 @@ pub(crate) fn build_with_plan_into(
         inconclusive_race,
         tail_gap,
         unplanted,
+        cascade,
         Some(plan),
         sink,
     )

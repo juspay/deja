@@ -346,6 +346,11 @@ pub struct Summary {
     /// divergence. Substitute hits do not contribute seed gaps.
     #[serde(default)]
     pub inconclusive_seed_gaps: u64,
+    /// Correlations with calls that never ran because a seed gap cut them off,
+    /// so they are inconclusive rather than failed: how much of the verdict
+    /// rests on that inheritance.
+    #[serde(default)]
+    pub seed_gap_cascade_correlations: u64,
     /// Calls that could not be conclusively classified because the RECORDING for
     /// their correlation stops at request teardown — the recorder releases the
     /// correlation at the API-lock release, so the post-response work the request
@@ -759,6 +764,61 @@ impl UnplantedPresence {
                 self.0
                     .contains(&(correlation.to_owned(), canonical_key(key)))
             })
+    }
+}
+
+/// Correlations whose FIRST divergence is a seed gap the harness could not
+/// plant, with the recorded sequence of that call. The calls recorded after it
+/// that never ran were cut off by the missing seed, not by the candidate, so
+/// they inherit its inconclusive status instead of blocking.
+///
+/// "First divergence" is judged in replay order over every call that could be
+/// one: a resolved call whose value diverged, or any unresolved call, whatever
+/// it is later classified as. Counting a tolerated or absorbed call as a
+/// divergence errs toward keeping the rows below blocking, never toward
+/// excusing them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeedGapCascade(BTreeMap<String, u64>);
+
+impl SeedGapCascade {
+    pub(crate) fn build(art: &RunArtifacts) -> Self {
+        let by_seq: HashMap<u64, &deja::BoundaryEvent> = art
+            .events
+            .iter()
+            .map(|ev| (ev.global_sequence, ev))
+            .collect();
+        let mut decided: HashSet<&str> = HashSet::new();
+        let mut starts = BTreeMap::new();
+        for obs in &art.observed {
+            let Some(corr) = obs.correlation_id.as_deref() else {
+                continue;
+            };
+            if observed_is_ingress(obs) || decided.contains(corr) {
+                continue;
+            }
+            let event = obs
+                .source_event_global_sequence
+                .and_then(|seq| by_seq.get(&seq).copied());
+            let diverges = !obs.resolved || observed_value_diverged(obs, event);
+            if !diverges {
+                continue;
+            }
+            decided.insert(corr);
+            if obs.resolved && art.unplanted_presence.read_by(Some(corr), event) {
+                if let Some(seq) = obs.source_event_global_sequence {
+                    starts.insert(corr.to_owned(), seq);
+                }
+            }
+        }
+        Self(starts)
+    }
+
+    /// Whether the recorded call at `seq` in `correlation` was cut off by its
+    /// correlation's seed gap: recorded after it.
+    pub(crate) fn covers(&self, correlation: Option<&str>, seq: u64) -> bool {
+        correlation
+            .and_then(|c| self.0.get(c))
+            .is_some_and(|start| seq > *start)
     }
 }
 
@@ -4929,6 +4989,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_seed_gaps = 0u64;
+    let seed_gap_cascade = SeedGapCascade::build(art);
+    let mut cascade_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_races = 0u64;
     // Expected events claimed by a ValueDiverged pairing: counted as the
     // divergence, NOT as an OmittedCall in the omitted pass below.
@@ -5376,6 +5438,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // the summary give a report two answers for one set of calls.
         let blocking = omission_is_blocking(exp.correlation, boundary, None);
         let stats = boundary_entry(&mut per_boundary, boundary);
+        // Cut off by the correlation's seed gap: no evidence about the
+        // candidate, so inconclusive, never blocking and never a pass.
+        if blocking && seed_gap_cascade.covers(exp.correlation, *seq) {
+            stats.bump_kind("InconclusiveSeedGapCascade");
+            if let Some(corr) = exp.correlation {
+                *corr_seed_gaps.entry(corr.to_owned()).or_insert(0) += 1;
+                cascade_correlations.insert(corr.to_owned());
+            }
+            continue;
+        }
         stats.bump_kind(if blocking && pruned {
             "PrunedSubtree"
         } else if blocking {
@@ -5417,6 +5489,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
     let absorbed_misses = kind_total(&per_boundary, "NovelCallAbsorbed");
+    let seed_gap_cascade_calls = kind_total(&per_boundary, "InconclusiveSeedGapCascade");
+    let seed_gap_cascade_correlations = cascade_correlations.len() as u64;
     let inconclusive_tail_gaps = kind_total(&per_boundary, "InconclusiveTailGap");
 
     // --- post-finalization correlated work warnings --------------------------
@@ -5764,6 +5838,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "{inconclusive_seed_gaps} inconclusive seed gap(s) (non-blocking)"
         ));
     }
+    if seed_gap_cascade_calls > 0 {
+        reasons.push(format!(
+            "{seed_gap_cascade_calls} call(s) in {seed_gap_cascade_correlations} correlation(s) \
+             never ran because a seed gap cut them off (non-blocking): nothing here is \
+             evidence about the candidate"
+        ));
+    }
     // A truncated recording tail is reported and does NOT fail the verdict — but
     // it does not pass either, so, like a seed gap, it forces `inconclusive`.
     if inconclusive_tail_gaps > 0 {
@@ -5806,6 +5887,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         - usize::from(stopped_calls > 0)
         - usize::from(identity_skews > 0)
         - usize::from(inconclusive_seed_gaps > 0)
+        - usize::from(seed_gap_cascade_calls > 0)
         - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
         - usize::from(idempotent_delete_warnings > 0)
@@ -6055,6 +6137,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             idempotent_delete_warnings,
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
+            seed_gap_cascade_correlations,
             inconclusive_tail_gaps,
             inconclusive_races,
             missing_scored_spans,
@@ -6444,6 +6527,7 @@ pub(crate) fn build_ledger_into(
         &inconclusive_race,
         &tail_gap,
         &art.unplanted_presence,
+        &SeedGapCascade::build(art),
         graph_plan,
         sink,
     )
@@ -13316,6 +13400,236 @@ mod tests {
             "the correlation cannot tell either"
         );
         assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    // -- a seed gap's cascade: what it cut off is inconclusive, not failed ------
+
+    fn unplanted_key_n(n: u32) -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!([format!("pro_{n}")]),
+        )
+    }
+
+    const DELETE_OK: fn() -> serde_json::Value =
+        || serde_json::json!({"result": "Ok", "value": true, "type_name": "bool"});
+    const DELETE_MISSED: fn() -> serde_json::Value =
+        || serde_json::json!({"result": "Err", "kind": "NotFound", "message": "none"});
+
+    /// A recorded db call at `seq` in c1 reading `key`, and its table entry.
+    fn recorded_at(seq: u64, key: Option<String>) -> (LookupEntry, deja::BoundaryEvent) {
+        let mut event = db_read_ev(
+            "c1",
+            "business_profile",
+            seq,
+            serde_json::json!({}),
+            100,
+            110,
+            "root",
+            0,
+        );
+        event.method_name = "generic_delete".to_owned();
+        event.read_set = key.into_iter().collect();
+        (
+            seq_entry_method_res(Some("c1"), "db", "generic_delete", seq, DELETE_OK()),
+            event,
+        )
+    }
+
+    /// The replayed call for the recorded one at `seq`, diverging or not.
+    fn replayed_at(seq: u64, diverges: bool) -> ObservedCall {
+        exec_obs_method(
+            "db",
+            Some("c1"),
+            "generic_delete",
+            true,
+            Some(seq),
+            Some(DELETE_OK()),
+            if diverges {
+                DELETE_MISSED()
+            } else {
+                DELETE_OK()
+            },
+        )
+    }
+
+    /// `seeded` names the keys the certificate says could not be planted.
+    fn cascade_card(
+        recorded: Vec<(LookupEntry, deja::BoundaryEvent)>,
+        replayed: Vec<ObservedCall>,
+        unplanted: &[u32],
+    ) -> (Scorecard, Vec<CallRecord>) {
+        let (entries, events): (Vec<_>, Vec<_>) = recorded.into_iter().unzip();
+        let mut a = art_with_events(entries, replayed, vec![http("c1", true, vec![])], events);
+        let cert: Vec<serde_json::Value> = unplanted
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "correlation_id": "c1", "boundary": "db",
+                    "logical_key": unplanted_key_n(*n), "materialization": "skipped",
+                    "skip_reason": {"cause": "recorded_presence"},
+                })
+            })
+            .collect();
+        a.unplanted_presence =
+            UnplantedPresence::from_certificate(&serde_json::json!({ "entries": cert }));
+        (detect(&a), build_ledger(&a).unwrap())
+    }
+
+    fn c1(card: &Scorecard) -> &CorrelationOutcome {
+        card.per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1")
+    }
+
+    /// The seed gap at 5, then two calls the replay never reached.
+    fn gap_then_unreached() -> (Scorecard, Vec<CallRecord>) {
+        cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(6, None),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true)],
+            &[1],
+        )
+    }
+
+    /// The calls a seed gap cut off inherit its status: inconclusive, charged
+    /// to nothing, and the correlation is counted as resting on the cascade.
+    #[test]
+    fn cascade_calls_cut_off_by_a_seed_gap_are_inconclusive() {
+        let (card, rows) = gap_then_unreached();
+        assert_eq!(card.summary.omitted_calls, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 1);
+        assert!(card.verdict.inconclusive, "{}", card.verdict.reason);
+        assert!(c1(&card).inconclusive);
+        let cascaded: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "inconclusive_seed_gap_cascade")
+            .collect();
+        assert_eq!(cascaded.len(), 2, "{rows:?}");
+        assert!(cascaded.iter().all(|r| !r.blocking));
+    }
+
+    /// THE guard: whatever the cascade relabels, the correlation never passes.
+    #[test]
+    fn cascade_never_makes_a_pass() {
+        let (card, _) = gap_then_unreached();
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert!(!c1(&card).passed, "the correlation is not a pass");
+        assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// A real divergence before the seed gap: the candidate may have caused
+    /// what followed, so the unreached calls stay blocking.
+    #[test]
+    fn cascade_only_from_a_seed_gap_that_comes_first() {
+        let (card, rows) = cascade_card(
+            vec![
+                recorded_at(3, None),
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(3, true), replayed_at(5, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 0);
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.kind != "inconclusive_seed_gap_cascade"),
+            "{rows:?}"
+        );
+    }
+
+    /// Only calls recorded AFTER the gap inherit: one before it was reachable.
+    #[test]
+    fn cascade_never_reaches_back_before_the_gap() {
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(4, None),
+                recorded_at(5, Some(unplanted_key_n(1))),
+            ],
+            vec![replayed_at(5, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+    }
+
+    /// A call after the gap that RAN and diverged is evidence; it still blocks.
+    #[test]
+    fn cascade_never_excuses_a_divergence_after_the_gap() {
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(6, None),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true), replayed_at(6, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.value_divergences, 1, "{}", card.verdict.reason);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(!c1(&card).passed && !c1(&card).inconclusive);
+    }
+
+    /// A call the candidate added after the gap is still counted as novel,
+    /// never folded into the cascade.
+    #[test]
+    fn cascade_never_absorbs_a_novel_call() {
+        let mut novel = exec_obs_method(
+            "db",
+            Some("c1"),
+            "generic_insert",
+            false,
+            None,
+            None,
+            DELETE_OK(),
+        );
+        novel.seed_gap = false;
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true), novel],
+            &[1],
+        );
+        assert_eq!(card.summary.novel_calls, 1, "{}", card.verdict.reason);
+    }
+
+    /// Two seed gaps: the FIRST governs, so a call between them inherits.
+    #[test]
+    fn cascade_runs_from_the_first_of_two_seed_gaps() {
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+                recorded_at(9, Some(unplanted_key_n(2))),
+            ],
+            vec![replayed_at(5, true), replayed_at(9, true)],
+            &[1, 2],
+        );
+        assert_eq!(card.summary.omitted_calls, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 1);
     }
 
     /// No certificate, or an old one: nothing to go on, so nothing demotes.
