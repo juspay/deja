@@ -6018,6 +6018,31 @@ mod tests {
         assert!(!said.contains("absence"), "{said}");
     }
 
+    /// The seeder's half of a borrowed row: when the planner attaches another
+    /// correlation's image to a delete's `Ok(true)`, the image is planted and
+    /// the bare `true` no longer decides the outcome.
+    #[test]
+    fn a_borrowed_image_plants_the_row_a_presence_asserted() {
+        let image = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "business_profile",
+            "columns": [
+                {"name": "profile_id", "type_oid": 1043, "value": "pro_1"},
+                {"name": "profile_name", "type_oid": 1043, "value": "v2"},
+            ],
+        });
+        let rows = super::seedable_rows(
+            &seed_target(&query_key()),
+            Some(&image),
+            &recorded_ok(serde_json::json!(true), "bool"),
+            &super::DbCatalog::default(),
+        )
+        .expect("the borrowed row is seedable");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].table, "business_profile");
+    }
+
     /// The fifteen correct skips: an empty set or no row is absence recorded.
     #[test]
     fn a_recorded_empty_set_or_null_is_absence() {

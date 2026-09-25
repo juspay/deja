@@ -355,6 +355,191 @@ pub fn db_row_state_key(table: &str, row: &serde_json::Value) -> Option<StateKey
 /// Extract all row-exact DB state keys carried by a structured DB `Ok` value or
 /// row/object array. Non-row shapes and rows without pragmatic PK columns are
 /// ignored; callers can fall back to [`db_query_state_key`].
+/// Row keys a statement names, from its query text and its bind values in
+/// position order: one per equality predicate on the table's first key column,
+/// completed by the other key columns' bound values. Empty unless EVERY key
+/// column is bound by equality: `db_row_state_key` refuses a partial row.
+pub fn row_keys_for_binds(table: &str, query: &str, binds: &[serde_json::Value]) -> Vec<StateKey> {
+    let Some(identity) = table_identity_columns(table) else {
+        return Vec::new();
+    };
+    fn bound_values<'a>(
+        query: &str,
+        binds: &'a [serde_json::Value],
+        column: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        let needle = format!("\"{column}\" = $");
+        let mut values = Vec::new();
+        let mut cursor = 0;
+        while let Some(found) = query[cursor..].find(&needle) {
+            let digits_start = cursor + found + needle.len();
+            let digits: String = query[digits_start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            cursor = digits_start;
+            if let Some(value) = digits
+                .parse::<usize>()
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .and_then(|index| binds.get(index))
+            {
+                values.push(value);
+            }
+        }
+        values
+    }
+    let mut per_column: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+    for column in identity {
+        let values = bound_values(query, binds, &column);
+        per_column.push((column, values));
+    }
+    let Some((_, leading)) = per_column.first() else {
+        return Vec::new();
+    };
+    let mut keys: Vec<StateKey> = Vec::new();
+    for index in 0..leading.len() {
+        let row: serde_json::Map<String, serde_json::Value> = per_column
+            .iter()
+            .map(|(column, values)| {
+                let value = values.get(index).or_else(|| values.first());
+                (
+                    column.clone(),
+                    value.map_or(serde_json::Value::Null, |value| (*value).clone()),
+                )
+            })
+            .collect();
+        if let Some(key) = db_row_state_key(table, &serde_json::Value::Object(row)) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Diesel's `-- binds: [...]` debug list read tolerantly: a newtype such as
+/// `ProfileId("pro_1")` is read as its inner value. Every item must reduce to
+/// a JSON scalar, or the whole list is refused rather than half-read.
+fn debug_bind_values(raw: &str) -> Option<Vec<serde_json::Value>> {
+    let inner = raw.trim().strip_prefix('[')?.strip_suffix(']')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut items = Vec::new();
+    let (mut depth, mut in_str, mut escaped, mut start) = (0i32, false, false, 0usize);
+    for (i, c) in inner.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&inner[start..]);
+    items
+        .into_iter()
+        .map(|item| {
+            let mut item = item.trim();
+            // `Name(inner)`, possibly nested: keep the inner value.
+            while let Some(open) = item.find('(') {
+                let name = &item[..open];
+                if item.ends_with(')')
+                    && !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                {
+                    item = item[open + 1..item.len() - 1].trim();
+                } else {
+                    break;
+                }
+            }
+            serde_json::from_str::<serde_json::Value>(item)
+                .ok()
+                .filter(|v| !v.is_object() && !v.is_array())
+        })
+        .collect()
+}
+
+/// The single row a db statement names, from its recorded SQL and debug binds.
+fn statement_row_key(table: &str, sql: &str) -> Option<String> {
+    let at = sql.rfind(" -- binds: ")?;
+    let (query, raw) = sql.split_at(at);
+    let binds = debug_bind_values(raw.trim_start_matches(" -- binds: "))?;
+    let mut keys = row_keys_for_binds(table, query, &binds);
+    (keys.len() == 1).then(|| keys.remove(0).to_wire())
+}
+
+/// Whether a db event's recorded result asserts presence without carrying the
+/// row: `Ok(true)`, as a delete that removed a row records.
+fn db_result_asserts_presence(event: &BoundaryEvent) -> bool {
+    // The same two shapes the seeder names `RecordedPresence`: an Ok envelope
+    // holding `true`, or a bare `true`.
+    let result = event.result.to_value();
+    let value = match result.get("version") {
+        Some(_) if result.get("result").and_then(serde_json::Value::as_str) == Some("Ok") => {
+            result.get("value")
+        }
+        Some(_) => None,
+        None => Some(&result),
+    };
+    event.boundary == "db" && value == Some(&serde_json::Value::Bool(true))
+}
+
+/// Every row image the run recorded, by row key, with its global sequence, so a
+/// presence-only delete can borrow the row's latest state before it.
+type RunRowImages = std::collections::HashMap<String, Vec<(u64, serde_json::Value)>>;
+
+fn run_row_images(events: &[BoundaryEvent]) -> RunRowImages {
+    let mut rows: RunRowImages = std::collections::HashMap::new();
+    for event in events.iter().filter(|e| !e.is_error) {
+        let Some(image) = &event.result_image else {
+            continue;
+        };
+        for row in image_rows(&image.to_value()) {
+            if let Some(key) = image_row_state_key(row) {
+                rows.entry(key)
+                    .or_default()
+                    .push((event.global_sequence, row.clone()));
+            }
+        }
+    }
+    rows
+}
+
+/// The latest image of the row a presence-only delete removed, recorded before
+/// it, and the sequence it came from: the state the row was actually in when
+/// the delete ran.
+fn borrowed_image(event: &BoundaryEvent, rows: &RunRowImages) -> Option<(u64, serde_json::Value)> {
+    if !db_result_asserts_presence(event) {
+        return None;
+    }
+    let args = event.args.to_value();
+    let table = db_table_from_event_args(&args)?;
+    let sql = args.get("sql")?.as_str()?;
+    let key = statement_row_key(table, sql)?;
+    // The row key names its table, so an image of another table never matches.
+    rows.get(&key)?
+        .iter()
+        .filter(|(seq, _)| *seq < event.global_sequence)
+        .max_by_key(|(seq, _)| *seq)
+        .cloned()
+}
+
 pub fn db_row_state_keys(table: &str, value: &serde_json::Value) -> Vec<StateKey> {
     fn visit(table: &str, value: &serde_json::Value, keys: &mut Vec<StateKey>) {
         if let Some(key) = db_row_state_key(table, value) {
@@ -2884,6 +3069,12 @@ pub enum SeedOrigin {
     Recording,
     /// Supplied by the static ambient/config template (deliverable 4).
     Ambient,
+    /// A row the recording asserted without carrying (a delete's `Ok(true)`),
+    /// planted from the latest image of that row recorded before the delete,
+    /// in any correlation of the run. The value is a real row in the wrong
+    /// place and cannot look planted, so its provenance is recorded instead:
+    /// the global sequence of the event whose image was borrowed.
+    Borrowed { global_sequence: u64 },
 }
 
 /// The set of `(boundary, key, value)` preconditions to materialize for a
@@ -3473,6 +3664,9 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
     // state its row was in BEFORE it (see `preferred_seed_image`). Updated
     // AFTER each event is planned, so an event never sees its own image.
     let mut observed_rows: ObservedRowImages = std::collections::HashMap::new();
+    // Every row image in the run, across its correlations, for a presence-only
+    // delete to borrow its row from.
+    let run_rows = run_row_images(events);
     // How this recording spells a physical redis key, so a delete that declares
     // no read set can still name the key it proves existed.
     // A delete-only correlation shows no read, so the rest of the run's
@@ -3587,6 +3781,16 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     continue;
                 }
 
+                let (image, origin) =
+                    match preferred_seed_image(event, &canonical_key, &observed_rows) {
+                        Some(image) => (Some(image), SeedOrigin::Recording),
+                        None => match borrowed_image(event, &run_rows) {
+                            Some((global_sequence, row)) => {
+                                (Some(row), SeedOrigin::Borrowed { global_sequence })
+                            }
+                            None => (None, SeedOrigin::Recording),
+                        },
+                    };
                 plan.upsert(SeedEntry {
                     boundary: event.boundary.clone(),
                     key: canonical_key.clone(),
@@ -3595,9 +3799,9 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     // A reply that proves only presence seeds a placeholder.
                     value: presence_placeholder_for(event)
                         .unwrap_or_else(|| redis_seedable_result(event)),
-                    image: preferred_seed_image(event, &canonical_key, &observed_rows),
+                    image,
                     method: Some(event.method_name.clone()),
-                    origin: SeedOrigin::Recording,
+                    origin,
                     source_sequence: event.global_sequence,
                 });
             }
@@ -8911,6 +9115,257 @@ redis\tcurrency\tusd
             Vec::<String>::new(),
             "c1 has no writes → empty write-target set"
         );
+    }
+
+    /// Route D: a delete's `Ok(true)` asserts a row without carrying it. The
+    /// row is borrowed from the latest image of it recorded before the delete,
+    /// in any correlation, and the entry names where it came from.
+    mod borrowed_rows {
+        use super::*;
+
+        const PRESENT: &str = r#"{"version":1,"result":"Ok","value":true,"type_name":"bool"}"#;
+
+        fn profile_row_key(profile_id: &str) -> String {
+            StateKey::DbRow {
+                table: "business_profile".to_owned(),
+                key: vec![("profile_id".to_owned(), profile_id.to_owned())],
+            }
+            .to_wire()
+        }
+
+        fn row_image(table: &str, key_column: &str, key: &str, name: &str) -> serde_json::Value {
+            serde_json::json!({
+                "deja_image": "db_row",
+                "version": 1,
+                "table": table,
+                "columns": [
+                    {"name": key_column, "type_oid": 1043, "value": key},
+                    {"name": "profile_name", "type_oid": 1043, "value": name},
+                ],
+            })
+        }
+
+        fn imaged(seq: u64, corr: &str, image: serde_json::Value) -> BoundaryEvent {
+            let table = image["table"].as_str().unwrap().to_owned();
+            let mut event = state_event(
+                seq,
+                Some(corr),
+                "db",
+                "find",
+                serde_json::json!({"table": table}),
+                serde_json::json!({"version": 1, "result": "Ok", "value": [], "type_name": "Vec"}),
+                &[],
+                &[],
+                false,
+            );
+            event.result_image = Some(Payload::from(image));
+            event
+        }
+
+        fn delete(seq: u64, corr: &str, table: &str, sql: &str, result: &str) -> BoundaryEvent {
+            let key = profile_row_key("pro_1");
+            state_event(
+                seq,
+                Some(corr),
+                "db",
+                "generic_delete",
+                serde_json::json!({"table": table, "sql": sql}),
+                serde_json::from_str(result).unwrap(),
+                &[key.as_str()],
+                &[key.as_str()],
+                false,
+            )
+        }
+
+        const PROFILE_DELETE: &str = r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) AND ("business_profile"."merchant_id" = $2)) -- binds: [ProfileId("pro_1"), MerchantId("m1")]"#;
+
+        fn planted(events: &[BoundaryEvent]) -> SeedEntry {
+            register_test_schema_identity();
+            build_seed_plan(events, Some("b"))
+                .resolve("db", &profile_row_key("pro_1"))
+                .expect("the delete's key is planned")
+                .clone()
+        }
+
+        #[test]
+        fn borrows_the_latest_image_before_the_delete_from_another_correlation() {
+            let events = [
+                imaged(
+                    1,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_1", "v1"),
+                ),
+                imaged(
+                    3,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_1", "v2"),
+                ),
+                delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT),
+                imaged(
+                    9,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_1", "after"),
+                ),
+            ];
+            let entry = planted(&events);
+            assert_eq!(
+                entry.image,
+                Some(row_image("business_profile", "profile_id", "pro_1", "v2")),
+                "the row as it stood when the delete ran: latest before it, never after"
+            );
+            assert_eq!(entry.origin, SeedOrigin::Borrowed { global_sequence: 3 });
+        }
+
+        #[test]
+        fn a_bare_true_asserts_presence_too() {
+            let events = [
+                imaged(
+                    1,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_1", "v1"),
+                ),
+                delete(5, "b", "business_profile", PROFILE_DELETE, "true"),
+            ];
+            assert_eq!(
+                planted(&events).origin,
+                SeedOrigin::Borrowed { global_sequence: 1 }
+            );
+        }
+
+        #[test]
+        fn only_a_recorded_presence_borrows() {
+            for result in [
+                r#"{"version":1,"result":"Ok","value":false,"type_name":"bool"}"#,
+                r#"{"version":1,"result":"Ok","value":1,"type_name":"usize"}"#,
+                r#"{"version":1,"result":"Err","kind":"NotFound","message":"x"}"#,
+                "false",
+            ] {
+                let events = [
+                    imaged(
+                        1,
+                        "a",
+                        row_image("business_profile", "profile_id", "pro_1", "v1"),
+                    ),
+                    delete(5, "b", "business_profile", PROFILE_DELETE, result),
+                ];
+                let entry = planted(&events);
+                assert_eq!(entry.image, None, "{result}");
+                assert_eq!(entry.origin, SeedOrigin::Recording, "{result}");
+            }
+        }
+
+        #[test]
+        fn an_errored_event_lends_no_image() {
+            let mut failed = imaged(
+                1,
+                "a",
+                row_image("business_profile", "profile_id", "pro_1", "v1"),
+            );
+            failed.is_error = true;
+            let events = [
+                failed,
+                delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT),
+            ];
+            assert_eq!(planted(&events).image, None);
+        }
+
+        #[test]
+        fn an_image_of_another_table_or_row_is_never_borrowed() {
+            let events = [
+                imaged(
+                    1,
+                    "a",
+                    row_image("merchant_key_store", "merchant_id", "pro_1", "other table"),
+                ),
+                imaged(
+                    2,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_2", "other row"),
+                ),
+                delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT),
+            ];
+            let entry = planted(&events);
+            assert_eq!(entry.image, None);
+            assert_eq!(
+                entry.origin,
+                SeedOrigin::Recording,
+                "still skipped as RecordedPresence"
+            );
+        }
+
+        #[test]
+        fn a_delete_that_names_no_single_whole_row_borrows_nothing() {
+            register_test_schema_identity();
+            // A composite key bound by only one of its columns.
+            assert_eq!(
+                statement_row_key(
+                    "incremental_authorization",
+                    r#"DELETE FROM "incremental_authorization" WHERE ("incremental_authorization"."authorization_id" = $1) -- binds: ["auth_1"]"#,
+                ),
+                None
+            );
+            // Two rows.
+            assert_eq!(
+                statement_row_key(
+                    "business_profile",
+                    r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) OR ("business_profile"."profile_id" = $2)) -- binds: [ProfileId("pro_1"), ProfileId("pro_2")]"#,
+                ),
+                None
+            );
+            assert_eq!(
+                statement_row_key(
+                    "business_profile",
+                    PROFILE_DELETE.split(" -- binds").next().unwrap()
+                ),
+                None,
+                "no binds, no key"
+            );
+            assert_eq!(
+                statement_row_key("business_profile", PROFILE_DELETE),
+                Some(profile_row_key("pro_1"))
+            );
+        }
+
+        #[test]
+        fn debug_binds_read_newtypes_as_their_inner_value() {
+            assert_eq!(
+                debug_bind_values(
+                    r#"[ProfileId("pro_1"), MerchantId("m, (1)"), 7, null, Some(Id("x"))]"#
+                ),
+                Some(vec![
+                    serde_json::json!("pro_1"),
+                    serde_json::json!("m, (1)"),
+                    serde_json::json!(7),
+                    serde_json::Value::Null,
+                    serde_json::json!("x"),
+                ])
+            );
+            assert_eq!(debug_bind_values("[]"), Some(Vec::new()));
+            assert_eq!(
+                debug_bind_values(r#"["a", Money { amount: 1 }]"#),
+                None,
+                "an item that is not a scalar refuses the whole list"
+            );
+            assert_eq!(debug_bind_values(r#""a""#), None, "not a list");
+            assert_eq!(
+                debug_bind_values(r#"["a", ["b", "c"]]"#),
+                None,
+                "a Vec bind renders as a JSON array and is refused, not used as a key"
+            );
+        }
+
+        #[test]
+        fn the_certificate_names_the_borrowed_image() {
+            assert_eq!(
+                serde_json::to_value(SeedOrigin::Borrowed { global_sequence: 3 }).unwrap(),
+                serde_json::json!({"borrowed": {"global_sequence": 3}})
+            );
+            assert_eq!(
+                serde_json::from_value::<SeedOrigin>(serde_json::json!("recording")).unwrap(),
+                SeedOrigin::Recording,
+                "existing certificates still read"
+            );
+        }
     }
 }
 
