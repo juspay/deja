@@ -157,8 +157,10 @@ fn form_fields_same(
 }
 
 /// A hash of `value` that any order of an array's members, or of an object's,
-/// gives the same result. Members are hashed, finalised, and summed with
-/// wrapping addition; a repeated member adds twice, so multiplicity counts.
+/// gives the same result. Member hashes (each already finalised) are summed
+/// with wrapping addition; a repeated member adds twice, so multiplicity
+/// counts. An object's keys are unique, so no two of its pairs could cancel
+/// under XOR either; addition is used there too, so there is one combiner.
 pub fn element_hash(value: &Value) -> u64 {
     const NULL: u64 = 0x6e75_6c6c;
     const ARRAY: u64 = 0x6172_7261_79;
@@ -196,13 +198,15 @@ pub fn element_hash(value: &Value) -> u64 {
                 let key = crate::fnv1a_str(crate::FNV_OFFSET_BASIS, key);
                 sum.wrapping_add(finalise(key ^ element_hash(member).rotate_left(29)))
             });
-            tagged(OBJECT, finalise(sum ^ map.len() as u64))
+            tagged(OBJECT, sum)
         }
         Value::Array(items) => {
-            let sum = items.iter().fold(0u64, |sum, member| {
-                sum.wrapping_add(finalise(element_hash(member)))
-            });
-            tagged(ARRAY, finalise(sum ^ items.len() as u64))
+            // Each member's hash is already finalised, and the sum alone keeps
+            // [], [a] and [a, a] apart.
+            let sum = items
+                .iter()
+                .fold(0u64, |sum, member| sum.wrapping_add(element_hash(member)));
+            tagged(ARRAY, sum)
         }
     }
 }
@@ -342,6 +346,10 @@ mod tests {
             json!([["a", "a"]]),
             json!({"a": "b"}),
             json!({"b": "a"}),
+            json!({"a": 1, "b": 2}),
+            json!({"a": 2, "b": 1}),
+            json!(["a", "a"]),
+            json!(["a", "b"]),
         ];
         for (i, a) in values.iter().enumerate() {
             for b in &values[i + 1..] {
