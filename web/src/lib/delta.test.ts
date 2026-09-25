@@ -6,7 +6,15 @@ describe("deltaUnavailable", () => {
     expect(deltaUnavailable({ unavailable: "baseline still running", unavailable_kind: "pending" })).toEqual({
       why: "baseline still running",
       pending: true,
+      tapeMismatch: false,
     });
+  });
+
+  it("names a tape mismatch apart from a refusal", () => {
+    const r = deltaUnavailable({ unavailable: "different seals", unavailable_kind: "tape_mismatch" });
+    expect(r?.tapeMismatch).toBe(true);
+    expect(r?.pending).toBe(false);
+    expect(deltaUnavailable({ unavailable: "x", unavailable_kind: "refused" })?.tapeMismatch).toBe(false);
   });
 
   it("reads a refusal, and an answer with no kind, as final", () => {

@@ -40,6 +40,9 @@ export type RunParams = {
   delta_against?: string;
   /** Why the run exists when it is not a candidate under test: `baseline`. */
   purpose?: string;
+  /** What the candidate is, in the creator's words: a PR number and title,
+   *  or the main commit a baseline stands for. Displayed, never parsed. */
+  label?: string;
 };
 
 /** The request a row carries, or null when it predates the record.
@@ -779,7 +782,10 @@ export type DeltaRow = {
 export type DeltaLane = {
   lane: { connector: string; flow: string };
   requests: number;
+  /** Bucket family → addresses. */
   buckets: Partial<Record<DeltaFamily, number>>;
+  /** Bucket family → requests. Absent from an older server. */
+  requests_by_family?: Partial<Record<DeltaFamily, number>>;
 };
 
 export type DeltaSideInfo = {
@@ -794,10 +800,17 @@ export type Delta = {
   canon_version: number;
   verdict: {
     pass: boolean;
+    /** Addresses by family: response fields and calls. */
     introduced: number;
     changed: number;
     inherited: number;
     resolved: number;
+    /** Requests with at least one address in the family: the unit the tape
+     *  verdict counts in. Absent from an older server. */
+    introduced_requests?: number;
+    changed_requests?: number;
+    inherited_requests?: number;
+    resolved_requests?: number;
     reason: string;
   };
   buckets: Partial<Record<DeltaBucket, number>>;
@@ -806,6 +819,11 @@ export type Delta = {
   clean: number;
   /** Correlations both runs drove: the comparison's domain. */
   covered_correlations: number;
+  /** Bucket family → requests with at least one address in it; `clean` is
+   *  requests in no other family. Absent from an older server. */
+  requests?: Partial<Record<DeltaFamily, number>>;
+  /** The lane of every covered request, clean ones included. */
+  request_lanes?: Record<string, { connector: string; flow: string }>;
   /** Requests only one run drove; their addresses are outside every bucket. */
   uncovered: { m_only: string[]; y_only: string[]; addresses: number };
   tape: string | null;
@@ -813,7 +831,12 @@ export type Delta = {
 };
 
 /** Why there is no delta: `pending` clears on its own, `refused` never will. */
-export type DeltaUnavailable = { unavailable: string; unavailable_kind?: "pending" | "refused" };
+export type DeltaUnavailable = {
+  unavailable: string;
+  /** `tape_mismatch`: the two runs read different tapes. A refusal, and a
+   *  data-integrity warning rather than "not applicable". */
+  unavailable_kind?: "pending" | "refused" | "tape_mismatch";
+};
 export type DeltaResponse = Delta | DeltaUnavailable;
 
 /**
@@ -821,9 +844,15 @@ export type DeltaResponse = Delta | DeltaUnavailable;
  * no kind is read as refused, so nothing polls on an answer it cannot tell
  * will change.
  */
-export function deltaUnavailable(r: DeltaResponse | undefined): { why: string; pending: boolean } | null {
+export function deltaUnavailable(
+  r: DeltaResponse | undefined,
+): { why: string; pending: boolean; tapeMismatch: boolean } | null {
   if (!r || !("unavailable" in r)) return null;
-  return { why: r.unavailable, pending: r.unavailable_kind === "pending" };
+  return {
+    why: r.unavailable,
+    pending: r.unavailable_kind === "pending",
+    tapeMismatch: r.unavailable_kind === "tape_mismatch",
+  };
 }
 
 export function deltaFamily(b: DeltaBucket): DeltaFamily {

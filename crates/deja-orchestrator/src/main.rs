@@ -2292,6 +2292,10 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
 enum Unavailable {
     Pending(String),
     Refused(String),
+    /// The two runs read different tapes. A refusal like any other for the
+    /// run row, but a data-integrity warning to a reader, so it has its own
+    /// kind rather than looking like "not applicable".
+    TapeMismatch(String),
 }
 
 impl Unavailable {
@@ -2299,11 +2303,14 @@ impl Unavailable {
         match self {
             Unavailable::Pending(_) => "pending",
             Unavailable::Refused(_) => "refused",
+            Unavailable::TapeMismatch(_) => "tape_mismatch",
         }
     }
 
     fn to_json(&self) -> serde_json::Value {
-        let (Unavailable::Pending(why) | Unavailable::Refused(why)) = self;
+        let (Unavailable::Pending(why)
+        | Unavailable::Refused(why)
+        | Unavailable::TapeMismatch(why)) = self;
         serde_json::json!({ "unavailable": why, "unavailable_kind": self.kind() })
     }
 }
@@ -2588,7 +2595,7 @@ async fn delta_between(
     };
     if let (Some(y_tape), Some(m_tape)) = (tape(&y_params), tape(&m_params)) {
         if y_tape != m_tape {
-            return Err(Unavailable::Refused(format!(
+            return Err(Unavailable::TapeMismatch(format!(
                 "the runs drove different tapes ({y_tape} and {m_tape}); a delta only holds between runs of one tape"
             )));
         }
@@ -2606,7 +2613,7 @@ async fn delta_between(
     let y_report = tape_report(st, y_id).await?;
     let m_report = tape_report(st, m_id).await?;
     let refuse = |why: String| {
-        Unavailable::Refused(format!(
+        Unavailable::TapeMismatch(format!(
             "{why}; a delta only holds between runs of one tape"
         ))
     };
@@ -2647,6 +2654,8 @@ fn delta_verdict_word(result: &Result<serde_json::Value, Unavailable>) -> &'stat
             Some(false) => "fail",
             None => "refused",
         },
+        // The run row keeps its four words; a tape mismatch is a refusal there.
+        Err(Unavailable::TapeMismatch(_)) => "refused",
         Err(why) => why.kind(),
     }
 }
@@ -3533,6 +3542,11 @@ mod tests {
             delta_verdict_word(&Err(Unavailable::Refused(String::new()))),
             "refused"
         );
+        // A reader sees a tape mismatch as its own kind; the run row keeps
+        // its four words and records a refusal.
+        let mismatch = Unavailable::TapeMismatch("different seals".to_owned());
+        assert_eq!(mismatch.to_json()["unavailable_kind"], "tape_mismatch");
+        assert_eq!(delta_verdict_word(&Err(mismatch)), "refused");
     }
 
     /// The runner reports its result before it publishes the ledger and diffs,
@@ -3565,6 +3579,7 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                label: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -4158,7 +4173,7 @@ mod tests {
 
     fn refused(u: &super::Unavailable) -> Option<&str> {
         match u {
-            super::Unavailable::Refused(why) => Some(why),
+            super::Unavailable::Refused(why) | super::Unavailable::TapeMismatch(why) => Some(why),
             super::Unavailable::Pending(_) => None,
         }
     }
@@ -4177,7 +4192,7 @@ mod tests {
         let cache = deja_orchestrator::delta_cache_of(&ledger);
         let mut doc = serde_json::json!({
             "y_run": "run-Y", "m_run": "run-M", "canon_version": CANON_VERSION,
-            "verdict": {"pass": true},
+            "verdict": {"pass": true}, "requests": {},
         });
 
         std::fs::write(&cache, doc.to_string()).unwrap();

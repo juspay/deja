@@ -495,6 +495,7 @@ mod tests {
     /// field it is about.
     fn replay_spec() -> RunSpec {
         RunSpec {
+            label: None,
             delta_against: None,
             purpose: None,
             mode: RunMode::Replay,

@@ -755,7 +755,7 @@ export default function ReportPage() {
       </div>
 
       <RunHeader run={r} />
-      {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} />}
+      {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} label={runParams(r)?.label} />}
       <VerdictBanner result={result} />
       {isReplay && scored && runParams(r)?.delta_against && (
         <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} />

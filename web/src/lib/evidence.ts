@@ -28,7 +28,7 @@ export function emptyFindingsText(e: Evidence): string {
   return "no divergence rows in what could be read; what could not be read is named above.";
 }
 
-function reasonOf(err: unknown): string {
+export function reasonOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
