@@ -54,9 +54,6 @@ pub fn runtime_mode_is_disabled() -> bool {
     deja_runtime::runtime_mode().is_disabled()
 }
 
-/// The deployment secret that turns captured values into keyed digests.
-/// Installed once at boot; see [`db::capture_query`].
-pub use deja_runtime::capture_key::{install_capture_key, CaptureKey};
 /// Explicit, per-collection hash seeding: draw a `BuildHasher` whose keys are
 /// recorded and replayed, so a `HashMap`/`HashSet` iterates the same way on
 /// replay as it did when recorded. There is deliberately no `Default` — a
@@ -1177,10 +1174,9 @@ pub mod db {
         first_captured, get_result_captured, get_results_captured, TableIdentityRow,
     };
 
-    /// Capture a query as its statement plus a bind image whose object and
-    /// array structure is kept and whose every scalar is a keyed digest, instead
-    /// of diesel's `-- binds: [...]` debug rendering. Without an installed
-    /// capture key it returns that debug rendering unchanged.
+    /// Capture a query as its statement plus its bind values as plain JSON,
+    /// keyed by placeholder, instead of diesel's `-- binds: [...]` debug
+    /// rendering, which printed a map in its iteration order.
     #[cfg(feature = "diesel-pg")]
     pub use deja_diesel::{capture_query, CapturedQuery};
 
