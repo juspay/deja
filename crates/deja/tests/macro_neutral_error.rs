@@ -224,6 +224,7 @@ fn a_neutral_recorded_error_is_served_only_at_its_own_site() {
             ),
             recorded("unlocated_insert", deja::Locus::Unlocated, "a", unique),
         ],
+        identity_entries: Vec::new(),
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("lookup.json");

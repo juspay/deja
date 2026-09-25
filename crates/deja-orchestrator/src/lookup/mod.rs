@@ -95,6 +95,12 @@ pub fn render_lookup_table(
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();
     let mut entries = Vec::new();
+    // The second lookup, by identity. Its stamper advances for every event, as
+    // the candidate's does for every call; entries are written only for an
+    // event another call could reach by identity alone, since otherwise the
+    // first lookup already addresses every call that could.
+    let mut identity_stamper = KeyStamper::new();
+    let mut identity_entries = Vec::new();
     let (mut dbg_ok, mut dbg_skip): (u64, u64) = (0, 0);
     let mut dbg_first_err: Option<String> = None;
     // Every schema the recording's events were captured under. The candidate
@@ -164,6 +170,23 @@ pub fn render_lookup_table(
                 source_event_global_sequence: event.global_sequence,
             });
         }
+        let identity_keys = identity_stamper.stamp(
+            event.correlation_id.as_deref(),
+            Some(bucket_id),
+            fork_seq,
+            identity,
+            &loci,
+            deja::identity::identity_args_hash(&event.args),
+        );
+        if deja::identity::identity_applies(&event.args) {
+            for key in identity_keys {
+                identity_entries.push(LookupEntry {
+                    key,
+                    result: std::sync::Arc::clone(&result),
+                    source_event_global_sequence: event.global_sequence,
+                });
+            }
+        }
     }
 
     // Permanent guard: dropping unparseable events here silently mutilates the
@@ -206,6 +229,7 @@ pub fn render_lookup_table(
         policy_version,
         event_schema_version: schemas.first().copied(),
         entries,
+        identity_entries,
     })
 }
 
@@ -566,6 +590,217 @@ mod tests {
                 && message.contains(&current.to_string()),
             "the refusal names both schemas: {message}"
         );
+    }
+
+    struct TableSource(Option<LookupTable>);
+    impl deja::LookupTableSource for TableSource {
+        fn load(&mut self) -> io::Result<LookupTable> {
+            Ok(self.0.take().expect("loaded once"))
+        }
+    }
+
+    /// Render a recording holding one uncorrelated call with `recorded` args,
+    /// install it in a candidate's hook, and make the same call with
+    /// `observed` args: the value served, and the call the candidate observed.
+    fn replay_one_call(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> (Option<serde_json::Value>, Vec<deja::ObservedCall>) {
+        use deja::DejaHook;
+        let mut recorded_event = event("redis", 1, serde_json::Value::Null);
+        recorded_event["correlation_id"] = serde_json::Value::Null;
+        recorded_event["args"] = recorded;
+        recorded_event["result"] = serde_json::json!("served");
+        let (_dir, recording) = write_events(&[recorded_event]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let calls = sink.handle();
+        let hook =
+            deja::LookupTableHook::from_source(TableSource(Some(table)), sink).expect("install");
+        let served = hook.try_replay_with_context(deja::ReplayLookup {
+            boundary: "redis",
+            trait_name: "T",
+            method_name: "m",
+            args: &observed,
+            callsite_identity: None,
+            caller_location: None,
+        });
+        let calls = calls.lock().unwrap().clone();
+        (served, calls)
+    }
+
+    /// The same call with its array in another order is the same call. The
+    /// diff has always tolerated the order; the address did not, so the call
+    /// missed and the replay stopped. The address now agrees with the diff.
+    #[test]
+    fn a_call_whose_array_arrived_in_another_order_is_served_its_recording() {
+        let (served, _) = replay_one_call(
+            serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
+            serde_json::json!({ "ids": ["c", "a", "b"], "q": 1 }),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+    }
+
+    /// A string that holds a JSON document is the same call when the document
+    /// is the same, whatever order its keys were written in.
+    #[test]
+    fn a_call_whose_embedded_document_was_written_in_another_order_is_served() {
+        let (served, _) = replay_one_call(
+            serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+    }
+
+    /// Several uncorrelated calls at one site: render `recorded` (args, result)
+    /// in order, then make the `observed` calls in order; what each was served.
+    fn replay_calls(
+        recorded: &[(serde_json::Value, &str)],
+        observed: &[serde_json::Value],
+    ) -> (Vec<Option<serde_json::Value>>, LookupTable) {
+        use deja::DejaHook;
+        let events: Vec<serde_json::Value> = recorded
+            .iter()
+            .enumerate()
+            .map(|(i, (args, result))| {
+                let mut e = event("redis", i as u64 + 1, serde_json::Value::Null);
+                e["correlation_id"] = serde_json::Value::Null;
+                e["args"] = args.clone();
+                e["result"] = serde_json::json!(result);
+                e
+            })
+            .collect();
+        let (_dir, recording) = write_events(&events);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let hook = deja::LookupTableHook::from_source(
+            TableSource(Some(table.clone())),
+            deja::InMemoryObservedSink::new(),
+        )
+        .expect("install");
+        let served = observed
+            .iter()
+            .map(|args| {
+                hook.try_replay_with_context(deja::ReplayLookup {
+                    boundary: "redis",
+                    trait_name: "T",
+                    method_name: "m",
+                    args,
+                    callsite_identity: None,
+                    caller_location: None,
+                })
+            })
+            .collect();
+        (served, table)
+    }
+
+    /// The exact lookup wins: a call that matches one recording exactly is
+    /// served that recording, not another with its identity.
+    #[test]
+    fn an_exact_match_wins_over_an_identity_match() {
+        let (served, _) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["b", "a"] }), "second"),
+            ],
+            &[serde_json::json!({ "ids": ["b", "a"] })],
+        );
+        assert_eq!(served, vec![Some(serde_json::json!("second"))]);
+    }
+
+    /// Identity occurrences advance on every call, hit or miss, as the
+    /// renderer's do on every event: the second call with this identity is
+    /// served the second recording even though the first hit exactly.
+    #[test]
+    fn identity_occurrences_advance_on_calls_the_exact_lookup_served() {
+        let (served, _) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["a", "b"] }), "second"),
+            ],
+            &[
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["b", "a"] }),
+            ],
+        );
+        assert_eq!(
+            served,
+            vec![
+                Some(serde_json::json!("first")),
+                Some(serde_json::json!("second"))
+            ]
+        );
+    }
+
+    /// The second lookup holds only the events another call could reach by
+    /// identity alone.
+    #[test]
+    fn identity_entries_are_written_only_where_identity_applies() {
+        let (_, table) = replay_calls(
+            &[
+                (serde_json::json!({ "id": 1, "n": [2, 1] }), "plain"),
+                (serde_json::json!({ "ids": ["a", "b"] }), "set"),
+            ],
+            &[],
+        );
+        assert!(!table.identity_entries.is_empty());
+        assert!(
+            table
+                .identity_entries
+                .iter()
+                .all(|e| e.source_event_global_sequence == 2),
+            "only the event holding a set: {:?}",
+            table
+                .identity_entries
+                .iter()
+                .map(|e| e.source_event_global_sequence)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// What identity still refuses: a changed member, a changed count, a
+    /// string that is not a document, and a document sent as an object where
+    /// the recording sent it as text.
+    #[test]
+    fn a_call_that_differs_in_anything_but_order_still_misses() {
+        let (served, _) = replay_one_call(
+            serde_json::json!({ "ids": ["a", "b"] }),
+            serde_json::json!({ "ids": ["a", "b"] }),
+        );
+        assert_eq!(
+            served,
+            Some(serde_json::json!("served")),
+            "control: the fixture serves a call that matches"
+        );
+        for (name, recorded, observed) in [
+            (
+                "a member changed",
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["a", "c"] }),
+            ),
+            (
+                "a member was dropped",
+                serde_json::json!({ "ids": ["a", "a", "b"] }),
+                serde_json::json!({ "ids": ["a", "b"] }),
+            ),
+            (
+                "a value inside the document changed",
+                serde_json::json!({ "body": r#"{"a":1}"# }),
+                serde_json::json!({ "body": r#"{"a":2}"# }),
+            ),
+            (
+                "text is not a document",
+                serde_json::json!({ "body": "b a" }),
+                serde_json::json!({ "body": "a b" }),
+            ),
+            (
+                "a document as text is not the document as an object",
+                serde_json::json!({ "body": r#"{"a":1}"# }),
+                serde_json::json!({ "body": { "a": 1 } }),
+            ),
+        ] {
+            let (served, _) = replay_one_call(recorded, observed);
+            assert_eq!(served, None, "{name}");
+        }
     }
 
     #[test]

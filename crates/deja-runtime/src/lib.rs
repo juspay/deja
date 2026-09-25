@@ -44,6 +44,7 @@ pub mod capture_key;
 pub mod correlation_layer;
 pub mod graph;
 pub mod hash_seed;
+pub mod identity;
 pub mod replay;
 pub mod round_trip;
 pub mod synth;

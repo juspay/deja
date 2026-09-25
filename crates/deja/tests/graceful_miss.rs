@@ -136,6 +136,7 @@ fn substitute_miss_returns_on_miss_value_in_replay() {
         policy_version: deja::POLICY_VERSION,
         event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![],
+        identity_entries: Vec::new(),
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("lookup.json");
