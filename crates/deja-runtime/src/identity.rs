@@ -748,6 +748,30 @@ mod tests {
         assert_ne!(identity_args_hash(&bytes), identity_args_hash(&text));
     }
 
+    /// Captured bodies whose content is the same but whose raw rendering
+    /// differs are one exact address, so swapping them is not a reorder, and
+    /// many of them still pair in linear time.
+    #[test]
+    fn bodies_that_differ_only_in_rendering_pair_as_exact() {
+        let form = |text: &str| json!({"kind": "FormUrlEncodedRequestBody", "text": text});
+        let (a, b) = (form("x=1&y=2"), form("y=2&x=1"));
+        assert_eq!(
+            identity_differences(&json!([a, b]), &json!([b, a])),
+            Some(vec![])
+        );
+        let (many_a, many_b) = (
+            serde_json::Value::Array(vec![a.clone(); 8_000]),
+            serde_json::Value::Array(vec![b.clone(); 8_000]),
+        );
+        let started = std::time::Instant::now();
+        assert!(same(&many_a, &many_b));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// Identical members are paired in linear time.
     #[test]
     fn identical_members_pair_in_linear_time() {
