@@ -181,34 +181,32 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
     if x.len() != y.len() {
         return None;
     }
-    let written = |value: &Value| value.to_string();
-    let mut exact: HashMap<String, VecDeque<usize>> = HashMap::new();
+    // Candidates by identity hash, in index order. Exactly equal members have
+    // one identity, so both passes draw on the same queues.
+    let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
     for (index, member) in y.iter().enumerate() {
-        exact.entry(written(member)).or_default().push_back(index);
-    }
-    let mut pairs: Vec<Option<usize>> = x
-        .iter()
-        .map(|member| {
-            exact
-                .get_mut(&written(member))
-                .and_then(VecDeque::pop_front)
-        })
-        .collect();
-    let mut by_identity: HashMap<u64, VecDeque<usize>> = HashMap::new();
-    for index in exact.into_values().flatten() {
-        by_identity
-            .entry(element_hash(&y[index]))
+        queues
+            .entry(element_hash(member))
             .or_default()
             .push_back(index);
     }
-    for queue in by_identity.values_mut() {
-        queue.make_contiguous().sort_unstable();
-    }
-    for (member, pair) in x.iter().zip(pairs.iter_mut()) {
+    let hashes: Vec<u64> = x.iter().map(element_hash).collect();
+    // Exactly equal as JSON, which reads object members by key, so an object
+    // written with its keys in another order is its own exact partner.
+    let mut pairs: Vec<Option<usize>> = x
+        .iter()
+        .zip(&hashes)
+        .map(|(member, hash)| {
+            let queue = queues.get_mut(hash)?;
+            let found = queue.iter().position(|&index| &y[index] == member)?;
+            queue.remove(found)
+        })
+        .collect();
+    for ((member, hash), pair) in x.iter().zip(&hashes).zip(pairs.iter_mut()) {
         if pair.is_some() {
             continue;
         }
-        let queue = by_identity.get_mut(&element_hash(member))?;
+        let queue = queues.get_mut(hash)?;
         let found = queue.iter().position(|&index| same(member, &y[index]))?;
         *pair = queue.remove(found);
     }
@@ -275,7 +273,9 @@ pub fn element_hash(value: &Value) -> u64 {
             let sum = map.iter().fold(0u64, |sum, (key, member)| {
                 let member = if is_byte_string(key, member) {
                     match byte_document(member) {
-                        Some(document) => tagged(DOCUMENT, element_hash(&document)),
+                        // Apart from a document held in a string, as that
+                        // is apart from the object it spells.
+                        Some(document) => tagged(BYTES ^ DOCUMENT, element_hash(&document)),
                         None => tagged(
                             BYTES,
                             crate::fnv1a_str(crate::FNV_OFFSET_BASIS, &member.to_string()),
@@ -744,6 +744,17 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "{:?}",
+            started.elapsed()
+        );
+        let (written, rewritten) = (
+            serde_json::Value::Array(vec![json!(r#"["a","b"]"#); 50_000]),
+            serde_json::Value::Array(vec![json!(r#"["b","a"]"#); 50_000]),
+        );
+        let started = std::time::Instant::now();
+        assert!(same(&written, &rewritten));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "members all rewritten: {:?}",
             started.elapsed()
         );
     }
