@@ -8623,7 +8623,9 @@ mod tests {
             doc(r#"{"ids":["a","b"],"n":1}"#),
             doc(r#"{"n":1,"ids":["b","a"]}"#),
         );
-        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        // The string's text changed, so it is document text, not ordering.
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
         assert!(card.verdict.pass, "{}", card.verdict.reason);
         let card = scored_matched_call(
             None,
@@ -9671,21 +9673,318 @@ mod tests {
     /// whose reordered members had keys moved is absorbed.
     #[test]
     fn keys_moved_inside_an_array_member_read_as_in_a_json_body() {
-        let page = embedded_card(
-            page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
-            page_embedding(r#"{"m":[{"a":0,"b":1},{"a":5}]}"#, "Collect"),
-        );
-        assert!(page.verdict.pass, "{}", page.verdict.reason);
-        assert_eq!(
-            kind_count(&page, "http_incoming", "EmbeddedJsonCompared"),
-            1
-        );
+        for replayed in [
+            r#"{"m":[{"a":0,"b":1},{"a":5}]}"#,
+            r#"{"m":[{"a":5},{"a":0,"b":1}]}"#,
+        ] {
+            let page = embedded_card(
+                page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
+                page_embedding(replayed, "Collect"),
+            );
+            assert!(page.verdict.pass, "{}", page.verdict.reason);
+            assert_eq!(
+                kind_count(&page, "http_incoming", "EmbeddedJsonCompared"),
+                1
+            );
+        }
         let body = embedded_card(
             serde_json::json!({"m": [{"b": 1, "a": 0}, {"a": 5}]}),
             serde_json::json!({"m": [{"a": 5}, {"a": 0, "b": 1}]}),
         );
         assert!(body.verdict.pass, "{}", body.verdict.reason);
         assert_eq!(kind_count(&body, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&body, "http_incoming", "ReplyCanonAbsorbed"),
+            1,
+            "counted, never a silent pass"
+        );
+    }
+
+    /// A row holding both a rewritten document string and a reordered array
+    /// names both, each at its own site: neither hides the other.
+    #[test]
+    fn a_row_with_document_text_and_a_reorder_names_both() {
+        let card = embedded_card(
+            serde_json::json!({"m": [{"s": "[1,2]", "t": [1, 2]}, {"a": 5}]}),
+            serde_json::json!({"m": [{"a": 5}, {"s": "[2,1]", "t": [2, 1]}]}),
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        // Ordering is named as a pure reorder names it, once at the row, so a
+        // document string beside it adds a site and changes none.
+        let control = embedded_card(
+            serde_json::json!({"m": [{"s": "[1,2]", "t": [1, 2]}, {"a": 5}]}),
+            serde_json::json!({"m": [{"a": 5}, {"s": "[1,2]", "t": [2, 1]}]}),
+        );
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"),
+            kind_count(&control, "http_incoming", "ReplyCanonAbsorbed"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("path $.m ") && w.contains("ordering alone")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A declared bag governs ordering alone: a document string rewritten at a
+    /// declared path is named as document text, not as the clause's ordering.
+    #[test]
+    fn a_declared_bag_does_not_name_document_text_as_ordering() {
+        let corr = "bag-document-text";
+        let recorded = serde_json::json!({ "ids": "[1,2]" });
+        let replayed = serde_json::json!({ "ids": "[2,1]" });
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                902,
+                Some("bag:$.ids"),
+                recorded,
+            )],
+        ));
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        assert!(
+            !card.warnings.iter().any(|w| w.contains("ordering alone")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A matched call's result holding both a rewritten document string and a
+    /// moved array names both.
+    #[test]
+    fn a_result_with_document_text_and_a_reorder_names_both() {
+        let card = scored_matched_call(
+            None,
+            db_envelope(serde_json::json!([{ "doc": "[1,2]" }, { "x": 1 }])),
+            db_envelope(serde_json::json!([{ "x": 1 }, { "doc": "[2,1]" }])),
+        );
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+    }
+
+    /// A declared bag keeps its own source for the array it governs when the
+    /// row also holds a rewritten document string.
+    #[test]
+    fn a_declared_bag_keeps_its_source_beside_document_text() {
+        let corr = "bag-beside-document-text";
+        let recorded = serde_json::json!({"m": [{"s": "[1,2]"}, {"a": 5}]});
+        let replayed = serde_json::json!({"m": [{"a": 5}, {"s": "[2,1]"}]});
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                903,
+                Some("bag:$.m"),
+                recorded,
+            )],
+        ));
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        let ordering: Vec<&String> = card
+            .warnings
+            .iter()
+            .filter(|w| w.contains("path $.m ") && w.contains("ordering alone"))
+            .collect();
+        assert_eq!(ordering.len(), 1, "{:?}", card.warnings);
+        assert!(ordering[0].contains("bag"), "{}", ordering[0]);
+        assert!(!ordering[0].contains("no path asserts"), "{}", ordering[0]);
+    }
+
+    /// A declared bag is credited with the row it governs, once, whether or
+    /// not a document string sits in it: never with a nested array it did not
+    /// name as a separate site.
+    #[test]
+    fn a_declared_bag_row_is_one_site_with_or_without_document_text() {
+        let count = |doc: &str| {
+            let corr = "bag-row-sites";
+            let recorded = serde_json::json!({"m": [{"s": "[1,2]", "n": [1, 2]}, {"a": 5}]});
+            let replayed = serde_json::json!({"m": [{"a": 5}, {"s": doc, "n": [2, 1]}]});
+            let card = detect(&art_with_events(
+                vec![],
+                vec![],
+                vec![http_with_bodies(
+                    corr,
+                    true,
+                    deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                    recorded.clone(),
+                    replayed,
+                )],
+                vec![http_incoming_ev_with_reply_canon(
+                    corr,
+                    904,
+                    Some("bag:$.m"),
+                    recorded,
+                )],
+            ));
+            kind_count(&card, "http_incoming", "ReplyCanonAbsorbed")
+        };
+        assert_eq!(count("[2,1]"), 1);
+        assert_eq!(count("[1,2]"), 1);
+    }
+
+    /// A whole-body bag names document text as document text, as every other
+    /// absorbing branch does: a clause about order does not make text order.
+    #[test]
+    fn a_whole_body_bag_names_document_text_as_document_text() {
+        let card = |doc: &str, moved: bool| {
+            let corr = "whole-body-bag-text";
+            let recorded = serde_json::json!({"m": [{"s": "[1,2]", "n": [1, 2]}, {"a": 5}]});
+            let member = serde_json::json!({"s": doc, "n": [1, 2]});
+            let replayed = if moved {
+                serde_json::json!({"m": [{"a": 5}, member]})
+            } else {
+                serde_json::json!({"m": [member, {"a": 5}]})
+            };
+            detect(&art_with_events(
+                vec![],
+                vec![],
+                vec![http_with_bodies(
+                    corr,
+                    true,
+                    deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                    recorded.clone(),
+                    replayed,
+                )],
+                vec![http_incoming_ev_with_reply_canon(
+                    corr,
+                    905,
+                    Some("bag"),
+                    recorded,
+                )],
+            ))
+        };
+        let text_only = card("[2,1]", false);
+        assert_eq!(
+            kind_count(&text_only, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        assert_eq!(
+            kind_count(&text_only, "http_incoming", "ReplyCanonAbsorbed"),
+            0
+        );
+        let both = card("[2,1]", true);
+        assert_eq!(
+            kind_count(&both, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        assert_eq!(kind_count(&both, "http_incoming", "ReplyCanonAbsorbed"), 1);
+    }
+
+    /// A recorder clause over a result's rows keeps its label for their order
+    /// when a document string in one of them was written differently.
+    #[test]
+    fn a_result_clause_keeps_its_source_beside_document_text() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            db_envelope(serde_json::json!([{ "ref": "a", "doc": "[1,2]" }, { "ref": "b" }])),
+            db_envelope(serde_json::json!([{ "ref": "b" }, { "ref": "a", "doc": "[2,1]" }])),
+        );
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        let warning = value_canon_warning(&card).expect("the ordering is named");
+        assert!(warning.contains("recorder"), "{warning}");
+        assert!(!warning.contains("no clause asserts"), "{warning}");
+    }
+
+    /// A matched call's result holding a document written differently is
+    /// counted as document text, not as ordering.
+    #[test]
+    fn a_result_document_string_rewritten_is_named_as_document_text() {
+        let card = scored_matched_call(
+            None,
+            db_envelope(serde_json::json!([{ "doc": "[1,2]" }])),
+            db_envelope(serde_json::json!([{ "doc": "[2,1]" }])),
+        );
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("text"))
+                && !card.warnings.iter().any(|w| w.contains("ordering alone")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A string in a JSON body holding a document written differently is
+    /// counted as document text, at the string's own path, never as ordering
+    /// alone: its text changed, though the document it holds did not.
+    #[test]
+    fn a_document_string_rewritten_in_a_body_is_named_as_document_text() {
+        for (recorded, replayed, site, reordered) in [
+            (
+                serde_json::json!({"ids": "[1,2]"}),
+                serde_json::json!({"ids": "[2,1]"}),
+                "$.ids",
+                0,
+            ),
+            (
+                serde_json::json!({"m": [{"s": "[1,2]"}, {"a": 5}]}),
+                serde_json::json!({"m": [{"a": 5}, {"s": "[2,1]"}]}),
+                "$.m[].s",
+                1,
+            ),
+        ] {
+            let card = embedded_card(recorded, replayed);
+            assert!(card.verdict.pass, "{site}: {}", card.verdict.reason);
+            assert_eq!(
+                kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+                1,
+                "{site}"
+            );
+            // Only an array that moved is ordering, never the string.
+            assert_eq!(
+                kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"),
+                reordered,
+                "{site}"
+            );
+            assert!(
+                card.warnings
+                    .iter()
+                    .any(|w| w.contains(site) && w.contains("text")),
+                "{site}: {:?}",
+                card.warnings
+            );
+            assert!(
+                !card
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("ordering alone") && w.contains(&format!("{site} "))),
+                "{site}: {:?}",
+                card.warnings
+            );
+        }
     }
 
     /// What the embedded comparison still refuses. Each of these blocks on
