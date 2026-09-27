@@ -181,34 +181,45 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
     if x.len() != y.len() {
         return None;
     }
-    // Candidates by identity hash, in index order. Exactly equal members have
-    // one identity, so both passes draw on the same queues.
-    let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
-    for (index, member) in y.iter().enumerate() {
+    // Two sets of candidate queues, both in index order: by the exact hash
+    // (arrays by position, objects by key, which is JSON equality) for the
+    // first pass, and by identity hash for the second. A member paired in one
+    // is marked, and skipped in the other.
+    let queues = |hash: &dyn Fn(&Value) -> u64| {
+        let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
+        for (index, member) in y.iter().enumerate() {
+            queues.entry(hash(member)).or_default().push_back(index);
+        }
         queues
-            .entry(element_hash(member))
-            .or_default()
-            .push_back(index);
-    }
-    let hashes: Vec<u64> = x.iter().map(element_hash).collect();
-    // Exactly equal as JSON, which reads object members by key, so an object
-    // written with its keys in another order is its own exact partner.
+    };
+    let mut exact = queues(&crate::replay::canonical_args_hash);
+    let mut by_identity = queues(&element_hash);
+    let mut used = vec![false; y.len()];
+    let mut take = |queue: &mut VecDeque<usize>, accepts: &dyn Fn(usize) -> bool| {
+        while queue.front().is_some_and(|&index| used[index]) {
+            queue.pop_front();
+        }
+        let found = queue
+            .iter()
+            .position(|&index| !used[index] && accepts(index))?;
+        let index = queue.remove(found)?;
+        used[index] = true;
+        Some(index)
+    };
+    // Exactly equal first, so an object written with its keys in another
+    // order is its own partner and a member that only moved pairs with itself.
     let mut pairs: Vec<Option<usize>> = x
         .iter()
-        .zip(&hashes)
-        .map(|(member, hash)| {
-            let queue = queues.get_mut(hash)?;
-            let found = queue.iter().position(|&index| &y[index] == member)?;
-            queue.remove(found)
+        .map(|member| {
+            let queue = exact.get_mut(&crate::replay::canonical_args_hash(member))?;
+            take(queue, &|index| &y[index] == member)
         })
         .collect();
-    for ((member, hash), pair) in x.iter().zip(&hashes).zip(pairs.iter_mut()) {
-        if pair.is_some() {
-            continue;
+    for (member, pair) in x.iter().zip(pairs.iter_mut()) {
+        if pair.is_none() {
+            let queue = by_identity.get_mut(&element_hash(member))?;
+            *pair = Some(take(queue, &|index| same(member, &y[index]))?);
         }
-        let queue = queues.get_mut(hash)?;
-        let found = queue.iter().position(|&index| same(member, &y[index]))?;
-        *pair = queue.remove(found);
     }
     pairs.into_iter().collect()
 }
