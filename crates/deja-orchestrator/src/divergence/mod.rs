@@ -2340,6 +2340,10 @@ enum ValueAbsorption {
     /// A paired request whose args have the recorded call's identity: an array
     /// in another order, or an embedded document written in another order.
     ArgsIdentity,
+    /// A value holding a JSON document in a string written differently: the
+    /// document is the recording's, its text is not. With the source of any
+    /// ordering beside it.
+    DocumentText(Option<ValueCanonSource>),
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
@@ -2478,6 +2482,26 @@ fn value_verdict(
     // permutation absorbed in one and blocking in the other is one fact with
     // two answers depending on where it happened to be compared.
     if json_order_only_difference(recorded, observed) {
+        // A document held in a string written differently is not ordering.
+        // Any ordering beside it is the clause's when the clause explains the
+        // two once each document stands as its identity, and the default's
+        // otherwise.
+        let (texts, orders) = identity_sites("$", recorded, observed);
+        if !texts.is_empty() {
+            let ordering = (!orders.is_empty()).then(|| {
+                let clauses = event.map(event_value_clauses).unwrap_or_default();
+                if declared_clauses_equivalent(
+                    &clauses,
+                    &documents_as_identities(recorded),
+                    &documents_as_identities(observed),
+                ) {
+                    ValueCanonSource::Recorder
+                } else {
+                    ValueCanonSource::Default
+                }
+            });
+            return ValueVerdict::Absorbed(ValueAbsorption::DocumentText(ordering));
+        }
         return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
     }
     ValueVerdict::Diverged
@@ -4218,6 +4242,81 @@ fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
     json_order_only_difference(&row.baseline, &row.candidate)
 }
 
+/// How a document held in a string is read, for the warnings that name one.
+const DOCUMENT_TEXT_READING: &str = "the document it holds is the recording's, read as JSON, so \
+    order, key order and spacing inside the text are set aside, and a fractional number is \
+    compared as a float. A consumer reading the string as text sees the change";
+
+/// Record an absorbed row by what the identity read differently in it. Its
+/// ordering is named as a pure reorder's is, once at the row's own path under
+/// `source`, and each string holding a document written differently is named
+/// as document text at its own site. So a row with both reasons names both,
+/// and a document string adds a site without changing the ordering's.
+fn absorb_by_identity(
+    classification: &mut HttpBodyClassification,
+    body: &JsonFieldDiff,
+    source: ClauseSource,
+) {
+    let (texts, orders) = identity_sites(&body.json_path, &body.baseline, &body.candidate);
+    if texts.is_empty() || !orders.is_empty() {
+        classification
+            .canon_absorbed
+            .push((body.json_path.clone(), source));
+    }
+    classification.document_text_paths.extend(texts);
+}
+
+/// `value` with each string holding a JSON document replaced by a marker of
+/// that document's identity, so a comparison that reads strings as text sees
+/// two writings of one document as equal and judges only what else differs.
+fn documents_as_identities(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) if deja::identity::embedded_document(text).is_some() => {
+            serde_json::Value::String(format!(
+                "\u{1}document {:016x}",
+                deja::identity::element_hash(value)
+            ))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(documents_as_identities).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, member)| (key.clone(), documents_as_identities(member)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Where two values of one identity at `path` were read differently: the
+/// sites of strings holding a document written differently, and of arrays that
+/// only moved, each with its indices written `[]`.
+fn identity_sites(
+    path: &str,
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    let (mut texts, mut orders) = (Vec::new(), Vec::new());
+    for change in deja::identity::identity_differences(baseline, candidate).unwrap_or_default() {
+        match change {
+            deja::identity::IdentityChange::DocumentText(inner) => {
+                texts.push(site_path(&format!(
+                    "{path}{}",
+                    inner.trim_start_matches('$')
+                )));
+            }
+            deja::identity::IdentityChange::ArrayOrder(inner) => {
+                orders.push(site_path(&format!(
+                    "{path}{}",
+                    inner.trim_start_matches('$')
+                )));
+            }
+        }
+    }
+    (texts, orders)
+}
+
 /// Larger bodies are not scanned for embedded documents; they compare as text.
 const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
 
@@ -4599,6 +4698,10 @@ struct HttpBodyClassification {
     /// counted as blocking; what differs inside the documents is classified
     /// like any other row.
     embedded_document_paths: Vec<String>,
+    /// Strings holding a JSON document written differently, at each string's
+    /// own site. Named and NOT counted as blocking: the document is the same,
+    /// its text is not.
+    document_text_paths: Vec<String>,
 }
 
 /// A JSON path reduced to the form a declaration is written in: every array
@@ -4683,9 +4786,7 @@ fn classify_http_body_diff(
         // provenance; one leaf is classified exactly once.
         match canon_verdict_for(diff, recorded_http, body, ctx.document_clauses) {
             CanonVerdict::Absorbed(source) => {
-                classification
-                    .canon_absorbed
-                    .push((body.json_path.clone(), source));
+                absorb_by_identity(&mut classification, body, source);
                 continue;
             }
             // Falls through to ordinary classification, so it still blocks.
@@ -4715,9 +4816,7 @@ fn classify_http_body_diff(
                 // all: two sources disagreeing about what a path MEANS must not
                 // be settled by a rule that says nothing about it.
                 if !conflicted {
-                    classification
-                        .canon_absorbed
-                        .push((body.json_path.clone(), ClauseSource::Default));
+                    absorb_by_identity(&mut classification, body, ClauseSource::Default);
                     continue;
                 }
                 classification.order_only_paths.push(body.json_path.clone());
@@ -5181,6 +5280,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut value_document_absorbed_seen: BTreeMap<String, u64> = BTreeMap::new();
     // Resolved calls whose args were read by identity to find their recording,
     // by call site, kind and path; and resolved calls whose args are another
     // call under identity, which neither lookup can have served.
@@ -5342,6 +5442,19 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             if let Some(ValueVerdict::Absorbed(ValueAbsorption::ServedRecordedError)) = verdict {
                 stats.note_kind("ServedRecordedError");
+            }
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::DocumentText(ordering))) = verdict {
+                stats.note_kind("ValueDocumentAbsorbed");
+                *value_document_absorbed_seen
+                    .entry(call_site_label(obs))
+                    .or_insert(0) += 1;
+                // An array beside the document that moved is still ordering.
+                if let Some(source) = ordering {
+                    stats.note_kind("ValueCanonAbsorbed");
+                    *value_canon_absorbed_seen
+                        .entry((call_site_label(obs), source.label()))
+                        .or_insert(0) += 1;
+                }
             }
             let diverged = matches!(verdict, Some(ValueVerdict::Diverged));
             if diverged {
@@ -5809,6 +5922,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // response must not read identically to one whose bodies agreed.
     let mut kernel_equivalent_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut embedded_document_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut document_text_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -5873,6 +5987,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             for path in body_classification.embedded_document_paths {
                 stats.note_kind("EmbeddedJsonCompared");
                 *embedded_document_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.document_text_paths {
+                stats.note_kind("ReplyDocumentAbsorbed");
+                *document_text_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -6333,6 +6451,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              altered member would still block"
         ));
     }
+    for (call_site, calls) in &value_document_absorbed_seen {
+        warnings.push(format!(
+            "matched call {call_site} returned a JSON document held in a string whose text changed \
+             on {calls} call(s) and was not counted: {DOCUMENT_TEXT_READING}"
+        ));
+    }
     for ((path, source), responses) in &canon_absorbed_seen {
         // The default is not a clause and must not read as one. "Declared by
         // the default" would describe a declaration nobody made.
@@ -6347,6 +6471,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "response body path {path} differed by ordering alone on {responses} response(s) and \
              was not counted: {by}. The members are identical as a multiset, so any added, \
              removed or altered member would still block"
+        ));
+    }
+    for (path, responses) in &document_text_paths_seen {
+        warnings.push(format!(
+            "response body path {path} held a JSON document whose text changed on {responses} \
+             response(s) and was not counted: {DOCUMENT_TEXT_READING}"
         ));
     }
     // What the recompute saw differ and the kernel judged the same. Named rather
