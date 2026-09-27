@@ -629,6 +629,53 @@ mod tests {
         );
     }
 
+    /// Members rewritten in place pair with the member at their own place,
+    /// every time: which of several candidates a member pairs with does not
+    /// depend on a hash map's iteration order.
+    #[test]
+    fn rewritten_members_pair_in_place_every_time() {
+        let (p, q) = (json!(["x", "y", "z"]), json!(["y", "z", "x"]));
+        let (r, s) = (json!(["z", "x", "y"]), json!(["z", "y", "x"]));
+        for _ in 0..64 {
+            assert_eq!(
+                identity_differences(&json!([p, q]), &json!([r, s])),
+                Some(vec![
+                    IdentityChange::ArrayOrder("$[0]".to_owned()),
+                    IdentityChange::ArrayOrder("$[1]".to_owned()),
+                ])
+            );
+        }
+    }
+
+    /// Bytes are a string, so bytes holding a JSON document are that document:
+    /// a redis reply whose stored document was written in another order is
+    /// the same value, as the write that stored it was.
+    #[test]
+    fn a_byte_string_holding_a_document_is_that_document() {
+        let bulk = |text: &str| json!({"BulkString": text.as_bytes()});
+        let (a, b) = (
+            bulk(r#"{"a":1,"b":["x","y"]}"#),
+            bulk(r#"{"b":["y","x"],"a":1}"#),
+        );
+        assert!(same(&a, &b));
+        assert_eq!(identity_args_hash(&a), identity_args_hash(&b));
+        assert_eq!(
+            identity_differences(&a, &b),
+            Some(vec![IdentityChange::DocumentText(
+                "$.BulkString".to_owned()
+            )])
+        );
+        assert_eq!(
+            identity_differences(&a, &bulk(r#"{"a":2,"b":["y","x"]}"#)),
+            None
+        );
+        assert_eq!(
+            identity_differences(&bulk("120"), &bulk("210")),
+            None,
+            "bytes that are not a document keep their order"
+        );
+    }
+
     /// Identical members are paired in linear time.
     #[test]
     fn identical_members_pair_in_linear_time() {
