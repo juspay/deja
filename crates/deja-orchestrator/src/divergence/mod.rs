@@ -3968,32 +3968,7 @@ fn order_canonical_diff(
             // however far apart they sit, so substituting one element of nine
             // is one difference and not the run of positional disagreements
             // that the substitution shifted everything else into.
-            let mut unmatched_candidates: HashMap<u64, Vec<&serde_json::Value>> = HashMap::new();
-            for item in c {
-                unmatched_candidates
-                    .entry(deja::identity::element_hash(item))
-                    .or_default()
-                    .push(item);
-            }
-            let mut only_baseline: Vec<&serde_json::Value> = Vec::new();
-            for item in b {
-                // Cancel against a member of the same identity wherever it
-                // sits, one partner each and the earliest first, so a lost
-                // duplicate still surfaces.
-                let partner = unmatched_candidates
-                    .get_mut(&deja::identity::element_hash(item))
-                    .and_then(|pool| {
-                        let found = pool
-                            .iter()
-                            .position(|other| deja::identity::same(item, other))?;
-                        Some(pool.remove(found))
-                    });
-                if partner.is_none() {
-                    only_baseline.push(item);
-                }
-            }
-            let only_candidate: Vec<&serde_json::Value> =
-                unmatched_candidates.into_values().flatten().collect();
+            let (only_baseline, only_candidate) = cancel_common(b, c);
             // Pair each leftover member with the one it shares most with, so a
             // member that changed one field reports that field alone; order-free,
             // so the paths it names are the same on every run.
@@ -4043,47 +4018,187 @@ pub(crate) fn json_order_only_difference(
     recorded != observed && deja::identity::same(recorded, observed)
 }
 
-/// Pair two arrays' leftover members for the report: each recorded member, in
-/// order of its identity hash, with the observed member sharing most equal
-/// object members with it (ties to the lowest identity hash). Nothing here
-/// depends on the order either side wrote its members in. Each member's fields
-/// are read once, into identity hashes, so scoring is cheap; past a bound the
-/// members pair in hash order unscored. Returns the two sides aligned by
-/// index; unpaired members follow.
+/// A hash of a member as written, every rendering included, and key order
+/// too unless `keys_sorted`.
+fn written_hash(member: &serde_json::Value, keys_sorted: bool) -> u64 {
+    use sha2::{Digest, Sha256};
+    fn feed(hasher: &mut Sha256, value: &serde_json::Value, keys_sorted: bool) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut members: Vec<_> = map.iter().collect();
+                if keys_sorted {
+                    members.sort_by(|a, b| a.0.cmp(b.0));
+                }
+                hasher.update(b"{");
+                for (key, member) in members {
+                    hasher.update(serde_json::to_vec(key).unwrap_or_default());
+                    hasher.update(b":");
+                    feed(hasher, member, keys_sorted);
+                    hasher.update(b",");
+                }
+                hasher.update(b"}");
+            }
+            serde_json::Value::Array(items) => {
+                hasher.update(b"[");
+                for item in items {
+                    feed(hasher, item, keys_sorted);
+                    hasher.update(b",");
+                }
+                hasher.update(b"]");
+            }
+            scalar => hasher.update(serde_json::to_vec(scalar).unwrap_or_default()),
+        }
+    }
+    let mut hasher = Sha256::new();
+    feed(&mut hasher, member, keys_sorted);
+    u64::from_le_bytes(
+        hasher.finalize()[..8]
+            .try_into()
+            .expect("a sha256 digest is 32 bytes"),
+    )
+}
+
+/// Cancel the members two arrays share, one partner each and the closest
+/// first: one written identically, then one written identically but for key
+/// order, then one the exact hash reads alike (a body in another rendering),
+/// then one of the same identity written another way. Each tier holds the one
+/// before it. Both sides are read in content order (identity, exact hash, key
+/// order aside, as written), so which member cancels and which is left never
+/// depends on the order either side wrote them in, and a lost duplicate still
+/// surfaces. Returns each side's leftovers in that order.
+fn cancel_common<'a>(
+    baseline: &'a [serde_json::Value],
+    candidate: &'a [serde_json::Value],
+) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
+    use std::collections::VecDeque;
+    type Keyed<'a> = (u64, u64, u64, u64, &'a serde_json::Value);
+    let in_content_order = |members: &'a [serde_json::Value]| {
+        let mut keyed: Vec<Keyed<'a>> = members
+            .iter()
+            .map(|member| {
+                (
+                    deja::identity::element_hash(member),
+                    deja::canonical_args_hash(member),
+                    written_hash(member, true),
+                    written_hash(member, false),
+                    member,
+                )
+            })
+            .collect();
+        keyed.sort_by_key(|&(identity, exact, sorted, written, _)| {
+            (identity, exact, sorted, written)
+        });
+        keyed
+    };
+    let (baseline, candidate) = (in_content_order(baseline), in_content_order(candidate));
+    let queues = |key: fn(&Keyed<'a>) -> u64| {
+        let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
+        for (index, member) in candidate.iter().enumerate() {
+            queues.entry(key(member)).or_default().push_back(index);
+        }
+        queues
+    };
+    let mut used = vec![false; candidate.len()];
+    let mut cancelled = vec![false; baseline.len()];
+    let written: fn(&Keyed<'a>) -> u64 = |&(_, _, _, written, _)| written;
+    let sorted: fn(&Keyed<'a>) -> u64 = |&(_, _, sorted, _, _)| sorted;
+    let exact: fn(&Keyed<'a>) -> u64 = |&(_, exact, _, _, _)| exact;
+    let identity: fn(&Keyed<'a>) -> u64 = |&(identity, _, _, _, _)| identity;
+    for key in [written, sorted, exact, identity] {
+        let mut queues = queues(key);
+        for (index, member) in baseline.iter().enumerate() {
+            if cancelled[index] {
+                continue;
+            }
+            let Some(queue) = queues.get_mut(&key(member)) else {
+                continue;
+            };
+            while queue.front().is_some_and(|&other| used[other]) {
+                queue.pop_front();
+            }
+            // Past the front only on a hash shared by another identity.
+            let found = queue.iter().position(|&other| {
+                !used[other] && deja::identity::same(member.4, candidate[other].4)
+            });
+            if let Some(other) = found.and_then(|found| queue.remove(found)) {
+                used[other] = true;
+                cancelled[index] = true;
+            }
+        }
+    }
+    let left = |members: Vec<Keyed<'a>>, gone: Vec<bool>| {
+        members
+            .into_iter()
+            .zip(gone)
+            .filter_map(|((_, _, _, _, member), gone)| (!gone).then_some(member))
+            .collect()
+    };
+    (left(baseline, cancelled), left(candidate, used))
+}
+
+/// Pair two arrays' leftover members for the report, each taken in content
+/// order: each recorded member with the observed member sharing the most
+/// fields with it, ties to the earliest. A field is an object's member, read
+/// with its key so a byte string keeps its order, or an array's member.
+/// Nothing here depends on the order either side wrote its members in. Each
+/// member's fields are read once. Past a bound on the work (every recorded
+/// member's fields against every observed member) the members pair in content
+/// order unscored, and a leftover paired with a stranger reports each field
+/// they differ in. Returns the two sides aligned by index; unpaired members
+/// follow.
 fn pair_residues<'a>(
     baseline: Vec<&'a serde_json::Value>,
     candidate: Vec<&'a serde_json::Value>,
 ) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
-    const MAX_SCORED: usize = 1_024;
-    let by_hash = |mut members: Vec<&'a serde_json::Value>| {
-        members.sort_by_cached_key(|member| deja::identity::element_hash(member));
-        members
+    const MAX_WORK: usize = 1 << 22;
+    let fields = |member: &serde_json::Value| -> HashMap<u64, usize> {
+        let hashes: Vec<u64> = match member {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(key, value)| {
+                    let mut field = serde_json::Map::new();
+                    field.insert(key.clone(), value.clone());
+                    deja::identity::element_hash(&serde_json::Value::Object(field))
+                })
+                .collect(),
+            serde_json::Value::Array(items) => {
+                items.iter().map(deja::identity::element_hash).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut counts = HashMap::new();
+        for hash in hashes {
+            *counts.entry(hash).or_insert(0) += 1;
+        }
+        counts
     };
-    let (baseline, candidate) = (by_hash(baseline), by_hash(candidate));
-    if baseline.len().max(candidate.len()) > MAX_SCORED {
+    let width = |member: &serde_json::Value| match member {
+        serde_json::Value::Object(map) => map.len(),
+        serde_json::Value::Array(items) => items.len(),
+        _ => 0,
+    };
+    let work = baseline
+        .iter()
+        .map(|member| width(member) + 1)
+        .sum::<usize>()
+        .saturating_mul(candidate.len());
+    if work > MAX_WORK {
         return (baseline, candidate);
     }
-    let fields = |member: &'a serde_json::Value| -> HashMap<&'a str, u64> {
-        member.as_object().map_or_else(HashMap::new, |map| {
-            map.iter()
-                .map(|(key, value)| (key.as_str(), deja::identity::element_hash(value)))
-                .collect()
-        })
-    };
-    let mut candidates: Vec<(&'a serde_json::Value, HashMap<&'a str, u64>)> = candidate
-        .iter()
-        .map(|member| (*member, fields(member)))
+    let own: Vec<HashMap<u64, usize>> = baseline.iter().map(|member| fields(member)).collect();
+    let mut candidates: Vec<(&'a serde_json::Value, HashMap<u64, usize>)> = candidate
+        .into_iter()
+        .map(|member| (member, fields(member)))
         .collect();
     let mut paired = Vec::with_capacity(candidates.len());
-    for member in &baseline {
+    for own in &own {
         if candidates.is_empty() {
             break;
         }
-        let own = fields(member);
-        let shared = |other: &HashMap<&'a str, u64>| {
+        let shared = |other: &HashMap<u64, usize>| -> usize {
             own.iter()
-                .filter(|(key, hash)| other.get(*key) == Some(*hash))
-                .count()
+                .map(|(hash, count)| (*count).min(other.get(hash).copied().unwrap_or(0)))
+                .sum()
         };
         let (mut best, mut best_score) = (0, shared(&candidates[0].1));
         for (index, (_, other)) in candidates.iter().enumerate().skip(1) {

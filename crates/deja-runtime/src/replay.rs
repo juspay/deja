@@ -2730,8 +2730,8 @@ impl LookupTableHook {
         let by_identity =
             !self.identity_table.is_empty() && crate::identity::identity_applies(query.args);
         // A pure function of this call's own args, so it is computed before the
-        // lock; the lock guards the occurrence counters, and both of this
-        // call's occurrences are still taken under it, together.
+        // lock; the lock guards the occurrence counters, and the one sequence
+        // this call is addressed by advances under it.
         let identity_hash = by_identity.then(|| crate::identity::identity_args_hash(query.args));
         let keys = match self.stamper.lock() {
             Ok(mut stampers) => stampers.stamp_call(
