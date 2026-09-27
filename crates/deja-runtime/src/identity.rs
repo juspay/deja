@@ -406,6 +406,84 @@ mod tests {
         );
     }
 
+    /// A byte string is one value that capture renders as an array of
+    /// numbers, not a collection: its bytes keep their order, as the exact
+    /// hash already keeps them. The shapes are deja's own: a captured body's
+    /// `raw_bytes`, and a redis wire `BulkString`.
+    #[test]
+    fn a_byte_string_keeps_its_order() {
+        let bytes = |text: &str| json!(text.as_bytes());
+        for (name, a, b) in [
+            (
+                "a JSON body whose document was not captured",
+                json!({"body": {"kind": "JsonRequestBody", "json": null, "raw_bytes": bytes("{\"amount\":120}")}}),
+                json!({"body": {"kind": "JsonRequestBody", "json": null, "raw_bytes": bytes("{\"amount\":210}")}}),
+            ),
+            (
+                "captured bytes",
+                json!({"captured": true, "utf8": false, "text": null, "raw_bytes": bytes("120")}),
+                json!({"captured": true, "utf8": false, "text": null, "raw_bytes": bytes("210")}),
+            ),
+            (
+                "a redis bulk string",
+                json!({"key": "k", "value": {"BulkString": bytes("120")}}),
+                json!({"key": "k", "value": {"BulkString": bytes("210")}}),
+            ),
+            (
+                "a redis bulk string under its other dialect's name",
+                json!({"Bytes": bytes("120")}),
+                json!({"Bytes": bytes("210")}),
+            ),
+        ] {
+            assert_ne!(identity_args_hash(&a), identity_args_hash(&b), "{name}");
+            assert_eq!(identity_differences(&a, &b), None, "{name}");
+            assert!(!identity_applies(&a), "{name}: nothing to reorder");
+        }
+    }
+
+    /// A number is compared as it is hashed, by its text, so the comparison
+    /// and the lookup agree: -0.0 and 0.0 are two values to both.
+    #[test]
+    fn a_number_is_compared_as_it_is_hashed() {
+        for (a, b) in [
+            (json!(-0.0), json!(0.0)),
+            (json!([-0.0]), json!([0.0])),
+            (json!({"k": -0.0}), json!({"k": 0.0})),
+        ] {
+            assert_eq!(
+                same(&a, &b),
+                identity_args_hash(&a) == identity_args_hash(&b),
+                "{a} {b}"
+            );
+            assert!(!same(&a, &b), "{a} {b}");
+        }
+    }
+
+    /// A reordering reported at an array does not hide what differs inside
+    /// its members: each is followed to the member it matched.
+    #[test]
+    fn a_reordered_arrays_members_are_still_followed() {
+        let (r, o) = (json!([["a", "b"], "c"]), json!(["c", ["b", "a"]]));
+        assert_eq!(
+            identity_differences(&r, &o),
+            Some(vec![
+                IdentityChange::ArrayOrder("$".to_owned()),
+                IdentityChange::ArrayOrder("$[0]".to_owned()),
+            ])
+        );
+        let (r, o) = (
+            json!(["x", r#"{"a":["p","q"]}"#]),
+            json!([r#"{"a":["q","p"]}"#, "x"]),
+        );
+        assert_eq!(
+            identity_differences(&r, &o),
+            Some(vec![
+                IdentityChange::ArrayOrder("$".to_owned()),
+                IdentityChange::DocumentText("$[1]".to_owned()),
+            ])
+        );
+    }
+
     /// Object key order is never read, by the hash or by the comparison.
     #[test]
     fn an_objects_key_order_is_never_read() {
