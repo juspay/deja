@@ -12,6 +12,12 @@
 //! happened. Object members are read by key. A string holding a JSON object or
 //! array is that document, kept apart from the same document sent as an object.
 //!
+//! A byte string is not an array: it is one value that capture renders as an
+//! array of numbers, because JSON has no bytes. deja's own capture writes bytes
+//! in two places, a captured body's `raw_bytes` and a redis wire `BulkString`
+//! (`Bytes` in the other dialect), and those keep their order, as the exact
+//! hash keeps them.
+//!
 //! Nothing is sorted and no canonical document is built: comparison is a
 //! multiset comparison, and the hash combines member hashes by wrapping
 //! addition, which any order gives the same sum and which, unlike XOR, keeps a
@@ -24,6 +30,9 @@ use serde_json::Value;
 /// the exact hash finds the same are always the same identity.
 const JSON_REQUEST_BODY_KIND: &str = "JsonRequestBody";
 const FORM_URLENCODED_REQUEST_BODY_KIND: &str = "FormUrlEncodedRequestBody";
+
+/// Members of deja's own capture that hold a byte string.
+const BYTE_STRING_MEMBERS: &[&str] = &["raw_bytes", "BulkString", "Bytes"];
 
 /// What the identity set aside to find two values the same call, at the path
 /// of the raw value it read differently.
@@ -54,7 +63,9 @@ pub fn identity_applies(value: &Value) -> bool {
         Value::Object(map) if is_json_request_body(map) => {
             map.get("json").is_some_and(identity_applies)
         }
-        Value::Object(map) => map.values().any(identity_applies),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, member)| !is_byte_string(key, member) && identity_applies(member)),
         Value::Array(items) => items.len() > 1 || items.iter().any(identity_applies),
         _ => false,
     }
@@ -78,7 +89,8 @@ pub fn identity_differences(recorded: &Value, observed: &Value) -> Option<Vec<Id
 }
 
 /// Whether two values are one identity: arrays compared as multisets, objects
-/// by key, a document in a string as that document.
+/// by key, a document in a string as that document, a byte string and a
+/// number as written.
 pub fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(x), Value::String(y)) => {
@@ -102,40 +114,62 @@ pub fn same(a: &Value, b: &Value) -> bool {
             !is_form_request_body(y)
                 && !is_json_request_body(y)
                 && x.len() == y.len()
-                && x.iter()
-                    .all(|(key, value)| y.get(key).is_some_and(|other| same(value, other)))
+                && x.iter().all(|(key, value)| {
+                    y.get(key)
+                        .is_some_and(|other| member_same(key, value, other))
+                })
         }
-        (Value::Array(x), Value::Array(y)) => same_members(x, y),
+        (Value::Array(x), Value::Array(y)) => matching(x, y).is_some(),
+        // As the hash reads a number: by its text, so -0.0 and 0.0 are two.
+        (Value::Number(x), Value::Number(y)) => x.to_string() == y.to_string(),
         (x, y) => x == y,
     }
 }
 
-/// Two arrays hold the same multiset: every member of one pairs with a
-/// distinct member of the other. Candidates are found by hash, and confirmed.
-fn same_members(x: &[Value], y: &[Value]) -> bool {
-    if x.len() != y.len() {
-        return false;
+/// One object member of each side: a byte string as written, anything else
+/// by [`same`].
+fn member_same(key: &str, value: &Value, other: &Value) -> bool {
+    if is_byte_string(key, value) || is_byte_string(key, other) {
+        value == other
+    } else {
+        same(value, other)
     }
-    let mut unmatched: std::collections::HashMap<u64, Vec<&Value>> =
+}
+
+/// A byte string in deja's capture: one of its byte members, holding bytes.
+fn is_byte_string(key: &str, value: &Value) -> bool {
+    BYTE_STRING_MEMBERS.contains(&key)
+        && value.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .all(|item| item.as_u64().is_some_and(|byte| byte <= 255))
+        })
+}
+
+/// The multiset matching of two arrays: for each member of `x`, the index of
+/// the distinct member of `y` it is one identity with. `None` when there is no
+/// such matching. Candidates are found by hash, and confirmed.
+fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
+    if x.len() != y.len() {
+        return None;
+    }
+    let mut unmatched: std::collections::HashMap<u64, Vec<usize>> =
         std::collections::HashMap::new();
-    for member in y {
+    for (index, member) in y.iter().enumerate() {
         unmatched
             .entry(element_hash(member))
             .or_default()
-            .push(member);
+            .push(index);
     }
-    x.iter().all(|member| {
-        let Some(candidates) = unmatched.get_mut(&element_hash(member)) else {
-            return false;
-        };
-        match candidates.iter().position(|other| same(member, other)) {
-            Some(found) => {
-                candidates.swap_remove(found);
-                true
-            }
-            None => false,
-        }
-    })
+    x.iter()
+        .map(|member| {
+            let candidates = unmatched.get_mut(&element_hash(member))?;
+            let found = candidates
+                .iter()
+                .position(|&index| same(member, &y[index]))?;
+            Some(candidates.swap_remove(found))
+        })
+        .collect()
 }
 
 fn form_fields_same(
@@ -159,8 +193,11 @@ fn form_fields_same(
 /// A hash of `value` that any order of an array's members, or of an object's,
 /// gives the same result. Member hashes (each already finalised) are summed
 /// with wrapping addition; a repeated member adds twice, so multiplicity
-/// counts. An object's keys are unique, so no two of its pairs could cancel
-/// under XOR either; addition is used there too, so there is one combiner.
+/// counts. Objects are summed the same way, as `(key, value)` pair hashes, so
+/// there is one combiner. For an object XOR would behave the same in practice:
+/// its keys are unique, so no pair can cancel another, and an XOR collision
+/// would need control of the hash outputs, which no test can exert (the
+/// 210-multiset collision test is the measured support).
 pub fn element_hash(value: &Value) -> u64 {
     const NULL: u64 = 0x6e75_6c6c;
     const ARRAY: u64 = 0x0061_7272_6179;
@@ -168,6 +205,7 @@ pub fn element_hash(value: &Value) -> u64 {
     const DOCUMENT: u64 = 0x0064_6f63;
     const FORM: u64 = 0x666f_726d;
     const BODY: u64 = 0x626f_6479;
+    const BYTES: u64 = 0x0062_7974_6573;
     let tagged = |tag: u64, inner: u64| finalise(tag ^ inner.rotate_left(17));
     match value {
         Value::Null => finalise(NULL),
@@ -182,21 +220,26 @@ pub fn element_hash(value: &Value) -> u64 {
         },
         Value::Object(map) if is_form_request_body(map) => {
             let text = crate::replay::request_body_text(map).unwrap_or_default();
-            let (count, sum) = text.split('&').fold((0u64, 0u64), |(count, sum), field| {
-                (
-                    count + 1,
-                    sum.wrapping_add(finalise(crate::fnv1a_str(crate::FNV_OFFSET_BASIS, field))),
-                )
+            let sum = text.split('&').fold(0u64, |sum, field| {
+                sum.wrapping_add(finalise(crate::fnv1a_str(crate::FNV_OFFSET_BASIS, field)))
             });
-            tagged(FORM, finalise(sum ^ count))
+            tagged(FORM, sum)
         }
         Value::Object(map) if is_json_request_body(map) => {
             tagged(BODY, map.get("json").map_or(0, element_hash))
         }
         Value::Object(map) => {
             let sum = map.iter().fold(0u64, |sum, (key, member)| {
+                let member = if is_byte_string(key, member) {
+                    tagged(
+                        BYTES,
+                        crate::fnv1a_str(crate::FNV_OFFSET_BASIS, &member.to_string()),
+                    )
+                } else {
+                    element_hash(member)
+                };
                 let key = crate::fnv1a_str(crate::FNV_OFFSET_BASIS, key);
-                sum.wrapping_add(finalise(key ^ element_hash(member).rotate_left(29)))
+                sum.wrapping_add(finalise(key ^ member.rotate_left(29)))
             });
             tagged(OBJECT, sum)
         }
@@ -247,7 +290,9 @@ fn is_json_request_body(map: &serde_json::Map<String, Value>) -> bool {
 }
 
 /// Where two values with one identity differ as written. Both sides have the
-/// same shape wherever this descends, because they are one identity.
+/// same shape wherever this descends, because they are one identity. A
+/// reordered array is reported, and each of its members is still followed to
+/// the member it matched, so a difference inside one is not lost.
 fn differences(recorded: &Value, observed: &Value, path: &str, out: &mut Vec<IdentityChange>) {
     if recorded == observed {
         return;
@@ -263,17 +308,21 @@ fn differences(recorded: &Value, observed: &Value, path: &str, out: &mut Vec<Ide
         (Value::Object(r), Value::Object(o)) => {
             for (key, value) in r {
                 if let Some(other) = o.get(key) {
-                    differences(value, other, &format!("{path}.{key}"), out);
+                    if !is_byte_string(key, value) {
+                        differences(value, other, &format!("{path}.{key}"), out);
+                    }
                 }
             }
         }
         (Value::Array(r), Value::Array(o)) => {
-            if r.iter().zip(o).all(|(a, b)| same(a, b)) {
-                for (index, (a, b)) in r.iter().zip(o).enumerate() {
-                    differences(a, b, &format!("{path}[{index}]"), out);
-                }
+            let pairs: Vec<usize> = if r.iter().zip(o).all(|(a, b)| same(a, b)) {
+                (0..r.len()).collect()
             } else {
                 out.push(IdentityChange::ArrayOrder(path.to_owned()));
+                matching(r, o).unwrap_or_default()
+            };
+            for (index, partner) in pairs.into_iter().enumerate() {
+                differences(&r[index], &o[partner], &format!("{path}[{index}]"), out);
             }
         }
         (Value::String(_), Value::String(_)) => {
