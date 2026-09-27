@@ -1522,6 +1522,7 @@ fn render_and_persist_lookup_table(
     .map_err(|e| format!("{e} Budget in force: {budget}."))?;
     let Persisted {
         entries,
+        identity_entries,
         legacy_bytes,
         shared_bytes,
         shared_only,
@@ -1532,13 +1533,15 @@ fn render_and_persist_lookup_table(
         .unwrap_or_default();
     let report = if shared_only {
         format!(
-            "{entries} entries rendered; one-result-per-entry table {legacy_bytes} bytes \
+            "{entries} entries rendered, and {identity_entries} by identity; \
+             one-result-per-entry table {legacy_bytes} bytes \
              compact, over the budget ({budget}), so only the shared-results table was written, \
              {shared_bytes} bytes, within that budget{runner}"
         )
     } else {
         format!(
-            "{entries} entries rendered; one-result-per-entry table {legacy_bytes} bytes compact \
+            "{entries} entries rendered, and {identity_entries} by identity; \
+             one-result-per-entry table {legacy_bytes} bytes compact \
              (compared against the budget, {budget}); shared-results table {shared_bytes} \
              bytes (information only){runner}"
         )
@@ -1554,6 +1557,8 @@ fn render_and_persist_lookup_table(
 #[derive(Debug)]
 struct Persisted {
     entries: usize,
+    /// Entries addressed by the args' identity, beside the exact ones.
+    identity_entries: usize,
     legacy_bytes: u64,
     shared_bytes: u64,
     event_schema_version: Option<u16>,
@@ -1727,6 +1732,7 @@ fn persist_lookup_table_within(
     }
     Ok(Persisted {
         entries: table.entries.len(),
+        identity_entries: table.identity_entries.len(),
         legacy_bytes,
         shared_bytes: shared.len() as u64,
         event_schema_version: table.event_schema_version,

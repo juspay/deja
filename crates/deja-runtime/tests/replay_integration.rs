@@ -241,6 +241,7 @@ async fn replay_lookup_hit_with_unreconstructable_result_fail_stops_before_real_
             result: std::sync::Arc::new(serde_json::json!("not-a-Result-u64-String")),
             source_event_global_sequence: 0,
         }],
+        identity_entries: Vec::new(),
     };
     let observed = InMemoryObservedSink::new();
     let observed_handle = observed.handle();
@@ -364,6 +365,7 @@ async fn replay_execute_delegate_runs_real_impl_and_emits_shadow_observation() {
             result: std::sync::Arc::new(serde_json::json!({"Ok": 42})),
             source_event_global_sequence: 0,
         }],
+        identity_entries: Vec::new(),
     };
     let observed = InMemoryObservedSink::new();
     let observed_handle = observed.handle();
