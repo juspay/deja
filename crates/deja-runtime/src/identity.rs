@@ -533,6 +533,30 @@ mod tests {
         );
     }
 
+    /// Members pair with their exact partner first, so a reorder is reported
+    /// only where one happened: members of one identity written differently
+    /// do not pair crosswise and report reorders nothing made.
+    #[test]
+    fn members_pair_with_their_exact_partner_first() {
+        let (r, o) = (
+            json!([["x", "y", "z"], ["y", "z", "x"], ["z", "x", "y"], "w"]),
+            json!(["w", ["x", "y", "z"], ["y", "z", "x"], ["z", "x", "y"]]),
+        );
+        assert_eq!(
+            identity_differences(&r, &o),
+            Some(vec![IdentityChange::ArrayOrder("$".to_owned())])
+        );
+        let (r, o) = (
+            json!([["a", "b"], ["b", "a"]]),
+            json!([["b", "a"], ["a", "b"]]),
+        );
+        assert_eq!(
+            identity_differences(&r, &o),
+            Some(vec![IdentityChange::ArrayOrder("$".to_owned())]),
+            "two members that swapped places are one reorder, at the array"
+        );
+    }
+
     /// Object key order is never read, by the hash or by the comparison.
     #[test]
     fn an_objects_key_order_is_never_read() {
