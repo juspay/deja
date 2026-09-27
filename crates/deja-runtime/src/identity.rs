@@ -148,7 +148,9 @@ fn is_byte_string(key: &str, value: &Value) -> bool {
 
 /// The multiset matching of two arrays: for each member of `x`, the index of
 /// the distinct member of `y` it is one identity with. `None` when there is no
-/// such matching. Candidates are found by hash, and confirmed.
+/// such matching. Candidates are found by hash and confirmed, an exactly equal
+/// one first, so members written alike pair with each other and a reorder is
+/// reported only where one happened.
 fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
     if x.len() != y.len() {
         return None;
@@ -166,8 +168,9 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
             let candidates = unmatched.get_mut(&element_hash(member))?;
             let found = candidates
                 .iter()
-                .position(|&index| same(member, &y[index]))?;
-            Some(candidates.swap_remove(found))
+                .position(|&index| member == &y[index])
+                .or_else(|| candidates.iter().position(|&index| same(member, &y[index])))?;
+            Some(candidates.remove(found))
         })
         .collect()
 }
@@ -315,12 +318,14 @@ fn differences(recorded: &Value, observed: &Value, path: &str, out: &mut Vec<Ide
             }
         }
         (Value::Array(r), Value::Array(o)) => {
-            let pairs: Vec<usize> = if r.iter().zip(o).all(|(a, b)| same(a, b)) {
-                (0..r.len()).collect()
-            } else {
+            let pairs = matching(r, o).unwrap_or_default();
+            if pairs
+                .iter()
+                .enumerate()
+                .any(|(index, &partner)| index != partner)
+            {
                 out.push(IdentityChange::ArrayOrder(path.to_owned()));
-                matching(r, o).unwrap_or_default()
-            };
+            }
             for (index, partner) in pairs.into_iter().enumerate() {
                 differences(&r[index], &o[partner], &format!("{path}[{index}]"), out);
             }
