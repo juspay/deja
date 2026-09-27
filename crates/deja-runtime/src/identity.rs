@@ -177,9 +177,9 @@ fn is_byte_string(key: &str, value: &Value) -> bool {
 /// by its content, so an object whose keys moved, or a body rendered
 /// differently, is its own partner. Last, the rest pair by identity. So a
 /// member that kept its place, or only moved, is never reported as rewritten,
-/// and the report does not depend on which side is read first. Each pass
-/// draws from queues in index order, keyed by the hash it tests, so the first
-/// candidate is taken and pairing is linear.
+/// and the report does not depend on which side is read first. The later
+/// passes draw from queues in index order, keyed by the hash they test, so
+/// the first candidate is taken and pairing is linear.
 fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
     use std::collections::{HashMap, VecDeque};
     if x.len() != y.len() {
