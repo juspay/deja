@@ -148,31 +148,51 @@ fn is_byte_string(key: &str, value: &Value) -> bool {
 
 /// The multiset matching of two arrays: for each member of `x`, the index of
 /// the distinct member of `y` it is one identity with. `None` when there is no
-/// such matching. Candidates are found by hash and confirmed, an exactly equal
-/// one first, so members written alike pair with each other and a reorder is
-/// reported only where one happened.
+/// such matching.
+///
+/// Two passes. First every member is paired with an exactly equal one, across
+/// the whole array, so a member that kept its place or only moved is paired
+/// with itself whichever side is read first. Then the rest are paired by
+/// identity, candidates found by hash and confirmed. Each pass takes its
+/// candidates from the front of a queue, so identical members pair in linear
+/// time.
 fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
+    use std::collections::{HashMap, VecDeque};
     if x.len() != y.len() {
         return None;
     }
-    let mut unmatched: std::collections::HashMap<u64, Vec<usize>> =
-        std::collections::HashMap::new();
+    let written = |value: &Value| value.to_string();
+    let mut exact: HashMap<String, VecDeque<usize>> = HashMap::new();
     for (index, member) in y.iter().enumerate() {
-        unmatched
-            .entry(element_hash(member))
-            .or_default()
-            .push(index);
+        exact.entry(written(member)).or_default().push_back(index);
     }
-    x.iter()
+    let mut pairs: Vec<Option<usize>> = x
+        .iter()
         .map(|member| {
-            let candidates = unmatched.get_mut(&element_hash(member))?;
-            let found = candidates
-                .iter()
-                .position(|&index| member == &y[index])
-                .or_else(|| candidates.iter().position(|&index| same(member, &y[index])))?;
-            Some(candidates.remove(found))
+            exact
+                .get_mut(&written(member))
+                .and_then(VecDeque::pop_front)
         })
-        .collect()
+        .collect();
+    let mut by_identity: HashMap<u64, VecDeque<usize>> = HashMap::new();
+    for index in exact.into_values().flatten() {
+        by_identity
+            .entry(element_hash(&y[index]))
+            .or_default()
+            .push_back(index);
+    }
+    for queue in by_identity.values_mut() {
+        queue.make_contiguous().sort_unstable();
+    }
+    for (member, pair) in x.iter().zip(pairs.iter_mut()) {
+        if pair.is_some() {
+            continue;
+        }
+        let queue = by_identity.get_mut(&element_hash(member))?;
+        let found = queue.iter().position(|&index| same(member, &y[index]))?;
+        *pair = queue.remove(found);
+    }
+    pairs.into_iter().collect()
 }
 
 fn form_fields_same(
