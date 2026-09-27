@@ -13105,6 +13105,310 @@ mod tests {
         );
     }
 
+    /// The rows of one array comparison, as `(path, baseline, candidate)`.
+    fn array_rows(
+        baseline: serde_json::Value,
+        candidate: serde_json::Value,
+    ) -> Vec<(String, serde_json::Value, serde_json::Value)> {
+        let mut rows = Vec::new();
+        order_canonical_diff(&baseline, &candidate, "$", &mut rows);
+        rows.into_iter()
+            .map(|row| (row.json_path, row.baseline, row.candidate))
+            .collect()
+    }
+
+    /// Members that cancel are chosen by content, never by the order either
+    /// side wrote them in: an exact partner before one of the same identity
+    /// written differently, and among those the same one every time.
+    #[test]
+    fn what_cancels_does_not_depend_on_written_order() {
+        let x = serde_json::json!({"d": r#"{"a":1,"b":2}"#, "k": 1});
+        let x_other = serde_json::json!({"d": r#"{"b":2,"a":1}"#, "k": 1});
+        let x_third = serde_json::json!({"d": r#"{"b":2, "a":1}"#, "k": 1});
+        let b = serde_json::json!({"d": r#"{"a":1,"b":2}"#, "k": 2});
+        let one = array_rows(serde_json::json!([x, b]), serde_json::json!([x_other, x]));
+        let other = array_rows(serde_json::json!([x, b]), serde_json::json!([x, x_other]));
+        assert!(!one.is_empty(), "precondition: the arrays differ");
+        assert_eq!(
+            one, other,
+            "the exact partner cancels, whichever came first"
+        );
+        let one = array_rows(
+            serde_json::json!([b, x]),
+            serde_json::json!([x_other, x_third, x]),
+        );
+        let other = array_rows(
+            serde_json::json!([x, b]),
+            serde_json::json!([x_third, x, x_other]),
+        );
+        assert_eq!(one, other, "and the same leftovers on every run");
+    }
+
+    /// An exact partner cancels before one of the same identity written
+    /// another way, from either side, so the member left over is the one
+    /// written differently.
+    #[test]
+    fn an_exact_partner_cancels_first() {
+        let x = serde_json::json!({"d": r#"{"a":1,"b":2}"#, "k": 1});
+        let x_other = serde_json::json!({"d": r#"{"b":2,"a":1}"#, "k": 1});
+        let b = serde_json::json!({"d": r#"{"a":1,"b":3}"#, "k": 2});
+        for (kept, written) in [(&x, &x_other), (&x_other, &x)] {
+            let rows = array_rows(
+                serde_json::json!([kept, b]),
+                serde_json::json!([written, kept]),
+            );
+            assert!(
+                rows.iter()
+                    .any(|(path, _, candidate)| path == "$[0].d" && candidate == &written["d"]),
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// The closest partner cancels first: one written identically, then one
+    /// that differs only in key order, which is never reported, then one whose
+    /// embedded document was written another way.
+    #[test]
+    fn the_closest_partner_cancels_first() {
+        for a in 0..40 {
+            let p = serde_json::json!({"a": a, "b": r#"{"x":1,"y":2}"#});
+            let mut keys_moved = serde_json::Map::new();
+            keys_moved.insert("b".to_owned(), p["b"].clone());
+            keys_moved.insert("a".to_owned(), p["a"].clone());
+            let text_moved = serde_json::json!({"a": a, "b": r#"{"y":2,"x":1}"#});
+            let rows = array_rows(
+                serde_json::json!([p, 7]),
+                serde_json::json!([serde_json::Value::Object(keys_moved), text_moved]),
+            );
+            assert!(
+                rows.iter()
+                    .any(|(_, _, candidate)| candidate["b"] == text_moved["b"]),
+                "a = {a}: {rows:?}"
+            );
+            // A body written identically before one the exact hash reads alike.
+            let body = |b: [i64; 2], text: String| serde_json::json!({"kind": "JsonRequestBody", "json": {"a": a, "b": b}, "text": text});
+            let (same_text, other_text, json_moved) = (
+                body([1, 2], format!(r#"{{"a":{a},"b":[1,2]}}"#)),
+                body([1, 2], format!(r#"{{"b":[1,2],"a":{a}}}"#)),
+                body([2, 1], format!(r#"{{"a":{a},"b":[2,1]}}"#)),
+            );
+            // And a body whose keys alone moved before one whose text moved.
+            let mut keys_moved = serde_json::Map::new();
+            for key in ["text", "json", "kind"] {
+                keys_moved.insert(key.to_owned(), same_text[key].clone());
+            }
+            let keys_moved = serde_json::Value::Object(keys_moved);
+            // Each pair: a partner in one tier, and one in the next.
+            for (closer, further) in [
+                (&same_text, &keys_moved),
+                (&keys_moved, &other_text),
+                (&other_text, &json_moved),
+            ] {
+                for candidate in [[closer, further], [further, closer]] {
+                    let rows = array_rows(
+                        serde_json::json!([same_text, 7]),
+                        serde_json::json!(candidate),
+                    );
+                    // Compared as written: a value ignores its key order.
+                    let written = |value: &serde_json::Value| value.to_string();
+                    assert!(
+                        rows.iter()
+                            .any(|(_, _, left)| written(left) == written(further)),
+                        "a = {a}: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Members the exact hash reads alike but written differently (a body's
+    /// text beside the same document, an object's keys in another order) are
+    /// still told apart by what was written, so the rows and their rendering
+    /// do not depend on written order.
+    #[test]
+    fn members_written_differently_are_ordered_by_what_was_written() {
+        let body = |text: &str| {
+            serde_json::json!({
+                "kind": "JsonRequestBody",
+                "json": {"a": 1, "b": 2},
+                "text": text,
+            })
+        };
+        let form =
+            |text: &str| serde_json::json!({"kind": "FormUrlEncodedRequestBody", "text": text});
+        let keyed = |first: &str, second: &str| {
+            let mut map = serde_json::Map::new();
+            map.insert(first.to_owned(), serde_json::json!(first));
+            map.insert(second.to_owned(), serde_json::json!(second));
+            serde_json::Value::Object(map)
+        };
+        let cases = [
+            (body(r#"{"a":1,"b":2}"#), body(r#"{"b":2,"a":1}"#)),
+            (form("a=1&b=2"), form("b=2&a=1")),
+            (keyed("a", "b"), keyed("b", "a")),
+        ];
+        for (one, two) in cases {
+            // Beside a partner for one of them, and with both left over.
+            for baseline in [serde_json::json!([one, 7]), serde_json::json!([7])] {
+                let render = |candidate: serde_json::Value| {
+                    serde_json::to_string(&array_rows(baseline.clone(), candidate))
+                        .expect("rows render")
+                };
+                assert_eq!(
+                    render(serde_json::json!([one, two])),
+                    render(serde_json::json!([two, one])),
+                    "{one} beside {two}"
+                );
+            }
+        }
+    }
+
+    /// Cancelling many members of one identity takes each partner in constant
+    /// time, including when the identity pass meets members the exact pass
+    /// already took.
+    #[test]
+    fn cancelling_many_equal_members_is_linear() {
+        // Four times the members may take about four times as long, never
+        // sixteen: a ratio, so a slow machine or build does not decide it.
+        let grows_linearly =
+            |label: &str,
+             size: usize,
+             pair: &dyn Fn(usize) -> (serde_json::Value, serde_json::Value)| {
+                let time = |size: usize| {
+                    let (baseline, candidate) = pair(size);
+                    let started = std::time::Instant::now();
+                    let rows = array_rows(baseline, candidate);
+                    assert_eq!(rows.len(), 1, "precondition: all but one member cancel");
+                    started.elapsed()
+                };
+                let linear = |small: std::time::Duration, large: std::time::Duration| {
+                    large < (small * 8).max(std::time::Duration::from_millis(200))
+                };
+                let (small, large) = (time(size), time(size * 4));
+                // Measured once more before failing, so one busy moment on a
+                // shared machine does not decide it.
+                if !linear(small, large) {
+                    let (small, large) = (time(size), time(size * 4));
+                    assert!(
+                        linear(small, large),
+                        "{label}: {small:?} at {size}, {large:?} at four times that"
+                    );
+                }
+            };
+        for (taken, left) in [([1, 2, 3], [3, 2, 1]), ([3, 2, 1], [1, 2, 3])] {
+            let side = |size: usize, other: [i64; 3], extra: i64| {
+                serde_json::Value::Array(
+                    std::iter::repeat_n(serde_json::json!(taken), size)
+                        .chain(std::iter::repeat_n(serde_json::json!(other), size))
+                        .chain([serde_json::json!(extra)])
+                        .collect(),
+                )
+            };
+            grows_linearly("past members the exact pass took", 12_500, &|size| {
+                (side(size, left, 9), side(size, [2, 1, 3], 10))
+            });
+        }
+        let many = |size: usize, extra: Option<i64>| {
+            serde_json::Value::Array(
+                std::iter::repeat_n(serde_json::json!(1), size)
+                    .chain(extra.map(serde_json::Value::from))
+                    .collect(),
+            )
+        };
+        grows_linearly("one identity, many members", 50_000, &|size| {
+            (many(size, Some(2)), many(size, None))
+        });
+    }
+
+    /// The pairing bound counts the work, members times their fields, not the
+    /// members alone.
+    #[test]
+    fn wide_residues_pair_within_a_bound() {
+        let side = |offset: i64| {
+            serde_json::Value::Array(
+                (0..1_024)
+                    .map(|i| {
+                        serde_json::Value::Object(
+                            (0..300)
+                                .map(|f| {
+                                    (format!("f{f}"), serde_json::json!(i * 1_000 + f + offset))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let started = std::time::Instant::now();
+        let rows = array_rows(side(0), side(1));
+        assert!(!rows.is_empty(), "precondition: every member changed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A member that is itself an array pairs by the members it shares, so a
+    /// row that changed one element reports that element alone.
+    #[test]
+    fn tuple_residues_pair_by_their_members() {
+        let mut rows = array_rows(
+            serde_json::json!([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]),
+            serde_json::json!([[1, 2, 30], [4, 50, 6], [70, 8, 9], [10, 110, 12]]),
+        );
+        rows.sort_by_key(|(_, baseline, _)| baseline.as_i64());
+        let changed: Vec<(serde_json::Value, serde_json::Value)> =
+            rows.into_iter().map(|(_, b, c)| (b, c)).collect();
+        assert_eq!(
+            changed,
+            vec![
+                (serde_json::json!(3), serde_json::json!(30)),
+                (serde_json::json!(5), serde_json::json!(50)),
+                (serde_json::json!(7), serde_json::json!(70)),
+                (serde_json::json!(11), serde_json::json!(110)),
+            ]
+        );
+        // A repeated member counts as often as both sides hold it.
+        let rows = array_rows(
+            serde_json::json!([[1, 1, 1, 5]]),
+            serde_json::json!([[1, 1, 1, 6], [1, 5, 8, 9]]),
+        );
+        assert!(
+            rows.iter()
+                .any(|(_, b, c)| (b, c) == (&serde_json::json!(5), &serde_json::json!(6))),
+            "{rows:?}"
+        );
+    }
+
+    /// Pairing reads a byte string in order, as `same` does: a permuted byte
+    /// string is not a shared field.
+    #[test]
+    fn residue_pairing_reads_a_byte_string_in_order() {
+        for (first, second) in [([1, 2], [2, 1]), ([2, 1], [1, 2])] {
+            let mut rows = array_rows(
+                serde_json::json!([
+                    {"raw_bytes": first, "v": 1},
+                    {"raw_bytes": second, "v": 2},
+                ]),
+                serde_json::json!([
+                    {"raw_bytes": second, "v": 20},
+                    {"raw_bytes": first, "v": 10},
+                ]),
+            );
+            rows.sort_by_key(|(_, baseline, _)| baseline.as_i64());
+            let changed: Vec<(serde_json::Value, serde_json::Value)> =
+                rows.into_iter().map(|(_, b, c)| (b, c)).collect();
+            assert_eq!(
+                changed,
+                vec![
+                    (serde_json::json!(1), serde_json::json!(10)),
+                    (serde_json::json!(2), serde_json::json!(20)),
+                ]
+            );
+        }
+    }
+
     /// Tolerations are counted by SITE: three calls reordered at one site are
     /// one site, and the warning carries the three calls.
     #[test]
