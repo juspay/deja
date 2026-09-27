@@ -170,30 +170,42 @@ fn is_byte_string(key: &str, value: &Value) -> bool {
 /// the distinct member of `y` it is one identity with. `None` when there is no
 /// such matching.
 ///
-/// Two passes. First every member is paired with an exactly equal one, across
-/// the whole array, so a member that kept its place or only moved is paired
-/// with itself whichever side is read first. Then the rest are paired by
-/// identity, candidates found by hash and confirmed. Each pass takes its
-/// candidates from the front of a queue, so identical members pair in linear
-/// time.
+/// Three passes, each confirming a candidate by identity. First, a member the
+/// exact lookup addresses as the member at its own position pairs with it in
+/// place. Then the rest pair with an exact partner anywhere in the array: the
+/// exact lookup reads arrays by position, objects by key and a captured body
+/// by its content, so an object whose keys moved, or a body rendered
+/// differently, is its own partner. Last, the rest pair by identity. So a
+/// member that kept its place, or only moved, is never reported as rewritten,
+/// and the report does not depend on which side is read first. Each pass
+/// draws from queues in index order, keyed by the hash it tests, so the first
+/// candidate is taken and pairing is linear.
 fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
     use std::collections::{HashMap, VecDeque};
     if x.len() != y.len() {
         return None;
     }
-    // Two sets of candidate queues, both in index order: by the exact lookup
-    // hash for the first pass, and by identity hash for the second. A member
-    // paired in one is marked, and skipped in the other.
-    let queues = |hash: &dyn Fn(&Value) -> u64| {
+    let queues = |hashes: &[u64]| {
         let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
-        for (index, member) in y.iter().enumerate() {
-            queues.entry(hash(member)).or_default().push_back(index);
+        for (index, hash) in hashes.iter().enumerate() {
+            queues.entry(*hash).or_default().push_back(index);
         }
         queues
     };
-    let mut exact = queues(&crate::replay::canonical_args_hash);
-    let mut by_identity = queues(&element_hash);
+    let exact_y: Vec<u64> = y.iter().map(crate::replay::canonical_args_hash).collect();
+    let exact_x: Vec<u64> = x.iter().map(crate::replay::canonical_args_hash).collect();
+    let mut exact = queues(&exact_y);
+    let mut by_identity = queues(&y.iter().map(element_hash).collect::<Vec<_>>());
     let mut used = vec![false; y.len()];
+    // In place first.
+    let mut pairs: Vec<Option<usize>> = (0..x.len())
+        .map(|index| {
+            (exact_x[index] == exact_y[index] && same(&x[index], &y[index])).then(|| {
+                used[index] = true;
+                index
+            })
+        })
+        .collect();
     let mut take = |queue: &mut VecDeque<usize>, accepts: &dyn Fn(usize) -> bool| {
         while queue.front().is_some_and(|&index| used[index]) {
             queue.pop_front();
@@ -207,23 +219,17 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
         used[index] = true;
         Some(index)
     };
-    // Exact partners first: members the exact lookup gives one address to,
-    // arrays by position, objects by key, a captured body by its content. So
-    // an object whose keys moved, or a body rendered differently, is its own
-    // partner, and a member that only moved pairs with itself. Every member of
-    // one exact queue is one identity, so the first candidate is taken and the
-    // pass is linear.
-    let mut pairs: Vec<Option<usize>> = x
-        .iter()
-        .map(|member| {
-            let queue = exact.get_mut(&crate::replay::canonical_args_hash(member))?;
-            take(queue, &|index| same(member, &y[index]))
-        })
-        .collect();
-    for (member, pair) in x.iter().zip(pairs.iter_mut()) {
+    for (index, pair) in pairs.iter_mut().enumerate() {
         if pair.is_none() {
-            let queue = by_identity.get_mut(&element_hash(member))?;
-            *pair = Some(take(queue, &|index| same(member, &y[index]))?);
+            if let Some(queue) = exact.get_mut(&exact_x[index]) {
+                *pair = take(queue, &|other| same(&x[index], &y[other]));
+            }
+        }
+    }
+    for (index, pair) in pairs.iter_mut().enumerate() {
+        if pair.is_none() {
+            let queue = by_identity.get_mut(&element_hash(&x[index]))?;
+            *pair = Some(take(queue, &|other| same(&x[index], &y[other]))?);
         }
     }
     pairs.into_iter().collect()
