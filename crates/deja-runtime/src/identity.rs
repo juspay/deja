@@ -517,8 +517,8 @@ mod tests {
         for (name, a, b) in [
             (
                 "a JSON body whose document was not captured",
-                json!({"body": {"kind": "JsonRequestBody", "json": null, "raw_bytes": bytes("{\"amount\":120}")}}),
-                json!({"body": {"kind": "JsonRequestBody", "json": null, "raw_bytes": bytes("{\"amount\":210}")}}),
+                json!({"body": {"kind": "JsonRequestBody", "json": null, "raw_bytes": bytes("120 units")}}),
+                json!({"body": {"kind": "JsonRequestBody", "json": null, "raw_bytes": bytes("210 units")}}),
             ),
             (
                 "captured bytes",
@@ -538,11 +538,7 @@ mod tests {
         ] {
             assert_ne!(identity_args_hash(&a), identity_args_hash(&b), "{name}");
             assert_eq!(identity_differences(&a, &b), None, "{name}");
-            if !name.starts_with("a JSON body") {
-                // Bytes that are not a document have nothing to reorder; the
-                // body's bytes are a document, which identity does read.
-                assert!(!identity_applies(&a), "{name}: nothing to reorder");
-            }
+            assert!(!identity_applies(&a), "{name}: nothing to reorder");
         }
     }
 
@@ -709,6 +705,34 @@ mod tests {
             None,
             "bytes that are not a document keep their order"
         );
+    }
+
+    /// Exactly equal means equal as JSON, which reads object members by key:
+    /// an object written with its keys in another order is its own exact
+    /// partner, so key order alone never reports a reorder.
+    #[test]
+    fn key_order_alone_is_never_a_reorder() {
+        let (ab, ba) = (json!({"a": 1, "b": 2}), json!({"b": 2, "a": 1}));
+        assert_eq!(
+            identity_differences(
+                &json!([ab, ba, r#"["x","y"]"#]),
+                &json!([ba, ab, r#"["y","x"]"#])
+            ),
+            Some(vec![IdentityChange::DocumentText("$[2]".to_owned())])
+        );
+    }
+
+    /// A document held in bytes and the same document held in a string are
+    /// two values, as a document in a string and the object it spells are:
+    /// the hash keeps them apart, as the comparison does.
+    #[test]
+    fn a_byte_document_and_a_string_document_are_apart() {
+        let (bytes, text) = (
+            json!({"BulkString": r#"{"a":1}"#.as_bytes()}),
+            json!({"BulkString": r#"{"a":1}"#}),
+        );
+        assert!(!same(&bytes, &text));
+        assert_ne!(identity_args_hash(&bytes), identity_args_hash(&text));
     }
 
     /// Identical members are paired in linear time.
