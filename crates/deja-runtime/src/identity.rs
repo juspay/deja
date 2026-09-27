@@ -181,10 +181,9 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
     if x.len() != y.len() {
         return None;
     }
-    // Two sets of candidate queues, both in index order: by the exact hash
-    // (arrays by position, objects by key, which is JSON equality) for the
-    // first pass, and by identity hash for the second. A member paired in one
-    // is marked, and skipped in the other.
+    // Two sets of candidate queues, both in index order: by the exact lookup
+    // hash for the first pass, and by identity hash for the second. A member
+    // paired in one is marked, and skipped in the other.
     let queues = |hash: &dyn Fn(&Value) -> u64| {
         let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
         for (index, member) in y.iter().enumerate() {
@@ -208,13 +207,17 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
         used[index] = true;
         Some(index)
     };
-    // Exactly equal first, so an object written with its keys in another
-    // order is its own partner and a member that only moved pairs with itself.
+    // Exact partners first: members the exact lookup gives one address to,
+    // arrays by position, objects by key, a captured body by its content. So
+    // an object whose keys moved, or a body rendered differently, is its own
+    // partner, and a member that only moved pairs with itself. Every member of
+    // one exact queue is one identity, so the first candidate is taken and the
+    // pass is linear.
     let mut pairs: Vec<Option<usize>> = x
         .iter()
         .map(|member| {
             let queue = exact.get_mut(&crate::replay::canonical_args_hash(member))?;
-            take(queue, &|index| &y[index] == member)
+            take(queue, &|index| same(member, &y[index]))
         })
         .collect();
     for (member, pair) in x.iter().zip(pairs.iter_mut()) {
