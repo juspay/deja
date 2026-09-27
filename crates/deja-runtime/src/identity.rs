@@ -562,6 +562,66 @@ mod tests {
         );
     }
 
+    /// Exact partners are paired across the whole array before any member is
+    /// paired by identity, so the report does not depend on which member came
+    /// first, and a member that kept its place is never counted as moved.
+    #[test]
+    fn exact_partners_are_paired_across_the_whole_array_first() {
+        let (p, q, r) = (
+            json!(["x", "y", "z"]),
+            json!(["y", "z", "x"]),
+            json!(["z", "x", "y"]),
+        );
+        assert_eq!(
+            identity_differences(&json!([p, q]), &json!([q, r])),
+            Some(vec![
+                IdentityChange::ArrayOrder("$".to_owned()),
+                IdentityChange::ArrayOrder("$[0]".to_owned()),
+            ]),
+            "q moved from 1 to 0, and p was written as r"
+        );
+        assert_eq!(
+            identity_differences(&json!([q, r]), &json!([p, q])),
+            Some(vec![
+                IdentityChange::ArrayOrder("$".to_owned()),
+                IdentityChange::ArrayOrder("$[1]".to_owned()),
+            ]),
+            "the same, from the other side"
+        );
+        assert_eq!(
+            identity_differences(&json!([p, q, r]), &json!([p, r, q])),
+            Some(vec![IdentityChange::ArrayOrder("$".to_owned())]),
+            "q and r swapped places, exactly"
+        );
+        let (a, b, c) = (
+            json!(["a", "b", "c"]),
+            json!(["b", "c", "a"]),
+            json!(["c", "a", "b"]),
+        );
+        let (b2, c2) = (json!(["c", "b", "a"]), json!(["a", "c", "b"]));
+        assert_eq!(
+            identity_differences(&json!([a, b, c]), &json!([a, b2, c2])),
+            Some(vec![
+                IdentityChange::ArrayOrder("$[1]".to_owned()),
+                IdentityChange::ArrayOrder("$[2]".to_owned()),
+            ]),
+            "nothing moved at the outer array: members kept their places"
+        );
+    }
+
+    /// Identical members are paired in linear time.
+    #[test]
+    fn identical_members_pair_in_linear_time() {
+        let many = serde_json::Value::Array(vec![json!(0); 200_000]);
+        let started = std::time::Instant::now();
+        assert!(same(&many, &many.clone()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// Object key order is never read, by the hash or by the comparison.
     #[test]
     fn an_objects_key_order_is_never_read() {
