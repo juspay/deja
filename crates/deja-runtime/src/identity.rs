@@ -775,6 +775,22 @@ mod tests {
         );
     }
 
+    /// A member that kept its place pairs with itself before any member pairs
+    /// across the array, so a member rewritten in place beside an identical
+    /// one is not reported as moved, read from either side.
+    #[test]
+    fn a_member_in_place_pairs_with_itself_first() {
+        let (kept, rewritten) = (json!(["x", "y"]), json!(["y", "x"]));
+        assert_eq!(
+            identity_differences(&json!([kept, kept]), &json!([rewritten, kept])),
+            Some(vec![IdentityChange::ArrayOrder("$[0]".to_owned())])
+        );
+        assert_eq!(
+            identity_differences(&json!([rewritten, kept]), &json!([kept, kept])),
+            Some(vec![IdentityChange::ArrayOrder("$[0]".to_owned())])
+        );
+    }
+
     /// Identical members are paired in linear time.
     #[test]
     fn identical_members_pair_in_linear_time() {
