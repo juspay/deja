@@ -199,6 +199,8 @@ fn matching(x: &[Value], y: &[Value]) -> Option<Vec<usize>> {
         while queue.front().is_some_and(|&index| used[index]) {
             queue.pop_front();
         }
+        // A marked member further back is reachable only past a candidate of
+        // another identity sharing the hash, so this guards a collision.
         let found = queue
             .iter()
             .position(|&index| !used[index] && accepts(index))?;
