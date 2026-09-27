@@ -797,6 +797,15 @@ mod tests {
         );
     }
 
+    /// A member paired in one pass is not paired again in another: two
+    /// members of one identity cannot both take the same partner.
+    #[test]
+    fn a_partner_is_taken_once_across_passes() {
+        let (p, q, r) = (json!(["x", "y"]), json!(["y", "x"]), json!(["z"]));
+        assert!(!same(&json!([q, p]), &json!([p, r])));
+        assert_eq!(identity_differences(&json!([q, p]), &json!([p, r])), None);
+    }
+
     /// Identical members are paired in linear time.
     #[test]
     fn identical_members_pair_in_linear_time() {
