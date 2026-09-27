@@ -16,7 +16,8 @@
 //! array of numbers, because JSON has no bytes. deja's own capture writes bytes
 //! in two places, a captured body's `raw_bytes` and a redis wire `BulkString`
 //! (`Bytes` in the other dialect), and those keep their order, as the exact
-//! hash keeps them.
+//! hash keeps them. Bytes are a string, so bytes that hold a JSON document are
+//! that document, as a string holding one is.
 //!
 //! Nothing is sorted and no canonical document is built: comparison is a
 //! multiset comparison, and the hash combines member hashes by wrapping
@@ -63,9 +64,13 @@ pub fn identity_applies(value: &Value) -> bool {
         Value::Object(map) if is_json_request_body(map) => {
             map.get("json").is_some_and(identity_applies)
         }
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, member)| !is_byte_string(key, member) && identity_applies(member)),
+        Value::Object(map) => map.iter().any(|(key, member)| {
+            if is_byte_string(key, member) {
+                byte_document(member).is_some()
+            } else {
+                identity_applies(member)
+            }
+        }),
         Value::Array(items) => items.len() > 1 || items.iter().any(identity_applies),
         _ => false,
     }
@@ -126,14 +131,29 @@ pub fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// One object member of each side: a byte string as written, anything else
-/// by [`same`].
+/// One object member of each side: a byte string as written unless both hold
+/// a document, anything else by [`same`].
 fn member_same(key: &str, value: &Value, other: &Value) -> bool {
     if is_byte_string(key, value) || is_byte_string(key, other) {
+        if is_byte_string(key, value) && is_byte_string(key, other) {
+            if let (Some(a), Some(b)) = (byte_document(value), byte_document(other)) {
+                return same(&a, &b);
+            }
+        }
         value == other
     } else {
         same(value, other)
     }
+}
+
+/// A byte string's text, when it is UTF-8 holding a JSON object or array.
+fn byte_document(value: &Value) -> Option<Value> {
+    let bytes: Vec<u8> = value
+        .as_array()?
+        .iter()
+        .map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+        .collect::<Option<_>>()?;
+    embedded_document(std::str::from_utf8(&bytes).ok()?)
 }
 
 /// A byte string in deja's capture: one of its byte members, holding bytes.
@@ -254,10 +274,13 @@ pub fn element_hash(value: &Value) -> u64 {
         Value::Object(map) => {
             let sum = map.iter().fold(0u64, |sum, (key, member)| {
                 let member = if is_byte_string(key, member) {
-                    tagged(
-                        BYTES,
-                        crate::fnv1a_str(crate::FNV_OFFSET_BASIS, &member.to_string()),
-                    )
+                    match byte_document(member) {
+                        Some(document) => tagged(DOCUMENT, element_hash(&document)),
+                        None => tagged(
+                            BYTES,
+                            crate::fnv1a_str(crate::FNV_OFFSET_BASIS, &member.to_string()),
+                        ),
+                    }
                 } else {
                     element_hash(member)
                 };
@@ -331,8 +354,12 @@ fn differences(recorded: &Value, observed: &Value, path: &str, out: &mut Vec<Ide
         (Value::Object(r), Value::Object(o)) => {
             for (key, value) in r {
                 if let Some(other) = o.get(key) {
+                    let path = format!("{path}.{key}");
                     if !is_byte_string(key, value) {
-                        differences(value, other, &format!("{path}.{key}"), out);
+                        differences(value, other, &path, out);
+                    } else if value != other {
+                        // Equal as documents, since the two are one identity.
+                        out.push(IdentityChange::DocumentText(path));
                     }
                 }
             }
@@ -511,7 +538,11 @@ mod tests {
         ] {
             assert_ne!(identity_args_hash(&a), identity_args_hash(&b), "{name}");
             assert_eq!(identity_differences(&a, &b), None, "{name}");
-            assert!(!identity_applies(&a), "{name}: nothing to reorder");
+            if !name.starts_with("a JSON body") {
+                // Bytes that are not a document have nothing to reorder; the
+                // body's bytes are a document, which identity does read.
+                assert!(!identity_applies(&a), "{name}: nothing to reorder");
+            }
         }
     }
 
