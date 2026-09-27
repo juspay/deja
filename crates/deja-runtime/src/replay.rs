@@ -1974,7 +1974,9 @@ fn hash_request_body(hash: u64, map: &serde_json::Map<String, serde_json::Value>
 /// A captured body's bytes as text — the `text` member when the capture kept
 /// one, otherwise decoded from `raw_bytes`. `None` when neither is present or
 /// the bytes are not UTF-8.
-fn request_body_text(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+pub(crate) fn request_body_text(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
     if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
         return Some(text.to_owned());
     }

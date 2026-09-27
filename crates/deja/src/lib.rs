@@ -61,6 +61,9 @@ pub fn runtime_mode_is_disabled() -> bool {
 pub use deja_runtime::hash_seed::{
     hash_seed, DejaBuildHasher, DejaHasher, HashKeys, SeededHashMap, SeededHashSet,
 };
+/// What makes two calls the same call: one order-free identity for the
+/// lookup address and the args diff.
+pub use deja_runtime::identity;
 /// Row identity is read from the schema that owns it, never listed here: the
 /// statement, the registry it feeds, and the lookup consumers use.
 pub use deja_runtime::replay::{
