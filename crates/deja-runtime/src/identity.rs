@@ -689,6 +689,10 @@ mod tests {
             bulk(r#"{"b":["y","x"],"a":1}"#),
         );
         assert!(same(&a, &b));
+        assert!(
+            identity_applies(&a),
+            "a document can be written another way"
+        );
         assert_eq!(identity_args_hash(&a), identity_args_hash(&b));
         assert_eq!(
             identity_differences(&a, &b),
