@@ -170,16 +170,16 @@ pub fn event_schema_versions(observed: &str) -> BTreeSet<u32> {
 /// to the same document sent as an object; that difference is real.
 fn canonical(v: &serde_json::Value) -> serde_json::Value {
     match v {
-        serde_json::Value::String(text) if looks_like_json(text) => {
-            match serde_json::from_str::<serde_json::Value>(text) {
-                Ok(doc @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
-                    let mut wrapped = serde_json::Map::new();
-                    wrapped.insert("$json".to_owned(), canonical(&doc));
-                    serde_json::Value::Object(wrapped)
-                }
-                _ => v.clone(),
+        // The same reading of a document in a string as a call's identity
+        // (`deja::identity`), so the two never disagree about what one is.
+        serde_json::Value::String(text) => match deja::identity::embedded_document(text) {
+            Some(doc) => {
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert("$json".to_owned(), canonical(&doc));
+                serde_json::Value::Object(wrapped)
             }
-        }
+            None => v.clone(),
+        },
         serde_json::Value::Object(map) => {
             // insert in key order: with `preserve_order` the map keeps
             // insertion order, so the order of insertion is the wire order
@@ -222,13 +222,6 @@ fn canonical(v: &serde_json::Value) -> serde_json::Value {
         }
         other => other.clone(),
     }
-}
-
-/// Cheap test before parsing: only a string that starts and ends like a JSON
-/// object or array is tried.
-fn looks_like_json(text: &str) -> bool {
-    let t = text.trim();
-    (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))
 }
 
 fn is_pair_list(v: &serde_json::Value) -> bool {

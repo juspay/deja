@@ -1970,7 +1970,7 @@ impl Canon for CanonPreset {
     fn equivalent(&self, recorded: &serde_json::Value, observed: &serde_json::Value) -> bool {
         match self {
             Self::Sequence => recorded == observed,
-            Self::Bag => bag_canon(recorded) == bag_canon(observed),
+            Self::Bag => deja::identity::same(recorded, observed),
             // A per-path clause makes no whole-body claim; it is consulted per
             // difference, not here.
             Self::BagPaths(_) => false,
@@ -2337,6 +2337,9 @@ enum ValueAbsorption {
     /// the recording's by construction, so it is not compared; it is counted,
     /// so a run shows how many calls it did not re-run.
     ServedRecordedError,
+    /// A paired request whose args have the recorded call's identity: an array
+    /// in another order, or an embedded document written in another order.
+    ArgsIdentity,
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
@@ -2355,11 +2358,24 @@ enum ValueVerdict {
 /// it — so a pair whose arguments agree missed its address by position alone,
 /// and is a match whatever it got back.
 ///
-/// The comparison is the one every value goes through ([`value_verdict`]): an
-/// order-only permutation, a recorder-declared clause and replay-local database
-/// infrastructure are absorbed here exactly as they are anywhere else.
+/// Order is judged by the identity the lookup address uses
+/// ([`deja::identity`]), so the diff and the address cannot disagree: a request
+/// whose identity is the recording's is absorbed and counted, and one whose
+/// identity differs is never forgiven as order by the diff alone. A
+/// recorder-declared clause and replay-local database infrastructure are
+/// absorbed as they are anywhere else ([`value_verdict`]).
 fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
     let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
+    match deja::identity::identity_differences(&recorded, &call.args).as_deref() {
+        // The same identity as written: the request is the recording's, even
+        // where its renderings differ (a form body's field order).
+        Some([]) => return ValueVerdict::Equal,
+        Some(_) => return ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity),
+        None => {}
+    }
+    // Different identities: the diff's own order rule is the same identity,
+    // so it cannot forgive them as order; a declared clause or replay-local
+    // database infrastructure still can.
     value_verdict(
         &call.boundary,
         &recorded,
@@ -2367,6 +2383,63 @@ fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>)
         twin,
         call.args.get("sql").and_then(serde_json::Value::as_str),
     )
+}
+
+/// A reported path with every array index written `[]`, so a row reordered
+/// in place (`$.rows[]`) and the rows reordered (`$.rows`) stay two sites.
+fn site_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find(']') {
+            Some(close)
+                if !after[..close].is_empty()
+                    && after[..close].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                out.push_str("[]");
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The kind a call read by its args' identity is counted under.
+fn args_identity_kind(change: &deja::identity::IdentityChange) -> &'static str {
+    match change {
+        deja::identity::IdentityChange::ArrayOrder(_) => "ArgsOrderAbsorbed",
+        deja::identity::IdentityChange::DocumentText(_) => "ArgsDocumentAbsorbed",
+    }
+}
+
+/// Count a toleration by SITE: the call site, the kind and the path in its
+/// args, none of which moves between runs. The kind ticks once per site per
+/// run, however many calls reach it, so the set can be validated once and a
+/// new site is what a later run shows; the warning carries the call count.
+fn note_identity_site(
+    stats: &mut BoundaryStats,
+    seen: &mut BTreeMap<(String, &'static str, String), u64>,
+    obs: &ObservedCall,
+    change: &deja::identity::IdentityChange,
+) {
+    let kind = args_identity_kind(change);
+    // The path without the index a run happened to reorder at, so the key is
+    // the same on every run: a set that can be validated once, where a new
+    // member is the signal.
+    let calls = seen
+        .entry((call_site_label(obs), kind, site_path(change.path())))
+        .or_insert(0);
+    if *calls == 0 {
+        stats.note_kind(kind);
+    }
+    *calls += 1;
 }
 
 fn value_verdict(
@@ -3006,22 +3079,6 @@ fn parse_project_canon(id: &str) -> Option<CanonPreset> {
 /// difference.
 fn sort_as_bag(items: &mut [serde_json::Value]) {
     items.sort_by_cached_key(|item| serde_json::to_string(item).unwrap_or_default());
-}
-
-fn bag_canon(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(items) => {
-            let mut items: Vec<_> = items.iter().map(bag_canon).collect();
-            sort_as_bag(&mut items);
-            serde_json::Value::Array(items)
-        }
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.iter()
-                .map(|(key, value)| (key.clone(), bag_canon(value)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
 }
 
 fn final_state_canon(value: &serde_json::Value) -> serde_json::Value {
@@ -3897,7 +3954,7 @@ fn order_canonical_diff(
             // re-describe it as however many positions this run's two orders
             // happened to disagree on — which is the count that will not sit
             // still between runs.
-            if bag_canon(baseline) == bag_canon(candidate) {
+            if deja::identity::same(baseline, candidate) {
                 out.push(JsonFieldDiff {
                     json_path: path.to_owned(),
                     baseline: baseline.clone(),
@@ -3911,35 +3968,36 @@ fn order_canonical_diff(
             // however far apart they sit, so substituting one element of nine
             // is one difference and not the run of positional disagreements
             // that the substitution shifted everything else into.
-            let key = |value: &serde_json::Value| {
-                serde_json::to_string(&bag_canon(value)).unwrap_or_default()
-            };
-            let mut unmatched_candidates: BTreeMap<String, Vec<&serde_json::Value>> =
-                BTreeMap::new();
+            let mut unmatched_candidates: HashMap<u64, Vec<&serde_json::Value>> = HashMap::new();
             for item in c {
                 unmatched_candidates
-                    .entry(key(item))
+                    .entry(deja::identity::element_hash(item))
                     .or_default()
                     .push(item);
             }
             let mut only_baseline: Vec<&serde_json::Value> = Vec::new();
             for item in b {
-                // Cancel against an equal member wherever it sits. Popping one
-                // occurrence rather than all of them is what keeps this a
-                // multiset difference: a lost duplicate still surfaces.
-                match unmatched_candidates.get_mut(&key(item)) {
-                    Some(pool) if !pool.is_empty() => {
-                        pool.pop();
-                    }
-                    _ => only_baseline.push(item),
+                // Cancel against a member of the same identity wherever it
+                // sits, one partner each and the earliest first, so a lost
+                // duplicate still surfaces.
+                let partner = unmatched_candidates
+                    .get_mut(&deja::identity::element_hash(item))
+                    .and_then(|pool| {
+                        let found = pool
+                            .iter()
+                            .position(|other| deja::identity::same(item, other))?;
+                        Some(pool.remove(found))
+                    });
+                if partner.is_none() {
+                    only_baseline.push(item);
                 }
             }
-            let mut only_candidate: Vec<&serde_json::Value> =
+            let only_candidate: Vec<&serde_json::Value> =
                 unmatched_candidates.into_values().flatten().collect();
-            // Both residues in canonical order, so the pairing below — and
-            // every path it names — is the same on every run.
-            only_baseline.sort_by_cached_key(|item| key(item));
-            only_candidate.sort_by_cached_key(|item| key(item));
+            // Pair each leftover member with the one it shares most with, so a
+            // member that changed one field reports that field alone; order-free,
+            // so the paths it names are the same on every run.
+            let (only_baseline, only_candidate) = pair_residues(only_baseline, only_candidate);
             for index in 0..only_baseline.len().max(only_candidate.len()) {
                 // The index is into the residue, not into the original array:
                 // once order carries no information, a position cannot be
@@ -3982,15 +4040,67 @@ pub(crate) fn json_order_only_difference(
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
 ) -> bool {
-    recorded != observed && bag_canon(recorded) == bag_canon(observed)
+    recorded != observed && deja::identity::same(recorded, observed)
 }
 
+/// Pair two arrays' leftover members for the report: each recorded member, in
+/// order of its identity hash, with the observed member sharing most equal
+/// object members with it (ties to the lowest identity hash). Nothing here
+/// depends on the order either side wrote its members in. Each member's fields
+/// are read once, into identity hashes, so scoring is cheap; past a bound the
+/// members pair in hash order unscored. Returns the two sides aligned by
+/// index; unpaired members follow.
+fn pair_residues<'a>(
+    baseline: Vec<&'a serde_json::Value>,
+    candidate: Vec<&'a serde_json::Value>,
+) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
+    const MAX_SCORED: usize = 1_024;
+    let by_hash = |mut members: Vec<&'a serde_json::Value>| {
+        members.sort_by_cached_key(|member| deja::identity::element_hash(member));
+        members
+    };
+    let (baseline, candidate) = (by_hash(baseline), by_hash(candidate));
+    if baseline.len().max(candidate.len()) > MAX_SCORED {
+        return (baseline, candidate);
+    }
+    let fields = |member: &'a serde_json::Value| -> HashMap<&'a str, u64> {
+        member.as_object().map_or_else(HashMap::new, |map| {
+            map.iter()
+                .map(|(key, value)| (key.as_str(), deja::identity::element_hash(value)))
+                .collect()
+        })
+    };
+    let mut candidates: Vec<(&'a serde_json::Value, HashMap<&'a str, u64>)> = candidate
+        .iter()
+        .map(|member| (*member, fields(member)))
+        .collect();
+    let mut paired = Vec::with_capacity(candidates.len());
+    for member in &baseline {
+        if candidates.is_empty() {
+            break;
+        }
+        let own = fields(member);
+        let shared = |other: &HashMap<&'a str, u64>| {
+            own.iter()
+                .filter(|(key, hash)| other.get(*key) == Some(*hash))
+                .count()
+        };
+        let (mut best, mut best_score) = (0, shared(&candidates[0].1));
+        for (index, (_, other)) in candidates.iter().enumerate().skip(1) {
+            let score = shared(other);
+            if score > best_score {
+                (best, best_score) = (index, score);
+            }
+        }
+        paired.push(candidates.remove(best).0);
+    }
+    paired.extend(candidates.into_iter().map(|(member, _)| member));
+    (baseline, paired)
+}
+
+/// The same predicate as [`json_order_only_difference`], for a reported row.
 fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
-    matches!(
-        (&row.baseline, &row.candidate),
-        (serde_json::Value::Array(_), serde_json::Value::Array(_))
-    ) && row.baseline != row.candidate
-        && bag_canon(&row.baseline) == bag_canon(&row.candidate)
+    json_order_only_difference(&row.baseline, &row.candidate)
 }
 
 /// Larger bodies are not scanned for embedded documents; they compare as text.
@@ -4183,7 +4293,7 @@ fn embedded_document_pairs(
                 && !bw.contains('<')
                 && !cw.contains('<')
                 && written_form(bw) == written_form(cw)
-                && bag_canon(b) == bag_canon(c)
+                && deja::identity::same(b, c)
         });
     if !arrangement_only {
         return None;
@@ -4956,6 +5066,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    // Resolved calls whose args were read by identity to find their recording,
+    // by call site, kind and path; and resolved calls whose args are another
+    // call under identity, which neither lookup can have served.
+    let mut args_identity_seen: BTreeMap<(String, &'static str, String), u64> = BTreeMap::new();
+    let mut identity_unconfirmed_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
     // Race evidence needs to be discovered before HTTP body classification:
@@ -5070,6 +5185,27 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if graph_identity_skew(graph_plan, obs).is_some() {
             stats.note_kind("IdentitySkew");
             identity_skews += 1;
+        }
+        // Read off the row itself: the exact lookup cannot serve args whose
+        // arrays moved or whose embedded documents were rewritten, so a
+        // resolved call that differs that way was served by its identity.
+        if let Some(event) = obs
+            .source_event_global_sequence
+            .and_then(|seq| events_by_seq.get(&seq).copied())
+        {
+            match deja::identity::identity_differences(&event.args, &obs.args) {
+                Some(changes) => {
+                    for change in changes {
+                        note_identity_site(stats, &mut args_identity_seen, obs, &change);
+                    }
+                }
+                None => {
+                    stats.note_kind("ArgsIdentityUnconfirmed");
+                    *identity_unconfirmed_seen
+                        .entry(call_site_label(obs))
+                        .or_insert(0) += 1;
+                }
+            }
         }
         {
             // The recorded baseline was found (args still aligned). Under lookup
@@ -5246,6 +5382,14 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
+            }
+            if let ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity) = verdict {
+                let recorded = twin_event.map_or(serde_json::Value::Null, |e| e.args.to_value());
+                for change in
+                    deja::identity::identity_differences(&recorded, &obs.args).unwrap_or_default()
+                {
+                    note_identity_site(stats, &mut args_identity_seen, obs, &change);
+                }
             }
             let value_diverged = pairing.changed(
                 observed_index,
@@ -6038,6 +6182,29 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // subtracted: a difference that stopped counting is still a difference that
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
+    for ((call_site, kind, path), calls) in &args_identity_seen {
+        let what = if *kind == "ArgsOrderAbsorbed" {
+            "the array at {path} in another order"
+        } else {
+            "the JSON document in the string at {path} written differently"
+        }
+        .replace("{path}", path);
+        warnings.push(format!(
+            "call {call_site} held {what} on {calls} call(s) and was matched to its recording by \
+             the args' identity rather than their exact form, either served by the identity \
+             lookup or paired afterwards. The two are equal under the identity rule (array \
+             order, and how an embedded document is written, set aside); a change the rule \
+             sees would still miss. A document is parsed as JSON numbers, so a difference only \
+             in digits beyond a float's precision is one the rule cannot see"
+        ));
+    }
+    for (call_site, calls) in &identity_unconfirmed_seen {
+        warnings.push(format!(
+            "matched call {call_site} resolved on {calls} call(s) with args whose identity differs \
+             from the recorded event it was served; neither lookup can serve that, so the table \
+             and the recording disagree"
+        ));
+    }
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
         let by = if *source == "default" {
             "no clause asserts an order for it, and order carries no meaning unless one does"
@@ -6584,6 +6751,7 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
         // No table was read, so no schema is known; the scorer never consults it.
         event_schema_version: None,
         entries: Vec::new(),
+        identity_entries: Vec::new(),
     };
     if !path.exists() {
         return empty();
@@ -7184,6 +7352,7 @@ mod tests {
                 policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -7273,6 +7442,7 @@ mod tests {
                     seq_entry(Some("c-drop"), "db", 2),
                     seq_entry(None, "db", 3),
                 ],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -7396,6 +7566,7 @@ mod tests {
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
                 ],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -7807,6 +7978,7 @@ mod tests {
                 policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
+                identity_entries: Vec::new(),
             },
             observed,
             http_diffs: http,
@@ -8323,6 +8495,27 @@ mod tests {
             ValueCanonSource::Default.label(),
             ClauseSource::Default.label()
         );
+    }
+
+    /// The diff reads order by the one identity: a result holding a JSON
+    /// document written in another order is an order-only difference, as a
+    /// permuted array is, and a changed document still diverges.
+    #[test]
+    fn a_result_documents_order_is_read_by_the_one_identity() {
+        let doc = |text: &str| serde_json::json!({ "result": "Ok", "value": { "raw": text } });
+        let card = scored_matched_call(
+            None,
+            doc(r#"{"ids":["a","b"],"n":1}"#),
+            doc(r#"{"n":1,"ids":["b","a"]}"#),
+        );
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        let card = scored_matched_call(
+            None,
+            doc(r#"{"ids":["a","b"],"n":1}"#),
+            doc(r#"{"n":2,"ids":["b","a"]}"#),
+        );
+        assert!(!card.verdict.pass, "a changed document still diverges");
     }
 
     fn scored_matched_call(
@@ -9358,6 +9551,28 @@ mod tests {
         ))
     }
 
+    /// Keys moved inside an array member are read as a JSON body reads them:
+    /// by key, so the page is compared through its document, as a JSON body
+    /// whose reordered members had keys moved is absorbed.
+    #[test]
+    fn keys_moved_inside_an_array_member_read_as_in_a_json_body() {
+        let page = embedded_card(
+            page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
+            page_embedding(r#"{"m":[{"a":0,"b":1},{"a":5}]}"#, "Collect"),
+        );
+        assert!(page.verdict.pass, "{}", page.verdict.reason);
+        assert_eq!(
+            kind_count(&page, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        let body = embedded_card(
+            serde_json::json!({"m": [{"b": 1, "a": 0}, {"a": 5}]}),
+            serde_json::json!({"m": [{"a": 5}, {"a": 0, "b": 1}]}),
+        );
+        assert!(body.verdict.pass, "{}", body.verdict.reason);
+        assert_eq!(kind_count(&body, "http_incoming", "BodyMismatch"), 0);
+    }
+
     /// What the embedded comparison still refuses. Each of these blocks on
     /// `main` and must keep blocking: the documents are only paired when
     /// everything around them is byte-identical, only objects are read as
@@ -9442,11 +9657,6 @@ mod tests {
                 "markup inside a document: order can change how the page parses",
                 page_embedding(r#"{"a":"</script>","c":"<img>"}"#, "Collect"),
                 page_embedding(r#"{"c":"<img>","a":"</script>"}"#, "Collect"),
-            ),
-            (
-                "keys moved inside an array member: the JSON-body rule's narrowing",
-                page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
-                page_embedding(r#"{"m":[{"a":0,"b":1},{"a":5}]}"#, "Collect"),
             ),
             (
                 "a document inside a template literal: a quote in a value ends it",
@@ -9705,6 +9915,7 @@ mod tests {
                 policy_version: deja::POLICY_VERSION,
                 event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
+                identity_entries: Vec::new(),
             },
             observed,
             http_diffs: vec![http(corr, true, vec![])],
@@ -11717,6 +11928,7 @@ mod tests {
                     raced_result.clone(),
                 ),
             ],
+            identity_entries: Vec::new(),
         };
         let observed = vec![
             exec_obs(
@@ -12719,6 +12931,265 @@ mod tests {
         )
     }
 
+    /// A resolved call at seq 7 whose recorded args are `recorded` and whose
+    /// candidate sent `observed`.
+    fn resolved_with_args(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> RunArtifacts {
+        let mut call = exec_obs(
+            "storage",
+            Some("c1"),
+            true,
+            Some(7),
+            Some(serde_json::json!("v")),
+            serde_json::json!("v"),
+        );
+        call.args = observed;
+        let mut event = omitted_ev(7, "storage", Some("c1"));
+        event.args = recorded.into();
+        art_with_events(
+            vec![seq_entry_res(
+                Some("c1"),
+                "storage",
+                7,
+                serde_json::json!("v"),
+            )],
+            vec![call],
+            vec![http("c1", true, vec![])],
+            vec![event],
+        )
+    }
+
+    /// A call served because its identity matched, not its exact args, says
+    /// so: counted under its own kind, the path named, nothing blocking.
+    #[test]
+    fn a_call_served_by_its_identity_is_counted_and_named() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
+            serde_json::json!({ "q": 1, "ids": ["c", "a", "b"] }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("$.ids")),
+            "the path is named: {:?}",
+            card.warnings
+        );
+
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// A site does not carry the array index a run happened to reorder at:
+    /// rows reordered inside at two indices are one site, `$.rows[]`, and
+    /// the rows themselves reordered are another, `$.rows`.
+    #[test]
+    fn a_site_key_does_not_carry_array_indices() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "rows": [["a", "b"], ["c", "d"], ["e", "f"]] }),
+            serde_json::json!({ "rows": [["a", "b"], ["d", "c"], ["f", "e"]] }),
+        ));
+        assert_eq!(
+            kind_count(&card, "storage", "ArgsOrderAbsorbed"),
+            1,
+            "{:?}",
+            card.warnings
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("at $.rows[] in")),
+            "{:?}",
+            card.warnings
+        );
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "rows": [["a", "b"], ["c", "d"]] }),
+            serde_json::json!({ "rows": [["d", "c"], ["a", "b"]] }),
+        ));
+        assert_eq!(
+            kind_count(&card, "storage", "ArgsOrderAbsorbed"),
+            2,
+            "{:?}",
+            card.warnings
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("at $.rows in")),
+            "{:?}",
+            card.warnings
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("at $.rows[] in")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// The HTTP body reads order-only by the same predicate as the value path:
+    /// a row holding one document written two ways is order-only in both.
+    #[test]
+    fn an_http_bodys_document_in_a_string_reads_as_the_value_path_does() {
+        let (recorded, replayed) = (
+            serde_json::json!(r#"{"a":1,"b":2}"#),
+            serde_json::json!(r#"{"b":2,"a":1}"#),
+        );
+        assert!(
+            json_order_only_difference(&recorded, &replayed),
+            "the value path"
+        );
+        let row = JsonFieldDiff {
+            json_path: "$.m".to_owned(),
+            baseline: recorded,
+            candidate: replayed,
+        };
+        assert!(
+            is_order_only_difference(&row),
+            "the HTTP body, the same answer"
+        );
+    }
+
+    /// Pairing many leftover members stays cheap: each is scored once per
+    /// candidate, and a document in a string is not re-parsed per comparison.
+    #[test]
+    fn many_residues_pair_quickly() {
+        let side = |offset: i64| {
+            serde_json::Value::Array(
+                (0..1_000)
+                    .map(|i| {
+                        serde_json::json!({
+                            "id": i,
+                            "doc": format!(r#"{{"k":{i},"v":[1,2,3]}}"#),
+                            "v": i + offset,
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        let rows = body_pair(side(0), side(1_000_000));
+        let started = std::time::Instant::now();
+        let diff = order_canonical_body_diff(&rows).expect("bodies");
+        assert!(!diff.is_empty(), "precondition: every member changed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Residues pair by what they share, not by the order a run wrote them, so
+    /// members that differ in one field report that field alone.
+    #[test]
+    fn residues_pair_by_what_they_share() {
+        let rows = body_pair(
+            serde_json::json!([{"a": ["x", "y"], "v": 1}, {"a": ["y", "z"], "v": 2}]),
+            serde_json::json!([{"a": ["y", "x"], "v": 10}, {"a": ["z", "y"], "v": 20}]),
+        );
+        let mut changed: Vec<(serde_json::Value, serde_json::Value)> =
+            order_canonical_body_diff(&rows)
+                .expect("bodies")
+                .into_iter()
+                .filter(|row| row.json_path.ends_with(".v"))
+                .map(|row| (row.baseline, row.candidate))
+                .collect();
+        changed.sort_by_key(|(b, _)| b.as_i64());
+        assert_eq!(
+            changed,
+            vec![
+                (serde_json::json!(1), serde_json::json!(10)),
+                (serde_json::json!(2), serde_json::json!(20)),
+            ],
+            "each member paired with the one it shares its other field with"
+        );
+    }
+
+    /// Tolerations are counted by SITE: three calls reordered at one site are
+    /// one site, and the warning carries the three calls.
+    #[test]
+    fn a_toleration_is_counted_once_per_site() {
+        let call = |seq: u64| {
+            let mut call = exec_obs(
+                "storage",
+                Some("c1"),
+                true,
+                Some(seq),
+                Some(serde_json::json!("v")),
+                serde_json::json!("v"),
+            );
+            call.args = serde_json::json!({ "ids": ["b", "a"] });
+            call
+        };
+        let event = |seq: u64| {
+            let mut event = omitted_ev(seq, "storage", Some("c1"));
+            event.args = serde_json::json!({ "ids": ["a", "b"] }).into();
+            event
+        };
+        let card = detect(&art_with_events(
+            (7..10)
+                .map(|seq| seq_entry_res(Some("c1"), "storage", seq, serde_json::json!("v")))
+                .collect(),
+            (7..10).map(call).collect(),
+            vec![http("c1", true, vec![])],
+            (7..10).map(event).collect(),
+        ));
+        assert_eq!(
+            card.summary.matched_side_effect_calls, 3,
+            "precondition: three calls"
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "ArgsOrderAbsorbed"),
+            1,
+            "one site"
+        );
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("$.ids") && w.contains("on 3 call(s)")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// Equal args, and args that differ only in key order, are nothing to
+    /// report: the exact lookup served them.
+    #[test]
+    fn a_call_served_by_its_exact_args_reports_no_identity() {
+        for (recorded, observed) in [
+            (
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["a", "b"] }),
+            ),
+            (
+                serde_json::json!({ "a": 1, "b": 2 }),
+                serde_json::json!({ "b": 2, "a": 1 }),
+            ),
+        ] {
+            let card = detect(&resolved_with_args(recorded, observed));
+            assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 0);
+            assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 0);
+            assert_eq!(kind_count(&card, "storage", "ArgsIdentityUnconfirmed"), 0);
+            assert!(card.verdict.pass, "{}", card.verdict.reason);
+        }
+    }
+
+    /// A resolved call whose args are a different call under identity cannot
+    /// have been served by either lookup. It is named, never passed silently.
+    #[test]
+    fn a_resolved_call_whose_args_are_another_call_is_named() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "ids": ["a", "b"] }),
+            serde_json::json!({ "ids": ["a", "c"] }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsIdentityUnconfirmed"), 1);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("identity")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
     /// A call that missed its address but sent what the recording sent — the same
     /// arguments at a shifted position — is paired and matched: never a
     /// Novel+Omitted split.
@@ -12752,6 +13223,57 @@ mod tests {
         let changed: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
         assert_eq!(changed.len(), 1, "{rows:?}");
         assert!(changed[0].blocking);
+    }
+
+    /// A pair's request is judged by the identity its address uses, so the
+    /// diff and the lookup cannot disagree: the same members in another order
+    /// are the same request, counted under the identity kinds.
+    #[test]
+    fn a_paired_request_is_judged_by_its_identity() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "ids": ["a", "b"] })),
+            serde_json::json!({ "ids": ["b", "a"] }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "storage", "ValueCanonAbsorbed"), 0);
+
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# })),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 1);
+    }
+
+    /// A pair whose request the exact hash already finds the same, a form
+    /// body's fields in another order, sent the same request.
+    #[test]
+    fn a_paired_request_the_exact_hash_finds_the_same_is_a_match() {
+        let form = |text: &str| serde_json::json!({ "body": { "kind": "FormUrlEncodedRequestBody", "text": text } });
+        let card = detect(&paired_write(Some(form("a=1&b=2")), form("b=2&a=1")));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(
+            kind_count(&card, "storage", "ValueCanonAbsorbed"),
+            0,
+            "the same request, not an absorbed reordering"
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// Every array is a multiset, numbers included: a paired request whose
+    /// numeric array arrived in another order sent the same request, counted.
+    #[test]
+    fn a_paired_request_with_a_reordered_numeric_array_is_absorbed() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "bytes": [1, 2, 3] })),
+            serde_json::json!({ "bytes": [3, 1, 2] }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
     /// A pair whose recorded request the tape does not hold cannot be shown to

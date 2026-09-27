@@ -167,11 +167,27 @@ impl<T: Serialize, E> CompareOkArmBySerde for &Compare<'_, Result<T, E>> {
 fn by_fingerprint<T: Serialize + ?Sized>(a: &T, b: &T) -> Comparison {
     match (fingerprint(a), fingerprint(b)) {
         (Some(a), Some(b)) if a == b => Comparison::Same,
+        // The round trip judges codec FIDELITY, not behaviour: a codec that
+        // reordered a value changed it, even where comparison tolerates the
+        // change, so an order-only difference is Incomparable ("the codec moved
+        // it; whether that mattered cannot be said from here"), never Equal. It
+        // is asked of the values as captured, by the one identity: only array
+        // order counts as order, so a document rewritten in any way is a loss.
+        // A value the capture cannot render as JSON has nothing to ask the rule.
         (Some(_), Some(_)) => {
-            if fingerprint_ignoring_sequence_order(a) == fingerprint_ignoring_sequence_order(b) {
-                Comparison::Incomparable
-            } else {
-                Comparison::Different
+            match (crate::canonical::to_value(a), crate::canonical::to_value(b)) {
+                (Ok(a), Ok(b)) => match crate::identity::identity_differences(&a, &b) {
+                    Some(changes)
+                        if !changes.is_empty()
+                            && changes.iter().all(|change| {
+                                matches!(change, crate::identity::IdentityChange::ArrayOrder(_))
+                            }) =>
+                    {
+                        Comparison::Incomparable
+                    }
+                    _ => Comparison::Different,
+                },
+                _ => Comparison::Incomparable,
             }
         }
         (None, None) => Comparison::Incomparable,
@@ -294,13 +310,7 @@ macro_rules! round_trip {
 /// the value refuses to serialise.
 #[must_use]
 pub fn fingerprint<T: Serialize + ?Sized>(value: &T) -> Option<String> {
-    value.serialize(Fingerprint::for_type::<T>(false)).ok()
-}
-
-/// [`fingerprint`] with every sequence rendered sorted, so two values that
-/// render alike here differ, if at all, only in sequence order.
-fn fingerprint_ignoring_sequence_order<T: Serialize + ?Sized>(value: &T) -> Option<String> {
-    value.serialize(Fingerprint::for_type::<T>(true)).ok()
+    value.serialize(Fingerprint::for_type::<T>()).ok()
 }
 
 /// Length-prefix a rendered part, so a composite is unambiguous whatever its
@@ -326,16 +336,12 @@ fn join(tag: &str, mut parts: Vec<String>, unordered: bool) -> String {
 /// `#[serde(flatten)]`, `serialize_with` — where a type name cannot be seen.
 struct Fingerprint {
     unordered: bool,
-    /// Render EVERY sequence sorted: used only to ask whether two renderings
-    /// differ in nothing but sequence order.
-    sequences_as_sets: bool,
 }
 
 impl Fingerprint {
-    fn for_type<T: ?Sized>(sequences_as_sets: bool) -> Self {
+    fn for_type<T: ?Sized>() -> Self {
         Self {
             unordered: is_set_behind_wrappers(std::any::type_name::<T>()),
-            sequences_as_sets,
         }
     }
 }
@@ -425,7 +431,7 @@ impl Serializer for Fingerprint {
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<String, Error> {
         Ok(format!(
             "S{}",
-            part(&value.serialize(Self::for_type::<T>(self.sequences_as_sets))?)
+            part(&value.serialize(Self::for_type::<T>())?)
         ))
     }
     fn serialize_unit(self) -> Result<String, Error> {
@@ -447,7 +453,7 @@ impl Serializer for Fingerprint {
         name: &'static str,
         value: &T,
     ) -> Result<String, Error> {
-        let inner = value.serialize(Self::for_type::<T>(self.sequences_as_sets))?;
+        let inner = value.serialize(Self::for_type::<T>())?;
         Ok(format!("ns{}{}", part(name), part(&inner)))
     }
     fn serialize_newtype_variant<T: Serialize + ?Sized>(
@@ -457,7 +463,7 @@ impl Serializer for Fingerprint {
         variant: &'static str,
         value: &T,
     ) -> Result<String, Error> {
-        let inner = value.serialize(Self::for_type::<T>(self.sequences_as_sets))?;
+        let inner = value.serialize(Self::for_type::<T>())?;
         Ok(format!(
             "nv{}{index};{}{}",
             part(name),
@@ -466,21 +472,13 @@ impl Serializer for Fingerprint {
         ))
     }
     fn serialize_seq(self, _len: Option<usize>) -> Result<Parts, Error> {
-        Ok(Parts::new(
-            "q".to_owned(),
-            self.unordered || self.sequences_as_sets,
-            self.sequences_as_sets,
-        ))
+        Ok(Parts::new("q".to_owned(), self.unordered))
     }
     fn serialize_tuple(self, _len: usize) -> Result<Parts, Error> {
-        Ok(Parts::new("t".to_owned(), false, self.sequences_as_sets))
+        Ok(Parts::new("t".to_owned(), false))
     }
     fn serialize_tuple_struct(self, name: &'static str, _len: usize) -> Result<Parts, Error> {
-        Ok(Parts::new(
-            format!("ts{}", part(name)),
-            false,
-            self.sequences_as_sets,
-        ))
+        Ok(Parts::new(format!("ts{}", part(name)), false))
     }
     fn serialize_tuple_variant(
         self,
@@ -492,18 +490,13 @@ impl Serializer for Fingerprint {
         Ok(Parts::new(
             format!("tv{}{index};{}", part(name), part(variant)),
             false,
-            self.sequences_as_sets,
         ))
     }
     fn serialize_map(self, _len: Option<usize>) -> Result<Parts, Error> {
-        Ok(Parts::new("m".to_owned(), true, self.sequences_as_sets))
+        Ok(Parts::new("m".to_owned(), true))
     }
     fn serialize_struct(self, name: &'static str, _len: usize) -> Result<Parts, Error> {
-        Ok(Parts::new(
-            format!("st{}", part(name)),
-            false,
-            self.sequences_as_sets,
-        ))
+        Ok(Parts::new(format!("st{}", part(name)), false))
     }
     fn serialize_struct_variant(
         self,
@@ -515,7 +508,6 @@ impl Serializer for Fingerprint {
         Ok(Parts::new(
             format!("sv{}{index};{}", part(name), part(variant)),
             false,
-            self.sequences_as_sets,
         ))
     }
 }
@@ -526,29 +518,27 @@ struct Parts {
     tag: String,
     parts: Vec<String>,
     unordered: bool,
-    sequences_as_sets: bool,
     pending_key: Option<String>,
 }
 
 impl Parts {
-    fn new(tag: String, unordered: bool, sequences_as_sets: bool) -> Self {
+    fn new(tag: String, unordered: bool) -> Self {
         Self {
             tag,
             parts: Vec::new(),
             unordered,
-            sequences_as_sets,
             pending_key: None,
         }
     }
 
     fn push<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
         self.parts
-            .push(value.serialize(Fingerprint::for_type::<T>(self.sequences_as_sets))?);
+            .push(value.serialize(Fingerprint::for_type::<T>())?);
         Ok(())
     }
 
     fn push_field<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) -> Result<(), Error> {
-        let value = value.serialize(Fingerprint::for_type::<T>(self.sequences_as_sets))?;
+        let value = value.serialize(Fingerprint::for_type::<T>())?;
         self.parts.push(format!("{}{}", part(key), part(&value)));
         Ok(())
     }
@@ -606,10 +596,7 @@ impl ser::SerializeMap for Parts {
     type Ok = String;
     type Error = Error;
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
-        self.pending_key = Some(key.serialize(Fingerprint {
-            unordered: false,
-            sequences_as_sets: self.sequences_as_sets,
-        })?);
+        self.pending_key = Some(key.serialize(Fingerprint { unordered: false })?);
         Ok(())
     }
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
@@ -666,6 +653,39 @@ impl ser::SerializeStructVariant for Parts {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap, HashSet};
+
+    /// A round trip is a fidelity check: a document in a string whose text
+    /// changed only in whitespace was still rewritten, which is a loss, and a
+    /// value the capture cannot render as JSON has nothing to ask the rule,
+    /// so it is not called different.
+    #[test]
+    fn a_rewritten_document_is_a_loss_and_an_unrenderable_value_is_not_judged() {
+        let (a, b) = (r#"{"a":1}"#.to_owned(), r#"{ "a": 1 }"#.to_owned());
+        assert_eq!(by_fingerprint(&a, &b), Comparison::Different);
+        let keyed = |v: Vec<i32>| {
+            let mut map = BTreeMap::new();
+            map.insert((1, 2), v);
+            map
+        };
+        assert_eq!(
+            by_fingerprint(&keyed(vec![1, 2]), &keyed(vec![2, 1])),
+            Comparison::Incomparable
+        );
+    }
+
+    /// Whether two values differ only in order is asked of the one identity:
+    /// a sequence the codec reordered is not called different, a document the
+    /// codec rewrote is, and so is a changed one.
+    #[test]
+    fn a_documents_order_is_read_by_the_one_identity() {
+        let (a, b) = (vec!["a", "b"], vec!["b", "a"]);
+        assert_eq!(by_fingerprint(&a, &b), Comparison::Incomparable);
+        let (a, b) = (
+            r#"{"ids":["a","b"],"n":1}"#.to_owned(),
+            r#"{"n":1,"ids":["b","a"]}"#.to_owned(),
+        );
+        assert_eq!(by_fingerprint(&a, &b), Comparison::Different);
+    }
 
     #[test]
     fn the_serde_tier_tells_a_present_none_from_an_absent_one() {
