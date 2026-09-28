@@ -1,0 +1,46 @@
+{
+  "manifest_version": 1,
+  "session_id": "rec-fixture",
+  "status": "sealed",
+  "seal_id": "d0751713beb07ad9",
+  "capture_mode": "session",
+  "envelope_schema_versions": [
+    2
+  ],
+  "event_schema_versions": [
+    1
+  ],
+  "code": [
+    {
+      "sha": "abc",
+      "deja_version": "0.1.0"
+    }
+  ],
+  "instances": [
+    {
+      "instance_id": "i1",
+      "gseq_min": 1,
+      "gseq_max": 3,
+      "events": 3,
+      "gaps": [],
+      "gaps_accounted": [],
+      "duplicates_dropped": 0
+    }
+  ],
+  "counts": {
+    "landing_objects": 1,
+    "lines_in": 3,
+    "events": 3,
+    "duplicates_dropped": 0,
+    "correlations": 2,
+    "graph_nodes": 0
+  },
+  "data_parts": [
+    {
+      "key": "sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst",
+      "events": 3,
+      "bytes": 217
+    }
+  ],
+  "created_unix_ms": 1790593621290
+}

@@ -163,7 +163,8 @@ fn run(cmd: &str, session_id: &str, system: Option<&str>) -> Result<(), String> 
                         "recording_id": r.session_id,
                         "dates": r.dates,
                         "objects": r.objects,
-                        "prefix": r.prefix,
+                        // In full, since it is read beside `bucket`.
+                        "prefix": cfg.bucket_key(&r.prefix),
                         "sealed": manifest.is_some(),
                         "correlations": manifest.as_ref().map(|m| m.counts.correlations),
                     })

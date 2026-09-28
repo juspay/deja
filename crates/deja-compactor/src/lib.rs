@@ -164,7 +164,17 @@ impl S3Config {
     /// May look the bucket's region up over the network, once per bucket per
     /// process.
     pub fn effective_region(&self) -> String {
-        let env = |k: &str| std::env::var(k).ok();
+        self.effective_region_with(bucket_region, |k| std::env::var(k).ok())
+    }
+
+    /// [`S3Config::effective_region`] over an injected bucket lookup and
+    /// environment, so the wiring into [`choose_region`] is testable without a
+    /// network or a process-global variable.
+    fn effective_region_with(
+        &self,
+        bucket_region: impl FnOnce(&str) -> Option<String>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> String {
         choose_region(RegionInputs {
             explicit: self.region.as_deref(),
             custom_endpoint: self.has_custom_endpoint(),
@@ -314,50 +324,73 @@ enum CachedRegion {
     Failed(std::time::Instant),
 }
 
-fn region_cache() -> &'static std::sync::Mutex<BTreeMap<String, CachedRegion>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, CachedRegion>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
+/// Bucket regions already looked up. A found region is kept; a failure is
+/// kept for [`BUCKET_REGION_RETRY`] and then looked up again. The clock and
+/// the lookup are the caller's, so both rules can be tested without waiting
+/// or a network.
+#[derive(Default)]
+struct RegionCache {
+    entries: std::sync::Mutex<BTreeMap<String, CachedRegion>>,
+}
+
+impl RegionCache {
+    fn region(
+        &self,
+        bucket: &str,
+        now: std::time::Instant,
+        lookup: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Option<String> {
+        let bucket = bucket.trim();
+        if bucket.is_empty() {
+            return None;
+        }
+        {
+            let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            match entries.get(bucket) {
+                Some(CachedRegion::Found(region)) => return Some(region.clone()),
+                Some(CachedRegion::Failed(at))
+                    if now.saturating_duration_since(*at) < BUCKET_REGION_RETRY =>
+                {
+                    return None
+                }
+                _ => {}
+            }
+        }
+        // Not under the lock: a slow lookup for one bucket must not stall every
+        // other bucket's client. Two threads may both look the same bucket up
+        // once; they get the same answer.
+        let looked_up = lookup(bucket);
+        let entry = match &looked_up {
+            Ok(region) => {
+                eprintln!("s3: bucket {bucket} is in {region}");
+                CachedRegion::Found(region.clone())
+            }
+            Err(e) => {
+                eprintln!(
+                    "s3: could not look up the region of bucket {bucket} ({e}); falling back to \
+                     AWS_REGION, AWS_DEFAULT_REGION, then {DEFAULT_REGION}"
+                );
+                CachedRegion::Failed(now)
+            }
+        };
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(bucket.to_owned(), entry);
+        looked_up.ok()
+    }
 }
 
 /// The bucket's region, looked up once per bucket per process. `None` when the
 /// lookup failed; the failure is logged and the caller falls through to the
 /// next rule rather than failing.
 fn bucket_region(bucket: &str) -> Option<String> {
-    let bucket = bucket.trim();
-    if bucket.is_empty() {
-        return None;
-    }
-    {
-        let cache = region_cache().lock().unwrap_or_else(|e| e.into_inner());
-        match cache.get(bucket) {
-            Some(CachedRegion::Found(region)) => return Some(region.clone()),
-            Some(CachedRegion::Failed(at)) if at.elapsed() < BUCKET_REGION_RETRY => return None,
-            _ => {}
-        }
-    }
-    // Not under the lock: a slow lookup for one bucket must not stall every
-    // other bucket's client. Two threads may both look the same bucket up
-    // once; they get the same answer.
-    let looked_up = lookup_bucket_region(bucket);
-    let entry = match &looked_up {
-        Ok(region) => {
-            eprintln!("s3: bucket {bucket} is in {region}");
-            CachedRegion::Found(region.clone())
-        }
-        Err(e) => {
-            eprintln!(
-                "s3: could not look up the region of bucket {bucket} ({e}); falling back to \
-                 AWS_REGION, AWS_DEFAULT_REGION, then {DEFAULT_REGION}"
-            );
-            CachedRegion::Failed(std::time::Instant::now())
-        }
-    };
-    region_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(bucket.to_owned(), entry);
-    looked_up.ok()
+    static CACHE: std::sync::OnceLock<RegionCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(RegionCache::default).region(
+        bucket,
+        std::time::Instant::now(),
+        lookup_bucket_region,
+    )
 }
 
 /// One HeadBucket, on a thread of its own with a runtime of its own.
@@ -5508,8 +5541,7 @@ s3_bucket = "ucs-deja"
     }
 
     /// A manifest's keys are relative to the system's root, so they never
-    /// carry the prefix they were sealed under — and the seal's address, which
-    /// hashes content, does not move with it either.
+    /// carry the prefix they were sealed under.
     #[test]
     fn a_manifest_sealed_under_a_prefix_stores_keys_without_it() {
         let (prefixed, bare) = (memory(), memory());
@@ -5523,10 +5555,6 @@ s3_bucket = "ucs-deja"
                 part.key
             );
         }
-        assert_eq!(
-            under.seal_id, root.seal_id,
-            "the address hashes content, not keys"
-        );
         let keys = |m: &SessionManifest| {
             m.data_parts
                 .iter()
@@ -5534,6 +5562,39 @@ s3_bucket = "ucs-deja"
                 .collect::<Vec<_>>()
         };
         assert_eq!(keys(&under), keys(&root));
+    }
+
+    /// A seal's address is its content. The same lines landed under two
+    /// layouts the sealer CAN see (flat versus date-partitioned, different
+    /// object names) seal to one id; a hash that took in a landing key would
+    /// tell them apart.
+    #[test]
+    fn a_seals_address_does_not_depend_on_where_its_landing_was() {
+        let lines = [
+            envelope_for("s1", "i1", 1, Some("c1")),
+            envelope_for("s1", "i1", 2, Some("c2")),
+        ];
+        let (flat, dated) = (memory(), memory());
+        put_object_at(&flat, "landing/v1/session=s1/inst=i1/0.ndjson", &lines);
+        put_object_at(
+            &dated,
+            "landing/v1/dt=2026-09-28/session=s1/inst=i1/batch-7.log",
+            &lines,
+        );
+        let seal = |store: &DynStore| {
+            sealed(
+                block(compact_session_inner(
+                    store,
+                    "s1",
+                    DEFAULT_RECORDING_ROOT,
+                    None,
+                ))
+                .unwrap(),
+            )
+        };
+        let (a, b) = (seal(&flat), seal(&dated));
+        assert!(!a.seal_id.is_empty());
+        assert_eq!(a.seal_id, b.seal_id, "the address hashes content, not keys");
     }
 
     /// The migration: a bucket sealed by today's code, copied verbatim under a
@@ -5579,7 +5640,234 @@ s3_bucket = "ucs-deja"
         );
     }
 
+    /// Objects a bucket held before system prefixes existed, byte for byte.
+    ///
+    /// Produced by origin/main f7b60f0's own code, in a scratch worktree: its
+    /// test module gained a one-off test that landed three envelopes as one
+    /// gzip object in the deployed aggregator's dated layout, sealed them with
+    /// `compact_session_inner` against an in-memory store, and wrote every
+    /// object out under its key. Nothing here was written by this revision.
+    const SEALED_AT_F7B60F0: &[(&str, &[u8])] = &[
+        (
+            "landing/v1/dt=2026-09-28/session=rec-fixture/inst=i1/0.log.gz",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/landing/v1/dt=2026-09-28/session=rec-fixture/inst=i1/0.log.gz"),
+        ),
+        (
+            "sessions/v1/rec-fixture/manifest.json",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/sessions/v1/rec-fixture/manifest.json"),
+        ),
+        (
+            "sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst"),
+        ),
+        (
+            "sessions/v1/rec-fixture/index/d0751713beb07ad9/correlations.ndjson.zst",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/sessions/v1/rec-fixture/index/d0751713beb07ad9/correlations.ndjson.zst"),
+        ),
+    ];
+
+    /// The migration against bytes the OLD code wrote: copied verbatim under
+    /// `hyperswitch/`, they read back through s3_prefix=hyperswitch — the seal
+    /// and the landing listing both — with nothing rewritten.
+    #[test]
+    fn a_bucket_sealed_before_prefixes_reads_back_copied_under_one() {
+        let bucket = memory();
+        for (key, bytes) in SEALED_AT_F7B60F0 {
+            block(bucket.put(
+                &object_store::path::Path::from(format!("hyperswitch/{key}")),
+                bytes.to_vec().into(),
+            ))
+            .unwrap();
+        }
+        let scoped = cfg_at("hyperswitch/").scope_store(bucket.clone());
+
+        let manifest = block(manifest_of(&scoped, "rec-fixture"))
+            .unwrap()
+            .expect("the copied seal is found");
+        assert_eq!(manifest.seal_id, "d0751713beb07ad9");
+        assert_eq!(
+            manifest.data_parts[0].key,
+            "sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst",
+            "the old manifest's key, unprefixed and unrewritten"
+        );
+        let lines = block(session_lines(&scoped, &manifest)).unwrap();
+        assert_eq!(lines.len(), manifest.counts.events);
+        assert_eq!(lines.len(), 3);
+        let rows = block(correlation_index_of(&scoped, &manifest))
+            .unwrap()
+            .expect("the copied index is found");
+        assert_eq!(
+            rows.iter().filter(|r| r.correlation_id.is_some()).count(),
+            manifest.counts.correlations
+        );
+
+        let listed: Vec<String> = block(list_keys(&scoped, DEFAULT_RECORDING_ROOT))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect();
+        let landed = index_landed_keys(DEFAULT_RECORDING_ROOT, &listed);
+        assert_eq!(landed.len(), 1, "{listed:?}");
+        assert_eq!(landed[0].session_id, "rec-fixture");
+        assert_eq!(landed[0].dates, vec!["2026-09-28".to_owned()]);
+        assert_eq!(
+            landed[0].prefix,
+            "landing/v1/dt=2026-09-28/session=rec-fixture"
+        );
+        assert_eq!(
+            cfg_at("hyperswitch").bucket_key(&landed[0].prefix),
+            "hyperswitch/landing/v1/dt=2026-09-28/session=rec-fixture"
+        );
+        assert!(
+            !matches!(
+                block(readiness_of(
+                    &scoped,
+                    "rec-fixture",
+                    DEFAULT_RECORDING_ROOT,
+                    0
+                ))
+                .unwrap(),
+                SealReadiness::Absent
+            ),
+            "the landing is located through the prefix"
+        );
+    }
+
     // -- region -------------------------------------------------------------
+
+    /// An environment holding exactly `vars`.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |k: &str| vars.get(k).cloned()
+    }
+
+    fn unconfigured() -> S3Config {
+        S3Config {
+            region: None,
+            ..cfg_at("")
+        }
+    }
+
+    #[test]
+    fn effective_region_prefers_the_buckets_region_to_the_pods() {
+        let got = unconfigured().effective_region_with(
+            |bucket| {
+                assert_eq!(bucket, "shared", "the lookup is for this config's bucket");
+                Some("ap-south-2".to_owned())
+            },
+            env_of(&[
+                ("AWS_REGION", "ap-south-1"),
+                ("AWS_DEFAULT_REGION", "eu-west-1"),
+            ]),
+        );
+        assert_eq!(got, "ap-south-2");
+    }
+
+    #[test]
+    fn effective_region_falls_back_to_aws_region_then_its_default() {
+        let failed = |_: &str| None;
+        let cfg = unconfigured();
+        assert_eq!(
+            cfg.effective_region_with(
+                failed,
+                env_of(&[
+                    ("AWS_REGION", "ap-south-1"),
+                    ("AWS_DEFAULT_REGION", "eu-west-1")
+                ]),
+            ),
+            "ap-south-1"
+        );
+        assert_eq!(
+            cfg.effective_region_with(failed, env_of(&[("AWS_DEFAULT_REGION", "eu-west-1")])),
+            "eu-west-1"
+        );
+        assert_eq!(
+            cfg.effective_region_with(failed, env_of(&[])),
+            DEFAULT_REGION
+        );
+    }
+
+    #[test]
+    fn effective_region_takes_the_configs_own_region_and_endpoint() {
+        let explicit = S3Config {
+            region: Some("me-south-1".to_owned()),
+            ..cfg_at("")
+        };
+        assert_eq!(
+            explicit.effective_region_with(|_| never(), env_of(&[("AWS_REGION", "x")])),
+            "me-south-1"
+        );
+        let minio = S3Config {
+            endpoint: "http://127.0.0.1:9100".to_owned(),
+            ..unconfigured()
+        };
+        assert_eq!(
+            minio.effective_region_with(|_| never(), env_of(&[("AWS_REGION", "x")])),
+            DEFAULT_REGION
+        );
+    }
+
+    #[test]
+    fn a_found_region_is_looked_up_once_per_bucket() {
+        let cache = RegionCache::default();
+        let calls = std::cell::Cell::new(0);
+        let lookup = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ok("ap-south-2".to_owned())
+        };
+        let t0 = std::time::Instant::now();
+        let later = t0 + BUCKET_REGION_RETRY * 10;
+        assert_eq!(
+            cache.region("shared", t0, lookup).as_deref(),
+            Some("ap-south-2")
+        );
+        assert_eq!(
+            cache.region("shared", later, lookup).as_deref(),
+            Some("ap-south-2")
+        );
+        assert_eq!(calls.get(), 1, "a found region is kept for the process");
+        assert_eq!(
+            cache.region("other", later, lookup).as_deref(),
+            Some("ap-south-2")
+        );
+        assert_eq!(calls.get(), 2, "another bucket is its own lookup");
+    }
+
+    #[test]
+    fn a_failed_lookup_is_retried_only_after_the_window() {
+        let cache = RegionCache::default();
+        let calls = std::cell::Cell::new(0);
+        let failing = |_: &str| {
+            calls.set(calls.get() + 1);
+            Err::<String, String>("unreachable".to_owned())
+        };
+        let t0 = std::time::Instant::now();
+        assert_eq!(cache.region("shared", t0, failing), None);
+        assert_eq!(
+            cache.region("shared", t0 + BUCKET_REGION_RETRY / 2, failing),
+            None
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "inside the window the failure is remembered"
+        );
+        let recovered = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ok("ap-south-2".to_owned())
+        };
+        assert_eq!(
+            cache
+                .region("shared", t0 + BUCKET_REGION_RETRY, recovered)
+                .as_deref(),
+            Some("ap-south-2"),
+            "after the window it is looked up again"
+        );
+        assert_eq!(calls.get(), 2);
+    }
 
     fn never() -> Option<String> {
         panic!("the bucket's region was looked up when an earlier rule had decided")
