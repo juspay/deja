@@ -852,6 +852,7 @@ mod tests {
             provenance: deja::Provenance::default(),
             seed_gap: false,
             absorbed: false,
+            arg_divergent: false,
         }
     }
 

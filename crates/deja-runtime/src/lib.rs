@@ -6573,6 +6573,7 @@ mod tests {
             seed_gap: false,
             absorbed: false,
             outcome: SubstituteOutcome::default(),
+            arg_divergent: false,
         }
     }
 
@@ -6907,6 +6908,7 @@ mod tests {
             // Minimal observation; `execute_shadow_observe` fills the result.
             Some(ExecuteShadowToken::new(crate::replay::ObservedCall {
                 outcome: crate::SubstituteOutcome::default(),
+                arg_divergent: false,
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
                 role: None,
@@ -8124,6 +8126,7 @@ mod serve_or_run_tests {
     fn token_at(recorded: Option<serde_json::Value>, rank: Option<u8>) -> ExecuteShadowToken {
         ExecuteShadowToken::new(crate::replay::ObservedCall {
             outcome: crate::SubstituteOutcome::default(),
+            arg_divergent: false,
             correlation_id: Some("c-1".to_owned()),
             boundary: "db".to_owned(),
             role: None,

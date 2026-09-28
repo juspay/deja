@@ -7525,6 +7525,7 @@ mod tests {
             provenance: deja::Provenance::default(),
             seed_gap: false,
             absorbed: false,
+            arg_divergent: false,
         }
     }
 
@@ -16626,6 +16627,83 @@ mod tests {
                  answers, and the viewer shows the wrong one: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_args_free_serve_is_scored_and_charged_as_a_value_divergence() {
+        // The load-bearing claim behind serving a call whose arguments moved. The
+        // candidate returns the recording's value for that address so the request
+        // does not die, and reports `resolved: false` so that the divergence is
+        // still scored — by machinery that already existed, with no change here.
+        //
+        // The row shape is NEW and could not occur before: unresolved, yet
+        // carrying a recorded result equal to its observed result, because under
+        // lookup the served value IS both sides. Equal results are exactly what
+        // could have made this quiet, so the claim needs its own row: the pair is
+        // judged on what the call SENT — its arguments — not on what came back.
+        //
+        // `arg_divergent` is deliberately not what makes this block. It is
+        // descriptive; `resolved` is load-bearing. That is what makes the change
+        // safe against an orchestrator older than the candidate emitting it.
+        let corr = "argfree-serve";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let mut recorded = omitted_ev(701, "db", Some(corr));
+        recorded.method_name = "load".to_owned();
+        // Not an integer `id`: that is replay-local DB infrastructure the value
+        // comparison normalizes away on purpose, so a fixture built on it would
+        // score matched for a reason that has nothing to do with this change.
+        recorded.args = serde_json::json!({"amount": 100}).into();
+        recorded.result = result.clone().into();
+
+        // Exactly as `LookupTableHook::resolve` now shapes an args-free serve.
+        let mut served = substituted_obs_method("db", Some(corr), "load", 701, result.clone());
+        served.args = serde_json::json!({"amount": 200});
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>load");
+
+        let artifacts = art_with_events(
+            // The rank-2 entry is what makes the recorded event poolable for
+            // args-free pairing; the identity columns come off the first entry
+            // for the sequence, which is the one before it.
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 701, result.clone()),
+                span_entry_res(Some(corr), 701, "request>load", result.clone()),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![recorded],
+        );
+        let card = detect(&artifacts);
+        let rows = build_ledger(&artifacts).expect("a ledger");
+
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "the scorecard must charge the changed arguments: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.per_boundary["db"].matched, 0,
+            "a served call whose arguments moved is not a match"
+        );
+        let diverged: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| row.kind == "value_diverged")
+            .collect();
+        assert_eq!(diverged.len(), 1, "{rows:?}");
+        assert!(
+            diverged[0].blocking,
+            "the request surviving must not make the divergence non-blocking: {:?}",
+            diverged[0]
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "no row may read as matched: {rows:?}"
+        );
     }
 
     #[test]

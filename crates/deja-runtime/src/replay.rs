@@ -1258,6 +1258,13 @@ impl DejaHook for ReplayHook {
 // `ObservedCallSink`; the orchestrator runs post-hoc divergence detection
 // against the recording.
 //
+// The candidate does honour `OnlyForArgful`'s argless half, by construction
+// rather than by consulting a policy: its args-free fallback reads
+// `args_are_empty`, the predicate that variant is defined by, so a clock or an
+// identifier is never served another call's value. Nothing else about the policy
+// reaches here — the candidate cannot decide whether a mismatch is tolerable, so
+// it serves and marks, and the orchestrator decides.
+//
 // Trait surface is dependency-inversion: deja-record ships local-file
 // implementations of both source and sink. HTTP/Kafka variants are supplied
 // by the application (same pattern as the JSONL → KafkaSink split for
@@ -1786,6 +1793,25 @@ pub struct ObservedCall {
     /// distinguishable from one that served it, which the two bools cannot say.
     #[serde(default)]
     pub outcome: crate::SubstituteOutcome,
+    /// The exact address MISSED and this call was served the recording's value
+    /// from the same address with different arguments.
+    ///
+    /// Only ever true together with `resolved == false`, and that pairing is the
+    /// point. `resolved` answers "did this call's own address and arguments find
+    /// their row", and the answer is no — so every consumer that already reads
+    /// `resolved` keeps scoring the call as the divergence it is, and a scorer
+    /// that has never heard of this field cannot be made quieter by it. What
+    /// this adds is only the reason the request did not die there.
+    ///
+    /// None of the other outcome fields can say it. `resolved` either hides the
+    /// miss or hides the serve; `resolved_rank` names the locus that matched and
+    /// a sentinel there would corrupt the rank histogram; `synthesized` and
+    /// `absorbed` mean a value derived from the query with no recorded
+    /// counterpart, which is the opposite of this; `seed_gap` means the baseline
+    /// was absent; and `outcome` is stamped by the seam, which cannot see that
+    /// the hook matched a different arguments bucket.
+    #[serde(default)]
+    pub arg_divergent: bool,
 }
 
 #[derive(Deserialize)]
@@ -1842,6 +1868,8 @@ struct ObservedCallWire {
     absorbed: bool,
     #[serde(default)]
     outcome: crate::SubstituteOutcome,
+    #[serde(default)]
+    arg_divergent: bool,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1878,6 +1906,7 @@ impl From<ObservedCallWire> for ObservedCall {
             seed_gap: wire.seed_gap,
             absorbed: wire.absorbed,
             outcome: wire.outcome,
+            arg_divergent: wire.arg_divergent,
         }
     }
 }
@@ -2179,20 +2208,136 @@ impl KeyStamper {
     }
 }
 
-/// The two occurrence assigners, exact and by identity. `stamp_call` is the
-/// only way to stamp either: a call advances the one sequence it is addressed
-/// by. An exact counter for args identity applies to is never read, so an
-/// identity-addressed call takes no exact stamp.
+/// The address an args-free lookup is made at: a [`LookupKey`] with `args_hash`
+/// dropped and `occurrence` renumbered over the calls that share everything
+/// else.
+///
+/// Only ever DERIVED — at load from the entries a table already carries, at
+/// replay from the loci a live call already has — so it is never written to a
+/// tape and there is no second producer to disagree with about what it holds.
+/// That is why it is a private type and not a `LookupKey` with a sentinel hash:
+/// a sentinel would be serializable, and a serializable args-free key is a wire
+/// format someone has to keep in step.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ArgFreeKey {
+    correlation_id: Option<String>,
+    bucket_id: Option<String>,
+    fork_seq: u64,
+    boundary: String,
+    component: String,
+    operation: String,
+    locus: Locus,
+    occurrence: u32,
+}
+
+/// What an args-free occurrence counter is scoped to: exactly
+/// [`OccurrenceScope`] with the args left out.
+///
+/// `fork_seq` is absent here because it is absent there. The exact counter
+/// numbers a locus's calls ACROSS the forks of one lineage bucket and stamps
+/// each key with the fork the call was made on; an args-free counter that
+/// restarted per fork would walk a different sequence from the one the entries
+/// were numbered into.
+type ArgFreeScope = (
+    Option<String>,
+    Option<String>,
+    (String, String, String),
+    Locus,
+);
+
+/// The scope a [`LookupKey`]'s args-free counter belongs to.
+fn arg_free_scope(key: &LookupKey) -> ArgFreeScope {
+    (
+        key.correlation_id.clone(),
+        key.bucket_id.clone(),
+        (
+            key.boundary.clone(),
+            key.component.clone(),
+            key.operation.clone(),
+        ),
+        key.locus.clone(),
+    )
+}
+
+/// The occurrence assigner for args-free addresses, counting calls at a locus
+/// whatever arguments they carried.
+#[derive(Default)]
+struct ArgFreeStamper {
+    occurrences: std::collections::HashMap<ArgFreeScope, u32>,
+}
+
+impl ArgFreeStamper {
+    /// Stamp args-free occurrence indices onto each locus, strongest first.
+    fn stamp(
+        &mut self,
+        correlation_id: Option<&str>,
+        bucket_id: Option<&str>,
+        fork_seq: u64,
+        identity: CallIdentity<'_>,
+        loci: &[Locus],
+    ) -> Vec<ArgFreeKey> {
+        let correlation_id = correlation_id.map(str::to_owned);
+        let bucket_id = bucket_id.map(str::to_owned);
+        loci.iter()
+            .map(|locus| {
+                let scope = (
+                    correlation_id.clone(),
+                    bucket_id.clone(),
+                    identity.owned(),
+                    locus.clone(),
+                );
+                let counter = self.occurrences.entry(scope).or_insert(0);
+                let occurrence = *counter;
+                *counter += 1;
+                ArgFreeKey {
+                    correlation_id: correlation_id.clone(),
+                    bucket_id: bucket_id.clone(),
+                    fork_seq,
+                    boundary: identity.boundary.to_owned(),
+                    component: identity.component.to_owned(),
+                    operation: identity.operation.to_owned(),
+                    locus: locus.clone(),
+                    occurrence,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The occurrence assigners: exact, by identity, and args-free. `stamp_call` is
+/// the only way to stamp any of them: a call advances the one EXACT sequence it
+/// is addressed by — an exact counter for args identity applies to is never
+/// read, so an identity-addressed call takes no exact stamp — and it always
+/// advances the args-free sequence.
+///
+/// The args-free counter sits here rather than inside [`KeyStamper`] because
+/// there is one args-free index over one population of entries, and a counter
+/// per `KeyStamper` would be two sequences over it — the hazard the exact/
+/// identity split already names, reached from the other side. `identity_applies`
+/// is a pure function of the arguments, so a call whose arguments changed shape
+/// can route exact where its recording routed by identity; both are numbered
+/// into the same args-free sequence, which is the whole point of dropping the
+/// arguments from the address.
 #[derive(Default)]
 struct Stampers {
     exact: KeyStamper,
     by_identity: KeyStamper,
+    arg_free: ArgFreeStamper,
 }
 
 impl Stampers {
-    /// Stamp one call, in the one sequence it is addressed by: its identity
-    /// occurrence when it is addressed by identity, its exact occurrence
-    /// otherwise. Returns the keys the call is looked up by.
+    /// Stamp one call, in the one exact sequence it is addressed by — its
+    /// identity occurrence when it is addressed by identity, its exact
+    /// occurrence otherwise — and in the args-free sequence, always. Returns
+    /// the keys the call is looked up by, exact first, args-free second.
+    ///
+    /// The args-free stamp is UNCONDITIONAL: not gated on the exact lookup
+    /// missing (which has not happened yet here), not on the arguments being
+    /// argful, not on which exact sequence the call took. A counter that
+    /// advances on some paths and not others numbers a different sequence from
+    /// the one the entries were numbered into, and every args-free address from
+    /// the first skip onwards points at another call's row — silently, since a
+    /// wrong row looks exactly like a right one.
     #[allow(clippy::too_many_arguments)]
     fn stamp_call(
         &mut self,
@@ -2203,8 +2348,8 @@ impl Stampers {
         loci: &[Locus],
         args_hash: u64,
         identity_hash: Option<u64>,
-    ) -> Vec<LookupKey> {
-        match identity_hash {
+    ) -> (Vec<LookupKey>, Vec<ArgFreeKey>) {
+        let keys = match identity_hash {
             Some(hash) => {
                 self.by_identity
                     .stamp(correlation_id, bucket_id, fork_seq, identity, loci, hash)
@@ -2217,7 +2362,11 @@ impl Stampers {
                 loci,
                 args_hash,
             ),
-        }
+        };
+        let arg_free = self
+            .arg_free
+            .stamp(correlation_id, bucket_id, fork_seq, identity, loci);
+        (keys, arg_free)
     }
 }
 
@@ -2585,6 +2734,106 @@ struct HookEntry {
     source_event_global_sequence: u64,
 }
 
+/// Whether the caller can SERVE an args-free fallback, or only advance its
+/// counter.
+///
+/// Both substitute callers serve it: a lookup boundary with no executor under it
+/// either gets a value or the request stops there. The execute caller does NOT,
+/// and the distinction is not tidiness. An `ExecuteShadowToken`'s
+/// `recorded_result` is read by the macro to decide whether a site that declared
+/// its error state-neutral is served its own recorded `Err` instead of running
+/// ([`crate::serves_recorded_error`]) — and "its own" is the whole licence.
+/// Handing that decision an `Err` recorded under different arguments would put a
+/// second, unasked-for substitution on a path that otherwise runs the real
+/// boundary and compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgFreeFallback {
+    Serve,
+    Skip,
+}
+
+/// The args-free index: the same entries a table already carries, addressed with
+/// `args_hash` dropped and occurrence renumbered over the calls that share the
+/// rest of the address.
+///
+/// Derived at load, never transmitted — no renderer change, no wire change, no
+/// bytes on the tape. The renderer walks the recording in sequence order and
+/// numbers occurrences as it goes, so numbering each group by ascending
+/// `source_event_global_sequence` reproduces that walk from the entries
+/// themselves. The tiebreak after it makes the order TOTAL, so the index is the
+/// same map however the entries arrived: a table read back as JSONL, or iterated
+/// out of a `HashMap`, is not in the renderer's order.
+fn arg_free_index(table: &HashMap<LookupKey, HookEntry>) -> HashMap<ArgFreeKey, HookEntry> {
+    let mut groups: HashMap<ArgFreeScope, Vec<&LookupKey>> = HashMap::new();
+    for key in table.keys() {
+        groups.entry(arg_free_scope(key)).or_default().push(key);
+    }
+    let mut index = HashMap::with_capacity(table.len());
+    for keys in groups.values_mut() {
+        keys.sort_by_key(|key| {
+            (
+                table
+                    .get(*key)
+                    .map_or(0, |entry| entry.source_event_global_sequence),
+                key.args_hash,
+                key.occurrence,
+            )
+        });
+        for (occurrence, key) in keys.iter().enumerate() {
+            let Some(entry) = table.get(*key) else {
+                continue;
+            };
+            let Ok(occurrence) = u32::try_from(occurrence) else {
+                continue;
+            };
+            index.insert(
+                ArgFreeKey {
+                    correlation_id: key.correlation_id.clone(),
+                    bucket_id: key.bucket_id.clone(),
+                    // The entry's OWN fork, as the exact key carries it: the
+                    // counter is scoped across a bucket's forks, the address is
+                    // stamped with one.
+                    fork_seq: key.fork_seq,
+                    boundary: key.boundary.clone(),
+                    component: key.component.clone(),
+                    operation: key.operation.clone(),
+                    locus: key.locus.clone(),
+                    occurrence,
+                },
+                HookEntry {
+                    result: std::sync::Arc::clone(&entry.result),
+                    source_event_global_sequence: entry.source_event_global_sequence,
+                },
+            );
+        }
+    }
+    index
+}
+
+/// Where every lookup the hook served ended up. One counter per arm plus an
+/// independent total, so `total == exact + arg_free + missed` is an assertion
+/// that can FAIL rather than an identity restated: a total derived as the sum
+/// asserts nothing about the arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupTally {
+    /// Lookups made, counted once as each one arrives.
+    pub total: u64,
+    /// The call's own address and arguments found their row.
+    pub exact: u64,
+    /// The address matched and the arguments did not; the recording's value for
+    /// that address was served and the observation marked `arg_divergent`.
+    pub arg_free: u64,
+    /// Nothing was found, at any rank, with or without the arguments.
+    pub missed: u64,
+}
+
+impl LookupTally {
+    /// Whether every lookup is accounted for by exactly one arm.
+    pub fn balances(&self) -> bool {
+        self.exact + self.arg_free + self.missed == self.total
+    }
+}
+
 /// In-process side-effect player driven by a frozen `LookupTable`.
 ///
 /// Does NOT run a cascade and does NOT classify divergences. It looks up a key
@@ -2595,9 +2844,18 @@ pub struct LookupTableHook {
     table: HashMap<LookupKey, HookEntry>,
     /// The table's second lookup, by identity; see [`LookupTable::identity_entries`].
     identity_table: HashMap<LookupKey, HookEntry>,
-    /// Occurrence assigners, exact and by identity, under one lock. Each call
-    /// advances the one it is addressed by, for every rank, in lockstep with
-    /// the renderer's. The exact one once also fed rank 6, a positional
+    /// The args-free index, derived from `table` at load; see [`arg_free_index`].
+    ///
+    /// Derived from `table` alone and not from `identity_table`, because
+    /// `identity_entries` is a second addressing of events `entries` already
+    /// holds — additive, by its own contract — so the exact entries are the whole
+    /// population and the args-free sequence is one sequence over it.
+    arg_free_table: HashMap<ArgFreeKey, HookEntry>,
+    /// Occurrence assigners — exact, by identity, and args-free — under one
+    /// lock, so no interleaving can advance one without the other. Each call
+    /// advances the exact one it is addressed by, for every rank, in lockstep
+    /// with the renderer's, and the args-free one always. The exact one once
+    /// also fed rank 6, a positional
     /// `Sequence` locus since removed, which never produced a match in any
     /// measured run; the orchestrator still reads rank 6 when it scores older
     /// artifacts.
@@ -2620,6 +2878,12 @@ pub struct LookupTableHook {
     /// separate from the lookup counters so replay addressing stays in
     /// lockstep with the recorder whether or not graph capture is on.
     graph_counter: std::sync::atomic::AtomicU64,
+    /// Lookups arriving, counted before anything is decided about them, and the
+    /// three arms one can end in. Read back as a [`LookupTally`].
+    lookups: std::sync::atomic::AtomicU64,
+    exact_hits: std::sync::atomic::AtomicU64,
+    arg_free_hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
 }
 
 impl LookupTableHook {
@@ -2648,20 +2912,43 @@ impl LookupTableHook {
             }
             map
         };
+        // Derived from the indexed map rather than the entry list, so a table
+        // that repeated a key contributes it once to both indexes: the exact map
+        // collapses a repeat, and an args-free sequence that counted it twice
+        // would be one longer than the sequence the calls walk.
+        let exact = index(table.entries);
+        let arg_free_table = arg_free_index(&exact);
         Ok(Self {
-            table: index(table.entries),
+            table: exact,
             identity_table: index(table.identity_entries),
+            arg_free_table,
             stamper: Mutex::new(Stampers::default()),
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
             observed_sink: Box::new(sink),
             graph_counter: std::sync::atomic::AtomicU64::new(0),
+            lookups: std::sync::atomic::AtomicU64::new(0),
+            exact_hits: std::sync::atomic::AtomicU64::new(0),
+            arg_free_hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// Number of entries loaded. Useful for assertions.
     pub fn entry_count(&self) -> usize {
         self.table.len()
+    }
+
+    /// Where the lookups this hook has served ended up. Every one is in exactly
+    /// one arm; [`LookupTally::balances`] is the check.
+    pub fn lookup_tally(&self) -> LookupTally {
+        use std::sync::atomic::Ordering::Relaxed;
+        LookupTally {
+            total: self.lookups.load(Relaxed),
+            exact: self.exact_hits.load(Relaxed),
+            arg_free: self.arg_free_hits.load(Relaxed),
+            missed: self.misses.load(Relaxed),
+        }
     }
 
     /// Force-flush the underlying observed-call sink. The hook does NOT
@@ -2688,7 +2975,9 @@ impl LookupTableHook {
     /// of mode, so numbering never drifts between a lookup boundary and an execute
     /// boundary in the same run. It does NOT emit an observation — the caller
     /// shapes and emits the `ObservedCall` (Recorded vs Shadow).
-    fn resolve(&self, query: &ReplayLookup<'_>) -> Resolution {
+    fn resolve(&self, query: &ReplayLookup<'_>, fallback: ArgFreeFallback) -> Resolution {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The candidate carries no notion of "current correlation" in
         // ReplayLookup; pull it from the ambient deja-context scope set up
         // by the request middleware.
@@ -2733,7 +3022,7 @@ impl LookupTableHook {
         // lock; the lock guards the occurrence counters, and the one sequence
         // this call is addressed by advances under it.
         let identity_hash = by_identity.then(|| crate::identity::identity_args_hash(query.args));
-        let keys = match self.stamper.lock() {
+        let (keys, arg_free_keys) = match self.stamper.lock() {
             Ok(mut stampers) => stampers.stamp_call(
                 correlation_id.as_deref(),
                 bucket_id.as_deref(),
@@ -2743,7 +3032,7 @@ impl LookupTableHook {
                 args_hash,
                 identity_hash,
             ),
-            Err(_) => Vec::new(),
+            Err(_) => (Vec::new(), Vec::new()),
         };
         let table = if by_identity {
             &self.identity_table
@@ -2758,12 +3047,49 @@ impl LookupTableHook {
             }
         }
 
-        // There is intentionally no arg-tolerant args-free fallback. Serving a
-        // re-keyed call its recorded value was the partial-derivative substitution
-        // that masked transitive effects (the eu-overcharge lie: "the function
-        // behaves as if the arg is the original, not the changed one"). Under the
-        // partial-function model a re-keyed call is an honest Lookup miss, and the
-        // seam fail-stops on it instead of serving stale.
+        // The address matched and only the arguments did not: serve the
+        // recording's value for that address, and say so.
+        //
+        // This used to be refused outright, and the reason it was refused is the
+        // reason it is marked now. Serving a re-keyed call its recorded value is
+        // the partial-derivative substitution that masks transitive effects — the
+        // eu-overcharge lie, "the function behaves as if the argument were the
+        // original, not the changed one" — and a serve that claimed to have
+        // RESOLVED would launder exactly that into a pass. So the observation
+        // says the call did not resolve, which is true of its address and its
+        // arguments both, and every consumer that already reads `resolved` keeps
+        // scoring it as the divergence it is; the orchestrator pairs it args-free
+        // and judges what it SENT, not what it got back. What changes is only
+        // that the request lives long enough for the divergence to be attributed
+        // to the call that caused it, instead of dying here and turning
+        // everything below it into a pruned subtree with no observed side.
+        //
+        // Argless calls are excluded, and that exclusion is the safety property.
+        // A boundary with no arguments is a clock, an identifier or a source of
+        // randomness; there is no "same address, different arguments" case for
+        // one, only a different call at the same site, and serving it another
+        // call's recorded value is a silent lie about a timestamp. `args_are_empty`
+        // is the same predicate `ArgMismatchPolicy::OnlyForArgful` is defined by,
+        // read here rather than restated.
+        let mut arg_divergent = false;
+        if hit.is_none() && fallback == ArgFreeFallback::Serve && !args_are_empty(query.args) {
+            for key in &arg_free_keys {
+                if let Some(entry) = self.arg_free_table.get(key) {
+                    hit = Some((entry, key.locus.rank()));
+                    arg_divergent = true;
+                    break;
+                }
+            }
+        }
+
+        use std::sync::atomic::Ordering::Relaxed;
+        if arg_divergent {
+            self.arg_free_hits.fetch_add(1, Relaxed);
+        } else if hit.is_some() {
+            self.exact_hits.fetch_add(1, Relaxed);
+        } else {
+            self.misses.fetch_add(1, Relaxed);
+        }
 
         // "Where" for the diff UI + graph placement. `location` is already
         // resolved above (rank-5 SourceLocation); the span path is the rank-2
@@ -2780,8 +3106,17 @@ impl LookupTableHook {
             location: location.map(|(f, l, c)| (f.to_owned(), l, c)),
             graph_node_id,
             resolved_rank: hit.map(|(_, rank)| rank),
-            source_event_global_sequence: hit.map(|(entry, _)| entry.source_event_global_sequence),
+            // Left absent on an args-free serve. The sequence is a claim that
+            // THIS call is the recorded event at it, and an args-free serve is
+            // not that claim: the arguments differ, and which recorded event the
+            // call belongs to is decided by the orchestrator's own args-free
+            // pairing, which stays the single place pairing is decided. The value
+            // served is still on the row, as `recorded_result`.
+            source_event_global_sequence: hit
+                .filter(|_| !arg_divergent)
+                .map(|(entry, _)| entry.source_event_global_sequence),
             recorded_result: hit.map(|(entry, _)| (*entry.result).clone()),
+            arg_divergent,
         }
     }
 }
@@ -2800,6 +3135,8 @@ struct Resolution {
     resolved_rank: Option<u8>,
     source_event_global_sequence: Option<u64>,
     recorded_result: Option<serde_json::Value>,
+    /// `recorded_result` came from the same address with different arguments.
+    arg_divergent: bool,
 }
 
 impl Resolution {
@@ -2826,7 +3163,10 @@ impl Resolution {
             trait_name: query.trait_name.to_owned(),
             method_name: query.method_name.to_owned(),
             args: query.args.clone(),
-            resolved: self.recorded_result.is_some(),
+            // An args-free serve did NOT resolve: this call's own address and
+            // arguments found no row, and only the mark says why the request
+            // continued anyway.
+            resolved: self.recorded_result.is_some() && !self.arg_divergent,
             resolved_rank: self.resolved_rank,
             source_event_global_sequence: self.source_event_global_sequence,
             timestamp_ns: crate::now_ns(),
@@ -2851,6 +3191,7 @@ impl Resolution {
             seed_gap: false,
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
+            arg_divergent: self.arg_divergent,
         }
     }
 }
@@ -2888,7 +3229,7 @@ impl DejaHook for LookupTableHook {
         // observation: under lookup mode the observed result IS the substituted
         // recorded result, so the two sides are identical and ValueDiverged is
         // inert.
-        let resolution = self.resolve(&query);
+        let resolution = self.resolve(&query, ArgFreeFallback::Serve);
         let recorded = resolution.recorded_result();
         self.observed_sink.observed(resolution.into_observed_call(
             &query,
@@ -2904,7 +3245,7 @@ impl DejaHook for LookupTableHook {
         // / occurrence counters advance EXACTLY ONCE, identically — but the
         // observation is held back rather than emitted, so the seam can stamp
         // what it actually did before it goes out.
-        let resolution = self.resolve(&query);
+        let resolution = self.resolve(&query, ArgFreeFallback::Serve);
         let recorded = resolution.recorded_result();
         let observed = resolution.into_observed_call(
             &query,
@@ -2934,7 +3275,13 @@ impl DejaHook for LookupTableHook {
         // do NOT emit yet. Build the shadow observation with `observed_result =
         // None`; the macro fills it after the real boundary call and hands the
         // token back to `execute_shadow_observe`.
-        let resolution = self.resolve(&query);
+        //
+        // `Skip`, so this path never SERVES an args-free value while its counter
+        // still advances with everything else: an execute site has the real
+        // boundary under it, so a miss here is already survivable, and the one
+        // thing the token's `recorded_result` decides — serving this call's own
+        // recorded `Err` for a state-neutral error — must mean its own.
+        let resolution = self.resolve(&query, ArgFreeFallback::Skip);
         let observed = resolution.into_observed_call(
             &query,
             // Filled in by `execute_shadow_observe` from the real result.
@@ -3049,6 +3396,7 @@ impl DejaHook for LookupTableHook {
             // absorb and no substitution to describe.
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
+            arg_divergent: false,
         });
     }
 
@@ -5695,11 +6043,18 @@ mod tests {
         // middle call has no span, so rank 2 skips it — and the two that do
         // have spans must still number 0 and 1 between themselves, or renderer
         // and hook disagree and every lookup silently misses.
+        //
+        // The args-free counter is held to the SAME contract in the same place,
+        // rather than beside it: it is a second sequence over one population, so
+        // the way it fails is the way this one would, and a separate test would
+        // let the two drift apart without saying so.
         let none = serde_json::json!({});
+        let argful = |n: u64| serde_json::json!({ "key": format!("k{n}") });
         let mut spanless = clock_identity("http>pay", 111);
         spanless.span_path = None;
-        let mut stamper = KeyStamper::new();
+        let mut stampers = Stampers::default();
         let mut entries = Vec::new();
+        let mut arg_free = Vec::new();
         for (i, (id, value)) in [
             (clock_identity("http>pay", 111), "first"),
             (spanless.clone(), "middle"),
@@ -5709,7 +6064,65 @@ mod tests {
         .enumerate()
         {
             let addresses = loci_for(Some(&id), None);
-            for key in stamper.stamp(
+            // Each call carries DIFFERENT arguments, which is what separates the
+            // two sequences: the exact counter restarts at 0 per arguments hash,
+            // the args-free counter does not.
+            let args = argful(i as u64);
+            let (keys, arg_free_keys) = stampers.stamp_call(
+                None,
+                Some(crate::ROOT_TASK_ID),
+                0,
+                CallIdentity {
+                    boundary: "redis",
+                    component: "RedisStore",
+                    operation: "get_key",
+                },
+                &addresses,
+                canonical_args_hash(&args),
+                None,
+            );
+            for key in keys {
+                entries.push(LookupEntry {
+                    key,
+                    result: std::sync::Arc::new(serde_json::json!(value)),
+                    source_event_global_sequence: i as u64,
+                });
+            }
+            arg_free.extend(arg_free_keys);
+        }
+        let spanned: Vec<u32> = entries
+            .iter()
+            .filter(|e| matches!(e.key.locus, Locus::SpanPath { .. }))
+            .map(|e| e.key.occurrence)
+            .collect();
+        assert_eq!(
+            spanned,
+            vec![0, 0],
+            "three different arguments means three exact sequences; each spanned call is the first in its own"
+        );
+        let spanned_arg_free: Vec<u32> = arg_free
+            .iter()
+            .filter(|k| matches!(k.locus, Locus::SpanPath { .. }))
+            .map(|k| k.occurrence)
+            .collect();
+        assert_eq!(
+            spanned_arg_free,
+            vec![0, 1],
+            "the args-free sequence spans the arguments and skips the rank the spanless call lacks"
+        );
+        // The same run with argLESS calls: the exact counter now numbers them
+        // between themselves, so both sequences say 0 and 1 and the original
+        // property is still pinned here rather than replaced by the one above.
+        let mut stampers = Stampers::default();
+        let mut spanned = Vec::new();
+        let mut spanned_arg_free = Vec::new();
+        for id in [
+            clock_identity("http>pay", 111),
+            spanless,
+            clock_identity("http>pay", 111),
+        ] {
+            let addresses = loci_for(Some(&id), None);
+            let (keys, arg_free_keys) = stampers.stamp_call(
                 None,
                 Some(crate::ROOT_TASK_ID),
                 0,
@@ -5720,23 +6133,501 @@ mod tests {
                 },
                 &addresses,
                 canonical_args_hash(&none),
-            ) {
-                entries.push(LookupEntry {
-                    key,
-                    result: std::sync::Arc::new(serde_json::json!(value)),
-                    source_event_global_sequence: i as u64,
-                });
-            }
+                None,
+            );
+            spanned.extend(
+                keys.iter()
+                    .filter(|k| matches!(k.locus, Locus::SpanPath { .. }))
+                    .map(|k| k.occurrence),
+            );
+            spanned_arg_free.extend(
+                arg_free_keys
+                    .iter()
+                    .filter(|k| matches!(k.locus, Locus::SpanPath { .. }))
+                    .map(|k| k.occurrence),
+            );
         }
-        let spanned: Vec<u32> = entries
-            .iter()
-            .filter(|e| matches!(e.key.locus, Locus::SpanPath { .. }))
-            .map(|e| e.key.occurrence)
+        assert_eq!(
+            (spanned, spanned_arg_free),
+            (vec![0, 1], vec![0, 1]),
+            "the spanned calls number between themselves; the spanless one does not shift them"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 1: the address matched and only the arguments did not.
+    // -----------------------------------------------------------------------
+
+    /// One recorded call at a declared site, with the arguments the fixture gives
+    /// it.
+    fn storage_event(seq: u64, tag: &str, args: serde_json::Value, value: &str) -> BoundaryEvent {
+        let mut event = make_event(
+            seq,
+            None,
+            "find_payment",
+            args,
+            serde_json::json!({ "Ok": value }),
+            false,
+        );
+        event.callsite_identity = Some(explicit_identity(tag));
+        event
+    }
+
+    /// Ask the hook for one storage call, the way a candidate does.
+    fn ask_storage(
+        hook: &LookupTableHook,
+        tag: &str,
+        method: &str,
+        args: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        hook.try_replay_with_context(ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentStore",
+            method_name: method,
+            args,
+            callsite_identity: Some(&explicit_identity(tag)),
+            caller_location: None,
+        })
+    }
+
+    fn last_call(handle: &ObservedHandle) -> ObservedCall {
+        handle
+            .lock()
+            .unwrap()
+            .last()
+            .expect("an observation")
+            .clone()
+    }
+
+    #[test]
+    fn arguments_that_differ_at_one_address_are_served_and_marked() {
+        // Rule 1. The recording made this call; the candidate makes it with a
+        // different amount. The exact address misses, the value is served from
+        // the same address anyway so the request survives, and the observation
+        // says it did not resolve — which is what keeps the divergence reported.
+        let table = render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]);
+        let (hook, handle) = hook_over(table);
+
+        let served = ask_storage(
+            &hook,
+            "find-payment",
+            "find_payment",
+            &serde_json::json!({ "amount": 200 }),
+        );
+        assert_eq!(
+            served,
+            Some(serde_json::json!({ "Ok": "recorded" })),
+            "the request must survive on the recording's value for this address"
+        );
+        let call = last_call(&handle);
+        assert!(
+            call.arg_divergent,
+            "an unmarked args-free serve turns a divergence into a pass; that is the whole risk"
+        );
+        assert!(
+            !call.resolved,
+            "this call's own address and arguments found no row, and every scorer reads that"
+        );
+        assert_eq!(
+            call.resolved_rank,
+            Some(1),
+            "the locus that matched is still named"
+        );
+        assert_eq!(
+            call.source_event_global_sequence, None,
+            "an args-free serve claims no recorded twin; the orchestrator pairs it"
+        );
+        assert_eq!(
+            call.recorded_result,
+            Some(serde_json::json!({ "Ok": "recorded" }))
+        );
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: 1,
+                exact: 0,
+                arg_free: 1,
+                missed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn the_same_arguments_at_that_address_still_resolve_exactly() {
+        // The vacuity guard for the test above: the two outcomes are told apart
+        // by the assertions, not by the fixture. Same table, the recording's own
+        // arguments, and the row that comes back is the unmarked exact hit —
+        // which is what makes `arg_divergent && !resolved` above a finding rather
+        // than the only shape this fixture can produce.
+        let args = serde_json::json!({ "amount": 100 });
+        let table = render_table(&[storage_event(0, "find-payment", args.clone(), "recorded")]);
+        let (hook, handle) = hook_over(table);
+
+        assert_eq!(
+            ask_storage(&hook, "find-payment", "find_payment", &args),
+            Some(serde_json::json!({ "Ok": "recorded" }))
+        );
+        let call = last_call(&handle);
+        assert!(call.resolved, "the arguments are the recording's");
+        assert!(!call.arg_divergent);
+        assert_eq!(call.source_event_global_sequence, Some(0));
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: 1,
+                exact: 1,
+                arg_free: 0,
+                missed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn an_argless_call_is_never_served_another_arguments_value() {
+        // `ArgMismatchPolicy::Never`, honoured by the predicate that variant is
+        // defined by. An argless boundary is a clock, an identifier or a source
+        // of randomness: there is no "same address, different arguments" case for
+        // one, only a different call at the same site, and serving it the
+        // recording's value is a silent lie about a timestamp. Both argless
+        // forms, in both directions, because `args_are_empty` accepts two and a
+        // gate that only knew one would pass this test on the other.
+        for (recorded, observed) in [
+            (serde_json::Value::Null, serde_json::json!({})),
+            (serde_json::json!({}), serde_json::Value::Null),
+        ] {
+            let table = render_table(&[storage_event(0, "clock", recorded.clone(), "recorded")]);
+            let (hook, handle) = hook_over(table);
+            assert_eq!(
+                ask_storage(&hook, "clock", "find_payment", &observed),
+                None,
+                "recorded {recorded} / observed {observed}: the miss must be preserved"
+            );
+            let call = last_call(&handle);
+            assert!(!call.resolved);
+            assert!(
+                !call.arg_divergent,
+                "recorded {recorded} / observed {observed}: no argless call is served args-free"
+            );
+            assert_eq!(
+                hook.lookup_tally(),
+                LookupTally {
+                    total: 1,
+                    exact: 0,
+                    arg_free: 0,
+                    missed: 1
+                },
+                "recorded {recorded} / observed {observed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_the_recording_never_made_is_not_papered_over() {
+        // The fallback answers "the same address with other arguments", not
+        // "some address". A method the recording never called shares no
+        // args-free scope with anything in the table — not even at the
+        // `Unlocated` floor, which carries the operation as a sibling field —
+        // so it stays the honest miss it is.
+        let table = render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]);
+        let (hook, handle) = hook_over(table);
+
+        assert_eq!(
+            ask_storage(
+                &hook,
+                "insert-payment",
+                "insert_payment",
+                &serde_json::json!({ "amount": 100 })
+            ),
+            None,
+            "a novel call site must not be served another operation's value"
+        );
+        let call = last_call(&handle);
+        assert!(!call.resolved);
+        assert!(!call.arg_divergent);
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: 1,
+                exact: 0,
+                arg_free: 0,
+                missed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_second_declared_site_for_one_operation_is_served_at_the_floor() {
+        // Stated because it is a widening, not because it is desirable. The
+        // args-free probe walks the same rank ladder the exact lookup does, and
+        // rank 3 (`Unlocated`) is the floor every call reaches: an argful call to
+        // an operation the recording DID make, from a different declared site, is
+        // served the recording's value there. The row says rank 3, which is how a
+        // scorecard already reports how much of a run leans on its weakest
+        // match — and it says `arg_divergent`, so it is never a pass.
+        let table = render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]);
+        let (hook, handle) = hook_over(table);
+
+        assert_eq!(
+            ask_storage(
+                &hook,
+                "find-payment-retry",
+                "find_payment",
+                &serde_json::json!({ "amount": 200 })
+            ),
+            Some(serde_json::json!({ "Ok": "recorded" }))
+        );
+        let call = last_call(&handle);
+        assert!(call.arg_divergent);
+        assert!(!call.resolved);
+        assert_eq!(
+            call.resolved_rank,
+            Some(3),
+            "the floor is where it matched, and the row must say so"
+        );
+    }
+
+    #[test]
+    fn several_arguments_at_one_address_pair_positionally_and_serve_each_row_once() {
+        // The fragile case, pinned rather than hidden. Three recorded calls at one
+        // address, three candidate calls there with three DIFFERENT arguments: no
+        // exact key can match, so pairing is by position in the args-free
+        // sequence — the k-th call gets the k-th recording. It is fragile because
+        // reordering the candidate's calls reorders the answers, and it is still
+        // strictly better than three dead requests, because every row says
+        // `arg_divergent` and the orchestrator pairs and judges them itself.
+        //
+        // What it must NOT do is serve one recording twice: that is the failure
+        // a counter advancing on some paths and not others produces.
+        let table = render_table(&[
+            storage_event(0, "loop", serde_json::json!({ "amount": 1 }), "first"),
+            storage_event(1, "loop", serde_json::json!({ "amount": 2 }), "second"),
+            storage_event(2, "loop", serde_json::json!({ "amount": 3 }), "third"),
+        ]);
+        let (hook, handle) = hook_over(table);
+
+        let served: Vec<Option<serde_json::Value>> = [11, 12, 13]
+            .into_iter()
+            .map(|amount| {
+                ask_storage(
+                    &hook,
+                    "loop",
+                    "find_payment",
+                    &serde_json::json!({ "amount": amount }),
+                )
+            })
             .collect();
         assert_eq!(
-            spanned,
-            vec![0, 1],
-            "the spanned calls number between themselves; the spanless one does not shift them"
+            served,
+            vec![
+                Some(serde_json::json!({ "Ok": "first" })),
+                Some(serde_json::json!({ "Ok": "second" })),
+                Some(serde_json::json!({ "Ok": "third" })),
+            ],
+            "positional: the k-th call is served the k-th recording, each exactly once"
+        );
+        let calls = handle.lock().unwrap().clone();
+        assert!(
+            calls.iter().all(|c| c.arg_divergent && !c.resolved),
+            "every positional serve is marked and none of them resolved"
+        );
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: 3,
+                exact: 0,
+                arg_free: 3,
+                missed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn the_args_free_counter_stays_in_step_with_the_exact_one_under_threads() {
+        // The two sequences advance under one lock, once per call. Eight threads
+        // call one address concurrently, each with arguments the recording never
+        // saw, so every call takes the args-free path; the eight recorded values
+        // must come back as a SET, each exactly once. A counter that could be
+        // read and written non-atomically hands two threads the same occurrence,
+        // which shows up here as one value twice and another never — the silent
+        // mis-pairing, made loud.
+        const CALLS: u64 = 8;
+        let events: Vec<BoundaryEvent> = (0..CALLS)
+            .map(|n| {
+                storage_event(
+                    n,
+                    "concurrent",
+                    serde_json::json!({ "amount": n }),
+                    &format!("recorded-{n}"),
+                )
+            })
+            .collect();
+        let (hook, handle) = hook_over(render_table(&events));
+        let hook = std::sync::Arc::new(hook);
+
+        let mut threads = Vec::new();
+        for n in 0..CALLS {
+            let hook = std::sync::Arc::clone(&hook);
+            threads.push(std::thread::spawn(move || {
+                ask_storage(
+                    &hook,
+                    "concurrent",
+                    "find_payment",
+                    &serde_json::json!({ "amount": 1_000 + n }),
+                )
+            }));
+        }
+        let mut served: Vec<serde_json::Value> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("thread panicked").expect("served"))
+            .collect();
+        served.sort_by_key(serde_json::Value::to_string);
+        let mut expected: Vec<serde_json::Value> = (0..CALLS)
+            .map(|n| serde_json::json!({ "Ok": format!("recorded-{n}") }))
+            .collect();
+        expected.sort_by_key(serde_json::Value::to_string);
+        assert_eq!(
+            served, expected,
+            "each recorded row is served exactly once: no occurrence handed out twice"
+        );
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(calls.len() as u64, CALLS);
+        assert!(calls.iter().all(|c| c.arg_divergent && !c.resolved));
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: CALLS,
+                exact: 0,
+                arg_free: CALLS,
+                missed: 0
+            }
+        );
+    }
+
+    // The other half of "unconditionally" — that a call addressed BY IDENTITY
+    // advances the args-free sequence too — needs a table with identity entries
+    // in it, which this module's `render_table` does not build: it mirrors the
+    // exact half of the renderer only. That case is
+    // `a_call_addressed_by_identity_advances_the_args_free_sequence_too` in
+    // `deja-orchestrator`'s lookup tests, over the real renderer, rather than a
+    // second copy of the renderer here that could agree with a bug.
+
+    #[test]
+    fn every_lookup_lands_in_exactly_one_arm_of_the_tally() {
+        // Accounting that balances: the total is counted as each lookup arrives,
+        // independently of the arms, so `total == exact + arg_free + missed` is a
+        // claim that can fail. Derived as a sum it would restate itself.
+        let table = render_table(&[
+            storage_event(0, "find", serde_json::json!({ "amount": 100 }), "found"),
+            storage_event(1, "clock", serde_json::Value::Null, "timed"),
+        ]);
+        let (hook, _handle) = hook_over(table);
+
+        // Exact.
+        ask_storage(
+            &hook,
+            "find",
+            "find_payment",
+            &serde_json::json!({ "amount": 100 }),
+        );
+        // Args-free: same address, other arguments.
+        ask_storage(
+            &hook,
+            "find",
+            "find_payment",
+            &serde_json::json!({ "amount": 200 }),
+        );
+        // Missed: argless, so no fallback.
+        ask_storage(&hook, "clock", "find_payment", &serde_json::json!({}));
+        // Missed: an operation the recording never made.
+        ask_storage(
+            &hook,
+            "insert",
+            "insert_payment",
+            &serde_json::json!({ "amount": 100 }),
+        );
+
+        let tally = hook.lookup_tally();
+        assert!(
+            tally.balances(),
+            "{tally:?} does not account for every lookup"
+        );
+        assert_eq!(
+            tally,
+            LookupTally {
+                total: 4,
+                exact: 1,
+                arg_free: 1,
+                missed: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_execute_path_advances_the_counter_without_serving_args_free() {
+        // An execute site has the real boundary under it, so a miss there is
+        // already survivable — and the one thing its token's `recorded_result`
+        // decides is whether this call's OWN recorded error is served instead of
+        // running. Handing that a value recorded under different arguments is a
+        // second substitution nobody asked for, so the execute path skips the
+        // serve. It must still advance the counter, or a run mixing lookup and
+        // execute boundaries numbers the two sides differently.
+        let table = render_table(&[
+            storage_event(0, "shadow", serde_json::json!({ "amount": 1 }), "first"),
+            storage_event(1, "shadow", serde_json::json!({ "amount": 2 }), "second"),
+        ]);
+        let (hook, _handle) = hook_over(table);
+        let identity = explicit_identity("shadow");
+        let query = |args| ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentStore",
+            method_name: "find_payment",
+            args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        };
+
+        let shadow_args = serde_json::json!({ "amount": 11 });
+        let token = hook
+            .execute_shadow_peek(query(&shadow_args))
+            .expect("a shadow token");
+        assert_eq!(
+            token.recorded_result(),
+            None,
+            "the execute path is not served an args-free value"
+        );
+
+        // The counter advanced anyway: this second call is the args-free
+        // occurrence 1, so it is served the SECOND recording, not the first.
+        let lookup_args = serde_json::json!({ "amount": 12 });
+        assert_eq!(
+            ask_storage(&hook, "shadow", "find_payment", &lookup_args),
+            Some(serde_json::json!({ "Ok": "second" })),
+            "the execute call consumed args-free occurrence 0"
+        );
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: 2,
+                exact: 0,
+                arg_free: 1,
+                missed: 1
+            },
+            "the skipped serve is a miss, not a hidden third state"
         );
     }
 
