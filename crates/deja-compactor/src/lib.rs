@@ -5540,6 +5540,23 @@ s3_bucket = "ucs-deja"
         }
     }
 
+    /// The seam's one production call site. The other prefix tests call
+    /// `scope_store` directly, so removing it from `build` broke nothing.
+    /// No network: the builder opens no connection and `cfg_at` pins a region.
+    #[test]
+    fn build_confines_the_store_it_hands_out_to_the_declared_prefix() {
+        assert_eq!(
+            cfg_at("prism").build().expect("builds").to_string(),
+            "PrefixObjectStore(prism)",
+            "a declared prefix must reach the store `build` returns"
+        );
+        assert_eq!(
+            cfg_at("").build().expect("builds").to_string(),
+            "AmazonS3(shared)",
+            "with no prefix the store is the client itself, never a wrapper over it"
+        );
+    }
+
     /// A manifest's keys are relative to the system's root, so they never
     /// carry the prefix they were sealed under.
     #[test]
