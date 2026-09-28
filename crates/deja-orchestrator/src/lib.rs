@@ -620,7 +620,8 @@ impl RunParams {
 pub struct S3Source {
     /// `s3://bucket/prefix` (scheme optional).
     pub path: String,
-    /// AWS region; defaults to the orchestrator env's `DEJA_S3_REGION`.
+    /// AWS region; defaults to the orchestrator env's `DEJA_S3_REGION`, then to
+    /// the bucket's own region (see `deja_compactor::choose_region`).
     #[serde(default)]
     pub region: Option<String>,
     /// Custom endpoint (MinIO etc.); defaults to the region's AWS endpoint.
@@ -645,13 +646,23 @@ impl S3Source {
         }
         let mut cfg = s3::S3Config::from_env();
         cfg.bucket = bucket.to_owned();
+        // The path spells its key from the bucket's root, so no system prefix
+        // applies on top of it.
+        cfg.prefix = String::new();
         if let Some(region) = &self.region {
-            cfg.region = region.clone();
+            cfg.region = Some(region.clone());
         }
-        cfg.endpoint = self
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", cfg.region));
+        cfg.endpoint = match &self.endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => {
+                // Cleared before the region is chosen, so the environment's
+                // endpoint cannot decide the region of a bucket it is not for.
+                cfg.endpoint.clear();
+                let region = cfg.effective_region();
+                cfg.region = Some(region.clone());
+                format!("https://s3.{region}.amazonaws.com")
+            }
+        };
         cfg.allow_http = cfg.endpoint.starts_with("http://");
         Ok((cfg, prefix.trim_matches('/').to_owned()))
     }
@@ -1404,6 +1415,40 @@ mod system_env_tests {
         .expect("legacy spec parses");
         assert_eq!(legacy.system(), DEFAULT_SYSTEM_UNDER_TEST);
         assert!(is_default_system(legacy.system()));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod s3_source_tests {
+    use super::*;
+
+    /// The unsealed pull hands a located landing prefix to the prefix scan as
+    /// a URI. The prefix it located is relative to the system's root; the URI
+    /// is read from the bucket's root. So the system prefix goes into the URI
+    /// once, and the config parsed back out of it applies none of its own.
+    #[test]
+    fn a_located_prefix_round_trips_through_its_uri() {
+        let located = s3::S3Config {
+            endpoint: String::new(),
+            bucket: "shared".to_owned(),
+            prefix: "prism/".to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: Some("ap-south-2".to_owned()),
+            allow_http: false,
+        };
+        let source = S3Source {
+            path: located.uri("landing/v1/session=s1"),
+            region: located.region.clone(),
+            endpoint: None,
+        };
+        let (cfg, prefix) = source.to_config().unwrap();
+        assert_eq!(source.path, "s3://shared/prism/landing/v1/session=s1");
+        assert_eq!(cfg.bucket, "shared");
+        assert_eq!(cfg.prefix, "", "the URI already spells the prefix");
+        assert_eq!(prefix, "prism/landing/v1/session=s1");
+        assert_eq!(cfg.endpoint, "https://s3.ap-south-2.amazonaws.com");
     }
 }
 

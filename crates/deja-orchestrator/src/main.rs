@@ -742,7 +742,9 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// wearing a confident label, which is worse than a refusal that says what to
 /// set. Its root override is optional and only consulted once its bucket
 /// resolves.
-fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
+fn scan_scope(
+    system: Option<&str>,
+) -> Result<(deja_orchestrator::system::RecordingBucket, String), String> {
     // Naming nothing means the default system, and the default system resolves
     // through the same registry as every other — declared, not special.
     // Delegates so that this endpoint, the correlation endpoint and the replay
@@ -794,6 +796,7 @@ async fn v1_systems() -> Response {
                 "is_default": s.is_default,
                 "configured": configured,
                 "s3_bucket": s.s3_bucket,
+                "s3_prefix": s.s3_prefix,
                 "recording_root": s.recording_root,
                 "manages_stores": s.manages_stores,
                 "manages_stores_declared": s.manages_stores_declared,
@@ -836,13 +839,16 @@ async fn v1_available_recordings(
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
     let root = match scan_scope(system_scope) {
-        Ok((bucket, root)) => {
-            cfg.bucket = bucket;
+        Ok((location, root)) => {
+            location.apply(&mut cfg);
             root
         }
         Err(message) => return error_resp(400, &message),
     };
     let scan_bucket = cfg.bucket.clone();
+    // The SCANNED config, bucket and prefix together, for the manifest
+    // enrichment below and for spelling each row's prefix in full.
+    let scanned = cfg.clone();
     let mut found = match tokio::task::spawn_blocking(move || {
         deja_compactor::list_landed_recordings(&cfg, &root)
     })
@@ -953,8 +959,7 @@ async fn v1_available_recordings(
     // in hyperswitch-art — finding nothing, and reporting every prism row as
     // unsealed with null counts. That failure is silent: "not sealed" is a valid
     // answer, so nothing downstream could tell it from the truth.
-    let mut cfg_for_manifests = deja_orchestrator::s3::S3Config::from_env();
-    cfg_for_manifests.bucket = scan_bucket.clone();
+    let cfg_for_manifests = scanned.clone();
     // This listing does not distinguish "not sealed" from "could not tell" —
     // read_manifests preserves that per-recording, a replay's membership check
     // needs it, this enrichment does not.
@@ -1077,7 +1082,8 @@ async fn v1_available_recordings(
                 "instances": r.instances,
                 // The prefix the orchestrator would ingest from. Reported so a
                 // run can be reproduced by hand, not so a caller has to supply it.
-                "prefix": r.prefix,
+                // In full, since it is read beside `bucket` as an `s3://` path.
+                "prefix": scanned.bucket_key(&r.prefix),
                 // Seal facts. Null, never zero, when the recording is unsealed.
                 "sealed": manifest.is_some(),
                 "correlations": manifest.map(|m| m.counts.correlations),
@@ -1325,13 +1331,14 @@ async fn v1_recording_correlations(
     // s3://<default>/landing/v1" about a recording that exists.
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let root = match scan_scope(q.system.as_deref().filter(|s| !s.trim().is_empty())) {
-        Ok((bucket, root)) => {
-            cfg.bucket = bucket;
+        Ok((location, root)) => {
+            location.apply(&mut cfg);
             root
         }
         Err(message) => return error_resp(400, &format!("{message} (reading correlations)")),
     };
-    let bucket = cfg.bucket.clone();
+    let searched = cfg.uri(&root);
+    let spelled = cfg.clone();
     let scanned = root.clone();
     let wanted = id.clone();
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
@@ -1438,7 +1445,7 @@ async fn v1_recording_correlations(
                 "offset": offset,
                 "limit": limit,
                 "correlations": serde_json::Value::Null,
-                "prefix": prefix,
+                "prefix": spelled.bucket_key(&prefix),
                 "detail": "recording has landed but is not sealed yet — its correlations are not \
                            knowable without ingesting it, which the first replay run of it does",
             }))
@@ -1460,10 +1467,9 @@ async fn v1_recording_correlations(
             "note": "sealed before the correlation index existed: the manifest knows how many \
                      correlations the seal covered but not which",
         })),
-        RecordingCorrelations::Unknown => error_resp(
-            404,
-            &format!("recording {id} is not in s3://{bucket}/{root}"),
-        ),
+        RecordingCorrelations::Unknown => {
+            error_resp(404, &format!("recording {id} is not in {searched}"))
+        }
     }
 }
 
@@ -3180,12 +3186,12 @@ mod tests {
         std::env::remove_var("DEJA_CONFIG_TOML");
 
         assert_eq!(
-            prism.as_ref().map(|(b, _)| b.as_str()),
+            prism.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("ucs-deja"),
             "a prism recording is in prism's bucket, whichever endpoint asks"
         );
         assert_eq!(
-            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("hyperswitch-art")
         );
         assert_eq!(hyperswitch, omitted, "naming the default is omitting it");
@@ -3203,7 +3209,7 @@ mod tests {
         std::env::set_var(
             "DEJA_CONFIG_TOML",
             format!(
-                "[systems.{default}]\ns3_bucket = \"declared-art\"\nrecording_root = \"landing/v7\"\n[systems.other]\ns3_bucket = \"other-art\"\n"
+                "[systems.{default}]\ns3_bucket = \"declared-art\"\nrecording_root = \"landing/v7\"\n[systems.other]\ns3_bucket = \"other-art\"\ns3_prefix = \"other/\"\n"
             ),
         );
         let named = scan_scope(Some(default));
@@ -3216,12 +3222,20 @@ mod tests {
             named, omitted,
             "the same scope, whichever way it is asked for"
         );
+        let at = |bucket: &str, prefix: &str| deja_orchestrator::system::RecordingBucket {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+        };
         assert_eq!(
             named,
-            Ok(("declared-art".to_owned(), "landing/v7".to_owned())),
+            Ok((at("declared-art", ""), "landing/v7".to_owned())),
             "the DECLARED bucket, not the orchestrator's own"
         );
-        assert_eq!(other, Ok(("other-art".to_owned(), "landing/v1".to_owned())));
+        assert_eq!(
+            other,
+            Ok((at("other-art", "other"), "landing/v1".to_owned())),
+            "a declared prefix travels with its bucket, normalised"
+        );
         let err = unknown.expect_err("an undeclared system is refused by name");
         assert!(
             err.contains("zzz") && err.contains("systems.zzz.s3_bucket"),

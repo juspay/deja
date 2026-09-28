@@ -447,6 +447,8 @@ export type SystemRow = {
   is_default: boolean;
   configured: boolean;
   s3_bucket?: string | null;
+  /** Directory inside the bucket this system's roots sit under; null is the bucket root. */
+  s3_prefix?: string | null;
   recording_root?: string | null;
   manages_stores: boolean;
   manages_stores_declared?: boolean | null;

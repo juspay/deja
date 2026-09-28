@@ -246,7 +246,7 @@ mod tests {
         // And what it receives is enough to resolve from: this is the call the
         // pull path makes at stage 1.
         assert_eq!(
-            crate::system::recording_scope("hyperswitch").map(|(b, _)| b),
+            crate::system::recording_scope("hyperswitch").map(|(b, _)| b.bucket),
             Ok("hyperswitch-art".to_owned()),
             "the pod's resolution succeeds on the carried document"
         );
