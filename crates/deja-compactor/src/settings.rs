@@ -210,13 +210,67 @@ pub fn load() -> Result<Settings, String> {
     let cfg = builder
         .build()
         .map_err(|e| format!("deja configuration could not be read: {e}"))?;
-    serde_path_to_error::deserialize::<_, Settings>(cfg).map_err(|e| {
+    let settings = serde_path_to_error::deserialize::<_, Settings>(cfg).map_err(|e| {
         format!(
             "deja configuration is invalid at `{}`: {}",
             e.path(),
             e.inner()
         )
-    })
+    })?;
+    shared_bucket_needs_distinct_roots(&settings)?;
+    Ok(settings)
+}
+
+/// Systems sharing a bucket are told apart by their prefixes alone, so two that
+/// resolve to the same root are refused here, naming both tables.
+///
+/// An undeclared `s3_bucket` is refused by name for the same reason: otherwise
+/// the sealer writes a seal into one system's `sessions/v1` from another's
+/// landing and nothing downstream can tell. A bucket per system gave that for
+/// free; a shared bucket rests it on the optional `s3_prefix` instead.
+///
+/// Only an identical root collides. Root beside a directory stays legal — a
+/// landing scan strips a literal root, so `landing/v1` never matches
+/// `hyperswitch/landing/v1`.
+fn shared_bucket_needs_distinct_roots(settings: &Settings) -> Result<(), String> {
+    let mut claimed: BTreeMap<(String, Option<String>), &str> = BTreeMap::new();
+    for (name, declared) in &settings.systems {
+        // A system with no bucket is not a collision: it is refused BY NAME when
+        // something resolves it, which names the field to set. Treating its
+        // absent bucket as one more empty string would collide every such system
+        // with every other.
+        let Some(bucket) = declared
+            .s3_bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        else {
+            continue;
+        };
+        // The SAME normalisation the resolver applies, so an absent prefix, a
+        // blank one, and `/` are one root here exactly as they are there. A
+        // guard that compared raw strings would pass a document that collides.
+        let prefix = declared
+            .s3_prefix
+            .as_deref()
+            .and_then(crate::layout::system_prefix);
+        if let Some(other) = claimed.insert((bucket.to_owned(), prefix.clone()), name.as_str()) {
+            return Err(match prefix {
+                None => format!(
+                    "systems.{other} and systems.{name} both sit at the root of bucket \
+                     '{bucket}': one system's recordings would be listed and sealed under the \
+                     other's name. Declare systems.{other}.s3_prefix and \
+                     systems.{name}.s3_prefix, or give them separate buckets"
+                ),
+                Some(p) => format!(
+                    "systems.{other} and systems.{name} both declare prefix '{p}' in bucket \
+                     '{bucket}': one system's recordings would be listed and sealed under the \
+                     other's name"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -323,6 +377,127 @@ s3_bucket = "ucs-deja"
             "the environment adds one; normalising it is the resolver's job"
         );
         assert_eq!(s.systems["solo"].s3_prefix, None);
+    }
+
+    /// One bucket, a directory each. This is the ap-south-2 layout and the case
+    /// the guard must NOT refuse.
+    #[test]
+    fn two_systems_in_one_bucket_with_their_own_prefixes_load() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\ns3_bucket = \"shared\"\ns3_prefix = \"hyperswitch\"\n\
+             [systems.prism]\ns3_bucket = \"shared\"\ns3_prefix = \"ucs\"\n",
+        );
+        let loaded = load();
+        clear();
+        assert!(
+            loaded.is_ok(),
+            "distinct prefixes share a bucket safely: {loaded:?}"
+        );
+    }
+
+    /// Both at the root of one bucket: each would list and seal the other's
+    /// recordings under its own name. The refusal names both tables and the
+    /// bucket, so an operator can act on it without reading the code.
+    #[test]
+    fn two_systems_at_the_root_of_one_bucket_are_refused_naming_both() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\ns3_bucket = \"shared\"\n\
+             [systems.prism]\ns3_bucket = \"shared\"\n",
+        );
+        let loaded = load();
+        clear();
+        let err = loaded.expect_err("two systems at one root is refused");
+        for named in [
+            "systems.hyperswitch",
+            "systems.prism",
+            "shared",
+            "s3_prefix",
+        ] {
+            assert!(err.contains(named), "refusal must name {named}: {err}");
+        }
+    }
+
+    /// An absent prefix and `/` are the same root. A guard comparing the raw
+    /// declared strings would pass this document and mislabel in production.
+    #[test]
+    fn a_slash_prefix_is_the_root_and_still_collides() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\ns3_bucket = \"shared\"\ns3_prefix = \"/\"\n\
+             [systems.prism]\ns3_bucket = \"shared\"\ns3_prefix = \"  \"\n",
+        );
+        let loaded = load();
+        clear();
+        assert!(
+            loaded.is_err(),
+            "`/` and blank both normalise to the root, so these collide: {loaded:?}"
+        );
+    }
+
+    /// The same directory twice is the same collision as the root twice.
+    #[test]
+    fn two_systems_declaring_one_prefix_in_one_bucket_are_refused() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\ns3_bucket = \"shared\"\ns3_prefix = \"art/\"\n\
+             [systems.prism]\ns3_bucket = \"shared\"\ns3_prefix = \"/art\"\n",
+        );
+        let loaded = load();
+        clear();
+        let err = loaded.expect_err("one prefix claimed twice is refused");
+        assert!(
+            err.contains("art"),
+            "refusal names the contested prefix: {err}"
+        );
+    }
+
+    /// A bucket per system with no prefix at all: what ap-south-1 runs today.
+    /// The guard must leave it alone, or it breaks the deployment it is meant to
+    /// protect.
+    #[test]
+    fn a_bucket_per_system_needs_no_prefix() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
+             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+        );
+        let loaded = load();
+        clear();
+        assert!(
+            loaded.is_ok(),
+            "separate buckets need no prefix: {loaded:?}"
+        );
+    }
+
+    /// An undeclared bucket is refused BY NAME when something resolves it, not
+    /// here. Two such systems must not collide on a phantom empty bucket, which
+    /// would refuse a document that is merely incomplete.
+    #[test]
+    fn systems_with_no_bucket_do_not_collide() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.one]\nmanages_stores = false\n[systems.two]\nmanages_stores = false\n",
+        );
+        let loaded = load();
+        clear();
+        assert!(
+            loaded.is_ok(),
+            "an absent bucket is not a claim on one: {loaded:?}"
+        );
     }
 
     #[test]
