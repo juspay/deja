@@ -10,6 +10,10 @@
 //!                                    ← per-correlation summary
 //!   sessions/v1/{id}/manifest.json   ← written LAST = the seal
 //!
+//! Both roots sit under the system's `s3_prefix` when it declares one, which
+//! `S3Config::build` applies; every key above, including the ones a manifest
+//! stores, is relative to that prefix.
+//!
 //! The manifest records per-instance `global_sequence` coverage (ranges,
 //! gaps, duplicates dropped), schema versions, code provenance, and counts —
 //! everything the catalog row and replay prep need without re-reading data.
@@ -106,18 +110,25 @@ const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const UPLOAD_CONCURRENCY: usize = 4;
 
 /// Connection settings. An EMPTY `endpoint` targets real AWS S3: object_store
-/// derives the virtual-hosted endpoint from `region` and uses the AWS
+/// derives the virtual-hosted endpoint from the region and uses the AWS
 /// credential chain (IRSA/web-identity) when no static credentials are set — so
-/// an in-cluster pod needs only region + bucket. A non-empty `endpoint` (the
-/// demo overlay's MinIO, host-published on 9100 with minioadmin credentials)
+/// an in-cluster pod needs only the bucket. A non-empty `endpoint` (the demo
+/// overlay's MinIO, host-published on 9100 with minioadmin credentials)
 /// overrides that for a self-hosted/S3-compatible store.
+#[derive(Clone)]
 pub struct S3Config {
-    /// Explicit S3 endpoint, or empty to derive the AWS endpoint from `region`.
+    /// Explicit S3 endpoint, or empty to derive the AWS endpoint from the region.
     pub endpoint: String,
     pub bucket: String,
+    /// The key prefix every key this config reads or writes sits under, so one
+    /// bucket can hold several systems. Empty is the bucket root. Applied by
+    /// [`S3Config::build`], never by a caller: see [`S3Config::scope_store`].
+    pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
-    pub region: String,
+    /// An explicitly configured region. `None` means "the bucket's own"; see
+    /// [`choose_region`] for the order the others are tried in.
+    pub region: Option<String>,
     pub allow_http: bool,
 }
 
@@ -129,9 +140,12 @@ impl S3Config {
             // demo overlay sets DEJA_S3_ENDPOINT explicitly for its MinIO.
             endpoint: env("DEJA_S3_ENDPOINT", ""),
             bucket: env("DEJA_S3_BUCKET", "deja-recordings"),
+            // The deployment's own bucket is addressed from its root; a
+            // system's prefix comes from its declaration, not from here.
+            prefix: String::new(),
             access_key: env("DEJA_S3_ACCESS_KEY", "minioadmin"),
             secret_key: env("DEJA_S3_SECRET_KEY", "minioadmin"),
-            region: env("DEJA_S3_REGION", "us-east-1"),
+            region: non_blank(std::env::var("DEJA_S3_REGION").ok().as_deref()),
             // Default true for the demo MinIO (plaintext); a real S3 endpoint
             // sets DEJA_S3_ALLOW_HTTP=false to require TLS.
             allow_http: env("DEJA_S3_ALLOW_HTTP", "true") != "false",
@@ -142,17 +156,37 @@ impl S3Config {
         !self.access_key.trim().is_empty() && !self.secret_key.trim().is_empty()
     }
 
+    fn has_custom_endpoint(&self) -> bool {
+        !self.endpoint.trim().is_empty()
+    }
+
+    /// The region this config talks to, resolved in [`choose_region`]'s order.
+    /// May look the bucket's region up over the network, once per bucket per
+    /// process.
+    pub fn effective_region(&self) -> String {
+        let env = |k: &str| std::env::var(k).ok();
+        choose_region(RegionInputs {
+            explicit: self.region.as_deref(),
+            custom_endpoint: self.has_custom_endpoint(),
+            bucket_region: || bucket_region(&self.bucket),
+            aws_region: env("AWS_REGION").as_deref(),
+            aws_default_region: env("AWS_DEFAULT_REGION").as_deref(),
+        })
+        .0
+    }
+
     pub fn build(&self) -> Result<DynStore, String> {
+        let region = self.effective_region();
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&self.bucket)
-            .with_region(&self.region)
+            .with_region(&region)
             .with_allow_http(self.allow_http);
 
         // Empty endpoint → let object_store derive the AWS virtual-hosted
         // endpoint from the region (real S3). A non-empty endpoint overrides it
         // (MinIO / S3-compatible). Passing an empty endpoint would break the
         // derived URL, so only set it when present.
-        if !self.endpoint.trim().is_empty() {
+        if self.has_custom_endpoint() {
             builder = builder.with_endpoint(&self.endpoint);
         }
 
@@ -163,7 +197,206 @@ impl S3Config {
         }
 
         let store = builder.build().map_err(|e| format!("s3 client: {e}"))?;
-        Ok(Arc::new(store))
+        Ok(self.scope_store(Arc::new(store)))
+    }
+
+    /// Confine `store` to this config's prefix.
+    ///
+    /// The one place a system prefix is applied to a key. Every read, write and
+    /// listing in this crate goes through a store from [`S3Config::build`], so
+    /// the landing, the seal's parts and index, and the manifest all move under
+    /// the prefix together, and keys inside deja stay relative to the system's
+    /// root. A listing through the wrapped store comes back relative too, so a
+    /// key read out of one is a key that can be read back through it.
+    ///
+    /// With no prefix the store is returned untouched: the keys are exactly the
+    /// ones a bucket-per-system deployment has always used.
+    pub fn scope_store(&self, store: DynStore) -> DynStore {
+        match layout::system_prefix(&self.prefix) {
+            None => store,
+            Some(prefix) => Arc::new(object_store::prefix::PrefixStore::new(
+                store,
+                prefix.as_str(),
+            )),
+        }
+    }
+
+    /// A key relative to this config's prefix, as the bucket spells it. For a
+    /// key that leaves deja as a string — a URI, a report, an error — since a
+    /// relative key read back without the prefix names a different object.
+    pub fn bucket_key(&self, key: &str) -> String {
+        layout::bucket_key(&self.prefix, key)
+    }
+
+    /// `s3://bucket/<bucket key>` for a key relative to this config's prefix.
+    pub fn uri(&self, key: &str) -> String {
+        format!("s3://{}/{}", self.bucket, self.bucket_key(key))
+    }
+}
+
+fn non_blank(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
+/// The region every earlier default fell back to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Which rule decided a region. Reported so a test, and a log, can say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionSource {
+    /// `DEJA_S3_REGION`, or a region a caller set on the config.
+    Explicit,
+    /// A custom endpoint (MinIO, the demo) with nothing explicit: the old
+    /// default, and no lookup, since that endpoint is not AWS.
+    CustomEndpoint,
+    /// The bucket's own region, from a HeadBucket.
+    Bucket,
+    AwsRegion,
+    AwsDefaultRegion,
+    Default,
+}
+
+/// What [`choose_region`] decides from. `bucket_region` is a closure so that
+/// the rule can be exercised without a network, and so that the lookup is not
+/// made at all when an earlier rule already decided.
+pub struct RegionInputs<'a, F: FnOnce() -> Option<String>> {
+    pub explicit: Option<&'a str>,
+    pub custom_endpoint: bool,
+    pub bucket_region: F,
+    pub aws_region: Option<&'a str>,
+    pub aws_default_region: Option<&'a str>,
+}
+
+/// The region to talk to a bucket in, first rule that answers wins:
+///
+/// 1. an explicit region;
+/// 2. a custom endpoint: [`DEFAULT_REGION`], without a lookup;
+/// 3. the bucket's own region;
+/// 4. `AWS_REGION`, then `AWS_DEFAULT_REGION`;
+/// 5. [`DEFAULT_REGION`].
+///
+/// The bucket comes before the pod's region because they differ exactly when
+/// it matters: an orchestrator in one region reading another region's bucket.
+/// Blank values count as absent.
+pub fn choose_region<F: FnOnce() -> Option<String>>(
+    inputs: RegionInputs<'_, F>,
+) -> (String, RegionSource) {
+    if let Some(r) = non_blank(inputs.explicit) {
+        return (r, RegionSource::Explicit);
+    }
+    if inputs.custom_endpoint {
+        return (DEFAULT_REGION.to_owned(), RegionSource::CustomEndpoint);
+    }
+    if let Some(r) = non_blank((inputs.bucket_region)().as_deref()) {
+        return (r, RegionSource::Bucket);
+    }
+    if let Some(r) = non_blank(inputs.aws_region) {
+        return (r, RegionSource::AwsRegion);
+    }
+    if let Some(r) = non_blank(inputs.aws_default_region) {
+        return (r, RegionSource::AwsDefaultRegion);
+    }
+    (DEFAULT_REGION.to_owned(), RegionSource::Default)
+}
+
+/// How long a failed bucket-region lookup is remembered before it is tried
+/// again. A success is remembered for the life of the process.
+const BUCKET_REGION_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Bounds the lookup so an unreachable endpoint costs seconds, not the client's
+/// default thirty.
+const BUCKET_REGION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum CachedRegion {
+    Found(String),
+    Failed(std::time::Instant),
+}
+
+fn region_cache() -> &'static std::sync::Mutex<BTreeMap<String, CachedRegion>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, CachedRegion>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The bucket's region, looked up once per bucket per process. `None` when the
+/// lookup failed; the failure is logged and the caller falls through to the
+/// next rule rather than failing.
+fn bucket_region(bucket: &str) -> Option<String> {
+    let bucket = bucket.trim();
+    if bucket.is_empty() {
+        return None;
+    }
+    {
+        let cache = region_cache().lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(bucket) {
+            Some(CachedRegion::Found(region)) => return Some(region.clone()),
+            Some(CachedRegion::Failed(at)) if at.elapsed() < BUCKET_REGION_RETRY => return None,
+            _ => {}
+        }
+    }
+    // Not under the lock: a slow lookup for one bucket must not stall every
+    // other bucket's client. Two threads may both look the same bucket up
+    // once; they get the same answer.
+    let looked_up = lookup_bucket_region(bucket);
+    let entry = match &looked_up {
+        Ok(region) => {
+            eprintln!("s3: bucket {bucket} is in {region}");
+            CachedRegion::Found(region.clone())
+        }
+        Err(e) => {
+            eprintln!(
+                "s3: could not look up the region of bucket {bucket} ({e}); falling back to \
+                 AWS_REGION, AWS_DEFAULT_REGION, then {DEFAULT_REGION}"
+            );
+            CachedRegion::Failed(std::time::Instant::now())
+        }
+    };
+    region_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(bucket.to_owned(), entry);
+    looked_up.ok()
+}
+
+/// One HeadBucket, on a thread of its own with a runtime of its own.
+///
+/// `build` is synchronous and is reached from plain threads, from
+/// `spawn_blocking`, and from the sealer's own runtime setup. Blocking on a
+/// runtime from inside another one panics, so the lookup never shares the
+/// caller's thread: whatever that thread is, this cannot nest.
+fn lookup_bucket_region(bucket: &str) -> Result<String, String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let options = object_store::ClientOptions::new()
+                    .with_timeout(BUCKET_REGION_TIMEOUT)
+                    .with_connect_timeout(BUCKET_REGION_TIMEOUT);
+                runtime()?
+                    .block_on(object_store::aws::resolve_bucket_region(bucket, &options))
+                    .map_err(|e| e.to_string())
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the lookup thread panicked".to_owned()))
+    })
+}
+
+/// Where one system's recordings are kept: its bucket, and the prefix its roots
+/// sit under inside it (empty for the bucket root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingBucket {
+    pub bucket: String,
+    pub prefix: String,
+}
+
+impl RecordingBucket {
+    /// Point `cfg` at these recordings. The bucket and the prefix are set
+    /// together because a config holding one without the other reads the
+    /// right bucket at the wrong keys, and finds nothing without saying so.
+    pub fn apply(&self, cfg: &mut S3Config) {
+        cfg.bucket = self.bucket.clone();
+        cfg.prefix = self.prefix.clone();
     }
 }
 
@@ -253,8 +486,50 @@ pub fn recording_root_for(system: &str) -> Result<String, String> {
 /// The landing layout a system uses unless it declares another.
 pub const DEFAULT_RECORDING_ROOT: &str = "landing/v1";
 
+/// The key prefix `system`'s roots sit under inside its bucket, normalised;
+/// empty for the bucket root.
+///
+/// Optional, unlike the bucket: a system with no prefix owns its bucket and
+/// its roots are at the top, which is how every bucket-per-system deployment
+/// is laid out. The prefix applies to BOTH roots, the landing and the sealed
+/// sessions, so a declared `recording_root` is written without it.
+pub fn prefix_for_system(system: &str) -> Result<String, String> {
+    Ok(settings::load()?
+        .systems
+        .get(system)
+        .and_then(|d| d.s3_prefix.as_deref())
+        .and_then(layout::system_prefix)
+        .unwrap_or_default())
+}
+
 /// Key layout for one session in the bucket.
+///
+/// Every key here is RELATIVE to the system's root. A system that shares a
+/// bucket declares a prefix, and [`crate::S3Config::build`] confines the store
+/// to it, so these functions never see one.
 pub mod layout {
+    /// The root every sealed session lives under.
+    pub const SESSIONS_ROOT: &str = "sessions/v1";
+
+    /// A system's key prefix, normalised, or `None` for the bucket root.
+    ///
+    /// `prism`, `prism/` and `/prism/` are one prefix; blank is none. This is
+    /// the only reading of a declared prefix, used both to confine a store and
+    /// to spell a key in full, so the two cannot disagree.
+    pub fn system_prefix(prefix: &str) -> Option<String> {
+        let p = prefix.trim().trim_matches('/');
+        (!p.is_empty()).then(|| p.to_owned())
+    }
+
+    /// A key relative to a system's root, as the bucket spells it. With no
+    /// prefix, the key unchanged.
+    pub fn bucket_key(prefix: &str, key: &str) -> String {
+        match system_prefix(prefix) {
+            None => key.to_owned(),
+            Some(p) => format!("{p}/{}", key.trim_start_matches('/')),
+        }
+    }
+
     /// The flat landing prefix for a session under an EXPLICIT root. Pure, so
     /// the key shape can be asserted without the environment taking part.
     pub fn landing_prefix_in(root: &str, session_id: &str) -> String {
@@ -262,7 +537,7 @@ pub mod layout {
     }
 
     pub fn session_root(session_id: &str) -> String {
-        format!("sessions/v1/{session_id}")
+        format!("{SESSIONS_ROOT}/{session_id}")
     }
 
     /// The directory component that scopes one seal's objects, or nothing for
@@ -2784,9 +3059,10 @@ mod tests {
         let mut cfg = S3Config {
             endpoint: "http://127.0.0.1:9100".to_owned(),
             bucket: "deja-recordings".to_owned(),
+            prefix: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
-            region: "us-east-1".to_owned(),
+            region: Some("us-east-1".to_owned()),
             allow_http: true,
         };
 
@@ -4889,6 +5165,34 @@ s3_bucket = "ucs-deja"
         out
     }
 
+    /// One bucket, a directory per system: the sealer's scope carries each
+    /// system's prefix, normalised, onto the config it seals with.
+    #[test]
+    fn the_sealer_scopes_a_shared_bucket_by_each_systems_prefix() {
+        let _lock = test_env::env_guard();
+        let doc = "[systems.hyperswitch]\ns3_bucket = \"shared\"\ns3_prefix = \"hyperswitch\"\n\
+                   [systems.prism]\ns3_bucket = \"shared\"\ns3_prefix = \"prism/\"\n\
+                   [systems.solo]\ns3_bucket = \"solo\"\ns3_prefix = \" \"\n";
+        with_doc(doc, || {
+            let (cfg, root) = pass::scope_for_system("prism").unwrap();
+            assert_eq!(
+                (cfg.bucket.as_str(), cfg.prefix.as_str()),
+                ("shared", "prism")
+            );
+            assert_eq!(
+                root, DEFAULT_RECORDING_ROOT,
+                "the root stays relative to the prefix"
+            );
+            assert_eq!(prefix_for_system("hyperswitch").unwrap(), "hyperswitch");
+            assert_eq!(
+                prefix_for_system("solo").unwrap(),
+                "",
+                "blank is the bucket root"
+            );
+            assert_eq!(prefix_for_system("undeclared").unwrap(), "");
+        });
+    }
+
     #[test]
     fn the_sealer_resolves_the_deployed_document_the_way_the_orchestrator_does() {
         // Two readers, one document. The orchestrator resolves a system to
@@ -4903,6 +5207,9 @@ s3_bucket = "ucs-deja"
             // Neither declares a root, so both use the standard layout — the
             // same default `scan_scope` applies.
             assert_eq!(recording_root_for("prism").unwrap(), DEFAULT_RECORDING_ROOT);
+            // Nor a prefix: a bucket per system keeps its roots at the top.
+            assert_eq!(prefix_for_system("prism").unwrap(), "");
+            assert_eq!(pass::scope_for_system("hyperswitch").unwrap().0.prefix, "");
         });
     }
 
@@ -5024,6 +5331,325 @@ s3_bucket = "ucs-deja"
                     "and it is refused when the pass reaches it"
                 );
             },
+        );
+    }
+
+    // -- system prefix ------------------------------------------------------
+
+    fn cfg_at(prefix: &str) -> S3Config {
+        S3Config {
+            endpoint: String::new(),
+            bucket: "shared".to_owned(),
+            prefix: prefix.to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: Some("ap-south-2".to_owned()),
+            allow_http: false,
+        }
+    }
+
+    /// Every key the BUCKET holds, sorted: the view of the store below the
+    /// prefix seam, which is what a recorder writing the landing and an
+    /// operator listing the bucket both see.
+    fn bucket_keys(base: &DynStore) -> Vec<String> {
+        block(list_keys(base, ""))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect()
+    }
+
+    /// One session landed at `{prefix}/landing/v1/...` in `base`, sealed
+    /// through the store `cfg_at(prefix)` scopes, the way the sealer and every
+    /// reader reach it. Returns the manifest.
+    fn land_and_seal_at(base: &DynStore, prefix: &str) -> SessionManifest {
+        let landing = layout::bucket_key(
+            prefix,
+            &format!(
+                "{}/inst=i1/0.ndjson",
+                layout::landing_prefix_in(DEFAULT_RECORDING_ROOT, "s1")
+            ),
+        );
+        put_object_at(
+            base,
+            &landing,
+            &[
+                envelope_for("s1", "i1", 1, Some("c1")),
+                envelope_for("s1", "i1", 2, Some("c2")),
+            ],
+        );
+        let scoped = cfg_at(prefix).scope_store(base.clone());
+        sealed(
+            block(compact_session_inner(
+                &scoped,
+                "s1",
+                DEFAULT_RECORDING_ROOT,
+                None,
+            ))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_prefix_is_read_one_way_whatever_its_slashes() {
+        for p in ["prism", "prism/", "/prism/", " prism/ "] {
+            assert_eq!(layout::system_prefix(p).as_deref(), Some("prism"), "{p:?}");
+        }
+        for p in ["", " ", "/", "//"] {
+            assert_eq!(layout::system_prefix(p), None, "{p:?} is the bucket root");
+        }
+        assert_eq!(
+            layout::bucket_key("prism/", "landing/v1/session=s1"),
+            "prism/landing/v1/session=s1"
+        );
+        assert_eq!(
+            layout::bucket_key("", "landing/v1/session=s1"),
+            "landing/v1/session=s1",
+            "no prefix spells a key exactly as it always was"
+        );
+        assert_eq!(
+            cfg_at("prism/").uri("sessions/v1/s1"),
+            "s3://shared/prism/sessions/v1/s1"
+        );
+        assert_eq!(
+            cfg_at("").uri("sessions/v1/s1"),
+            "s3://shared/sessions/v1/s1"
+        );
+    }
+
+    /// Every root a seal touches moves under the prefix together: the landing
+    /// it reads, the parts, the index and the manifest it writes, and each
+    /// reader of those. Checked from BELOW the seam, in the bucket's own keys.
+    #[test]
+    fn a_prefixed_system_lands_seals_and_reads_under_its_prefix() {
+        let base = memory();
+        let manifest = land_and_seal_at(&base, "prism");
+        let keys = bucket_keys(&base);
+        assert!(
+            keys.iter().all(|k| k.starts_with("prism/")),
+            "nothing is written outside the prefix: {keys:?}"
+        );
+        let expect = [
+            format!("prism/{}", layout::manifest_key("s1")),
+            format!(
+                "prism/{}",
+                layout::correlations_key("s1", &manifest.seal_id)
+            ),
+            format!("prism/{}", layout::part_key("s1", &manifest.seal_id, 0)),
+            "prism/landing/v1/session=s1/inst=i1/0.ndjson".to_owned(),
+        ];
+        for key in &expect {
+            assert!(keys.contains(key), "{key} missing from {keys:?}");
+        }
+        assert_eq!(keys.len(), expect.len(), "{keys:?}");
+
+        // Every reader, through the scoped store.
+        let scoped = cfg_at("prism").scope_store(base.clone());
+        let read = block(manifest_of(&scoped, "s1")).unwrap().expect("sealed");
+        assert_eq!(read.seal_id, manifest.seal_id);
+        let rows = block(correlation_index_of(&scoped, &read)).unwrap();
+        assert_eq!(rows.map(|r| r.len()), Some(2), "the index is found");
+        assert_eq!(block(session_lines(&scoped, &read)).unwrap().len(), 2);
+        let listed: Vec<String> = block(list_keys(&scoped, DEFAULT_RECORDING_ROOT))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect();
+        let landed = index_landed_keys(DEFAULT_RECORDING_ROOT, &listed);
+        assert_eq!(landed.len(), 1);
+        assert_eq!(
+            landed[0].prefix, "landing/v1/session=s1",
+            "a listing comes back relative to the system's root"
+        );
+        assert!(
+            !matches!(
+                block(readiness_of(&scoped, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap(),
+                SealReadiness::Absent
+            ),
+            "readiness finds the landing"
+        );
+
+        // And the unscoped bucket does not answer as though it were prism's.
+        assert!(block(manifest_of(&base, "s1")).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_move_a_single_key() {
+        let (a, b) = (memory(), memory());
+        let with = land_and_seal_at(&a, "prism");
+        let slashed = land_and_seal_at(&b, "prism/");
+        assert_eq!(bucket_keys(&a), bucket_keys(&b));
+        assert_eq!(with.seal_id, slashed.seal_id);
+    }
+
+    /// An undeclared prefix is today's layout, key for key, and the store is
+    /// handed back untouched rather than wrapped in a no-op.
+    #[test]
+    fn an_empty_prefix_is_todays_keys() {
+        let base = memory();
+        let manifest = land_and_seal_at(&base, "");
+        let mut expect = vec![
+            layout::correlations_key("s1", &manifest.seal_id),
+            layout::part_key("s1", &manifest.seal_id, 0),
+            layout::manifest_key("s1"),
+            "landing/v1/session=s1/inst=i1/0.ndjson".to_owned(),
+        ];
+        expect.sort();
+        assert_eq!(bucket_keys(&base), expect);
+        assert_eq!(
+            layout::manifest_key("s1"),
+            "sessions/v1/s1/manifest.json",
+            "the unprefixed layout itself has not moved"
+        );
+        for blank in ["", " ", "/"] {
+            let scoped = cfg_at(blank).scope_store(base.clone());
+            assert!(Arc::ptr_eq(&scoped, &base), "{blank:?} wraps nothing");
+        }
+    }
+
+    /// A manifest's keys are relative to the system's root, so they never
+    /// carry the prefix they were sealed under — and the seal's address, which
+    /// hashes content, does not move with it either.
+    #[test]
+    fn a_manifest_sealed_under_a_prefix_stores_keys_without_it() {
+        let (prefixed, bare) = (memory(), memory());
+        let under = land_and_seal_at(&prefixed, "hyperswitch");
+        let root = land_and_seal_at(&bare, "");
+        assert!(!under.data_parts.is_empty());
+        for part in &under.data_parts {
+            assert!(
+                part.key.starts_with("sessions/v1/"),
+                "a part key is relative to the system root: {}",
+                part.key
+            );
+        }
+        assert_eq!(
+            under.seal_id, root.seal_id,
+            "the address hashes content, not keys"
+        );
+        let keys = |m: &SessionManifest| {
+            m.data_parts
+                .iter()
+                .map(|p| p.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&under), keys(&root));
+    }
+
+    /// The migration: a bucket sealed by today's code, copied verbatim under a
+    /// prefix (`aws s3 sync s3://old/ s3://new/hyperswitch/`), reads back
+    /// through that prefix with nothing rewritten.
+    #[test]
+    fn a_plain_copy_under_a_prefix_reads_without_rewriting() {
+        let old = memory();
+        let manifest = land_and_seal_at(&old, "");
+        let lines = block(session_lines(&old, &manifest)).unwrap();
+
+        let new = memory();
+        for key in bucket_keys(&old) {
+            let bytes = block(async {
+                old.get(&object_store::path::Path::from(key.as_str()))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            });
+            block(new.put(
+                &object_store::path::Path::from(format!("hyperswitch/{key}")),
+                bytes.into(),
+            ))
+            .unwrap();
+        }
+
+        let scoped = cfg_at("hyperswitch").scope_store(new.clone());
+        let read = block(manifest_of(&scoped, "s1"))
+            .unwrap()
+            .expect("the copy is sealed");
+        assert_eq!(
+            read.data_parts[0].key, manifest.data_parts[0].key,
+            "the copied manifest is byte for byte the old one"
+        );
+        assert_eq!(block(session_lines(&scoped, &read)).unwrap(), lines);
+        assert_eq!(
+            block(correlation_index_of(&scoped, &read))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(2)
+        );
+    }
+
+    // -- region -------------------------------------------------------------
+
+    fn never() -> Option<String> {
+        panic!("the bucket's region was looked up when an earlier rule had decided")
+    }
+
+    #[test]
+    fn an_explicit_region_wins_and_nothing_is_looked_up() {
+        let got = choose_region(RegionInputs {
+            explicit: Some("ap-south-1"),
+            custom_endpoint: true,
+            bucket_region: never,
+            aws_region: Some("eu-west-1"),
+            aws_default_region: Some("eu-west-2"),
+        });
+        assert_eq!(got, ("ap-south-1".to_owned(), RegionSource::Explicit));
+    }
+
+    #[test]
+    fn a_custom_endpoint_keeps_the_old_default_without_a_lookup() {
+        let got = choose_region(RegionInputs {
+            explicit: Some("  "),
+            custom_endpoint: true,
+            bucket_region: never,
+            aws_region: Some("eu-west-1"),
+            aws_default_region: None,
+        });
+        assert_eq!(
+            got,
+            (DEFAULT_REGION.to_owned(), RegionSource::CustomEndpoint)
+        );
+    }
+
+    #[test]
+    fn the_buckets_region_comes_before_the_pods() {
+        let got = choose_region(RegionInputs {
+            explicit: None,
+            custom_endpoint: false,
+            bucket_region: || Some("ap-south-2".to_owned()),
+            aws_region: Some("ap-south-1"),
+            aws_default_region: Some("ap-south-1"),
+        });
+        assert_eq!(got, ("ap-south-2".to_owned(), RegionSource::Bucket));
+    }
+
+    #[test]
+    fn a_failed_lookup_falls_through_in_order() {
+        let pick = |aws: Option<&str>, default: Option<&str>| {
+            choose_region(RegionInputs {
+                explicit: None,
+                custom_endpoint: false,
+                bucket_region: || None,
+                aws_region: aws,
+                aws_default_region: default,
+            })
+        };
+        assert_eq!(
+            pick(Some("eu-west-1"), Some("eu-west-2")),
+            ("eu-west-1".to_owned(), RegionSource::AwsRegion)
+        );
+        assert_eq!(
+            pick(Some(""), Some("eu-west-2")),
+            ("eu-west-2".to_owned(), RegionSource::AwsDefaultRegion)
+        );
+        assert_eq!(
+            pick(None, None),
+            (DEFAULT_REGION.to_owned(), RegionSource::Default)
+        );
+        assert_eq!(
+            DEFAULT_REGION, "us-east-1",
+            "the default every deployment had"
         );
     }
 }

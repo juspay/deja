@@ -54,6 +54,11 @@ pub struct SystemDeclaration {
     pub s3_bucket: Option<String>,
     /// Key prefix under the bucket; the deployment-wide root when unset.
     pub recording_root: Option<String>,
+    /// The directory inside the bucket this system's roots sit under, for a
+    /// bucket shared by several systems: `prism` puts its landing at
+    /// `prism/landing/v1` and its seals at `prism/sessions/v1`. Unset or blank
+    /// is the bucket root. A trailing slash is ignored.
+    pub s3_prefix: Option<String>,
 
     // ---- what a candidate is ----
     /// Registry a bare candidate reference is qualified against.
@@ -291,6 +296,33 @@ s3_bucket = "ucs-deja"
             Some(&["ucs::".to_owned(), "connector::".to_owned()][..]),
             "a comma string in the environment is a list"
         );
+    }
+
+    /// `s3_prefix` is declared like `s3_bucket`: in the document, overridable
+    /// by `DEJA__SYSTEMS__<NAME>__S3_PREFIX`, absent when nobody says.
+    #[test]
+    fn a_systems_prefix_is_declared_and_overridden_like_its_bucket() {
+        let _lock = env_guard();
+        clear();
+        std::env::set_var(
+            "DEJA_CONFIG_TOML",
+            "[systems.hyperswitch]\ns3_bucket = \"shared\"\ns3_prefix = \"from-toml\"\n\
+             [systems.prism]\ns3_bucket = \"shared\"\n\
+             [systems.solo]\ns3_bucket = \"solo\"\n",
+        );
+        std::env::set_var("DEJA__SYSTEMS__PRISM__S3_PREFIX", "prism/");
+        let s = load().expect("loads");
+        clear();
+        assert_eq!(
+            s.systems["hyperswitch"].s3_prefix.as_deref(),
+            Some("from-toml")
+        );
+        assert_eq!(
+            s.systems["prism"].s3_prefix.as_deref(),
+            Some("prism/"),
+            "the environment adds one; normalising it is the resolver's job"
+        );
+        assert_eq!(s.systems["solo"].s3_prefix, None);
     }
 
     #[test]

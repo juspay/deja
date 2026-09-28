@@ -5554,9 +5554,9 @@ fn wait_s3_objects(recording_id: &str, system: &str, timeout: Duration) -> Resul
     // One call for both halves. Resolving the bucket here and the root at the
     // count below, through two functions, is how a later call site comes to
     // resolve one and forget the other — which is the defect this pair fixes.
-    let (bucket, root) = crate::system::recording_scope(system)?;
+    let (location, root) = crate::system::recording_scope(system)?;
     let mut cfg = crate::s3::S3Config::from_env();
-    cfg.bucket = bucket;
+    location.apply(&mut cfg);
     let deadline = Instant::now() + timeout;
     let mut last = 0usize;
     let mut stable = 0u8;
@@ -5636,6 +5636,17 @@ fn empty_group_error(
     ))
 }
 
+/// The source the unsealed pull rescans, for a landing prefix located through
+/// `cfg`. The located prefix is relative to the system's root; a source is a
+/// URI, read from the bucket's root, so the prefix is spelled into it once.
+fn unsealed_source(cfg: &crate::s3::S3Config, located: &str) -> crate::S3Source {
+    crate::S3Source {
+        path: cfg.uri(located),
+        region: cfg.region.clone(),
+        endpoint: (!cfg.endpoint.trim().is_empty()).then(|| cfg.endpoint.clone()),
+    }
+}
+
 fn pull_recording(
     root: &HarnessRoot,
     ctx: &StoreCtx,
@@ -5647,9 +5658,9 @@ fn pull_recording(
     // in another system's bucket failed "no landing objects" for a recording the
     // listing had just offered — a failure BEFORE admission, which is why
     // admission's own ingress gap was never the first obstacle.
-    let (bucket, landing_root) = crate::system::recording_scope(system)?;
+    let (location, landing_root) = crate::system::recording_scope(system)?;
     let mut cfg = crate::s3::S3Config::from_env();
-    cfg.bucket = bucket;
+    location.apply(&mut cfg);
     // WHICH KIND OF NAME IS THIS — asked FIRST, before anything tries to find a
     // session by it.
     //
@@ -5682,15 +5693,11 @@ fn pull_recording(
         let prefix = deja_compactor::locate_landing_prefix(&cfg, recording_id, &root_prefix)?
             .ok_or_else(|| {
                 format!(
-                    "recording {recording_id} is not in s3://{}/{root_prefix} — it was never                      landed, or it landed under a different root",
-                    cfg.bucket
+                    "recording {recording_id} is not in {} — it was never                      landed, or it landed under a different root",
+                    cfg.uri(&root_prefix)
                 )
             })?;
-        let source = crate::S3Source {
-            path: format!("s3://{}/{prefix}", cfg.bucket),
-            region: Some(cfg.region.clone()),
-            endpoint: (!cfg.endpoint.trim().is_empty()).then(|| cfg.endpoint.clone()),
-        };
+        let source = unsealed_source(&cfg, &prefix);
         resolve_recording_from_source(root, ctx, &source, Some(recording_id))?;
         return Ok(());
     }
@@ -5782,7 +5789,7 @@ fn pull_recording(
             if let Some(err) = empty_group_error(
                 recording_id,
                 &cfg.bucket,
-                &landing_root,
+                &cfg.bucket_key(&landing_root),
                 ids.len(),
                 &excluded,
             ) {
@@ -6316,6 +6323,30 @@ mod tests {
     /// "wait 30 minutes" message sends the reader to wait on the wrong thing.
     /// The fresh group from a custom build is an identifier nobody has typed
     /// before, which makes a typo the likeliest first failure.
+    /// A system in a shared bucket rescans its landing at the prefixed key,
+    /// and one with a bucket of its own at exactly the key it always did.
+    #[test]
+    fn the_unsealed_pull_spells_the_systems_prefix_into_its_source() {
+        let cfg = |prefix: &str| crate::s3::S3Config {
+            endpoint: String::new(),
+            bucket: "shared".to_owned(),
+            prefix: prefix.to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: Some("ap-south-2".to_owned()),
+            allow_http: false,
+        };
+        let located = "landing/v1/dt=2026-09-28/session=rec-a";
+        assert_eq!(
+            super::unsealed_source(&cfg("prism/"), located).path,
+            "s3://shared/prism/landing/v1/dt=2026-09-28/session=rec-a"
+        );
+        assert_eq!(
+            super::unsealed_source(&cfg(""), located).path,
+            "s3://shared/landing/v1/dt=2026-09-28/session=rec-a"
+        );
+    }
+
     #[test]
     fn an_empty_group_is_not_told_to_wait_for_the_sealer() {
         let err = super::empty_group_error("grp-typo", "bkt", "landing/v1", 0, &[])

@@ -25,14 +25,13 @@ fn expected() -> BTreeMap<&'static str, (usize, &'static str)> {
         (
             "src/main.rs",
             (
-                6,
-                "three recording readers that overwrite the bucket from `scan_scope` \
-                 (the listing, its correlations sibling, and the listing's manifest \
-                 enrichment, which must use the SCANNED bucket or it looks for a \
-                 prism recording's seal in hyperswitch-art and reports every row \
-                 unsealed), and three that take the bucket from a parsed `s3://` \
-                 artifact URI (hydration, the raw fetch, and the delta's check that an \
-                 expired ingest report is gone)",
+                5,
+                "two recording readers that apply `scan_scope`'s bucket and prefix \
+                 (the listing, whose manifest enrichment clones the SCANNED config \
+                 rather than building its own, and its correlations sibling), and \
+                 three that take the bucket from a parsed `s3://` artifact URI \
+                 (hydration, the raw fetch, and the delta's check that an expired \
+                 ingest report is gone)",
             ),
         ),
         (
@@ -40,8 +39,8 @@ fn expected() -> BTreeMap<&'static str, (usize, &'static str)> {
             (
                 3,
                 "the run-artifact sink, which is deployment-owned; and the landing \
-                 poll and the pull, which overwrite the bucket from \
-                 `system::recording_scope`",
+                 poll and the pull, which apply `system::recording_scope`'s bucket \
+                 and prefix",
             ),
         ),
         (
@@ -162,6 +161,36 @@ fn every_deployment_bucket_read_is_accounted_for() {
             found.contains_key(*file),
             "{file} no longer reads the deployment bucket — remove it from this test's list so \
              the accounting stays exact rather than aspirational"
+        );
+    }
+}
+
+/// A resolved recording scope is a bucket AND the prefix inside it. A reader
+/// that copied only the bucket onto its config would read the right bucket at
+/// the wrong keys, and a shared bucket answers that with nothing rather than an
+/// error. So each resolving reader must apply the scope whole, and this counts
+/// that it does, one apply per resolution.
+#[test]
+fn every_resolved_recording_scope_is_applied_whole() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shipped = |file: &str| {
+        let text = std::fs::read_to_string(root.join(file)).expect("read source");
+        text.split_once("#[cfg(test)]")
+            .map(|(before, _)| before.to_owned())
+            .unwrap_or(text)
+    };
+    for (file, resolutions) in [("src/lifecycle/mod.rs", 2), ("src/main.rs", 2)] {
+        let text = shipped(file);
+        assert_eq!(
+            text.matches("location.apply(&mut cfg)").count(),
+            resolutions,
+            "{file}: every recording scope it resolves must be applied with \
+             `RecordingBucket::apply`, which sets the bucket and the prefix together"
+        );
+        assert_eq!(
+            text.matches("location.bucket").count(),
+            0,
+            "{file} reads a resolved scope's bucket on its own; apply the scope whole"
         );
     }
 }

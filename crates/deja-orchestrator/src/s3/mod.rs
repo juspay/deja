@@ -32,10 +32,10 @@ pub use deja_compactor::S3Config;
 /// answering costs one manifest GET (plus one sidecar GET for the rows).
 pub use deja_compactor::{correlation_count, read_correlation_index, CorrelationSummary};
 
-/// The prefix every sealed session lives under. Named here rather than spelled
-/// inline so the one place a selection's `prefix` is derived cannot drift from
-/// the layout that produces the per-session roots.
-const SESSIONS_ROOT: &str = "sessions/v1";
+/// The prefix every sealed session lives under: the compactor's own, so the
+/// one place a selection's `prefix` is derived cannot drift from the layout
+/// that produces the per-session roots.
+use deja_compactor::layout::SESSIONS_ROOT;
 
 /// What `pull_recording` reports back (persisted next to the events file,
 /// registered as a run artifact, folded into the catalog row).
@@ -45,6 +45,9 @@ pub struct IngestReport {
     /// recording that is its session root; for a selection it is the root they
     /// share, because no single session root describes a selection and naming
     /// one of them would name a fraction of it.
+    ///
+    /// Relative to the system's root, like the manifest's own keys, so a
+    /// recording copied under a prefix is still described correctly.
     ///
     /// Deliberately never prose. This is a serialised field persisted beside
     /// the events file and folded into the catalog row, so a consumer outside
@@ -1232,8 +1235,8 @@ pub fn pull_recording_from_prefix(
     let keys = deja_compactor::list_objects(cfg, prefix)?;
     if keys.is_empty() {
         return Err(format!(
-            "no objects under s3://{}/{prefix} — check the path (and that the recording window landed)",
-            cfg.bucket
+            "no objects under {} — check the path (and that the recording window landed)",
+            cfg.uri(prefix)
         ));
     }
 
@@ -1282,8 +1285,8 @@ pub fn pull_recording_from_prefix(
         Some(want) => {
             if !by_session.contains_key(want) {
                 return Err(format!(
-                    "session '{want}' not found under s3://{}/{prefix}; sessions seen: {}",
-                    cfg.bucket,
+                    "session '{want}' not found under {}; sessions seen: {}",
+                    cfg.uri(prefix),
                     describe_sessions(&seen)
                 ));
             }
@@ -1293,14 +1296,14 @@ pub fn pull_recording_from_prefix(
             1 => seen[0].0.clone(),
             0 => {
                 return Err(format!(
-                    "objects under s3://{}/{prefix} contained no envelope lines",
-                    cfg.bucket
+                    "objects under {} contained no envelope lines",
+                    cfg.uri(prefix)
                 ))
             }
             _ => {
                 return Err(format!(
-                    "multiple sessions under s3://{}/{prefix} — pick one as the recording id: {}",
-                    cfg.bucket,
+                    "multiple sessions under {} — pick one as the recording id: {}",
+                    cfg.uri(prefix),
                     describe_sessions(&seen)
                 ))
             }
@@ -1356,7 +1359,7 @@ pub fn pull_recording_from_prefix(
         // root — it is the deployed-aggregator rescan, not a sealed pull — so
         // the prefix is that bucket URI and `members` still names the one
         // session the scan resolved out of it.
-        prefix: format!("s3://{}/{prefix}", cfg.bucket),
+        prefix: cfg.uri(prefix),
         members: vec![resolved.clone()],
         // One session, resolved whole: nothing was left out.
         excluded_members: Vec::new(),

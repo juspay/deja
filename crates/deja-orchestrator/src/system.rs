@@ -87,6 +87,9 @@ pub struct SystemConfig {
     /// `DEJA_<SYSTEM>_RECORDING_ROOT`. `None` = the deployment-wide root. The
     /// key LAYOUT is shared across systems; only the bucket is per-system.
     pub recording_root: Option<String>,
+    /// The directory inside the bucket this system's roots sit under,
+    /// normalised (no trailing slash). `None` = the bucket root.
+    pub s3_prefix: Option<String>,
     /// Whether the harness migrates this system's postgres, gates its schema
     /// fingerprint, flushes redis and materialises the seed plan.
     pub manages_stores: bool,
@@ -305,6 +308,10 @@ pub fn system_config(name: &str) -> SystemConfig {
         is_default,
         s3_bucket: clean(d.s3_bucket),
         recording_root: clean(d.recording_root),
+        s3_prefix: d
+            .s3_prefix
+            .as_deref()
+            .and_then(deja_compactor::layout::system_prefix),
         manages_stores: d.manages_stores.unwrap_or(is_default),
         manages_stores_declared: d.manages_stores,
         has_code_bundle: d.has_code_bundle.unwrap_or(is_default),
@@ -356,7 +363,11 @@ pub fn system_config(name: &str) -> SystemConfig {
 /// No fallback to the deployment's own bucket. A system that has not declared
 /// where its recordings are is refused BY NAME, because scanning somebody
 /// else's bucket under this system's label does not fail — it answers wrongly.
-pub fn recording_scope(system: &str) -> Result<(String, String), String> {
+///
+/// The bucket comes back with the system's prefix inside it, as one value a
+/// caller applies to its config whole (`RecordingBucket::apply`), and the root
+/// is relative to that prefix.
+pub fn recording_scope(system: &str) -> Result<(RecordingBucket, String), String> {
     let profile = system_config(system);
     let bucket = profile.s3_bucket.ok_or_else(|| {
         format!(
@@ -367,11 +378,20 @@ pub fn recording_scope(system: &str) -> Result<(String, String), String> {
         .recording_root
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_RECORDING_ROOT.to_owned());
-    Ok((bucket, root))
+    Ok((
+        RecordingBucket {
+            bucket,
+            prefix: profile.s3_prefix.unwrap_or_default(),
+        },
+        root,
+    ))
 }
 
-/// The key root a system falls back to when it declares none.
-pub const DEFAULT_RECORDING_ROOT: &str = "landing/v1";
+pub use deja_compactor::RecordingBucket;
+
+/// The key root a system falls back to when it declares none. The compactor's,
+/// so the sealer and the readers cannot disagree about it.
+pub use deja_compactor::DEFAULT_RECORDING_ROOT;
 
 #[must_use]
 pub fn registry() -> Vec<SystemConfig> {
@@ -672,6 +692,7 @@ source_repo = "juspay/hyperswitch-prism""#;
 [systems.regsys-full]
 s3_bucket = "regsys-bucket"
 recording_root = "landing/v9"
+s3_prefix = "regsys/"
 candidate_image_repo = "registry.example/repo/"
 candidate_env_prefix = "X__"
 candidate_run_id_env = "LEGACY_RUN"
@@ -692,6 +713,7 @@ scored_span_namespaces = ["a::", "b::"]
         assert!(!c.is_default);
         assert_eq!(c.s3_bucket.as_deref(), Some("regsys-bucket"));
         assert_eq!(c.recording_root.as_deref(), Some("landing/v9"));
+        assert_eq!(c.s3_prefix.as_deref(), Some("regsys"));
         // Trailing slash stripped, so joining a reference cannot double it.
         assert_eq!(
             c.candidate_image_repo.as_deref(),
@@ -741,17 +763,17 @@ scored_span_namespaces = ["a::", "b::"]
         clear();
 
         assert_eq!(
-            prism.as_ref().map(|(b, _)| b.as_str()),
+            prism.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("ucs-deja"),
             "a prism run pulls from prism's bucket"
         );
         assert_eq!(
-            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("hyperswitch-art")
         );
         assert_ne!(
-            prism.as_ref().map(|(b, _)| b.as_str()),
-            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            prism.as_ref().map(|(b, _)| b.bucket.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
             "and not from each other's"
         );
         assert_eq!(

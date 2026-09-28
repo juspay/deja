@@ -439,13 +439,18 @@ impl PassLedger {
     }
 }
 
-/// A system's bucket and key root, resolved from the declared document.
+/// A system's bucket, its prefix inside it, and its key root, resolved from the
+/// declared document.
 ///
 /// Shared with the CLI's own scope resolution so a pass and a hand-run `seal`
 /// cannot come to disagree about where a system's recordings are.
 pub fn scope_for_system(system: &str) -> Result<(S3Config, String), String> {
     let mut cfg = S3Config::from_env();
-    cfg.bucket = crate::bucket_for_system(system)?;
+    crate::RecordingBucket {
+        bucket: crate::bucket_for_system(system)?,
+        prefix: crate::prefix_for_system(system)?,
+    }
+    .apply(&mut cfg);
     let root = crate::recording_root_for(system)?;
     Ok((cfg, root))
 }
@@ -1187,6 +1192,35 @@ mod tests {
     /// was still going" from a comment into an assertion.
     fn off_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
         std::thread::scope(|scope| scope.spawn(f).join().unwrap())
+    }
+
+    /// The sealer, run through a system's prefixed store, plans from the
+    /// landing under the prefix and writes its seal there, and nowhere else.
+    #[test]
+    fn a_pass_over_a_prefixed_system_seals_under_its_prefix() {
+        let bucket = store();
+        let mut cfg = S3Config::from_env();
+        cfg.prefix = "prism/".to_owned();
+        let scoped = cfg.scope_store(bucket.clone());
+        land(&scoped, "r1", 0, &[envelope("r1", 1, 0), eof("r1")]);
+
+        let ledger = block(seal_system_in(&scoped, "prism", ROOT, 0, None, &mut |_| {}));
+        assert_eq!(ledger.planned, vec!["r1".to_owned()]);
+        assert!(
+            matches!(ledger.rows.as_slice(), [r] if matches!(r.outcome, Outcome::Sealed { .. })),
+            "{ledger:?}"
+        );
+
+        let keys: Vec<String> = block(crate::list_keys(&bucket, ""))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect();
+        assert!(
+            keys.contains(&format!("prism/{}", crate::layout::manifest_key("r1"))),
+            "{keys:?}"
+        );
+        assert!(keys.iter().all(|k| k.starts_with("prism/")), "{keys:?}");
     }
 
     #[test]
