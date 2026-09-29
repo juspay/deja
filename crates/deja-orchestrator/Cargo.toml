@@ -56,6 +56,8 @@ async-stream = "0.3"
 tempfile = "3"
 deja-context = { path = "../deja-context" }
 tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [[bin]]
 name = "deja-orchestrator"

@@ -656,6 +656,8 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tower",
+ "tracing",
+ "tracing-subscriber",
  "ureq",
 ]
 

@@ -894,6 +894,7 @@ fn drive_replay(
         &run.run_id,
         &scope,
     )?;
+    settle_observed_stream(root, ctx, &run.run_id);
 
     // Compose: the orchestrator serves artifacts from its own state dir.
     score_and_register(root, run, ctx, &recording_id, total, &ArtifactSink::Local)
@@ -2186,6 +2187,7 @@ pub fn drive_replay_in_pod(
         &run.run_id,
         &scope,
     )?;
+    settle_observed_stream(root, ctx, &run.run_id);
 
     // In-pod: DEJA_RUN_ARTIFACT_S3=1 (Job template) uploads artifacts to S3 so
     // they survive the ephemeral pod and the dashboard can hydrate them.
@@ -5521,6 +5523,77 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
+/// Whether the observed stream stopped growing before scoring read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamSettled {
+    /// Quiet for the whole window.
+    Quiet,
+    /// Still being written when the bound was reached.
+    StillGrowing,
+    /// No stream to wait for.
+    Absent,
+}
+
+/// How long the observed stream must stay unchanged before it is read.
+const OBSERVED_STREAM_QUIET: Duration = Duration::from_secs(2);
+/// How long scoring waits for that before it reads the stream anyway.
+const OBSERVED_STREAM_SETTLE_BOUND: Duration = Duration::from_secs(60);
+
+/// Wait until `path` has not grown for `quiet`, or until `bound` has passed.
+///
+/// The candidate outlives the driver: the last response can return while a
+/// lookup it started, or one a background task started, is still running. A
+/// lookup takes its number as it arrives and writes its observation when it
+/// finishes, so a stream read before it settles shows that lookup as missing.
+pub(crate) fn wait_for_stream_to_settle(
+    path: &std::path::Path,
+    quiet: Duration,
+    bound: Duration,
+) -> StreamSettled {
+    let size = || std::fs::metadata(path).ok().map(|meta| meta.len());
+    let Some(mut last) = size() else {
+        return StreamSettled::Absent;
+    };
+    let deadline = Instant::now() + bound;
+    let mut unchanged_since = Instant::now();
+    loop {
+        std::thread::sleep((quiet / 5).max(Duration::from_millis(10)));
+        let now = size().unwrap_or(last);
+        if now != last {
+            last = now;
+            unchanged_since = Instant::now();
+        } else if unchanged_since.elapsed() >= quiet {
+            return StreamSettled::Quiet;
+        }
+        if Instant::now() >= deadline {
+            return StreamSettled::StillGrowing;
+        }
+    }
+}
+
+/// Wait for the run's observed stream to settle before it is scored, and say
+/// in the run log how that went.
+fn settle_observed_stream(root: &HarnessRoot, ctx: &StoreCtx, run_id: &str) {
+    let started = Instant::now();
+    let settled = wait_for_stream_to_settle(
+        &root.observed_path(run_id),
+        OBSERVED_STREAM_QUIET,
+        OBSERVED_STREAM_SETTLE_BOUND,
+    );
+    let line = match settled {
+        StreamSettled::Quiet => format!(
+            "settled after {:.1}s; scoring reads it whole",
+            started.elapsed().as_secs_f64()
+        ),
+        StreamSettled::StillGrowing => format!(
+            "still growing after {}s; lookups still running will read as missing",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
+        ),
+        StreamSettled::Absent => "absent; there is nothing to wait for".to_owned(),
+    };
+    ctx.log("observed stream", &line);
+}
+
 /// Poll a candidate readiness URL until 200 or timeout. The URL is the
 /// caller's: HTTP `/health` on the traffic port for the router; a prism
 /// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
@@ -5988,6 +6061,63 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+
+    /// Scoring waits for the observed stream to stop growing: a stream still
+    /// being written is read once it has been quiet for the window, and one
+    /// that never stops is named when the bound is reached.
+    #[test]
+    fn scoring_waits_for_the_observed_stream_to_settle() {
+        use super::{wait_for_stream_to_settle, StreamSettled};
+        use std::time::Duration;
+        // Margins far wider than a busy machine's scheduling noise: a writer
+        // that pauses 10ms between lines is growing, a 500ms silence is quiet.
+        let quiet = Duration::from_millis(500);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    writeln!(file, "b").unwrap();
+                }
+            })
+        };
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30));
+        assert_eq!(settled, StreamSettled::Quiet);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            6,
+            "settled only after the last write"
+        );
+        writer.join().unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                    writeln!(file, "c").unwrap();
+                }
+            })
+        };
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert_eq!(settled, StreamSettled::StillGrowing);
+
+        let missing = dir.path().join("absent.jsonl");
+        assert_eq!(
+            wait_for_stream_to_settle(&missing, quiet, Duration::from_secs(1)),
+            StreamSettled::Absent
+        );
+    }
     // -- a skipped db seed says which kind of nothing it carried -------------
 
     fn seed_target(key: &str) -> super::DbSeedTarget {

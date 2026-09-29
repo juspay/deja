@@ -93,9 +93,13 @@ pub struct CallRecord {
     pub correlation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_event_global_sequence: Option<u64>,
-    /// The recorded event actually served by the replay lookup ladder. Present
-    /// when graph alignment found that serving and structural identity differ;
-    /// `source_event_global_sequence` remains the structurally aligned event.
+    /// The recorded event actually served by the replay lookup ladder, where it
+    /// is not `source_event_global_sequence`. Present for two reasons, told
+    /// apart by `kind`: on an identity skew, graph alignment found that serving
+    /// and structural identity differ, and `source_event_global_sequence`
+    /// remains the structurally aligned event; on a call served by its address
+    /// alone, it is the recording the candidate took the value from, and
+    /// `source_event_global_sequence` is the twin the pairing judged it against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_event_global_sequence: Option<u64>,
     pub boundary: String,
@@ -483,6 +487,7 @@ pub(crate) fn build_with_inconclusive_into(
                 args_free_effective_values(&recorded_result, obs, twin_event);
             let value_diverged = paired_value_diverged(obs, observed_index, &by_seq, &pairing);
             let race_downstream = !twin.order_mismatch
+                && !obs.arg_divergent
                 && value_diverged
                 && inconclusive_race
                     .attributable_downstream(obs.correlation_id.as_deref(), &obs.args);
@@ -490,7 +495,7 @@ pub(crate) fn build_with_inconclusive_into(
             // statements say the schema filled every differing column.
             // Exact later-args evidence is instead always value-diverged and
             // blocking; equivalent result envelopes cannot absorb the swap.
-            let schema_default = (value_diverged && !twin.order_mismatch)
+            let schema_default = (value_diverged && !twin.order_mismatch && !obs.arg_divergent)
                 .then(|| {
                     schema_default_divergence(
                         &obs.boundary,
@@ -509,7 +514,9 @@ pub(crate) fn build_with_inconclusive_into(
             sink(CallRecord {
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: Some(twin_seq),
-                served_event_global_sequence: None,
+                // The recorded event the candidate served, where it served one
+                // by address alone: auditable against the twin paired here.
+                served_event_global_sequence: obs.served_event_global_sequence,
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -552,6 +559,11 @@ pub(crate) fn build_with_inconclusive_into(
             } else {
                 (if recovered { "recovered" } else { "matched" }, false)
             }
+        } else if obs.arg_divergent {
+            // Served by its address alone with no recorded call left to pair it
+            // with: blocking, as the scorecard's `ArgsServedUnpaired`, ahead of
+            // every arm that tolerates a miss.
+            ("args_served_unpaired", true)
         } else if plan.is_some_and(|plan| {
             obs.correlation_id
                 .as_deref()
@@ -627,7 +639,7 @@ pub(crate) fn build_with_inconclusive_into(
             served_event_global_sequence: if skewed {
                 obs.source_event_global_sequence
             } else {
-                None
+                obs.served_event_global_sequence
             },
             boundary: obs.boundary.clone(),
             trait_name: obs.trait_name.clone(),
@@ -852,6 +864,10 @@ mod tests {
             provenance: deja::Provenance::default(),
             seed_gap: false,
             absorbed: false,
+            arg_divergent: false,
+            served_event_global_sequence: None,
+            lookup_ordinal: None,
+            cancelled: false,
         }
     }
 

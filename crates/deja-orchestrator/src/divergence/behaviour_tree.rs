@@ -291,10 +291,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
         };
         // any row at all is evidence the run drove this request, seams included
         correlations.insert(correlation.clone());
-        if matches!(
-            row.boundary.as_str(),
-            "time" | "id" | "id_generation" | "uuid" | "rng"
-        ) {
+        if deja::is_pure_boundary(&row.boundary) {
             continue;
         }
         if let Some(lane) = lane_of(row) {

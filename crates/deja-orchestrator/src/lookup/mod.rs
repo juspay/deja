@@ -632,30 +632,49 @@ mod tests {
     /// missed and the replay stopped. The address now agrees with the diff.
     #[test]
     fn a_call_whose_array_arrived_in_another_order_is_served_its_recording() {
-        let (served, _) = replay_one_call(
+        let (served, calls) = replay_one_call(
             serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
             serde_json::json!({ "ids": ["c", "a", "b"], "q": 1 }),
         );
         assert_eq!(served, Some(serde_json::json!("served")));
+        assert!(
+            all_resolved_exactly(&calls),
+            "identity must be what served it, not the args-free fallback"
+        );
     }
 
     /// A string that holds a JSON document is the same call when the document
     /// is the same, whatever order its keys were written in.
     #[test]
     fn a_call_whose_embedded_document_was_written_in_another_order_is_served() {
-        let (served, _) = replay_one_call(
+        let (served, calls) = replay_one_call(
             serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
             serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
         );
         assert_eq!(served, Some(serde_json::json!("served")));
+        assert!(
+            all_resolved_exactly(&calls),
+            "identity must be what served it, not the args-free fallback"
+        );
     }
 
     /// Several uncorrelated calls at one site: render `recorded` (args, result)
-    /// in order, then make the `observed` calls in order; what each was served.
+    /// in order, then make the `observed` calls in order; what each was served,
+    /// the table, and the calls the candidate observed.
+    ///
+    /// The observations are returned because an order-tolerance test that only
+    /// checks the VALUE would keep passing if identity stopped matching and the
+    /// args-free fallback served the same value instead — the same assertion for
+    /// a different, weaker reason. `all_resolved_exactly` is what tells them
+    /// apart.
     fn replay_calls(
         recorded: &[(serde_json::Value, &str)],
         observed: &[serde_json::Value],
-    ) -> (Vec<Option<serde_json::Value>>, LookupTable) {
+    ) -> (
+        Vec<Option<serde_json::Value>>,
+        LookupTable,
+        Vec<deja::ObservedCall>,
+    ) {
         use deja::DejaHook;
         let events: Vec<serde_json::Value> = recorded
             .iter()
@@ -670,11 +689,10 @@ mod tests {
             .collect();
         let (_dir, recording) = write_events(&events);
         let table = render_lookup_table(&recording, "rec-1").unwrap();
-        let hook = deja::LookupTableHook::from_source(
-            TableSource(Some(table.clone())),
-            deja::InMemoryObservedSink::new(),
-        )
-        .expect("install");
+        let sink = deja::InMemoryObservedSink::new();
+        let calls = sink.handle();
+        let hook = deja::LookupTableHook::from_source(TableSource(Some(table.clone())), sink)
+            .expect("install");
         let served = observed
             .iter()
             .map(|args| {
@@ -688,7 +706,14 @@ mod tests {
                 })
             })
             .collect();
-        (served, table)
+        let calls = calls.lock().unwrap().clone();
+        (served, table, calls)
+    }
+
+    /// Every one of these calls found its own row: the address and the arguments
+    /// both, with no args-free fallback standing in for either.
+    fn all_resolved_exactly(calls: &[deja::ObservedCall]) -> bool {
+        !calls.is_empty() && calls.iter().all(|c| c.resolved && !c.arg_divergent)
     }
 
     /// Calls that share an identity are one sequence: the k-th is served the
@@ -714,7 +739,7 @@ mod tests {
             ),
         ] {
             let args = |(x, y): (&str, &str)| serde_json::json!({ "ids": [x, y] });
-            let (served, _) = replay_calls(
+            let (served, _, calls) = replay_calls(
                 &[(args(recorded[0]), "first"), (args(recorded[1]), "second")],
                 &[args(observed[0]), args(observed[1])],
             );
@@ -726,7 +751,47 @@ mod tests {
                 ],
                 "{name}"
             );
+            assert!(all_resolved_exactly(&calls), "{name}: by identity, exactly");
         }
+    }
+
+    /// A call addressed BY IDENTITY advances the args-free sequence too.
+    ///
+    /// That sequence is advanced unconditionally, and this is the half a counter
+    /// living inside either exact assigner would get wrong: a call whose
+    /// arguments identity applies to takes no exact stamp at all, so it would
+    /// advance on some calls and not others. Both calls here hold a set, so both
+    /// route by identity, and both hold an identity the recording never had, so
+    /// both miss. The second must be served the SECOND recording — it is served
+    /// the first if the identity-routed call did not advance the sequence.
+    #[test]
+    fn a_call_addressed_by_identity_advances_the_args_free_sequence_too() {
+        let (served, table, calls) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["c", "d"] }), "second"),
+            ],
+            &[
+                serde_json::json!({ "ids": ["w", "x"] }),
+                serde_json::json!({ "ids": ["y", "z"] }),
+            ],
+        );
+        assert!(
+            !table.identity_entries.is_empty(),
+            "the fixture must reach the identity lookup, or it proves nothing"
+        );
+        assert_eq!(
+            served,
+            vec![
+                Some(serde_json::json!("first")),
+                Some(serde_json::json!("second"))
+            ],
+            "one args-free sequence, walked in recorded order"
+        );
+        assert!(
+            calls.iter().all(|c| c.arg_divergent && !c.resolved),
+            "novel identities do not resolve; each is served args-free and marked"
+        );
     }
 
     /// Identity occurrences advance on every call, hit or miss, as the
@@ -734,7 +799,7 @@ mod tests {
     /// served the second recording even though the first hit exactly.
     #[test]
     fn identity_occurrences_advance_on_calls_the_exact_lookup_served() {
-        let (served, _) = replay_calls(
+        let (served, _, calls) = replay_calls(
             &[
                 (serde_json::json!({ "ids": ["a", "b"] }), "first"),
                 (serde_json::json!({ "ids": ["a", "b"] }), "second"),
@@ -751,13 +816,14 @@ mod tests {
                 Some(serde_json::json!("second"))
             ]
         );
+        assert!(all_resolved_exactly(&calls), "by identity, exactly");
     }
 
     /// The second lookup holds only the events another call could reach by
     /// identity alone.
     #[test]
     fn identity_entries_are_written_only_where_identity_applies() {
-        let (_, table) = replay_calls(
+        let (_, table, _) = replay_calls(
             &[
                 (serde_json::json!({ "id": 1, "n": [2] }), "plain"),
                 (serde_json::json!({ "ids": ["a", "b"] }), "set"),
@@ -793,7 +859,7 @@ mod tests {
                 } }
             })
         };
-        let (served, _) = replay_one_call(
+        let (served, calls) = replay_one_call(
             binds([
                 "h:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "h:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -804,6 +870,10 @@ mod tests {
             ]),
         );
         assert_eq!(served, Some(serde_json::json!("served")));
+        assert!(
+            all_resolved_exactly(&calls),
+            "identity must be what served it, not the args-free fallback"
+        );
     }
 
     /// Calls that share an identity, made from many threads at once, are each
@@ -873,12 +943,131 @@ mod tests {
         );
     }
 
+    /// End to end, candidate to scorer: a real table, a real hook and the
+    /// scorer, with no hand-built row between them. Two sites call one method
+    /// in the order the recording did not, with their arguments moved. The
+    /// candidate serves each site its own recording; the scorer pairs by first
+    /// call, first recording, with no site. Both calls block, each is named as
+    /// served by its address, and where the two pairings disagree the scorer
+    /// says so.
+    #[test]
+    fn a_real_args_free_serve_blocks_and_its_pick_is_checked_against_the_pairing() {
+        use deja::DejaHook;
+        let identity = |name: &str| deja::CallsiteIdentity {
+            version: 1,
+            source: deja::CallsiteSource::Explicit,
+            id: Some(name.to_owned()),
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: Some("request>load".to_owned()),
+        };
+        let site = |name: &str| serde_json::to_value(identity(name)).expect("an identity");
+        let mut first = event("db", 1, site("x"));
+        first["args"] = serde_json::json!({ "amount": 1 });
+        first["result"] = serde_json::json!("x-value");
+        let mut second = event("db", 2, site("y"));
+        second["args"] = serde_json::json!({ "amount": 2 });
+        second["result"] = serde_json::json!("y-value");
+        let (_dir, recording) = write_events(&[first.clone(), second.clone()]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let handle = sink.handle();
+        let hook = deja::LookupTableHook::from_source_with_policy(
+            TableSource(Some(table.clone())),
+            sink,
+            deja::ArgMismatchPolicy::OnlyForArgful,
+        )
+        .expect("install");
+        let _correlation = deja_context::enter_correlation_id("c-1");
+        // The span path an observation carries comes from the tracing layer, as
+        // in the candidate; the scorer pairs args-free by it.
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer);
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let _request = tracing::info_span!("request").entered();
+        let _load = tracing::info_span!("load").entered();
+        for (name, amount) in [("y", 20), ("x", 10)] {
+            let identity = identity(name);
+            let served = hook.try_replay_with_context(deja::ReplayLookup {
+                boundary: "db",
+                trait_name: "T",
+                method_name: "m",
+                args: &serde_json::json!({ "amount": amount }),
+                callsite_identity: Some(&identity),
+                caller_location: None,
+            });
+            assert_eq!(
+                served,
+                Some(serde_json::json!(format!("{name}-value"))),
+                "{name}"
+            );
+        }
+        let observed = handle.lock().unwrap().clone();
+        assert_eq!(observed.len(), 2);
+        assert!(observed
+            .iter()
+            .all(|call| call.arg_divergent && !call.resolved));
+        let events: Vec<deja::BoundaryEvent> = [first, second]
+            .into_iter()
+            .map(|event| serde_json::from_value(event).expect("an event"))
+            .collect();
+        let artifacts = crate::divergence::RunArtifacts {
+            unplanted_presence: Default::default(),
+            scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
+            run_id: "run-1".to_owned(),
+            recording_id: Some("rec-1".to_owned()),
+            table,
+            observed,
+            http_diffs: Vec::new(),
+            record_graph: None,
+            replay_graph: Vec::new(),
+            events,
+            correlation_scope: None,
+            warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
+        };
+        let card = crate::divergence::detect(&artifacts);
+        let rows = crate::divergence::build_ledger(&artifacts).expect("a ledger");
+        let db = &card.per_boundary["db"];
+        assert_eq!(db.matched, 0, "{db:?}");
+        assert_eq!(db.kinds.get("ArgDivergentServe"), Some(&2), "{db:?}");
+        assert_eq!(
+            db.kinds.get("ArgsServedPairingDisagrees"),
+            Some(&2),
+            "{db:?}"
+        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        let served: Vec<&crate::divergence::CallRecord> =
+            rows.iter().filter(|row| row.boundary == "db").collect();
+        assert_eq!(served.len(), 2, "{rows:?}");
+        for row in served {
+            assert!(row.blocking, "{row:?}");
+            assert!(row.served_event_global_sequence.is_some(), "{row:?}");
+            assert_ne!(
+                row.served_event_global_sequence, row.source_event_global_sequence,
+                "the candidate's pick and the pairing's disagree here, and the row shows both: {row:?}"
+            );
+        }
+    }
+
     /// What identity still refuses: a changed member, a changed count, a
     /// string that is not a document, and a document sent as an object where
     /// the recording sent it as text.
+    ///
+    /// Refusing is now about the ADDRESS, not about the request's survival. None
+    /// of these resolves — identity does not call them the same call, which is
+    /// the property this test exists for — and each is then served the
+    /// recording's value for that address with `arg_divergent` on it, so the
+    /// divergence is still reported and the request does not die on the way to
+    /// reporting it. Asserting only the value here would have let the address
+    /// silently start matching them.
     #[test]
-    fn a_call_that_differs_in_anything_but_order_still_misses() {
-        let (served, _) = replay_one_call(
+    fn a_call_that_differs_in_anything_but_order_does_not_resolve() {
+        let (served, calls) = replay_one_call(
             serde_json::json!({ "ids": ["a", "b"] }),
             serde_json::json!({ "ids": ["a", "b"] }),
         );
@@ -886,6 +1075,10 @@ mod tests {
             served,
             Some(serde_json::json!("served")),
             "control: the fixture serves a call that matches"
+        );
+        assert!(
+            all_resolved_exactly(&calls),
+            "control: a call that matches resolves, and is not marked"
         );
         for (name, recorded, observed) in [
             (
@@ -914,8 +1107,21 @@ mod tests {
                 serde_json::json!({ "body": { "a": 1 } }),
             ),
         ] {
-            let (served, _) = replay_one_call(recorded, observed);
-            assert_eq!(served, None, "{name}");
+            let (served, calls) = replay_one_call(recorded, observed);
+            let call = calls.last().expect("an observation");
+            assert!(
+                !call.resolved,
+                "{name}: identity must not call these the same call"
+            );
+            assert!(
+                call.arg_divergent,
+                "{name}: served from the same address with other arguments, and marked"
+            );
+            assert_eq!(
+                served,
+                Some(serde_json::json!("served")),
+                "{name}: the request carries on rather than dying at the miss"
+            );
         }
     }
 
