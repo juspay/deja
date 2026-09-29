@@ -6547,6 +6547,47 @@ mod tests {
     }
 
     #[test]
+    fn a_lookup_dropped_before_it_finishes_writes_a_cancelled_observation() {
+        // A lookup takes its number as it arrives and writes its observation when
+        // the seam finishes. A future dropped between the two (a sibling's error
+        // in a join, a client that went away, a panic) used to take a number and
+        // write nothing; now the token it leaves behind writes the observation,
+        // marked cancelled, so every numbered lookup writes exactly one.
+        use crate::DejaHook;
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]));
+        let identity = explicit_identity("find-payment");
+        let args = serde_json::json!({ "amount": 100 });
+        let query = || ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentStore",
+            method_name: "find_payment",
+            args: &args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        };
+        drop(hook.substitute_peek(query()));
+        drop(hook.execute_shadow_peek(query()));
+        let finished = hook.substitute_peek(query());
+        hook.substitute_observe(
+            finished.token.expect("a token"),
+            crate::SubstituteOutcome::Substituted,
+        );
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.lookup_ordinal, c.cancelled))
+                .collect::<Vec<_>>(),
+            vec![(Some(1), true), (Some(2), true), (Some(3), false)]
+        );
+    }
+
+    #[test]
     fn a_deployment_can_restore_the_fail_stop() {
         // `Never` is the fail-stop the fallback replaced: a call whose arguments
         // moved misses, and the request stops there.

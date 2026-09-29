@@ -17219,6 +17219,46 @@ mod tests {
         );
     }
 
+    /// A cancelled lookup is a named drop: its number closes the count, and its
+    /// call is not scored, because it never finished.
+    #[test]
+    fn a_cancelled_lookup_closes_the_count_and_is_not_scored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let numbered = |ordinal: u64, cancelled: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.lookup_ordinal = Some(ordinal);
+            call.cancelled = cancelled;
+            deja::DejaRecord::Observed(Box::new(call))
+        };
+        let lines: Vec<String> = [numbered(1, true), numbered(2, false)]
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let mut warnings = Vec::new();
+        let stream = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(stream.observed.len(), 1, "a cancelled call is not scored");
+        assert_eq!(stream.cancelled.len(), 1);
+        let mut artifacts = art(vec![], stream.observed, vec![]);
+        artifacts.cancelled_lookups = stream.cancelled;
+        let card = super::detect(&artifacts);
+        let tally = card.lookup_tally.expect("a tally");
+        assert_eq!(tally.total, 2);
+        assert!(
+            !card.verdict.reason.contains("wrote no observation"),
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("cancelled")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
     /// The ordinal survives the stream: written by the candidate's file sink,
     /// read back by the scorer's loader.
     #[test]
