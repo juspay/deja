@@ -943,6 +943,120 @@ mod tests {
         );
     }
 
+    /// End to end, candidate to scorer: a real table, a real hook and the
+    /// scorer, with no hand-built row between them. Two sites call one method
+    /// in the order the recording did not, with their arguments moved. The
+    /// candidate serves each site its own recording; the scorer pairs by first
+    /// call, first recording, with no site. Both calls block, each is named as
+    /// served by its address, and where the two pairings disagree the scorer
+    /// says so.
+    #[test]
+    fn a_real_args_free_serve_blocks_and_its_pick_is_checked_against_the_pairing() {
+        use deja::DejaHook;
+        let identity = |name: &str| deja::CallsiteIdentity {
+            version: 1,
+            source: deja::CallsiteSource::Explicit,
+            id: Some(name.to_owned()),
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: Some("request>load".to_owned()),
+        };
+        let site = |name: &str| serde_json::to_value(identity(name)).expect("an identity");
+        let mut first = event("db", 1, site("x"));
+        first["args"] = serde_json::json!({ "amount": 1 });
+        first["result"] = serde_json::json!("x-value");
+        let mut second = event("db", 2, site("y"));
+        second["args"] = serde_json::json!({ "amount": 2 });
+        second["result"] = serde_json::json!("y-value");
+        let (_dir, recording) = write_events(&[first.clone(), second.clone()]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let handle = sink.handle();
+        let hook = deja::LookupTableHook::from_source_with_policy(
+            TableSource(Some(table.clone())),
+            sink,
+            deja::ArgMismatchPolicy::OnlyForArgful,
+        )
+        .expect("install");
+        let _correlation = deja_context::enter_correlation_id("c-1");
+        // The span path an observation carries comes from the tracing layer, as
+        // in the candidate; the scorer pairs args-free by it.
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer);
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let _request = tracing::info_span!("request").entered();
+        let _load = tracing::info_span!("load").entered();
+        for (name, amount) in [("y", 20), ("x", 10)] {
+            let identity = identity(name);
+            let served = hook.try_replay_with_context(deja::ReplayLookup {
+                boundary: "db",
+                trait_name: "T",
+                method_name: "m",
+                args: &serde_json::json!({ "amount": amount }),
+                callsite_identity: Some(&identity),
+                caller_location: None,
+            });
+            assert_eq!(
+                served,
+                Some(serde_json::json!(format!("{name}-value"))),
+                "{name}"
+            );
+        }
+        let observed = handle.lock().unwrap().clone();
+        assert_eq!(observed.len(), 2);
+        assert!(observed
+            .iter()
+            .all(|call| call.arg_divergent && !call.resolved));
+        let events: Vec<deja::BoundaryEvent> = [first, second]
+            .into_iter()
+            .map(|event| serde_json::from_value(event).expect("an event"))
+            .collect();
+        let artifacts = crate::divergence::RunArtifacts {
+            unplanted_presence: Default::default(),
+            scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
+            run_id: "run-1".to_owned(),
+            recording_id: Some("rec-1".to_owned()),
+            table,
+            observed,
+            http_diffs: Vec::new(),
+            record_graph: None,
+            replay_graph: Vec::new(),
+            events,
+            correlation_scope: None,
+            warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
+        };
+        let card = crate::divergence::detect(&artifacts);
+        let rows = crate::divergence::build_ledger(&artifacts).expect("a ledger");
+        let db = &card.per_boundary["db"];
+        assert_eq!(db.matched, 0, "{db:?}");
+        assert_eq!(db.kinds.get("ArgDivergentServe"), Some(&2), "{db:?}");
+        // No disagreement is possible on a successful claim: the pairing now takes
+        // the event the candidate named, so its pick and the twin are the same one.
+        // The check still guards the refused-claim path, where an exact hit owns the
+        // event and the shape search picks another.
+        assert_eq!(db.kinds.get("ArgsServedPairingDisagrees"), None, "{db:?}");
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        let served: Vec<&crate::divergence::CallRecord> =
+            rows.iter().filter(|row| row.boundary == "db").collect();
+        assert_eq!(served.len(), 2, "{rows:?}");
+        for row in served {
+            assert!(row.blocking, "{row:?}");
+            assert!(row.served_event_global_sequence.is_some(), "{row:?}");
+            // The pick and the pairing agree, because the pairing takes the event
+            // the candidate named. The row still shows both, so a future
+            // divergence between them stays visible rather than being assumed away.
+            assert_eq!(
+                row.served_event_global_sequence, row.source_event_global_sequence,
+                "the pairing should take the event the candidate served: {row:?}"
+            );
+        }
+    }
+
     /// What identity still refuses: a changed member, a changed count, a
     /// string that is not a document, and a document sent as an object where
     /// the recording sent it as text.

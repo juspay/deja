@@ -737,6 +737,14 @@ impl ArgMismatchPolicy {
     }
 }
 
+/// Whether `boundary` is an entropy seam: a clock, an identifier or a source of
+/// randomness. A call there with other arguments is another value, never the
+/// same address with its arguments moved, so it is never served by address
+/// alone. The scorer's pure tier is this list.
+pub fn is_pure_boundary(boundary: &str) -> bool {
+    matches!(boundary, "time" | "id" | "id_generation" | "uuid" | "rng")
+}
+
 /// Returns true if `args` is JSON-null or an empty object (treated as
 /// "argless" for arg-mismatch policy purposes).
 fn args_are_empty(args: &serde_json::Value) -> bool {
@@ -1812,18 +1820,23 @@ pub struct ObservedCall {
     /// the hook matched a different arguments bucket.
     #[serde(default)]
     pub arg_divergent: bool,
-    /// On an args-free serve, the global sequence of the recorded event whose
-    /// value was served. `None` on every other call.
-    ///
-    /// Not `source_event_global_sequence`: that says this call IS the recorded
-    /// event, and every consumer that reads it treats the call as resolved. This
-    /// says only which recording the call was answered from. The scorer pairs
-    /// the call with exactly that event instead of searching for a twin by the
-    /// shape of its args — a request that gained or lost a field has a
-    /// different shape, and a search by shape finds nothing, which scored the
-    /// changed call as an egress miss beside an omitted one.
+    /// On an args-free serve, the recorded event whose value was served. The
+    /// row claims no twin (`source_event_global_sequence` is absent), because
+    /// which recorded call a re-keyed call belongs to is the scorer's to
+    /// decide; this names the candidate's pick so the two can be compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arg_divergent_from: Option<u64>,
+    pub served_event_global_sequence: Option<u64>,
+    /// This lookup's number, taken as it arrived: one per lookup, from one. The
+    /// scorer counts the lookups a run made from these, so a lookup that wrote
+    /// no observation is a gap between two of them. Absent from a candidate
+    /// that does not number its lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_ordinal: Option<u64>,
+    /// The lookup was dropped before it finished: the future carrying it went
+    /// away, so the call never completed. Written by the token it was left in,
+    /// so the lookup's number still reaches the stream; not scored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 #[derive(Deserialize)]
@@ -1883,7 +1896,11 @@ struct ObservedCallWire {
     #[serde(default)]
     arg_divergent: bool,
     #[serde(default)]
-    arg_divergent_from: Option<u64>,
+    served_event_global_sequence: Option<u64>,
+    #[serde(default)]
+    lookup_ordinal: Option<u64>,
+    #[serde(default)]
+    cancelled: bool,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1921,7 +1938,9 @@ impl From<ObservedCallWire> for ObservedCall {
             absorbed: wire.absorbed,
             outcome: wire.outcome,
             arg_divergent: wire.arg_divergent,
-            arg_divergent_from: wire.arg_divergent_from,
+            served_event_global_sequence: wire.served_event_global_sequence,
+            lookup_ordinal: wire.lookup_ordinal,
+            cancelled: wire.cancelled,
         }
     }
 }
@@ -2829,7 +2848,7 @@ fn arg_free_index(table: &HashMap<LookupKey, HookEntry>) -> HashMap<ArgFreeKey, 
 /// independent total, so `total == exact + arg_free + missed` is an assertion
 /// that can FAIL rather than an identity restated: a total derived as the sum
 /// asserts nothing about the arms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupTally {
     /// Lookups made, counted once as each one arrives.
     pub total: u64,
@@ -2857,6 +2876,9 @@ impl LookupTally {
 /// result if found.
 pub struct LookupTableHook {
     table: HashMap<LookupKey, HookEntry>,
+    /// Whether a call whose arguments moved may be served by its address
+    /// alone; see [`LookupTableHook::from_source_with_policy`].
+    arg_mismatch_policy: ArgMismatchPolicy,
     /// The table's second lookup, by identity; see [`LookupTable::identity_entries`].
     identity_table: HashMap<LookupKey, HookEntry>,
     /// The args-free index, derived from `table` at load; see [`arg_free_index`].
@@ -2888,7 +2910,7 @@ pub struct LookupTableHook {
     /// macro would receive the default `0` for every call and only the first
     /// (occurrence-0) call at each callsite would resolve.
     callsite_occurrence: Mutex<crate::CallsiteOccurrenceMap>,
-    observed_sink: Box<dyn ObservedCallSink>,
+    observed_sink: std::sync::Arc<dyn ObservedCallSink>,
     /// Sequence space for replay-side graph nodes on the observed stream;
     /// separate from the lookup counters so replay addressing stays in
     /// lockstep with the recorder whether or not graph capture is on.
@@ -2906,7 +2928,25 @@ impl LookupTableHook {
     /// and any `ObservedCallSink` (typically `InMemoryObservedSink` for tests
     /// or `FileObservedSink` for harness runs). Loading happens once at
     /// construction; failures bubble up as `io::Error`.
-    pub fn from_source<S, K>(mut source: S, sink: K) -> std::io::Result<Self>
+    ///
+    /// Under the default [`ArgMismatchPolicy`]; see
+    /// [`LookupTableHook::from_source_with_policy`] for a deployment's own.
+    pub fn from_source<S, K>(source: S, sink: K) -> std::io::Result<Self>
+    where
+        S: LookupTableSource,
+        K: ObservedCallSink + 'static,
+    {
+        Self::from_source_with_policy(source, sink, ArgMismatchPolicy::default())
+    }
+
+    /// [`LookupTableHook::from_source`] with the arg-mismatch policy given, as
+    /// the embedder reads it from its own settings. `Never` restores the
+    /// fail-stop: a call whose arguments moved misses.
+    pub fn from_source_with_policy<S, K>(
+        mut source: S,
+        sink: K,
+        arg_mismatch_policy: ArgMismatchPolicy,
+    ) -> std::io::Result<Self>
     where
         S: LookupTableSource,
         K: ObservedCallSink + 'static,
@@ -2935,12 +2975,13 @@ impl LookupTableHook {
         let arg_free_table = arg_free_index(&exact);
         Ok(Self {
             table: exact,
+            arg_mismatch_policy,
             identity_table: index(table.identity_entries),
             arg_free_table,
             stamper: Mutex::new(Stampers::default()),
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
-            observed_sink: Box::new(sink),
+            observed_sink: std::sync::Arc::new(sink),
             graph_counter: std::sync::atomic::AtomicU64::new(0),
             lookups: std::sync::atomic::AtomicU64::new(0),
             exact_hits: std::sync::atomic::AtomicU64::new(0),
@@ -2991,8 +3032,10 @@ impl LookupTableHook {
     /// boundary in the same run. It does NOT emit an observation — the caller
     /// shapes and emits the `ObservedCall` (Recorded vs Shadow).
     fn resolve(&self, query: &ReplayLookup<'_>, fallback: ArgFreeFallback) -> Resolution {
-        self.lookups
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lookup_ordinal = self
+            .lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         // The candidate carries no notion of "current correlation" in
         // ReplayLookup; pull it from the ambient deja-context scope set up
         // by the request middleware.
@@ -3087,7 +3130,11 @@ impl LookupTableHook {
         // is the same predicate `ArgMismatchPolicy::OnlyForArgful` is defined by,
         // read here rather than restated.
         let mut arg_divergent = false;
-        if hit.is_none() && fallback == ArgFreeFallback::Serve && !args_are_empty(query.args) {
+        if hit.is_none()
+            && fallback == ArgFreeFallback::Serve
+            && self.arg_mismatch_policy.allow_arg_mismatch(query.args)
+            && !is_pure_boundary(query.boundary)
+        {
             for key in &arg_free_keys {
                 if let Some(entry) = self.arg_free_table.get(key) {
                     hit = Some((entry, key.locus.rank()));
@@ -3125,15 +3172,16 @@ impl LookupTableHook {
             // THIS call is the recorded event at it, and an args-free serve is
             // not that claim: the arguments differ. Which event the value came
             // from is a different fact, and it rides separately as
-            // `arg_divergent_from`, so the orchestrator pairs the call with the
-            // event it was actually served rather than guessing it again.
+            // `served_event_global_sequence`, so the orchestrator pairs the call
+            // with the event it was actually served rather than guessing it again.
             source_event_global_sequence: hit
                 .filter(|_| !arg_divergent)
                 .map(|(entry, _)| entry.source_event_global_sequence),
-            arg_divergent_from: hit
+            recorded_result: hit.map(|(entry, _)| (*entry.result).clone()),
+            served_event_global_sequence: hit
                 .filter(|_| arg_divergent)
                 .map(|(entry, _)| entry.source_event_global_sequence),
-            recorded_result: hit.map(|(entry, _)| (*entry.result).clone()),
+            lookup_ordinal,
             arg_divergent,
         }
     }
@@ -3155,8 +3203,10 @@ struct Resolution {
     recorded_result: Option<serde_json::Value>,
     /// `recorded_result` came from the same address with different arguments.
     arg_divergent: bool,
-    /// The recorded event an args-free serve answered from.
-    arg_divergent_from: Option<u64>,
+    /// The recorded event an args-free serve took its value from.
+    served_event_global_sequence: Option<u64>,
+    /// This lookup's number; see [`ObservedCall::lookup_ordinal`].
+    lookup_ordinal: u64,
 }
 
 impl Resolution {
@@ -3212,7 +3262,9 @@ impl Resolution {
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: self.arg_divergent,
-            arg_divergent_from: self.arg_divergent_from,
+            served_event_global_sequence: self.served_event_global_sequence,
+            lookup_ordinal: Some(self.lookup_ordinal),
+            cancelled: false,
         }
     }
 }
@@ -3276,7 +3328,10 @@ impl DejaHook for LookupTableHook {
         );
         crate::SubstitutePeek {
             recorded,
-            token: Some(crate::SubstituteToken::new(observed)),
+            token: Some(
+                crate::SubstituteToken::new(observed)
+                    .written_on_cancel_to(std::sync::Arc::clone(&self.observed_sink)),
+            ),
         }
     }
 
@@ -3321,7 +3376,10 @@ impl DejaHook for LookupTableHook {
         // A recorded counterpart, when present, is resolved by the lookup table;
         // seed planning is a separate precondition-materialization pass and does
         // not decide whether this observation has a baseline.
-        Some(crate::ExecuteShadowToken::new(observed))
+        Some(
+            crate::ExecuteShadowToken::new(observed)
+                .written_on_cancel_to(std::sync::Arc::clone(&self.observed_sink)),
+        )
     }
 
     fn execute_shadow_observe(
@@ -3418,7 +3476,9 @@ impl DejaHook for LookupTableHook {
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
-            arg_divergent_from: None,
+            served_event_global_sequence: None,
+            lookup_ordinal: None,
+            cancelled: false,
         });
     }
 
@@ -6265,7 +6325,7 @@ mod tests {
             "an args-free serve does not claim to BE the recorded event"
         );
         assert_eq!(
-            call.arg_divergent_from,
+            call.served_event_global_sequence,
             Some(0),
             "but it names the event it was answered from, which is what the \
              orchestrator pairs it with"
@@ -6305,7 +6365,7 @@ mod tests {
         assert!(!call.arg_divergent);
         assert_eq!(call.source_event_global_sequence, Some(0));
         assert_eq!(
-            call.arg_divergent_from, None,
+            call.served_event_global_sequence, None,
             "an exact hit names its event as its own"
         );
         assert_eq!(
@@ -6398,6 +6458,238 @@ mod tests {
     }
 
     #[test]
+    fn an_argful_pure_boundary_is_never_served_another_arguments_value() {
+        // A clock, an identifier or a source of randomness can take arguments
+        // (a prefix, a namespace, a key) and is still an entropy seam: a call
+        // with other arguments is a different value, not the same address with
+        // its arguments moved. Serving it the recording's value would hand a
+        // generated identifier to a call that asked for a different one, and
+        // the scorer excuses a pure-tier miss the request survived.
+        for boundary in ["time", "id", "id_generation", "uuid", "rng"] {
+            let mut event = storage_event(
+                0,
+                "generate",
+                serde_json::json!({ "prefix": "pay" }),
+                "recorded",
+            );
+            event.boundary = boundary.to_owned();
+            let (hook, handle) = hook_over(render_table(&[event]));
+            let served = hook.try_replay_with_context(ReplayLookup {
+                boundary,
+                trait_name: "PaymentStore",
+                method_name: "find_payment",
+                args: &serde_json::json!({ "prefix": "ref" }),
+                callsite_identity: Some(&explicit_identity("generate")),
+                caller_location: None,
+            });
+            assert_eq!(served, None, "{boundary}");
+            assert!(!last_call(&handle).arg_divergent, "{boundary}");
+            assert_eq!(hook.lookup_tally().arg_free, 0, "{boundary}");
+        }
+    }
+
+    #[test]
+    fn an_args_free_serve_names_the_recording_it_served() {
+        // The row claims no twin, because which recorded call a re-keyed call
+        // belongs to is the scorer's to decide. But the candidate did pick one,
+        // and the value it ran on came from there, so the row says which: the
+        // scorer's pairing can then be checked against it.
+        let table = render_table(&[
+            storage_event(0, "loop", serde_json::json!({ "amount": 1 }), "first"),
+            storage_event(1, "loop", serde_json::json!({ "amount": 2 }), "second"),
+        ]);
+        let (hook, handle) = hook_over(table);
+        for amount in [10, 20] {
+            ask_storage(
+                &hook,
+                "loop",
+                "find_payment",
+                &serde_json::json!({ "amount": amount }),
+            );
+        }
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|c| c.arg_divergent && c.source_event_global_sequence.is_none()));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| c.served_event_global_sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        // An exact serve names its event as its source, and claims no other.
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "loop",
+            serde_json::json!({ "amount": 1 }),
+            "first",
+        )]));
+        ask_storage(
+            &hook,
+            "loop",
+            "find_payment",
+            &serde_json::json!({ "amount": 1 }),
+        );
+        let call = last_call(&handle);
+        assert_eq!(call.source_event_global_sequence, Some(0));
+        assert_eq!(call.served_event_global_sequence, None);
+    }
+
+    #[test]
+    fn every_lookup_carries_its_ordinal_whatever_its_arm() {
+        // One ordinal per lookup, taken as it arrives, on the observation each
+        // lookup writes: the scorer counts the lookups a run made from these,
+        // with no flush to wait for, and a lookup that wrote no observation is
+        // the gap between two of them.
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]));
+        for (method, amount) in [("find_payment", 200), ("find_payment", 100), ("other", 100)] {
+            ask_storage(
+                &hook,
+                "find-payment",
+                method,
+                &serde_json::json!({ "amount": amount }),
+            );
+        }
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().map(|c| c.lookup_ordinal).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.arg_divergent, c.resolved))
+                .collect::<Vec<_>>(),
+            vec![(true, false), (false, true), (false, false)],
+            "precondition: one call in each arm"
+        );
+    }
+
+    #[test]
+    fn a_lookup_dropped_before_it_finishes_writes_a_cancelled_observation() {
+        // A lookup takes its number as it arrives and writes its observation when
+        // the seam finishes. A future dropped between the two (a sibling's error
+        // in a join, a client that went away, a panic) used to take a number and
+        // write nothing; now the token it leaves behind writes the observation,
+        // marked cancelled, so every numbered lookup writes exactly one.
+        use crate::DejaHook;
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]));
+        let identity = explicit_identity("find-payment");
+        let args = serde_json::json!({ "amount": 100 });
+        let query = || ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentStore",
+            method_name: "find_payment",
+            args: &args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        };
+        drop(hook.substitute_peek(query()));
+        drop(hook.execute_shadow_peek(query()));
+        let finished = hook.substitute_peek(query());
+        hook.substitute_observe(
+            finished.token.expect("a token"),
+            crate::SubstituteOutcome::Substituted,
+        );
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.lookup_ordinal, c.cancelled))
+                .collect::<Vec<_>>(),
+            vec![(Some(1), true), (Some(2), true), (Some(3), false)]
+        );
+    }
+
+    #[test]
+    fn a_call_dropped_while_its_boundary_runs_is_written_as_cancelled() {
+        // The shape a join produces when a sibling fails: an execute-mode call
+        // polled once, its real boundary still running, and then dropped.
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]));
+        let mut spec = crate::BoundarySpec::new("storage", "PaymentStore", "find_payment");
+        spec.replay_strategy = crate::ReplayStrategy::Execute;
+        let mut call = Box::pin(crate::dispatch_async_with_hook(
+            crate::DelegateObservation {
+                hook: &hook,
+                spec,
+                caller: std::panic::Location::caller(),
+                identity: explicit_identity("find-payment"),
+                receiver: None,
+            },
+            serde_json::json!({ "amount": 100 }),
+            std::future::pending::<Result<u64, String>>,
+            |_| crate::Reconstructed::NoValue,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            crate::round_trip::RoundTrip::<
+                fn(&Result<u64, String>, &Result<u64, String>) -> crate::round_trip::Comparison,
+            >::Unverifiable,
+        ));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(call.as_mut(), &mut cx).is_pending(),
+            "precondition: the boundary is running"
+        );
+        assert!(
+            handle.lock().unwrap().is_empty(),
+            "precondition: nothing written yet"
+        );
+        drop(call);
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].cancelled);
+        assert_eq!(calls[0].lookup_ordinal, Some(1));
+    }
+
+    #[test]
+    fn a_deployment_can_restore_the_fail_stop() {
+        // `Never` is the fail-stop the fallback replaced: a call whose arguments
+        // moved misses, and the request stops there.
+        let table = render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]);
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        let hook = LookupTableHook::from_source_with_policy(
+            VecSource(Some(table)),
+            observed,
+            ArgMismatchPolicy::Never,
+        )
+        .expect("from_source_with_policy");
+        assert_eq!(
+            ask_storage(
+                &hook,
+                "find-payment",
+                "find_payment",
+                &serde_json::json!({ "amount": 200 })
+            ),
+            None
+        );
+        assert!(!last_call(&handle).arg_divergent);
+        assert_eq!(hook.lookup_tally().arg_free, 0);
+        assert_eq!(hook.lookup_tally().missed, 1);
+    }
+
+    #[test]
     fn a_second_declared_site_for_one_operation_is_served_at_the_floor() {
         // Stated because it is a widening, not because it is desirable. The
         // args-free probe walks the same rank ladder the exact lookup does, and
@@ -6480,7 +6772,7 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
-                .map(|c| c.arg_divergent_from)
+                .map(|c| c.served_event_global_sequence)
                 .collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(2)],
             "each serve names the recording it was answered from, each exactly once"
