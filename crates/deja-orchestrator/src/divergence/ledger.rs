@@ -42,9 +42,9 @@ use serde::{Deserialize, Serialize};
 use super::{
     args_free_effective_values, correlation_column_provenance, event_reply_canon_kind,
     observed_miss_is_excused, observed_schema_default_divergence, observed_value_diverged,
-    omission_is_blocking, schema_default_divergence, tier_for, GraphScoringPlan,
-    InconclusiveRaceEvidence, SchemaDefaultVerdict, TailGapEvidence, Tier,
-    POSITIONAL_FALLBACK_RANK,
+    omission_is_blocking, schema_default_divergence, tier_for, ArgDivergenceReach,
+    GraphScoringPlan, InconclusiveRaceEvidence, ReachPlacement, SchemaDefaultVerdict, ServeReach,
+    TailGapEvidence, Tier, POSITIONAL_FALLBACK_RANK,
 };
 
 /// One side (recorded or observed) of a call, with everything a diff/graph UI
@@ -134,6 +134,30 @@ pub struct CallRecord {
     /// not hold. Absent when the call went through.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// This call was served the recording's value because only its ARGUMENTS
+    /// moved, and this is how far that substitution could have carried. A reach
+    /// of zero is an empty reach — nothing followed the serve — and is reported,
+    /// not omitted. Absent on every row that is not such a serve.
+    ///
+    /// The serve's own divergence is in `kind` and `blocking`; this field adds
+    /// no charge. See `ArgDivergenceReach`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_divergence_reach: Option<ServeReach>,
+    /// An argument-divergent serve ran earlier in this call's correlation, so the
+    /// substituted value COULD have reached this work. It is not a claim that it
+    /// did, nor that anything divergent was observed here: deja records the
+    /// execution graph, not value provenance. This row keeps its own `kind` and
+    /// its own `blocking`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub could_be_affected_by_arg_divergence: bool,
+    /// Where the graph puts this call relative to that serve — inside its span,
+    /// outside it, or nowhere it could say. Three states rather than a flag,
+    /// because "outside the serve's span" is a structural claim and a flat-scored
+    /// correlation is the absence of one, and a reader who cannot tell those apart
+    /// is being told the run decided something it never looked at. Absent on a row
+    /// nothing reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_divergence_placement: Option<ReachPlacement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_rank: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,8 +340,15 @@ pub fn build(
     )
 }
 
-/// Collecting wrapper over [`build_with_inconclusive_into`], for callers that genuinely
-/// want every row in memory (the `/calls` API).
+/// Collecting wrapper over [`build_with_inconclusive_into`], for a caller that
+/// wants every row in memory and has no graph plan to offer.
+///
+/// That is the test fixtures and nothing else. Production builds the ledger
+/// through `build_with_plan_into` WITH a plan, and the API serves the streamed
+/// artifact rather than calling either — so rows from here differ from shipped
+/// rows on whatever the plan contributes, `arg_divergence_placement` included.
+/// This comment used to name `/calls` as the caller, which made that gap look
+/// live when it is confined to older fixtures.
 pub(crate) fn build_with_inconclusive(
     events: &[BoundaryEvent],
     observed: &[ObservedCall],
@@ -391,6 +422,10 @@ pub(crate) fn build_with_inconclusive_into(
     // boundary sits; and structure never pairs, because a span holding one event
     // on each side says nothing about whether they are one call.
     let pairing = super::CallPairing::build(table, events, observed, &column_provenance);
+    // How far each argument-divergent substitution could have carried, from the
+    // same seam the scorecard reads so the rows and the counts cannot come apart.
+    // Attribution only: it sets no `kind` and no `blocking`.
+    let arg_divergence = ArgDivergenceReach::build(observed, plan);
     // Recorded twins claimed by a value_diverged consequence, so the omitted pass
     // doesn't also flag them (collapses the would-be novel+omitted split).
     let mut paired_consumed: HashSet<u64> = HashSet::new();
@@ -402,6 +437,10 @@ pub(crate) fn build_with_inconclusive_into(
     // with nothing diverging after it is not a finding at all.
     let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap, &pairing);
     for (observed_index, obs) in observed.iter().enumerate() {
+        let arg_divergence_reach = arg_divergence.serve(observed_index);
+        let reached = arg_divergence.reached(observed_index);
+        let could_be_affected_by_arg_divergence = reached.is_some();
+        let arg_divergence_placement = reached.map(|call| call.placement);
         // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
         // result differs from the recorded baseline — the cause of a cascade.
         let source_event = obs
@@ -444,6 +483,9 @@ pub(crate) fn build_with_inconclusive_into(
                 blocking,
                 origin: true,
                 stopped: stopped_at(obs),
+                arg_divergence_reach,
+                could_be_affected_by_arg_divergence,
+                arg_divergence_placement,
                 resolved_rank: obs.resolved_rank,
                 recorded,
                 observed: observed_side(obs).or_none(),
@@ -537,6 +579,9 @@ pub(crate) fn build_with_inconclusive_into(
                             .is_some_and(|first| *first < observed_index)
                     }),
                 stopped: stopped_at(obs),
+                arg_divergence_reach,
+                could_be_affected_by_arg_divergence,
+                arg_divergence_placement,
                 resolved_rank: obs.resolved_rank,
                 recorded,
                 observed: observed.or_none(),
@@ -648,6 +693,9 @@ pub(crate) fn build_with_inconclusive_into(
             blocking,
             origin: novel_origin,
             stopped: stopped_at(obs),
+            arg_divergence_reach,
+            could_be_affected_by_arg_divergence,
+            arg_divergence_placement,
             resolved_rank: obs.resolved_rank,
             recorded,
             observed: observed_side(obs).or_none(),
@@ -694,6 +742,12 @@ pub(crate) fn build_with_inconclusive_into(
             blocking: blocking && !cascaded,
             origin: false,
             stopped: false,
+            // A recorded event nothing claimed has no position in the candidate's
+            // stream, so there is no "after the serve" for it to be in. The
+            // reach speaks about the calls the candidate MADE.
+            arg_divergence_reach: None,
+            could_be_affected_by_arg_divergence: false,
+            arg_divergence_placement: None,
             resolved_rank: None,
             recorded: recorded_for(ev.global_sequence),
             observed: None,
