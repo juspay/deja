@@ -228,6 +228,10 @@ pub struct Scorecard {
     pub correlation_scope: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Where the candidate's lookups ended, counted from the ordinal each
+    /// observation carries. Absent when the candidate numbers none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_tally: Option<deja::LookupTally>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -534,6 +538,7 @@ impl Scorecard {
             },
             correlation_scope: None,
             warnings: Vec::new(),
+            lookup_tally: None,
         }
     }
 
@@ -2401,6 +2406,60 @@ fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> V
         twin,
         call.args.get("sql").and_then(serde_json::Value::as_str),
     )
+}
+
+/// The candidate's lookups, counted from the ordinals its observations carry,
+/// with each way the count fails to close named as a reason. `None`, with a
+/// warning, when the candidate numbered none.
+fn account_lookups(
+    observed: &[ObservedCall],
+    reasons: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Option<deja::LookupTally> {
+    let numbered: Vec<&ObservedCall> = observed
+        .iter()
+        .filter(|call| call.lookup_ordinal.is_some())
+        .collect();
+    if numbered.is_empty() {
+        if !observed.is_empty() {
+            warnings.push(
+                "the candidate numbers no lookup, so the lookups it made are not accounted \
+                 for: a candidate built before lookups were numbered writes none"
+                    .to_owned(),
+            );
+        }
+        return None;
+    }
+    let mut seen: HashMap<u64, u64> = HashMap::with_capacity(numbered.len());
+    for call in &numbered {
+        *seen
+            .entry(call.lookup_ordinal.unwrap_or_default())
+            .or_insert(0) += 1;
+    }
+    let highest = seen.keys().copied().max().unwrap_or_default();
+    let repeated = seen.values().filter(|count| **count > 1).count();
+    let missing = (1..=highest)
+        .filter(|ordinal| !seen.contains_key(ordinal))
+        .count();
+    if repeated > 0 {
+        reasons.push(format!(
+            "{repeated} lookup number(s) repeat: the candidate started over during the run, so \
+             its observations come from more than one process"
+        ));
+    }
+    if missing > 0 {
+        reasons.push(format!(
+            "{missing} of the candidate's {highest} lookup(s) wrote no observation"
+        ));
+    }
+    let exact = numbered.iter().filter(|call| call.resolved).count() as u64;
+    let arg_free = numbered.iter().filter(|call| call.arg_divergent).count() as u64;
+    Some(deja::LookupTally {
+        total: highest,
+        exact,
+        arg_free,
+        missed: numbered.len() as u64 - exact - arg_free,
+    })
 }
 
 /// Why a served call's arguments would otherwise have passed, for its warning.
@@ -6359,6 +6418,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // candidate caused; exclude them from the blocking count so a run whose
     // only "reasons" are those still avoids a blocking failure (race becomes an
     // explicit inconclusive verdict).
+    // Every lookup the candidate made, counted from the ordinal it took as it
+    // arrived. The ordinals on the stream must be one to the highest, once
+    // each: a gap is a lookup that wrote no observation, and a repeat is a
+    // candidate that started over, so its stream holds two processes' lookups.
+    let lookup_tally = account_lookups(&art.observed, &mut reasons, &mut warnings_extra);
     let blocking_reasons = reasons.len()
         - usize::from(novel_calls > 0)
         - usize::from(absorbed_misses > 0)
@@ -6689,6 +6753,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             .as_ref()
             .map(|scope| scope.iter().cloned().collect()),
         warnings,
+        lookup_tally,
     }
 }
 
@@ -7618,6 +7683,7 @@ mod tests {
             absorbed: false,
             arg_divergent: false,
             served_event_global_sequence: None,
+            lookup_ordinal: None,
         }
     }
 

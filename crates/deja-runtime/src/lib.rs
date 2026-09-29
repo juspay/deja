@@ -56,7 +56,7 @@ pub use graph::{
 };
 pub use replay::{
     is_pure_boundary, ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook,
-    ReplayReport, ARG_MISMATCH_POLICY_ENV,
+    ReplayReport,
 };
 pub use writer::{
     AsyncRecordWriter, CompositeSink, JsonlSink, MarkerKind, RecordSink, SinkPolicy, WriterConfig,
@@ -6576,6 +6576,7 @@ mod tests {
             outcome: SubstituteOutcome::default(),
             arg_divergent: false,
             served_event_global_sequence: None,
+            lookup_ordinal: None,
         }
     }
 
@@ -6912,6 +6913,7 @@ mod tests {
                 outcome: crate::SubstituteOutcome::default(),
                 arg_divergent: false,
                 served_event_global_sequence: None,
+                lookup_ordinal: None,
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
                 role: None,
@@ -8131,6 +8133,7 @@ mod serve_or_run_tests {
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
             served_event_global_sequence: None,
+            lookup_ordinal: None,
             correlation_id: Some("c-1".to_owned()),
             boundary: "db".to_owned(),
             role: None,

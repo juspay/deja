@@ -727,39 +727,7 @@ pub enum ArgMismatchPolicy {
     Always,
 }
 
-/// The environment variable a deployment sets to choose the candidate's
-/// [`ArgMismatchPolicy`]: `never`, `only_for_argful` (the default when unset)
-/// or `always`.
-pub const ARG_MISMATCH_POLICY_ENV: &str = "DEJA_REPLAY_ARG_MISMATCH_POLICY";
-
 impl ArgMismatchPolicy {
-    /// The policy a setting names, or an error naming the settings there are.
-    pub fn from_setting(setting: &str) -> Result<Self, String> {
-        match setting.trim() {
-            "never" => Ok(Self::Never),
-            "only_for_argful" => Ok(Self::OnlyForArgful),
-            "always" => Ok(Self::Always),
-            other => Err(format!(
-                "{ARG_MISMATCH_POLICY_ENV}={other:?} names no policy: use never, \
-                 only_for_argful or always"
-            )),
-        }
-    }
-
-    /// The policy this deployment's environment sets, the default when it sets
-    /// none, and an error when it sets one that does not exist.
-    pub fn from_env() -> std::io::Result<Self> {
-        Self::from_optional_setting(std::env::var(ARG_MISMATCH_POLICY_ENV).ok().as_deref())
-    }
-
-    /// [`ArgMismatchPolicy::from_env`] over a setting already read.
-    fn from_optional_setting(setting: Option<&str>) -> std::io::Result<Self> {
-        setting.map_or(Ok(Self::default()), |setting| {
-            Self::from_setting(setting)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        })
-    }
-
     fn allow_arg_mismatch(self, args: &serde_json::Value) -> bool {
         match self {
             Self::Never => false,
@@ -1858,6 +1826,12 @@ pub struct ObservedCall {
     /// decide; this names the candidate's pick so the two can be compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_event_global_sequence: Option<u64>,
+    /// This lookup's number, taken as it arrived: one per lookup, from one. The
+    /// scorer counts the lookups a run made from these, so a lookup that wrote
+    /// no observation is a gap between two of them. Absent from a candidate
+    /// that does not number its lookups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_ordinal: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1918,6 +1892,8 @@ struct ObservedCallWire {
     arg_divergent: bool,
     #[serde(default)]
     served_event_global_sequence: Option<u64>,
+    #[serde(default)]
+    lookup_ordinal: Option<u64>,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1956,6 +1932,7 @@ impl From<ObservedCallWire> for ObservedCall {
             outcome: wire.outcome,
             arg_divergent: wire.arg_divergent,
             served_event_global_sequence: wire.served_event_global_sequence,
+            lookup_ordinal: wire.lookup_ordinal,
         }
     }
 }
@@ -2863,7 +2840,7 @@ fn arg_free_index(table: &HashMap<LookupKey, HookEntry>) -> HashMap<ArgFreeKey, 
 /// independent total, so `total == exact + arg_free + missed` is an assertion
 /// that can FAIL rather than an identity restated: a total derived as the sum
 /// asserts nothing about the arms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupTally {
     /// Lookups made, counted once as each one arrives.
     pub total: u64,
@@ -2944,19 +2921,19 @@ impl LookupTableHook {
     /// or `FileObservedSink` for harness runs). Loading happens once at
     /// construction; failures bubble up as `io::Error`.
     ///
-    /// The arg-mismatch policy comes from the deployment's environment
-    /// ([`ARG_MISMATCH_POLICY_ENV`]); a setting that names no policy fails the
-    /// install rather than falling back to a default.
+    /// Under the default [`ArgMismatchPolicy`]; see
+    /// [`LookupTableHook::from_source_with_policy`] for a deployment's own.
     pub fn from_source<S, K>(source: S, sink: K) -> std::io::Result<Self>
     where
         S: LookupTableSource,
         K: ObservedCallSink + 'static,
     {
-        Self::from_source_with_policy(source, sink, ArgMismatchPolicy::from_env()?)
+        Self::from_source_with_policy(source, sink, ArgMismatchPolicy::default())
     }
 
-    /// [`LookupTableHook::from_source`] with the arg-mismatch policy given.
-    /// `Never` restores the fail-stop: a call whose arguments moved misses.
+    /// [`LookupTableHook::from_source`] with the arg-mismatch policy given, as
+    /// the embedder reads it from its own settings. `Never` restores the
+    /// fail-stop: a call whose arguments moved misses.
     pub fn from_source_with_policy<S, K>(
         mut source: S,
         sink: K,
@@ -3047,8 +3024,10 @@ impl LookupTableHook {
     /// boundary in the same run. It does NOT emit an observation — the caller
     /// shapes and emits the `ObservedCall` (Recorded vs Shadow).
     fn resolve(&self, query: &ReplayLookup<'_>, fallback: ArgFreeFallback) -> Resolution {
-        self.lookups
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lookup_ordinal = self
+            .lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         // The candidate carries no notion of "current correlation" in
         // ReplayLookup; pull it from the ambient deja-context scope set up
         // by the request middleware.
@@ -3194,6 +3173,7 @@ impl LookupTableHook {
             served_event_global_sequence: hit
                 .filter(|_| arg_divergent)
                 .map(|(entry, _)| entry.source_event_global_sequence),
+            lookup_ordinal,
             arg_divergent,
         }
     }
@@ -3217,6 +3197,8 @@ struct Resolution {
     arg_divergent: bool,
     /// The recorded event an args-free serve took its value from.
     served_event_global_sequence: Option<u64>,
+    /// This lookup's number; see [`ObservedCall::lookup_ordinal`].
+    lookup_ordinal: u64,
 }
 
 impl Resolution {
@@ -3273,6 +3255,7 @@ impl Resolution {
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: self.arg_divergent,
             served_event_global_sequence: self.served_event_global_sequence,
+            lookup_ordinal: Some(self.lookup_ordinal),
         }
     }
 }
@@ -3479,6 +3462,7 @@ impl DejaHook for LookupTableHook {
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
             served_event_global_sequence: None,
+            lookup_ordinal: None,
         });
     }
 
@@ -6592,31 +6576,6 @@ mod tests {
         assert!(!last_call(&handle).arg_divergent);
         assert_eq!(hook.lookup_tally().arg_free, 0);
         assert_eq!(hook.lookup_tally().missed, 1);
-    }
-
-    #[test]
-    fn the_policy_setting_names_every_policy_and_refuses_the_rest() {
-        for (setting, policy) in [
-            ("never", ArgMismatchPolicy::Never),
-            ("only_for_argful", ArgMismatchPolicy::OnlyForArgful),
-            ("always", ArgMismatchPolicy::Always),
-        ] {
-            assert_eq!(ArgMismatchPolicy::from_setting(setting), Ok(policy));
-            assert_eq!(
-                ArgMismatchPolicy::from_optional_setting(Some(setting)).expect("a policy"),
-                policy
-            );
-        }
-        assert_eq!(
-            ArgMismatchPolicy::from_optional_setting(None).expect("the default"),
-            ArgMismatchPolicy::OnlyForArgful
-        );
-        let refused = ArgMismatchPolicy::from_optional_setting(Some("sometimes"))
-            .expect_err("a setting that names no policy fails the install");
-        assert!(
-            refused.to_string().contains(ARG_MISMATCH_POLICY_ENV),
-            "{refused}"
-        );
     }
 
     #[test]

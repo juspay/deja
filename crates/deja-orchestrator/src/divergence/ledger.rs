@@ -93,9 +93,13 @@ pub struct CallRecord {
     pub correlation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_event_global_sequence: Option<u64>,
-    /// The recorded event actually served by the replay lookup ladder. Present
-    /// when graph alignment found that serving and structural identity differ;
-    /// `source_event_global_sequence` remains the structurally aligned event.
+    /// The recorded event actually served by the replay lookup ladder, where it
+    /// is not `source_event_global_sequence`. Present for two reasons, told
+    /// apart by `kind`: on an identity skew, graph alignment found that serving
+    /// and structural identity differ, and `source_event_global_sequence`
+    /// remains the structurally aligned event; on a call served by its address
+    /// alone, it is the recording the candidate took the value from, and
+    /// `source_event_global_sequence` is the twin the pairing judged it against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_event_global_sequence: Option<u64>,
     pub boundary: String,
@@ -862,6 +866,7 @@ mod tests {
             absorbed: false,
             arg_divergent: false,
             served_event_global_sequence: None,
+            lookup_ordinal: None,
         }
     }
 
