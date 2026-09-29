@@ -1852,6 +1852,12 @@ pub struct ObservedCall {
     /// the hook matched a different arguments bucket.
     #[serde(default)]
     pub arg_divergent: bool,
+    /// On an args-free serve, the recorded event whose value was served. The
+    /// row claims no twin (`source_event_global_sequence` is absent), because
+    /// which recorded call a re-keyed call belongs to is the scorer's to
+    /// decide; this names the candidate's pick so the two can be compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_event_global_sequence: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1910,6 +1916,8 @@ struct ObservedCallWire {
     outcome: crate::SubstituteOutcome,
     #[serde(default)]
     arg_divergent: bool,
+    #[serde(default)]
+    served_event_global_sequence: Option<u64>,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1947,6 +1955,7 @@ impl From<ObservedCallWire> for ObservedCall {
             absorbed: wire.absorbed,
             outcome: wire.outcome,
             arg_divergent: wire.arg_divergent,
+            served_event_global_sequence: wire.served_event_global_sequence,
         }
     }
 }
@@ -3182,6 +3191,9 @@ impl LookupTableHook {
                 .filter(|_| !arg_divergent)
                 .map(|(entry, _)| entry.source_event_global_sequence),
             recorded_result: hit.map(|(entry, _)| (*entry.result).clone()),
+            served_event_global_sequence: hit
+                .filter(|_| arg_divergent)
+                .map(|(entry, _)| entry.source_event_global_sequence),
             arg_divergent,
         }
     }
@@ -3203,6 +3215,8 @@ struct Resolution {
     recorded_result: Option<serde_json::Value>,
     /// `recorded_result` came from the same address with different arguments.
     arg_divergent: bool,
+    /// The recorded event an args-free serve took its value from.
+    served_event_global_sequence: Option<u64>,
 }
 
 impl Resolution {
@@ -3258,6 +3272,7 @@ impl Resolution {
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: self.arg_divergent,
+            served_event_global_sequence: self.served_event_global_sequence,
         }
     }
 }
@@ -3463,6 +3478,7 @@ impl DejaHook for LookupTableHook {
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
+            served_event_global_sequence: None,
         });
     }
 

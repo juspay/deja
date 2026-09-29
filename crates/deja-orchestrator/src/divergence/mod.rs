@@ -5310,6 +5310,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
     let mut args_served_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut pairing_disagreements: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
     let mut value_document_absorbed_seen: BTreeMap<String, u64> = BTreeMap::new();
     // Resolved calls whose args were read by identity to find their recording,
     // by call site, kind and path; and resolved calls whose args are another
@@ -5635,6 +5636,21 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
             let verdict = pair_request_verdict(obs, twin_event);
+            if obs.arg_divergent
+                && obs
+                    .served_event_global_sequence
+                    .is_some_and(|served| served != twin_seq)
+            {
+                // The candidate ran on one recording's value and the pairing
+                // judged the call against another. Both rows say which; this
+                // says that they differ.
+                stats.note_kind("ArgsServedPairingDisagrees");
+                let served = obs.served_event_global_sequence.unwrap_or_default();
+                pairing_disagreements
+                    .entry(call_site_label(obs))
+                    .or_insert((0, served, twin_seq))
+                    .0 += 1;
+            }
             if obs.arg_divergent {
                 stats.note_kind("ArgsServedByAddress");
                 *args_served_seen
@@ -6498,6 +6514,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "matched call {call_site} resolved on {calls} call(s) with args whose identity differs \
              from the recorded event it was served; neither lookup can serve that, so the table \
              and the recording disagree"
+        ));
+    }
+    for (call_site, (calls, served, paired)) in &pairing_disagreements {
+        warnings.push(format!(
+            "call {call_site} was served one recording's value and judged against another on \
+             {calls} call(s), first serving recorded event {served} and pairing with {paired}: \
+             the candidate picks by site and the scorer by order, and here they differ"
         ));
     }
     for ((call_site, reason), calls) in &args_served_seen {
@@ -7594,6 +7617,7 @@ mod tests {
             seed_gap: false,
             absorbed: false,
             arg_divergent: false,
+            served_event_global_sequence: None,
         }
     }
 

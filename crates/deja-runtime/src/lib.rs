@@ -6575,6 +6575,7 @@ mod tests {
             absorbed: false,
             outcome: SubstituteOutcome::default(),
             arg_divergent: false,
+            served_event_global_sequence: None,
         }
     }
 
@@ -6910,6 +6911,7 @@ mod tests {
             Some(ExecuteShadowToken::new(crate::replay::ObservedCall {
                 outcome: crate::SubstituteOutcome::default(),
                 arg_divergent: false,
+                served_event_global_sequence: None,
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
                 role: None,
@@ -8128,6 +8130,7 @@ mod serve_or_run_tests {
         ExecuteShadowToken::new(crate::replay::ObservedCall {
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
+            served_event_global_sequence: None,
             correlation_id: Some("c-1".to_owned()),
             boundary: "db".to_owned(),
             role: None,

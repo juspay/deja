@@ -510,7 +510,9 @@ pub(crate) fn build_with_inconclusive_into(
             sink(CallRecord {
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: Some(twin_seq),
-                served_event_global_sequence: None,
+                // The recorded event the candidate served, where it served one
+                // by address alone: auditable against the twin paired here.
+                served_event_global_sequence: obs.served_event_global_sequence,
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -633,7 +635,7 @@ pub(crate) fn build_with_inconclusive_into(
             served_event_global_sequence: if skewed {
                 obs.source_event_global_sequence
             } else {
-                None
+                obs.served_event_global_sequence
             },
             boundary: obs.boundary.clone(),
             trait_name: obs.trait_name.clone(),
@@ -859,6 +861,7 @@ mod tests {
             seed_gap: false,
             absorbed: false,
             arg_divergent: false,
+            served_event_global_sequence: None,
         }
     }
 
