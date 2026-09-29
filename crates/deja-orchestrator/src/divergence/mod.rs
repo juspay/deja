@@ -16706,6 +16706,100 @@ mod tests {
         );
     }
 
+    /// An args-free serve scored against its recorded twin, with the args each
+    /// side sent and the recorded event's declaration, as `LookupTableHook`
+    /// shapes the call.
+    fn args_free_served(
+        recorded_args: serde_json::Value,
+        served_args: serde_json::Value,
+        declaration: Option<&str>,
+    ) -> (Scorecard, Vec<CallRecord>) {
+        let corr = "argfree-absorber";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let mut recorded = omitted_ev(702, "db", Some(corr));
+        recorded.method_name = "load".to_owned();
+        recorded.args = recorded_args.into();
+        recorded.result = result.clone().into();
+        if let Some(declaration) = declaration {
+            recorded.declaration = db_read_declaring(declaration).declaration;
+        }
+        let mut served = substituted_obs_method("db", Some(corr), "load", 702, result.clone());
+        served.args = served_args;
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>load");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 702, result.clone()),
+                span_entry_res(Some(corr), 702, "request>load", result),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![recorded],
+        );
+        (
+            detect(&artifacts),
+            build_ledger(&artifacts).expect("a ledger"),
+        )
+    }
+
+    /// A call served by its address alone had its arguments rejected by every
+    /// rank of the candidate's lookup, so no absorber may forgive them. It
+    /// blocks, and is named for what it is.
+    fn assert_args_free_serve_blocks(
+        name: &str,
+        recorded: serde_json::Value,
+        served: serde_json::Value,
+        declaration: Option<&str>,
+    ) {
+        let (card, rows) = args_free_served(recorded, served, declaration);
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "{name}: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.per_boundary["db"].matched, 0, "{name}");
+        assert_eq!(kind_count(&card, "db", "ArgsServedByAddress"), 1, "{name}");
+        assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
+        assert!(!rows.is_empty(), "{name}");
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "value_diverged" && row.blocking),
+            "{name}: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "{name}: {rows:?}"
+        );
+    }
+
+    /// The replay-local id rule does not forgive a served call's arguments.
+    #[test]
+    fn an_args_free_serve_is_not_forgiven_as_a_replay_local_id() {
+        assert_args_free_serve_blocks(
+            "an integer id the database rule strips",
+            serde_json::json!({"amount": 100, "id": 41}),
+            serde_json::json!({"amount": 100, "id": 42}),
+            None,
+        );
+    }
+
+    /// A recorder's clause, which is applied to arguments too, does not
+    /// forgive a served call's arguments.
+    #[test]
+    fn an_args_free_serve_is_not_forgiven_by_a_recorder_clause() {
+        assert_args_free_serve_blocks(
+            "a field a recorder clause projects away",
+            serde_json::json!({"amount": 100, "nonce": "a"}),
+            serde_json::json!({"amount": 100, "nonce": "b"}),
+            Some("project:!nonce"),
+        );
+    }
+
     #[test]
     fn scorecard_and_ledger_classifications_agree_in_graph_and_flat_tiers() {
         let graph_corr = "agreement-graph";
