@@ -5767,15 +5767,17 @@ s3_bucket = "ucs-deja"
     /// A seal written before seals were addressed carries an EMPTY id, so its
     /// parts and index sit at the unscoped keys. The old-release fixture cannot
     /// cover that shape — its id is content-addressed and non-empty — and it is
-    /// `correlations_key` that DERIVES its key from the id rather than reading it
-    /// from the manifest, so that derivation is what a plain copy has to survive.
-    /// Reachable as soon as an existing bucket's recordings move under a
-    /// directory.
+    /// `correlations_key` that derives its key from the id rather than reading it
+    /// from the manifest, so a legacy seal is looked for at keys no seal written
+    /// today uses. Reachable as soon as an existing bucket's recordings move
+    /// under a directory.
     #[test]
     fn a_legacy_seal_with_no_id_reads_back_copied_under_a_prefix() {
         // The keys a pre-addressed sealer actually wrote, spelled out. Deriving
-        // them through `layout` instead would move the write and the read
-        // together, so the test could not see the derivation change at all.
+        // them would make the pins below tautological, and the reads cannot
+        // stand in for them: `Path::from` drops empty segments, so an empty seal
+        // id that began naming a directory reads back identically. S3
+        // distinguishes those keys; `object_store` does not.
         const LEGACY_PARTS: [&str; 1] = ["sessions/v1/s1/data/part-00000.ndjsonl.zst"];
         const LEGACY_INDEX: &str = "sessions/v1/s1/index/correlations.ndjson.zst";
         const LEGACY_MANIFEST: &str = "sessions/v1/s1/manifest.json";
@@ -5787,8 +5789,9 @@ s3_bucket = "ucs-deja"
             "the sealer addresses its seals"
         );
         assert_eq!(addressed.data_parts.len(), LEGACY_PARTS.len());
-        // Pin the derivation to those literals: this is the assertion that fails
-        // if an empty seal id stops meaning "no seal directory".
+        // The pins hold the key SPELLING; the reads below hold any change that
+        // yields a real segment. Both halves are needed — neither alone covers
+        // an empty seal id ceasing to mean "no seal directory".
         assert_eq!(layout::part_key("s1", "", 0), LEGACY_PARTS[0]);
         assert_eq!(layout::correlations_key("s1", ""), LEGACY_INDEX);
         assert_eq!(layout::manifest_key("s1"), LEGACY_MANIFEST);
@@ -5824,9 +5827,17 @@ s3_bucket = "ucs-deja"
             &layout::correlations_key(&session, &addressed.seal_id),
             LEGACY_INDEX,
         );
+        // A real legacy manifest OMITS the key rather than carrying an empty one,
+        // and `seal_id` is `#[serde(default)]` so that parses. Write it absent,
+        // so removing that default fails here instead of only in production.
+        let mut doc = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            doc.as_object_mut().unwrap().remove("seal_id").is_some(),
+            "the field has to be there to be removed"
+        );
         block(legacy_store.put(
             &object_store::path::Path::from(LEGACY_MANIFEST),
-            serde_json::to_vec(&legacy).unwrap().into(),
+            serde_json::to_vec(&doc).unwrap().into(),
         ))
         .unwrap();
 
