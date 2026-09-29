@@ -17090,6 +17090,90 @@ mod tests {
         assert!(!card.verdict.pass, "{}", card.verdict.reason);
     }
 
+    /// The lookups a run made are counted from the ordinal on each observation:
+    /// every ordinal from one to the highest, once each. A gap is a lookup that
+    /// wrote no observation, a repeat is a candidate that started over, and
+    /// either fails the run, named.
+    #[test]
+    fn lookups_are_accounted_by_their_ordinals() {
+        let call = |ordinal: u64, arg_divergent: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.arg_divergent = arg_divergent;
+            call.lookup_ordinal = Some(ordinal);
+            call
+        };
+        let card = |observed: Vec<ObservedCall>| super::detect(&art(vec![], observed, vec![]));
+        let whole = card(vec![call(1, false), call(2, false)]);
+        let tally = whole
+            .lookup_tally
+            .expect("a numbered run reports its tally");
+        assert_eq!(tally.total, 2);
+        assert!(tally.balances(), "{tally:?}");
+        assert!(
+            !whole.verdict.reason.contains("lookup"),
+            "{}",
+            whole.verdict.reason
+        );
+        for (name, observed, cause) in [
+            (
+                "a gap",
+                vec![call(1, false), call(3, false)],
+                "wrote no observation",
+            ),
+            (
+                "a repeat",
+                vec![call(1, false), call(1, false)],
+                "started over",
+            ),
+        ] {
+            let card = card(observed);
+            assert!(!card.verdict.pass, "{name}");
+            assert!(
+                card.verdict.reason.contains(cause),
+                "{name}: {}",
+                card.verdict.reason
+            );
+        }
+        let unnumbered = card(vec![substituted_obs_method(
+            "db",
+            Some("c1"),
+            "load",
+            1,
+            serde_json::json!(1),
+        )]);
+        assert!(unnumbered.lookup_tally.is_none());
+        assert!(
+            unnumbered
+                .warnings
+                .iter()
+                .any(|w| w.contains("numbers no lookup")),
+            "{:?}",
+            unnumbered.warnings
+        );
+    }
+
+    /// The ordinal survives the stream: written by the candidate's file sink,
+    /// read back by the scorer's loader.
+    #[test]
+    fn a_lookup_ordinal_rides_the_observed_stream() {
+        use deja::ObservedCallSink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let sink = deja::FileObservedSink::create(&path).expect("a sink");
+        let mut call = substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+        call.lookup_ordinal = Some(7);
+        call.served_event_global_sequence = Some(3);
+        sink.observed(call);
+        sink.flush().expect("flush");
+        let mut warnings = Vec::new();
+        let (observed, _) = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].lookup_ordinal, Some(7));
+        assert_eq!(observed[0].served_event_global_sequence, Some(3));
+    }
+
     /// The replay-local id rule does not forgive a served call's arguments.
     #[test]
     fn an_args_free_serve_is_not_forgiven_as_a_replay_local_id() {

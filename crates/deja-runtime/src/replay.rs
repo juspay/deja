@@ -6528,6 +6528,41 @@ mod tests {
     }
 
     #[test]
+    fn every_lookup_carries_its_ordinal_whatever_its_arm() {
+        // One ordinal per lookup, taken as it arrives, on the observation each
+        // lookup writes: the scorer counts the lookups a run made from these,
+        // with no flush to wait for, and a lookup that wrote no observation is
+        // the gap between two of them.
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]));
+        for (method, amount) in [("find_payment", 200), ("find_payment", 100), ("other", 100)] {
+            ask_storage(
+                &hook,
+                "find-payment",
+                method,
+                &serde_json::json!({ "amount": amount }),
+            );
+        }
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().map(|c| c.lookup_ordinal).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.arg_divergent, c.resolved))
+                .collect::<Vec<_>>(),
+            vec![(true, false), (false, true), (false, false)],
+            "precondition: one call in each arm"
+        );
+    }
+
+    #[test]
     fn a_deployment_can_restore_the_fail_stop() {
         // `Never` is the fail-stop the fallback replaced: a call whose arguments
         // moved misses, and the request stops there.
