@@ -985,7 +985,7 @@ mod tests {
         // The span path an observation carries comes from the tracing layer, as
         // in the candidate; the scorer pairs args-free by it.
         use tracing_subscriber::layer::SubscriberExt;
-        let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer::default());
+        let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer);
         let _subscriber = tracing::subscriber::set_default(subscriber);
         let _request = tracing::info_span!("request").entered();
         let _load = tracing::info_span!("load").entered();
