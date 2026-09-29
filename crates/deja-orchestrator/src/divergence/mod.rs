@@ -2369,6 +2369,20 @@ enum ValueVerdict {
 /// recorder-declared clause and replay-local database infrastructure are
 /// absorbed as they are anywhere else ([`value_verdict`]).
 fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+    // A call served by its address alone had its arguments rejected by every
+    // rank of the candidate's own lookup, the exact key and the identity both,
+    // and it ran on a value recorded for other arguments. Nothing may forgive
+    // that: not the replay-local id rule, and not a clause.
+    if call.arg_divergent {
+        return ValueVerdict::Diverged;
+    }
+    request_verdict(call, twin)
+}
+
+/// What [`pair_request_verdict`] would say of a call's arguments if it had not
+/// been served by its address alone: the absorber that would have forgiven
+/// them, named on the warning so the reason stays visible.
+fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
     let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
     match deja::identity::identity_differences(&recorded, &call.args).as_deref() {
         // The same identity as written: the request is the recording's, even
@@ -2387,6 +2401,21 @@ fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>)
         twin,
         call.args.get("sql").and_then(serde_json::Value::as_str),
     )
+}
+
+/// Why a served call's arguments would otherwise have passed, for its warning.
+fn args_served_reason(verdict: ValueVerdict) -> &'static str {
+    match verdict {
+        ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure) => {
+            "its arguments differ only where replay-local database infrastructure is \
+             forgiven, which cannot be confirmed for a value recorded against other arguments"
+        }
+        ValueVerdict::Absorbed(ValueAbsorption::Canon(_)) => {
+            "a declared clause would have forgiven the difference, but not for a value \
+             recorded against other arguments"
+        }
+        _ => "its arguments differ from the recorded call's",
+    }
 }
 
 /// A reported path with every array index written `[]`, so a row reordered
@@ -5280,6 +5309,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut args_served_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
     let mut value_document_absorbed_seen: BTreeMap<String, u64> = BTreeMap::new();
     // Resolved calls whose args were read by identity to find their recording,
     // by call site, kind and path; and resolved calls whose args are another
@@ -5605,6 +5635,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
             let verdict = pair_request_verdict(obs, twin_event);
+            if obs.arg_divergent {
+                stats.note_kind("ArgsServedByAddress");
+                *args_served_seen
+                    .entry((
+                        call_site_label(obs),
+                        args_served_reason(request_verdict(obs, twin_event)),
+                    ))
+                    .or_insert(0) += 1;
+            }
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
@@ -5640,7 +5679,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             // An exact later-args match is direct order evidence. Result/schema
             // equivalence and race demotion must not absorb that blocking signal.
-            let schema_default = if value_diverged && !order_mismatch {
+            let schema_default = if value_diverged && !order_mismatch && !obs.arg_divergent {
                 schema_default_divergence(
                     &obs.boundary,
                     twin_event
@@ -5668,6 +5707,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .or_insert(0) += 1;
             } else if value_diverged {
                 if !order_mismatch
+                    && !obs.arg_divergent
                     && inconclusive_race
                         .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
                 {
@@ -5690,6 +5730,28 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             // Either way the recorded twin is accounted for here, not omitted.
             paired_consumed.insert(twin_seq);
+        } else if obs.arg_divergent {
+            // Served by its address alone, with no recorded call left to pair it
+            // with. The candidate found one at that address, so this is a call
+            // the recording holds, run on a value recorded for other arguments.
+            // It blocks, ahead of every arm that tolerates a miss: before the
+            // fallback those arms never saw it, because the call stopped.
+            // Counted as the value divergence it is, and named for how it
+            // arose.
+            stats.bump_kind("ValueDiverged");
+            stats.note_kind("ArgsServedByAddress");
+            stats.note_kind("ArgsServedUnpaired");
+            *args_served_seen
+                .entry((
+                    call_site_label(obs),
+                    "no recorded call was left to pair it with",
+                ))
+                .or_insert(0) += 1;
+            value_divergences += 1;
+            blocking_side_effect += 1;
+            if let Some(corr) = &obs.correlation_id {
+                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+            }
         } else if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
             graph_plan.replay_event_is_novel(correlation_id, observed_index)
         }) {
@@ -6436,6 +6498,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "matched call {call_site} resolved on {calls} call(s) with args whose identity differs \
              from the recorded event it was served; neither lookup can serve that, so the table \
              and the recording disagree"
+        ));
+    }
+    for ((call_site, reason), calls) in &args_served_seen {
+        warnings.push(format!(
+            "call {call_site} was served the recording's value for its address on {calls} \
+             call(s) although its arguments differed, and it blocks: {reason}"
         ));
     }
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
@@ -16642,9 +16710,9 @@ mod tests {
         // could have made this quiet, so the claim needs its own row: the pair is
         // judged on what the call SENT — its arguments — not on what came back.
         //
-        // `arg_divergent` is deliberately not what makes this block. It is
-        // descriptive; `resolved` is load-bearing. That is what makes the change
-        // safe against an orchestrator older than the candidate emitting it.
+        // `resolved` is what makes an orchestrator older than the candidate
+        // score this as a divergence. `arg_divergent` is what makes this one
+        // refuse every absorber on the way: see the two tests that follow.
         let corr = "argfree-serve";
         let result = serde_json::json!({"result": "Ok", "value": 9});
         let mut recorded = omitted_ev(701, "db", Some(corr));
@@ -16775,6 +16843,62 @@ mod tests {
             !rows.iter().any(|row| row.kind == "matched"),
             "{name}: {rows:?}"
         );
+    }
+
+    /// A call served by its address alone with no recorded call left to pair it
+    /// with blocks, on a stateful boundary and on a pure one, where a miss the
+    /// request survived would otherwise be excused.
+    #[test]
+    fn an_unpaired_args_free_serve_blocks() {
+        for boundary in ["db", "id"] {
+            let corr = "argfree-unpaired";
+            let result = serde_json::json!({"result": "Ok", "value": 9});
+            let mut served =
+                substituted_obs_method(boundary, Some(corr), "load", 703, result.clone());
+            served.args = serde_json::json!({"prefix": "pay"});
+            served.resolved = false;
+            served.arg_divergent = true;
+            served.resolved_rank = Some(1);
+            served.source_event_global_sequence = None;
+            served.outcome = deja::SubstituteOutcome::Substituted;
+            let artifacts = art_with_events(
+                vec![],
+                vec![with_span(served, "request>load")],
+                vec![http(corr, true, vec![])],
+                vec![],
+            );
+            let card = detect(&artifacts);
+            let rows = build_ledger(&artifacts).expect("a ledger");
+            assert_eq!(
+                kind_count(&card, boundary, "ArgsServedUnpaired"),
+                1,
+                "{boundary}"
+            );
+            assert_eq!(
+                kind_count(&card, boundary, "ValueDiverged"),
+                1,
+                "{boundary}"
+            );
+            assert_eq!(
+                kind_count(&card, boundary, "DeterministicMiss"),
+                0,
+                "{boundary}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{boundary}");
+            assert!(!card.verdict.pass, "{boundary}: {}", card.verdict.reason);
+            assert!(!rows.is_empty(), "{boundary}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.kind == "args_served_unpaired" && row.blocking),
+                "{boundary}: {rows:?}"
+            );
+            assert!(
+                card.warnings
+                    .iter()
+                    .any(|w| w.contains("no recorded call was left")),
+                "{boundary}"
+            );
+        }
     }
 
     /// The replay-local id rule does not forgive a served call's arguments.

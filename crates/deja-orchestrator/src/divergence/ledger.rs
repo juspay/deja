@@ -483,6 +483,7 @@ pub(crate) fn build_with_inconclusive_into(
                 args_free_effective_values(&recorded_result, obs, twin_event);
             let value_diverged = paired_value_diverged(obs, observed_index, &by_seq, &pairing);
             let race_downstream = !twin.order_mismatch
+                && !obs.arg_divergent
                 && value_diverged
                 && inconclusive_race
                     .attributable_downstream(obs.correlation_id.as_deref(), &obs.args);
@@ -490,7 +491,7 @@ pub(crate) fn build_with_inconclusive_into(
             // statements say the schema filled every differing column.
             // Exact later-args evidence is instead always value-diverged and
             // blocking; equivalent result envelopes cannot absorb the swap.
-            let schema_default = (value_diverged && !twin.order_mismatch)
+            let schema_default = (value_diverged && !twin.order_mismatch && !obs.arg_divergent)
                 .then(|| {
                     schema_default_divergence(
                         &obs.boundary,
@@ -552,6 +553,11 @@ pub(crate) fn build_with_inconclusive_into(
             } else {
                 (if recovered { "recovered" } else { "matched" }, false)
             }
+        } else if obs.arg_divergent {
+            // Served by its address alone with no recorded call left to pair it
+            // with: blocking, as the scorecard's `ArgsServedUnpaired`, ahead of
+            // every arm that tolerates a miss.
+            ("args_served_unpaired", true)
         } else if plan.is_some_and(|plan| {
             obs.correlation_id
                 .as_deref()
