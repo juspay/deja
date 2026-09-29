@@ -5750,6 +5750,119 @@ s3_bucket = "ucs-deja"
         );
     }
 
+    /// Copy one object between stores, key for key, the way a bucket migration
+    /// does.
+    fn copy_key(from: &DynStore, to: &DynStore, src: &str, dst: &str) {
+        let bytes = block(async {
+            from.get(&object_store::path::Path::from(src))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        });
+        block(to.put(&object_store::path::Path::from(dst), bytes.into())).unwrap();
+    }
+
+    /// A seal written before seals were addressed carries an EMPTY id, so its
+    /// parts and index sit at the unscoped keys. The old-release fixture cannot
+    /// cover that shape — its id is content-addressed and non-empty — and it is
+    /// `correlations_key` that DERIVES its key from the id rather than reading it
+    /// from the manifest, so that derivation is what a plain copy has to survive.
+    /// Reachable as soon as an existing bucket's recordings move under a
+    /// directory.
+    #[test]
+    fn a_legacy_seal_with_no_id_reads_back_copied_under_a_prefix() {
+        // The keys a pre-addressed sealer actually wrote, spelled out. Deriving
+        // them through `layout` instead would move the write and the read
+        // together, so the test could not see the derivation change at all.
+        const LEGACY_PARTS: [&str; 1] = ["sessions/v1/s1/data/part-00000.ndjsonl.zst"];
+        const LEGACY_INDEX: &str = "sessions/v1/s1/index/correlations.ndjson.zst";
+        const LEGACY_MANIFEST: &str = "sessions/v1/s1/manifest.json";
+
+        let old = memory();
+        let addressed = land_and_seal_at(&old, "");
+        assert!(
+            !addressed.seal_id.is_empty(),
+            "the sealer addresses its seals"
+        );
+        assert_eq!(addressed.data_parts.len(), LEGACY_PARTS.len());
+        // Pin the derivation to those literals: this is the assertion that fails
+        // if an empty seal id stops meaning "no seal directory".
+        assert_eq!(layout::part_key("s1", "", 0), LEGACY_PARTS[0]);
+        assert_eq!(layout::correlations_key("s1", ""), LEGACY_INDEX);
+        assert_eq!(layout::manifest_key("s1"), LEGACY_MANIFEST);
+        let lines = block(session_lines(&old, &addressed)).unwrap();
+        let rows = block(correlation_index_of(&old, &addressed))
+            .unwrap()
+            .expect("the seal just written has its index")
+            .len();
+        let session = addressed.session_id.clone();
+
+        // Re-lay the same session as an older sealer wrote it: every object at
+        // its unscoped key, and a manifest naming those keys with no id.
+        let legacy_store = memory();
+        let legacy = SessionManifest {
+            seal_id: String::new(),
+            data_parts: addressed
+                .data_parts
+                .iter()
+                .enumerate()
+                .map(|(n, part)| DataPart {
+                    key: LEGACY_PARTS[n].to_owned(),
+                    ..part.clone()
+                })
+                .collect(),
+            ..addressed.clone()
+        };
+        for (n, part) in addressed.data_parts.iter().enumerate() {
+            copy_key(&old, &legacy_store, &part.key, LEGACY_PARTS[n]);
+        }
+        copy_key(
+            &old,
+            &legacy_store,
+            &layout::correlations_key(&session, &addressed.seal_id),
+            LEGACY_INDEX,
+        );
+        block(legacy_store.put(
+            &object_store::path::Path::from(LEGACY_MANIFEST),
+            serde_json::to_vec(&legacy).unwrap().into(),
+        ))
+        .unwrap();
+
+        // The migration itself: a plain copy of every key under one directory.
+        let migrated = memory();
+        for key in bucket_keys(&legacy_store) {
+            copy_key(
+                &legacy_store,
+                &migrated,
+                &key,
+                &format!("hyperswitch/{key}"),
+            );
+        }
+
+        let scoped = cfg_at("hyperswitch").scope_store(migrated.clone());
+        let read = block(manifest_of(&scoped, &session))
+            .unwrap()
+            .expect("the copy is sealed");
+        assert!(
+            read.seal_id.is_empty(),
+            "the copy is still the legacy shape, not a re-seal"
+        );
+        assert_eq!(
+            block(session_lines(&scoped, &read)).unwrap(),
+            lines,
+            "part keys named by a legacy manifest resolve under the prefix"
+        );
+        assert_eq!(
+            block(correlation_index_of(&scoped, &read))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(rows),
+            "the index key derived from an EMPTY seal id resolves under the prefix"
+        );
+    }
+
     // -- region -------------------------------------------------------------
 
     /// An environment holding exactly `vars`.
