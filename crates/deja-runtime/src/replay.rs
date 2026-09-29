@@ -472,13 +472,65 @@ fn debug_bind_values(raw: &str) -> Option<Vec<serde_json::Value>> {
         .collect()
 }
 
-/// The single row a db statement names, from its recorded SQL and debug binds.
-fn statement_row_key(table: &str, sql: &str) -> Option<String> {
-    let at = sql.rfind(" -- binds: ")?;
-    let (query, raw) = sql.split_at(at);
-    let binds = debug_bind_values(raw.trim_start_matches(" -- binds: "))?;
-    let mut keys = row_keys_for_binds(table, query, &binds);
+/// The single row a db statement names, from its recorded SQL and binds.
+fn statement_row_key(table: &str, args: &serde_json::Value) -> Option<String> {
+    let (query, binds) = recorded_statement(args).ok()?;
+    let mut keys = row_keys_for_binds(table, &query, &binds);
     (keys.len() == 1).then(|| keys.remove(0).to_wire())
+}
+
+/// A recorded db statement's query text and its binds by position — the one
+/// place either is read. Current tapes carry the binds structured under
+/// `inputs.binds` (`"$n"` → value) and bare SQL; older ones append diesel's
+/// debug list to the SQL as ` -- binds: [...]`. Structured binds win when both
+/// are present. Every bind must be a JSON scalar, or the statement is refused.
+fn recorded_statement(
+    args: &serde_json::Value,
+) -> Result<(String, Vec<serde_json::Value>), String> {
+    const SUFFIX: &str = " -- binds: ";
+    let sql = args
+        .get("sql")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the recorded call carries no statement text")?;
+    let (query, suffix) = match sql.rfind(SUFFIX) {
+        Some(at) => (&sql[..at], Some(&sql[at + SUFFIX.len()..])),
+        None => (sql, None),
+    };
+    if let Some(binds) = args.get("inputs").and_then(|inputs| inputs.get("binds")) {
+        return Ok((query.to_owned(), structured_binds(binds)?));
+    }
+    let raw = suffix.ok_or("the recorded statement carries no bind list")?;
+    let binds =
+        debug_bind_values(raw).ok_or("the statement's bind list is not a list of scalars")?;
+    Ok((query.to_owned(), binds))
+}
+
+/// `inputs.binds` as a positional list: `"$1"` is index 0. A position the map
+/// skips reads as NULL, which no equality accepts.
+fn structured_binds(binds: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let map = binds
+        .as_object()
+        .ok_or("the recorded binds are not keyed by position")?;
+    let mut by_position = BTreeMap::new();
+    for (name, value) in map {
+        let position = name
+            .strip_prefix('$')
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .filter(|position| *position > 0)
+            .ok_or_else(|| format!("the recorded bind {name} is not a $n position"))?;
+        if value.is_object() || value.is_array() {
+            return Err(format!("the recorded bind {name} is not a scalar"));
+        }
+        by_position.insert(position, value.clone());
+    }
+    let len = by_position.keys().next_back().copied().unwrap_or(0);
+    Ok((1..=len)
+        .map(|position| {
+            by_position
+                .remove(&position)
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect())
 }
 
 /// Whether a db event's recorded result asserts presence without carrying the
@@ -526,7 +578,7 @@ fn presence_row_key(event: &BoundaryEvent) -> Option<String> {
     }
     let args = event.args.to_value();
     let table = db_table_from_event_args(&args)?;
-    statement_row_key(table, args.get("sql")?.as_str()?)
+    statement_row_key(table, &args)
 }
 
 /// The latest image of a row recorded before `before`, and the sequence it came
@@ -550,12 +602,7 @@ fn statement_presence_predicate(event: &BoundaryEvent) -> PresencePredicate {
     let Some(table) = db_table_from_event_args(&args) else {
         return PresencePredicate::Unsatisfiable("the recorded call names no table".to_owned());
     };
-    let Some(sql) = args.get("sql").and_then(serde_json::Value::as_str) else {
-        return PresencePredicate::Unsatisfiable(
-            "the recorded call carries no statement text".to_owned(),
-        );
-    };
-    match statement_equalities(table, sql) {
+    match statement_equalities(table, &args) {
         Ok(columns) => PresencePredicate::Equalities {
             table: table.to_owned(),
             columns,
@@ -855,22 +902,17 @@ impl EqualityReader<'_> {
 }
 
 /// The `column = value` pairs a recorded single-table DELETE's `WHERE` binds,
-/// read from its own SQL text and debug binds. Refused, with the reason, unless
+/// read from its own SQL text and recorded binds. Refused, with the reason, unless
 /// every term is an equality to a non-NULL bind joined by `AND`: a row holding
 /// the pairs then satisfies the whole `WHERE`, which is the only claim a
 /// planted row may make.
 fn statement_equalities(
     table: &str,
-    sql: &str,
+    args: &serde_json::Value,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
-    let at = sql
-        .rfind(" -- binds: ")
-        .ok_or("the recorded statement carries no bind list")?;
-    let (query, raw) = sql.split_at(at);
-    let binds = debug_bind_values(raw.trim_start_matches(" -- binds: "))
-        .ok_or("the statement's bind list is not a list of scalars")?;
+    let (query, binds) = recorded_statement(args)?;
     let mut reader = EqualityReader {
-        tokens: sql_tokens(query),
+        tokens: sql_tokens(&query),
         at: 0,
         table,
         binds: &binds,
@@ -11019,11 +11061,14 @@ redis\tcurrency\tusd
         #[test]
         fn a_delete_that_names_no_single_whole_row_borrows_nothing() {
             register_test_schema_identity();
+            let sql = |sql: &str| serde_json::json!({ "sql": sql });
             // A composite key bound by only one of its columns.
             assert_eq!(
                 statement_row_key(
                     "incremental_authorization",
-                    r#"DELETE FROM "incremental_authorization" WHERE ("incremental_authorization"."authorization_id" = $1) -- binds: ["auth_1"]"#,
+                    &sql(
+                        r#"DELETE FROM "incremental_authorization" WHERE ("incremental_authorization"."authorization_id" = $1) -- binds: ["auth_1"]"#
+                    )
                 ),
                 None
             );
@@ -11031,20 +11076,22 @@ redis\tcurrency\tusd
             assert_eq!(
                 statement_row_key(
                     "business_profile",
-                    r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) OR ("business_profile"."profile_id" = $2)) -- binds: [ProfileId("pro_1"), ProfileId("pro_2")]"#,
+                    &sql(
+                        r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) OR ("business_profile"."profile_id" = $2)) -- binds: [ProfileId("pro_1"), ProfileId("pro_2")]"#
+                    )
                 ),
                 None
             );
             assert_eq!(
                 statement_row_key(
                     "business_profile",
-                    PROFILE_DELETE.split(" -- binds").next().unwrap()
+                    &sql(PROFILE_DELETE.split(" -- binds").next().unwrap())
                 ),
                 None,
                 "no binds, no key"
             );
             assert_eq!(
-                statement_row_key("business_profile", PROFILE_DELETE),
+                statement_row_key("business_profile", &sql(PROFILE_DELETE)),
                 Some(profile_row_key("pro_1"))
             );
         }
@@ -11186,8 +11233,10 @@ redis\tcurrency\tusd
 
         #[test]
         fn statement_equalities_accept_only_a_conjunction_of_bound_equalities() {
-            let ok = |table: &str, sql: &str| statement_equalities(table, sql).unwrap();
-            let refused = |table: &str, sql: &str| statement_equalities(table, sql).unwrap_err();
+            let args = |sql: &str| serde_json::json!({ "sql": sql });
+            let ok = |table: &str, sql: &str| statement_equalities(table, &args(sql)).unwrap();
+            let refused =
+                |table: &str, sql: &str| statement_equalities(table, &args(sql)).unwrap_err();
             assert_eq!(
                 ok(
                     "t",
@@ -11280,6 +11329,118 @@ redis\tcurrency\tusd
         }
 
         /// The same recording and scope plan the same entry, byte for byte.
+        /// The args a current tape records for the delete, verbatim: bare SQL,
+        /// binds structured under `inputs.binds`.
+        const RECORDED_KEY_STORE_DELETE: &str = r#"{"inputs": {"binds": {"$1": "cyMerchant_39c7be0f"}, "predicate": {"type": "diesel::expression::grouped::Grouped<diesel::expression::operators::Eq<diesel_models::schema::merchant_key_store::columns::merchant_id, diesel::expression::bound::Bound<diesel::sql_types::Text, common_utils::id_type::merchant::MerchantId>>>"}}, "operation": "generic_delete", "sql": "DELETE FROM \"merchant_key_store\" WHERE (\"merchant_key_store\".\"merchant_id\" = $1)", "table": "merchant_key_store"}"#;
+
+        fn structured_delete(args: serde_json::Value) -> SeedEntry {
+            let key = "deja:test:structured-delete";
+            let event = state_event(
+                5,
+                Some("b"),
+                "db",
+                "generic_delete",
+                args,
+                serde_json::from_str(PRESENT).unwrap(),
+                &[key],
+                &[key],
+                false,
+            );
+            build_seed_plan(&[event], Some("b"))
+                .iter()
+                .find(|entry| entry.boundary == "db")
+                .expect("the delete is planned")
+                .clone()
+        }
+
+        #[test]
+        fn a_current_tapes_structured_binds_name_the_row() {
+            let entry = structured_delete(serde_json::from_str(RECORDED_KEY_STORE_DELETE).unwrap());
+            assert_eq!(
+                entry.presence,
+                Some(PresencePredicate::Equalities {
+                    table: "merchant_key_store".to_owned(),
+                    columns: vec![(
+                        "merchant_id".to_owned(),
+                        serde_json::json!("cyMerchant_39c7be0f")
+                    )],
+                })
+            );
+        }
+
+        #[test]
+        fn two_structured_binds_both_reach_the_row() {
+            let entry = structured_delete(serde_json::json!({
+                "table": "business_profile",
+                "sql": PROFILE_DELETE.split(" -- binds").next().unwrap(),
+                "inputs": {"binds": {"$2": "m1", "$1": "pro_1"}},
+            }));
+            assert_eq!(
+                entry.presence,
+                Some(PresencePredicate::Equalities {
+                    table: "business_profile".to_owned(),
+                    columns: vec![
+                        ("profile_id".to_owned(), serde_json::json!("pro_1")),
+                        ("merchant_id".to_owned(), serde_json::json!("m1")),
+                    ],
+                })
+            );
+        }
+
+        #[test]
+        fn structured_binds_keep_scalars_and_refuse_the_rest_by_name() {
+            let sql = r#"DELETE FROM "t" WHERE ("t"."a" = $1) AND ("t"."b" = $2)"#;
+            assert_eq!(
+                statement_equalities(
+                    "t",
+                    &serde_json::json!({"sql": sql, "inputs": {"binds": {"$1": 7, "$2": true}}})
+                ),
+                Ok(vec![
+                    ("a".to_owned(), serde_json::json!(7)),
+                    ("b".to_owned(), serde_json::json!(true)),
+                ])
+            );
+            for (binds, cause) in [
+                (
+                    serde_json::json!({"$1": ["x"], "$2": 1}),
+                    "bind $1 is not a scalar",
+                ),
+                (
+                    serde_json::json!({"$1": {"k": 1}, "$2": 1}),
+                    "bind $1 is not a scalar",
+                ),
+                (serde_json::json!({"a": 1}), "bind a is not a $n position"),
+                (serde_json::json!(["x"]), "not keyed by position"),
+                (serde_json::json!({"$1": "x"}), "$2, which has no bind"),
+                (
+                    serde_json::json!({"$2": "x", "$3": 1}),
+                    "column a is compared to a NULL bind",
+                ),
+            ] {
+                let why = statement_equalities(
+                    "t",
+                    &serde_json::json!({"sql": sql, "inputs": {"binds": binds}}),
+                )
+                .unwrap_err();
+                assert!(why.contains(cause), "{binds}: {why}");
+            }
+        }
+
+        /// Route D reads the same binds: a structured tape names its row too.
+        #[test]
+        fn a_structured_delete_names_its_row_for_borrowing() {
+            register_test_schema_identity();
+            let args = serde_json::json!({
+                "table": "business_profile",
+                "sql": PROFILE_DELETE.split(" -- binds").next().unwrap(),
+                "inputs": {"binds": {"$1": "pro_1", "$2": "m1"}},
+            });
+            assert_eq!(
+                statement_row_key("business_profile", &args),
+                Some(profile_row_key("pro_1"))
+            );
+        }
+
         #[test]
         fn a_synthesized_presence_plans_deterministically() {
             let events = [delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT)];
