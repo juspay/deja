@@ -57,7 +57,7 @@ fn tier_for(boundary: &str) -> Tier {
     match boundary {
         "http_outgoing" | "http_client" | "grpc" => Tier::Environmental,
         "redis" | "db" | "database" | "storage" | "pg" => Tier::Stateful,
-        "time" | "id" | "id_generation" | "uuid" | "rng" => Tier::Pure,
+        pure if deja::is_pure_boundary(pure) => Tier::Pure,
         _ => Tier::Unknown,
     }
 }
@@ -254,6 +254,10 @@ pub struct Scorecard {
     pub correlation_scope: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Where the candidate's lookups ended, counted from the ordinal each
+    /// observation carries. Absent when the candidate numbers none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_tally: Option<deja::LookupTally>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -609,6 +613,7 @@ impl Scorecard {
             },
             correlation_scope: None,
             warnings: Vec::new(),
+            lookup_tally: None,
         }
     }
 
@@ -1010,6 +1015,9 @@ pub struct RunArtifacts {
     /// canon, which is the behaviour for a system that declares nothing.
     pub reply_canons: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<String>,
+    /// Lookups the candidate dropped before they finished. They close the
+    /// lookup count and are not scored: the call never completed.
+    pub cancelled_lookups: Vec<ObservedCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -2524,6 +2532,20 @@ enum ValueVerdict {
 /// recorder-declared clause and replay-local database infrastructure are
 /// absorbed as they are anywhere else ([`value_verdict`]).
 fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+    // A call served by its address alone had its arguments rejected by every
+    // rank of the candidate's own lookup, the exact key and the identity both,
+    // and it ran on a value recorded for other arguments. Nothing may forgive
+    // that: not the replay-local id rule, and not a clause.
+    if call.arg_divergent {
+        return ValueVerdict::Diverged;
+    }
+    request_verdict(call, twin)
+}
+
+/// What [`pair_request_verdict`] would say of a call's arguments if it had not
+/// been served by its address alone: the absorber that would have forgiven
+/// them, named on the warning so the reason stays visible.
+fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
     let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
     match deja::identity::identity_differences(&recorded, &call.args).as_deref() {
         // The same identity as written: the request is the recording's, even
@@ -2542,6 +2564,104 @@ fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>)
         twin,
         call.args.get("sql").and_then(serde_json::Value::as_str),
     )
+}
+
+/// The candidate's lookups, counted from the ordinals its observations carry,
+/// with each way the count fails to close named as a reason. `None`, with a
+/// warning, when the candidate numbered none.
+fn account_lookups(
+    observed: &[ObservedCall],
+    cancelled: &[ObservedCall],
+    reasons: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Option<deja::LookupTally> {
+    if !cancelled.is_empty() {
+        warnings.push(format!(
+            "{} lookup(s) were cancelled before they finished, their future dropped (a \
+             sibling's error in a join, a client that went away, a panic): they close the \
+             lookup count and are not scored",
+            cancelled.len()
+        ));
+    }
+    let numbered: Vec<&ObservedCall> = observed
+        .iter()
+        .chain(cancelled)
+        .filter(|call| call.lookup_ordinal.is_some())
+        .collect();
+    if numbered.is_empty() {
+        if !observed.is_empty() {
+            warnings.push(
+                "the candidate numbers no lookup, so the lookups it made are not accounted \
+                 for: a candidate built before lookups were numbered writes none"
+                    .to_owned(),
+            );
+        }
+        return None;
+    }
+    let mut seen: HashMap<u64, u64> = HashMap::with_capacity(numbered.len());
+    for call in &numbered {
+        *seen
+            .entry(call.lookup_ordinal.unwrap_or_default())
+            .or_insert(0) += 1;
+    }
+    let highest = seen.keys().copied().max().unwrap_or_default();
+    let repeated = seen.values().filter(|count| **count > 1).count();
+    let missing = (1..=highest)
+        .filter(|ordinal| !seen.contains_key(ordinal))
+        .count();
+    if repeated > 0 {
+        reasons.push(format!(
+            "{repeated} lookup number(s) repeat: the candidate started over during the run, so \
+             its observations come from more than one process"
+        ));
+    }
+    if missing > 0 {
+        reasons.push(format!(
+            "{missing} of the candidate's {highest} lookup(s) wrote no observation: lost with \
+             a process that died mid-call, or still running when the run was scored"
+        ));
+    }
+    // A cancelled lookup still ended in an arm: the arms describe where each
+    // lookup was resolved, which happened before it was dropped. Each arm is
+    // counted on its own, so a call claiming two arms unbalances the tally.
+    let arm = |resolved: bool, arg_divergent: bool| {
+        numbered
+            .iter()
+            .filter(|call| call.resolved == resolved && call.arg_divergent == arg_divergent)
+            .count() as u64
+    };
+    let tally = deja::LookupTally {
+        total: seen.len() as u64,
+        exact: arm(true, false),
+        arg_free: arm(false, true),
+        missed: arm(false, false),
+    };
+    if repeated == 0 && !tally.balances() {
+        reasons.push(format!(
+            "the candidate's lookups do not sum to their count: {} exact, {} args-free and {} \
+             missed of {}, so a call claims more than one arm",
+            tally.exact, tally.arg_free, tally.missed, tally.total
+        ));
+    }
+    Some(deja::LookupTally {
+        total: highest,
+        ..tally
+    })
+}
+
+/// Why a served call's arguments would otherwise have passed, for its warning.
+fn args_served_reason(verdict: ValueVerdict) -> &'static str {
+    match verdict {
+        ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure) => {
+            "its arguments differ only where replay-local database infrastructure is \
+             forgiven, which cannot be confirmed for a value recorded against other arguments"
+        }
+        ValueVerdict::Absorbed(ValueAbsorption::Canon(_)) => {
+            "a declared clause would have forgiven the difference, but not for a value \
+             recorded against other arguments"
+        }
+        _ => "its arguments differ from the recorded call's",
+    }
 }
 
 /// A reported path with every array index written `[]`, so a row reordered
@@ -5711,6 +5831,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut args_served_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut pairing_disagreements: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
     let mut value_document_absorbed_seen: BTreeMap<String, u64> = BTreeMap::new();
     // Resolved calls whose args were read by identity to find their recording,
     // by call site, kind and path; and resolved calls whose args are another
@@ -6036,6 +6158,30 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
             let verdict = pair_request_verdict(obs, twin_event);
+            if obs.arg_divergent
+                && obs
+                    .served_event_global_sequence
+                    .is_some_and(|served| served != twin_seq)
+            {
+                // The candidate ran on one recording's value and the pairing
+                // judged the call against another. Both rows say which; this
+                // says that they differ.
+                stats.note_kind("ArgsServedPairingDisagrees");
+                let served = obs.served_event_global_sequence.unwrap_or_default();
+                pairing_disagreements
+                    .entry(call_site_label(obs))
+                    .or_insert((0, served, twin_seq))
+                    .0 += 1;
+            }
+            if obs.arg_divergent {
+                stats.note_kind("ArgDivergentServe");
+                *args_served_seen
+                    .entry((
+                        call_site_label(obs),
+                        args_served_reason(request_verdict(obs, twin_event)),
+                    ))
+                    .or_insert(0) += 1;
+            }
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
@@ -6071,7 +6217,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             // An exact later-args match is direct order evidence. Result/schema
             // equivalence and race demotion must not absorb that blocking signal.
-            let schema_default = if value_diverged && !order_mismatch {
+            let schema_default = if value_diverged && !order_mismatch && !obs.arg_divergent {
                 schema_default_divergence(
                     &obs.boundary,
                     twin_event
@@ -6099,6 +6245,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .or_insert(0) += 1;
             } else if value_diverged {
                 if !order_mismatch
+                    && !obs.arg_divergent
                     && inconclusive_race
                         .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
                 {
@@ -6121,6 +6268,28 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             // Either way the recorded twin is accounted for here, not omitted.
             paired_consumed.insert(twin_seq);
+        } else if obs.arg_divergent {
+            // Served by its address alone, with no recorded call left to pair it
+            // with. The candidate found one at that address, so this is a call
+            // the recording holds, run on a value recorded for other arguments.
+            // It blocks, ahead of every arm that tolerates a miss: before the
+            // fallback those arms never saw it, because the call stopped.
+            // Counted as the value divergence it is, and named for how it
+            // arose.
+            stats.bump_kind("ValueDiverged");
+            stats.note_kind("ArgDivergentServe");
+            stats.note_kind("ArgsServedUnpaired");
+            *args_served_seen
+                .entry((
+                    call_site_label(obs),
+                    "no recorded call was left to pair it with",
+                ))
+                .or_insert(0) += 1;
+            value_divergences += 1;
+            blocking_side_effect += 1;
+            if let Some(corr) = &obs.correlation_id {
+                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+            }
         } else if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
             graph_plan.replay_event_is_novel(correlation_id, observed_index)
         }) {
@@ -6760,6 +6929,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // candidate caused; exclude them from the blocking count so a run whose
     // only "reasons" are those still avoids a blocking failure (race becomes an
     // explicit inconclusive verdict).
+    // Every lookup the candidate made, counted from the ordinal it took as it
+    // arrived. The ordinals on the stream must be one to the highest, once
+    // each: a gap is a lookup that wrote no observation, and a repeat is a
+    // candidate that started over, so its stream holds two processes' lookups.
+    let lookup_tally = account_lookups(
+        &art.observed,
+        &art.cancelled_lookups,
+        &mut reasons,
+        &mut warnings_extra,
+    );
     let blocking_reasons = reasons.len()
         - usize::from(novel_calls > 0)
         - usize::from(absorbed_misses > 0)
@@ -6947,6 +7126,19 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              and the recording disagree"
         ));
     }
+    for (call_site, (calls, served, paired)) in &pairing_disagreements {
+        warnings.push(format!(
+            "call {call_site} was served one recording's value and judged against another on \
+             {calls} call(s), first serving recorded event {served} and pairing with {paired}: \
+             the candidate picks by site and the scorer by order, and here they differ"
+        ));
+    }
+    for ((call_site, reason), calls) in &args_served_seen {
+        warnings.push(format!(
+            "call {call_site} was served the recording's value for its address on {calls} \
+             call(s) although its arguments differed, and it blocks: {reason}"
+        ));
+    }
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
         let by = if *source == "default" {
             "no clause asserts an order for it, and order carries no meaning unless one does"
@@ -7112,6 +7304,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             .as_ref()
             .map(|scope| scope.iter().cloned().collect()),
         warnings,
+        lookup_tally,
     }
 }
 
@@ -7190,8 +7383,11 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     let mut cost = LoadCost::start();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
     cost.report("lookup table", table.entries.len());
-    let (observed, mut replay_graph) =
-        load_replay_stream(&root.observed_path(run_id), &mut warnings);
+    let ReplayStream {
+        observed,
+        graph: mut replay_graph,
+        cancelled: cancelled_lookups,
+    } = load_replay_stream(&root.observed_path(run_id), &mut warnings);
     cost.report("observed calls", observed.len());
     cost.report("replay graph nodes", replay_graph.len());
     let mut record_graph = load_record_graph(&root.record_graph_path(run_id), &mut warnings);
@@ -7376,6 +7572,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         scored_span_namespaces,
         reply_canons,
         warnings,
+        cancelled_lookups,
     })
 }
 
@@ -7587,14 +7784,22 @@ fn stream_deja_records(
     true
 }
 
+/// The replay's shared tagged stream, split.
+struct ReplayStream {
+    /// The calls that finished, which are scored.
+    observed: Vec<ObservedCall>,
+    graph: Vec<deja_core::ExecutionGraphNode>,
+    /// Lookups dropped before they finished: counted, never scored.
+    cancelled: Vec<ObservedCall>,
+}
+
 /// Split the replay's shared tagged stream in one pass.
-fn load_replay_stream(
-    path: &std::path::Path,
-    warnings: &mut Vec<String>,
-) -> (Vec<ObservedCall>, Vec<deja_core::ExecutionGraphNode>) {
+fn load_replay_stream(path: &std::path::Path, warnings: &mut Vec<String>) -> ReplayStream {
     let mut observed = Vec::new();
     let mut graph = Vec::new();
+    let mut cancelled = Vec::new();
     if !stream_deja_records(path, warnings, |record| match record {
+        deja::DejaRecord::Observed(call) if call.cancelled => cancelled.push(*call),
         deja::DejaRecord::Observed(call) => observed.push(*call),
         deja::DejaRecord::GraphNode(node) => graph.push(*node),
         deja::DejaRecord::BoundaryEvent(_) => {}
@@ -7603,8 +7808,13 @@ fn load_replay_stream(
         // masquerade as a complete, smaller replay.
         observed.clear();
         graph.clear();
+        cancelled.clear();
     }
-    (observed, graph)
+    ReplayStream {
+        observed,
+        graph,
+        cancelled,
+    }
 }
 
 /// Load the optional record-side tagged graph stream. Missing or unreadable is
@@ -8040,6 +8250,9 @@ mod tests {
             seed_gap: false,
             absorbed: false,
             arg_divergent: false,
+            served_event_global_sequence: None,
+            lookup_ordinal: None,
+            cancelled: false,
         }
     }
 
@@ -8641,7 +8854,9 @@ mod tests {
         write_jsonl_rows(&path, &rows);
         let mut warnings = Vec::new();
 
-        let (observed, graph) = load_replay_stream(&path, &mut warnings);
+        let ReplayStream {
+            observed, graph, ..
+        } = load_replay_stream(&path, &mut warnings);
         assert!(warnings.is_empty());
         assert_eq!(
             observed
@@ -8747,6 +8962,7 @@ mod tests {
             events: Vec::new(),
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         }
     }
 
@@ -10983,6 +11199,7 @@ mod tests {
             events: events.clone(),
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         })
         .unwrap();
         let volatile_row = rows
@@ -12812,6 +13029,109 @@ mod tests {
         );
     }
 
+    /// A served call whose arguments a concurrent write raced is not demoted to
+    /// an inconclusive race: it ran on a value recorded for other arguments,
+    /// and blocks as it did before the fallback.
+    #[test]
+    fn a_served_call_is_not_demoted_to_an_inconclusive_race() {
+        register_test_schema_identity();
+        let corr = "race-served";
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
+        let raced_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let read_event = with_event_lineage(
+            db_read_ev(
+                corr,
+                "payment_attempt",
+                300,
+                recorded_row.clone(),
+                100,
+                300,
+                "root",
+                0,
+            ),
+            "root",
+            None,
+            "root",
+            0,
+        );
+        let conflicting_write = with_event_lineage(
+            declared_db_update_ev(corr, "payment_attempt", 301, raced_row.clone(), 150, 250),
+            "detached-writer",
+            Some("root"),
+            "detached-writer-bucket",
+            1,
+        );
+        let read_observation = exec_obs(
+            "db",
+            Some(corr),
+            true,
+            Some(300),
+            Some(envelope(recorded_row)),
+            envelope(raced_row.clone()),
+        );
+        let mut served = with_span(
+            exec_obs_method(
+                "storage",
+                Some(corr),
+                "write_branch",
+                false,
+                None,
+                None,
+                serde_json::json!({"branch": "pending"}),
+            ),
+            "root>flow>write_branch",
+        );
+        served.args = serde_json::json!({"source": envelope(raced_row)});
+        served.arg_divergent = true;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let mut recorded_downstream = omitted_ev(302, "storage", Some(corr));
+        recorded_downstream.method_name = "write_branch".to_owned();
+        recorded_downstream.args = serde_json::json!({
+            "source": envelope(serde_json::json!({"attempt_id": "pay_1", "status": "pending"}))
+        })
+        .into();
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "storage",
+                    "write_branch",
+                    302,
+                    serde_json::json!({"branch": "pending"}),
+                ),
+                span_entry(Some(corr), 302, "root>flow>write_branch"),
+            ],
+            vec![read_observation, served],
+            vec![http(corr, true, vec![])],
+            vec![read_event, conflicting_write, recorded_downstream],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "storage", "InconclusiveRace"),
+            0,
+            "{:?}",
+            card.per_boundary
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "ValueDiverged"),
+            1,
+            "{:?}",
+            card.per_boundary
+        );
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let storage: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| row.boundary == "storage")
+            .collect();
+        assert!(!storage.is_empty(), "{rows:?}");
+        assert!(
+            storage
+                .iter()
+                .all(|row| row.kind == "value_diverged" && row.blocking),
+            "{storage:?}"
+        );
+    }
+
     #[test]
     fn race_attributed_http_body_diff_is_inconclusive_not_blocking() {
         register_test_schema_identity();
@@ -13037,6 +13357,7 @@ mod tests {
             events: recorded_events,
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         };
 
         let rows = build_ledger(&art).unwrap();
@@ -17156,9 +17477,9 @@ mod tests {
         // could have made this quiet, so the claim needs its own row: the pair is
         // judged on what the call SENT — its arguments — not on what came back.
         //
-        // `arg_divergent` is deliberately not what makes this block. It is
-        // descriptive; `resolved` is load-bearing. That is what makes the change
-        // safe against an orchestrator older than the candidate emitting it.
+        // `resolved` is what makes an orchestrator older than the candidate
+        // score this as a divergence. `arg_divergent` is what makes this one
+        // refuse every absorber on the way: see the two tests that follow.
         let corr = "argfree-serve";
         let result = serde_json::json!({"result": "Ok", "value": 9});
         let mut recorded = omitted_ev(701, "db", Some(corr));
@@ -18024,6 +18345,359 @@ mod tests {
             .expect("a scorecard serializes");
         assert!(reach.contains("arg_divergence_reach_calls"), "{reach}");
         assert!(reach.contains("arg_divergent_serves"), "{reach}");
+    }
+
+    /// An args-free serve scored against its recorded twin, with the args each
+    /// side sent and the recorded event's declaration, as `LookupTableHook`
+    /// shapes the call.
+    fn args_free_served(
+        recorded_args: serde_json::Value,
+        served_args: serde_json::Value,
+        declaration: Option<&str>,
+    ) -> (Scorecard, Vec<CallRecord>) {
+        let corr = "argfree-absorber";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let mut recorded = omitted_ev(702, "db", Some(corr));
+        recorded.method_name = "load".to_owned();
+        recorded.args = recorded_args.into();
+        recorded.result = result.clone().into();
+        if let Some(declaration) = declaration {
+            recorded.declaration = db_read_declaring(declaration).declaration;
+        }
+        let mut served = substituted_obs_method("db", Some(corr), "load", 702, result.clone());
+        served.args = served_args;
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>load");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 702, result.clone()),
+                span_entry_res(Some(corr), 702, "request>load", result),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![recorded],
+        );
+        (
+            detect(&artifacts),
+            build_ledger(&artifacts).expect("a ledger"),
+        )
+    }
+
+    /// A call served by its address alone had its arguments rejected by every
+    /// rank of the candidate's lookup, so no absorber may forgive them. It
+    /// blocks, and is named for what it is.
+    fn assert_args_free_serve_blocks(
+        name: &str,
+        recorded: serde_json::Value,
+        served: serde_json::Value,
+        declaration: Option<&str>,
+    ) {
+        let (card, rows) = args_free_served(recorded, served, declaration);
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "{name}: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.per_boundary["db"].matched, 0, "{name}");
+        assert_eq!(kind_count(&card, "db", "ArgDivergentServe"), 1, "{name}");
+        assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
+        assert!(!rows.is_empty(), "{name}");
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "value_diverged" && row.blocking),
+            "{name}: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "{name}: {rows:?}"
+        );
+    }
+
+    /// A call served by its address alone with no recorded call left to pair it
+    /// with blocks, on a stateful boundary and on a pure one, where a miss the
+    /// request survived would otherwise be excused.
+    #[test]
+    fn an_unpaired_args_free_serve_blocks() {
+        for boundary in ["db", "id"] {
+            let corr = "argfree-unpaired";
+            let result = serde_json::json!({"result": "Ok", "value": 9});
+            let mut served =
+                substituted_obs_method(boundary, Some(corr), "load", 703, result.clone());
+            served.args = serde_json::json!({"prefix": "pay"});
+            served.resolved = false;
+            served.arg_divergent = true;
+            served.resolved_rank = Some(1);
+            served.source_event_global_sequence = None;
+            served.outcome = deja::SubstituteOutcome::Substituted;
+            let artifacts = art_with_events(
+                vec![],
+                vec![with_span(served, "request>load")],
+                vec![http(corr, true, vec![])],
+                vec![],
+            );
+            let card = detect(&artifacts);
+            let rows = build_ledger(&artifacts).expect("a ledger");
+            assert_eq!(
+                kind_count(&card, boundary, "ArgsServedUnpaired"),
+                1,
+                "{boundary}"
+            );
+            assert_eq!(
+                kind_count(&card, boundary, "ValueDiverged"),
+                1,
+                "{boundary}"
+            );
+            assert_eq!(
+                kind_count(&card, boundary, "DeterministicMiss"),
+                0,
+                "{boundary}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{boundary}");
+            assert!(!card.verdict.pass, "{boundary}: {}", card.verdict.reason);
+            assert!(!rows.is_empty(), "{boundary}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.kind == "args_served_unpaired" && row.blocking),
+                "{boundary}: {rows:?}"
+            );
+            assert!(
+                card.warnings
+                    .iter()
+                    .any(|w| w.contains("no recorded call was left")),
+                "{boundary}"
+            );
+        }
+    }
+
+    /// A served write whose rows differ only where the schema filled a column
+    /// is not demoted to a schema default: it ran on a value recorded for other
+    /// arguments, and blocks as it did before the fallback.
+    #[test]
+    fn a_served_call_is_not_demoted_to_a_schema_default() {
+        let corr = "c1";
+        let ev = db_insert_ev(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+        );
+        let mut served = db_exec_obs_with_sql(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+            payment_intent_row(serde_json::json!("default")),
+        );
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>insert");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_insert",
+                    7,
+                    envelope(payment_intent_row(serde_json::Value::Null)),
+                ),
+                span_entry(Some(corr), 7, "request>insert"),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![ev],
+        );
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "value_diverged" && row.blocking),
+            "{rows:?}"
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "SchemaDefaultDivergence"),
+            0,
+            "{:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "{:?}",
+            card.per_boundary["db"]
+        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// The lookups a run made are counted from the ordinal on each observation:
+    /// every ordinal from one to the highest, once each. A gap is a lookup that
+    /// wrote no observation, a repeat is a candidate that started over, and
+    /// either fails the run, named.
+    #[test]
+    fn lookups_are_accounted_by_their_ordinals() {
+        let call = |ordinal: u64, arg_divergent: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.arg_divergent = arg_divergent;
+            call.lookup_ordinal = Some(ordinal);
+            call
+        };
+        let card = |observed: Vec<ObservedCall>| super::detect(&art(vec![], observed, vec![]));
+        let whole = card(vec![call(1, false), call(2, false)]);
+        let tally = whole
+            .lookup_tally
+            .expect("a numbered run reports its tally");
+        assert_eq!(tally.total, 2);
+        assert!(tally.balances(), "{tally:?}");
+        assert!(
+            !whole.verdict.reason.contains("lookup"),
+            "{}",
+            whole.verdict.reason
+        );
+        for (name, observed, cause) in [
+            (
+                "a gap",
+                vec![call(1, false), call(3, false)],
+                "wrote no observation",
+            ),
+            (
+                "a repeat",
+                vec![call(1, false), call(1, false)],
+                "started over",
+            ),
+        ] {
+            let card = card(observed);
+            assert!(!card.verdict.pass, "{name}");
+            assert!(
+                card.verdict.reason.contains(cause),
+                "{name}: {}",
+                card.verdict.reason
+            );
+        }
+        let unnumbered = card(vec![substituted_obs_method(
+            "db",
+            Some("c1"),
+            "load",
+            1,
+            serde_json::json!(1),
+        )]);
+        assert!(unnumbered.lookup_tally.is_none());
+        assert!(
+            unnumbered
+                .warnings
+                .iter()
+                .any(|w| w.contains("numbers no lookup")),
+            "{:?}",
+            unnumbered.warnings
+        );
+    }
+
+    /// A cancelled lookup is a named drop: its number closes the count, and its
+    /// call is not scored, because it never finished.
+    #[test]
+    fn a_cancelled_lookup_closes_the_count_and_is_not_scored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let numbered = |ordinal: u64, cancelled: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.lookup_ordinal = Some(ordinal);
+            call.cancelled = cancelled;
+            deja::DejaRecord::Observed(Box::new(call))
+        };
+        let lines: Vec<String> = [numbered(1, true), numbered(2, false)]
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let mut warnings = Vec::new();
+        let stream = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(stream.observed.len(), 1, "a cancelled call is not scored");
+        assert_eq!(stream.cancelled.len(), 1);
+        let mut artifacts = art(vec![], stream.observed, vec![]);
+        artifacts.cancelled_lookups = stream.cancelled;
+        let card = super::detect(&artifacts);
+        let tally = card.lookup_tally.expect("a tally");
+        assert_eq!(tally.total, 2);
+        assert!(
+            !card.verdict.reason.contains("wrote no observation"),
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("cancelled")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// The ordinal survives the stream: written by the candidate's file sink,
+    /// read back by the scorer's loader.
+    #[test]
+    fn a_lookup_ordinal_rides_the_observed_stream() {
+        use deja::ObservedCallSink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let sink = deja::FileObservedSink::create(&path).expect("a sink");
+        let mut call = substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+        call.lookup_ordinal = Some(7);
+        call.served_event_global_sequence = Some(3);
+        sink.observed(call);
+        sink.flush().expect("flush");
+        let mut warnings = Vec::new();
+        let ReplayStream { observed, .. } = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].lookup_ordinal, Some(7));
+        assert_eq!(observed[0].served_event_global_sequence, Some(3));
+    }
+
+    /// A call claiming two arms, resolved and served by its address alone,
+    /// unbalances the tally rather than hiding in a remainder.
+    #[test]
+    fn a_call_claiming_two_arms_unbalances_the_lookup_count() {
+        let mut call = substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+        call.lookup_ordinal = Some(1);
+        call.resolved = true;
+        call.arg_divergent = true;
+        let card = super::detect(&art(vec![], vec![call], vec![]));
+        assert!(!card.verdict.pass);
+        assert!(
+            card.verdict.reason.contains("more than one arm"),
+            "{}",
+            card.verdict.reason
+        );
+    }
+
+    /// The replay-local id rule does not forgive a served call's arguments.
+    #[test]
+    fn an_args_free_serve_is_not_forgiven_as_a_replay_local_id() {
+        assert_args_free_serve_blocks(
+            "an integer id the database rule strips",
+            serde_json::json!({"amount": 100, "id": 41}),
+            serde_json::json!({"amount": 100, "id": 42}),
+            None,
+        );
+    }
+
+    /// A recorder's clause, which is applied to arguments too, does not
+    /// forgive a served call's arguments.
+    #[test]
+    fn an_args_free_serve_is_not_forgiven_by_a_recorder_clause() {
+        assert_args_free_serve_blocks(
+            "a field a recorder clause projects away",
+            serde_json::json!({"amount": 100, "nonce": "a"}),
+            serde_json::json!({"amount": 100, "nonce": "b"}),
+            Some("project:!nonce"),
+        );
     }
 
     #[test]
