@@ -57,7 +57,7 @@ fn tier_for(boundary: &str) -> Tier {
     match boundary {
         "http_outgoing" | "http_client" | "grpc" => Tier::Environmental,
         "redis" | "db" | "database" | "storage" | "pg" => Tier::Stateful,
-        "time" | "id" | "id_generation" | "uuid" | "rng" => Tier::Pure,
+        pure if deja::is_pure_boundary(pure) => Tier::Pure,
         _ => Tier::Unknown,
     }
 }

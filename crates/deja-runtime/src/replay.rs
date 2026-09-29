@@ -727,7 +727,39 @@ pub enum ArgMismatchPolicy {
     Always,
 }
 
+/// The environment variable a deployment sets to choose the candidate's
+/// [`ArgMismatchPolicy`]: `never`, `only_for_argful` (the default when unset)
+/// or `always`.
+pub const ARG_MISMATCH_POLICY_ENV: &str = "DEJA_REPLAY_ARG_MISMATCH_POLICY";
+
 impl ArgMismatchPolicy {
+    /// The policy a setting names, or an error naming the settings there are.
+    pub fn from_setting(setting: &str) -> Result<Self, String> {
+        match setting.trim() {
+            "never" => Ok(Self::Never),
+            "only_for_argful" => Ok(Self::OnlyForArgful),
+            "always" => Ok(Self::Always),
+            other => Err(format!(
+                "{ARG_MISMATCH_POLICY_ENV}={other:?} names no policy: use never, \
+                 only_for_argful or always"
+            )),
+        }
+    }
+
+    /// The policy this deployment's environment sets, the default when it sets
+    /// none, and an error when it sets one that does not exist.
+    pub fn from_env() -> std::io::Result<Self> {
+        Self::from_optional_setting(std::env::var(ARG_MISMATCH_POLICY_ENV).ok().as_deref())
+    }
+
+    /// [`ArgMismatchPolicy::from_env`] over a setting already read.
+    fn from_optional_setting(setting: Option<&str>) -> std::io::Result<Self> {
+        setting.map_or(Ok(Self::default()), |setting| {
+            Self::from_setting(setting)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })
+    }
+
     fn allow_arg_mismatch(self, args: &serde_json::Value) -> bool {
         match self {
             Self::Never => false,
@@ -735,6 +767,14 @@ impl ArgMismatchPolicy {
             Self::Always => true,
         }
     }
+}
+
+/// Whether `boundary` is an entropy seam: a clock, an identifier or a source of
+/// randomness. A call there with other arguments is another value, never the
+/// same address with its arguments moved, so it is never served by address
+/// alone. The scorer's pure tier is this list.
+pub fn is_pure_boundary(boundary: &str) -> bool {
+    matches!(boundary, "time" | "id" | "id_generation" | "uuid" | "rng")
 }
 
 /// Returns true if `args` is JSON-null or an empty object (treated as
@@ -2842,6 +2882,9 @@ impl LookupTally {
 /// result if found.
 pub struct LookupTableHook {
     table: HashMap<LookupKey, HookEntry>,
+    /// Whether a call whose arguments moved may be served by its address
+    /// alone; see [`LookupTableHook::from_source_with_policy`].
+    arg_mismatch_policy: ArgMismatchPolicy,
     /// The table's second lookup, by identity; see [`LookupTable::identity_entries`].
     identity_table: HashMap<LookupKey, HookEntry>,
     /// The args-free index, derived from `table` at load; see [`arg_free_index`].
@@ -2891,7 +2934,25 @@ impl LookupTableHook {
     /// and any `ObservedCallSink` (typically `InMemoryObservedSink` for tests
     /// or `FileObservedSink` for harness runs). Loading happens once at
     /// construction; failures bubble up as `io::Error`.
-    pub fn from_source<S, K>(mut source: S, sink: K) -> std::io::Result<Self>
+    ///
+    /// The arg-mismatch policy comes from the deployment's environment
+    /// ([`ARG_MISMATCH_POLICY_ENV`]); a setting that names no policy fails the
+    /// install rather than falling back to a default.
+    pub fn from_source<S, K>(source: S, sink: K) -> std::io::Result<Self>
+    where
+        S: LookupTableSource,
+        K: ObservedCallSink + 'static,
+    {
+        Self::from_source_with_policy(source, sink, ArgMismatchPolicy::from_env()?)
+    }
+
+    /// [`LookupTableHook::from_source`] with the arg-mismatch policy given.
+    /// `Never` restores the fail-stop: a call whose arguments moved misses.
+    pub fn from_source_with_policy<S, K>(
+        mut source: S,
+        sink: K,
+        arg_mismatch_policy: ArgMismatchPolicy,
+    ) -> std::io::Result<Self>
     where
         S: LookupTableSource,
         K: ObservedCallSink + 'static,
@@ -2920,6 +2981,7 @@ impl LookupTableHook {
         let arg_free_table = arg_free_index(&exact);
         Ok(Self {
             table: exact,
+            arg_mismatch_policy,
             identity_table: index(table.identity_entries),
             arg_free_table,
             stamper: Mutex::new(Stampers::default()),
@@ -3072,7 +3134,11 @@ impl LookupTableHook {
         // is the same predicate `ArgMismatchPolicy::OnlyForArgful` is defined by,
         // read here rather than restated.
         let mut arg_divergent = false;
-        if hit.is_none() && fallback == ArgFreeFallback::Serve && !args_are_empty(query.args) {
+        if hit.is_none()
+            && fallback == ArgFreeFallback::Serve
+            && self.arg_mismatch_policy.allow_arg_mismatch(query.args)
+            && !is_pure_boundary(query.boundary)
+        {
             for key in &arg_free_keys {
                 if let Some(entry) = self.arg_free_table.get(key) {
                     hit = Some((entry, key.locus.rank()));
@@ -6394,6 +6460,63 @@ mod tests {
             assert!(!last_call(&handle).arg_divergent, "{boundary}");
             assert_eq!(hook.lookup_tally().arg_free, 0, "{boundary}");
         }
+    }
+
+    #[test]
+    fn a_deployment_can_restore_the_fail_stop() {
+        // `Never` is the fail-stop the fallback replaced: a call whose arguments
+        // moved misses, and the request stops there.
+        let table = render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]);
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        let hook = LookupTableHook::from_source_with_policy(
+            VecSource(Some(table)),
+            observed,
+            ArgMismatchPolicy::Never,
+        )
+        .expect("from_source_with_policy");
+        assert_eq!(
+            ask_storage(
+                &hook,
+                "find-payment",
+                "find_payment",
+                &serde_json::json!({ "amount": 200 })
+            ),
+            None
+        );
+        assert!(!last_call(&handle).arg_divergent);
+        assert_eq!(hook.lookup_tally().arg_free, 0);
+        assert_eq!(hook.lookup_tally().missed, 1);
+    }
+
+    #[test]
+    fn the_policy_setting_names_every_policy_and_refuses_the_rest() {
+        for (setting, policy) in [
+            ("never", ArgMismatchPolicy::Never),
+            ("only_for_argful", ArgMismatchPolicy::OnlyForArgful),
+            ("always", ArgMismatchPolicy::Always),
+        ] {
+            assert_eq!(ArgMismatchPolicy::from_setting(setting), Ok(policy));
+            assert_eq!(
+                ArgMismatchPolicy::from_optional_setting(Some(setting)).expect("a policy"),
+                policy
+            );
+        }
+        assert_eq!(
+            ArgMismatchPolicy::from_optional_setting(None).expect("the default"),
+            ArgMismatchPolicy::OnlyForArgful
+        );
+        let refused = ArgMismatchPolicy::from_optional_setting(Some("sometimes"))
+            .expect_err("a setting that names no policy fails the install");
+        assert!(
+            refused.to_string().contains(ARG_MISMATCH_POLICY_ENV),
+            "{refused}"
+        );
     }
 
     #[test]

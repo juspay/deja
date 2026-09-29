@@ -55,7 +55,8 @@ pub use graph::{
     GraphNodeSink,
 };
 pub use replay::{
-    ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
+    is_pure_boundary, ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook,
+    ReplayReport, ARG_MISMATCH_POLICY_ENV,
 };
 pub use writer::{
     AsyncRecordWriter, CompositeSink, JsonlSink, MarkerKind, RecordSink, SinkPolicy, WriterConfig,

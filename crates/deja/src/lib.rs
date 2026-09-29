@@ -119,7 +119,8 @@ pub use deja_runtime::{
 };
 /// Re-export replay primitives so `deja::*` consumers get the full replay API.
 pub use deja_runtime::{
-    ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
+    is_pure_boundary, ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook,
+    ReplayReport, ARG_MISMATCH_POLICY_ENV,
 };
 /// Re-export the declarative boundary primitives: the per-site
 /// [`ReplayStrategy`] enum selects Execute or Substitute behavior, while
