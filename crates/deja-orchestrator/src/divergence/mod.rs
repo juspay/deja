@@ -17647,7 +17647,11 @@ mod tests {
     /// design: it sits under a SIBLING span, so the substituted value could only
     /// have reached it by being returned past the serve's span, where a subtree
     /// walk rooted at the serve cannot see it and position can.
-    fn arg_divergent_reach_run() -> RunArtifacts {
+    ///
+    /// `serve_node` is the node the serve reports. `Some(15)` puts it in the
+    /// replay forest, which is the ordinary shape; a node the forest does not
+    /// hold is the annexed serve the reach cannot place.
+    fn arg_divergent_reach_run_with_serve_node(serve_node: Option<u64>) -> RunArtifacts {
         let corr = "reach-graph";
         let result = serde_json::json!({"result": "Ok", "value": 9});
         let args = serde_json::json!({"amount": 100});
@@ -17655,7 +17659,7 @@ mod tests {
             arg_divergent_serve(
                 Some(corr),
                 "load",
-                Some(15),
+                serve_node,
                 serde_json::json!({"amount": 200}),
                 result.clone(),
             ),
@@ -17726,6 +17730,10 @@ mod tests {
                 graph_span(17, corr, Some(14), 3, "sibling"),
             ],
         )
+    }
+
+    fn arg_divergent_reach_run() -> RunArtifacts {
+        arg_divergent_reach_run_with_serve_node(Some(15))
     }
 
     #[test]
@@ -17906,6 +17914,236 @@ mod tests {
         assert_ne!(
             child.arg_divergence_placement,
             Some(ReachPlacement::OutsideServeSpan)
+        );
+        assert_eq!(child.kind, "matched", "{child:?}");
+    }
+
+    #[test]
+    fn a_serve_whose_node_left_the_replay_forest_is_unplaced_not_outside() {
+        // The second producer of `Unplaced`, and the one that is easy to read as
+        // its opposite. The correlation IS graph-scored, so the mode guard lets
+        // this through; what is missing is the serve's own node, because an
+        // annexed call has no node in the forest. There is nothing to root a
+        // subtree walk on, and the reach has to say it could not tell — reporting
+        // every later call as sitting outside a span this run never looked at
+        // would be a structural claim about a structure it does not have.
+        const ANNEXED: u64 = 99;
+        let artifacts = arg_divergent_reach_run_with_serve_node(Some(ANNEXED));
+        let plan = GraphScoringPlan::build(&artifacts);
+        let entry = plan
+            .correlations
+            .get("reach-graph")
+            .expect("the fixture's correlation is planned");
+        // Vacuity guards, in the order the guard under test reads its inputs.
+        // Flat scoring or an absent forest would produce `Unplaced` for the OTHER
+        // guard's reason and prove nothing about this one.
+        assert_eq!(
+            entry.scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "{:?}",
+            entry.scoring_mode
+        );
+        let replay = entry
+            .replay
+            .as_ref()
+            .expect("a graph-scored correlation has a replay forest");
+        assert!(
+            !replay.nodes.is_empty(),
+            "an empty forest would satisfy the premise below by absence"
+        );
+        assert!(
+            !replay.nodes.contains_key(&ANNEXED),
+            "the premise: the serve's node is not in the forest, which holds {:?}",
+            replay.nodes.keys().collect::<Vec<_>>()
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 3,
+            "position bounds the reach whether or not the graph can annotate it: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 0,
+            "the graph placed nothing: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 3,
+            "and every reached call says so: {:?}",
+            card.per_boundary["db"]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let reached: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| ["same_frame", "child", "sibling"].contains(&row.method_name.as_str()))
+            .collect();
+        assert_eq!(reached.len(), 3, "{rows:?}");
+        for row in reached {
+            assert!(row.could_be_affected_by_arg_divergence, "{row:?}");
+            assert_eq!(
+                row.arg_divergence_placement,
+                Some(ReachPlacement::Unplaced),
+                "{row:?}"
+            );
+            // The split the widening exists for. `sibling` really does sit outside
+            // the serve's span in this shape and `child` really does not, and
+            // saying either here would be a claim nothing computed.
+            assert_ne!(
+                row.arg_divergence_placement,
+                Some(ReachPlacement::OutsideServeSpan),
+                "{row:?}"
+            );
+            assert_ne!(
+                row.arg_divergence_placement,
+                Some(ReachPlacement::WithinServeSpan),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_correlation_that_has_a_replay_forest_is_unplaced_too() {
+        // The mode guard's own row, which the missing-forest case above cannot
+        // reach: that one is unplaced because there is no forest at all, and it
+        // passes with this guard gone. Here the forest is there and the serve's
+        // node is in it, so the walk would answer happily — but the correlation
+        // fell back to the flat tier, and structure the run declined to trust
+        // cannot be read back out as a structural claim.
+        //
+        // The shape is a record side carrying no graph (an old tape, a record
+        // graph refused at load) against a candidate that emitted one, which is
+        // `FlatReason::MissingForest` with the replay half still present.
+        let corr = "reach-flat-forest";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                Some(15),
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let under = graph_observed(
+            corr,
+            16,
+            802,
+            "child",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        let mut artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 801, result.clone()),
+                span_entry_res(Some(corr), 801, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "child", 802, result.clone()),
+            ],
+            vec![served, under],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(
+                    corr,
+                    801,
+                    "load",
+                    serde_json::json!({"amount": 100}),
+                    result.clone(),
+                ),
+                db_event(corr, 802, "child", serde_json::json!({}), result),
+            ],
+        );
+        // The replay half alone. `child` hangs UNDER the serve's node, so a run
+        // that read this forest would call it `WithinServeSpan` — which is what
+        // makes the absence of an answer a different fact from that one.
+        artifacts.replay_graph = vec![
+            graph_span(14, corr, None, 0, "request"),
+            graph_span(15, corr, Some(14), 1, "load"),
+            graph_span(16, corr, Some(15), 2, "child"),
+        ];
+        assert!(
+            artifacts.record_graph.is_none(),
+            "the record half is what is missing here"
+        );
+
+        let plan = GraphScoringPlan::build(&artifacts);
+        let entry = plan
+            .correlations
+            .get(corr)
+            .expect("the fixture's correlation is planned");
+        // Vacuity guards. Without the forest, or without the serve's node in it,
+        // the node guard below would answer `Unplaced` first and this test would
+        // pass for the other guard's reason — which is exactly how the
+        // missing-forest case fails to exercise this one.
+        assert_eq!(
+            entry.scoring_mode,
+            deja_forest::ScoringMode::Flat {
+                reason: deja_forest::FlatReason::MissingForest
+            },
+            "{:?}",
+            entry.scoring_mode
+        );
+        assert!(
+            entry.alignment.is_none(),
+            "the flat tier scored this correlation"
+        );
+        let replay = entry
+            .replay
+            .as_ref()
+            .expect("the replay half built a forest of its own");
+        assert!(
+            replay.nodes.contains_key(&15) && replay.nodes.contains_key(&16),
+            "the serve's node and the call under it are both there: {:?}",
+            replay.nodes.keys().collect::<Vec<_>>()
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 1,
+            "position bounds the reach on this path too: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 0,
+            "a forest the run did not score by cannot place anything: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 1,
+            "and it says so: {:?}",
+            card.per_boundary["db"]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let child = rows
+            .iter()
+            .find(|row| row.method_name == "child")
+            .unwrap_or_else(|| panic!("a row for child: {rows:?}"));
+        assert!(child.could_be_affected_by_arg_divergence, "{child:?}");
+        assert_eq!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::Unplaced),
+            "{child:?}"
+        );
+        // The value reading the untrusted forest would have produced, named so
+        // the assertion above cannot agree with it by coincidence.
+        assert_ne!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::WithinServeSpan),
+            "{child:?}"
         );
         assert_eq!(child.kind, "matched", "{child:?}");
     }
