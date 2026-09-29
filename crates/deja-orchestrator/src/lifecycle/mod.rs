@@ -5523,11 +5523,6 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
-/// Poll a candidate readiness URL until 200 or timeout. The URL is the
-/// caller's: HTTP `/health` on the traffic port for the router; a prism
-/// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
-/// curl — so its Job template names a probeable URL (`RUNNER_HEALTH_URL`,
-/// e.g. the metrics endpoint) instead of teaching this function systems.
 /// Whether the observed stream stopped growing before scoring read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamSettled {
@@ -5599,6 +5594,11 @@ fn settle_observed_stream(root: &HarnessRoot, ctx: &StoreCtx, run_id: &str) {
     ctx.log("observed stream", &line);
 }
 
+/// Poll a candidate readiness URL until 200 or timeout. The URL is the
+/// caller's: HTTP `/health` on the traffic port for the router; a prism
+/// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
+/// curl — so its Job template names a probeable URL (`RUNNER_HEALTH_URL`,
+/// e.g. the metrics endpoint) instead of teaching this function systems.
 fn wait_health(url: &str, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -6068,7 +6068,10 @@ mod tests {
     #[test]
     fn scoring_waits_for_the_observed_stream_to_settle() {
         use super::{wait_for_stream_to_settle, StreamSettled};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+        // Margins far wider than a busy machine's scheduling noise: a writer
+        // that pauses 10ms between lines is growing, a 500ms silence is quiet.
+        let quiet = Duration::from_millis(500);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.jsonl");
         std::fs::write(&path, "a\n").unwrap();
@@ -6078,21 +6081,19 @@ mod tests {
                 use std::io::Write;
                 let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
                 for _ in 0..5 {
-                    std::thread::sleep(Duration::from_millis(40));
+                    std::thread::sleep(Duration::from_millis(10));
                     writeln!(file, "b").unwrap();
                 }
             })
         };
-        let started = Instant::now();
-        let settled =
-            wait_for_stream_to_settle(&path, Duration::from_millis(150), Duration::from_secs(5));
-        writer.join().unwrap();
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30));
         assert_eq!(settled, StreamSettled::Quiet);
-        assert!(
-            started.elapsed() >= Duration::from_millis(200),
-            "{:?}",
-            started.elapsed()
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            6,
+            "settled only after the last write"
         );
+        writer.join().unwrap();
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer = {
@@ -6101,23 +6102,19 @@ mod tests {
                 use std::io::Write;
                 let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(Duration::from_millis(10));
                     writeln!(file, "c").unwrap();
                 }
             })
         };
-        let settled = wait_for_stream_to_settle(
-            &path,
-            Duration::from_millis(150),
-            Duration::from_millis(600),
-        );
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         writer.join().unwrap();
         assert_eq!(settled, StreamSettled::StillGrowing);
 
         let missing = dir.path().join("absent.jsonl");
         assert_eq!(
-            wait_for_stream_to_settle(&missing, Duration::from_millis(50), Duration::from_secs(1)),
+            wait_for_stream_to_settle(&missing, quiet, Duration::from_secs(1)),
             StreamSettled::Absent
         );
     }

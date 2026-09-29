@@ -2467,14 +2467,30 @@ fn account_lookups(
         ));
     }
     // A cancelled lookup still ended in an arm: the arms describe where each
-    // lookup was resolved, which happened before it was dropped.
-    let exact = numbered.iter().filter(|call| call.resolved).count() as u64;
-    let arg_free = numbered.iter().filter(|call| call.arg_divergent).count() as u64;
+    // lookup was resolved, which happened before it was dropped. Each arm is
+    // counted on its own, so a call claiming two arms unbalances the tally.
+    let arm = |resolved: bool, arg_divergent: bool| {
+        numbered
+            .iter()
+            .filter(|call| call.resolved == resolved && call.arg_divergent == arg_divergent)
+            .count() as u64
+    };
+    let tally = deja::LookupTally {
+        total: seen.len() as u64,
+        exact: arm(true, false),
+        arg_free: arm(false, true),
+        missed: arm(false, false),
+    };
+    if repeated == 0 && !tally.balances() {
+        reasons.push(format!(
+            "the candidate's lookups do not sum to their count: {} exact, {} args-free and {} \
+             missed of {}, so a call claims more than one arm",
+            tally.exact, tally.arg_free, tally.missed, tally.total
+        ));
+    }
     Some(deja::LookupTally {
         total: highest,
-        exact,
-        arg_free,
-        missed: numbered.len() as u64 - exact - arg_free,
+        ..tally
     })
 }
 
@@ -17322,6 +17338,23 @@ mod tests {
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].lookup_ordinal, Some(7));
         assert_eq!(observed[0].served_event_global_sequence, Some(3));
+    }
+
+    /// A call claiming two arms, resolved and served by its address alone,
+    /// unbalances the tally rather than hiding in a remainder.
+    #[test]
+    fn a_call_claiming_two_arms_unbalances_the_lookup_count() {
+        let mut call = substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+        call.lookup_ordinal = Some(1);
+        call.resolved = true;
+        call.arg_divergent = true;
+        let card = super::detect(&art(vec![], vec![call], vec![]));
+        assert!(!card.verdict.pass);
+        assert!(
+            card.verdict.reason.contains("more than one arm"),
+            "{}",
+            card.verdict.reason
+        );
     }
 
     /// The replay-local id rule does not forgive a served call's arguments.

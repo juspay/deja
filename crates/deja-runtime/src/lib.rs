@@ -4186,8 +4186,9 @@ fn shadow_observe_loud<F: FnOnce()>(boundary: &str, method: &str, observe: F) {
 /// emit its own observation, so the seam's decision arrived too late to be
 /// recorded and the boundary's DECLARATION had to stand in for it. Holding the
 /// observation across the decision — which the execute-shadow path has always
-/// done — makes the outcome an observed fact. Deferral is safe because the seam
-/// owns both fail-stops, so no emission has to survive an unwind.
+/// done — makes the outcome an observed fact. The seam owns both fail-stops and
+/// consumes the token before it panics; a future dropped before the seam
+/// decides leaves the token to write the call as cancelled.
 fn substitute_lookup<T, C>(
     caller: &'static Location<'static>,
     spec: &BoundarySpec,
@@ -4405,7 +4406,8 @@ where
                         // Serialization of the live output runs UNGUARDED: a
                         // panicking `extract` is a code bug and must propagate —
                         // returning live output without an observation would
-                        // silently under-report divergence.
+                        // silently under-report divergence. The unwind drops
+                        // the token, which writes the call as cancelled.
                         let result_json = extract(&out).into().result;
                         shadow_observe_loud(obs.spec.boundary, obs.spec.method_name, || {
                             #[allow(deprecated)]
@@ -4812,7 +4814,8 @@ where
                         // Serialization of the live output runs UNGUARDED: a
                         // panicking `extract` is a code bug and must propagate —
                         // returning live output without an observation would
-                        // silently under-report divergence.
+                        // silently under-report divergence. The unwind drops
+                        // the token, which writes the call as cancelled.
                         let result_json = extract(&out).into().result;
                         shadow_observe_loud(obs.spec.boundary, obs.spec.method_name, || {
                             #[allow(deprecated)]
