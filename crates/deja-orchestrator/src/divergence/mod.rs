@@ -6174,7 +6174,10 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .0 += 1;
             }
             if obs.arg_divergent {
-                stats.note_kind("ArgDivergentServe");
+                // The kind is not noted here. `summary.arg_divergent_serves` is documented as
+                // the projection of this kind, and the reach pass notes it once per serve in
+                // lockstep with that counter. Noting it again here would count every serve
+                // twice and break the fold that checks the projection.
                 *args_served_seen
                     .entry((
                         call_site_label(obs),
@@ -6277,7 +6280,6 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // Counted as the value divergence it is, and named for how it
             // arose.
             stats.bump_kind("ValueDiverged");
-            stats.note_kind("ArgDivergentServe");
             stats.note_kind("ArgsServedUnpaired");
             *args_served_seen
                 .entry((
