@@ -6463,6 +6463,55 @@ mod tests {
     }
 
     #[test]
+    fn an_args_free_serve_names_the_recording_it_served() {
+        // The row claims no twin, because which recorded call a re-keyed call
+        // belongs to is the scorer's to decide. But the candidate did pick one,
+        // and the value it ran on came from there, so the row says which: the
+        // scorer's pairing can then be checked against it.
+        let table = render_table(&[
+            storage_event(0, "loop", serde_json::json!({ "amount": 1 }), "first"),
+            storage_event(1, "loop", serde_json::json!({ "amount": 2 }), "second"),
+        ]);
+        let (hook, handle) = hook_over(table);
+        for amount in [10, 20] {
+            ask_storage(
+                &hook,
+                "loop",
+                "find_payment",
+                &serde_json::json!({ "amount": amount }),
+            );
+        }
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|c| c.arg_divergent && c.source_event_global_sequence.is_none()));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| c.served_event_global_sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        // An exact serve names its event as its source, and claims no other.
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "loop",
+            serde_json::json!({ "amount": 1 }),
+            "first",
+        )]));
+        ask_storage(
+            &hook,
+            "loop",
+            "find_payment",
+            &serde_json::json!({ "amount": 1 }),
+        );
+        let call = last_call(&handle);
+        assert_eq!(call.source_event_global_sequence, Some(0));
+        assert_eq!(call.served_event_global_sequence, None);
+    }
+
+    #[test]
     fn a_deployment_can_restore_the_fail_stop() {
         // `Never` is the fail-stop the fallback replaced: a call whose arguments
         // moved misses, and the request stops there.
