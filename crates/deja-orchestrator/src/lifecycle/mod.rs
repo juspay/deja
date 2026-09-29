@@ -894,6 +894,7 @@ fn drive_replay(
         &run.run_id,
         &scope,
     )?;
+    settle_observed_stream(root, ctx, &run.run_id);
 
     // Compose: the orchestrator serves artifacts from its own state dir.
     score_and_register(root, run, ctx, &recording_id, total, &ArtifactSink::Local)
@@ -2186,6 +2187,7 @@ pub fn drive_replay_in_pod(
         &run.run_id,
         &scope,
     )?;
+    settle_observed_stream(root, ctx, &run.run_id);
 
     // In-pod: DEJA_RUN_ARTIFACT_S3=1 (Job template) uploads artifacts to S3 so
     // they survive the ephemeral pod and the dashboard can hydrate them.
@@ -5526,6 +5528,77 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
 /// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
 /// curl — so its Job template names a probeable URL (`RUNNER_HEALTH_URL`,
 /// e.g. the metrics endpoint) instead of teaching this function systems.
+/// Whether the observed stream stopped growing before scoring read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamSettled {
+    /// Quiet for the whole window.
+    Quiet,
+    /// Still being written when the bound was reached.
+    StillGrowing,
+    /// No stream to wait for.
+    Absent,
+}
+
+/// How long the observed stream must stay unchanged before it is read.
+const OBSERVED_STREAM_QUIET: Duration = Duration::from_secs(2);
+/// How long scoring waits for that before it reads the stream anyway.
+const OBSERVED_STREAM_SETTLE_BOUND: Duration = Duration::from_secs(60);
+
+/// Wait until `path` has not grown for `quiet`, or until `bound` has passed.
+///
+/// The candidate outlives the driver: the last response can return while a
+/// lookup it started, or one a background task started, is still running. A
+/// lookup takes its number as it arrives and writes its observation when it
+/// finishes, so a stream read before it settles shows that lookup as missing.
+pub(crate) fn wait_for_stream_to_settle(
+    path: &std::path::Path,
+    quiet: Duration,
+    bound: Duration,
+) -> StreamSettled {
+    let size = || std::fs::metadata(path).ok().map(|meta| meta.len());
+    let Some(mut last) = size() else {
+        return StreamSettled::Absent;
+    };
+    let deadline = Instant::now() + bound;
+    let mut unchanged_since = Instant::now();
+    loop {
+        std::thread::sleep((quiet / 5).max(Duration::from_millis(10)));
+        let now = size().unwrap_or(last);
+        if now != last {
+            last = now;
+            unchanged_since = Instant::now();
+        } else if unchanged_since.elapsed() >= quiet {
+            return StreamSettled::Quiet;
+        }
+        if Instant::now() >= deadline {
+            return StreamSettled::StillGrowing;
+        }
+    }
+}
+
+/// Wait for the run's observed stream to settle before it is scored, and say
+/// in the run log how that went.
+fn settle_observed_stream(root: &HarnessRoot, ctx: &StoreCtx, run_id: &str) {
+    let started = Instant::now();
+    let settled = wait_for_stream_to_settle(
+        &root.observed_path(run_id),
+        OBSERVED_STREAM_QUIET,
+        OBSERVED_STREAM_SETTLE_BOUND,
+    );
+    let line = match settled {
+        StreamSettled::Quiet => format!(
+            "settled after {:.1}s; scoring reads it whole",
+            started.elapsed().as_secs_f64()
+        ),
+        StreamSettled::StillGrowing => format!(
+            "still growing after {}s; lookups still running will read as missing",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
+        ),
+        StreamSettled::Absent => "absent; there is nothing to wait for".to_owned(),
+    };
+    ctx.log("observed stream", &line);
+}
+
 fn wait_health(url: &str, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {

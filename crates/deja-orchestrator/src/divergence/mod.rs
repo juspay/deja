@@ -2462,7 +2462,8 @@ fn account_lookups(
     }
     if missing > 0 {
         reasons.push(format!(
-            "{missing} of the candidate's {highest} lookup(s) wrote no observation"
+            "{missing} of the candidate's {highest} lookup(s) wrote no observation: lost with \
+             a process that died mid-call, or still running when the run was scored"
         ));
     }
     // A cancelled lookup still ended in an arm: the arms describe where each
