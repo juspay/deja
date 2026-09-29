@@ -5800,6 +5800,10 @@ s3_bucket = "ucs-deja"
             .unwrap()
             .expect("the seal just written has its index")
             .len();
+        // Pinned, not just carried: the reads below compare against these, so
+        // without a literal a reader returning nothing satisfies both sides.
+        assert_eq!(lines.len(), 2, "the fixture lands two envelopes");
+        assert_eq!(rows, 2, "both envelopes are indexed");
         let session = addressed.session_id.clone();
 
         // Re-lay the same session as an older sealer wrote it: every object at
@@ -5840,6 +5844,22 @@ s3_bucket = "ucs-deja"
             serde_json::to_vec(&doc).unwrap().into(),
         ))
         .unwrap();
+
+        // Control: the same legacy layout read at the bucket root. Without it a
+        // failure below cannot tell a broken prefix from legacy keys never
+        // resolving at all.
+        assert_eq!(
+            block(session_lines(&legacy_store, &legacy)).unwrap(),
+            lines,
+            "a legacy manifest resolves its parts at the bucket root"
+        );
+        assert_eq!(
+            block(correlation_index_of(&legacy_store, &legacy))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(rows),
+            "an empty seal id resolves its index at the bucket root"
+        );
 
         // The migration itself: a plain copy of every key under one directory.
         let migrated = memory();
