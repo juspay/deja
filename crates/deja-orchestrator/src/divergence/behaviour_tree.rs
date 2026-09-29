@@ -527,6 +527,9 @@ mod tests {
             blocking: kind == "value_diverged",
             origin: false,
             stopped: false,
+            arg_divergence_reach: None,
+            could_be_affected_by_arg_divergence: false,
+            arg_divergence_placement: None,
             resolved_rank: None,
             recorded: Some(CallSide {
                 args: Some(args.clone()),

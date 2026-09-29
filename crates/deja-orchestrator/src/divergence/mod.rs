@@ -208,6 +208,32 @@ const UNDECLARED_CONCURRENCY_WARNING: &str = "undeclared_concurrency";
 /// as a divergence.
 const INAPPLICABLE_REPLY_CANON_WARNING: &str = "inapplicable_reply_canon";
 
+/// A call served the recording's value because only its ARGUMENTS moved.
+///
+/// Named without being charged. The serve is scored on its own row, by the arms
+/// above and independently of this — a `ValueDiverged` where it pairs with a
+/// recorded twin, and whatever the unpaired arms make of it where it does not.
+/// Charging it here as well would charge one call twice. These four kinds exist
+/// so a reader can see WHAT a substitution could have carried into, which no
+/// divergence count says.
+const ARG_DIVERGENT_SERVE: &str = "ArgDivergentServe";
+/// A serve with no correlation, and so no request to bound a reach within.
+const ARG_DIVERGENT_SERVE_UNATTRIBUTABLE: &str = "ArgDivergentServeUnattributable";
+/// A call an earlier argument-divergent serve in its correlation could have
+/// reached. Not a divergence, and not evidence of one.
+const ARG_DIVERGENCE_REACH: &str = "ArgDivergenceReach";
+/// A reached call the graph puts on the serve's own span node or under it.
+const ARG_DIVERGENCE_REACH_WITHIN_SPAN: &str = "ArgDivergenceReachWithinSpan";
+/// A reached call the graph declined to place, so the run says where it could
+/// not look rather than reporting a structural claim it never made.
+const ARG_DIVERGENCE_REACH_UNPLACED: &str = "ArgDivergenceReachUnplaced";
+
+/// A counter the scorecard omits when it has nothing to report, so a run with
+/// no argument-divergent serve serializes exactly as it did before they existed.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 // ---------------------------------------------------------------------------
 // Scorecard data model (`replay-scorecard/v1`)
 // ---------------------------------------------------------------------------
@@ -305,6 +331,49 @@ pub struct Summary {
     /// counterpart. Projection of `per_boundary[*].kinds["IdentitySkew"]`.
     #[serde(default)]
     pub identity_skews: u64,
+    /// Calls served the recording's value because only their ARGUMENTS moved.
+    ///
+    /// Not a term in any divergence counter: each serve is scored on its own row
+    /// independently of these four, and the `arg_divergence_*` counters are
+    /// attribution — which of the run stands on a value nobody checked — not a
+    /// second verdict. Making them block would turn one argument divergence into
+    /// a cascade of failures and bury the row naming the cause.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergentServe"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergent_serves: u64,
+    /// Of those, the ones with no correlation, and so no request to bound a
+    /// reach within. Held apart so a reach of zero is never read as "nothing
+    /// could be affected" when the truth is "this could not be answered".
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergentServeUnattributable"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergent_serves_unattributable: u64,
+    /// Calls that ran after an argument-divergent serve in the same correlation
+    /// and COULD have consumed the substituted value. An over-approximation
+    /// bounded by position, because deja records execution and not value
+    /// provenance — see `ArgDivergenceReach`.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergenceReach"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergence_reach_calls: u64,
+    /// Of those, the ones the graph puts on the serve's own span node or under
+    /// it: the value got here without leaving the span it was produced in, most
+    /// often by being returned and used in the same frame. A subset of
+    /// `arg_divergence_reach_calls`.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergenceReachWithinSpan"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergence_reach_within_span: u64,
+    /// And the ones the graph declined to place at all — a flat-scored
+    /// correlation, or a call with no node. Counted apart from the two structural
+    /// answers so that "outside the serve's span", which is a claim, is never
+    /// read off a number that also holds the cases nobody looked at. The
+    /// remainder, `reach_calls - within_span - unplaced`, is the outside set.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergenceReachUnplaced"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergence_reach_unplaced: u64,
     /// Response body rows the order-canonical recompute reported at a region the
     /// kernel judged the same, and which therefore did not count: an encoded
     /// value whose serialisation order differed (a hash-ordered map inside an
@@ -486,6 +555,12 @@ pub struct CorrelationOutcome {
     /// how much this correlation's verdict is worth and belongs beside it.
     #[serde(default)]
     pub absorbed_misses: u64,
+    /// How many of this correlation's calls were served the recording's value on
+    /// moved arguments. Beside `absorbed_misses` for the same reason: what the
+    /// correlation's verdict is worth belongs next to it, and a request that ran
+    /// on a stale value is a request whose later work nobody checked.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergent_serves: u64,
     pub passed: bool,
 }
 
@@ -591,6 +666,31 @@ impl Scorecard {
         );
         folds("identity_skews", s.identity_skews, &["IdentitySkew"]);
         folds(
+            "arg_divergent_serves",
+            s.arg_divergent_serves,
+            &[ARG_DIVERGENT_SERVE],
+        );
+        folds(
+            "arg_divergent_serves_unattributable",
+            s.arg_divergent_serves_unattributable,
+            &[ARG_DIVERGENT_SERVE_UNATTRIBUTABLE],
+        );
+        folds(
+            "arg_divergence_reach_calls",
+            s.arg_divergence_reach_calls,
+            &[ARG_DIVERGENCE_REACH],
+        );
+        folds(
+            "arg_divergence_reach_within_span",
+            s.arg_divergence_reach_within_span,
+            &[ARG_DIVERGENCE_REACH_WITHIN_SPAN],
+        );
+        folds(
+            "arg_divergence_reach_unplaced",
+            s.arg_divergence_reach_unplaced,
+            &[ARG_DIVERGENCE_REACH_UNPLACED],
+        );
+        folds(
             "inconclusive_seed_gaps",
             s.inconclusive_seed_gaps,
             &["InconclusiveSeedGap"],
@@ -670,6 +770,35 @@ impl Scorecard {
         // skew is a disagreement about pairing ORDER between two methods that
         // both resolved every call, so it cannot be hiding a content difference —
         // that would be counted under `value_divergences`.
+        // The reach's two containments, which its four counters can violate while
+        // each fold above still agrees with its own kind. A serve that could not
+        // be attributed cannot be more numerous than the serves; a reached call
+        // the graph placed relative to a serve cannot be more numerous than the
+        // reached. And a reach with no serve to have come from is a reach
+        // attributed to nothing.
+        if s.arg_divergent_serves_unattributable > s.arg_divergent_serves {
+            out.push(format!(
+                "summary.arg_divergent_serves_unattributable = {}, more than the {} serve(s) it \
+                 is part of",
+                s.arg_divergent_serves_unattributable, s.arg_divergent_serves
+            ));
+        }
+        let placed = s.arg_divergence_reach_within_span + s.arg_divergence_reach_unplaced;
+        if placed > s.arg_divergence_reach_calls {
+            out.push(format!(
+                "summary.arg_divergence_reach_within_span + arg_divergence_reach_unplaced = \
+                 {placed}, more than the {} reached call(s) they are part of",
+                s.arg_divergence_reach_calls
+            ));
+        }
+        if s.arg_divergence_reach_calls > 0 && s.arg_divergent_serves == 0 {
+            out.push(format!(
+                "summary.arg_divergence_reach_calls = {}, but no serve is reported for them to \
+                 be downstream of",
+                s.arg_divergence_reach_calls
+            ));
+        }
+
         let blocking = s.omitted_calls + s.value_divergences;
         if s.side_effect_divergences != blocking {
             out.push(format!(
@@ -1203,6 +1332,32 @@ impl GraphScoringPlan {
         self.correlations
             .get(correlation_id)
             .is_some_and(|entry| entry.flat_replay_nodes.contains(&replay_node))
+    }
+
+    /// The observed calls that ran inside `replay_node`'s span or below it.
+    ///
+    /// `None` when the correlation is not graph-scored or the node is not in its
+    /// replay forest (an annexed call has no node there). An absent answer makes
+    /// the reach annotation absent, never the reach itself — structure does not
+    /// bound what a returned value could reach. See [`ArgDivergenceReach`].
+    fn replay_subtree_observed(
+        &self,
+        correlation_id: &str,
+        replay_node: u64,
+    ) -> Option<HashSet<u64>> {
+        let entry = self.correlations.get(correlation_id)?;
+        if !matches!(entry.scoring_mode, deja_forest::ScoringMode::Graph) {
+            return None;
+        }
+        let replay = entry.replay.as_ref()?;
+        if !replay.nodes.contains_key(&replay_node) {
+            return None;
+        }
+        Some(
+            forest_event_sequences(replay, replay_node, true)
+                .into_iter()
+                .collect(),
+        )
     }
 
     fn recorded_event_is_pruned(&self, correlation_id: &str, sequence: u64) -> bool {
@@ -3051,6 +3206,282 @@ impl CallPairing {
     /// args, if any. A resolved call's pair is its own served event.
     pub(crate) fn twin(&self, index: usize) -> Option<&ArgsFreePairingResult> {
         self.twins.get(&index)
+    }
+}
+
+/// What the attribution had to say about one argument-divergent serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServeReach {
+    /// Later calls in the serve's correlation that could have consumed the
+    /// substituted value. Zero is an EMPTY reach — the serve was the last call
+    /// its correlation made — and not an absent one.
+    Calls(u64),
+    /// The serve carries no correlation, so there is no request to bound a reach
+    /// within. Named rather than reported as a reach of zero.
+    NoCorrelation,
+}
+
+/// Where the graph puts a reached call relative to the serve that reached it.
+///
+/// Three states and not a bool, for the reason [`ServeReach::NoCorrelation`] is
+/// not a reach of zero: a structural claim and the absence of one are different
+/// facts, and sharing `false` between them tells a reader the run decided
+/// something it never looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachPlacement {
+    /// On the serve's own span node, or under it: the substituted value got here
+    /// without leaving the span it was produced in.
+    ///
+    /// Emphatically NOT "passed down". A boundary call and a consumer in the same
+    /// function body attach to the SAME span node, and the walk behind this set
+    /// takes a node's own events before descending — so the commonest shape in
+    /// here is a value RETURNED by the serve and used a line later, in one frame.
+    WithinServeSpan,
+    /// Outside that subtree: the value was returned out of the serve's span and
+    /// carried here through a caller.
+    OutsideServeSpan,
+    /// The graph could not say — the correlation is not graph-scored, one of the
+    /// two calls carries no node, or the caller supplied no plan. The absence of
+    /// a structural claim, never a negative one.
+    Unplaced,
+}
+
+/// One call an earlier argument-divergent serve could have reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReachedCall {
+    /// What the graph had to say about how the value could have got here. The
+    /// graph annotates the reach; it does not bound it, so `Unplaced` narrows
+    /// nothing.
+    pub(crate) placement: ReachPlacement,
+}
+
+/// Which calls an argument-divergent substitution COULD have reached.
+///
+/// A candidate whose arguments moved at an address the recording does hold is
+/// served the recording's value and marked `arg_divergent`. That value is the
+/// RECORDING's, not this run's, and the request continues on it. Marking the
+/// serve says one call diverged; it does not say which of the work after it
+/// stands on a value nobody checked, and a stale value propagating into
+/// downstream computation is the whole reason the silent version of this
+/// substitution was a lie. This says it.
+///
+/// Reach is bounded by POSITION — the later calls of the same correlation.
+/// deja records the execution graph, not value provenance: no edge says which
+/// call consumed what. So this is an over-approximation and is named as one
+/// wherever it is reported. A reached call COULD be affected; nothing here
+/// claims it was, or that anything divergent was observed in it.
+///
+/// Containment deliberately does not bound it, which is the one place this
+/// departs from `pruned_subtree`. A served value RETURNS to its caller, so it can
+/// leave the span it was produced in: the serve runs inside a helper, the value
+/// goes back to the handler, and the handler's next call sits under a span that is
+/// a SIBLING of the helper's. A subtree walk rooted at the serve cannot see that
+/// call, so the reach would be short by however much of the request came after
+/// the helper returned — and short without saying so.
+///
+/// The level at hand is not the problem, and the distinction matters because the
+/// obvious argument for this design gets it wrong. A consumer in the serve's OWN
+/// frame attaches to the same span node as the serve, and the walk takes a node's
+/// own events before it descends, so containment does see that one. What it
+/// cannot see is one level up. The graph is therefore an ANNOTATION rather than a
+/// bound: [`ReachPlacement`] says which of the two shapes a reached call is, or
+/// that this run could not tell.
+///
+/// A call after two serves is charged to the NEAREST, so the per-serve reaches
+/// partition the reached calls instead of overlapping, and their sum is the
+/// total. A serve is itself reached by any serve before it in its correlation.
+///
+/// Nothing here blocks. The serve is classified on its own row by the arms that
+/// already existed — a blocking `ValueDiverged` where it pairs with a recorded
+/// twin, and whatever the unpaired arms make of it where it does not — so the
+/// finding is reported without this. Making its reach block as well would turn
+/// one argument divergence into a cascade of failures and bury the row that names
+/// the cause, which is the complaint `pruned_subtree` already draws.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ArgDivergenceReach {
+    serves: BTreeMap<usize, ServeReach>,
+    reached: BTreeMap<usize, ReachedCall>,
+}
+
+impl ArgDivergenceReach {
+    /// Read from one place by the scorecard and by the ledger, for the reason
+    /// [`CallPairing`] is: a run whose counts and whose rows disagree about what
+    /// a substitution could have touched describes itself two ways.
+    pub(crate) fn build(observed: &[ObservedCall], plan: Option<&GraphScoringPlan>) -> Self {
+        let mut serves: BTreeMap<usize, ServeReach> = BTreeMap::new();
+        let mut reached: BTreeMap<usize, ReachedCall> = BTreeMap::new();
+        // The nearest serve so far in each correlation, with the observed calls
+        // the graph puts on its span node or under it. Computed once per serve
+        // rather than per reached call, and `None` where the graph declined to
+        // answer — an empty set would claim it answered "none of them".
+        let mut open: HashMap<&str, (usize, Option<HashSet<u64>>)> = HashMap::new();
+        for (index, call) in observed.iter().enumerate() {
+            if observed_is_ingress(call) {
+                // The boundary the kernel re-drives, not a call the candidate
+                // made. It neither serves nor consumes.
+                continue;
+            }
+            let Some(correlation_id) = call.correlation_id.as_deref() else {
+                if call.arg_divergent {
+                    serves.insert(index, ServeReach::NoCorrelation);
+                }
+                continue;
+            };
+            if let Some((serve, within)) = open.get(correlation_id) {
+                reached.insert(
+                    index,
+                    ReachedCall {
+                        placement: match within {
+                            // The replay forest carries each observed call's INDEX
+                            // as its event sequence (see `GraphScoringPlan::build`),
+                            // which is what makes this comparison meaningful. A
+                            // forest that moved to a real sequence space here would
+                            // match nothing and read as `OutsideServeSpan`.
+                            Some(within) if within.contains(&(index as u64)) => {
+                                ReachPlacement::WithinServeSpan
+                            }
+                            Some(_) => ReachPlacement::OutsideServeSpan,
+                            None => ReachPlacement::Unplaced,
+                        },
+                    },
+                );
+                if let Some(ServeReach::Calls(count)) = serves.get_mut(serve) {
+                    *count += 1;
+                }
+            }
+            if call.arg_divergent {
+                serves.insert(index, ServeReach::Calls(0));
+                let within = call.graph_node_id.and_then(|node| {
+                    plan.and_then(|plan| plan.replay_subtree_observed(correlation_id, node))
+                });
+                open.insert(correlation_id, (index, within));
+            }
+        }
+        let reach = Self { serves, reached };
+        reach
+            .balance(observed)
+            .expect("argument-divergence reach must account for the calls it speaks about");
+        reach
+    }
+
+    /// Every claim this makes, recomputed from the observed stream and compared.
+    ///
+    /// Independent of how [`Self::build`] walks: the serve set by the flag alone,
+    /// the reached set as each correlation's calls after its FIRST serve (where
+    /// `build` charges each to its nearest), the per-serve counts against the
+    /// reached set they partition, and each serve's count against the calls
+    /// between it and the next serve — which is what "nearest" means, recomputed
+    /// from the positions. A call charged twice, charged to a serve in another
+    /// correlation, or dropped is a failure here rather than a total that quietly
+    /// does not add up.
+    fn balance(&self, observed: &[ObservedCall]) -> Result<(), String> {
+        let declared = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.arg_divergent && !observed_is_ingress(call))
+            .count();
+        if declared != self.serves.len() {
+            return Err(format!(
+                "{declared} call(s) report moved arguments but {} were attributed",
+                self.serves.len()
+            ));
+        }
+        let mut by_correlation: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, call) in observed.iter().enumerate() {
+            if observed_is_ingress(call) {
+                continue;
+            }
+            if let Some(correlation_id) = call.correlation_id.as_deref() {
+                by_correlation
+                    .entry(correlation_id)
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        for (index, call) in observed.iter().enumerate() {
+            if !call.arg_divergent || observed_is_ingress(call) {
+                continue;
+            }
+            if let Some(correlation_id) = call.correlation_id.as_deref() {
+                first.entry(correlation_id).or_insert(index);
+            }
+        }
+        let after_first = observed
+            .iter()
+            .enumerate()
+            .filter(|(index, call)| {
+                !observed_is_ingress(call)
+                    && call
+                        .correlation_id
+                        .as_deref()
+                        .and_then(|id| first.get(id))
+                        .is_some_and(|serve| serve < index)
+            })
+            .count();
+        if after_first != self.reached.len() {
+            return Err(format!(
+                "{after_first} call(s) follow a serve in their correlation but {} were attributed",
+                self.reached.len()
+            ));
+        }
+        let charged: u64 = self
+            .serves
+            .values()
+            .map(|reach| match reach {
+                ServeReach::Calls(count) => *count,
+                ServeReach::NoCorrelation => 0,
+            })
+            .sum();
+        if charged != self.reached.len() as u64 {
+            return Err(format!(
+                "the serves account for {charged} reached call(s), but {} carry the attribution",
+                self.reached.len()
+            ));
+        }
+        for (index, call) in observed.iter().enumerate() {
+            if !call.arg_divergent || observed_is_ingress(call) {
+                continue;
+            }
+            let Some(correlation_id) = call.correlation_id.as_deref() else {
+                continue;
+            };
+            let calls = &by_correlation[correlation_id];
+            let next = calls
+                .iter()
+                .copied()
+                .find(|&at| at > index && observed[at].arg_divergent);
+            let owned = calls
+                .iter()
+                .copied()
+                .filter(|&at| at > index && next.is_none_or(|next| at <= next))
+                .count() as u64;
+            let charged = match self.serves.get(&index) {
+                Some(ServeReach::Calls(count)) => *count,
+                _ => 0,
+            };
+            if owned != charged {
+                return Err(format!(
+                    "the serve at {index} owns {owned} call(s) up to the next serve but was \
+                     charged {charged}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The call at `index` was served the recording's value on moved arguments,
+    /// and this is what its reach came to. `None` says the call is not a serve.
+    pub(crate) fn serve(&self, index: usize) -> Option<ServeReach> {
+        self.serves.get(&index).copied()
+    }
+
+    /// An argument-divergent serve earlier in this call's correlation could have
+    /// reached it. `None` says nothing upstream of it was served that way.
+    pub(crate) fn reached(&self, index: usize) -> Option<ReachedCall> {
+        self.reached.get(&index).copied()
     }
 }
 
@@ -5858,6 +6289,53 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         }
     }
 
+    // --- reach of an argument-divergent substitution -------------------------
+    // Which of the candidate's work could have consumed a value it was served
+    // because only its arguments moved. Attribution, from the seam the ledger
+    // reads: named through `note_kind` so `matched + diverged` over a boundary
+    // is untouched and nothing here can change a verdict. See
+    // `ArgDivergenceReach` for why position bounds this and containment does not.
+    let arg_divergence = ArgDivergenceReach::build(&art.observed, Some(graph_plan));
+    let mut arg_divergent_serves = 0u64;
+    let mut arg_divergent_serves_unattributable = 0u64;
+    let mut arg_divergence_reach_calls = 0u64;
+    let mut arg_divergence_reach_within_span = 0u64;
+    let mut arg_divergence_reach_unplaced = 0u64;
+    let mut corr_arg_divergent_serves: BTreeMap<String, u64> = BTreeMap::new();
+    for (observed_index, obs) in art.observed.iter().enumerate() {
+        if let Some(reach) = arg_divergence.serve(observed_index) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            stats.note_kind(ARG_DIVERGENT_SERVE);
+            arg_divergent_serves += 1;
+            if reach == ServeReach::NoCorrelation {
+                stats.note_kind(ARG_DIVERGENT_SERVE_UNATTRIBUTABLE);
+                arg_divergent_serves_unattributable += 1;
+            }
+            if let Some(corr) = &obs.correlation_id {
+                *corr_arg_divergent_serves.entry(corr.clone()).or_insert(0) += 1;
+            }
+        }
+        if let Some(reached) = arg_divergence.reached(observed_index) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            stats.note_kind(ARG_DIVERGENCE_REACH);
+            arg_divergence_reach_calls += 1;
+            match reached.placement {
+                ReachPlacement::WithinServeSpan => {
+                    stats.note_kind(ARG_DIVERGENCE_REACH_WITHIN_SPAN);
+                    arg_divergence_reach_within_span += 1;
+                }
+                ReachPlacement::Unplaced => {
+                    stats.note_kind(ARG_DIVERGENCE_REACH_UNPLACED);
+                    arg_divergence_reach_unplaced += 1;
+                }
+                // The outside set is the remainder, so it carries no kind of its
+                // own: a third name would be a third number saying what two
+                // already say, and the folds would then have to agree three ways.
+                ReachPlacement::OutsideServeSpan => {}
+            }
+        }
+    }
+
     // The accounting identity, asserted: every recorded event resolves through
     // EXACTLY one arm — resolved (`consumed`), args-free paired
     // (`paired_consumed`), or the omitted pass above. The two claim sets
@@ -6138,6 +6616,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             span_shape: span_shapes.remove(corr),
             inconclusive,
             absorbed_misses: corr_absorbed.get(corr).copied().unwrap_or(0),
+            arg_divergent_serves: corr_arg_divergent_serves.get(corr).copied().unwrap_or(0),
             passed,
         });
     }
@@ -6431,6 +6910,36 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              in digits beyond a float's precision is one the rule cannot see"
         ));
     }
+    if arg_divergent_serves > 0 {
+        // Said in prose because the number a reader needs is not a divergence
+        // count: the serves are already charged, and what this adds is how much
+        // of the run was standing on a value nobody checked. The wording is
+        // "could" throughout on purpose — see `ArgDivergenceReach`.
+        let outside = arg_divergence_reach_calls
+            .saturating_sub(arg_divergence_reach_within_span)
+            .saturating_sub(arg_divergence_reach_unplaced);
+        let unattributable = if arg_divergent_serves_unattributable > 0 {
+            format!(
+                "; {arg_divergent_serves_unattributable} of the serves carry no correlation, so \
+                 there is no request to bound their reach within"
+            )
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "{arg_divergent_serves} call(s) were served the recording's value because only their \
+             arguments moved, and are scored on their own rows independently of this line. \
+             {arg_divergence_reach_calls} later call(s) in the same correlations COULD have \
+             consumed a substituted value. The graph places \
+             {arg_divergence_reach_within_span} of them on the serve's own span or under it, so \
+             the value reached them without leaving the span it was produced in; it places \
+             {outside} of them outside it, reached only after the value was returned to a caller; \
+             and it could not place {arg_divergence_reach_unplaced}, whose correlation is scored \
+             flat or whose calls carry no node. Which of them actually consumed anything is not \
+             something this run can answer — deja records execution, not value provenance — so \
+             none of these is counted as a divergence{unattributable}"
+        ));
+    }
     for (call_site, calls) in &identity_unconfirmed_seen {
         warnings.push(format!(
             "matched call {call_site} resolved on {calls} call(s) with args whose identity differs \
@@ -6568,6 +7077,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             novel_calls_tolerated,
             value_divergences,
             identity_skews,
+            arg_divergent_serves,
+            arg_divergent_serves_unattributable,
+            arg_divergence_reach_calls,
+            arg_divergence_reach_within_span,
+            arg_divergence_reach_unplaced,
             order_nondeterminism_warnings,
             schema_default_divergences,
             idempotent_delete_warnings,
@@ -16704,6 +17218,574 @@ mod tests {
             !rows.iter().any(|row| row.kind == "matched"),
             "no row may read as matched: {rows:?}"
         );
+        // The reach attribution runs over this row too, and has nothing after the
+        // serve to attribute. An empty reach, said rather than left absent — and
+        // the totals still close with the four new counters in them.
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 0);
+        assert_eq!(
+            diverged[0].arg_divergence_reach,
+            Some(ServeReach::Calls(0)),
+            "the serve's reach is empty, not absent: {:?}",
+            diverged[0]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// An args-free serve exactly as `LookupTableHook::resolve` shapes one:
+    /// unresolved, marked, carrying the recording's value as both sides (under
+    /// lookup the served value IS both), and claiming no recorded twin of its own.
+    fn arg_divergent_serve(
+        corr: Option<&str>,
+        method: &str,
+        node: Option<u64>,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> ObservedCall {
+        let mut served = substituted_obs_method("db", corr, method, 0, result);
+        served.args = args;
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        served.graph_node_id = node;
+        served
+    }
+
+    fn db_event(
+        corr: &str,
+        seq: u64,
+        method: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut event = omitted_ev(seq, "db", Some(corr));
+        event.method_name = method.to_owned();
+        event.args = args.into();
+        event.result = result.into();
+        event
+    }
+
+    /// A graph-scored correlation whose serve is followed by one call under its
+    /// span and one beside it. The `beside` call is the shape that decides the
+    /// design: it sits under a SIBLING span, so the substituted value could only
+    /// have reached it by being returned past the serve's span, where a subtree
+    /// walk rooted at the serve cannot see it and position can.
+    fn arg_divergent_reach_run() -> RunArtifacts {
+        let corr = "reach-graph";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let args = serde_json::json!({"amount": 100});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                Some(15),
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        // On the serve's OWN span node: one function body, the value returned by
+        // the serve and used a line later. This is what `WithinServeSpan` mostly
+        // means, and the reason its gloss is not "passed down".
+        let same_frame = graph_observed(
+            corr,
+            15,
+            804,
+            "same_frame",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        let within = graph_observed(
+            corr,
+            16,
+            802,
+            "child",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        let beside = graph_observed(
+            corr,
+            17,
+            803,
+            "sibling",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(corr), "db", "load", 801, result.clone()),
+                    span_entry_res(Some(corr), 801, "request>load", result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "same_frame", 804, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "child", 802, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "sibling", 803, result.clone()),
+                ],
+                vec![served, same_frame, within, beside],
+                vec![http(corr, true, vec![])],
+                vec![
+                    graph_event(corr, 801, 5, "load", args, result.clone()),
+                    graph_event(
+                        corr,
+                        804,
+                        5,
+                        "same_frame",
+                        serde_json::json!({}),
+                        result.clone(),
+                    ),
+                    graph_event(corr, 802, 6, "child", serde_json::json!({}), result.clone()),
+                    graph_event(corr, 803, 7, "sibling", serde_json::json!({}), result),
+                ],
+            ),
+            vec![
+                graph_span(4, corr, None, 0, "request"),
+                graph_span(5, corr, Some(4), 1, "load"),
+                graph_span(6, corr, Some(5), 2, "child"),
+                graph_span(7, corr, Some(4), 3, "sibling"),
+            ],
+            vec![
+                graph_span(14, corr, None, 0, "request"),
+                graph_span(15, corr, Some(14), 1, "load"),
+                graph_span(16, corr, Some(15), 2, "child"),
+                graph_span(17, corr, Some(14), 3, "sibling"),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_arg_divergent_serve_names_the_work_it_could_have_reached() {
+        let artifacts = arg_divergent_reach_run();
+        let card = detect(&artifacts);
+        // Vacuity guard. The placement is the only thing the graph tier
+        // contributes, so a flat fallback would satisfy every assertion about it
+        // by reporting `Unplaced` throughout.
+        assert_eq!(
+            card.per_correlation[0].scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "{:?}",
+            card.per_correlation[0]
+        );
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergent_serves_unattributable, 0);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 3,
+            "every later call could have consumed the substituted value: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 2,
+            "the serve's own frame and the span it called; only the sibling needed \
+             the value returned past the serve's span: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 0,
+            "the graph placed both: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.per_correlation[0].arg_divergent_serves, 1);
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let row = |method: &str| {
+            rows.iter()
+                .find(|row| row.method_name == method)
+                .unwrap_or_else(|| panic!("a row for {method}: {rows:?}"))
+        };
+        let serve = row("load");
+        assert_eq!(serve.arg_divergence_reach, Some(ServeReach::Calls(3)));
+        // The commonest shape, and the one whose meaning is easiest to state
+        // backwards: the consumer shares the serve's span node, so the value was
+        // RETURNED to it rather than passed into it, and it is still WITHIN the span.
+        let same_frame = row("same_frame");
+        assert_eq!(
+            same_frame.arg_divergence_placement,
+            Some(ReachPlacement::WithinServeSpan),
+            "{same_frame:?}"
+        );
+        assert!(
+            !serve.could_be_affected_by_arg_divergence,
+            "a serve is not downstream of itself: {serve:?}"
+        );
+        let child = row("child");
+        assert!(child.could_be_affected_by_arg_divergence, "{child:?}");
+        assert_eq!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::WithinServeSpan),
+            "{child:?}"
+        );
+        let sibling = row("sibling");
+        assert!(sibling.could_be_affected_by_arg_divergence, "{sibling:?}");
+        // A CLAIM that it sits outside, not the absence of one — which is the
+        // whole reason the placement is three states and not a flag.
+        assert_eq!(
+            sibling.arg_divergence_placement,
+            Some(ReachPlacement::OutsideServeSpan),
+            "{sibling:?}"
+        );
+        // Attribution, not a finding. Both reached calls resolved to their own
+        // recorded events and stay matched: charging them would turn one argument
+        // divergence into three failures and bury the row naming the cause.
+        for reached in [same_frame, child, sibling] {
+            assert_eq!(reached.kind, "matched", "{reached:?}");
+            assert!(!reached.blocking, "{reached:?}");
+            assert!(
+                reached.arg_divergence_reach.is_none(),
+                "a reached call is not itself a serve: {reached:?}"
+            );
+        }
+        assert_eq!(card.summary.matched_side_effect_calls, 3);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    #[test]
+    fn a_flat_correlation_attributes_the_reach_without_the_graph_annotation() {
+        // The guard's own row. The serve carries a node, but the correlation has
+        // no forest, so the structural question cannot be asked: the annotation
+        // goes absent and the attribution does NOT. Reading it the other way
+        // round would make a flat correlation report nothing suspect at all.
+        let corr = "reach-flat";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                Some(15),
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let mut after = substituted_obs_method("db", Some(corr), "child", 802, result.clone());
+        after.graph_node_id = Some(16);
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 801, result.clone()),
+                span_entry_res(Some(corr), 801, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "child", 802, result.clone()),
+            ],
+            vec![served, after],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(
+                    corr,
+                    801,
+                    "load",
+                    serde_json::json!({"amount": 100}),
+                    result.clone(),
+                ),
+                db_event(corr, 802, "child", serde_json::json!({}), result),
+            ],
+        );
+        let card = detect(&artifacts);
+        // Vacuity guard, the mirror of the graph case's: on a graph-scored
+        // correlation the absent annotation below would prove nothing.
+        assert!(
+            matches!(
+                card.per_correlation[0].scoring_mode,
+                deja_forest::ScoringMode::Flat { .. }
+            ),
+            "{:?}",
+            card.per_correlation[0]
+        );
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 1,
+            "position bounds the reach on this path too: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 0,
+            "the graph placed nothing: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 1,
+            "and it says so, rather than leaving the reached call looking like it \
+             was placed outside the serve's span: {:?}",
+            card.per_boundary["db"]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let child = rows
+            .iter()
+            .find(|row| row.method_name == "child")
+            .expect("a row for child");
+        assert!(child.could_be_affected_by_arg_divergence, "{child:?}");
+        assert_eq!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::Unplaced),
+            "{child:?}"
+        );
+        // Vacuity guard on the split this variant exists for: "could not say" must
+        // not be the same value the graph-scored case uses for "outside".
+        assert_ne!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::OutsideServeSpan)
+        );
+        assert_eq!(child.kind, "matched", "{child:?}");
+    }
+
+    #[test]
+    fn a_reached_call_that_diverged_on_its_own_is_counted_once() {
+        // The row this exists for: downstream of a substitution AND a divergence
+        // in its own right. The attribution is additive, so it must not produce a
+        // second row, a second charge, or a third ValueDiverged.
+        let corr = "reach-both";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let recorded = serde_json::json!({"amount": 100});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                None,
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let mut changed = obs("db", Some(corr), false, None, None);
+        changed.method_name = "save".to_owned();
+        changed.args = serde_json::json!({"amount": 300});
+        let changed = with_span(changed, "request>save");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 901, result.clone()),
+                span_entry_res(Some(corr), 901, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "save", 902, result.clone()),
+                span_entry_res(Some(corr), 902, "request>save", result.clone()),
+            ],
+            vec![served, changed],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(corr, 901, "load", recorded.clone(), result.clone()),
+                db_event(corr, 902, "save", recorded, result),
+            ],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            2,
+            "two calls changed what they sent: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.summary.value_divergences, 2);
+        assert_eq!(card.summary.omitted_calls, 0);
+        // The headline still closes over the two, with the reach counted in
+        // neither term.
+        assert_eq!(card.summary.side_effect_divergences, 2);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert_eq!(rows.len(), 2, "one row per call, not a split: {rows:?}");
+        let save = rows
+            .iter()
+            .find(|row| row.method_name == "save")
+            .expect("a row for save");
+        assert_eq!(save.kind, "value_diverged", "{save:?}");
+        assert!(save.blocking, "{save:?}");
+        assert!(
+            save.could_be_affected_by_arg_divergence,
+            "it is also downstream of the serve: {save:?}"
+        );
+        // Vacuity guard on the pair of markers: being reached must not be
+        // recorded as being a serve, or the two counters measure one thing.
+        assert!(save.arg_divergence_reach.is_none(), "{save:?}");
+    }
+
+    #[test]
+    fn a_second_serve_is_reached_by_the_first_and_owns_what_follows_it() {
+        // Ownership is by the NEAREST serve, so the per-serve reaches partition
+        // the reached calls instead of overlapping. Charged to the FIRST instead,
+        // the tail would be counted under both and no total would close.
+        let corr = "reach-chain";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let recorded = serde_json::json!({"amount": 100});
+        let first = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                None,
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let second = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "reload",
+                None,
+                serde_json::json!({"amount": 300}),
+                result.clone(),
+            ),
+            "request>reload",
+        );
+        let tail = substituted_obs_method("db", Some(corr), "tail", 913, result.clone());
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 911, result.clone()),
+                span_entry_res(Some(corr), 911, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "reload", 912, result.clone()),
+                span_entry_res(Some(corr), 912, "request>reload", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "tail", 913, result.clone()),
+            ],
+            vec![first, second, tail],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(corr, 911, "load", recorded.clone(), result.clone()),
+                db_event(corr, 912, "reload", recorded.clone(), result.clone()),
+                db_event(corr, 913, "tail", recorded, result),
+            ],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 2);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 2);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let row = |method: &str| {
+            rows.iter()
+                .find(|row| row.method_name == method)
+                .unwrap_or_else(|| panic!("a row for {method}: {rows:?}"))
+        };
+        // One each, not two and one: the nearest serve owns the tail.
+        assert_eq!(row("load").arg_divergence_reach, Some(ServeReach::Calls(1)));
+        assert_eq!(
+            row("reload").arg_divergence_reach,
+            Some(ServeReach::Calls(1))
+        );
+        assert!(
+            !row("load").could_be_affected_by_arg_divergence,
+            "nothing precedes the first serve: {:?}",
+            row("load")
+        );
+        assert!(
+            row("reload").could_be_affected_by_arg_divergence,
+            "a serve is reached by the serve before it: {:?}",
+            row("reload")
+        );
+        assert!(row("tail").could_be_affected_by_arg_divergence);
+        assert!(row("tail").arg_divergence_reach.is_none());
+    }
+
+    #[test]
+    fn a_serve_with_no_correlation_says_its_reach_could_not_be_bounded() {
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let served = arg_divergent_serve(
+            None,
+            "load",
+            None,
+            serde_json::json!({"amount": 200}),
+            result,
+        );
+        let artifacts = art(Vec::new(), vec![served], Vec::new());
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergent_serves_unattributable, 1);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 0);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|warning| warning.contains("no correlation")),
+            "the empty reach must name its cause: {:?}",
+            card.warnings
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].arg_divergence_reach,
+            Some(ServeReach::NoCorrelation),
+            "{:?}",
+            rows[0]
+        );
+        // Vacuity guard: "could not be bounded" and "bounded, and empty" are two
+        // statements, and reporting either as the other is the failure this
+        // variant exists to prevent.
+        assert_ne!(rows[0].arg_divergence_reach, Some(ServeReach::Calls(0)));
+    }
+
+    #[test]
+    fn a_run_with_no_arg_divergent_serve_says_nothing_about_reach() {
+        let corr = "no-reach";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let artifacts = art_with_events(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "load",
+                921,
+                result.clone(),
+            )],
+            vec![substituted_obs_method(
+                "db",
+                Some(corr),
+                "load",
+                921,
+                result.clone(),
+            )],
+            vec![http(corr, true, vec![])],
+            vec![db_event(
+                corr,
+                921,
+                "load",
+                serde_json::json!({"amount": 100}),
+                result,
+            )],
+        );
+        let card = detect(&artifacts);
+        let json = serde_json::to_string(&card).expect("a scorecard serializes");
+        assert!(
+            !json.contains("arg_diverg"),
+            "a run with no serve must read exactly as it did before the \
+             attribution existed: {json}"
+        );
+        for row in &build_ledger(&artifacts).expect("a ledger") {
+            let row = serde_json::to_string(row).expect("a row serializes");
+            assert!(!row.contains("arg_diverg"), "{row}");
+            assert!(!row.contains("could_be_affected"), "{row}");
+        }
+        // Every new counter defaults, so a document written without them reads
+        // back as zero rather than failing to parse.
+        let back: Scorecard = serde_json::from_str(&json).expect("a scorecard round-trips");
+        assert_eq!(back.summary.arg_divergent_serves, 0);
+        assert_eq!(back.summary.arg_divergence_reach_calls, 0);
+        assert_eq!(back.per_correlation[0].arg_divergent_serves, 0);
+        // Vacuity guard: the keys DO appear once there is something to report, so
+        // the absence above is the skip and not a needle nothing would match.
+        let reach = serde_json::to_string(&detect(&arg_divergent_reach_run()))
+            .expect("a scorecard serializes");
+        assert!(reach.contains("arg_divergence_reach_calls"), "{reach}");
+        assert!(reach.contains("arg_divergent_serves"), "{reach}");
     }
 
     #[test]
