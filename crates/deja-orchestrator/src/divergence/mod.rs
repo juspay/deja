@@ -855,17 +855,29 @@ impl Scorecard {
 // Detection
 // ---------------------------------------------------------------------------
 
-/// Keys the seeder planned and could not plant because the recording asserted
-/// a row it did not carry (`recorded_presence` in the seed certificate), per
-/// correlation. A divergence at one of them describes the missing seed, not
-/// the candidate.
+/// Keys whose recorded presence the seeder could not guarantee at replay, per
+/// correlation: `recorded_presence` (no statement to build the row from),
+/// `unsynthesizable_presence` (a statement no row can be built from), or
+/// `presence_already_held` (an earlier seeded row satisfied the statement at
+/// seed time, but an earlier delete in the replay may consume it first) in the
+/// seed certificate. A presence the seeder synthesized is planted and is not
+/// one of these. A divergence at one of them describes the seed, not the
+/// candidate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnplantedPresence(BTreeSet<(String, String)>);
 
 impl UnplantedPresence {
+    /// The seed-certificate skip causes that mean a recorded presence was not
+    /// guaranteed at replay.
+    pub const UNPLANTED_CAUSES: [&'static str; 3] = [
+        "recorded_presence",
+        "unsynthesizable_presence",
+        "presence_already_held",
+    ];
+
     /// From a seed certificate's JSON. Only a skipped db entry whose cause is
-    /// `recorded_presence` counts; every other skip, and every planted entry,
-    /// is left to judge its divergence as before.
+    /// one of [`Self::UNPLANTED_CAUSES`] counts; every other skip, and every
+    /// planted entry, is left to judge its divergence as before.
     pub fn from_certificate(cert: &serde_json::Value) -> Self {
         Self(
             cert["entries"]
@@ -875,7 +887,9 @@ impl UnplantedPresence {
                 .filter(|e| {
                     e["boundary"] == "db"
                         && e["materialization"] == "skipped"
-                        && e["skip_reason"]["cause"] == "recorded_presence"
+                        && e["skip_reason"]["cause"]
+                            .as_str()
+                            .is_some_and(|cause| Self::UNPLANTED_CAUSES.contains(&cause))
                 })
                 .filter_map(|e| {
                     Some((
@@ -15682,12 +15696,30 @@ mod tests {
     /// the missing seed's, so it is a seed gap, and the verdict cannot tell.
     #[test]
     fn unplanted_presence_makes_its_divergence_a_seed_gap() {
+        // Spelled out, not read from the constant: a test that iterates the
+        // constant cannot notice a cause dropped from it.
+        for cause in [
+            "recorded_presence",
+            "unsynthesizable_presence",
+            // Held at seed time only: an earlier replayed delete can consume
+            // the row this key relied on, so a miss here is the seed's.
+            "presence_already_held",
+        ] {
+            unplanted_presence_is_a_seed_gap(cause);
+        }
+    }
+
+    fn unplanted_presence_is_a_seed_gap(cause: &str) {
         let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
             "c1",
             "skipped",
-            Some("recorded_presence")
+            Some(cause)
         )])));
-        assert_eq!(card.summary.value_divergences, 0, "{}", card.verdict.reason);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "{cause}: {}",
+            card.verdict.reason
+        );
         assert_eq!(card.summary.inconclusive_seed_gaps, 1);
         assert!(
             card.verdict.inconclusive && !card.verdict.pass,
@@ -16033,9 +16065,10 @@ mod tests {
         assert_blocking_divergence(&card, &rows);
     }
 
-    /// A skip for any other cause is not this fact.
+    /// A skip for any other cause is not this fact. (`presence_already_held`
+    /// is one: see `unplanted_presence_makes_its_divergence_a_seed_gap`.)
     #[test]
-    fn unplanted_only_for_recorded_presence() {
+    fn unplanted_only_for_an_unplanted_presence() {
         for cause in ["recorded_absence", "recorded_count", "recorded_scalar"] {
             let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
                 "c1",
