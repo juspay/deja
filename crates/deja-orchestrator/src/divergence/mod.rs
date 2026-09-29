@@ -856,15 +856,27 @@ impl Scorecard {
 // ---------------------------------------------------------------------------
 
 /// Keys whose recorded presence the seeder could not guarantee at replay, per
-/// correlation: `recorded_presence` (no statement to build the row from),
-/// `unsynthesizable_presence` (a statement no row can be built from), or
+/// correlation, and the tables a synthesized row could have leaked into. A
+/// divergence at one of them describes the seed, not the candidate.
+///
+/// A key counts when its seed-certificate entry is skipped as
+/// `recorded_presence` (no statement to build the row from),
+/// `unsynthesizable_presence` (a statement no row can be built from) or
 /// `presence_already_held` (an earlier seeded row satisfied the statement at
-/// seed time, but an earlier delete in the replay may consume it first) in the
-/// seed certificate. A presence the seeder synthesized is planted and is not
-/// one of these. A divergence at one of them describes the seed, not the
-/// candidate.
+/// seed time, but an earlier delete in the replay may consume it first); or
+/// when its row was synthesized and the readback did not match, since a
+/// synthesis that goes wrong must never score worse than no synthesis.
+///
+/// A synthesized row also makes every OTHER read of its table in that
+/// correlation inconclusive: its neutral columns can satisfy a predicate the
+/// recorded row did not (`deleted = false`, an enum's first label, a zero
+/// version), so such a read can return a row the recording never saw.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UnplantedPresence(BTreeSet<(String, String)>);
+pub struct UnplantedPresence {
+    keys: BTreeSet<(String, String)>,
+    /// `(correlation, table)` → the synthesized entries' own keys on it.
+    synthesized: BTreeMap<(String, String), BTreeSet<String>>,
+}
 
 impl UnplantedPresence {
     /// The seed-certificate skip causes that mean a recorded presence was not
@@ -875,50 +887,79 @@ impl UnplantedPresence {
         "presence_already_held",
     ];
 
-    /// From a seed certificate's JSON. Only a skipped db entry whose cause is
-    /// one of [`Self::UNPLANTED_CAUSES`] counts; every other skip, and every
-    /// planted entry, is left to judge its divergence as before.
+    /// From a seed certificate's JSON. Every other skip, and every planted
+    /// entry that is not synthesized, is left to judge its divergence as
+    /// before.
     pub fn from_certificate(cert: &serde_json::Value) -> Self {
-        Self(
-            cert["entries"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|e| {
-                    e["boundary"] == "db"
-                        && e["materialization"] == "skipped"
-                        && e["skip_reason"]["cause"]
-                            .as_str()
-                            .is_some_and(|cause| Self::UNPLANTED_CAUSES.contains(&cause))
-                })
-                .filter_map(|e| {
-                    Some((
-                        e["correlation_id"].as_str()?.to_owned(),
-                        canonical_key(e["logical_key"].as_str()?),
-                    ))
-                })
-                .collect(),
-        )
+        let mut this = Self::default();
+        for e in cert["entries"].as_array().into_iter().flatten() {
+            if e["boundary"] != "db" {
+                continue;
+            }
+            let (Some(correlation), Some(key)) =
+                (e["correlation_id"].as_str(), e["logical_key"].as_str())
+            else {
+                continue;
+            };
+            let key = canonical_key(key);
+            let skipped_unplanted = e["materialization"] == "skipped"
+                && e["skip_reason"]["cause"]
+                    .as_str()
+                    .is_some_and(|cause| Self::UNPLANTED_CAUSES.contains(&cause));
+            let is_synthesized = e["origin"].get("synthesized_presence").is_some();
+            let synthesis_unverified = is_synthesized && e["readback"]["status"] != "matched";
+            if skipped_unplanted || synthesis_unverified {
+                this.keys.insert((correlation.to_owned(), key.clone()));
+            }
+            if is_synthesized {
+                let table = e["mechanism"]["table"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| key_table(&key));
+                if let Some(table) = table {
+                    this.synthesized
+                        .entry((correlation.to_owned(), table))
+                        .or_default()
+                        .insert(key);
+                }
+            }
+        }
+        this
     }
 
     #[cfg(test)]
     pub(crate) fn names(&self, correlation: &str, key: &str) -> bool {
-        self.0
+        self.keys
             .contains(&(correlation.to_owned(), canonical_key(key)))
     }
 
     /// Whether `event`, recorded in `correlation`, read a key the seeder could
-    /// not plant.
+    /// not guarantee, or another key of a table it synthesized a row into.
     pub fn read_by(&self, correlation: Option<&str>, event: Option<&deja::BoundaryEvent>) -> bool {
         let (Some(correlation), Some(event)) = (correlation, event) else {
             return false;
         };
-        !self.0.is_empty()
-            && event.read_set.iter().any(|key| {
-                self.0
-                    .contains(&(correlation.to_owned(), canonical_key(key)))
-            })
+        if self.keys.is_empty() && self.synthesized.is_empty() {
+            return false;
+        }
+        event.read_set.iter().any(|key| {
+            let key = canonical_key(key);
+            if self.keys.contains(&(correlation.to_owned(), key.clone())) {
+                return true;
+            }
+            key_table(&key)
+                .and_then(|table| self.synthesized.get(&(correlation.to_owned(), table)))
+                .is_some_and(|own| !own.contains(&key))
+        })
     }
+}
+
+/// The db table a state key names, if it names one.
+fn key_table(key: &str) -> Option<String> {
+    deja::StateKey::parse(key)
+        .ok()?
+        .db_table()
+        .map(str::to_owned)
 }
 
 /// Correlations whose FIRST divergence is a seed gap the harness could not
@@ -16158,6 +16199,57 @@ mod tests {
         let card = detect(&a);
         let rows = build_ledger(&a).unwrap();
         assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A matched synthesized row on `business_profile` in `corr`, keyed by `key`.
+    fn synthesized_cert_entry(corr: &str, key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "correlation_id": corr,
+            "boundary": "db",
+            "logical_key": key,
+            "materialization": "materialized",
+            "origin": {"synthesized_presence": {
+                "from": "statement_binds",
+                "columns_from_statement": ["profile_id"],
+                "columns_defaulted": ["deleted"],
+            }},
+            "readback": {"status": "matched"},
+            "mechanism": {"table": "business_profile", "rows": 1, "via_copy": 0, "via_insert": 1},
+        })
+    }
+
+    fn other_profile_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!(["pro_9"]),
+        )
+    }
+
+    /// A synthesized row's neutral columns can join another read of its
+    /// table, so in that correlation such a read's divergence is the seed's.
+    #[test]
+    fn a_synthesized_row_makes_other_reads_of_its_table_a_seed_gap() {
+        let (card, _) = unplanted_delete(certificate(serde_json::json!([synthesized_cert_entry(
+            "c1",
+            &other_profile_key()
+        )])));
+        assert_eq!(card.summary.value_divergences, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.inconclusive_seed_gaps, 1);
+    }
+
+    /// A verified synthesized row's own key stays the candidate's to answer
+    /// for, and so does the same table in another correlation.
+    #[test]
+    fn a_verified_synthesis_excuses_neither_its_own_key_nor_another_correlation() {
+        for entry in [
+            synthesized_cert_entry("c1", &unplanted_key()),
+            synthesized_cert_entry("c2", &other_profile_key()),
+        ] {
+            let (card, rows) = unplanted_delete(certificate(serde_json::json!([entry])));
+            assert_blocking_divergence(&card, &rows);
+        }
     }
 
     /// The same key in ANOTHER correlation is another request's precondition.

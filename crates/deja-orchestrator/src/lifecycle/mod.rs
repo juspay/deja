@@ -4414,10 +4414,19 @@ fn neutral_value(shape: &DbColumnShape) -> Result<serde_json::Value, String> {
 /// the statement and the replay database's catalog. The key columns come from
 /// the statement's own binds and nothing else.
 ///
-/// The candidate reads this row's neutral columns only if it reads the row
-/// from the database before deleting it, which the recording did not (else
-/// the read's image would have been planted instead), so that read is a call
-/// the recording lacks and is already reported as a novel call.
+/// Known limits, which the scorer answers by treating reads near a synthesized
+/// row as seed gaps rather than by any claim made here:
+///
+/// - The neutral columns are visible to reads. A recorded read whose predicate
+///   the real row failed (`deleted = false` where the row was deleted, an
+///   enum's first label, `version = 0`, a timestamp bound the epoch meets)
+///   returned no row, left no image, and so is exactly the case that reaches
+///   synthesis — and at replay the synthesized row can satisfy it and join its
+///   result set.
+/// - Bind fidelity is assumed. The plant and the readback use the same
+///   recorded bind text, so a bind recorded in a form the candidate does not
+///   send (a secret recorded as `***`) plants the wrong key and still
+///   certifies matched. Non-scalar debug forms are refused up front.
 fn synthesize_presence_row(
     table: &str,
     predicate: &deja::PresencePredicate,
@@ -4780,6 +4789,31 @@ const DB_CATALOG_SQL: &str =
        AND cls.relkind IN ('r', 'p') \
      ORDER BY cls.relname, attr.attnum";
 
+/// One row of [`DB_CATALOG_SQL`]'s tab-separated output, decoded by the
+/// query's column positions: the table, and the column as synthesis and the
+/// renderer each see it. `None` for a row without exactly nine fields.
+fn decode_catalog_row(line: &str) -> Option<(String, DbColumnShape, DbColumnMetadata)> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() != 9 {
+        return None;
+    }
+    let shape = DbColumnShape {
+        name: parts[1].to_string(),
+        required: parse_pg_bool(parts[4]) == Some(false) && parse_pg_bool(parts[5]) == Some(false),
+        type_name: parts[3].to_string(),
+        sql_type: parts[7].to_string(),
+        category: parts[6].chars().next().unwrap_or('X'),
+        first_enum_label: catalog_first_enum_label(parts[6], parts[8]),
+    };
+    let metadata = DbColumnMetadata {
+        name: parts[1].to_string(),
+        type_oid: parts[2].parse().ok(),
+        type_name: nonempty(parts[3]),
+        nullable: parse_pg_bool(parts[4]),
+    };
+    Some((parts[0].to_string(), shape, metadata))
+}
+
 fn load_db_catalog(store: &StoreExec) -> DbCatalog {
     let sql = DB_CATALOG_SQL;
     match store.psql(&["-A", "-t", "-F", "\t"], false, sql).output() {
@@ -4787,32 +4821,12 @@ fn load_db_catalog(store: &StoreExec) -> DbCatalog {
             let mut catalog = DbCatalog::default();
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() != 9 {
+                let Some((table, shape, metadata)) = decode_catalog_row(line) else {
                     eprintln!("lifecycle: skipping malformed db catalog row '{line}'");
                     continue;
-                }
-                catalog.insert_shape(
-                    parts[0].to_string(),
-                    DbColumnShape {
-                        name: parts[1].to_string(),
-                        required: parse_pg_bool(parts[4]) == Some(false)
-                            && parse_pg_bool(parts[5]) == Some(false),
-                        type_name: parts[3].to_string(),
-                        sql_type: parts[7].to_string(),
-                        category: parts[6].chars().next().unwrap_or('X'),
-                        first_enum_label: catalog_first_enum_label(parts[6], parts[8]),
-                    },
-                );
-                catalog.insert(
-                    parts[0].to_string(),
-                    DbColumnMetadata {
-                        name: parts[1].to_string(),
-                        type_oid: parts[2].parse().ok(),
-                        type_name: nonempty(parts[3]),
-                        nullable: parse_pg_bool(parts[4]),
-                    },
-                );
+                };
+                catalog.insert_shape(table.clone(), shape);
+                catalog.insert(table, metadata);
             }
             eprintln!(
                 "lifecycle: loaded db catalog metadata for {} table(s), {} column(s)",
@@ -7123,7 +7137,7 @@ mod tests {
             entry["readback"]["observed"],
             serde_json::json!({"planted": 1, "rows": 1})
         );
-        assert!(entry.get("skip_reason").is_none(), "{entry}");
+        assert!(entry.get("skip_reason").is_none());
     }
 
     /// Every (planted, matching) pair has a named outcome; only a real plant
@@ -7472,6 +7486,248 @@ mod tests {
         psql("DROP SCHEMA deja_synth CASCADE; DROP TABLE public.widget; DROP TYPE widget_status;");
     }
 
+    /// Every field of the catalog query's row, decoded by position. The query
+    /// only runs against a live database, so this is the CI check that the
+    /// decode and the query's column order agree.
+    #[test]
+    fn the_catalog_decode_reads_every_field_by_position() {
+        let decode = |line: &str| super::decode_catalog_row(line).expect("nine fields");
+        let column =
+            |name: &str, oid: u32, type_name: &str, nullable: bool| super::DbColumnMetadata {
+                name: name.to_owned(),
+                type_oid: Some(oid),
+                type_name: Some(type_name.to_owned()),
+                nullable: Some(nullable),
+            };
+        let shape = |name: &str,
+                     required: bool,
+                     type_name: &str,
+                     sql_type: &str,
+                     category: char,
+                     label: Option<&str>| super::DbColumnShape {
+            name: name.to_owned(),
+            required,
+            type_name: type_name.to_owned(),
+            sql_type: sql_type.to_owned(),
+            category,
+            first_enum_label: label.map(str::to_owned),
+        };
+        assert_eq!(
+            decode("widget\tprofile_id\t1043\tvarchar\tf\tf\tS\tcharacter varying(64)\t"),
+            (
+                "widget".to_owned(),
+                shape(
+                    "profile_id",
+                    true,
+                    "varchar",
+                    "character varying(64)",
+                    'S',
+                    None
+                ),
+                column("profile_id", 1043, "varchar", false),
+            )
+        );
+        assert_eq!(
+            decode("widget\tname\t25\ttext\tt\tf\tS\ttext\t"),
+            (
+                "widget".to_owned(),
+                shape("name", false, "text", "text", 'S', None),
+                column("name", 25, "text", true),
+            ),
+            "nullable, so not required"
+        );
+        assert_eq!(
+            decode("widget\tid\t23\tint4\tf\tt\tN\tinteger\t"),
+            (
+                "widget".to_owned(),
+                shape("id", false, "int4", "integer", 'N', None),
+                column("id", 23, "int4", false),
+            ),
+            "NOT NULL but defaulted, so not required"
+        );
+        assert_eq!(
+            decode("widget\tstatus\t16500\twidget_status\tf\tf\tE\twidget_status\tactive"),
+            (
+                "widget".to_owned(),
+                shape(
+                    "status",
+                    true,
+                    "widget_status",
+                    "widget_status",
+                    'E',
+                    Some("active")
+                ),
+                column("status", 16_500, "widget_status", false),
+            )
+        );
+        assert_eq!(
+            decode("widget\tbare\t16501\tbare_enum\tf\tf\tE\tpublic.bare_enum\t"),
+            (
+                "widget".to_owned(),
+                shape("bare", true, "bare_enum", "public.bare_enum", 'E', None),
+                column("bare", 16_501, "bare_enum", false),
+            ),
+            "an enum with no labels"
+        );
+        assert_eq!(
+            super::decode_catalog_row("widget\tid\t23\tint4\tf\tt\tN\tinteger"),
+            None
+        );
+    }
+
+    fn synthesized_entry(corr: &str, planted: u64, matching: u64) -> super::SeedCertificateEntry {
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        let outcome = super::presence_outcome(
+            &seed_target(&widget_key()),
+            &row,
+            super::SeedEntryMechanism {
+                table: "widget".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
+            planted,
+            matching,
+        );
+        super::SeedCertificateEntry::new(
+            &Some(corr.to_owned()),
+            &presence_entry(),
+            None,
+            None,
+            outcome.status,
+            outcome.readback,
+        )
+        .with_origin(outcome.origin)
+        .with_mechanism(outcome.mechanism)
+        .with_skip_reason(outcome.skip_reason)
+    }
+
+    /// A synthesis that goes wrong never scores worse than no synthesis: each
+    /// unmatched shape, written and read back as a certificate, excuses its
+    /// key, and only the matched plant leaves it to the candidate.
+    #[test]
+    fn every_unverified_synthesis_is_excused_through_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-unverified-synthesis";
+        let mut certificate = super::SeedCertificate::new("rec-1", run_id, true);
+        let shapes = [
+            ("conflicted", 0, 0, "failed", "missing"),
+            ("vanished", 1, 0, "materialized", "missing"),
+            ("doubled", 1, 2, "materialized", "mismatched"),
+            ("verified", 1, 1, "materialized", "matched"),
+        ];
+        for (corr, planted, matching, materialization, readback) in shapes {
+            let entry = synthesized_entry(corr, planted, matching);
+            let json = serde_json::to_value(&entry).unwrap();
+            assert_eq!(json["materialization"], materialization, "{corr}");
+            assert_eq!(json["readback"]["status"], readback, "{corr}");
+            certificate.push(entry);
+        }
+        crate::write_json(&root.seed_certificate_path(run_id), &certificate).unwrap();
+        let art = crate::divergence::load_artifacts(&root, run_id).unwrap();
+        for corr in ["conflicted", "vanished", "doubled"] {
+            assert!(art.unplanted_presence.names(corr, &query_key()), "{corr}");
+        }
+        assert!(!art.unplanted_presence.names("verified", &query_key()));
+    }
+
+    /// A cast that truncates the bind is not certified matched: the plant
+    /// stores `pro`, the recorded WHERE asks for `pro_1`.
+    #[test]
+    fn a_truncating_cast_is_not_certified_matched() {
+        let catalog = synthesis_catalog(
+            "widget",
+            &[
+                (
+                    shape("profile_id", true, "bpchar", "character(3)", 'S'),
+                    1042,
+                ),
+                (shape("merchant_id", true, "text", "text", 'S'), 25),
+            ],
+        );
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &catalog).unwrap();
+        let plant = super::build_presence_plant_sql(None, &row).unwrap();
+        assert!(plant.contains("('pro_1')::character(3)"), "{plant}");
+        assert_eq!(
+            super::build_presence_readback_sql(None, &row).unwrap(),
+            r#"SELECT COUNT(*) FROM "widget" WHERE "profile_id" = 'pro_1' AND "merchant_id" = 'm1';"#,
+            "the readback asks the recorded bind, not the planted value"
+        );
+        let outcome = super::presence_outcome(
+            &seed_target(&widget_key()),
+            &row,
+            super::SeedEntryMechanism {
+                table: "widget".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
+            1,
+            0,
+        );
+        assert_eq!(
+            (outcome.status, outcome.readback.status),
+            (
+                super::SeedMaterializationStatus::Materialized,
+                super::SeedReadbackStatus::Missing
+            )
+        );
+    }
+
+    /// The truncating cast against a real Postgres: planted, not matched.
+    #[test]
+    #[ignore = "needs a disposable Postgres at DEJA_TEST_DATABASE_URL"]
+    fn a_truncating_cast_in_postgres_reads_back_missing() {
+        let url = std::env::var("DEJA_TEST_DATABASE_URL")
+            .expect("DEJA_TEST_DATABASE_URL names a disposable Postgres");
+        let store = super::StoreExec::direct("127.0.0.1".to_owned(), 1, url);
+        let psql = |sql: &str| {
+            let output = store.psql(&["-A", "-t"], true, sql).output().unwrap();
+            assert!(output.status.success(), "psql failed");
+        };
+        // Its own table, so it can run beside the other Postgres test.
+        psql(
+            "DROP SCHEMA IF EXISTS deja_trunc CASCADE; DROP TABLE IF EXISTS public.gizmo; \
+             CREATE TABLE public.gizmo (profile_id char(3) NOT NULL, merchant_id text NOT NULL);",
+        );
+        let catalog = super::load_db_catalog(&store);
+        super::create_db_schema(&store, "deja_trunc", &["gizmo".to_owned()]);
+        let presence = deja::PresencePredicate::Equalities {
+            table: "gizmo".to_owned(),
+            columns: vec![
+                ("profile_id".to_owned(), serde_json::json!("pro_1")),
+                ("merchant_id".to_owned(), serde_json::json!("m1")),
+            ],
+        };
+        let key = deja::db::query_state_key(
+            "generic_delete",
+            "gizmo",
+            "DELETE FROM gizmo WHERE profile_id = $1 AND merchant_id = $2",
+            &serde_json::json!(["pro_1", "m1"]),
+        );
+        let outcome = super::seed_db(
+            &store,
+            Some("deja_trunc"),
+            &catalog,
+            &key,
+            None,
+            &recorded_ok(serde_json::json!(true), "bool"),
+            Some(&presence),
+        );
+        psql("DROP SCHEMA deja_trunc CASCADE; DROP TABLE public.gizmo;");
+        assert_eq!(
+            (outcome.status, outcome.readback.status),
+            (
+                super::SeedMaterializationStatus::Materialized,
+                super::SeedReadbackStatus::Missing
+            )
+        );
+    }
+
     #[test]
     fn a_count_skip_serializes_its_detail() {
         let outcome =
@@ -7502,7 +7758,7 @@ mod tests {
             },
         );
         let entry = certificate_entry_for(outcome);
-        assert!(entry.get("skip_reason").is_none(), "{entry}");
+        assert!(entry.get("skip_reason").is_none());
         let parsed: super::SeedCertificateEntry = serde_json::from_value(entry).unwrap();
         assert_eq!(parsed.skip_reason, None);
     }
