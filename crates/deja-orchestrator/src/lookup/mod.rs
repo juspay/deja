@@ -951,7 +951,7 @@ mod tests {
     /// served by its address, and where the two pairings disagree the scorer
     /// says so.
     #[test]
-    fn a_real_args_free_serve_blocks_and_its_pick_is_checked_against_the_pairing() {
+    fn a_real_args_free_serve_blocks_and_its_pick_matches_the_pairing() {
         use deja::DejaHook;
         let identity = |name: &str| deja::CallsiteIdentity {
             version: 1,
@@ -1039,6 +1039,9 @@ mod tests {
         // the event the candidate named, so its pick and the twin are the same one.
         // The check still guards the refused-claim path, where an exact hit owns the
         // event and the shape search picks another.
+        // NOT COVERED HERE: that refused-claim path has no test. Neutralising the
+        // disagreement check leaves this suite green, so the kind, its counter and
+        // its warning could stop appearing unnoticed.
         assert_eq!(db.kinds.get("ArgsServedPairingDisagrees"), None, "{db:?}");
         assert!(!card.verdict.pass, "{}", card.verdict.reason);
         let served: Vec<&crate::divergence::CallRecord> =
