@@ -886,6 +886,9 @@ pub struct RunArtifacts {
     /// canon, which is the behaviour for a system that declares nothing.
     pub reply_canons: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<String>,
+    /// Lookups the candidate dropped before they finished. They close the
+    /// lookup count and are not scored: the call never completed.
+    pub cancelled_lookups: Vec<ObservedCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -2413,11 +2416,21 @@ fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> V
 /// warning, when the candidate numbered none.
 fn account_lookups(
     observed: &[ObservedCall],
+    cancelled: &[ObservedCall],
     reasons: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Option<deja::LookupTally> {
+    if !cancelled.is_empty() {
+        warnings.push(format!(
+            "{} lookup(s) were cancelled before they finished, their future dropped (a \
+             sibling's error in a join, a client that went away, a panic): they close the \
+             lookup count and are not scored",
+            cancelled.len()
+        ));
+    }
     let numbered: Vec<&ObservedCall> = observed
         .iter()
+        .chain(cancelled)
         .filter(|call| call.lookup_ordinal.is_some())
         .collect();
     if numbered.is_empty() {
@@ -2452,6 +2465,8 @@ fn account_lookups(
             "{missing} of the candidate's {highest} lookup(s) wrote no observation"
         ));
     }
+    // A cancelled lookup still ended in an arm: the arms describe where each
+    // lookup was resolved, which happened before it was dropped.
     let exact = numbered.iter().filter(|call| call.resolved).count() as u64;
     let arg_free = numbered.iter().filter(|call| call.arg_divergent).count() as u64;
     Some(deja::LookupTally {
@@ -6422,7 +6437,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // arrived. The ordinals on the stream must be one to the highest, once
     // each: a gap is a lookup that wrote no observation, and a repeat is a
     // candidate that started over, so its stream holds two processes' lookups.
-    let lookup_tally = account_lookups(&art.observed, &mut reasons, &mut warnings_extra);
+    let lookup_tally = account_lookups(
+        &art.observed,
+        &art.cancelled_lookups,
+        &mut reasons,
+        &mut warnings_extra,
+    );
     let blocking_reasons = reasons.len()
         - usize::from(novel_calls > 0)
         - usize::from(absorbed_misses > 0)
@@ -6832,8 +6852,11 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     let mut cost = LoadCost::start();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
     cost.report("lookup table", table.entries.len());
-    let (observed, mut replay_graph) =
-        load_replay_stream(&root.observed_path(run_id), &mut warnings);
+    let ReplayStream {
+        observed,
+        graph: mut replay_graph,
+        cancelled: cancelled_lookups,
+    } = load_replay_stream(&root.observed_path(run_id), &mut warnings);
     cost.report("observed calls", observed.len());
     cost.report("replay graph nodes", replay_graph.len());
     let mut record_graph = load_record_graph(&root.record_graph_path(run_id), &mut warnings);
@@ -7018,6 +7041,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         scored_span_namespaces,
         reply_canons,
         warnings,
+        cancelled_lookups,
     })
 }
 
@@ -7229,14 +7253,22 @@ fn stream_deja_records(
     true
 }
 
+/// The replay's shared tagged stream, split.
+struct ReplayStream {
+    /// The calls that finished, which are scored.
+    observed: Vec<ObservedCall>,
+    graph: Vec<deja_core::ExecutionGraphNode>,
+    /// Lookups dropped before they finished: counted, never scored.
+    cancelled: Vec<ObservedCall>,
+}
+
 /// Split the replay's shared tagged stream in one pass.
-fn load_replay_stream(
-    path: &std::path::Path,
-    warnings: &mut Vec<String>,
-) -> (Vec<ObservedCall>, Vec<deja_core::ExecutionGraphNode>) {
+fn load_replay_stream(path: &std::path::Path, warnings: &mut Vec<String>) -> ReplayStream {
     let mut observed = Vec::new();
     let mut graph = Vec::new();
+    let mut cancelled = Vec::new();
     if !stream_deja_records(path, warnings, |record| match record {
+        deja::DejaRecord::Observed(call) if call.cancelled => cancelled.push(*call),
         deja::DejaRecord::Observed(call) => observed.push(*call),
         deja::DejaRecord::GraphNode(node) => graph.push(*node),
         deja::DejaRecord::BoundaryEvent(_) => {}
@@ -7245,8 +7277,13 @@ fn load_replay_stream(
         // masquerade as a complete, smaller replay.
         observed.clear();
         graph.clear();
+        cancelled.clear();
     }
-    (observed, graph)
+    ReplayStream {
+        observed,
+        graph,
+        cancelled,
+    }
 }
 
 /// Load the optional record-side tagged graph stream. Missing or unreadable is
@@ -7684,6 +7721,7 @@ mod tests {
             arg_divergent: false,
             served_event_global_sequence: None,
             lookup_ordinal: None,
+            cancelled: false,
         }
     }
 
@@ -8285,7 +8323,9 @@ mod tests {
         write_jsonl_rows(&path, &rows);
         let mut warnings = Vec::new();
 
-        let (observed, graph) = load_replay_stream(&path, &mut warnings);
+        let ReplayStream {
+            observed, graph, ..
+        } = load_replay_stream(&path, &mut warnings);
         assert!(warnings.is_empty());
         assert_eq!(
             observed
@@ -8391,6 +8431,7 @@ mod tests {
             events: Vec::new(),
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         }
     }
 
@@ -10627,6 +10668,7 @@ mod tests {
             events: events.clone(),
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         })
         .unwrap();
         let volatile_row = rows
@@ -12784,6 +12826,7 @@ mod tests {
             events: recorded_events,
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         };
 
         let rows = build_ledger(&art).unwrap();
@@ -17273,7 +17316,7 @@ mod tests {
         sink.observed(call);
         sink.flush().expect("flush");
         let mut warnings = Vec::new();
-        let (observed, _) = load_replay_stream(&path, &mut warnings);
+        let ReplayStream { observed, .. } = load_replay_stream(&path, &mut warnings);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].lookup_ordinal, Some(7));

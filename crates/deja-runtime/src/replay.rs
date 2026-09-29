@@ -1832,6 +1832,11 @@ pub struct ObservedCall {
     /// that does not number its lookups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookup_ordinal: Option<u64>,
+    /// The lookup was dropped before it finished: the future carrying it went
+    /// away, so the call never completed. Written by the token it was left in,
+    /// so the lookup's number still reaches the stream; not scored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 #[derive(Deserialize)]
@@ -1894,6 +1899,8 @@ struct ObservedCallWire {
     served_event_global_sequence: Option<u64>,
     #[serde(default)]
     lookup_ordinal: Option<u64>,
+    #[serde(default)]
+    cancelled: bool,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1933,6 +1940,7 @@ impl From<ObservedCallWire> for ObservedCall {
             arg_divergent: wire.arg_divergent,
             served_event_global_sequence: wire.served_event_global_sequence,
             lookup_ordinal: wire.lookup_ordinal,
+            cancelled: wire.cancelled,
         }
     }
 }
@@ -2902,7 +2910,7 @@ pub struct LookupTableHook {
     /// macro would receive the default `0` for every call and only the first
     /// (occurrence-0) call at each callsite would resolve.
     callsite_occurrence: Mutex<crate::CallsiteOccurrenceMap>,
-    observed_sink: Box<dyn ObservedCallSink>,
+    observed_sink: std::sync::Arc<dyn ObservedCallSink>,
     /// Sequence space for replay-side graph nodes on the observed stream;
     /// separate from the lookup counters so replay addressing stays in
     /// lockstep with the recorder whether or not graph capture is on.
@@ -2973,7 +2981,7 @@ impl LookupTableHook {
             stamper: Mutex::new(Stampers::default()),
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
-            observed_sink: Box::new(sink),
+            observed_sink: std::sync::Arc::new(sink),
             graph_counter: std::sync::atomic::AtomicU64::new(0),
             lookups: std::sync::atomic::AtomicU64::new(0),
             exact_hits: std::sync::atomic::AtomicU64::new(0),
@@ -3256,6 +3264,7 @@ impl Resolution {
             arg_divergent: self.arg_divergent,
             served_event_global_sequence: self.served_event_global_sequence,
             lookup_ordinal: Some(self.lookup_ordinal),
+            cancelled: false,
         }
     }
 }
@@ -3319,7 +3328,10 @@ impl DejaHook for LookupTableHook {
         );
         crate::SubstitutePeek {
             recorded,
-            token: Some(crate::SubstituteToken::new(observed)),
+            token: Some(
+                crate::SubstituteToken::new(observed)
+                    .written_on_cancel_to(std::sync::Arc::clone(&self.observed_sink)),
+            ),
         }
     }
 
@@ -3364,7 +3376,10 @@ impl DejaHook for LookupTableHook {
         // A recorded counterpart, when present, is resolved by the lookup table;
         // seed planning is a separate precondition-materialization pass and does
         // not decide whether this observation has a baseline.
-        Some(crate::ExecuteShadowToken::new(observed))
+        Some(
+            crate::ExecuteShadowToken::new(observed)
+                .written_on_cancel_to(std::sync::Arc::clone(&self.observed_sink)),
+        )
     }
 
     fn execute_shadow_observe(
@@ -3463,6 +3478,7 @@ impl DejaHook for LookupTableHook {
             arg_divergent: false,
             served_event_global_sequence: None,
             lookup_ordinal: None,
+            cancelled: false,
         });
     }
 
@@ -6585,6 +6601,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(Some(1), true), (Some(2), true), (Some(3), false)]
         );
+    }
+
+    #[test]
+    fn a_call_dropped_while_its_boundary_runs_is_written_as_cancelled() {
+        // The shape a join produces when a sibling fails: an execute-mode call
+        // polled once, its real boundary still running, and then dropped.
+        let (hook, handle) = hook_over(render_table(&[storage_event(
+            0,
+            "find-payment",
+            serde_json::json!({ "amount": 100 }),
+            "recorded",
+        )]));
+        let mut spec = crate::BoundarySpec::new("storage", "PaymentStore", "find_payment");
+        spec.replay_strategy = crate::ReplayStrategy::Execute;
+        let mut call = Box::pin(crate::dispatch_async_with_hook(
+            crate::DelegateObservation {
+                hook: &hook,
+                spec,
+                caller: std::panic::Location::caller(),
+                identity: explicit_identity("find-payment"),
+                receiver: None,
+            },
+            serde_json::json!({ "amount": 100 }),
+            std::future::pending::<Result<u64, String>>,
+            |_| crate::Reconstructed::NoValue,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            crate::round_trip::RoundTrip::<
+                fn(&Result<u64, String>, &Result<u64, String>) -> crate::round_trip::Comparison,
+            >::Unverifiable,
+        ));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(call.as_mut(), &mut cx).is_pending(),
+            "precondition: the boundary is running"
+        );
+        assert!(
+            handle.lock().unwrap().is_empty(),
+            "precondition: nothing written yet"
+        );
+        drop(call);
+        let calls = handle.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].cancelled);
+        assert_eq!(calls[0].lookup_ordinal, Some(1));
     }
 
     #[test]

@@ -1028,6 +1028,7 @@ mod tests {
             events,
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         };
         let card = crate::divergence::detect(&artifacts);
         let rows = crate::divergence::build_ledger(&artifacts).expect("a ledger");

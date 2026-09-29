@@ -867,6 +867,7 @@ mod tests {
             arg_divergent: false,
             served_event_global_sequence: None,
             lookup_ordinal: None,
+            cancelled: false,
         }
     }
 

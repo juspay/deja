@@ -943,8 +943,12 @@ pub enum ExecuteMode {
 /// macro only moves it from `peek` into `observe`.
 pub struct ExecuteShadowToken {
     /// The observation to emit once the real result is known. `observed_result`
-    /// is `None` here and filled by [`DejaHook::execute_shadow_observe`].
-    observed: crate::replay::ObservedCall,
+    /// is `None` here and filled by [`DejaHook::execute_shadow_observe`]. Taken
+    /// when the token is consumed, so a token dropped unconsumed still holds it.
+    observed: Option<crate::replay::ObservedCall>,
+    /// Where a token dropped unconsumed writes its observation, marked
+    /// cancelled; see [`ExecuteShadowToken::written_on_cancel_to`].
+    on_cancel: Option<std::sync::Arc<dyn crate::replay::ObservedCallSink>>,
 }
 
 /// A resolved-but-unemitted `Substitute` lookup, carried across the seam's
@@ -956,26 +960,64 @@ pub struct ExecuteShadowToken {
 /// knowable. Deferring the emission the way the execute path always has makes
 /// the outcome observable instead.
 ///
-/// Deferral is safe here specifically because the seam owns the fail-stop: a
-/// [`Reconstructed::NoValue`] or [`Reconstructed::Failed`] causes the SEAM to
-/// emit and then panic, in that order. Nothing relies on an emission surviving
-/// an unwind, so this needs no `Drop` guard.
+/// The seam owns the fail-stop: a [`Reconstructed::NoValue`] or
+/// [`Reconstructed::Failed`] causes the SEAM to emit and then panic, in that
+/// order. But the lookup was already counted, and a future dropped before the
+/// seam decides (a sibling's error in a join, a client that went away, a panic
+/// elsewhere) would leave it counted and never written. So a token dropped
+/// unconsumed writes its observation, marked cancelled, where the hook asked.
 pub struct SubstituteToken {
-    observed: crate::replay::ObservedCall,
+    observed: Option<crate::replay::ObservedCall>,
+    on_cancel: Option<std::sync::Arc<dyn crate::replay::ObservedCallSink>>,
 }
 
 impl SubstituteToken {
     /// Build a token from a resolved [`ObservedCall`](crate::replay::ObservedCall)
     /// whose outcome fields are not yet stamped.
     pub fn new(observed: crate::replay::ObservedCall) -> Self {
-        Self { observed }
+        Self {
+            observed: Some(observed),
+            on_cancel: None,
+        }
+    }
+
+    /// Write the observation to `sink`, marked cancelled, if this token is
+    /// dropped without being consumed.
+    pub fn written_on_cancel_to(
+        mut self,
+        sink: std::sync::Arc<dyn crate::replay::ObservedCallSink>,
+    ) -> Self {
+        self.on_cancel = Some(sink);
+        self
     }
 
     /// Consume the token, stamping what the seam ACTUALLY did, and return the
     /// completed observation ready to emit.
     pub fn into_observed(mut self, outcome: SubstituteOutcome) -> crate::replay::ObservedCall {
-        self.observed.stamp_outcome(outcome);
-        self.observed
+        let mut observed = self
+            .observed
+            .take()
+            .expect("a token holds its observation until it is consumed");
+        observed.stamp_outcome(outcome);
+        observed
+    }
+}
+
+impl Drop for SubstituteToken {
+    fn drop(&mut self) {
+        write_cancelled(self.observed.take(), self.on_cancel.take());
+    }
+}
+
+/// A lookup's observation written by the token it was left in, marked
+/// cancelled, when the future carrying it was dropped before it finished.
+fn write_cancelled(
+    observed: Option<crate::replay::ObservedCall>,
+    sink: Option<std::sync::Arc<dyn crate::replay::ObservedCallSink>>,
+) {
+    if let (Some(mut observed), Some(sink)) = (observed, sink) {
+        observed.cancelled = true;
+        sink.observed(observed);
     }
 }
 
@@ -995,7 +1037,21 @@ impl ExecuteShadowToken {
     /// (or `None` + `seed_gap = true` when no baseline was found), and a `None`
     /// `observed_result` (filled at observe time).
     pub fn new(observed: crate::replay::ObservedCall) -> Self {
-        Self { observed }
+        Self {
+            observed: Some(observed),
+            on_cancel: None,
+        }
+    }
+
+    /// Write the observation to `sink`, marked cancelled, if this token is
+    /// dropped without being consumed: the real call it waits on may never
+    /// return, when the future running it is dropped.
+    pub fn written_on_cancel_to(
+        mut self,
+        sink: std::sync::Arc<dyn crate::replay::ObservedCallSink>,
+    ) -> Self {
+        self.on_cancel = Some(sink);
+        self
     }
 
     /// Consume the token, attaching the real boundary's `observed_result`, and
@@ -1004,19 +1060,36 @@ impl ExecuteShadowToken {
         mut self,
         observed_result: serde_json::Value,
     ) -> crate::replay::ObservedCall {
-        self.observed.observed_result = Some(observed_result);
-        self.observed
+        let mut observed = self
+            .observed
+            .take()
+            .expect("a token holds its observation until it is consumed");
+        observed.observed_result = Some(observed_result);
+        observed
     }
 
     /// The recorded result the peek resolved for THIS call, if it found one.
     pub fn recorded_result(&self) -> Option<&serde_json::Value> {
-        self.observed.recorded_result.as_ref()
+        self.observed.as_ref()?.recorded_result.as_ref()
+    }
+
+    /// The rank the peek resolved this call at, if it resolved.
+    fn resolved_rank(&self) -> Option<u8> {
+        self.observed.as_ref()?.resolved_rank
     }
 
     /// Mark the call as served from its recorded result rather than re-run.
     fn served(mut self) -> Self {
-        self.observed.provenance = Provenance::ServedRecordedError;
+        if let Some(observed) = self.observed.as_mut() {
+            observed.provenance = Provenance::ServedRecordedError;
+        }
         self
+    }
+}
+
+impl Drop for ExecuteShadowToken {
+    fn drop(&mut self) {
+        write_cancelled(self.observed.take(), self.on_cancel.take());
     }
 }
 
@@ -4562,7 +4635,7 @@ where
     C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     P: FnOnce(&T) -> bool,
 {
-    if !matches!(token.observed.resolved_rank, Some(rank) if SERVING_RANKS.contains(&rank)) {
+    if !matches!(token.resolved_rank(), Some(rank) if SERVING_RANKS.contains(&rank)) {
         return Err(token);
     }
     let recorded = match token.recorded_result() {
@@ -6577,6 +6650,7 @@ mod tests {
             arg_divergent: false,
             served_event_global_sequence: None,
             lookup_ordinal: None,
+            cancelled: false,
         }
     }
 
@@ -6914,6 +6988,7 @@ mod tests {
                 arg_divergent: false,
                 served_event_global_sequence: None,
                 lookup_ordinal: None,
+                cancelled: false,
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
                 role: None,
@@ -8134,6 +8209,7 @@ mod serve_or_run_tests {
             arg_divergent: false,
             served_event_global_sequence: None,
             lookup_ordinal: None,
+            cancelled: false,
             correlation_id: Some("c-1".to_owned()),
             boundary: "db".to_owned(),
             role: None,
