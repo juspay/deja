@@ -1812,6 +1812,18 @@ pub struct ObservedCall {
     /// the hook matched a different arguments bucket.
     #[serde(default)]
     pub arg_divergent: bool,
+    /// On an args-free serve, the global sequence of the recorded event whose
+    /// value was served. `None` on every other call.
+    ///
+    /// Not `source_event_global_sequence`: that says this call IS the recorded
+    /// event, and every consumer that reads it treats the call as resolved. This
+    /// says only which recording the call was answered from. The scorer pairs
+    /// the call with exactly that event instead of searching for a twin by the
+    /// shape of its args — a request that gained or lost a field has a
+    /// different shape, and a search by shape finds nothing, which scored the
+    /// changed call as an egress miss beside an omitted one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_divergent_from: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1870,6 +1882,8 @@ struct ObservedCallWire {
     outcome: crate::SubstituteOutcome,
     #[serde(default)]
     arg_divergent: bool,
+    #[serde(default)]
+    arg_divergent_from: Option<u64>,
 }
 
 impl From<ObservedCallWire> for ObservedCall {
@@ -1907,6 +1921,7 @@ impl From<ObservedCallWire> for ObservedCall {
             absorbed: wire.absorbed,
             outcome: wire.outcome,
             arg_divergent: wire.arg_divergent,
+            arg_divergent_from: wire.arg_divergent_from,
         }
     }
 }
@@ -3108,12 +3123,15 @@ impl LookupTableHook {
             resolved_rank: hit.map(|(_, rank)| rank),
             // Left absent on an args-free serve. The sequence is a claim that
             // THIS call is the recorded event at it, and an args-free serve is
-            // not that claim: the arguments differ, and which recorded event the
-            // call belongs to is decided by the orchestrator's own args-free
-            // pairing, which stays the single place pairing is decided. The value
-            // served is still on the row, as `recorded_result`.
+            // not that claim: the arguments differ. Which event the value came
+            // from is a different fact, and it rides separately as
+            // `arg_divergent_from`, so the orchestrator pairs the call with the
+            // event it was actually served rather than guessing it again.
             source_event_global_sequence: hit
                 .filter(|_| !arg_divergent)
+                .map(|(entry, _)| entry.source_event_global_sequence),
+            arg_divergent_from: hit
+                .filter(|_| arg_divergent)
                 .map(|(entry, _)| entry.source_event_global_sequence),
             recorded_result: hit.map(|(entry, _)| (*entry.result).clone()),
             arg_divergent,
@@ -3137,6 +3155,8 @@ struct Resolution {
     recorded_result: Option<serde_json::Value>,
     /// `recorded_result` came from the same address with different arguments.
     arg_divergent: bool,
+    /// The recorded event an args-free serve answered from.
+    arg_divergent_from: Option<u64>,
 }
 
 impl Resolution {
@@ -3192,6 +3212,7 @@ impl Resolution {
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: self.arg_divergent,
+            arg_divergent_from: self.arg_divergent_from,
         }
     }
 }
@@ -3397,6 +3418,7 @@ impl DejaHook for LookupTableHook {
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
+            arg_divergent_from: None,
         });
     }
 
@@ -6240,7 +6262,13 @@ mod tests {
         );
         assert_eq!(
             call.source_event_global_sequence, None,
-            "an args-free serve claims no recorded twin; the orchestrator pairs it"
+            "an args-free serve does not claim to BE the recorded event"
+        );
+        assert_eq!(
+            call.arg_divergent_from,
+            Some(0),
+            "but it names the event it was answered from, which is what the \
+             orchestrator pairs it with"
         );
         assert_eq!(
             call.recorded_result,
@@ -6276,6 +6304,10 @@ mod tests {
         assert!(call.resolved, "the arguments are the recording's");
         assert!(!call.arg_divergent);
         assert_eq!(call.source_event_global_sequence, Some(0));
+        assert_eq!(
+            call.arg_divergent_from, None,
+            "an exact hit names its event as its own"
+        );
         assert_eq!(
             hook.lookup_tally(),
             LookupTally {
@@ -6444,6 +6476,14 @@ mod tests {
         assert!(
             calls.iter().all(|c| c.arg_divergent && !c.resolved),
             "every positional serve is marked and none of them resolved"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| c.arg_divergent_from)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)],
+            "each serve names the recording it was answered from, each exactly once"
         );
         assert_eq!(
             hook.lookup_tally(),

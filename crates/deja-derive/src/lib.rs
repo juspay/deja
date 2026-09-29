@@ -131,9 +131,12 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// it means "not in cache", which is TRUE on replay, and the caller's fallback
 /// is separately instrumented. A fabricated egress response is not: it claims a
 /// third party answered when none did, and launders the divergence into a false
-/// pass. Egress (http/grpc) keeps the fail-stop default. `on_miss` on a site
-/// that resolves to `replay = Execute` is rejected at build: that branch never
-/// reaches the Substitute-miss arm, so the declaration would be dead.
+/// pass. Egress (http/grpc) declares no `on_miss`. A call there whose address
+/// the recording holds under other args is served that recording by the lookup
+/// hook and marked `arg_divergent`, which the orchestrator scores as a blocking
+/// divergence; a call the recording never made still fail-stops. `on_miss` on
+/// a site that resolves to `replay = Execute` is rejected at build: that branch
+/// never reaches the Substitute-miss arm, so the declaration would be dead.
 #[proc_macro_attribute]
 pub fn boundary(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as boundary::BoundaryArgs);

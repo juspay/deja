@@ -3123,21 +3123,48 @@ impl CallPairing {
         observed: &[ObservedCall],
         provenance: &CorrelationColumnProvenance,
     ) -> Self {
+        // A call the candidate served args-free says which recorded event it was
+        // answered from, so it pairs with exactly that one. It is not searched
+        // for by shape: the request it changed may have gained or lost a field,
+        // and a shape that differs finds nothing — the call then read as an
+        // egress miss beside an omitted call. Its event is claimed with the
+        // resolved ones, so no other call can pair with it.
+        let served: Vec<(usize, ArgsFreePairingResult)> = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.arg_divergent && !observed_is_ingress(call))
+            .filter_map(|(index, call)| {
+                call.arg_divergent_from.map(|sequence| {
+                    (
+                        index,
+                        ArgsFreePairingResult {
+                            sequence,
+                            order_mismatch: false,
+                        },
+                    )
+                })
+            })
+            .collect();
         let resolved: HashSet<u64> = observed
             .iter()
             .filter(|call| call.resolved && !observed_is_ingress(call))
             .filter_map(|call| call.source_event_global_sequence)
+            .chain(served.iter().map(|(_, twin)| twin.sequence))
             .collect();
         let mut pool = ArgsFreePairing::build(table, events, provenance);
         // An uncorrelated call has no correlation in its address to pair within.
-        let twins: Vec<(usize, ArgsFreePairingResult)> = observed
+        let mut twins: Vec<(usize, ArgsFreePairingResult)> = observed
             .iter()
             .enumerate()
             .filter(|(_, call)| {
-                !call.resolved && !observed_is_ingress(call) && call.correlation_id.is_some()
+                !call.resolved
+                    && !observed_is_ingress(call)
+                    && call.correlation_id.is_some()
+                    && call.arg_divergent_from.is_none()
             })
             .filter_map(|(index, call)| pool.take_twin(call, &resolved).map(|twin| (index, twin)))
             .collect();
+        twins.extend(served);
 
         // Pairing is FIFO, so two requests sent in swapped order produce two
         // pairs: the one that jumped ahead is flagged out of order, and the one
@@ -8040,6 +8067,7 @@ mod tests {
             seed_gap: false,
             absorbed: false,
             arg_divergent: false,
+            arg_divergent_from: None,
         }
     }
 
@@ -17139,6 +17167,103 @@ mod tests {
                 "the scorecard charges an identity skew to nothing, so the ledger row \
                  the viewer routes on must not be blocking either — one fact, two \
                  answers, and the viewer shows the wrong one: {row:?}"
+            );
+        }
+    }
+
+    /// An args-free serve whose request gained a field. Its args no longer have
+    /// the recording's shape, so the search for a twin by shape finds nothing:
+    /// without the event it was served, the call reads as an egress miss beside
+    /// an omitted call, and the reach attributed to it hangs off a row that is
+    /// not a divergence. Naming the served event pairs it with exactly that
+    /// one — one call whose input changed, blocking, both requests on its row.
+    #[test]
+    fn an_args_free_serve_whose_request_gained_a_field_pairs_with_the_event_it_was_served() {
+        let recorded = serde_json::json!({"body": {"card": {"number": "4111"}}});
+        let changed = serde_json::json!({
+            "body": {"card": {"number": "4111", "customer": {"merchant_customer_id": "cus_1"}}}
+        });
+        let run = |served_from: Option<u64>| {
+            let recorded = recorded.clone();
+            let changed = changed.clone();
+            in_both_tiers(move || {
+                // Exactly as `LookupTableHook::resolve` shapes an args-free serve.
+                let mut call = added_draw(
+                    "http_outgoing",
+                    "send_request",
+                    deja::SubstituteOutcome::Substituted,
+                );
+                call.args = changed.clone();
+                call.resolved = false;
+                call.arg_divergent = true;
+                call.arg_divergent_from = served_from;
+                call.source_event_global_sequence = None;
+                one_span_recording(("http_outgoing", "send_request"), recorded.clone(), call)
+            })
+        };
+
+        // Vacuity guard: without the served event, shape pairing finds nothing.
+        for (tier, art) in run(None) {
+            let card = detect(&art);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+                1,
+                "{tier}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                1,
+                "{tier}"
+            );
+        }
+
+        for (tier, art) in run(Some(UPSTREAM_CALL)) {
+            let card = detect(&art);
+            let kinds = &card.per_boundary.get("http_outgoing").map(|b| &b.kinds);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{tier}: {kinds:?}");
+            assert_eq!(
+                card.summary.arg_divergent_serves, 1,
+                "{tier}: the reach still counts the serve it attributes to"
+            );
+            assert!(!card.verdict.pass, "{tier}");
+            assert!(
+                card.counter_disagreements().is_empty(),
+                "{tier}: {:?}",
+                card.counter_disagreements()
+            );
+
+            let rows = build_ledger(&art).expect("ledger builds");
+            let call: Vec<_> = rows
+                .iter()
+                .filter(|r| r.boundary == "http_outgoing")
+                .collect();
+            assert_eq!(call.len(), 1, "{tier}: one call, one row: {rows:?}");
+            assert_eq!(call[0].kind, "value_diverged", "{tier}: {rows:?}");
+            assert!(call[0].blocking, "{tier}");
+            assert_eq!(
+                call[0].source_event_global_sequence,
+                Some(UPSTREAM_CALL),
+                "{tier}"
+            );
+            assert_eq!(
+                call[0].recorded.as_ref().and_then(|side| side.args.clone()),
+                Some(recorded.clone()),
+                "{tier}: the recorded request is on the row"
+            );
+            assert_eq!(
+                call[0].observed.as_ref().and_then(|side| side.args.clone()),
+                Some(changed.clone()),
+                "{tier}: the candidate's request is on the row"
             );
         }
     }

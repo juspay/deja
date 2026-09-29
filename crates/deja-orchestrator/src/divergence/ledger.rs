@@ -907,6 +907,7 @@ mod tests {
             seed_gap: false,
             absorbed: false,
             arg_divergent: false,
+            arg_divergent_from: None,
         }
     }
 
