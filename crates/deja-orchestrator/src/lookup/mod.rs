@@ -1033,7 +1033,7 @@ mod tests {
         let rows = crate::divergence::build_ledger(&artifacts).expect("a ledger");
         let db = &card.per_boundary["db"];
         assert_eq!(db.matched, 0, "{db:?}");
-        assert_eq!(db.kinds.get("ArgsServedByAddress"), Some(&2), "{db:?}");
+        assert_eq!(db.kinds.get("ArgDivergentServe"), Some(&2), "{db:?}");
         assert_eq!(
             db.kinds.get("ArgsServedPairingDisagrees"),
             Some(&2),

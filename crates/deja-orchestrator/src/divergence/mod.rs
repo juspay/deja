@@ -5652,7 +5652,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .0 += 1;
             }
             if obs.arg_divergent {
-                stats.note_kind("ArgsServedByAddress");
+                stats.note_kind("ArgDivergentServe");
                 *args_served_seen
                     .entry((
                         call_site_label(obs),
@@ -5755,7 +5755,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // Counted as the value divergence it is, and named for how it
             // arose.
             stats.bump_kind("ValueDiverged");
-            stats.note_kind("ArgsServedByAddress");
+            stats.note_kind("ArgDivergentServe");
             stats.note_kind("ArgsServedUnpaired");
             *args_served_seen
                 .entry((
@@ -16855,7 +16855,7 @@ mod tests {
             card.per_boundary["db"]
         );
         assert_eq!(card.per_boundary["db"].matched, 0, "{name}");
-        assert_eq!(kind_count(&card, "db", "ArgsServedByAddress"), 1, "{name}");
+        assert_eq!(kind_count(&card, "db", "ArgDivergentServe"), 1, "{name}");
         assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
         assert!(!rows.is_empty(), "{name}");
         assert!(
