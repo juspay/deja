@@ -3243,21 +3243,61 @@ impl CallPairing {
         observed: &[ObservedCall],
         provenance: &CorrelationColumnProvenance,
     ) -> Self {
-        let resolved: HashSet<u64> = observed
+        // Resolved claims first: an exact hit IS its recorded event, and nothing
+        // below may take that event from it.
+        let mut claimed: HashSet<u64> = observed
             .iter()
             .filter(|call| call.resolved && !observed_is_ingress(call))
             .filter_map(|call| call.source_event_global_sequence)
             .collect();
+        // Then a call the candidate served args-free, which says which recorded
+        // event it was answered from, pairs with exactly that one. It is not
+        // searched for by shape: the request it changed may have gained or lost a
+        // field, and a shape that differs finds nothing — the call then read as
+        // an egress miss beside an omitted call. The event it names joins the
+        // claimed set, so the shape search below cannot hand it to a sibling.
+        //
+        // The claim holds only if the event is still free. An args-free serve
+        // counts every call at its address, so it can name an event that an exact
+        // hit also owns (the candidate sent one recorded call's args at another's
+        // position). The exact hit keeps it, and the served call falls back to
+        // the shape search like any other unresolved call. Same guard as the
+        // shape search: an uncorrelated call has no request to pair within.
+        let mut served: Vec<(usize, ArgsFreePairingResult)> = Vec::new();
+        for (index, call) in observed.iter().enumerate() {
+            if !call.arg_divergent || observed_is_ingress(call) || call.correlation_id.is_none() {
+                continue;
+            }
+            let Some(sequence) = call.served_event_global_sequence else {
+                continue;
+            };
+            if claimed.insert(sequence) {
+                served.push((
+                    index,
+                    ArgsFreePairingResult {
+                        sequence,
+                        order_mismatch: false,
+                    },
+                ));
+            }
+        }
+        let served_calls: HashSet<usize> = served.iter().map(|(index, _)| *index).collect();
         let mut pool = ArgsFreePairing::build(table, events, provenance);
         // An uncorrelated call has no correlation in its address to pair within.
-        let twins: Vec<(usize, ArgsFreePairingResult)> = observed
+        let mut twins: Vec<(usize, ArgsFreePairingResult)> = observed
             .iter()
             .enumerate()
-            .filter(|(_, call)| {
-                !call.resolved && !observed_is_ingress(call) && call.correlation_id.is_some()
+            .filter(|(index, call)| {
+                !call.resolved
+                    && !observed_is_ingress(call)
+                    && call.correlation_id.is_some()
+                    && !served_calls.contains(index)
             })
-            .filter_map(|(index, call)| pool.take_twin(call, &resolved).map(|twin| (index, twin)))
+            .filter_map(|(index, call)| pool.take_twin(call, &claimed).map(|twin| (index, twin)))
             .collect();
+        twins.extend(served);
+        pairing_balance(observed, &twins)
+            .expect("every recorded event is paired with at most one observed call");
 
         // Pairing is FIFO, so two requests sent in swapped order produce two
         // pairs: the one that jumped ahead is flagged out of order, and the one
@@ -3603,6 +3643,43 @@ impl ArgDivergenceReach {
     pub(crate) fn reached(&self, index: usize) -> Option<ReachedCall> {
         self.reached.get(&index).copied()
     }
+}
+
+/// One recorded event, one observed call: recomputed from what [`CallPairing`]
+/// produced rather than trusted from how it was built. `twins` is keyed by the
+/// observed call, so an event two calls claim is a state it can represent, and
+/// the scorer's consumed-set would absorb the duplicate silently — a spurious
+/// `matched` row with nothing to say it was one event twice. Checked here: no
+/// event pairs twice, none a resolved call owns, and no call pairs twice.
+fn pairing_balance(
+    observed: &[ObservedCall],
+    twins: &[(usize, ArgsFreePairingResult)],
+) -> Result<(), String> {
+    let owned: HashSet<u64> = observed
+        .iter()
+        .filter(|call| call.resolved && !observed_is_ingress(call))
+        .filter_map(|call| call.source_event_global_sequence)
+        .collect();
+    let mut paired: HashSet<u64> = HashSet::new();
+    let mut pairing_calls: HashSet<usize> = HashSet::new();
+    for (index, twin) in twins {
+        if !pairing_calls.insert(*index) {
+            return Err(format!("call {index} paired twice"));
+        }
+        if owned.contains(&twin.sequence) {
+            return Err(format!(
+                "call {index} paired with event {} that a resolved call owns",
+                twin.sequence
+            ));
+        }
+        if !paired.insert(twin.sequence) {
+            return Err(format!(
+                "call {index} paired with event {}, which another call already paired with",
+                twin.sequence
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn args_free_effective_values(
@@ -17464,6 +17541,307 @@ mod tests {
                  answers, and the viewer shows the wrong one: {row:?}"
             );
         }
+    }
+
+    /// An args-free serve whose request gained a field. Its args no longer have
+    /// the recording's shape, so the search for a twin by shape finds nothing:
+    /// without the event it was served, the call reads as an egress miss beside
+    /// an omitted call, and the reach attributed to it hangs off a row that is
+    /// not a divergence. Naming the served event pairs it with exactly that
+    /// one — one call whose input changed, blocking, both requests on its row.
+    #[test]
+    fn an_args_free_serve_whose_request_gained_a_field_pairs_with_the_event_it_was_served() {
+        let recorded = serde_json::json!({"body": {"card": {"number": "4111"}}});
+        let changed = serde_json::json!({
+            "body": {"card": {"number": "4111", "customer": {"merchant_customer_id": "cus_1"}}}
+        });
+        let run = |served_from: Option<u64>| {
+            let recorded = recorded.clone();
+            let changed = changed.clone();
+            in_both_tiers(move || {
+                // Exactly as `LookupTableHook::resolve` shapes an args-free serve.
+                let mut call = added_draw(
+                    "http_outgoing",
+                    "send_request",
+                    deja::SubstituteOutcome::Substituted,
+                );
+                call.args = changed.clone();
+                call.resolved = false;
+                call.arg_divergent = true;
+                call.served_event_global_sequence = served_from;
+                call.source_event_global_sequence = None;
+                one_span_recording(("http_outgoing", "send_request"), recorded.clone(), call)
+            })
+        };
+
+        // Vacuity guard: without the served event, shape pairing finds nothing, so
+        // the serve stays unpaired. It says so itself rather than scoring as a
+        // tolerated miss — an arg-divergent serve blocks ahead of those arms.
+        for (tier, art) in run(None) {
+            let card = detect(&art);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "ArgsServedUnpaired"),
+                1,
+                "{tier}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                1,
+                "{tier}"
+            );
+        }
+
+        for (tier, art) in run(Some(UPSTREAM_CALL)) {
+            let card = detect(&art);
+            let kinds = &card.per_boundary.get("http_outgoing").map(|b| &b.kinds);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{tier}: {kinds:?}");
+            assert_eq!(
+                card.summary.arg_divergent_serves, 1,
+                "{tier}: the reach still counts the serve it attributes to"
+            );
+            assert!(
+                card.counter_disagreements().is_empty(),
+                "{tier}: {:?}",
+                card.counter_disagreements()
+            );
+
+            let rows = build_ledger(&art).expect("ledger builds");
+            let call: Vec<_> = rows
+                .iter()
+                .filter(|r| r.boundary == "http_outgoing")
+                .collect();
+            assert_eq!(call.len(), 1, "{tier}: one call, one row: {rows:?}");
+            assert_eq!(call[0].kind, "value_diverged", "{tier}: {rows:?}");
+            assert!(call[0].blocking, "{tier}");
+            assert_eq!(
+                call[0].source_event_global_sequence,
+                Some(UPSTREAM_CALL),
+                "{tier}"
+            );
+            assert_eq!(
+                call[0].recorded.as_ref().and_then(|side| side.args.clone()),
+                Some(recorded.clone()),
+                "{tier}: the recorded request is on the row"
+            );
+            assert_eq!(
+                call[0].observed.as_ref().and_then(|side| side.args.clone()),
+                Some(changed.clone()),
+                "{tier}: the candidate's request is on the row"
+            );
+        }
+    }
+
+    const SERVED_CORR: &str = "served-claim";
+    const SERVED_SPAN: &str = "request>call_upstream";
+
+    /// An args-free serve observed at `SERVED_SPAN`, answered from `served_from`.
+    fn args_free_serve(args: serde_json::Value, served_from: u64) -> ObservedCall {
+        let mut call = unresolved_call(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            SERVED_SPAN,
+            args,
+        );
+        call.arg_divergent = true;
+        call.served_event_global_sequence = Some(served_from);
+        call
+    }
+
+    /// The rows the ledger writes against `sequence`.
+    fn rows_for(rows: &[CallRecord], sequence: u64) -> Vec<&CallRecord> {
+        rows.iter()
+            .filter(|row| row.source_event_global_sequence == Some(sequence))
+            .collect()
+    }
+
+    /// A served call names event 701, and a sibling in the same pool has
+    /// exactly 701's args, so the search by shape would hand 701 to the
+    /// sibling. The served call keeps the event it was answered from; the
+    /// sibling is left unpaired rather than read as a match. This re-pairs a
+    /// case that already paired, deliberately: before, the sibling took 701 by
+    /// shape and the served call went unpaired.
+    #[test]
+    fn a_served_event_is_not_handed_to_a_sibling_that_matches_its_shape() {
+        let recorded = serde_json::json!({"body": {"n": 1}});
+        let (entries, event) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            701,
+            SERVED_SPAN,
+            recorded.clone(),
+        );
+        // A second recorded call with the SERVED call's shape: the search by
+        // shape would pair the served call here too if it were let in.
+        let (other_entries, other) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            702,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 2, "extra": "y"}}),
+        );
+        let mut entries = entries;
+        entries.extend(other_entries);
+        let sibling = unresolved_call(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            SERVED_SPAN,
+            recorded.clone(),
+        );
+        let served = args_free_serve(serde_json::json!({"body": {"n": 1, "extra": "x"}}), 701);
+        let art = art_with_events(
+            entries,
+            // The sibling first, so the shape search would reach 701 before the
+            // served call's claim did if the claim did not hold it.
+            vec![sibling, served],
+            vec![http(SERVED_CORR, true, vec![])],
+            vec![event, other],
+        );
+
+        let card = detect(&art);
+        assert_eq!(
+            card.per_boundary["http_outgoing"].matched, 0,
+            "{:?}",
+            card.per_boundary
+        );
+        assert_eq!(card.summary.value_divergences, 1, "{:?}", card.per_boundary);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let on_701 = rows_for(&rows, 701);
+        assert_eq!(
+            on_701.len(),
+            1,
+            "event 701 is claimed exactly once: {rows:?}"
+        );
+        assert_eq!(on_701[0].kind, "value_diverged", "{rows:?}");
+        assert!(on_701[0].blocking);
+        assert_eq!(
+            on_701[0]
+                .observed
+                .as_ref()
+                .and_then(|side| side.args.clone()),
+            Some(serde_json::json!({"body": {"n": 1, "extra": "x"}})),
+            "and the call on it is the served one, not the sibling"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "the sibling is not read as a match of an event it was not answered from: {rows:?}"
+        );
+        let on_702 = rows_for(&rows, 702);
+        assert_eq!(on_702.len(), 1, "{rows:?}");
+        assert_eq!(
+            on_702[0].kind, "omitted",
+            "the served call pairs once, with the event it named: {rows:?}"
+        );
+    }
+
+    /// An exact hit owns its event before any serve is considered. Here the
+    /// candidate made 701's call exactly, and a second call, served args-free,
+    /// names 701 too: the args-free counter numbers every call at the address,
+    /// so it can land on an event an exact hit also took. The exact hit keeps
+    /// 701, and the served call falls back to the search by shape, where it
+    /// finds 702.
+    #[test]
+    fn a_served_claim_on_an_event_an_exact_hit_owns_falls_back_to_the_shape_search() {
+        let (mut entries, first) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            701,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 1}}),
+        );
+        let (second_entries, second) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            702,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 2}}),
+        );
+        entries.extend(second_entries);
+        let mut exact = obs("http_outgoing", Some(SERVED_CORR), true, Some(1), Some(701));
+        exact.method_name = "send_request".to_owned();
+        exact.span_path = Some(SERVED_SPAN.to_owned());
+        exact.args = serde_json::json!({"body": {"n": 1}});
+        let served = args_free_serve(serde_json::json!({"body": {"n": 3}}), 701);
+        let art = art_with_events(
+            entries,
+            vec![exact, served],
+            vec![http(SERVED_CORR, true, vec![])],
+            vec![first, second],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let on_701 = rows_for(&rows, 701);
+        assert_eq!(on_701.len(), 1, "701 is the exact hit's alone: {rows:?}");
+        assert_eq!(on_701[0].kind, "matched", "{rows:?}");
+        let on_702 = rows_for(&rows, 702);
+        assert_eq!(on_702.len(), 1, "{rows:?}");
+        assert_eq!(on_702[0].kind, "value_diverged", "{rows:?}");
+        assert_eq!(
+            on_702[0]
+                .observed
+                .as_ref()
+                .and_then(|side| side.args.clone()),
+            Some(serde_json::json!({"body": {"n": 3}})),
+            "the served call paired by shape once its named event was taken"
+        );
+        let card = detect(&art);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// A served call with no correlation is not paired by the event it names,
+    /// just as the search by shape does not pair one: pairing is always within
+    /// one request, and a call that carries none has no request to pair in.
+    #[test]
+    fn an_uncorrelated_serve_is_not_paired_by_the_event_it_names() {
+        let (entries, event) = addressed_event(
+            "http_outgoing",
+            None,
+            "send_request",
+            701,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 1}}),
+        );
+        let mut served = args_free_serve(serde_json::json!({"body": {"n": 1, "extra": "x"}}), 701);
+        served.correlation_id = None;
+        let art = art_with_events(entries, vec![served], Vec::new(), vec![event]);
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(
+            !rows.iter().any(|row| row.kind == "value_diverged"),
+            "an uncorrelated serve was paired: {rows:?}"
+        );
+        // The claim is that it is not PAIRED. It still blocks: an arg-divergent
+        // serve blocks whether or not a recorded call is left to pair it with.
+        assert_eq!(
+            kind_count(&detect(&art), "http_outgoing", "ArgsServedUnpaired"),
+            1,
+            "an uncorrelated serve must stay unpaired"
+        );
     }
 
     #[test]

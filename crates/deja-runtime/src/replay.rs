@@ -3170,10 +3170,10 @@ impl LookupTableHook {
             resolved_rank: hit.map(|(_, rank)| rank),
             // Left absent on an args-free serve. The sequence is a claim that
             // THIS call is the recorded event at it, and an args-free serve is
-            // not that claim: the arguments differ, and which recorded event the
-            // call belongs to is decided by the orchestrator's own args-free
-            // pairing, which stays the single place pairing is decided. The value
-            // served is still on the row, as `recorded_result`.
+            // not that claim: the arguments differ. Which event the value came
+            // from is a different fact, and it rides separately as
+            // `served_event_global_sequence`, so the orchestrator pairs the call
+            // with the event it was actually served rather than guessing it again.
             source_event_global_sequence: hit
                 .filter(|_| !arg_divergent)
                 .map(|(entry, _)| entry.source_event_global_sequence),
@@ -6322,7 +6322,13 @@ mod tests {
         );
         assert_eq!(
             call.source_event_global_sequence, None,
-            "an args-free serve claims no recorded twin; the orchestrator pairs it"
+            "an args-free serve does not claim to BE the recorded event"
+        );
+        assert_eq!(
+            call.served_event_global_sequence,
+            Some(0),
+            "but it names the event it was answered from, which is what the \
+             orchestrator pairs it with"
         );
         assert_eq!(
             call.recorded_result,
@@ -6358,6 +6364,10 @@ mod tests {
         assert!(call.resolved, "the arguments are the recording's");
         assert!(!call.arg_divergent);
         assert_eq!(call.source_event_global_sequence, Some(0));
+        assert_eq!(
+            call.served_event_global_sequence, None,
+            "an exact hit names its event as its own"
+        );
         assert_eq!(
             hook.lookup_tally(),
             LookupTally {
@@ -6758,6 +6768,14 @@ mod tests {
         assert!(
             calls.iter().all(|c| c.arg_divergent && !c.resolved),
             "every positional serve is marked and none of them resolved"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| c.served_event_global_sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)],
+            "each serve names the recording it was answered from, each exactly once"
         );
         assert_eq!(
             hook.lookup_tally(),
