@@ -5750,6 +5750,150 @@ s3_bucket = "ucs-deja"
         );
     }
 
+    /// Copy one object between stores, key for key, the way a bucket migration
+    /// does.
+    fn copy_key(from: &DynStore, to: &DynStore, src: &str, dst: &str) {
+        let bytes = block(async {
+            from.get(&object_store::path::Path::from(src))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        });
+        block(to.put(&object_store::path::Path::from(dst), bytes.into())).unwrap();
+    }
+
+    /// A seal written before seals were addressed carries an EMPTY id, so its
+    /// parts and index sit at the unscoped keys. The old-release fixture cannot
+    /// cover that shape — its id is content-addressed and non-empty — and it is
+    /// `correlations_key` that derives its key from the id rather than reading it
+    /// from the manifest, so a legacy seal is looked for at keys no seal written
+    /// today uses. Reachable as soon as an existing bucket's recordings move
+    /// under a directory.
+    #[test]
+    fn a_legacy_seal_with_no_id_reads_back_copied_under_a_prefix() {
+        // The keys a pre-addressed sealer actually wrote, spelled out. Deriving
+        // them would make the pins below tautological, and the reads cannot
+        // stand in for them: `Path::from` drops empty segments, so an empty seal
+        // id that began naming a directory reads back identically. S3
+        // distinguishes those keys; `object_store` does not.
+        const LEGACY_PARTS: [&str; 1] = ["sessions/v1/s1/data/part-00000.ndjsonl.zst"];
+        const LEGACY_INDEX: &str = "sessions/v1/s1/index/correlations.ndjson.zst";
+        const LEGACY_MANIFEST: &str = "sessions/v1/s1/manifest.json";
+
+        let old = memory();
+        let addressed = land_and_seal_at(&old, "");
+        assert!(
+            !addressed.seal_id.is_empty(),
+            "the sealer addresses its seals"
+        );
+        assert_eq!(addressed.data_parts.len(), LEGACY_PARTS.len());
+        // The pins hold the key SPELLING; the reads below hold any change that
+        // yields a real segment. Both halves are needed — neither alone covers
+        // an empty seal id ceasing to mean "no seal directory".
+        assert_eq!(layout::part_key("s1", "", 0), LEGACY_PARTS[0]);
+        assert_eq!(layout::correlations_key("s1", ""), LEGACY_INDEX);
+        assert_eq!(layout::manifest_key("s1"), LEGACY_MANIFEST);
+        let lines = block(session_lines(&old, &addressed)).unwrap();
+        let rows = block(correlation_index_of(&old, &addressed))
+            .unwrap()
+            .expect("the seal just written has its index")
+            .len();
+        // Pinned, not just carried: the reads below compare against these, so
+        // without a literal a reader returning nothing satisfies both sides.
+        assert_eq!(lines.len(), 2, "the fixture lands two envelopes");
+        assert_eq!(rows, 2, "both envelopes are indexed");
+        let session = addressed.session_id.clone();
+
+        // Re-lay the same session as an older sealer wrote it: every object at
+        // its unscoped key, and a manifest naming those keys with no id.
+        let legacy_store = memory();
+        let legacy = SessionManifest {
+            seal_id: String::new(),
+            data_parts: addressed
+                .data_parts
+                .iter()
+                .enumerate()
+                .map(|(n, part)| DataPart {
+                    key: LEGACY_PARTS[n].to_owned(),
+                    ..part.clone()
+                })
+                .collect(),
+            ..addressed.clone()
+        };
+        for (n, part) in addressed.data_parts.iter().enumerate() {
+            copy_key(&old, &legacy_store, &part.key, LEGACY_PARTS[n]);
+        }
+        copy_key(
+            &old,
+            &legacy_store,
+            &layout::correlations_key(&session, &addressed.seal_id),
+            LEGACY_INDEX,
+        );
+        // A real legacy manifest OMITS the key rather than carrying an empty one,
+        // and `seal_id` is `#[serde(default)]` so that parses. Write it absent,
+        // so removing that default fails here instead of only in production.
+        let mut doc = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            doc.as_object_mut().unwrap().remove("seal_id").is_some(),
+            "the field has to be there to be removed"
+        );
+        block(legacy_store.put(
+            &object_store::path::Path::from(LEGACY_MANIFEST),
+            serde_json::to_vec(&doc).unwrap().into(),
+        ))
+        .unwrap();
+
+        // Control: the same legacy layout read at the bucket root. Without it a
+        // failure below cannot tell a broken prefix from legacy keys never
+        // resolving at all.
+        assert_eq!(
+            block(session_lines(&legacy_store, &legacy)).unwrap(),
+            lines,
+            "a legacy manifest resolves its parts at the bucket root"
+        );
+        assert_eq!(
+            block(correlation_index_of(&legacy_store, &legacy))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(rows),
+            "an empty seal id resolves its index at the bucket root"
+        );
+
+        // The migration itself: a plain copy of every key under one directory.
+        let migrated = memory();
+        for key in bucket_keys(&legacy_store) {
+            copy_key(
+                &legacy_store,
+                &migrated,
+                &key,
+                &format!("hyperswitch/{key}"),
+            );
+        }
+
+        let scoped = cfg_at("hyperswitch").scope_store(migrated.clone());
+        let read = block(manifest_of(&scoped, &session))
+            .unwrap()
+            .expect("the copy is sealed");
+        assert!(
+            read.seal_id.is_empty(),
+            "the copy is still the legacy shape, not a re-seal"
+        );
+        assert_eq!(
+            block(session_lines(&scoped, &read)).unwrap(),
+            lines,
+            "part keys named by a legacy manifest resolve under the prefix"
+        );
+        assert_eq!(
+            block(correlation_index_of(&scoped, &read))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(rows),
+            "the index key derived from an EMPTY seal id resolves under the prefix"
+        );
+    }
+
     // -- region -------------------------------------------------------------
 
     /// An environment holding exactly `vars`.
