@@ -5988,6 +5988,66 @@ fn resolve_recording_from_source(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
+
+    /// Scoring waits for the observed stream to stop growing: a stream still
+    /// being written is read once it has been quiet for the window, and one
+    /// that never stops is named when the bound is reached.
+    #[test]
+    fn scoring_waits_for_the_observed_stream_to_settle() {
+        use super::{wait_for_stream_to_settle, StreamSettled};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(40));
+                    writeln!(file, "b").unwrap();
+                }
+            })
+        };
+        let started = Instant::now();
+        let settled =
+            wait_for_stream_to_settle(&path, Duration::from_millis(150), Duration::from_secs(5));
+        writer.join().unwrap();
+        assert_eq!(settled, StreamSettled::Quiet);
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    writeln!(file, "c").unwrap();
+                }
+            })
+        };
+        let settled = wait_for_stream_to_settle(
+            &path,
+            Duration::from_millis(150),
+            Duration::from_millis(600),
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert_eq!(settled, StreamSettled::StillGrowing);
+
+        let missing = dir.path().join("absent.jsonl");
+        assert_eq!(
+            wait_for_stream_to_settle(&missing, Duration::from_millis(50), Duration::from_secs(1)),
+            StreamSettled::Absent
+        );
+    }
     // -- a skipped db seed says which kind of nothing it carried -------------
 
     fn seed_target(key: &str) -> super::DbSeedTarget {
