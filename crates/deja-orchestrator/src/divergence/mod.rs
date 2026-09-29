@@ -12390,6 +12390,109 @@ mod tests {
         );
     }
 
+    /// A served call whose arguments a concurrent write raced is not demoted to
+    /// an inconclusive race: it ran on a value recorded for other arguments,
+    /// and blocks as it did before the fallback.
+    #[test]
+    fn a_served_call_is_not_demoted_to_an_inconclusive_race() {
+        register_test_schema_identity();
+        let corr = "race-served";
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
+        let raced_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let read_event = with_event_lineage(
+            db_read_ev(
+                corr,
+                "payment_attempt",
+                300,
+                recorded_row.clone(),
+                100,
+                300,
+                "root",
+                0,
+            ),
+            "root",
+            None,
+            "root",
+            0,
+        );
+        let conflicting_write = with_event_lineage(
+            declared_db_update_ev(corr, "payment_attempt", 301, raced_row.clone(), 150, 250),
+            "detached-writer",
+            Some("root"),
+            "detached-writer-bucket",
+            1,
+        );
+        let read_observation = exec_obs(
+            "db",
+            Some(corr),
+            true,
+            Some(300),
+            Some(envelope(recorded_row)),
+            envelope(raced_row.clone()),
+        );
+        let mut served = with_span(
+            exec_obs_method(
+                "storage",
+                Some(corr),
+                "write_branch",
+                false,
+                None,
+                None,
+                serde_json::json!({"branch": "pending"}),
+            ),
+            "root>flow>write_branch",
+        );
+        served.args = serde_json::json!({"source": envelope(raced_row)});
+        served.arg_divergent = true;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let mut recorded_downstream = omitted_ev(302, "storage", Some(corr));
+        recorded_downstream.method_name = "write_branch".to_owned();
+        recorded_downstream.args = serde_json::json!({
+            "source": envelope(serde_json::json!({"attempt_id": "pay_1", "status": "pending"}))
+        })
+        .into();
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "storage",
+                    "write_branch",
+                    302,
+                    serde_json::json!({"branch": "pending"}),
+                ),
+                span_entry(Some(corr), 302, "root>flow>write_branch"),
+            ],
+            vec![read_observation, served],
+            vec![http(corr, true, vec![])],
+            vec![read_event, conflicting_write, recorded_downstream],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "storage", "InconclusiveRace"),
+            0,
+            "{:?}",
+            card.per_boundary
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "ValueDiverged"),
+            1,
+            "{:?}",
+            card.per_boundary
+        );
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let storage: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| row.boundary == "storage")
+            .collect();
+        assert!(!storage.is_empty(), "{rows:?}");
+        assert!(
+            storage
+                .iter()
+                .all(|row| row.kind == "value_diverged" && row.blocking),
+            "{storage:?}"
+        );
+    }
+
     #[test]
     fn race_attributed_http_body_diff_is_inconclusive_not_blocking() {
         register_test_schema_identity();
@@ -16923,6 +17026,68 @@ mod tests {
                 "{boundary}"
             );
         }
+    }
+
+    /// A served write whose rows differ only where the schema filled a column
+    /// is not demoted to a schema default: it ran on a value recorded for other
+    /// arguments, and blocks as it did before the fallback.
+    #[test]
+    fn a_served_call_is_not_demoted_to_a_schema_default() {
+        let corr = "c1";
+        let ev = db_insert_ev(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+        );
+        let mut served = db_exec_obs_with_sql(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+            payment_intent_row(serde_json::json!("default")),
+        );
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>insert");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_insert",
+                    7,
+                    envelope(payment_intent_row(serde_json::Value::Null)),
+                ),
+                span_entry(Some(corr), 7, "request>insert"),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![ev],
+        );
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "value_diverged" && row.blocking),
+            "{rows:?}"
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "SchemaDefaultDivergence"),
+            0,
+            "{:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "{:?}",
+            card.per_boundary["db"]
+        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
     }
 
     /// The replay-local id rule does not forgive a served call's arguments.
