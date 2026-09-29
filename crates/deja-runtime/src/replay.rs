@@ -6366,6 +6366,37 @@ mod tests {
     }
 
     #[test]
+    fn an_argful_pure_boundary_is_never_served_another_arguments_value() {
+        // A clock, an identifier or a source of randomness can take arguments
+        // (a prefix, a namespace, a key) and is still an entropy seam: a call
+        // with other arguments is a different value, not the same address with
+        // its arguments moved. Serving it the recording's value would hand a
+        // generated identifier to a call that asked for a different one, and
+        // the scorer excuses a pure-tier miss the request survived.
+        for boundary in ["time", "id", "id_generation", "uuid", "rng"] {
+            let mut event = storage_event(
+                0,
+                "generate",
+                serde_json::json!({ "prefix": "pay" }),
+                "recorded",
+            );
+            event.boundary = boundary.to_owned();
+            let (hook, handle) = hook_over(render_table(&[event]));
+            let served = hook.try_replay_with_context(ReplayLookup {
+                boundary,
+                trait_name: "PaymentStore",
+                method_name: "find_payment",
+                args: &serde_json::json!({ "prefix": "ref" }),
+                callsite_identity: Some(&explicit_identity("generate")),
+                caller_location: None,
+            });
+            assert_eq!(served, None, "{boundary}");
+            assert!(!last_call(&handle).arg_divergent, "{boundary}");
+            assert_eq!(hook.lookup_tally().arg_free, 0, "{boundary}");
+        }
+    }
+
+    #[test]
     fn a_second_declared_site_for_one_operation_is_served_at_the_floor() {
         // Stated because it is a widening, not because it is desirable. The
         // args-free probe walks the same rank ladder the exact lookup does, and
