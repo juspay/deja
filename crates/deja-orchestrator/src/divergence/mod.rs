@@ -2621,6 +2621,51 @@ fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> V
     )
 }
 
+/// How many times each lookup number appears among `calls`.
+fn lookup_ordinals_seen<'a>(calls: impl Iterator<Item = &'a ObservedCall>) -> HashMap<u64, u64> {
+    let mut seen = HashMap::new();
+    for ordinal in calls.filter_map(|call| call.lookup_ordinal) {
+        *seen.entry(ordinal).or_insert(0) += 1;
+    }
+    seen
+}
+
+/// The numbers from one to the highest seen that no call carries.
+fn missing_ordinals(seen: &HashMap<u64, u64>) -> u64 {
+    let highest = seen.keys().copied().max().unwrap_or_default();
+    (1..=highest)
+        .filter(|ordinal| !seen.contains_key(ordinal))
+        .count() as u64
+}
+
+/// The lookups the observed stream at `path` has not closed: numbered, and
+/// neither finished nor cancelled. Counted exactly as the scorer counts a gap,
+/// finished and cancelled alike, so waiting for it to reach zero waits for what
+/// the scorer will check. Reads only each observation's number, so checking a
+/// large stream costs a pass over its lines, not a decode of every call. `None`
+/// when the stream cannot be read, which is never taken for closed.
+pub(crate) fn missing_lookup_ordinals(path: &std::path::Path) -> Option<u64> {
+    use std::io::BufRead;
+    #[derive(serde::Deserialize)]
+    struct Numbered {
+        record_kind: String,
+        #[serde(default)]
+        lookup_ordinal: Option<u64>,
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut seen: HashMap<u64, u64> = HashMap::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.ok()?;
+        let Ok(record) = serde_json::from_str::<Numbered>(&line) else {
+            continue;
+        };
+        if let (true, Some(ordinal)) = (record.record_kind == "observed", record.lookup_ordinal) {
+            *seen.entry(ordinal).or_insert(0) += 1;
+        }
+    }
+    Some(missing_ordinals(&seen))
+}
+
 /// The candidate's lookups, counted from the ordinals its observations carry,
 /// with each way the count fails to close named as a reason. `None`, with a
 /// warning, when the candidate numbered none.
@@ -2653,17 +2698,10 @@ fn account_lookups(
         }
         return None;
     }
-    let mut seen: HashMap<u64, u64> = HashMap::with_capacity(numbered.len());
-    for call in &numbered {
-        *seen
-            .entry(call.lookup_ordinal.unwrap_or_default())
-            .or_insert(0) += 1;
-    }
+    let seen = lookup_ordinals_seen(numbered.iter().copied());
     let highest = seen.keys().copied().max().unwrap_or_default();
     let repeated = seen.values().filter(|count| **count > 1).count();
-    let missing = (1..=highest)
-        .filter(|ordinal| !seen.contains_key(ordinal))
-        .count();
+    let missing = missing_ordinals(&seen);
     if repeated > 0 {
         reasons.push(format!(
             "{repeated} lookup number(s) repeat: the candidate started over during the run, so \
@@ -19163,6 +19201,54 @@ mod tests {
             card.warnings.iter().any(|w| w.contains("cancelled")),
             "{:?}",
             card.warnings
+        );
+    }
+
+    /// The lookups a stream has not closed, counted as the scorer counts them:
+    /// a cancelled lookup closes its number, a gap does not.
+    #[test]
+    fn missing_lookups_are_counted_off_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let numbered = |ordinal: u64, cancelled: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.lookup_ordinal = Some(ordinal);
+            call.cancelled = cancelled;
+            serde_json::to_string(&deja::DejaRecord::Observed(Box::new(call))).unwrap()
+        };
+        let stream = |lines: Vec<String>| {
+            let path = dir.path().join(format!("observed-{}.jsonl", lines.len()));
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let gap = stream(vec![numbered(1, false), numbered(3, false)]);
+        assert_eq!(missing_lookup_ordinals(&gap), Some(1));
+        let closed = stream(vec![
+            numbered(1, false),
+            numbered(2, true),
+            numbered(3, false),
+        ]);
+        assert_eq!(missing_lookup_ordinals(&closed), Some(0));
+        // The scorer's own count agrees, over the same stream.
+        let mut warnings = Vec::new();
+        let loaded = load_replay_stream(&gap, &mut warnings);
+        assert_eq!(
+            missing_ordinals(&lookup_ordinals_seen(
+                loaded.observed.iter().chain(&loaded.cancelled)
+            )),
+            1
+        );
+        // A stream that cannot be read is not taken for closed.
+        let torn = dir.path().join("torn.jsonl");
+        let mut bytes = [numbered(1, false), numbered(3, false)]
+            .join("\n")
+            .into_bytes();
+        bytes.extend_from_slice(b"\n\xff\xfe");
+        std::fs::write(&torn, bytes).unwrap();
+        assert_eq!(missing_lookup_ordinals(&torn), None);
+        assert_eq!(
+            missing_lookup_ordinals(&dir.path().join("gone.jsonl")),
+            None
         );
     }
 
