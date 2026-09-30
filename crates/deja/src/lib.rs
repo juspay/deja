@@ -32,7 +32,7 @@ pub use deja_context::{
 pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_execute_mode};
 pub use deja_runtime::replay::{
     build_seed_plan, build_write_target_tables, AmbientTemplate, NotPreconditionReason,
-    ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
+    PresencePredicate, ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
 };
 /// Re-export lookup-table replay primitives (hybrid architecture: in-process
 /// lookup with per-site ReplayStrategy selecting Execute vs Substitute).

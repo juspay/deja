@@ -472,13 +472,65 @@ fn debug_bind_values(raw: &str) -> Option<Vec<serde_json::Value>> {
         .collect()
 }
 
-/// The single row a db statement names, from its recorded SQL and debug binds.
-fn statement_row_key(table: &str, sql: &str) -> Option<String> {
-    let at = sql.rfind(" -- binds: ")?;
-    let (query, raw) = sql.split_at(at);
-    let binds = debug_bind_values(raw.trim_start_matches(" -- binds: "))?;
-    let mut keys = row_keys_for_binds(table, query, &binds);
+/// The single row a db statement names, from its recorded SQL and binds.
+fn statement_row_key(table: &str, args: &serde_json::Value) -> Option<String> {
+    let (query, binds) = recorded_statement(args).ok()?;
+    let mut keys = row_keys_for_binds(table, &query, &binds);
     (keys.len() == 1).then(|| keys.remove(0).to_wire())
+}
+
+/// A recorded db statement's query text and its binds by position — the one
+/// place either is read. Current tapes carry the binds structured under
+/// `inputs.binds` (`"$n"` → value) and bare SQL; older ones append diesel's
+/// debug list to the SQL as ` -- binds: [...]`. Structured binds win when both
+/// are present. Every bind must be a JSON scalar, or the statement is refused.
+fn recorded_statement(
+    args: &serde_json::Value,
+) -> Result<(String, Vec<serde_json::Value>), String> {
+    const SUFFIX: &str = " -- binds: ";
+    let sql = args
+        .get("sql")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the recorded call carries no statement text")?;
+    let (query, suffix) = match sql.rfind(SUFFIX) {
+        Some(at) => (&sql[..at], Some(&sql[at + SUFFIX.len()..])),
+        None => (sql, None),
+    };
+    if let Some(binds) = args.get("inputs").and_then(|inputs| inputs.get("binds")) {
+        return Ok((query.to_owned(), structured_binds(binds)?));
+    }
+    let raw = suffix.ok_or("the recorded statement carries no bind list")?;
+    let binds =
+        debug_bind_values(raw).ok_or("the statement's bind list is not a list of scalars")?;
+    Ok((query.to_owned(), binds))
+}
+
+/// `inputs.binds` as a positional list: `"$1"` is index 0. A position the map
+/// skips reads as NULL, which no equality accepts.
+fn structured_binds(binds: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let map = binds
+        .as_object()
+        .ok_or("the recorded binds are not keyed by position")?;
+    let mut by_position = BTreeMap::new();
+    for (name, value) in map {
+        let position = name
+            .strip_prefix('$')
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .filter(|position| *position > 0)
+            .ok_or_else(|| format!("the recorded bind {name} is not a $n position"))?;
+        if value.is_object() || value.is_array() {
+            return Err(format!("the recorded bind {name} is not a scalar"));
+        }
+        by_position.insert(position, value.clone());
+    }
+    let len = by_position.keys().next_back().copied().unwrap_or(0);
+    Ok((1..=len)
+        .map(|position| {
+            by_position
+                .remove(&position)
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect())
 }
 
 /// Whether a db event's recorded result asserts presence without carrying the
@@ -526,7 +578,7 @@ fn presence_row_key(event: &BoundaryEvent) -> Option<String> {
     }
     let args = event.args.to_value();
     let table = db_table_from_event_args(&args)?;
-    statement_row_key(table, args.get("sql")?.as_str()?)
+    statement_row_key(table, &args)
 }
 
 /// The latest image of a row recorded before `before`, and the sequence it came
@@ -542,6 +594,332 @@ fn latest_image_before(
         .filter(|(seq, _)| *seq < before)
         .max_by_key(|(seq, _)| *seq)
         .cloned()
+}
+
+/// What a presence-only db event's statement requires of the row it removed.
+fn statement_presence_predicate(event: &BoundaryEvent) -> PresencePredicate {
+    let args = event.args.to_value();
+    let Some(table) = db_table_from_event_args(&args) else {
+        return PresencePredicate::Unsatisfiable("the recorded call names no table".to_owned());
+    };
+    match statement_equalities(table, &args) {
+        Ok(columns) => PresencePredicate::Equalities {
+            table: table.to_owned(),
+            columns,
+        },
+        Err(why) => PresencePredicate::Unsatisfiable(why),
+    }
+}
+
+/// One lexical unit of a recorded statement, as far as reading its `WHERE`
+/// needs. Anything unrecognised is `Other`, and no term accepts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlToken {
+    /// An identifier; a quoted one never reads as a keyword.
+    Ident {
+        name: String,
+        quoted: bool,
+    },
+    Dot,
+    Eq,
+    LParen,
+    RParen,
+    /// `$n`, 1-based.
+    Param(usize),
+    Other(String),
+}
+
+impl SqlToken {
+    fn is_keyword(&self, keyword: &str) -> bool {
+        matches!(self, Self::Ident { name, quoted: false } if name.eq_ignore_ascii_case(keyword))
+    }
+
+    fn spelled(&self) -> String {
+        match self {
+            Self::Ident { name, .. } => name.clone(),
+            Self::Dot => ".".to_owned(),
+            Self::Eq => "=".to_owned(),
+            Self::LParen => "(".to_owned(),
+            Self::RParen => ")".to_owned(),
+            Self::Param(n) => format!("${n}"),
+            Self::Other(text) => text.clone(),
+        }
+    }
+}
+
+fn sql_tokens(query: &str) -> Vec<SqlToken> {
+    let chars: Vec<char> = query.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '"' {
+            let mut name = String::new();
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        name.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            tokens.push(SqlToken::Ident { name, quoted: true });
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            tokens.push(SqlToken::Ident {
+                name: chars[start..i].iter().collect(),
+                quoted: false,
+            });
+        } else if c == '$' && chars.get(i + 1).is_some_and(char::is_ascii_digit) {
+            let start = i + 1;
+            i += 1;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits: String = chars[start..i].iter().collect();
+            tokens.push(match digits.parse() {
+                Ok(n) => SqlToken::Param(n),
+                Err(_) => SqlToken::Other(format!("${digits}")),
+            });
+        } else {
+            tokens.push(match c {
+                '.' => SqlToken::Dot,
+                '=' => SqlToken::Eq,
+                '(' => SqlToken::LParen,
+                ')' => SqlToken::RParen,
+                other => SqlToken::Other(other.to_string()),
+            });
+            i += 1;
+        }
+    }
+    tokens
+}
+
+/// Reads `DELETE FROM <table> WHERE <column = $n [AND ...]>` from a recorded
+/// statement, and nothing looser.
+struct EqualityReader<'a> {
+    tokens: Vec<SqlToken>,
+    at: usize,
+    table: &'a str,
+    binds: &'a [serde_json::Value],
+    columns: Vec<(String, serde_json::Value)>,
+}
+
+impl EqualityReader<'_> {
+    fn peek(&self) -> Option<&SqlToken> {
+        self.tokens.get(self.at)
+    }
+
+    fn near(&self) -> String {
+        self.peek().map_or_else(
+            || "the end of the statement".to_owned(),
+            |token| format!("`{}`", token.spelled()),
+        )
+    }
+
+    fn eat(&mut self, token: &SqlToken) -> bool {
+        let found = self.peek() == Some(token);
+        if found {
+            self.at += 1;
+        }
+        found
+    }
+
+    fn keyword(&mut self, keyword: &str) -> Result<(), String> {
+        if self.peek().is_some_and(|token| token.is_keyword(keyword)) {
+            self.at += 1;
+            Ok(())
+        } else {
+            Err(format!(
+                "the statement is not a single-table DELETE with a WHERE: expected {keyword} at {}",
+                self.near()
+            ))
+        }
+    }
+
+    /// `name` or `qualifier.name`.
+    fn qualified_name(&mut self) -> Option<(Option<String>, String)> {
+        let Some(SqlToken::Ident { name: first, .. }) = self.peek().cloned() else {
+            return None;
+        };
+        self.at += 1;
+        if !self.eat(&SqlToken::Dot) {
+            return Some((None, first));
+        }
+        match self.peek().cloned() {
+            Some(SqlToken::Ident { name, .. }) => {
+                self.at += 1;
+                Some((Some(first), name))
+            }
+            _ => None,
+        }
+    }
+
+    fn statement(&mut self) -> Result<(), String> {
+        self.keyword("DELETE")?;
+        self.keyword("FROM")?;
+        match self.qualified_name() {
+            // A schema-qualified table is not resolved through the
+            // correlation's search_path at replay, so a row planted in the
+            // seeded schema is not the row it would delete. The recording
+            // never names the seeded schema, so every qualifier is refused.
+            Some((Some(schema), name)) => {
+                return Err(format!(
+                    "the statement deletes from {schema}.{name}, a schema-qualified table the \
+                     seeded schema does not stand in for"
+                ));
+            }
+            Some((None, name)) if name == self.table => {}
+            Some((None, name)) => {
+                return Err(format!(
+                    "the statement deletes from {name}, not the recorded table {}",
+                    self.table
+                ));
+            }
+            None => return Err("the statement names no table to delete from".to_owned()),
+        }
+        self.keyword("WHERE")?;
+        self.conjunction()?;
+        match self.peek() {
+            None => Ok(()),
+            // The caller reads the deleted row's columns back, and a
+            // synthesized row's neutral values would reach it as if recorded.
+            Some(token) if token.is_keyword("RETURNING") => Err(
+                "the statement returns the deleted row, whose unbound columns a synthesized row \
+                 would invent"
+                    .to_owned(),
+            ),
+            Some(_) => Err(self.not_a_conjunction()),
+        }
+    }
+
+    fn not_a_conjunction(&self) -> String {
+        format!(
+            "the WHERE is not a conjunction of column = bind terms: it continues at {}",
+            self.near()
+        )
+    }
+
+    fn not_an_equality(&self) -> String {
+        format!(
+            "the WHERE holds a term that is not column = bind, near {}",
+            self.near()
+        )
+    }
+
+    fn conjunction(&mut self) -> Result<(), String> {
+        self.term()?;
+        while self.peek().is_some_and(|token| token.is_keyword("AND")) {
+            self.at += 1;
+            self.term()?;
+        }
+        Ok(())
+    }
+
+    fn term(&mut self) -> Result<(), String> {
+        if self.eat(&SqlToken::LParen) {
+            self.conjunction()?;
+            return if self.eat(&SqlToken::RParen) {
+                Ok(())
+            } else {
+                Err(self.not_a_conjunction())
+            };
+        }
+        // `column = $n`, or the same written the other way round.
+        let (column, position) = if let Some(SqlToken::Param(position)) = self.peek().cloned() {
+            self.at += 1;
+            if !self.eat(&SqlToken::Eq) {
+                return Err(self.not_an_equality());
+            }
+            let column = self.column().ok_or_else(|| self.not_an_equality())?;
+            (column, position)
+        } else {
+            let column = self.column().ok_or_else(|| self.not_an_equality())?;
+            if !self.eat(&SqlToken::Eq) {
+                return Err(self.not_an_equality());
+            }
+            match self.peek().cloned() {
+                Some(SqlToken::Param(position)) => {
+                    self.at += 1;
+                    (column, position)
+                }
+                _ => return Err(self.not_an_equality()),
+            }
+        };
+        let value = position
+            .checked_sub(1)
+            .and_then(|index| self.binds.get(index))
+            .ok_or_else(|| {
+                format!("column {column} is compared to ${position}, which has no bind")
+            })?;
+        if value.is_null() {
+            return Err(format!(
+                "column {column} is compared to a NULL bind, which no row satisfies"
+            ));
+        }
+        match self.columns.iter().find(|(name, _)| *name == column) {
+            Some((_, bound)) if bound == value => {}
+            Some(_) => {
+                return Err(format!(
+                    "column {column} is bound to two different values, which no row satisfies"
+                ));
+            }
+            None => self.columns.push((column, value.clone())),
+        }
+        Ok(())
+    }
+
+    /// A column of the deleted table, bare or qualified by that table.
+    fn column(&mut self) -> Option<String> {
+        let start = self.at;
+        let column = match self.qualified_name() {
+            Some((Some(qualifier), name)) if qualifier == self.table => Some(name),
+            Some((None, name))
+                if !["AND", "OR", "NOT", "NULL", "IS", "IN", "TRUE", "FALSE"]
+                    .iter()
+                    .any(|keyword| self.tokens[start].is_keyword(keyword)) =>
+            {
+                Some(name)
+            }
+            _ => None,
+        };
+        if column.is_none() {
+            self.at = start;
+        }
+        column
+    }
+}
+
+/// The `column = value` pairs a recorded single-table DELETE's `WHERE` binds,
+/// read from its own SQL text and recorded binds. Refused, with the reason, unless
+/// every term is an equality to a non-NULL bind joined by `AND`: a row holding
+/// the pairs then satisfies the whole `WHERE`, which is the only claim a
+/// planted row may make.
+fn statement_equalities(
+    table: &str,
+    args: &serde_json::Value,
+) -> Result<Vec<(String, serde_json::Value)>, String> {
+    let (query, binds) = recorded_statement(args)?;
+    let mut reader = EqualityReader {
+        tokens: sql_tokens(&query),
+        at: 0,
+        table,
+        binds: &binds,
+        columns: Vec::new(),
+    };
+    reader.statement()?;
+    Ok(reader.columns)
 }
 
 /// Extract all row-exact DB state keys carried by a structured DB `Ok` value or
@@ -3586,6 +3964,30 @@ pub struct SeedEntry {
     /// misses from exactly this).
     #[serde(default)]
     pub source_sequence: u64,
+    /// For a db entry whose recorded result asserts presence without carrying
+    /// the row (a delete's `Ok(true)`) and for which no image of the row was
+    /// available, what the recorded statement says a planted row must hold —
+    /// or why it says nothing a row can satisfy. The seeder synthesizes a row
+    /// from it; `None` everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<PresencePredicate>,
+}
+
+/// What a presence-only statement's `WHERE` requires of the row it removed,
+/// read from the statement's own recorded SQL and binds and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresencePredicate {
+    /// Every term of the `WHERE` is `column = bind`, joined by `AND`: a row
+    /// holding these values satisfies it. Columns in statement order, each
+    /// once.
+    Equalities {
+        table: String,
+        columns: Vec<(String, serde_json::Value)>,
+    },
+    /// The statement does not reduce to equality binds a row can satisfy, and
+    /// why.
+    Unsatisfiable(String),
 }
 
 /// Where a [`SeedEntry`] came from.
@@ -4328,6 +4730,13 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                             None => (None, SeedOrigin::Recording),
                         },
                     };
+                // No image anywhere in scope: what the statement itself says the
+                // row held is all the seeder has. Borrowing stays first.
+                let presence = if image.is_none() && db_result_asserts_presence(event) {
+                    Some(statement_presence_predicate(event))
+                } else {
+                    None
+                };
                 plan.upsert(SeedEntry {
                     boundary: event.boundary.clone(),
                     key: canonical_key.clone(),
@@ -4340,6 +4749,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                     method: Some(event.method_name.clone()),
                     origin,
                     source_sequence: event.global_sequence,
+                    presence,
                 });
             }
         }
@@ -4383,6 +4793,7 @@ pub fn build_seed_plan(events: &[BoundaryEvent], correlation_id: Option<&str>) -
                         method: Some(event.method_name.clone()),
                         origin: SeedOrigin::Recording,
                         source_sequence: event.global_sequence,
+                        presence: None,
                     });
                 }
             }
@@ -4516,6 +4927,7 @@ impl AmbientTemplate {
             method: None,
             origin: SeedOrigin::Ambient,
             source_sequence: 0,
+            presence: None,
         });
     }
 
@@ -10595,6 +11007,10 @@ redis\tcurrency\tusd
                 let entry = planted(&events);
                 assert_eq!(entry.image, None, "{result}");
                 assert_eq!(entry.origin, SeedOrigin::Recording, "{result}");
+                assert_eq!(
+                    entry.presence, None,
+                    "only a recorded presence is synthesized either: {result}"
+                );
             }
         }
 
@@ -10633,18 +11049,26 @@ redis\tcurrency\tusd
             assert_eq!(
                 entry.origin,
                 SeedOrigin::Recording,
-                "still skipped as RecordedPresence"
+                "nothing borrowed: the seeder synthesizes from the statement instead"
+            );
+            assert!(
+                matches!(entry.presence, Some(PresencePredicate::Equalities { .. })),
+                "{:?}",
+                entry.presence
             );
         }
 
         #[test]
         fn a_delete_that_names_no_single_whole_row_borrows_nothing() {
             register_test_schema_identity();
+            let sql = |sql: &str| serde_json::json!({ "sql": sql });
             // A composite key bound by only one of its columns.
             assert_eq!(
                 statement_row_key(
                     "incremental_authorization",
-                    r#"DELETE FROM "incremental_authorization" WHERE ("incremental_authorization"."authorization_id" = $1) -- binds: ["auth_1"]"#,
+                    &sql(
+                        r#"DELETE FROM "incremental_authorization" WHERE ("incremental_authorization"."authorization_id" = $1) -- binds: ["auth_1"]"#
+                    )
                 ),
                 None
             );
@@ -10652,20 +11076,22 @@ redis\tcurrency\tusd
             assert_eq!(
                 statement_row_key(
                     "business_profile",
-                    r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) OR ("business_profile"."profile_id" = $2)) -- binds: [ProfileId("pro_1"), ProfileId("pro_2")]"#,
+                    &sql(
+                        r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) OR ("business_profile"."profile_id" = $2)) -- binds: [ProfileId("pro_1"), ProfileId("pro_2")]"#
+                    )
                 ),
                 None
             );
             assert_eq!(
                 statement_row_key(
                     "business_profile",
-                    PROFILE_DELETE.split(" -- binds").next().unwrap()
+                    &sql(PROFILE_DELETE.split(" -- binds").next().unwrap())
                 ),
                 None,
                 "no binds, no key"
             );
             assert_eq!(
-                statement_row_key("business_profile", PROFILE_DELETE),
+                statement_row_key("business_profile", &sql(PROFILE_DELETE)),
                 Some(profile_row_key("pro_1"))
             );
         }
@@ -10732,6 +11158,7 @@ redis\tcurrency\tusd
                 method: None,
                 origin,
                 source_sequence: 1,
+                presence: None,
             };
             let borrowed = SeedOrigin::Borrowed { global_sequence: 3 };
             for later in [SeedOrigin::Ambient, SeedOrigin::Recording] {
@@ -10752,6 +11179,274 @@ redis\tcurrency\tusd
                 borrowed,
                 "a borrow replaces ambient"
             );
+        }
+
+        /// With no image of the row anywhere in scope, the entry carries what
+        /// the statement's own WHERE binds: every equality, in statement order.
+        #[test]
+        fn with_nothing_to_borrow_the_statement_names_the_row() {
+            let events = [delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT)];
+            let entry = planted(&events);
+            assert_eq!(entry.image, None);
+            assert_eq!(entry.origin, SeedOrigin::Recording);
+            assert_eq!(
+                entry.presence,
+                Some(PresencePredicate::Equalities {
+                    table: "business_profile".to_owned(),
+                    columns: vec![
+                        ("profile_id".to_owned(), serde_json::json!("pro_1")),
+                        ("merchant_id".to_owned(), serde_json::json!("m1")),
+                    ],
+                }),
+                "both equality binds, so a planted row satisfies the whole WHERE"
+            );
+        }
+
+        /// Route D stays first: a borrowable image means no synthesis.
+        #[test]
+        fn a_borrowable_image_is_never_synthesized_over() {
+            let events = [
+                imaged(
+                    1,
+                    "a",
+                    row_image("business_profile", "profile_id", "pro_1", "v1"),
+                ),
+                delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT),
+            ];
+            let entry = planted(&events);
+            assert_eq!(entry.origin, SeedOrigin::Borrowed { global_sequence: 1 });
+            assert_eq!(entry.presence, None);
+        }
+
+        /// A WHERE no row can be built to satisfy is named, not guessed at.
+        #[test]
+        fn an_unsatisfiable_where_says_why() {
+            let or = r#"DELETE FROM "business_profile" WHERE (("business_profile"."profile_id" = $1) OR ("business_profile"."profile_id" = $2)) -- binds: [ProfileId("pro_1"), ProfileId("pro_2")]"#;
+            let events = [delete(5, "b", "business_profile", or, PRESENT)];
+            match planted(&events).presence {
+                Some(PresencePredicate::Unsatisfiable(why)) => {
+                    assert!(why.contains("`OR`"), "{why}");
+                }
+                other => panic!("expected an unsatisfiable predicate, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn statement_equalities_accept_only_a_conjunction_of_bound_equalities() {
+            let args = |sql: &str| serde_json::json!({ "sql": sql });
+            let ok = |table: &str, sql: &str| statement_equalities(table, &args(sql)).unwrap();
+            let refused =
+                |table: &str, sql: &str| statement_equalities(table, &args(sql)).unwrap_err();
+            assert_eq!(
+                ok(
+                    "t",
+                    r#"DELETE FROM "t" WHERE ("t"."a" = $1) -- binds: ["x"]"#
+                ),
+                vec![("a".to_owned(), serde_json::json!("x"))]
+            );
+            assert_eq!(
+                ok(
+                    "t",
+                    r#"delete from t where $2 = b and (a = $1) -- binds: [1, true]"#
+                ),
+                vec![
+                    ("b".to_owned(), serde_json::json!(true)),
+                    ("a".to_owned(), serde_json::json!(1)),
+                ],
+                "reversed operands, bare names, lower case"
+            );
+            assert_eq!(
+                ok(
+                    "t",
+                    r#"DELETE FROM t WHERE a = $1 AND a = $2 -- binds: ["x", "x"]"#
+                ),
+                vec![("a".to_owned(), serde_json::json!("x"))],
+                "one column bound twice to one value"
+            );
+            for (sql, cause) in [
+                (
+                    r#"DELETE FROM t WHERE a = $1 RETURNING * -- binds: ["x"]"#,
+                    "returns the deleted row",
+                ),
+                (
+                    r#"DELETE FROM public.t WHERE a = $1 -- binds: ["x"]"#,
+                    "deletes from public.t, a schema-qualified table",
+                ),
+                (
+                    r#"DELETE FROM "other"."t" WHERE a = $1 -- binds: ["x"]"#,
+                    "deletes from other.t, a schema-qualified table",
+                ),
+                (r#"DELETE FROM t WHERE a = $1"#, "no bind list"),
+                (
+                    r#"DELETE FROM t WHERE a = $1 -- binds: [Status::Active]"#,
+                    "not a list of scalars",
+                ),
+                (r#"UPDATE t SET a = $1 -- binds: ["x"]"#, "expected DELETE"),
+                (
+                    r#"DELETE FROM u WHERE a = $1 -- binds: ["x"]"#,
+                    "deletes from u",
+                ),
+                (r#"DELETE FROM t -- binds: []"#, "expected WHERE"),
+                (
+                    r#"DELETE FROM t WHERE a IN ($1) -- binds: ["x"]"#,
+                    "near `IN`",
+                ),
+                (r#"DELETE FROM t WHERE a IS NULL -- binds: []"#, "near `IS`"),
+                (r#"DELETE FROM t WHERE a < $1 -- binds: [1]"#, "near `<`"),
+                (r#"DELETE FROM t WHERE a = 'x' -- binds: []"#, "near `'`"),
+                (
+                    r#"DELETE FROM t WHERE u.a = $1 -- binds: ["x"]"#,
+                    "not column = bind",
+                ),
+                (
+                    r#"DELETE FROM t WHERE a = $2 -- binds: ["x"]"#,
+                    "$2, which has no bind",
+                ),
+                (
+                    r#"DELETE FROM t WHERE a = $1 -- binds: [null]"#,
+                    "NULL bind",
+                ),
+                (
+                    r#"DELETE FROM t WHERE a = $1 AND a = $2 -- binds: ["x", "y"]"#,
+                    "two different values",
+                ),
+                (
+                    r#"DELETE FROM t WHERE a = $1 OR b = $2 -- binds: ["x", "y"]"#,
+                    "continues at `OR`",
+                ),
+                (
+                    r#"DELETE FROM t WHERE NOT a = $1 -- binds: ["x"]"#,
+                    "near `NOT`",
+                ),
+                (
+                    r#"DELETE FROM t USING u WHERE a = $1 -- binds: ["x"]"#,
+                    "expected WHERE",
+                ),
+            ] {
+                let why = refused("t", sql);
+                assert!(why.contains(cause), "{sql}: {why}");
+            }
+        }
+
+        /// The args a current tape records for the delete, verbatim: bare SQL,
+        /// binds structured under `inputs.binds`.
+        const RECORDED_KEY_STORE_DELETE: &str = r#"{"inputs": {"binds": {"$1": "cyMerchant_39c7be0f"}, "predicate": {"type": "diesel::expression::grouped::Grouped<diesel::expression::operators::Eq<diesel_models::schema::merchant_key_store::columns::merchant_id, diesel::expression::bound::Bound<diesel::sql_types::Text, common_utils::id_type::merchant::MerchantId>>>"}}, "operation": "generic_delete", "sql": "DELETE FROM \"merchant_key_store\" WHERE (\"merchant_key_store\".\"merchant_id\" = $1)", "table": "merchant_key_store"}"#;
+
+        fn structured_delete(args: serde_json::Value) -> SeedEntry {
+            let key = "deja:test:structured-delete";
+            let event = state_event(
+                5,
+                Some("b"),
+                "db",
+                "generic_delete",
+                args,
+                serde_json::from_str(PRESENT).unwrap(),
+                &[key],
+                &[key],
+                false,
+            );
+            build_seed_plan(&[event], Some("b"))
+                .iter()
+                .find(|entry| entry.boundary == "db")
+                .expect("the delete is planned")
+                .clone()
+        }
+
+        #[test]
+        fn a_current_tapes_structured_binds_name_the_row() {
+            let entry = structured_delete(serde_json::from_str(RECORDED_KEY_STORE_DELETE).unwrap());
+            assert_eq!(
+                entry.presence,
+                Some(PresencePredicate::Equalities {
+                    table: "merchant_key_store".to_owned(),
+                    columns: vec![(
+                        "merchant_id".to_owned(),
+                        serde_json::json!("cyMerchant_39c7be0f")
+                    )],
+                })
+            );
+        }
+
+        #[test]
+        fn two_structured_binds_both_reach_the_row() {
+            let entry = structured_delete(serde_json::json!({
+                "table": "business_profile",
+                "sql": PROFILE_DELETE.split(" -- binds").next().unwrap(),
+                "inputs": {"binds": {"$2": "m1", "$1": "pro_1"}},
+            }));
+            assert_eq!(
+                entry.presence,
+                Some(PresencePredicate::Equalities {
+                    table: "business_profile".to_owned(),
+                    columns: vec![
+                        ("profile_id".to_owned(), serde_json::json!("pro_1")),
+                        ("merchant_id".to_owned(), serde_json::json!("m1")),
+                    ],
+                })
+            );
+        }
+
+        #[test]
+        fn structured_binds_keep_scalars_and_refuse_the_rest_by_name() {
+            let sql = r#"DELETE FROM "t" WHERE ("t"."a" = $1) AND ("t"."b" = $2)"#;
+            assert_eq!(
+                statement_equalities(
+                    "t",
+                    &serde_json::json!({"sql": sql, "inputs": {"binds": {"$1": 7, "$2": true}}})
+                ),
+                Ok(vec![
+                    ("a".to_owned(), serde_json::json!(7)),
+                    ("b".to_owned(), serde_json::json!(true)),
+                ])
+            );
+            for (binds, cause) in [
+                (
+                    serde_json::json!({"$1": ["x"], "$2": 1}),
+                    "bind $1 is not a scalar",
+                ),
+                (
+                    serde_json::json!({"$1": {"k": 1}, "$2": 1}),
+                    "bind $1 is not a scalar",
+                ),
+                (serde_json::json!({"a": 1}), "bind a is not a $n position"),
+                (serde_json::json!(["x"]), "not keyed by position"),
+                (serde_json::json!({"$1": "x"}), "$2, which has no bind"),
+                (
+                    serde_json::json!({"$2": "x", "$3": 1}),
+                    "column a is compared to a NULL bind",
+                ),
+            ] {
+                let why = statement_equalities(
+                    "t",
+                    &serde_json::json!({"sql": sql, "inputs": {"binds": binds}}),
+                )
+                .unwrap_err();
+                assert!(why.contains(cause), "{binds}: {why}");
+            }
+        }
+
+        /// Route D reads the same binds: a structured tape names its row too.
+        #[test]
+        fn a_structured_delete_names_its_row_for_borrowing() {
+            register_test_schema_identity();
+            let args = serde_json::json!({
+                "table": "business_profile",
+                "sql": PROFILE_DELETE.split(" -- binds").next().unwrap(),
+                "inputs": {"binds": {"$1": "pro_1", "$2": "m1"}},
+            });
+            assert_eq!(
+                statement_row_key("business_profile", &args),
+                Some(profile_row_key("pro_1"))
+            );
+        }
+
+        /// The same recording and scope plan the same entry, byte for byte.
+        #[test]
+        fn a_synthesized_presence_plans_deterministically() {
+            let events = [delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT)];
+            let first = serde_json::to_vec(&planted(&events)).unwrap();
+            let second = serde_json::to_vec(&planted(&events)).unwrap();
+            assert_eq!(first, second);
         }
 
         #[test]
