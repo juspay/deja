@@ -19144,6 +19144,33 @@ mod tests {
         );
     }
 
+    /// The lookups a stream has not closed, counted as the scorer counts them:
+    /// a cancelled lookup closes its number, a gap does not.
+    #[test]
+    fn missing_lookups_are_counted_off_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let numbered = |ordinal: u64, cancelled: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.lookup_ordinal = Some(ordinal);
+            call.cancelled = cancelled;
+            serde_json::to_string(&deja::DejaRecord::Observed(Box::new(call))).unwrap()
+        };
+        let stream = |lines: Vec<String>| {
+            let path = dir.path().join(format!("observed-{}.jsonl", lines.len()));
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let gap = stream(vec![numbered(1, false), numbered(3, false)]);
+        assert_eq!(missing_lookup_ordinals(&gap), 1);
+        let closed = stream(vec![
+            numbered(1, false),
+            numbered(2, true),
+            numbered(3, false),
+        ]);
+        assert_eq!(missing_lookup_ordinals(&closed), 0);
+    }
+
     /// The ordinal survives the stream: written by the candidate's file sink,
     /// read back by the scorer's loader.
     #[test]

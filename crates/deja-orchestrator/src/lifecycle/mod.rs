@@ -6596,6 +6596,7 @@ mod tests {
         // Margins far wider than a busy machine's scheduling noise: a writer
         // that pauses 10ms between lines is growing, a 500ms silence is quiet.
         let quiet = Duration::from_millis(500);
+        let closed = || 0;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.jsonl");
         std::fs::write(&path, "a\n").unwrap();
@@ -6610,8 +6611,8 @@ mod tests {
                 }
             })
         };
-        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30));
-        assert_eq!(settled, StreamSettled::Quiet);
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30), closed);
+        assert_eq!(settled, StreamSettled::Closed);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap().lines().count(),
             6,
@@ -6631,15 +6632,57 @@ mod tests {
                 }
             })
         };
-        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500));
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500), closed);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         writer.join().unwrap();
         assert_eq!(settled, StreamSettled::StillGrowing);
 
         let missing = dir.path().join("absent.jsonl");
         assert_eq!(
-            wait_for_stream_to_settle(&missing, quiet, Duration::from_secs(1)),
+            wait_for_stream_to_settle(&missing, quiet, Duration::from_secs(1), closed),
             StreamSettled::Absent
+        );
+    }
+
+    /// A quiet stream is not a finished one while a lookup it numbered has not
+    /// written its observation: scoring waits for the lookups to close, and
+    /// names how many never did.
+    #[test]
+    fn scoring_waits_for_the_lookups_to_close_not_only_for_quiet() {
+        use super::{wait_for_stream_to_settle, StreamSettled};
+        use std::time::Duration;
+        let quiet = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        std::fs::write(&path, "1\n3\n").unwrap();
+        // Lookup 2 is still running: the stream is quiet with a number missing.
+        let missing = |path: &std::path::Path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            u64::from(!text.lines().any(|line| line == "2"))
+        };
+        let late = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                std::thread::sleep(Duration::from_millis(1200));
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                writeln!(file, "2").unwrap();
+            })
+        };
+        let settled =
+            wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30), || missing(&path));
+        late.join().unwrap();
+        assert_eq!(
+            settled,
+            StreamSettled::Closed,
+            "waited past the first quiet for the late lookup"
+        );
+
+        let open = dir.path().join("open.jsonl");
+        std::fs::write(&open, "1\n3\n").unwrap();
+        assert_eq!(
+            wait_for_stream_to_settle(&open, quiet, Duration::from_millis(1200), || missing(&open)),
+            StreamSettled::Open { missing: 1 }
         );
     }
     // -- a skipped db seed says which kind of nothing it carried -------------
