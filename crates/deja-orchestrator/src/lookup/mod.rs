@@ -1038,10 +1038,8 @@ mod tests {
         // No disagreement is possible on a successful claim: the pairing now takes
         // the event the candidate named, so its pick and the twin are the same one.
         // The check still guards the refused-claim path, where an exact hit owns the
-        // event and the shape search picks another.
-        // NOT COVERED HERE: that refused-claim path has no test. Neutralising the
-        // disagreement check leaves this suite green, so the kind, its counter and
-        // its warning could stop appearing unnoticed.
+        // event and the shape search picks another; that path is asserted in
+        // `a_served_claim_on_an_event_an_exact_hit_owns_falls_back_to_the_shape_search`.
         assert_eq!(db.kinds.get("ArgsServedPairingDisagrees"), None, "{db:?}");
         assert!(!card.verdict.pass, "{}", card.verdict.reason);
         let served: Vec<&crate::divergence::CallRecord> =

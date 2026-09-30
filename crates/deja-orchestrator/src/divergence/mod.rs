@@ -17930,11 +17930,33 @@ mod tests {
             Some(serde_json::json!({"body": {"n": 3}})),
             "the served call paired by shape once its named event was taken"
         );
+        // The one path where the candidate's pick and the pairing can differ:
+        // the call ran on 701's value and is judged against 702. The row shows
+        // both, and the scorecard says they differ.
+        assert_eq!(
+            on_702[0].served_event_global_sequence,
+            Some(701),
+            "the row names the recording the call ran on: {rows:?}"
+        );
         let card = detect(&art);
         assert!(
             card.counter_disagreements().is_empty(),
             "{:?}",
             card.counter_disagreements()
+        );
+        assert_eq!(
+            kind_count(&card, "http_outgoing", "ArgsServedPairingDisagrees"),
+            1,
+            "{:?}",
+            card.per_boundary["http_outgoing"]
+        );
+        assert!(
+            card.warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("first serving recorded event 701 and pairing with 702")),
+            "{:?}",
+            card.warnings
         );
     }
 
