@@ -11328,7 +11328,6 @@ redis\tcurrency\tusd
             }
         }
 
-        /// The same recording and scope plan the same entry, byte for byte.
         /// The args a current tape records for the delete, verbatim: bare SQL,
         /// binds structured under `inputs.binds`.
         const RECORDED_KEY_STORE_DELETE: &str = r#"{"inputs": {"binds": {"$1": "cyMerchant_39c7be0f"}, "predicate": {"type": "diesel::expression::grouped::Grouped<diesel::expression::operators::Eq<diesel_models::schema::merchant_key_store::columns::merchant_id, diesel::expression::bound::Bound<diesel::sql_types::Text, common_utils::id_type::merchant::MerchantId>>>"}}, "operation": "generic_delete", "sql": "DELETE FROM \"merchant_key_store\" WHERE (\"merchant_key_store\".\"merchant_id\" = $1)", "table": "merchant_key_store"}"#;
@@ -11441,6 +11440,7 @@ redis\tcurrency\tusd
             );
         }
 
+        /// The same recording and scope plan the same entry, byte for byte.
         #[test]
         fn a_synthesized_presence_plans_deterministically() {
             let events = [delete(5, "b", "business_profile", PROFILE_DELETE, PRESENT)];
