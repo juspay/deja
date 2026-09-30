@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use deja_kernel::HttpDiff;
+use deja_kernel::{HttpDiff, JsonFieldDiff};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -39,7 +39,10 @@ use super::ledger::CallRecord;
 ///    under.
 /// 4: a JSON document carried inside a string is canonicalised as structure,
 ///    so the sending process's map order inside it is not behaviour.
-pub const CANON_VERSION: u32 = 4;
+/// 5: a whole-body difference the kernel could only report as raw bytes is
+///    hashed by the candidate's decoded body, so the map order serialised
+///    into those bytes is not behaviour either.
+pub const CANON_VERSION: u32 = 5;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -241,6 +244,20 @@ pub fn hash_of(v: &serde_json::Value) -> String {
     hex::encode(&digest[..8])
 }
 
+/// What a body difference is judged by. A difference at `$` is the whole body,
+/// and is judged by the candidate's decoded body the diff carries. For JSON
+/// that is the value already; the gRPC kernel, when one side will not decode (a
+/// recorded error that carried no payload), reports it as `raw_b64` bytes
+/// instead, which keep the order each map was serialised in and so differ
+/// between two runs of one build. A candidate that did not decode is judged by
+/// its bytes, and a localised difference by its own value.
+fn body_diff_value<'a>(diff: &'a HttpDiff, body: &'a JsonFieldDiff) -> &'a serde_json::Value {
+    match (body.json_path.as_str(), diff.candidate_body.as_ref()) {
+        ("$", Some(decoded)) => decoded,
+        _ => &body.candidate,
+    }
+}
+
 /// The lane a call ran in: the host's most specific label as the connector
 /// (`api-m.sandbox.paypal.com` → `paypal`), and the flow span on its path.
 pub fn lane_of(row: &CallRecord) -> Option<Lane> {
@@ -394,7 +411,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                     json_path: p.json_path.clone(),
                 },
                 value: Value::Diverged {
-                    hash: hash_of(&p.candidate),
+                    hash: hash_of(body_diff_value(d, p)),
                 },
                 blocking: true,
             });
@@ -604,6 +621,93 @@ mod tests {
         );
         let not_json = serde_json::json!({"value": "{not json"});
         assert_eq!(hash_of(&not_json), hash_of(&not_json.clone()));
+    }
+
+    /// A recorded error carried no payload, so the gRPC kernel reported the
+    /// whole body at `$` as raw bytes. Two runs of one build serialise the same
+    /// response with their maps in different orders: the bytes differ, the
+    /// decoded bodies do not. The tree judges the decoded body.
+    #[test]
+    fn a_raw_whole_body_difference_is_judged_by_the_decoded_body() {
+        let diff = |raw: &str, decoded: serde_json::Value| HttpDiff {
+            correlation_id: "c1".into(),
+            request_sequence: 0,
+            request_path: "/types.PaymentService/Authorize".into(),
+            status_baseline: 500,
+            status_candidate: 200,
+            status_match: false,
+            body_diff: vec![JsonFieldDiff {
+                json_path: "$".into(),
+                baseline: serde_json::json!({"raw_b64": ""}),
+                candidate: serde_json::json!({"raw_b64": raw}),
+            }],
+            baseline_body: None,
+            candidate_body: Some(decoded),
+            transport_error: None,
+        };
+        let body_hash = |d: HttpDiff| {
+            build("run", &[], &[d])
+                .entries
+                .into_iter()
+                .find_map(|e| match (e.address, e.value) {
+                    (Address::Body { .. }, Value::Diverged { hash }) => Some(hash),
+                    _ => None,
+                })
+                .expect("a body entry")
+        };
+        let main = serde_json::json!({
+            "status": "FAILURE",
+            "responseHeaders": {"content-length": "5462", "date": "d", "connection": "keep-alive"},
+            "rawConnectorRequest": {"value": r#"{"url":"https://x/v1","headers":{"Accept-Language":"en","Authorization":"t"}}"#}
+        });
+        let pr = serde_json::json!({
+            "status": "FAILURE",
+            "responseHeaders": {"connection": "keep-alive", "content-length": "5462", "date": "d"},
+            "rawConnectorRequest": {"value": r#"{"url":"https://x/v1","headers":{"Authorization":"t","Accept-Language":"en"}}"#}
+        });
+        assert_eq!(
+            body_hash(diff("AAAA", main.clone())),
+            body_hash(diff("BBBB", pr)),
+            "the same response in another map order is not behaviour"
+        );
+
+        let mut changed = main.clone();
+        changed["status"] = serde_json::json!("CHARGED");
+        assert_ne!(
+            body_hash(diff("AAAA", main.clone())),
+            body_hash(diff("AAAA", changed)),
+            "a value in the decoded body is behaviour"
+        );
+
+        let mut undecoded = diff("AAAA", main);
+        undecoded.candidate_body = None;
+        let mut other_bytes = undecoded.clone();
+        other_bytes.body_diff[0].candidate = serde_json::json!({"raw_b64": "BBBB"});
+        assert_ne!(
+            body_hash(undecoded),
+            body_hash(other_bytes),
+            "with nothing decoded, the bytes are all there is to judge"
+        );
+
+        // A difference the kernel could localise keeps its own value: a field
+        // is judged by that field, not by the rest of the body around it.
+        let field = |rest: &str| {
+            let mut d = diff(
+                "AAAA",
+                serde_json::json!({"status": "CHARGED", "rest": rest}),
+            );
+            d.body_diff[0] = JsonFieldDiff {
+                json_path: "$.status".into(),
+                baseline: serde_json::json!("FAILURE"),
+                candidate: serde_json::json!("CHARGED"),
+            };
+            d
+        };
+        assert_eq!(
+            body_hash(field("one")),
+            body_hash(field("two")),
+            "a field-level difference is judged by the field alone"
+        );
     }
 
     /// A call a seed gap cut off never ran: it is absent in the tree, as any
