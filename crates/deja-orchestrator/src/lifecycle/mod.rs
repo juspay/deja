@@ -6047,32 +6047,41 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
-/// Whether the observed stream stopped growing before scoring read it.
+/// How the observed stream stood when scoring read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamSettled {
-    /// Quiet for the whole window.
-    Quiet,
+    /// Quiet, with every lookup it numbered written.
+    Closed,
+    /// Quiet at the bound, with lookups it numbered still unwritten.
+    Open {
+        /// How many; `None` when the stream could not be read to count them.
+        missing: Option<u64>,
+    },
     /// Still being written when the bound was reached.
     StillGrowing,
     /// No stream to wait for.
     Absent,
 }
 
-/// How long the observed stream must stay unchanged before it is read.
+/// How long the observed stream must stay unchanged before it is checked.
 const OBSERVED_STREAM_QUIET: Duration = Duration::from_secs(2);
-/// How long scoring waits for that before it reads the stream anyway.
+/// How long scoring waits for the stream to close before it reads it anyway.
 const OBSERVED_STREAM_SETTLE_BOUND: Duration = Duration::from_secs(60);
 
-/// Wait until `path` has not grown for `quiet`, or until `bound` has passed.
+/// Wait until the stream at `path` is quiet and `missing` reports every lookup
+/// it numbered written, or until `bound` has passed.
 ///
 /// The candidate outlives the driver: the last response can return while a
 /// lookup it started, or one a background task started, is still running. A
 /// lookup takes its number as it arrives and writes its observation when it
-/// finishes, so a stream read before it settles shows that lookup as missing.
+/// finishes, so a stream that is merely quiet can still be missing one. Each
+/// time the stream goes quiet it is checked, and a stream quiet but open waits
+/// for the next write before it is checked again.
 pub(crate) fn wait_for_stream_to_settle(
     path: &std::path::Path,
     quiet: Duration,
     bound: Duration,
+    missing: impl Fn() -> Option<u64>,
 ) -> StreamSettled {
     let size = || std::fs::metadata(path).ok().map(|meta| meta.len());
     let Some(mut last) = size() else {
@@ -6080,17 +6089,25 @@ pub(crate) fn wait_for_stream_to_settle(
     };
     let deadline = Instant::now() + bound;
     let mut unchanged_since = Instant::now();
+    let mut checked: Option<(u64, Option<u64>)> = None;
     loop {
         std::thread::sleep((quiet / 5).max(Duration::from_millis(10)));
         let now = size().unwrap_or(last);
         if now != last {
             last = now;
             unchanged_since = Instant::now();
-        } else if unchanged_since.elapsed() >= quiet {
-            return StreamSettled::Quiet;
+        } else if unchanged_since.elapsed() >= quiet && checked.is_none_or(|(at, _)| at != last) {
+            let open = missing();
+            if open == Some(0) {
+                return StreamSettled::Closed;
+            }
+            checked = Some((last, open));
         }
         if Instant::now() >= deadline {
-            return StreamSettled::StillGrowing;
+            return match checked {
+                Some((at, missing)) if at == last => StreamSettled::Open { missing },
+                _ => StreamSettled::StillGrowing,
+            };
         }
     }
 }
@@ -6099,15 +6116,29 @@ pub(crate) fn wait_for_stream_to_settle(
 /// in the run log how that went.
 fn settle_observed_stream(root: &HarnessRoot, ctx: &StoreCtx, run_id: &str) {
     let started = Instant::now();
+    let path = root.observed_path(run_id);
     let settled = wait_for_stream_to_settle(
-        &root.observed_path(run_id),
+        &path,
         OBSERVED_STREAM_QUIET,
         OBSERVED_STREAM_SETTLE_BOUND,
+        || crate::divergence::missing_lookup_ordinals(&path),
     );
     let line = match settled {
-        StreamSettled::Quiet => format!(
-            "settled after {:.1}s; scoring reads it whole",
+        StreamSettled::Closed => format!(
+            "closed after {:.1}s: every lookup it numbered is written",
             started.elapsed().as_secs_f64()
+        ),
+        StreamSettled::Open {
+            missing: Some(missing),
+        } => format!(
+            "quiet but open after {}s: {missing} lookup(s) it numbered never wrote an \
+             observation, and read as missing",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
+        ),
+        StreamSettled::Open { missing: None } => format!(
+            "quiet after {}s but could not be read to count its lookups; scoring reads it \
+             as it is",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
         ),
         StreamSettled::StillGrowing => format!(
             "still growing after {}s; lookups still running will read as missing",
@@ -6596,45 +6627,28 @@ mod tests {
         // Margins far wider than a busy machine's scheduling noise: a writer
         // that pauses 10ms between lines is growing, a 500ms silence is quiet.
         let quiet = Duration::from_millis(500);
-        let closed = || 0;
+        let closed = || Some(0);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("observed.jsonl");
         std::fs::write(&path, "a\n").unwrap();
-        let writer = {
-            let path = path.clone();
-            std::thread::spawn(move || {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-                for _ in 0..5 {
-                    std::thread::sleep(Duration::from_millis(10));
-                    writeln!(file, "b").unwrap();
-                }
-            })
-        };
+        // A quiet stream with nothing missing is read once the window passes.
+        // Waiting past a quiet stream that is still open is the next test's,
+        // where it does not hang on a thread's scheduling.
         let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30), closed);
         assert_eq!(settled, StreamSettled::Closed);
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap().lines().count(),
-            6,
-            "settled only after the last write"
-        );
-        writer.join().unwrap();
 
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let writer = {
-            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
-            std::thread::spawn(move || {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(10));
-                    writeln!(file, "c").unwrap();
-                }
-            })
+        // A stream that grows every time it is checked is still growing at the
+        // bound, with no thread's timing involved: the check itself writes.
+        let growing = || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "c").unwrap();
+            Some(1)
         };
-        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500), closed);
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        writer.join().unwrap();
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500), growing);
         assert_eq!(settled, StreamSettled::StillGrowing);
 
         let missing = dir.path().join("absent.jsonl");
@@ -6658,7 +6672,7 @@ mod tests {
         // Lookup 2 is still running: the stream is quiet with a number missing.
         let missing = |path: &std::path::Path| {
             let text = std::fs::read_to_string(path).unwrap();
-            u64::from(!text.lines().any(|line| line == "2"))
+            Some(u64::from(!text.lines().any(|line| line == "2")))
         };
         let late = {
             let path = path.clone();
@@ -6682,7 +6696,7 @@ mod tests {
         std::fs::write(&open, "1\n3\n").unwrap();
         assert_eq!(
             wait_for_stream_to_settle(&open, quiet, Duration::from_millis(1200), || missing(&open)),
-            StreamSettled::Open { missing: 1 }
+            StreamSettled::Open { missing: Some(1) }
         );
     }
     // -- a skipped db seed says which kind of nothing it carried -------------
