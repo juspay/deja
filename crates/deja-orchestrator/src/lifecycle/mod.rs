@@ -7486,9 +7486,11 @@ mod tests {
         psql("DROP SCHEMA deja_synth CASCADE; DROP TABLE public.widget; DROP TYPE widget_status;");
     }
 
-    /// Every field of the catalog query's row, decoded by position. The query
-    /// only runs against a live database, so this is the CI check that the
-    /// decode and the query's column order agree.
+    /// Every field of the catalog query's row, decoded by position, from a canned
+    /// line. This pins what each index MEANS, not that the query selects them in
+    /// that order — the line here is written in the decoder's own order, so a
+    /// reordered SELECT leaves it green. The order is pinned separately, by
+    /// `the_catalog_query_selects_the_columns_the_decode_reads`.
     #[test]
     fn the_catalog_decode_reads_every_field_by_position() {
         let decode = |line: &str| super::decode_catalog_row(line).expect("nine fields");
@@ -7572,6 +7574,71 @@ mod tests {
         assert_eq!(
             super::decode_catalog_row("widget\tid\t23\tint4\tf\tt\tN\tinteger"),
             None
+        );
+    }
+
+    /// The expressions `DB_CATALOG_SQL` selects, in order, with runs of
+    /// whitespace collapsed. Commas inside parentheses do not split, so
+    /// `format_type(a, b)` and the `COALESCE` subquery stay whole.
+    fn catalog_select_list() -> Vec<String> {
+        let sql = super::DB_CATALOG_SQL;
+        let open = sql.find("SELECT ").expect("the query selects") + "SELECT ".len();
+        let close = sql
+            .find(" FROM pg_catalog.pg_attribute")
+            .expect("the query reads pg_attribute");
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        for ch in sql[open..close].chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    out.push(std::mem::take(&mut current));
+                }
+                _ => current.push(ch),
+            }
+        }
+        out.push(current);
+        out.iter()
+            .map(|e| e.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// `decode_catalog_row` reads the catalog row BY POSITION, and until this
+    /// test nothing pinned the query's column order: swapping two expressions in
+    /// the SELECT left the whole workspace green, because the canned-line test
+    /// writes its line in the decoder's order and the only other assertion is
+    /// that the text contains `format_type(...)` somewhere. A swap re-types every
+    /// column silently — category becomes the first letter of a type name, so
+    /// `neutral_value` refuses, and every presence-only delete goes back to
+    /// `unsynthesizable_presence` with the feature inert.
+    #[test]
+    fn the_catalog_query_selects_the_columns_the_decode_reads() {
+        assert_eq!(
+            catalog_select_list(),
+            vec![
+                "cls.relname".to_owned(),
+                "attr.attname".to_owned(),
+                "typ.oid::int4".to_owned(),
+                "typ.typname".to_owned(),
+                "(NOT attr.attnotnull)".to_owned(),
+                "(attr.atthasdef OR attr.attidentity <> '')".to_owned(),
+                "typ.typcategory".to_owned(),
+                "pg_catalog.format_type(attr.atttypid, attr.atttypmod)".to_owned(),
+                "COALESCE((SELECT e.enumlabel FROM pg_catalog.pg_enum e WHERE \
+                 e.enumtypid = typ.oid ORDER BY e.enumsortorder LIMIT 1), '')"
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ],
+            "the SELECT list moved; decode_catalog_row reads these by index"
         );
     }
 
