@@ -183,6 +183,9 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
     let rank: FindingRank | null = null;
     if (c.kind === "value_diverged") rank = c.origin ? "origin" : "consequence";
     else if (c.kind === "omitted" || c.kind === "pruned_subtree") rank = "omitted";
+    // Never re-made because the call around it was served: not a finding,
+    // unless the scorer charges it, and then it is the omission it is charged as.
+    else if (c.kind === "nested_in_served_call") rank = c.blocking ? "omitted" : null;
     else if (c.kind === "novel" || c.kind === "novel_subtree") rank = "novel";
     else if (c.kind === "environmental") rank = "environmental";
     else if (c.kind === "identity_skew") rank = "identity-skew";

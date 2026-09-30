@@ -312,8 +312,12 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             | "deterministic"
             | "served_recorded_error" => Value::Reproduced,
             // A call a seed gap cut off never ran: absent, like any omission.
-            // The scorecard decides who it is charged to, not the tree.
-            "omitted" | "pruned_subtree" | "inconclusive_seed_gap_cascade" => Value::Absent,
+            // So did one inside a served call. The scorecard decides who either
+            // is charged to, not the tree.
+            "omitted"
+            | "pruned_subtree"
+            | "nested_in_served_call"
+            | "inconclusive_seed_gap_cascade" => Value::Absent,
             "novel" | "novel_subtree" | "environmental" | "novel_absorbed" => Value::Novel {
                 hash: observed_hash(),
             },
@@ -524,6 +528,7 @@ mod tests {
             blocking: kind == "value_diverged",
             origin: false,
             stopped: false,
+            served_ancestor: None,
             arg_divergence_reach: None,
             could_be_affected_by_arg_divergence: false,
             arg_divergence_placement: None,

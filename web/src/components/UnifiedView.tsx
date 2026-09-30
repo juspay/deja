@@ -8,6 +8,7 @@ import {
   CallEntry,
   CaseModel,
   flatten,
+  isFinding,
   Mark,
   MARK_ORDER,
   Side,
@@ -47,6 +48,7 @@ const MARK_LABEL: Record<Mark, string> = {
   unknown: "unrecognised kind",
   "non-blocking": "non-blocking",
   matched: "matched",
+  "inside-served": "inside a served call",
 };
 
 const PRESENCE_LABEL: Record<SpineNode["presence"], string> = {
@@ -445,18 +447,63 @@ function PrunedSubtree({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">
-        The recording made this call. On the replay side the subtree above it was pruned, so there
-        is nothing to pair it with{c.blocking ? " — and the scorer counts this toward the verdict" : ""}.
+        The recording made this call. On the replay side the span it ran under never opened, so
+        there is nothing to pair it with{c.blocking ? " — and the scorer counts this toward the verdict" : ""}.
       </p>
       <p className="evlimit">
-        Pruning is a statement about the <i>tree</i>, not about this call: the candidate diverged
-        somewhere above and everything beneath went with it. The cause is the pruning point, not
-        this row.
+        Pruning is a statement about the <i>tree</i>, not about this call: the candidate's path left
+        the recording's somewhere above, by a stop, a divergence or another branch, and everything
+        beneath went with it. The cause is the pruning point, not this row. A call that was not
+        re-made only because the call around it was served from the recording is not pruned; it is
+        shown as inside a served call.
       </p>
       <h4>recorded arguments</h4>
       <JsonView value={c.recorded?.args} />
       <h4>recorded result</h4>
       <JsonView value={c.recorded?.result} />
+    </div>
+  );
+}
+
+/**
+ * NESTED IN A SERVED CALL — the recording made this call from inside another,
+ * and the replay served that other call from the recording. A served call's body
+ * does not run, so this call never could. Substitution working, not a finding.
+ */
+function NestedInServedCall({ e }: { e: CallEntry }) {
+  const c = e.call;
+  const a = c.served_ancestor;
+  return (
+    <div className={c.blocking ? "evidence ev-omitted" : "evidence ev-matched"}>
+      <CallHead c={c} />
+      <SplitSpans e={e} />
+      <p className="evwhat">
+        The recording made this call inside{" "}
+        {a ? (
+          <>
+            <code>
+              {a.boundary}·{a.method_name}
+            </code>{" "}
+            at <code>{`${a.call_file}:${a.call_line}`}</code> (recorded #{a.global_sequence})
+          </>
+        ) : (
+          "another call"
+        )}
+        , which the replay served from the recording. A served call returns its recorded value
+        without running its body, so this call was never re-made. Nothing failed here.
+      </p>
+      {c.blocking && (
+        <p className="evlimit">
+          The scorer still counts this row toward the verdict, as the omission it is charged as.
+        </p>
+      )}
+      <h4>recorded arguments</h4>
+      <JsonView value={c.recorded?.args} />
+      <h4>recorded result</h4>
+      <JsonView value={c.recorded?.result} />
+      <p className="hint">
+        The value reached the candidate through the served call's own recorded result.
+      </p>
     </div>
   );
 }
@@ -854,6 +901,7 @@ function SpanDetail({
             return <Environmental key={i} e={e} note={boundaryNotes[e.call.boundary] ?? null} />;
           if (k === "novel") return <Novel key={i} e={e} />;
           if (k === "pruned_subtree") return <PrunedSubtree key={i} e={e} />;
+          if (k === "nested_in_served_call") return <NestedInServedCall key={i} e={e} />;
           if (k === "novel_subtree") return <NovelSubtree key={i} e={e} />;
           if (k === "identity_skew") return <IdentitySkew key={i} e={e} />;
           // Agreement is an ALLOW-LIST. Falling through to `Matched` told the
@@ -1150,7 +1198,7 @@ export default function UnifiedView({
       <div className="uvtabs">
         {model.cases.map((c) => {
           const on = c.caseId === active.caseId;
-          const bad = MARK_ORDER.filter((m) => m !== "matched").reduce(
+          const bad = MARK_ORDER.filter(isFinding).reduce(
             (a, m) => a + (c.counts[m] ?? 0),
             0,
           );
