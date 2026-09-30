@@ -20,7 +20,10 @@
 //!   unresolved, pure/req  → deterministic (tolerated)
 //!   unresolved, blocking  → novel
 //!     …after a truncated recording tail → inconclusive_tail_gap (tolerated)
-//!   recorded ∧ unconsumed → omitted
+//!   recorded ∧ unconsumed → omitted, or why it was not re-made:
+//!     inside a served call → nested_in_served_call; under a span the replay
+//!     never reached → pruned_subtree; cut off by a seed gap →
+//!     inconclusive_seed_gap_cascade
 //!
 //! Each row carries `blocking` so the UI can show the same pass/fail split the
 //! verdict used. `kind` alone does NOT: an `omitted` row may be a divergence the
@@ -108,7 +111,25 @@ pub struct CallRecord {
     /// matched | recovered | served_recorded_error | novel | novel_absorbed | inconclusive_seed_gap |
     /// inconclusive_tail_gap | omitted | environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
-    /// identity_skew | pruned_subtree | novel_subtree
+    /// identity_skew | pruned_subtree | novel_subtree | nested_in_served_call |
+    /// inconclusive_seed_gap_cascade
+    ///
+    /// A recorded call nothing claimed takes exactly one of four kinds, and they
+    /// are four different reasons it did not run:
+    ///
+    /// - `nested_in_served_call`: it ran INSIDE a recorded call the replay
+    ///   served from the recording, so the served call's body never executed.
+    ///   Substitution working as intended, not a finding. `served_ancestor`
+    ///   names the call.
+    /// - `pruned_subtree`: the span it ran under never opened on the replay
+    ///   side, and no served call accounts for that: the candidate's path left
+    ///   the recording's above it, by a stop, a divergence or another branch.
+    /// - `omitted`: its span did run (or structure could not say), and the
+    ///   candidate made no such call there.
+    /// - `inconclusive_seed_gap_cascade`: cut off by the correlation's seed gap.
+    ///
+    /// Which of them counts toward the verdict is `blocking`, which the
+    /// scorecard decides; the kind only says why the call is absent.
     ///
     /// Every kind the scorecard tolerates is non-blocking HERE too: this row is
     /// what the viewer routes on, and the scorecard and the ledger are two
@@ -134,6 +155,11 @@ pub struct CallRecord {
     /// not hold. Absent when the call went through.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// On a `nested_in_served_call` row, the recorded call this one ran inside.
+    /// The replay served that call from the recording, so its body did not run
+    /// and this call with it. Absent on every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_ancestor: Option<ServedAncestor>,
     /// This call was served the recording's value because only its ARGUMENTS
     /// moved, and this is how far that substitution could have carried. A reach
     /// of zero is an empty reach — nothing followed the serve — and is reported,
@@ -164,6 +190,129 @@ pub struct CallRecord {
     pub recorded: Option<CallSide>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed: Option<CallSide>,
+}
+
+/// The recorded call a `nested_in_served_call` row ran inside: enough to name
+/// it without a second lookup, and its sequence to find its own row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedAncestor {
+    pub global_sequence: u64,
+    pub boundary: String,
+    pub method_name: String,
+    pub call_file: String,
+    pub call_line: u32,
+}
+
+/// Which unclaimed recorded calls ran inside a call the replay SERVED.
+///
+/// A served call returns the recording's value without running its body, so
+/// every boundary call its body made on the recording side has no counterpart
+/// by construction. Structure alone labels those calls `pruned_subtree` when
+/// the body opened a span of its own and `omitted` when it did not, and both
+/// read as the candidate going missing when nothing failed.
+///
+/// Nesting is read off the recording: the recorder takes a call's sequence and
+/// start time before the call runs and its end time after, so a call made from
+/// inside another starts no earlier, ends no later, and holds a later sequence,
+/// on the same task of the same correlation. Nothing here knows what any
+/// boundary is. What the tape cannot separate is two futures polled
+/// concurrently on one task: a call from one of them that falls inside a served
+/// call of the other is read as nested in it. The kind it is given then says
+/// the call was not re-made, which is still true; `blocking` is unaffected.
+///
+/// A call is served when its value came from the recording and the request
+/// went on: resolved, or served by address with other arguments, and neither
+/// run for real (`Shadow`) nor stopped.
+pub(crate) struct ServedNesting<'a> {
+    served: HashMap<(Option<&'a str>, Option<&'a str>), Vec<&'a BoundaryEvent>>,
+}
+
+/// A served call's recorded window, when the tape stamped one. A tape written
+/// before `end_timestamp_ns` carries only a duration truncated to microseconds,
+/// too coarse to tell a call made inside from one made just after, so such a
+/// call contains nothing and its neighbours keep their structural kind.
+fn recorded_window(ev: &BoundaryEvent) -> Option<(u64, u64)> {
+    let end = ev.end_timestamp_ns?;
+    (ev.timestamp_ns > 0 && end > ev.timestamp_ns).then_some((ev.timestamp_ns, end))
+}
+
+impl<'a> ServedNesting<'a> {
+    pub(crate) fn build(
+        observed: &[ObservedCall],
+        by_seq: &HashMap<u64, &'a BoundaryEvent>,
+    ) -> Self {
+        let mut served: HashMap<(Option<&'a str>, Option<&'a str>), Vec<&'a BoundaryEvent>> =
+            HashMap::new();
+        for obs in observed {
+            let from_recording = obs.resolved || obs.arg_divergent;
+            if !from_recording
+                || obs.provenance == deja::Provenance::Shadow
+                || obs.outcome != deja::SubstituteOutcome::Substituted
+            {
+                continue;
+            }
+            let sequence = obs
+                .served_event_global_sequence
+                .or(obs.source_event_global_sequence);
+            let Some(ev) = sequence.and_then(|seq| by_seq.get(&seq).copied()) else {
+                continue;
+            };
+            if recorded_window(ev).is_none() {
+                continue;
+            }
+            served
+                .entry((ev.correlation_id.as_deref(), ev.task_id.as_deref()))
+                .or_default()
+                .push(ev);
+        }
+        for calls in served.values_mut() {
+            calls.sort_by_key(|ev| (ev.timestamp_ns, ev.global_sequence));
+            calls.dedup_by_key(|ev| ev.global_sequence);
+        }
+        Self { served }
+    }
+
+    /// The innermost served call `ev` ran inside, if any.
+    pub(crate) fn ancestor_of(&self, ev: &BoundaryEvent) -> Option<&'a BoundaryEvent> {
+        ev.correlation_id.as_ref()?;
+        let calls = self
+            .served
+            .get(&(ev.correlation_id.as_deref(), ev.task_id.as_deref()))?;
+        let start = ev.timestamp_ns;
+        let end = ev.end_timestamp_ns.unwrap_or(start);
+        let started_before = calls.partition_point(|parent| parent.timestamp_ns <= start);
+        // Latest start first, so the first that contains `ev` is the innermost.
+        calls[..started_before]
+            .iter()
+            .rev()
+            .copied()
+            .find(|parent| {
+                parent.global_sequence < ev.global_sequence
+                    && recorded_window(parent).is_some_and(|(_, parent_end)| end <= parent_end)
+            })
+    }
+}
+
+/// How the unclaimed recorded calls were labelled, asserted to cover them all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnclaimedTally {
+    pub nested_in_served_call: usize,
+    pub pruned_subtree: usize,
+    pub omitted: usize,
+    pub seed_gap_cascade: usize,
+    /// Covered by the table, unclaimed, and absent from the loaded tape, so
+    /// there is no recorded side to write a row from.
+    pub no_recorded_event: usize,
+}
+
+impl UnclaimedTally {
+    fn total(self) -> usize {
+        self.nested_in_served_call
+            + self.pruned_subtree
+            + self.omitted
+            + self.seed_gap_cascade
+            + self.no_recorded_event
+    }
 }
 
 /// The ledger's snake_case name for a schema-derived INSERT row.
@@ -483,6 +632,7 @@ pub(crate) fn build_with_inconclusive_into(
                 blocking,
                 origin: true,
                 stopped: stopped_at(obs),
+                served_ancestor: None,
                 arg_divergence_reach,
                 could_be_affected_by_arg_divergence,
                 arg_divergence_placement,
@@ -579,6 +729,7 @@ pub(crate) fn build_with_inconclusive_into(
                             .is_some_and(|first| *first < observed_index)
                     }),
                 stopped: stopped_at(obs),
+                served_ancestor: None,
                 arg_divergence_reach,
                 could_be_affected_by_arg_divergence,
                 arg_divergence_placement,
@@ -693,6 +844,7 @@ pub(crate) fn build_with_inconclusive_into(
             blocking,
             origin: novel_origin,
             stopped: stopped_at(obs),
+            served_ancestor: None,
             arg_divergence_reach,
             could_be_affected_by_arg_divergence,
             arg_divergence_placement,
@@ -702,16 +854,30 @@ pub(crate) fn build_with_inconclusive_into(
         })?;
     }
 
-    // --- omitted: expected (table-covered) recorded events never consumed ----
-    let mut omitted: Vec<&BoundaryEvent> = expected_seqs
+    // --- unclaimed: expected (table-covered) recorded events never consumed ---
+    let unclaimed_seqs: Vec<u64> = expected_seqs
         .iter()
         .filter(|s| !consumed.contains(s) && !paired_consumed.contains(s))
-        .filter_map(|s| by_seq.get(s).copied())
+        .copied()
         .collect();
+    let unclaimed = unclaimed_seqs.len();
+    let mut tally = UnclaimedTally::default();
+    // A covered sequence with no event on the loaded tape (a tape that failed
+    // to load, or lost lines) has no recorded side to write. Named, not dropped.
+    let mut omitted: Vec<&BoundaryEvent> = Vec::with_capacity(unclaimed);
+    for seq in &unclaimed_seqs {
+        match by_seq.get(seq) {
+            Some(ev) => omitted.push(ev),
+            None => tally.no_recorded_event += 1,
+        }
+    }
     omitted.sort_by_key(|e| e.global_sequence);
+    let nesting = ServedNesting::build(observed, &by_seq);
     for ev in omitted {
-        // Claimed by no address. Structure says whether the span it ran under was
-        // never reached (a pruned subtree) or ran without it (omitted).
+        // Claimed by no address. Why it did not run is one of four answers, in
+        // this order: cut off by the seed gap; inside a call the replay served,
+        // so its body never ran; under a span the replay never reached; or its
+        // span ran without it.
         let pruned = plan.is_some_and(|plan| {
             ev.correlation_id
                 .as_deref()
@@ -724,6 +890,30 @@ pub(crate) fn build_with_inconclusive_into(
         );
         // Cut off by the correlation's seed gap, mirroring the scorecard.
         let cascaded = blocking && cascade.covers(ev.correlation_id.as_deref(), ev.global_sequence);
+        let served_ancestor = if cascaded {
+            None
+        } else {
+            nesting.ancestor_of(ev).map(|parent| ServedAncestor {
+                global_sequence: parent.global_sequence,
+                boundary: parent.boundary.clone(),
+                method_name: parent.method_name.clone(),
+                call_file: parent.call_file.clone(),
+                call_line: parent.call_line,
+            })
+        };
+        let kind = if cascaded {
+            tally.seed_gap_cascade += 1;
+            "inconclusive_seed_gap_cascade"
+        } else if served_ancestor.is_some() {
+            tally.nested_in_served_call += 1;
+            "nested_in_served_call"
+        } else if pruned {
+            tally.pruned_subtree += 1;
+            "pruned_subtree"
+        } else {
+            tally.omitted += 1;
+            "omitted"
+        };
         sink(CallRecord {
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
@@ -731,17 +921,13 @@ pub(crate) fn build_with_inconclusive_into(
             boundary: ev.boundary.clone(),
             trait_name: ev.trait_name.clone(),
             method_name: ev.method_name.clone(),
-            kind: if cascaded {
-                "inconclusive_seed_gap_cascade"
-            } else if pruned {
-                "pruned_subtree"
-            } else {
-                "omitted"
-            }
-            .to_owned(),
+            kind: kind.to_owned(),
+            // The kind says why the call is absent; whether that counts is the
+            // scorecard's, and it is not re-decided here.
             blocking: blocking && !cascaded,
             origin: false,
             stopped: false,
+            served_ancestor,
             // A recorded event nothing claimed has no position in the candidate's
             // stream, so there is no "after the serve" for it to be in. The
             // reach speaks about the calls the candidate MADE.
@@ -752,6 +938,29 @@ pub(crate) fn build_with_inconclusive_into(
             recorded: recorded_for(ev.global_sequence),
             observed: None,
         })?;
+    }
+    // Every recorded call the table covers is claimed by the candidate, written
+    // here under exactly one of the four kinds, or named as having no event.
+    // An imbalance is returned rather than panicked on: the scorecard is already
+    // written by the time the ledger is, and a ledger failure must not end the
+    // run that produced it.
+    let claimed = expected_seqs
+        .iter()
+        .filter(|s| consumed.contains(s) || paired_consumed.contains(s))
+        .count();
+    if tally.total() != unclaimed || claimed + unclaimed != expected_seqs.len() {
+        return Err(std::io::Error::other(format!(
+            "ledger accounting violation: {} expected recorded calls, {claimed} claimed, \
+             {unclaimed} unclaimed, labelled {tally:?}",
+            expected_seqs.len()
+        )));
+    }
+    if tally.no_recorded_event > 0 {
+        eprintln!(
+            "divergence: ledger has no row for {} unclaimed recorded call(s) the lookup table \
+             covers but the loaded tape does not carry",
+            tally.no_recorded_event
+        );
     }
 
     Ok(())
@@ -1258,5 +1467,121 @@ mod tests {
         assert_eq!(find(&rows, "environmental").len(), 1);
         assert_eq!(find(&rows, "deterministic").len(), 1);
         assert!(rows.iter().all(|r| !r.blocking));
+    }
+
+    /// A table entry whose event the loaded tape does not carry has no recorded
+    /// side to write. It is named in the tally, and the ledger still builds:
+    /// it is written after the scorecard and must not end the run.
+    #[test]
+    fn a_covered_call_missing_from_the_tape_does_not_fail_the_ledger() {
+        let events = vec![event(1, "db", Some("c1")), event(2, "db", Some("c1"))];
+        let table = table_for(&events, &HashMap::new());
+        let loaded = &events[..1];
+        let mut rows = Vec::new();
+        let built = build_with_inconclusive_into(
+            loaded,
+            &[],
+            &table,
+            &HashSet::new(),
+            &InconclusiveRaceEvidence::default(),
+            &TailGapEvidence::default(),
+            &super::super::UnplantedPresence::default(),
+            &super::super::SeedGapCascade::default(),
+            None,
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        );
+        assert!(built.is_ok(), "{built:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the loaded event still has its row: {rows:?}"
+        );
+    }
+
+    /// A recorded call with a window, for the nesting tests below.
+    fn timed(seq: u64, boundary: &str, task: &str, start: u64, end: u64) -> BoundaryEvent {
+        let mut ev = event(seq, boundary, Some("c1"));
+        ev.task_id = Some(task.to_owned());
+        ev.timestamp_ns = start;
+        ev.end_timestamp_ns = Some(end);
+        ev
+    }
+
+    /// The label for the child of a parent the candidate called as `parent`.
+    fn child_kind(parent: ObservedCall, child: BoundaryEvent) -> (String, Option<u64>) {
+        child_kind_of(timed(1, "km", "t", 100, 200), parent, child)
+    }
+
+    fn child_kind_of(
+        recorded_parent: BoundaryEvent,
+        parent: ObservedCall,
+        child: BoundaryEvent,
+    ) -> (String, Option<u64>) {
+        let events = vec![recorded_parent, child];
+        let rows = build(
+            &events,
+            &[parent],
+            &table_for(&events, &HashMap::new()),
+            &HashSet::new(),
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.source_event_global_sequence == Some(2) && r.observed.is_none())
+            .expect("the child is unclaimed");
+        (
+            row.kind.clone(),
+            row.served_ancestor.as_ref().map(|a| a.global_sequence),
+        )
+    }
+
+    /// Served means the body did not run. A parent that ran for real, or that
+    /// stopped the request, accounts for nothing beneath it; nor does a served
+    /// call account for work on another task, or for a call that outlived it.
+    #[test]
+    fn only_a_served_call_accounts_for_the_calls_inside_it() {
+        let served = || obs("km", Some("c1"), true, Some(2), Some(1));
+        let inside = || timed(2, "time", "t", 150, 151);
+        assert_eq!(
+            child_kind(served(), inside()),
+            ("nested_in_served_call".to_owned(), Some(1))
+        );
+
+        let mut executed = served();
+        executed.provenance = deja::Provenance::Shadow;
+        let mut stopped = served();
+        stopped.outcome = deja::SubstituteOutcome::Stopped;
+        for parent in [executed, stopped] {
+            assert_eq!(child_kind(parent, inside()), ("omitted".to_owned(), None));
+        }
+
+        for child in [
+            timed(2, "time", "other-task", 150, 151),
+            timed(2, "time", "t", 150, 250),
+            timed(2, "time", "t", 250, 251),
+        ] {
+            assert_eq!(child_kind(served(), child), ("omitted".to_owned(), None));
+        }
+
+        // A tape without end stamps cannot say what was inside what.
+        let mut unstamped = timed(1, "km", "t", 100, 200);
+        unstamped.end_timestamp_ns = None;
+        unstamped.duration_us = 1;
+        assert_eq!(
+            child_kind_of(unstamped, served(), inside()),
+            ("omitted".to_owned(), None)
+        );
+
+        // Served by its address with other arguments: still the recording's
+        // value, so still a body that never ran.
+        let mut by_address = obs("km", Some("c1"), false, None, None);
+        by_address.arg_divergent = true;
+        by_address.served_event_global_sequence = Some(1);
+        assert_eq!(
+            child_kind(by_address, inside()),
+            ("nested_in_served_call".to_owned(), Some(1))
+        );
     }
 }

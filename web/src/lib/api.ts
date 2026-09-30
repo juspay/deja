@@ -288,6 +288,15 @@ export type CallSide = {
   graph_node_id?: number;
 };
 
+// The recorded call a `nested_in_served_call` row ran inside.
+export type ServedAncestor = {
+  global_sequence: number;
+  boundary: string;
+  method_name: string;
+  call_file: string;
+  call_line: number;
+};
+
 // A reconciled side-effect call: identity + classification + both sides.
 export type CallRecord = {
   correlation_id?: string;
@@ -296,7 +305,13 @@ export type CallRecord = {
   trait_name: string;
   method_name: string;
   // matched | recovered | novel | omitted | environmental | deterministic |
-  // value_diverged
+  // value_diverged | pruned_subtree | novel_subtree | nested_in_served_call | …
+  //
+  // A recorded call the candidate did not make is one of: `omitted` (its span
+  // ran, the call did not), `pruned_subtree` (the span it ran under never
+  // opened: the path left the recording above it), or `nested_in_served_call`
+  // (it ran inside a call the replay served from the recording, so it was never
+  // going to run; `served_ancestor` names that call).
   kind: string;
   blocking: boolean;
   // For a value_diverged row: true on the ORIGIN (executed read whose real value
@@ -307,6 +322,8 @@ export type CallRecord = {
   // the tape and failed closed, so there is no replayed result — the finding is
   // in the arguments. Absent when the call went through.
   stopped?: boolean;
+  // On a `nested_in_served_call` row: the served call this one ran inside.
+  served_ancestor?: ServedAncestor;
   resolved_rank?: number;
   recorded?: CallSide;
   observed?: CallSide;

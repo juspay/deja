@@ -711,7 +711,7 @@ main:has(.recintro) { max-width: 1440px; }
 .mchip.m-response { background: rgba(57,197,207,0.14); color: var(--cyan); }
 .mchip.m-omitted { background: rgba(248,81,73,0.10); color: var(--red-fg); }
 .mchip.m-novel { background: rgba(63,185,80,0.14); color: var(--green-fg); }
-.mchip.m-environmental, .mchip.m-matched { background: var(--surface-overlay); color: var(--text-faint); }
+.mchip.m-environmental, .mchip.m-matched, .mchip.m-inside-served { background: var(--surface-overlay); color: var(--text-faint); }
 .mchip.m-field-diff { background: rgba(248,81,73,0.16); color: var(--red-fg); font-weight: 600; }
 .mchip.m-missing-span { background: rgba(248,81,73,0.10); color: var(--red-fg); }
 .mchip.m-novel-span { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
