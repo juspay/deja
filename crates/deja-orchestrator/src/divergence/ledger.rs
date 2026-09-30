@@ -300,11 +300,18 @@ pub(crate) struct UnclaimedTally {
     pub pruned_subtree: usize,
     pub omitted: usize,
     pub seed_gap_cascade: usize,
+    /// Covered by the table, unclaimed, and absent from the loaded tape, so
+    /// there is no recorded side to write a row from.
+    pub no_recorded_event: usize,
 }
 
 impl UnclaimedTally {
     fn total(self) -> usize {
-        self.nested_in_served_call + self.pruned_subtree + self.omitted + self.seed_gap_cascade
+        self.nested_in_served_call
+            + self.pruned_subtree
+            + self.omitted
+            + self.seed_gap_cascade
+            + self.no_recorded_event
     }
 }
 
@@ -848,15 +855,24 @@ pub(crate) fn build_with_inconclusive_into(
     }
 
     // --- unclaimed: expected (table-covered) recorded events never consumed ---
-    let mut omitted: Vec<&BoundaryEvent> = expected_seqs
+    let unclaimed_seqs: Vec<u64> = expected_seqs
         .iter()
         .filter(|s| !consumed.contains(s) && !paired_consumed.contains(s))
-        .filter_map(|s| by_seq.get(s).copied())
+        .copied()
         .collect();
-    omitted.sort_by_key(|e| e.global_sequence);
-    let unclaimed = omitted.len();
-    let nesting = ServedNesting::build(observed, &by_seq);
+    let unclaimed = unclaimed_seqs.len();
     let mut tally = UnclaimedTally::default();
+    // A covered sequence with no event on the loaded tape (a tape that failed
+    // to load, or lost lines) has no recorded side to write. Named, not dropped.
+    let mut omitted: Vec<&BoundaryEvent> = Vec::with_capacity(unclaimed);
+    for seq in &unclaimed_seqs {
+        match by_seq.get(seq) {
+            Some(ev) => omitted.push(ev),
+            None => tally.no_recorded_event += 1,
+        }
+    }
+    omitted.sort_by_key(|e| e.global_sequence);
+    let nesting = ServedNesting::build(observed, &by_seq);
     for ev in omitted {
         // Claimed by no address. Why it did not run is one of four answers, in
         // this order: cut off by the seed gap; inside a call the replay served,
@@ -923,18 +939,29 @@ pub(crate) fn build_with_inconclusive_into(
             observed: None,
         })?;
     }
-    // Every recorded call the table covers is claimed by the candidate or
-    // written here under exactly one of the four kinds.
+    // Every recorded call the table covers is claimed by the candidate, written
+    // here under exactly one of the four kinds, or named as having no event.
+    // An imbalance is returned rather than panicked on: the scorecard is already
+    // written by the time the ledger is, and a ledger failure must not end the
+    // run that produced it.
     let claimed = expected_seqs
         .iter()
         .filter(|s| consumed.contains(s) || paired_consumed.contains(s))
         .count();
-    assert!(
-        tally.total() == unclaimed && claimed + unclaimed == expected_seqs.len(),
-        "ledger accounting violation: {} expected recorded calls, {claimed} claimed, \
-         {unclaimed} unclaimed, labelled {tally:?}",
-        expected_seqs.len()
-    );
+    if tally.total() != unclaimed || claimed + unclaimed != expected_seqs.len() {
+        return Err(std::io::Error::other(format!(
+            "ledger accounting violation: {} expected recorded calls, {claimed} claimed, \
+             {unclaimed} unclaimed, labelled {tally:?}",
+            expected_seqs.len()
+        )));
+    }
+    if tally.no_recorded_event > 0 {
+        eprintln!(
+            "divergence: ledger has no row for {} unclaimed recorded call(s) the lookup table \
+             covers but the loaded tape does not carry",
+            tally.no_recorded_event
+        );
+    }
 
     Ok(())
 }
@@ -1440,6 +1467,38 @@ mod tests {
         assert_eq!(find(&rows, "environmental").len(), 1);
         assert_eq!(find(&rows, "deterministic").len(), 1);
         assert!(rows.iter().all(|r| !r.blocking));
+    }
+
+    /// A table entry whose event the loaded tape does not carry has no recorded
+    /// side to write. It is named in the tally, and the ledger still builds:
+    /// it is written after the scorecard and must not end the run.
+    #[test]
+    fn a_covered_call_missing_from_the_tape_does_not_fail_the_ledger() {
+        let events = vec![event(1, "db", Some("c1")), event(2, "db", Some("c1"))];
+        let table = table_for(&events, &HashMap::new());
+        let loaded = &events[..1];
+        let mut rows = Vec::new();
+        let built = build_with_inconclusive_into(
+            loaded,
+            &[],
+            &table,
+            &HashSet::new(),
+            &InconclusiveRaceEvidence::default(),
+            &TailGapEvidence::default(),
+            &super::super::UnplantedPresence::default(),
+            &super::super::SeedGapCascade::default(),
+            None,
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        );
+        assert!(built.is_ok(), "{built:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the loaded event still has its row: {rows:?}"
+        );
     }
 
     /// A recorded call with a window, for the nesting tests below.

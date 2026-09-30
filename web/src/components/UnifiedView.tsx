@@ -490,11 +490,15 @@ function NestedInServedCall({ e }: { e: CallEntry }) {
           "another call"
         )}
         , which the replay served from the recording. A served call returns its recorded value
-        without running its body, so this call was never re-made. Nothing failed here.
+        without running its body, so this call was never re-made
+        {c.blocking ? "." : ". Nothing failed here."}
       </p>
       {c.blocking && (
         <p className="evlimit">
-          The scorer still counts this row toward the verdict, as the omission it is charged as.
+          The scorer counts this row toward the verdict, as the omission it is charged as. The nesting
+          is read from the recorded timing, and two futures run concurrently on one task cannot be
+          told apart there, so this call may instead have been cut off in a sibling of the served
+          call.
         </p>
       )}
       <h4>recorded arguments</h4>
