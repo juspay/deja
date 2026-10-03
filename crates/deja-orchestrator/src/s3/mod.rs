@@ -32,11 +32,53 @@ pub use deja_compactor::S3Config;
 /// answering costs one manifest GET (plus one sidecar GET for the rows).
 pub use deja_compactor::{correlation_count, read_correlation_index, CorrelationSummary};
 
+/// The prefix every sealed session lives under: the compactor's own, so the
+/// one place a selection's `prefix` is derived cannot drift from the layout
+/// that produces the per-session roots.
+use deja_compactor::layout::SESSIONS_ROOT;
+
 /// What `pull_recording` reports back (persisted next to the events file,
 /// registered as a run artifact, folded into the catalog row).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IngestReport {
+    /// Where the events came from, as a KEY PREFIX and always a path. For one
+    /// recording that is its session root; for a selection it is the root they
+    /// share, because no single session root describes a selection and naming
+    /// one of them would name a fraction of it.
+    ///
+    /// Relative to the system's root, like the manifest's own keys, so a
+    /// recording copied under a prefix is still described correctly.
+    ///
+    /// Deliberately never prose. This is a serialised field persisted beside
+    /// the events file and folded into the catalog row, so a consumer outside
+    /// this repo may be doing something with it that a grep here cannot find.
+    /// "82 recordings" would read as fine in the log line it currently feeds
+    /// and break anything treating it as a path — a value-shape change hiding
+    /// inside an unchanged type.
     pub prefix: String,
+    /// The recordings this pull actually drew from, in the order they were
+    /// read.
+    ///
+    /// This is what tells a reader one session from a selection, STRUCTURALLY
+    /// rather than by parsing `prefix`. One entry is a single recording; many
+    /// is a deployment's day pulled as one tape.
+    pub members: Vec<String>,
+    /// The recordings a group named that this pull did NOT draw from, because
+    /// they are not sealed yet.
+    ///
+    /// Beside `members` rather than in a log line, because this is the
+    /// persisted artifact a reader acts on: a verdict over part of a day is
+    /// honest when the part is stated and misleading when it is not, and prose
+    /// in a log is not something a consumer can check. Empty for a single
+    /// recording and for a group that was pulled whole.
+    pub excluded_members: Vec<String>,
+    /// Which seal of each member this pull read, in `members` order.
+    ///
+    /// A recording is sealed on quiet and re-sealed as it grows, so its name
+    /// does not identify the content a run scored; its `seal_id` does, being a
+    /// content address. Two runs are comparable only when these agree. Empty
+    /// when the pull did not go through sealed manifests.
+    pub member_seals: Vec<MemberSeal>,
     pub landing_objects: usize,
     pub lines_in: usize,
     pub duplicates_dropped: usize,
@@ -64,6 +106,35 @@ pub struct IngestReport {
     ///
     /// This is the fact a replay acts on; acting on it is the lifecycle's job.
     pub delivery: DeliveryCertificate,
+    /// How each producer stream was shifted onto the recording-wide sequence
+    /// space — see [`Renumbering`]. Empty when the tape came from one process,
+    /// whose numbering is already the tape's and is written untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renumbered: Vec<StreamRenumbering>,
+}
+
+/// The seal one member of a pull was read from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemberSeal {
+    pub recording_id: String,
+    pub seal_id: String,
+    pub correlations: usize,
+    pub events: usize,
+    pub landing_objects: usize,
+    pub sealed_unix_ms: u64,
+}
+
+impl MemberSeal {
+    fn of(manifest: &deja_compactor::SessionManifest) -> Self {
+        Self {
+            recording_id: manifest.session_id.clone(),
+            seal_id: manifest.seal_id.clone(),
+            correlations: manifest.counts.correlations,
+            events: manifest.counts.events,
+            landing_objects: manifest.counts.landing_objects,
+            sealed_unix_ms: manifest.created_unix_ms,
+        }
+    }
 }
 
 impl IngestReport {
@@ -115,6 +186,9 @@ impl IngestReport {
     pub fn report(&self) {
         eprintln!("{}", self.accounting());
         eprintln!("{}", self.delivery.describe());
+        if !self.renumbered.is_empty() {
+            eprintln!("{}", describe_renumbering(&self.renumbered));
+        }
         for line in self.delivery.describe_exclusions() {
             eprintln!("ingest: EXCLUDED {line}");
         }
@@ -658,19 +732,392 @@ pub fn count_session_objects(
 /// Pull a session recording into `dest` (the canonical
 /// `{root}/recordings/{id}/events.jsonl` slot), compacting first if the
 /// session isn't sealed yet. Returns the ingest report plus the manifest.
+/// One producer stream's place on the recording-wide sequence space.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StreamRenumbering {
+    /// The stream — the `recording_run_id` one recorder process stamped on
+    /// everything it wrote.
+    pub recording_run_id: String,
+    /// Added to every boundary event's `global_sequence`.
+    pub event_offset: u64,
+    /// Added to every graph node id: the node's own `node_id`, its
+    /// `parent_id`, its `causal_parent_ids`, and the `graph_node_id` boundary
+    /// events anchor to.
+    pub node_offset: u64,
+    pub events: usize,
+    pub graph_nodes: usize,
+}
+
+/// Recording-wide identities for a tape assembled from several producer
+/// processes.
+///
+/// `global_sequence` and the execution graph's `node_id` are PER-PROCESS
+/// counters that start at zero. A multi-member pull concatenates one member per
+/// recorder process, so a four-pod recording puts four streams that all count
+/// from zero onto one tape. The replay lookup is keyed by correlation and never
+/// noticed. Everything that names a recorded event by its bare sequence did:
+/// the ledger's recorded side, the scorecard's consumed and expected sets, the
+/// forest's event refs and the rank-2 span paths are all `HashMap<u64, _>`, and
+/// on such a tape they answer with whichever stream's event was inserted last.
+/// One run showed another pod's PayPal GET as the recorded twin of an Adyen
+/// POST on a third of its matched rows, hid four of eight omitted calls behind
+/// sequences another pod had consumed, and reported thirteen ingress events as
+/// omitted side-effect calls.
+///
+/// So each stream is shifted onto its own range as the tape is written. The
+/// first stream keeps its numbering (offset zero, bytes untouched), so a
+/// single-process tape is byte-identical to what it was; every later stream
+/// starts where the previous one's range ended. Offsets are keyed by
+/// `recording_run_id` rather than by member, because the run id is what the
+/// counter belongs to. The shift is reported in the ingest report so a
+/// sequence on the tape can be traced back to the producer's own numbering,
+/// which is the space the sink markers speak in.
+#[derive(Debug, Default)]
+struct Renumbering {
+    streams: std::collections::BTreeMap<String, StreamRenumbering>,
+    /// Per stream, the end of the range it has RESERVED: `(events, nodes)`.
+    ///
+    /// A stream's offset is fixed the first time it is seen, but its extent is
+    /// only known from the members read so far. A later member can therefore
+    /// need more room than was reserved, and if another stream has since been
+    /// placed above it there is nowhere to grow into — the two ranges overlap
+    /// and the tape carries colliding sequences again, which is the exact
+    /// defect this type exists to remove. Reservations are what let that be
+    /// DETECTED rather than silently produced.
+    reserved: std::collections::BTreeMap<String, (u64, u64)>,
+    /// One past the highest event sequence handed out so far.
+    next_event: u64,
+    /// One past the highest graph node id (or node-stream sequence) handed
+    /// out so far.
+    next_node: u64,
+}
+
+/// The one identity field the collated key does not already carry: a graph
+/// node's `node_id`. (`global_sequence` rides on the collated tuple.)
+#[derive(serde::Deserialize)]
+struct IdentityProbe {
+    #[serde(default)]
+    node_id: Option<u64>,
+}
+
+impl Renumbering {
+    /// Shift one member's collated records onto the recording-wide space.
+    ///
+    /// Two passes over the member: the first reads each stream's highest event
+    /// sequence and node id, so a stream's range is known before anything in it
+    /// is rewritten; the second rewrites. A stream already placed by an earlier
+    /// member keeps its offsets (the counter it continues is the same one), and
+    /// only widens the high-water marks.
+    fn apply(&mut self, member: &str, collated: &mut Collated) -> Result<(), String> {
+        let mut high: std::collections::BTreeMap<String, (u64, u64, usize, usize)> =
+            Default::default();
+        for (run, kind, gseq, raw) in &collated.events {
+            let entry = high.entry(run.clone().unwrap_or_default()).or_default();
+            match *kind {
+                "boundary_event" => {
+                    entry.0 = entry.0.max(*gseq + 1);
+                    entry.2 += 1;
+                }
+                _ => {
+                    let node_id = serde_json::from_str::<IdentityProbe>(raw)
+                        .ok()
+                        .and_then(|probe| probe.node_id)
+                        .unwrap_or_default();
+                    entry.1 = entry.1.max(node_id + 1).max(*gseq + 1);
+                    entry.3 += 1;
+                }
+            }
+        }
+        // Streams are placed in the order the sorted member presents them, so
+        // the same members pulled in the same order always produce the same
+        // tape.
+        for (run, (event_hwm, node_hwm, events, nodes)) in &high {
+            let stream = self
+                .streams
+                .entry(run.clone())
+                .or_insert_with(|| StreamRenumbering {
+                    recording_run_id: run.clone(),
+                    event_offset: self.next_event,
+                    node_offset: self.next_node,
+                    events: 0,
+                    graph_nodes: 0,
+                });
+            stream.events += events;
+            stream.graph_nodes += nodes;
+            let want_event_end = stream.event_offset + event_hwm;
+            let want_node_end = stream.node_offset + node_hwm;
+            let reserved = self
+                .reserved
+                .entry(run.clone())
+                .or_insert((want_event_end, want_node_end));
+            // Growing past the reservation is fine while this stream is still
+            // the highest one placed — nothing is above it to collide with.
+            // Once another stream has been placed above, it is not: the records
+            // already written for the earlier members cannot be moved, so the
+            // only honest outcome is to say so.
+            for (want, have, next, what) in [
+                (
+                    want_event_end,
+                    &mut reserved.0,
+                    &mut self.next_event,
+                    "event sequence",
+                ),
+                (
+                    want_node_end,
+                    &mut reserved.1,
+                    &mut self.next_node,
+                    "node id",
+                ),
+            ] {
+                if want > *have {
+                    if *have < *next {
+                        return Err(format!(
+                            "stream {run} resumed in member {member} and needs {what}s up to {want}, but only {have} was reserved for it and another stream is already placed at {next}. Writing it would overlap that stream, which is the sequence collision this renumbering removes. The members carrying one stream must be read together — exclude {member} or pull them in one call."
+                        ));
+                    }
+                    *have = want;
+                }
+                *next = (*next).max(*have);
+            }
+        }
+        for (run, kind, gseq, raw) in &mut collated.events {
+            let stream = &self.streams[&run.clone().unwrap_or_default()];
+            if stream.event_offset == 0 && stream.node_offset == 0 {
+                // The first stream keeps the producer's bytes.
+                continue;
+            }
+            if let Some(rewritten) = renumber_record(raw, kind, stream) {
+                *raw = rewritten;
+                *gseq += match *kind {
+                    "boundary_event" => stream.event_offset,
+                    _ => stream.node_offset,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// The streams, for the report — only when there was more than one, so a
+    /// single-process tape's report is unchanged.
+    fn into_report(self) -> Vec<StreamRenumbering> {
+        if self.streams.len() > 1 {
+            self.streams.into_values().collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Rewrite one raw record's identity fields by the stream's offsets. `None`
+/// when the line is not a JSON object — it will fail downstream parsing as it
+/// would have anyway, and it is left as it was so the failure names the
+/// producer's bytes.
+fn renumber_record(raw: &str, kind: &str, stream: &StreamRenumbering) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object_mut()?;
+    let shift = |slot: &mut serde_json::Value, by: u64| {
+        // The Kafka -> Vector -> S3 pipeline stringifies u64s above i64::MAX,
+        // so an id may arrive as a string; it leaves here as the number it is.
+        let current = match &*slot {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            _ => None,
+        };
+        if let Some(current) = current {
+            *slot = serde_json::Value::from(current + by);
+        }
+    };
+    match kind {
+        "boundary_event" => {
+            if let Some(slot) = object.get_mut("global_sequence") {
+                shift(slot, stream.event_offset);
+            }
+            if let Some(slot) = object.get_mut("graph_node_id") {
+                shift(slot, stream.node_offset);
+            }
+        }
+        _ => {
+            for field in ["node_id", "parent_id", "global_sequence"] {
+                if let Some(slot) = object.get_mut(field) {
+                    shift(slot, stream.node_offset);
+                }
+            }
+            if let Some(serde_json::Value::Array(parents)) = object.get_mut("causal_parent_ids") {
+                for slot in parents {
+                    shift(slot, stream.node_offset);
+                }
+            }
+        }
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn describe_renumbering(streams: &[StreamRenumbering]) -> String {
+    let parts: Vec<String> = streams
+        .iter()
+        .map(|s| {
+            format!(
+                "{} events +{} ({}) nodes +{} ({})",
+                s.recording_run_id, s.event_offset, s.events, s.node_offset, s.graph_nodes
+            )
+        })
+        .collect();
+    format!(
+        "ingest: {} producer stream(s) placed on one sequence space: {}",
+        streams.len(),
+        parts.join("; ")
+    )
+}
+
+/// What several members add up to, kept apart from the IO that produces them.
+///
+/// Separated so the arithmetic is testable without a store: `pull_recordings`
+/// needs a real `S3Config` and has never had a unit test, while THIS is where a
+/// multi-member pull can actually be wrong — a count that fails to sum, a
+/// correlation lost to a collision, an instance's dropped ranges overwritten.
+#[derive(Default)]
+struct PullTally {
+    per_correlation: std::collections::BTreeMap<String, CorrelationTrace>,
+    markers: MarkerLedger,
+    landing_objects: usize,
+    lines_in: usize,
+    duplicates_dropped: usize,
+    events_out: usize,
+    correlations: usize,
+    drops: DropCounts,
+    renumbering: Renumbering,
+}
+
+impl PullTally {
+    /// Fold one member in. Consumes its `Collated` so the events it carries are
+    /// released here rather than held until the pull ends — which is the bound
+    /// the member-at-a-time loop exists for.
+    fn absorb(&mut self, counts: &deja_compactor::Counts, collated: Collated) {
+        self.landing_objects += counts.landing_objects;
+        self.correlations += counts.correlations;
+        self.lines_in += collated.lines_in;
+        self.events_out += collated.events.len();
+        // The member's own duplicates were dropped when it was sealed, so they
+        // are outside this pass's line accounting and are added separately from
+        // what collate saw.
+        self.duplicates_dropped += counts.duplicates_dropped + collated.drops.duplicates;
+        self.drops.duplicates += collated.drops.duplicates;
+        self.drops.markers += collated.drops.markers;
+        self.drops.non_envelope += collated.drops.non_envelope;
+        self.drops.unparseable += collated.drops.unparseable;
+        // Correlations cannot span members — one is allocated inside one
+        // process for one request — so these keys cannot collide and extending
+        // is a union rather than a merge that has to resolve anything.
+        self.per_correlation.extend(collated.per_correlation);
+        self.markers.seen += collated.markers.seen;
+        self.markers.unreadable += collated.markers.unreadable;
+        self.markers.checkpoints += collated.markers.checkpoints;
+        // An instance writes one session for its life, so a key here cannot
+        // collide across members in practice — and a sealed session carries no
+        // markers at all, because the compactor drops them when it builds one.
+        // Merged rather than overwritten anyway: if that ever stops holding,
+        // losing an instance's dropped ranges would UNDERSTATE loss, which is
+        // the direction that reads healthier than the truth.
+        for (instance, delivery) in collated.markers.by_instance {
+            match self.markers.by_instance.entry(instance) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(delivery);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    let held = o.get_mut();
+                    held.eof |= delivery.eof;
+                    held.last_seq = held.last_seq.max(delivery.last_seq);
+                    held.dropped_ranges.extend(delivery.dropped_ranges);
+                }
+            }
+        }
+    }
+
+    fn finish(
+        self,
+        members: Vec<String>,
+        manifests: &[deja_compactor::SessionManifest],
+    ) -> IngestReport {
+        IngestReport {
+            // One member names its own session root. Several share only the
+            // prefix every session lives under, and saying that is both true
+            // and still a path — `members` carries which ones.
+            prefix: match members.as_slice() {
+                [only] => deja_compactor::layout::session_root(only),
+                _ => SESSIONS_ROOT.to_owned(),
+            },
+            members,
+            excluded_members: Vec::new(),
+            member_seals: manifests.iter().map(MemberSeal::of).collect(),
+            landing_objects: self.landing_objects,
+            lines_in: self.lines_in,
+            duplicates_dropped: self.duplicates_dropped,
+            events_out: self.events_out,
+            correlations: self.correlations,
+            sealed: true,
+            markers_dropped: self.drops.markers,
+            non_envelope_dropped: self.drops.non_envelope,
+            unparseable_dropped: self.drops.unparseable,
+            // The compactor skips marker lines when it builds a session, so a
+            // sealed session carries no producer audit trail and the
+            // certificate rests on the event stream alone. Admission does not
+            // need the markers — they only tell an admitted gap from an
+            // admitted loss.
+            delivery: certify(self.per_correlation, self.markers),
+            renumbered: self.renumbering.into_report(),
+        }
+    }
+}
+
 pub fn pull_recording(
     cfg: &S3Config,
     recording_id: &str,
-    root: &str,
     dest: &Path,
 ) -> Result<(IngestReport, deja_compactor::SessionManifest), String> {
-    let manifest = match deja_compactor::read_manifest(cfg, recording_id)? {
-        Some(m) => m,
-        None => deja_compactor::compact_session(cfg, recording_id, root)?,
-    };
-    let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
-    let chunk = lines.join("\n").into_bytes();
-    let collated = collate(&[chunk]);
+    let (report, mut manifests) = pull_recordings(cfg, &[recording_id], dest)?;
+    // One member in, one manifest out. Delegating rather than keeping a second
+    // implementation is the point: the single-recording path IS the many-member
+    // path with one member, so it cannot drift from it.
+    let manifest = manifests
+        .pop()
+        .ok_or_else(|| format!("no manifest for {recording_id}"))?;
+    Ok((report, manifest))
+}
+
+/// Pull SEVERAL sealed recordings into one local tape, for replaying a
+/// deployment's day as a single run instead of one run per pod.
+///
+/// MEMBER AT A TIME, and that is the whole design. Each member is read,
+/// collated, written out and dropped before the next is touched, so the peak
+/// is bounded by the LARGEST SINGLE MEMBER rather than by their sum.
+/// `pull_recording` holds a tape three times over — the owned lines, the joined
+/// bytes, and the parsed events — so reading a whole selection at once costs
+/// roughly three times its total: a measured 82-member day is 1.46 GB of parts
+/// and would be ~4.4 GB resident against a 4 GiB runner. Member at a time, the
+/// same day peaks at the largest member seen, about 69 MB, so ~200 MB.
+///
+/// CONCATENATION, NOT MERGING, and it is worth saying why that is sound rather
+/// than convenient. Members are separate recorder processes:
+/// `global_sequence` comes from a per-process counter, so there is no ordering
+/// ACROSS members to preserve — the question does not exist. A correlation is
+/// allocated inside one process for one request, so it cannot span members
+/// either. The scorer works per correlation. So appending each member's already
+/// sorted lines is not an approximation of a merge; a merge would be answering
+/// a question nothing asks, and would carry an ordering assumption of exactly
+/// the kind that has been wrong twice in this codebase.
+///
+/// What DOES accumulate across members is the per-correlation trace and the
+/// marker ledger, because admission is judged over the whole selection. Those
+/// are small — sequence pairs per correlation, not events — so accumulating
+/// them does not reintroduce the bound this avoids.
+pub fn pull_recordings(
+    cfg: &S3Config,
+    recording_ids: &[&str],
+    dest: &Path,
+) -> Result<(IngestReport, Vec<deja_compactor::SessionManifest>), String> {
+    if recording_ids.is_empty() {
+        return Err("no recordings named for this pull".to_owned());
+    }
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -678,35 +1125,79 @@ pub fn pull_recording(
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
-    for (_, _, _, line) in &collated.events {
-        out.write_all(line.as_bytes())
-            .and_then(|_| out.write_all(b"\n"))
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+
+    let mut manifests: Vec<deja_compactor::SessionManifest> =
+        Vec::with_capacity(recording_ids.len());
+    let mut tally = PullTally::default();
+
+    for recording_id in recording_ids {
+        // A REPLAY READS THE TAPE STORE AND NEVER WRITES IT.
+        //
+        // This used to seal an unsealed member right here, by calling
+        // `compact_session` — which writes `sessions/v1/*`. The replay Job's
+        // role is deliberately least-privilege, so a group holding one unsealed
+        // member died with a 403 naming a member nobody had asked about. Five
+        // runs failed that way on one day.
+        //
+        // The permission is the visible half. The other is why this is not
+        // merely a permissions bug: with credentials that allowed it, a replay
+        // would SEAL a recording the sealer has not judged quiescent — a run
+        // altering the evidence it is judged against, and fixing a tape that
+        // may still be being written. Sealing belongs to the job that is
+        // allowed to write tapes and runs on its own schedule.
+        //
+        // The denial does not even fail fast: the object store retries with
+        // backoff, several multipart pieces at a time, so a read becomes a
+        // hang. One recording spent 3,589s there and never reached stage 2.
+        //
+        // The sibling `pull_recording_from_prefix` had promote-on-pull removed
+        // for exactly these reasons and says so at length. This arm did not, so
+        // one half of the puller obeyed a stated rule and the other did not.
+        //
+        // Refusing rather than reading the landing here is deliberate. Only the
+        // GROUP path reaches this function — a single unsealed recording is
+        // short-circuited to the prefix rescan before it gets here — and a
+        // group whose day is not fully sealed is a day that is not ready, which
+        // is what both the dashboard and the pipeline already require before
+        // they offer one. A partial day replayed as if whole would report a
+        // verdict over a denominator that moves.
+        let Some(manifest) = deja_compactor::read_manifest(cfg, recording_id)? else {
+            return Err(format!(
+                "{recording_id} is part of this selection but is not sealed yet, and a replay \
+                 must not seal it — sealing writes the tape store, which a replay may not do \
+                 and is not permitted to. Wait for the sealer to reach it (it runs every 30 \
+                 minutes), or name a day whose recordings are all sealed."
+            ));
+        };
+        // Scoped so the lines, the joined bytes and the parsed events are all
+        // released before the next member is read. Without this the peak is the
+        // sum again and the bound above is a comment rather than a property.
+        {
+            let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
+            let chunk = lines.join("\n").into_bytes();
+            drop(lines);
+            let mut collated = collate(&[chunk]);
+            // Concatenation is sound for ORDER — see above — but not for
+            // IDENTITY: each member counts from zero, so the streams are placed
+            // end to end before a byte is written.
+            tally.renumbering.apply(recording_id, &mut collated)?;
+            for (_, _, _, line) in &collated.events {
+                out.write_all(line.as_bytes())
+                    .and_then(|_| out.write_all(b"\n"))
+                    .map_err(|e| format!("write {}: {e}", dest.display()))?;
+            }
+            tally.absorb(&manifest.counts, collated);
+        }
+        manifests.push(manifest);
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
 
-    let report = IngestReport {
-        prefix: deja_compactor::layout::session_root(recording_id),
-        landing_objects: manifest.counts.landing_objects,
-        lines_in: collated.lines_in,
-        // The manifest's own duplicates were dropped when the session was
-        // sealed, so they are outside this pass's line accounting and are
-        // reported separately from what collate saw.
-        duplicates_dropped: manifest.counts.duplicates_dropped + collated.drops.duplicates,
-        events_out: collated.events.len(),
-        correlations: manifest.counts.correlations,
-        sealed: true,
-        markers_dropped: collated.drops.markers,
-        non_envelope_dropped: collated.drops.non_envelope,
-        unparseable_dropped: collated.drops.unparseable,
-        // The compactor skips marker lines when it builds a session, so a
-        // sealed session carries no producer audit trail and the certificate
-        // below rests on the event stream alone. Admission does not need the
-        // markers — they only tell an admitted gap from an admitted loss.
-        delivery: certify(collated.per_correlation, collated.markers),
-    };
+    let report = tally.finish(
+        recording_ids.iter().map(|id| (*id).to_owned()).collect(),
+        &manifests,
+    );
     report.report();
-    Ok((report, manifest))
+    Ok((report, manifests))
 }
 
 /// Sessions discovered in a prefix scan: `(session_id, envelope line count)`,
@@ -744,8 +1235,8 @@ pub fn pull_recording_from_prefix(
     let keys = deja_compactor::list_objects(cfg, prefix)?;
     if keys.is_empty() {
         return Err(format!(
-            "no objects under s3://{}/{prefix} — check the path (and that the recording window landed)",
-            cfg.bucket
+            "no objects under {} — check the path (and that the recording window landed)",
+            cfg.uri(prefix)
         ));
     }
 
@@ -794,8 +1285,8 @@ pub fn pull_recording_from_prefix(
         Some(want) => {
             if !by_session.contains_key(want) {
                 return Err(format!(
-                    "session '{want}' not found under s3://{}/{prefix}; sessions seen: {}",
-                    cfg.bucket,
+                    "session '{want}' not found under {}; sessions seen: {}",
+                    cfg.uri(prefix),
                     describe_sessions(&seen)
                 ));
             }
@@ -805,14 +1296,14 @@ pub fn pull_recording_from_prefix(
             1 => seen[0].0.clone(),
             0 => {
                 return Err(format!(
-                    "objects under s3://{}/{prefix} contained no envelope lines",
-                    cfg.bucket
+                    "objects under {} contained no envelope lines",
+                    cfg.uri(prefix)
                 ))
             }
             _ => {
                 return Err(format!(
-                    "multiple sessions under s3://{}/{prefix} — pick one as the recording id: {}",
-                    cfg.bucket,
+                    "multiple sessions under {} — pick one as the recording id: {}",
+                    cfg.uri(prefix),
                     describe_sessions(&seen)
                 ))
             }
@@ -821,7 +1312,11 @@ pub fn pull_recording_from_prefix(
 
     let lines = by_session.remove(&resolved).unwrap_or_default();
     let chunk = lines.join("\n").into_bytes();
-    let collated = collate(&[chunk]);
+    let mut collated = collate(&[chunk]);
+    // One session is normally one process, so this is a no-op that leaves the
+    // bytes alone; a session two processes wrote into is placed like a pull.
+    let mut renumbering = Renumbering::default();
+    renumbering.apply(&resolved, &mut collated)?;
 
     let dest = dest_for(&resolved);
     let dest = dest.as_path();
@@ -860,7 +1355,15 @@ pub fn pull_recording_from_prefix(
         .unwrap_or_default();
 
     let report = IngestReport {
-        prefix: format!("s3://{}/{prefix}", cfg.bucket),
+        // This path names an ARBITRARY landing prefix rather than a session
+        // root — it is the deployed-aggregator rescan, not a sealed pull — so
+        // the prefix is that bucket URI and `members` still names the one
+        // session the scan resolved out of it.
+        prefix: cfg.uri(prefix),
+        members: vec![resolved.clone()],
+        // One session, resolved whole: nothing was left out.
+        excluded_members: Vec::new(),
+        member_seals: Vec::new(),
         landing_objects: session_objects,
         lines_in: collated.lines_in,
         duplicates_dropped: collated.drops.duplicates,
@@ -876,6 +1379,7 @@ pub fn pull_recording_from_prefix(
         non_envelope_dropped: collated.drops.non_envelope,
         unparseable_dropped: collated.drops.unparseable,
         delivery: certify(collated.per_correlation, collated.markers),
+        renumbered: renumbering.into_report(),
     };
     report.report();
     Ok((report, resolved, seen))
@@ -1120,6 +1624,154 @@ mod tests {
         )
     }
 
+    fn a_member(lines: &[String]) -> Collated {
+        let chunk = lines.join("\n").into_bytes();
+        collate(&[chunk])
+    }
+
+    fn counts_of(objects: usize, correlations: usize, dupes: usize) -> deja_compactor::Counts {
+        deja_compactor::Counts {
+            landing_objects: objects,
+            lines_in: 0,
+            events: 0,
+            duplicates_dropped: dupes,
+            correlations,
+            graph_nodes: 0,
+        }
+    }
+
+    /// Several members add up. The counts a caller reads must describe the whole
+    /// selection, not the last member folded in — a pull of a deployment's day
+    /// that reported one pod's numbers would understate it by eighty-one
+    /// eighty-seconds and look entirely plausible doing it.
+    /// `prefix` stays a PATH whatever the member count, and `members` is what
+    /// says one session from a selection.
+    ///
+    /// This field is serialised beside the events file and folded into the
+    /// catalog row, so it has readers outside this repo that a grep here cannot
+    /// enumerate. Putting a count in it — "82 recordings" — would have read as
+    /// fine in the log line it currently feeds and broken anything treating it
+    /// as a path: a value-shape change hiding inside an unchanged type.
+    #[test]
+    fn the_prefix_stays_a_path_and_members_says_how_many() {
+        let one = PullTally::default().finish(vec!["rec-a".to_owned()], &[]);
+        assert_eq!(one.prefix, "sessions/v1/rec-a", "one member names its root");
+        assert_eq!(one.members, vec!["rec-a".to_owned()]);
+
+        let many = PullTally::default().finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &[]);
+        assert_eq!(
+            many.prefix, "sessions/v1",
+            "a selection names the root they share, not a count"
+        );
+        // The property, stated properly. "not a count" cannot be checked by
+        // looking for digits — `sessions/v1` has one — so check the thing that
+        // actually matters: the reported prefix really is a PREFIX of where
+        // every member lives. A count could never satisfy that.
+        for m in &many.members {
+            let root = deja_compactor::layout::session_root(m);
+            assert!(
+                root.starts_with(&many.prefix),
+                "{root} does not live under the reported prefix {}",
+                many.prefix
+            );
+        }
+        assert_eq!(many.members.len(), 2, "the member list carries the truth");
+    }
+
+    #[test]
+    fn a_multi_member_pull_sums_its_members() {
+        let mut tally = PullTally::default();
+        tally.absorb(
+            &counts_of(3, 2, 1),
+            a_member(&[
+                at_boundary("i1", 0, "c1", 0, "http_incoming"),
+                at_boundary("i1", 1, "c1", 1, "db"),
+            ]),
+        );
+        tally.absorb(
+            &counts_of(5, 4, 2),
+            a_member(&[at_boundary("i2", 0, "c2", 0, "http_incoming")]),
+        );
+
+        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &[]);
+        assert_eq!(report.landing_objects, 8, "3 + 5");
+        assert_eq!(report.correlations, 6, "2 + 4");
+        assert_eq!(report.events_out, 3, "2 + 1");
+        assert_eq!(report.lines_in, 3);
+        assert_eq!(
+            report.duplicates_dropped, 3,
+            "the members' own sealed duplicates, 1 + 2, carried through"
+        );
+    }
+
+    fn sealed_as(
+        session_id: &str,
+        seal_id: &str,
+        correlations: usize,
+    ) -> deja_compactor::SessionManifest {
+        serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "session_id": session_id,
+            "status": "sealed",
+            "seal_id": seal_id,
+            "capture_mode": "session",
+            "envelope_schema_versions": [1],
+            "event_schema_versions": [1],
+            "code": [],
+            "instances": [],
+            "counts": {
+                "landing_objects": 3, "lines_in": 9, "events": 7,
+                "duplicates_dropped": 0, "correlations": correlations
+            },
+            "data_parts": [],
+            "created_unix_ms": 42
+        }))
+        .expect("a well-formed manifest")
+    }
+
+    /// The report names the seal each member was read from, in member order:
+    /// the name alone does not identify the content once a recording re-seals.
+    #[test]
+    fn a_pull_records_the_seal_each_member_was_read_from() {
+        let manifests = [sealed_as("rec-a", "aaaa", 2), sealed_as("rec-b", "bbbb", 5)];
+        let report =
+            PullTally::default().finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &manifests);
+        let seals: Vec<_> = report
+            .member_seals
+            .iter()
+            .map(|s| (s.recording_id.as_str(), s.seal_id.as_str(), s.correlations))
+            .collect();
+        assert_eq!(seals, [("rec-a", "aaaa", 2), ("rec-b", "bbbb", 5)]);
+        assert_eq!(report.member_seals[0].sealed_unix_ms, 42);
+    }
+
+    /// Correlations from different members both survive into admission. They
+    /// cannot collide — one is allocated inside one process for one request —
+    /// so the union must keep both, and admission is judged over the whole
+    /// selection rather than over whichever member happened to be last.
+    #[test]
+    fn correlations_from_every_member_reach_admission() {
+        let mut tally = PullTally::default();
+        tally.absorb(
+            &counts_of(1, 1, 0),
+            a_member(&[at_boundary("i1", 0, "c1", 0, "http_incoming")]),
+        );
+        tally.absorb(
+            &counts_of(1, 1, 0),
+            a_member(&[at_boundary("i2", 0, "c2", 0, "http_incoming")]),
+        );
+
+        // The precondition: two DISTINCT correlations went in, so this tests the
+        // union rather than a single member surviving.
+        assert_eq!(tally.per_correlation.len(), 2, "both correlations held");
+
+        let report = tally.finish(vec!["rec-a".to_owned(), "rec-b".to_owned()], &[]);
+        assert_eq!(
+            report.delivery.correlations_checked, 2,
+            "admission saw both members' correlations, not just the last"
+        );
+    }
+
     #[test]
     fn collate_unwraps_dedups_and_sorts() {
         // Two objects, out-of-order gseq, one duplicate across objects, one
@@ -1222,6 +1874,9 @@ mod tests {
         assert_eq!(drops.non_envelope, 2); // the junk line and the payload-less envelope
 
         let report = IngestReport {
+            members: vec!["rec-test".to_owned()],
+            excluded_members: Vec::new(),
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in,
@@ -1233,15 +1888,58 @@ mod tests {
             non_envelope_dropped: drops.non_envelope,
             unparseable_dropped: drops.unparseable,
             delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
         };
         assert!(report.balances(), "{}", report.accounting());
         assert!(!report.accounting().contains("UNACCOUNTED"));
+    }
+
+    /// A partial run has to say so in the artifact, not only in a log line.
+    ///
+    /// The exclusion was carried in a local, printed to stderr and into the
+    /// ingest log, and then dropped — so the persisted report described a
+    /// subset of a day exactly as it describes a whole one. A consumer reading
+    /// the artifact could not tell the two apart, and prose in a log is not
+    /// something it can check.
+    #[test]
+    fn the_report_names_what_a_partial_pull_left_out() {
+        let report = IngestReport {
+            members: vec!["rec-sealed".to_owned()],
+            excluded_members: vec!["rec-still-open".to_owned()],
+            member_seals: Vec::new(),
+            prefix: "s3://b/p".into(),
+            landing_objects: 1,
+            lines_in: 0,
+            duplicates_dropped: 0,
+            events_out: 0,
+            correlations: 0,
+            sealed: false,
+            markers_dropped: 0,
+            non_envelope_dropped: 0,
+            unparseable_dropped: 0,
+            delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
+        };
+        let json = serde_json::to_value(&report).expect("the report serialises");
+        assert_eq!(
+            json["excluded_members"],
+            serde_json::json!(["rec-still-open"]),
+            "the artifact a reader acts on has to carry the exclusion"
+        );
+        assert_eq!(
+            json["members"],
+            serde_json::json!(["rec-sealed"]),
+            "beside what was drawn from, not instead of it"
+        );
     }
 
     #[test]
     fn an_unbalanced_report_says_so() {
         // The assertion has to be able to fail, or it is decoration.
         let report = IngestReport {
+            members: vec!["rec-test".to_owned()],
+            excluded_members: Vec::new(),
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 139_916,
@@ -1253,6 +1951,7 @@ mod tests {
             non_envelope_dropped: 0,
             unparseable_dropped: 0,
             delivery: DeliveryCertificate::default(),
+            renumbered: Vec::new(),
         };
         assert!(!report.balances());
         assert!(report.accounting().contains("UNACCOUNTED: 97309"));
@@ -1680,6 +2379,269 @@ mod tests {
         };
         assert!(!cert.balances());
         assert!(cert.describe().contains("UNACCOUNTED: 29"));
+    }
+
+    /// A graph node with the id fields a renumbering must move, in the
+    /// producer's envelope shape.
+    fn graph_envelope_with(rid: &str, gseq: u64, node_id: u64, extra: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"artifact_type":"deja_graph_node","instance_id":"router-h-1","recording_run_id":"{rid}","capture":{{"mode":"session","session_id":"{rid}"}},"node":{{"recording_run_id":"{rid}","global_sequence":{gseq},"node_id":{node_id}{extra},"span_name":"payments_create"}}}}"#
+        )
+    }
+
+    fn line_of(collated: &Collated, run: &str, kind: &str, index: usize) -> serde_json::Value {
+        let raw = &collated
+            .events
+            .iter()
+            .filter(|(r, k, _, _)| r.as_deref() == Some(run) && *k == kind)
+            .nth(index)
+            .expect("record present")
+            .3;
+        serde_json::from_str(raw).expect("record is json")
+    }
+
+    /// Two recorder processes both count events and graph nodes from zero. On
+    /// one tape their numbers collide, and everything downstream that keys a
+    /// recorded event by its bare sequence answers with the wrong process's
+    /// event. Placing the second stream after the first keeps every id unique
+    /// and every reference (event -> node, node -> parent) pointing where it did.
+    /// A stream split across members, with ANOTHER stream's member between its
+    /// two halves, cannot be placed without overlapping — and must say so.
+    ///
+    /// The offsets are high-water marks taken per MEMBER, so a stream's range
+    /// is reserved from the first member that carries it. Its continuation
+    /// resumes the producer's counter exactly where it stopped, which is
+    /// precisely the range already handed to whatever was placed next. Before
+    /// the reservation check this wrote a tape where two streams shared
+    /// sequences 2 and 3 — the collision the renumbering exists to remove,
+    /// reintroduced by the renumbering itself, with nothing said anywhere.
+    ///
+    /// Unreachable as the deployment stands: `recording_run_id` falls back to
+    /// `run-{boot_ns}` per process and `DEJA_RUN_ID` is set only for the replay
+    /// runner, so one process is one session is one member. It is asserted
+    /// rather than deleted because `apply` deliberately supports a resumed
+    /// stream, and support that silently corrupts is worse than none.
+    #[test]
+    fn a_stream_resumed_after_another_was_placed_is_refused_not_overlapped() {
+        let member = |rid: &str, lo: u64, hi: u64| {
+            a_member(&[
+                envelope(rid, lo, r#","graph_node_id":3"#),
+                envelope(rid, hi, r#","graph_node_id":7"#),
+                graph_envelope_with(rid, lo, 3, r#","parent_id":null,"causal_parent_ids":[]"#),
+                graph_envelope_with(rid, hi, 7, r#","parent_id":3,"causal_parent_ids":[3]"#),
+            ])
+        };
+        let mut first = member("rA", 0, 1);
+        let mut other = member("rB", 0, 1);
+        // rA's producer counter CONTINUES from 1 — which is the range rB now
+        // holds. This is the ordinary shape of a continuation, not a contrived
+        // one: a counter that resumed anywhere else would have skipped.
+        let mut resumed = member("rA", 2, 3);
+
+        let mut renumbering = Renumbering::default();
+        renumbering
+            .apply("member-1", &mut first)
+            .expect("first placement");
+        renumbering
+            .apply("member-2", &mut other)
+            .expect("second stream");
+        let refused = renumbering
+            .apply("member-3", &mut resumed)
+            .expect_err("a resumed stream that would overlap must be refused");
+        assert!(
+            refused.contains("rA") && refused.contains("overlap") && refused.contains("member-3"),
+            "the refusal must name the stream, the MEMBER to exclude, and what it \
+             would otherwise do: {refused}"
+        );
+    }
+
+    /// The legitimate resume — same stream, consecutive members, nothing placed
+    /// in between — still works. Without this the check above is satisfied by a
+    /// guard that simply refuses every resumed stream.
+    #[test]
+    fn a_stream_resumed_with_nothing_placed_above_it_just_extends() {
+        let member = |rid: &str, lo: u64, hi: u64| {
+            a_member(&[
+                envelope(rid, lo, r#","graph_node_id":3"#),
+                envelope(rid, hi, r#","graph_node_id":7"#),
+            ])
+        };
+        let mut first = member("rA", 0, 1);
+        let mut resumed = member("rA", 2, 3);
+        let mut after = member("rB", 0, 1);
+
+        let mut renumbering = Renumbering::default();
+        renumbering
+            .apply("member-1", &mut first)
+            .expect("first placement");
+        renumbering
+            .apply("member-3", &mut resumed)
+            .expect("a stream may grow while it is the highest one placed");
+        renumbering
+            .apply("member-3", &mut after)
+            .expect("the next stream starts above the grown range");
+
+        let report = renumbering.into_report();
+        let b = report
+            .iter()
+            .find(|s| s.recording_run_id == "rB")
+            .expect("rB is in the report");
+        assert_eq!(
+            b.event_offset, 4,
+            "rB must start above rA's GROWN extent (0..=3), not its first reservation"
+        );
+    }
+
+    /// The refusal must cover the NODE dimension, not only event sequences.
+    ///
+    /// A resumed member can sit entirely inside its event reservation while its
+    /// graph node ids run past the node reservation — node ids are allocated on
+    /// span close and events on boundary entry, so the two extents grow at
+    /// different rates and either can be the one that overflows. The guard
+    /// checks events FIRST and returns early, so a check covering only that
+    /// dimension still passes the interleaved test above while writing
+    /// colliding node ids — which `node_offset` shifts into `node_id`,
+    /// `parent_id`, `causal_parent_ids` and every event's `graph_node_id`.
+    #[test]
+    fn a_resume_that_overflows_only_its_node_reservation_is_refused_too() {
+        let member = |rid: &str, lo: u64, hi: u64, n_lo: u64, n_hi: u64| {
+            a_member(&[
+                envelope(rid, lo, &format!(r#","graph_node_id":{n_lo}"#)),
+                envelope(rid, hi, &format!(r#","graph_node_id":{n_hi}"#)),
+                graph_envelope_with(rid, lo, n_lo, r#","parent_id":null,"causal_parent_ids":[]"#),
+                graph_envelope_with(
+                    rid,
+                    hi,
+                    n_hi,
+                    &format!(r#","parent_id":{n_lo},"causal_parent_ids":[{n_lo}]"#),
+                ),
+            ])
+        };
+        let mut first = member("rA", 0, 1, 3, 7);
+        let mut other = member("rB", 0, 1, 3, 7);
+        // rA resumes INSIDE its event reservation — sequences 0..=1 is all it
+        // reserved and all this member uses — but its graph counter ran on.
+        let mut resumed = member("rA", 0, 1, 20, 21);
+
+        let mut renumbering = Renumbering::default();
+        renumbering
+            .apply("member-1", &mut first)
+            .expect("first placement");
+        renumbering
+            .apply("member-2", &mut other)
+            .expect("second stream");
+        let refused = renumbering
+            .apply("member-3", &mut resumed)
+            .expect_err("a resume overflowing only its NODE reservation must be refused");
+        assert!(
+            refused.contains("rA") && refused.contains("node id"),
+            "the refusal must name the stream and the node dimension: {refused}"
+        );
+    }
+
+    #[test]
+    fn two_streams_that_both_count_from_zero_are_placed_end_to_end() {
+        let stream = |rid: &str| {
+            a_member(&[
+                envelope(rid, 0, r#","graph_node_id":3"#),
+                envelope(rid, 1, r#","graph_node_id":7"#),
+                graph_envelope_with(rid, 0, 3, r#","parent_id":null,"causal_parent_ids":[]"#),
+                graph_envelope_with(rid, 1, 7, r#","parent_id":3,"causal_parent_ids":[3]"#),
+            ])
+        };
+        let mut first = stream("r1");
+        let mut second = stream("r2");
+        let first_bytes: Vec<String> = first.events.iter().map(|e| e.3.clone()).collect();
+
+        let mut renumbering = Renumbering::default();
+        renumbering
+            .apply("member-1", &mut first)
+            .expect("first member places cleanly");
+        renumbering
+            .apply("member-2", &mut second)
+            .expect("second stream places above the first");
+
+        let untouched: Vec<String> = first.events.iter().map(|e| e.3.clone()).collect();
+        assert_eq!(
+            untouched, first_bytes,
+            "the first stream keeps the producer's bytes"
+        );
+
+        // r1's events end at 1 and its nodes at 7, so r2 starts at 2 and 8.
+        let event = line_of(&second, "r2", "boundary_event", 1);
+        assert_eq!(event["global_sequence"], 3, "1 + 2");
+        assert_eq!(event["graph_node_id"], 15, "7 + 8");
+        let node = line_of(&second, "r2", "graph_node", 1);
+        assert_eq!(node["node_id"], 15);
+        assert_eq!(node["parent_id"], 11, "the parent moved with its child");
+        assert_eq!(node["causal_parent_ids"], serde_json::json!([11]));
+        assert_eq!(
+            node["global_sequence"], 9,
+            "the node stream shares the node offset"
+        );
+        let root = line_of(&second, "r2", "graph_node", 0);
+        assert!(root["parent_id"].is_null(), "an absent parent stays absent");
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .filter(|(_, k, _, _)| *k == "boundary_event")
+                .map(|e| e.2)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the collated key follows the rewritten record"
+        );
+
+        let report = renumbering.into_report();
+        assert_eq!(report.len(), 2);
+        assert_eq!(
+            (
+                report[1].recording_run_id.as_str(),
+                report[1].event_offset,
+                report[1].node_offset
+            ),
+            ("r2", 2, 8)
+        );
+        assert_eq!((report[1].events, report[1].graph_nodes), (2, 2));
+    }
+
+    /// One process, one stream: nothing to place, nothing rewritten, and the
+    /// report does not mention it — a single-process tape is what it always was.
+    #[test]
+    fn a_single_stream_tape_is_written_byte_for_byte() {
+        let mut member = a_member(&[
+            envelope("r1", 4, r#","graph_node_id":"9225624661302181899""#),
+            graph_envelope("r1", 2),
+        ]);
+        let before: Vec<String> = member.events.iter().map(|e| e.3.clone()).collect();
+        let mut renumbering = Renumbering::default();
+        renumbering
+            .apply("member-1", &mut member)
+            .expect("a single member places cleanly");
+        let after: Vec<String> = member.events.iter().map(|e| e.3.clone()).collect();
+        assert_eq!(after, before);
+        assert!(renumbering.into_report().is_empty());
+    }
+
+    /// The pipeline stringifies large u64s; a stringified anchor is still an
+    /// anchor and moves with its node.
+    #[test]
+    fn a_stringified_anchor_is_shifted_like_a_number() {
+        let mut first = a_member(&[envelope("r1", 0, ""), graph_envelope("r1", 4)]);
+        let mut second = a_member(&[
+            envelope("r2", 0, r#","graph_node_id":"4""#),
+            graph_envelope("r2", 4),
+        ]);
+        let mut renumbering = Renumbering::default();
+        renumbering
+            .apply("member-1", &mut first)
+            .expect("first member places cleanly");
+        renumbering
+            .apply("member-2", &mut second)
+            .expect("second stream places above the first");
+        let event = line_of(&second, "r2", "boundary_event", 0);
+        assert_eq!(event["graph_node_id"], 9, "4 + (4 + 1)");
+        assert_eq!(line_of(&second, "r2", "graph_node", 0)["node_id"], 9);
     }
 
     #[test]

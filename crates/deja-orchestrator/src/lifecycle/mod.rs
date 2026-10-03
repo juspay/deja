@@ -377,6 +377,23 @@ CMD ["-f", "/local/config/docker_compose.toml"]
 "#;
 
 fn set_status(root: &HarnessRoot, run: &mut Run, status: RunStatus, failure: Option<String>) {
+    // The FINAL stage has no successor to report it, and it is the one that
+    // matters: a run that spends its time in `[6/6] scoring` looks identical
+    // from the outside to one that spends it in `[5/6] driving`. Report it here,
+    // where every terminal transition passes, so no stage goes unmeasured.
+    if matches!(status, RunStatus::Completed | RunStatus::Failed) {
+        if let Some(last) = run.stage.clone().filter(|_| run.stage_updated_ms > 0) {
+            let elapsed_ms = crate::now_ms().saturating_sub(run.stage_updated_ms);
+            let mut line = format!(
+                "run {} {status:?} — final stage `{last}` took {elapsed_ms} ms",
+                run.run_id
+            );
+            if let Some(memory) = resident_fact() {
+                line = format!("{line}; {memory}");
+            }
+            eprintln!("lifecycle: {line}");
+        }
+    }
     run.status = status;
     run.failure_reason = failure;
     if let Err(e) = write_json(&root.run_path(&run.run_id), run) {
@@ -384,6 +401,104 @@ fn set_status(root: &HarnessRoot, run: &mut Run, status: RunStatus, failure: Opt
             "lifecycle: failed to persist status for {}: {e}",
             run.run_id
         );
+    }
+}
+
+/// This process's current and peak resident set, in MiB, from
+/// `/proc/self/status`. `None` where that file cannot be read.
+///
+/// `VmHWM` is the kernel's own high-water mark, which is the whole reason to
+/// read it here rather than trust the cluster's metrics. A replay runner that
+/// dies in scoring allocates its peak inside about fourteen seconds, and
+/// cadvisor scrapes every fifteen to thirty, so the external series reports the
+/// plateau the run sat at for minutes and never the spike that killed it. Five
+/// separate investigations read that plateau and concluded memory was not the
+/// problem. A process that reads its own counter cannot miss it.
+pub(crate) fn resident_mib() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    };
+    Some((field("VmRSS:")?, field("VmHWM:")?))
+}
+
+/// The resident-set reading as one log-line fact, or `None` when unavailable —
+/// a missing measurement never changes what a line says about the run itself.
+fn resident_fact() -> Option<String> {
+    let (rss, peak) = resident_mib()?;
+    Some(format!("rss {rss} MiB, peak {peak} MiB"))
+}
+
+/// Reports this process's resident set every two seconds until dropped.
+///
+/// Stage boundaries bracket a stage; they cannot describe what happens inside
+/// one. Scoring allocates its entire input set in a single burst and, when that
+/// burst is fatal, the stage has no closing boundary at all — the last line the
+/// run ever writes is the one announcing the stage it died in. This leaves a
+/// curve behind instead, so a run that is killed still says how far it got and
+/// how fast it got there.
+struct ResidentTrace {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How much the resident set must grow before the trace says so again.
+///
+/// Small enough that a fatal climb — better than a gigabyte inside a few
+/// seconds — still prints as a curve rather than two endpoints, and large
+/// enough that a settled process stops repeating itself.
+const TRACE_GROWTH_MIB: u64 = 64;
+
+impl ResidentTrace {
+    fn start(label: &'static str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("deja-resident-trace".to_owned())
+            .spawn(move || {
+                let mut reported: Option<u64> = None;
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Only growth is worth a line. A run that is climbing says
+                    // so on every sample; a run that has settled says it once
+                    // and then stops, which is the difference between a curve
+                    // and a log full of the same number. The threshold is what
+                    // makes this quiet enough to leave on: the scoring stage of
+                    // a healthy run now costs a handful of lines rather than
+                    // one every two seconds for as long as it takes.
+                    if let Some((rss, peak)) = resident_mib() {
+                        let grew = reported
+                            .is_none_or(|last| rss.saturating_sub(last) >= TRACE_GROWTH_MIB);
+                        if grew {
+                            eprintln!("lifecycle: {label} rss {rss} MiB, peak {peak} MiB");
+                            reported = Some(rss);
+                        }
+                    }
+                    // Sliced so dropping the trace is prompt rather than
+                    // costing a full sampling interval on every run.
+                    for _ in 0..20 {
+                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for ResidentTrace {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -397,11 +512,40 @@ fn set_stage(
     total: u32,
     label: &str,
 ) {
+    // How long the PREVIOUS stage took, reported as this one begins.
+    //
+    // Without it a run that takes 49 minutes says only which stage it is in, and
+    // nobody can tell a slow render from a slow seed from a slow drive without
+    // reading pod logs that carry no timestamps and pool every pod in the app.
+    // That cost this project a day of hypotheses about where the time went, and
+    // the answer was always one subtraction away. `stage_updated_ms` was already
+    // being written; only the arithmetic was missing.
+    let previous = run
+        .stage
+        .clone()
+        .filter(|_| run.stage_updated_ms > 0)
+        .map(|prev| (prev, crate::now_ms().saturating_sub(run.stage_updated_ms)));
+
     run.step = step;
     run.steps_total = total;
     run.stage = Some(label.to_owned());
     run.stage_updated_ms = crate::now_ms();
-    eprintln!("lifecycle: [{step}/{total}] {label}");
+    let mut facts: Vec<String> = Vec::new();
+    if let Some((prev_label, elapsed_ms)) = previous {
+        facts.push(format!("previous `{prev_label}` took {elapsed_ms} ms"));
+    }
+    // The baseline belongs on stage 1's line too, even though it has no
+    // predecessor to time: every later peak is read against it.
+    if let Some(memory) = resident_fact() {
+        facts.push(memory);
+    }
+    if facts.is_empty() {
+        eprintln!("lifecycle: [{step}/{total}] {label}");
+    } else {
+        let line = format!("[{step}/{total}] {label} ({})", facts.join("; "));
+        eprintln!("lifecycle: {line}");
+        ctx.log("timing", &line);
+    }
     ctx.stage(label, step, total);
     if let Err(e) = write_json(&root.run_path(&run.run_id), run) {
         eprintln!("lifecycle: failed to persist stage for {}: {e}", run.run_id);
@@ -646,12 +790,11 @@ fn drive_replay(
     // Render the lookup table (whole-document JSON; round-trips through both the
     // candidate's LocalFileLookupSource and the divergence detector).
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording, &recording_id, 1)
-        .map_err(|e| format!("render lookup table: {e}"))?;
-    write_json(&root.lookup_table_path(&run.run_id), &table)
-        .map_err(|e| format!("write lookup table: {e}"))?;
-    if table.entries.is_empty() {
-        return Err("rendered lookup table is empty".to_string());
+    let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
+    ctx.log("rendering lookup table", &rendered.report);
+    let suspect = render_suspect(&recording_id, &rendered);
+    if let Some(note) = &suspect {
+        ctx.log("rendering lookup table", note);
     }
 
     set_status(root, run, RunStatus::Building, None);
@@ -692,7 +835,8 @@ fn drive_replay(
     wait_health(
         &format!("http://127.0.0.1:{}/health", demo.replay_port),
         Duration::from_secs(240),
-    )?;
+    )
+    .map_err(|e| with_suspect(e, suspect.as_deref()))?;
 
     set_stage(
         root,
@@ -750,6 +894,7 @@ fn drive_replay(
         &run.run_id,
         &scope,
     )?;
+    settle_observed_stream(root, ctx, &run.run_id);
 
     // Compose: the orchestrator serves artifacts from its own state dir.
     score_and_register(root, run, ctx, &recording_id, total, &ArtifactSink::Local)
@@ -768,10 +913,22 @@ fn stage_resolve_recording(
     ctx: &StoreCtx,
     total: u32,
 ) -> Result<String, String> {
+    // A GROUP wins over a single id when both are set, and says so rather than
+    // resolving one silently. Naming both is a caller that has not decided, and
+    // discovering which won by reading the tape afterwards is the failure this
+    // whole area keeps producing.
+    if run.spec.recording_group.is_some() && run.spec.recording_id.is_some() {
+        return Err(
+            "both recording_group and recording_id are set; name a deployment's day or one \
+             recording, not both"
+                .to_owned(),
+        );
+    }
     let wanted = run
         .spec
-        .recording_id
+        .recording_group
         .clone()
+        .or_else(|| run.spec.recording_id.clone())
         .or_else(|| run.recording_id.clone());
     let s3_source = run.spec.s3_source.clone();
     let recording_id = match &s3_source {
@@ -1136,27 +1293,6 @@ fn resolve_correlation_filter(
     Ok(())
 }
 
-/// Final stage (shared): score the run, report the verdict, register the
-/// The replay-run stream artifacts [`score_and_register`] publishes, as
-/// `(kind, s3-filename)`. One list so the sink loop and the DB-constraint
-/// coverage test stay in agreement. `observed` also carries the replay-side
-/// execution-graph nodes (`DejaRecord::GraphNode`).
-const REPLAY_STREAM_ARTIFACTS: [(&str, &str); 6] = [
-    ("lookup_table", "lookup_table.jsonl"),
-    ("observed", "observed.jsonl"),
-    ("http_diffs", "http_diffs.jsonl"),
-    ("scorecard", "scorecard.json"),
-    ("call_ledger", "call_ledger.jsonl"),
-    // The seed certificate is the run's own account of what seeding did —
-    // planned/materialized/failed per entry, with readback. It used to be
-    // registered with the runner pod's LOCAL path (never uploaded), so on k8s
-    // the one artifact that explains a seed-shaped divergence was unreadable
-    // the moment the pod died. It publishes like every other stream; the same
-    // prefix already carries the full lookup table, so this adds no new kind
-    // of egress.
-    ("seed_certificate", "seed-certificate.json"),
-];
-
 /// Where a run's replay artifacts are published so the dashboard can read them
 /// back AFTER the run. Compose/local: the orchestrator serves them from its own
 /// state dir, so the local path is enough. In-pod: the runner pod is ephemeral,
@@ -1353,6 +1489,299 @@ pub fn extract_record_graph(
     Ok(Some(node_count))
 }
 
+/// Render the run's lookup table, persist it where the candidate reads it, and
+/// return how many entries it carries.
+///
+/// The table itself is deliberately not returned, and that is the whole point
+/// of this function existing rather than the four lines sitting inline. It is
+/// the largest allocation this process makes — a 200 MB table on disk is over a
+/// gigabyte of owned structures once parsed — and it is wanted only long enough
+/// to be written to that file.
+///
+/// Bound in the caller, it was a local of a function that does not return until
+/// the run is over, so Rust kept it alive through seeding, through driving, and
+/// through scoring. Scoring then re-reads the very file written here into a
+/// second, independent copy, because `load_artifacts` takes a path and knows
+/// nothing about a caller that already has one. Both copies were resident at
+/// the same time, for the whole run, to no purpose. Returning a summary means the
+/// caller cannot hold the first one even by accident.
+fn render_and_persist_lookup_table(
+    root: &HarnessRoot,
+    run_id: &str,
+    recording: &crate::scope::ScopedRecording,
+    recording_id: &str,
+) -> Result<RenderedTable, String> {
+    let raw = std::env::var(LOOKUP_TABLE_MAX_BYTES_ENV).ok();
+    let (max_bytes, budget) = describe_lookup_table_budget(raw.as_deref());
+    let persisted = persist_lookup_table_within(
+        root,
+        run_id,
+        recording,
+        recording_id,
+        max_bytes.unwrap_or(u64::MAX),
+    )
+    .map_err(|e| format!("{e} Budget in force: {budget}."))?;
+    let Persisted {
+        entries,
+        identity_entries,
+        legacy_bytes,
+        shared_bytes,
+        shared_only,
+        ..
+    } = persisted;
+    let runner = resident_fact()
+        .map(|fact| format!("; runner {fact}"))
+        .unwrap_or_default();
+    let report = if shared_only {
+        format!(
+            "{entries} entries rendered, and {identity_entries} by identity; \
+             one-result-per-entry table {legacy_bytes} bytes \
+             compact, over the budget ({budget}), so only the shared-results table was written, \
+             {shared_bytes} bytes, within that budget{runner}"
+        )
+    } else {
+        format!(
+            "{entries} entries rendered, and {identity_entries} by identity; \
+             one-result-per-entry table {legacy_bytes} bytes compact \
+             (compared against the budget, {budget}); shared-results table {shared_bytes} \
+             bytes (information only){runner}"
+        )
+    };
+    Ok(RenderedTable {
+        report,
+        event_schema_version: persisted.event_schema_version,
+        shared_only,
+    })
+}
+
+/// What the render wrote.
+#[derive(Debug)]
+struct Persisted {
+    entries: usize,
+    /// Entries addressed by the args' identity, beside the exact ones.
+    identity_entries: usize,
+    legacy_bytes: u64,
+    shared_bytes: u64,
+    event_schema_version: Option<u16>,
+    /// The one-result-per-entry table was over the budget, so only the
+    /// shared-results table was written, at the table's own path.
+    shared_only: bool,
+}
+
+/// What a caller may know about the table it rendered, and nothing it could
+/// hold the table by.
+#[derive(Debug)]
+struct RenderedTable {
+    /// The line the run log records for the render.
+    report: String,
+    event_schema_version: Option<u16>,
+    shared_only: bool,
+}
+
+/// Everything the render gives the runner to suspect if the candidate then
+/// never becomes healthy.
+fn render_suspect(recording_id: &str, rendered: &RenderedTable) -> Option<String> {
+    let shared_only = rendered.shared_only.then(|| {
+        "only the shared-results lookup table was written, because the one-result-per-entry \
+         table was over the budget: a candidate on a deja pin from before shared-results tables \
+         cannot read it and refuses to boot, naming the table on its stderr. Run it on a \
+         candidate whose pin reads shared-results tables, or split its correlation filter into \
+         smaller runs whose tables fit the budget"
+            .to_owned()
+    });
+    let parts: Vec<String> = [
+        schema_suspect(recording_id, rendered.event_schema_version),
+        shared_only,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join("; and "))
+}
+
+/// The cause to suspect when a recording's schema is not the one this runner
+/// writes. A candidate on a deja pin at this runner's schema refuses such a
+/// table at boot, before its logger starts, so the only symptom the runner sees
+/// is a health check that times out. The runner cannot know the candidate's
+/// pin, so this names a suspect rather than refusing.
+fn schema_suspect(recording_id: &str, schema: Option<u16>) -> Option<String> {
+    let current = deja::CURRENT_EVENT_SCHEMA_VERSION;
+    let recorded = match schema {
+        Some(version) if version == current => return None,
+        Some(version) => format!("event schema v{version}"),
+        None => "no declared event schema".to_owned(),
+    };
+    Some(format!(
+        "recording {recording_id} has {recorded} and this runner writes v{current}. If the \
+         candidate's deja pin is at v{current}, it refuses this recording at boot, before its \
+         logger starts (the refusal is on the candidate container's stderr), and the recording \
+         must be re-recorded; a candidate on an older pin is not affected, and times out for \
+         some other reason"
+    ))
+}
+
+/// A health-check failure, with the suspected cause attached when there is one.
+fn with_suspect(error: String, suspect: Option<&str>) -> String {
+    match suspect {
+        Some(suspect) => format!("{error}; suspected cause: {suspect}"),
+        None => error,
+    }
+}
+
+/// Read by the runner, which renders the table; set it on the replay Job
+/// template, beside the candidate's memory limit. Not forwarded from the
+/// orchestrator.
+pub const LOOKUP_TABLE_MAX_BYTES_ENV: &str = "DEJA_LOOKUP_TABLE_MAX_BYTES";
+
+/// The largest lookup table, in compact bytes, a run hands its candidate.
+///
+/// The candidate parses the whole table at boot, so its size, not the number
+/// of correlations, is what runs out of memory. In compact bytes, the largest
+/// table measured to complete at a 1536 MiB candidate limit was 72.30 MB, and
+/// the smallest killed was 96.49 MB, summed from its correlations' measured
+/// bytes. This is the first, rounded up to the next 100 KB: the band between
+/// them is unmeasured, so this is the proven-safe edge, not the limit.
+pub const DEFAULT_LOOKUP_TABLE_MAX_BYTES: u64 = 72_300_000;
+
+/// The budget in force and a sentence saying what decided it, so a value that
+/// did not take effect is visible in the run log.
+fn describe_lookup_table_budget(raw: Option<&str>) -> (Option<u64>, String) {
+    let budget = lookup_table_budget_from(raw);
+    let said = match (raw, budget) {
+        (None, _) => format!("{DEFAULT_LOOKUP_TABLE_MAX_BYTES} bytes (default)"),
+        (Some(v), None) => format!("none ({LOOKUP_TABLE_MAX_BYTES_ENV}={v} disables it)"),
+        (Some(v), Some(max)) if v.trim().parse::<u64>().is_ok() => {
+            format!("{max} bytes ({LOOKUP_TABLE_MAX_BYTES_ENV}={v})")
+        }
+        (Some(v), Some(max)) => format!(
+            "{max} bytes (default; {LOOKUP_TABLE_MAX_BYTES_ENV}={v:?} is not a byte count and \
+             was ignored)"
+        ),
+    };
+    (budget, said)
+}
+
+/// `DEJA_LOOKUP_TABLE_MAX_BYTES` read as a budget: unset or unparseable keeps
+/// the default, and `0` disables the check.
+fn lookup_table_budget_from(raw: Option<&str>) -> Option<u64> {
+    match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(max) => Some(max),
+        None => Some(DEFAULT_LOOKUP_TABLE_MAX_BYTES),
+    }
+}
+
+/// Render, then write the one-result-per-entry table and its shared form, or
+/// only the shared form when the table is over `max_bytes` and the shared form
+/// is not, or refuse when both are over. The same budget bounds both forms: it
+/// was measured on the one-result-per-entry form and is conservative for the
+/// shared one, which has not been measured against a candidate's limit.
+fn persist_lookup_table_within(
+    root: &HarnessRoot,
+    run_id: &str,
+    recording: &crate::scope::ScopedRecording,
+    recording_id: &str,
+    max_bytes: u64,
+) -> Result<Persisted, String> {
+    let table = crate::lookup::render_lookup_table(recording, recording_id)
+        .map_err(|e| format!("render lookup table: {e}"))?;
+    // Compact, not pretty: the candidate holds this whole file in one buffer at
+    // boot, and indentation made it about 2.5x its content. The budget is in
+    // these bytes.
+    let bytes = serde_json::to_vec(&table).map_err(|e| format!("write lookup table: {e}"))?;
+    // Over the budget, a candidate that reads only the one-result-per-entry
+    // table would be killed loading it; a candidate that reads the shared form
+    // loads that instead. So only the shared form is written, if it fits.
+    let shared_only = bytes.len() as u64 > max_bytes;
+    let shared_table = build_shared(&table, &bytes)?;
+    // Sized without being written out, so a refusal costs no more than this.
+    let shared_len = deja::LegacyDigest::of_serialized(&shared_table)
+        .map_err(|e| format!("size shared-results table: {e}"))?
+        .len;
+    if shared_only && shared_len > max_bytes {
+        let correlations = table
+            .entries
+            .iter()
+            .map(|e| e.key.correlation_id.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        return Err(format!(
+            "the lookup table for this run is {} bytes across {correlations} correlation(s), \
+             over the {max_bytes}-byte budget. The candidate loads the whole table at boot \
+             and tables this size have been killed for memory rather than replayed. Table \
+             bytes, not the correlation count, bound a run: replay these correlations as \
+             several smaller runs, each naming a correlation filter. The budget is \
+             {LOOKUP_TABLE_MAX_BYTES_ENV} on the replay Job's runner container. Its \
+             shared-results form, {shared_len} bytes, is over the budget too.",
+            bytes.len()
+        ));
+    }
+    let shared = finish_shared(shared_table, &bytes)?;
+    let legacy_bytes = bytes.len() as u64;
+    let path = root.lookup_table_path(run_id);
+    if shared_only {
+        drop(bytes);
+        crate::divergence::behaviour_tree::write_atomic(&path, &shared)
+            .map_err(|e| format!("write shared-results table: {e}"))?;
+    } else {
+        std::fs::write(&path, bytes).map_err(|e| format!("write lookup table: {e}"))?;
+        crate::divergence::behaviour_tree::write_atomic(&deja::shared_results_path(&path), &shared)
+            .map_err(|e| format!("write shared-results table: {e}"))?;
+    }
+    if table.entries.is_empty() {
+        return Err("rendered lookup table is empty".to_string());
+    }
+    Ok(Persisted {
+        entries: table.entries.len(),
+        identity_entries: table.identity_entries.len(),
+        legacy_bytes,
+        shared_bytes: shared.len() as u64,
+        event_schema_version: table.event_schema_version,
+        shared_only,
+    })
+}
+
+/// The shared-results form of `table`, stamped with the digest of `legacy`,
+/// the table's serialization. Not yet checked: see [`finish_shared`].
+fn build_shared(
+    table: &deja::LookupTable,
+    legacy: &[u8],
+) -> Result<deja::SharedResultsTable, String> {
+    deja::SharedResultsTable::from_table(table, legacy)
+        .map_err(|e| format!("build shared-results table: {e}"))
+}
+
+/// Serialize `shared`, then prove the bytes expand to `legacy`.
+fn finish_shared(shared: deja::SharedResultsTable, legacy: &[u8]) -> Result<Vec<u8>, String> {
+    let bytes =
+        serde_json::to_vec(&shared).map_err(|e| format!("write shared-results table: {e}"))?;
+    drop(shared);
+    // The bytes about to be written, read back, so the check covers what a
+    // candidate will parse rather than the struct that produced it.
+    let written: deja::SharedResultsTable = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("read back shared-results table: {e}"))?;
+    expands_to(written, legacy)?;
+    Ok(bytes)
+}
+
+/// Refuse a shared-results table that does not expand to the table it was
+/// written from. A candidate reads one and the scorer may read the other, so
+/// they must be the same table, not merely both plausible.
+fn expands_to(shared: deja::SharedResultsTable, legacy: &[u8]) -> Result<(), String> {
+    let expanded = shared.into_table().map_err(|e| e.to_string())?;
+    let got = deja::LegacyDigest::of_serialized(&expanded).map_err(|e| e.to_string())?;
+    let want = deja::LegacyDigest::of(legacy);
+    if got != want {
+        return Err(format!(
+            "the shared-results table does not expand to the table it was written from \
+             ({} bytes, FNV-1a {:016x}, against {} bytes, {:016x}); neither is written",
+            got.len, got.fnv1a, want.len, want.fnv1a
+        ));
+    }
+    Ok(())
+}
+
+/// Final stage (shared): score the run, report the verdict, register the
 /// replay artifacts (best-effort; absent files are skipped).
 fn score_and_register(
     root: &HarnessRoot,
@@ -1370,6 +1799,11 @@ fn score_and_register(
         total,
         "scoring divergence (byte-exact)",
     );
+    // Scoring is the stage replay runs die in, and it is the one stage whose
+    // closing boundary never gets written when they do. Trace it from the
+    // inside so a killed run still leaves the shape of its allocation behind.
+    let _trace = ResidentTrace::start("scoring");
+
     // BEFORE the verdict, deliberately. This step can refuse the run, and a run
     // that is going to be refused must not first write a scorecard and push a
     // result the caller then marks failed. `set_stage` above is a label, not a
@@ -1428,20 +1862,12 @@ fn score_and_register(
     // the run manifest index below. `observed` carries the replay-side
     // execution-graph nodes (`DejaRecord::GraphNode`) — no separate artifact.
     let mut index = serde_json::Map::new();
-    for (kind, filename) in REPLAY_STREAM_ARTIFACTS {
-        let path = match kind {
-            "lookup_table" => root.lookup_table_path(&run.run_id),
-            "observed" => root.observed_path(&run.run_id),
-            "http_diffs" => root.http_diff_path(&run.run_id),
-            "scorecard" => root.scorecard_path(&run.run_id),
-            "call_ledger" => root.call_ledger_path(&run.run_id),
-            "seed_certificate" => root.seed_certificate_path(&run.run_id),
-            _ => continue,
-        };
-        if let Some((uri, bytes)) = sink.publish(&run.run_id, filename, &path) {
-            ctx.artifact_uri(Some(recording_id), kind, &uri, Some(bytes));
+    for kind in crate::artifact_kinds::streamed() {
+        let path = kind.path(root, &run.run_id);
+        if let Some((uri, bytes)) = sink.publish(&run.run_id, kind.object, &path) {
+            ctx.artifact_uri(Some(recording_id), kind.name, &uri, Some(bytes));
             index.insert(
-                kind.to_owned(),
+                kind.name.to_owned(),
                 serde_json::json!({ "uri": uri, "bytes": bytes }),
             );
         }
@@ -1455,13 +1881,12 @@ fn score_and_register(
     // recording directly there, so this is belt-and-suspenders — but it keeps
     // both modes on one artifact contract.)
     if let Some(node_count) = record_graph_nodes {
-        let record_graph_path = root.record_graph_path(&run.run_id);
-        if let Some((uri, bytes)) =
-            sink.publish(&run.run_id, "record_graph.jsonl", &record_graph_path)
-        {
-            ctx.artifact_uri(Some(recording_id), "record_graph", &uri, Some(bytes));
+        let kind = &crate::artifact_kinds::RECORD_GRAPH;
+        let record_graph_path = kind.path(root, &run.run_id);
+        if let Some((uri, bytes)) = sink.publish(&run.run_id, kind.object, &record_graph_path) {
+            ctx.artifact_uri(Some(recording_id), kind.name, &uri, Some(bytes));
             index.insert(
-                "record_graph".to_owned(),
+                kind.name.to_owned(),
                 serde_json::json!({ "uri": uri, "bytes": bytes, "nodes": node_count }),
             );
         }
@@ -1595,12 +2020,11 @@ pub fn drive_replay_in_pod(
         .map_err(|e| format!("open recording {recording_id}: {e}"))?;
 
     set_stage(root, run, ctx, 2, total, "rendering lookup table");
-    let table = crate::lookup::render_lookup_table(&recording, &recording_id, 1)
-        .map_err(|e| format!("render lookup table: {e}"))?;
-    write_json(&root.lookup_table_path(&run.run_id), &table)
-        .map_err(|e| format!("write lookup table: {e}"))?;
-    if table.entries.is_empty() {
-        return Err("rendered lookup table is empty".to_string());
+    let rendered = render_and_persist_lookup_table(root, &run.run_id, &recording, &recording_id)?;
+    ctx.log("rendering lookup table", &rendered.report);
+    let suspect = render_suspect(&recording_id, &rendered);
+    if let Some(note) = &suspect {
+        ctx.log("rendering lookup table", note);
     }
 
     set_status(root, run, RunStatus::Building, None);
@@ -1752,7 +2176,8 @@ pub fn drive_replay_in_pod(
         .health_url
         .clone()
         .unwrap_or_else(|| format!("http://127.0.0.1:{}/health", opts.candidate_port));
-    wait_health(&health_url, Duration::from_secs(240))?;
+    wait_health(&health_url, Duration::from_secs(240))
+        .map_err(|e| with_suspect(e, suspect.as_deref()))?;
     run_kernel(
         &opts.kernel_bin,
         opts.candidate_port,
@@ -1762,6 +2187,7 @@ pub fn drive_replay_in_pod(
         &run.run_id,
         &scope,
     )?;
+    settle_observed_stream(root, ctx, &run.run_id);
 
     // In-pod: DEJA_RUN_ARTIFACT_S3=1 (Job template) uploads artifacts to S3 so
     // they survive the ephemeral pod and the dashboard can hydrate them.
@@ -1942,77 +2368,103 @@ fn seed_redis(
         store,
         &RedisSeedImage {
             physical_key: key.to_string(),
-            payload: RedisSeedPayload::String(value.to_string()),
+            payload: RedisSeedPayload::String(value.as_bytes().to_vec()),
             ttl_seconds: None,
         },
     )
 }
 
+/// One command as a RESP array of bulk strings — the wire form `redis-cli
+/// --pipe` reads from stdin.
+///
+/// Length-prefixed rather than delimited, which is the whole point: every
+/// argument is preceded by its byte count, so a value carrying newlines, quotes
+/// or zero bytes arrives exactly as recorded.
+fn encode_resp(argv: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("*{}\r\n", argv.len()).as_bytes());
+    for arg in argv {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
 /// The typed write-shape a redis seed materializes as — the backward half of
 /// the [`deja::value::RedisWireValue`] transform (#39). One variant per value
 /// family the wire type carries; each maps to the native write command whose
-/// type-appropriate read returns the recorded value. Members are already
-/// rendered to the raw strings redis holds (via
-/// [`deja::value::RedisWireValue::to_redis_string`]).
+/// type-appropriate read returns the recorded value.
+///
+/// Members are BYTES, not strings. They used to be rendered through
+/// `to_redis_string`, which decodes lossily — and a recorded locker payload is
+/// encrypted, so that rewrote it before it was ever written. Carrying the bytes
+/// keeps the value the recording captured all the way to the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RedisSeedPayload {
     /// Scalar → `SET`; read back with `GET`.
-    String(String),
+    String(Vec<u8>),
     /// Map → `HSET` field/value pairs in recorded order; read back with
     /// `HGETALL`.
-    Hash(Vec<(String, String)>),
+    Hash(Vec<(Vec<u8>, Vec<u8>)>),
     /// Array → `RPUSH` members in recorded order; read back with `LRANGE`.
-    List(Vec<String>),
+    List(Vec<Vec<u8>>),
     /// Array recorded by a sorted-set method → `ZADD`; read back with
     /// `ZRANGE`. A range read without `WITHSCORES` records member ORDER but no
     /// scores, so each member's index is its score — that reproduces exactly
     /// what the recorded read observed (the order), fabricating nothing the
     /// replay can see.
-    SortedSet(Vec<String>),
+    SortedSet(Vec<Vec<u8>>),
     /// Set → `SADD`; read back with `SMEMBERS` (unordered).
-    Set(Vec<String>),
+    Set(Vec<Vec<u8>>),
 }
 
 impl RedisSeedPayload {
     /// The `redis-cli` argv that writes this payload under `key`.
-    fn write_args(&self, key: &str) -> Vec<String> {
-        let mut args: Vec<String>;
+    /// The write as RESP, ready for `redis-cli --pipe` on stdin.
+    ///
+    /// Not argv. A process argument cannot carry a zero byte — `Command`
+    /// refuses to spawn with "nul byte found in provided data" — and recorded
+    /// locker payloads are encrypted, so they contain zero bytes routinely.
+    /// Every such seed failed, and the reads that depended on it pruned whole
+    /// subtrees. RESP is length-prefixed, so a value is carried by its length
+    /// and never by a delimiter: any byte sequence survives, zero included.
+    fn write_frames(&self, key: &str) -> Vec<u8> {
+        let mut argv: Vec<Vec<u8>> = Vec::new();
         match self {
             Self::String(value) => {
-                args = vec!["SET".into(), key.into(), value.clone()];
+                argv.push(b"SET".to_vec());
+                argv.push(key.as_bytes().to_vec());
+                argv.push(value.clone());
             }
             Self::Hash(pairs) => {
-                args = Vec::with_capacity(2 + pairs.len() * 2);
-                args.push("HSET".into());
-                args.push(key.into());
+                argv.push(b"HSET".to_vec());
+                argv.push(key.as_bytes().to_vec());
                 for (field, value) in pairs {
-                    args.push(field.clone());
-                    args.push(value.clone());
+                    argv.push(field.clone());
+                    argv.push(value.clone());
                 }
             }
             Self::List(items) => {
-                args = Vec::with_capacity(2 + items.len());
-                args.push("RPUSH".into());
-                args.push(key.into());
-                args.extend(items.iter().cloned());
+                argv.push(b"RPUSH".to_vec());
+                argv.push(key.as_bytes().to_vec());
+                argv.extend(items.iter().cloned());
             }
             Self::SortedSet(members) => {
-                args = Vec::with_capacity(2 + members.len() * 2);
-                args.push("ZADD".into());
-                args.push(key.into());
+                argv.push(b"ZADD".to_vec());
+                argv.push(key.as_bytes().to_vec());
                 for (index, member) in members.iter().enumerate() {
-                    args.push(index.to_string());
-                    args.push(member.clone());
+                    argv.push(index.to_string().into_bytes());
+                    argv.push(member.clone());
                 }
             }
             Self::Set(members) => {
-                args = Vec::with_capacity(2 + members.len());
-                args.push("SADD".into());
-                args.push(key.into());
-                args.extend(members.iter().cloned());
+                argv.push(b"SADD".to_vec());
+                argv.push(key.as_bytes().to_vec());
+                argv.extend(members.iter().cloned());
             }
         }
-        args
+        encode_resp(&argv)
     }
 
     /// The `redis-cli` argv of the type-appropriate readback READ for `key`.
@@ -2030,7 +2482,8 @@ impl RedisSeedPayload {
     /// one element per line, in command order (`HGETALL` alternates
     /// field/value). `SMEMBERS` order is not defined — [`Self::compare`]
     /// handles that, not this image.
-    fn expected_readback_lines(&self) -> Vec<String> {
+    /// The elements this payload expects a readback to return, as bytes.
+    fn expected_readback_elements(&self) -> Vec<Vec<u8>> {
         match self {
             Self::String(value) => vec![value.clone()],
             Self::Hash(pairs) => pairs
@@ -2043,27 +2496,49 @@ impl RedisSeedPayload {
         }
     }
 
+    /// The same elements rendered for a human — the certificate field and log
+    /// lines. Lossy on purpose and ONLY here: a reader wants something
+    /// printable, and nothing downstream of this compares it.
+    fn expected_readback_lines(&self) -> Vec<String> {
+        self.expected_readback_elements()
+            .iter()
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect()
+    }
+
     /// Compare a `--raw` readback against this payload. Line-oriented, like the
     /// `redis-cli` transport itself: an element containing a newline cannot be
     /// distinguished from two elements (a pre-existing transport limitation,
     /// #26 owns the transport). `Set` compares order-insensitively; everything
     /// else is order-exact.
+    /// Compared as BYTES, not as text. Both sides used to go through
+    /// `from_utf8_lossy` first, which made this agree with itself for the wrong
+    /// reason: a non-UTF-8 value was mangled identically on the way in and on
+    /// the way back, so a corrupted seed read back as `matched`. Comparing the
+    /// bytes is what lets the readback actually witness the write.
     fn compare(&self, observed: &[u8]) -> Result<(), (Vec<String>, Vec<String>)> {
-        let mut expected = self.expected_readback_lines();
-        let observed_text = String::from_utf8_lossy(observed);
-        let mut observed_lines: Vec<String> = if observed_text.is_empty() {
+        let mut expected = self.expected_readback_elements();
+        let mut observed_elements: Vec<Vec<u8>> = if observed.is_empty() {
             Vec::new()
         } else {
-            observed_text.split('\n').map(str::to_owned).collect()
+            observed
+                .split(|b| *b == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect()
         };
         if matches!(self, Self::Set(_)) {
             expected.sort();
-            observed_lines.sort();
+            observed_elements.sort();
         }
-        if expected == observed_lines {
+        if expected == observed_elements {
             Ok(())
         } else {
-            Err((expected, observed_lines))
+            let render = |v: &Vec<Vec<u8>>| {
+                v.iter()
+                    .map(|e| String::from_utf8_lossy(e).into_owned())
+                    .collect::<Vec<_>>()
+            };
+            Err((render(&expected), render(&observed_elements)))
         }
     }
 
@@ -2088,38 +2563,63 @@ struct RedisSeedImage {
 
 /// Materialize one typed redis seed and read it back. Best-effort: a failure
 /// logs, is recorded on the certificate, and never fails the replay.
+/// Feed one RESP command to `redis-cli --pipe` and report what it said.
+///
+/// `--pipe` exits 0 even when the server rejected a command, so the reply is
+/// inspected rather than the exit status: an `-ERR` in the output is a failed
+/// write however the process exited. Nothing here can fail the replay — a
+/// failure is recorded on the certificate and the run continues.
+fn run_redis_pipe(mut cmd: std::process::Command, frames: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn redis-cli: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "redis-cli stdin unavailable".to_owned())?
+        .write_all(frames)
+        .map_err(|e| format!("write RESP to redis-cli: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for redis-cli: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!("exited {}; stderr='{}'", out.status, stderr.trim()));
+    }
+    if stdout.contains("ERR") || stderr.contains("ERR") {
+        return Err(format!(
+            "server rejected the write: stdout='{}' stderr='{}'",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 fn seed_redis_image(
     store: &StoreExec,
     image: &RedisSeedImage,
 ) -> (SeedMaterializationStatus, SeedReadback) {
-    let write_args = image.payload.write_args(&image.physical_key);
-    let write_refs: Vec<&str> = write_args.iter().map(String::as_str).collect();
-    let mut cmd = store.redis_cli(&write_refs);
+    let frames = image.payload.write_frames(&image.physical_key);
+    let mut cmd = store.redis_cli(&["--pipe"]);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     eprintln!(
-        "lifecycle: {} (redis key {} byte(s), write {}, ttl {:?})",
+        "lifecycle: {} (redis key {} byte(s), write {} as {} RESP byte(s), ttl {:?})",
         store_exec::describe(&cmd),
         image.physical_key.len(),
         image.payload.write_verb(),
+        frames.len(),
         image.ttl_seconds
     );
-    match cmd.status() {
-        Ok(status) if status.success() => (
+    match run_redis_pipe(cmd, &frames) {
+        Ok(()) => (
             SeedMaterializationStatus::Materialized,
             readback_redis(store, image),
         ),
-        Ok(status) => {
-            let message = format!("seed_redis {} exited {status}", image.payload.write_verb());
-            eprintln!("lifecycle: {message}; continuing (best-effort)");
-            (
-                SeedMaterializationStatus::Failed,
-                SeedReadback::error(message),
-            )
-        }
         Err(e) => {
-            let message = format!(
-                "could not run seed_redis {}: {e}",
-                image.payload.write_verb()
-            );
+            let message = format!("seed_redis {} failed: {e}", image.payload.write_verb());
             eprintln!("lifecycle: {message}; continuing (best-effort)");
             (
                 SeedMaterializationStatus::Failed,
@@ -2279,13 +2779,73 @@ struct SeedCertificateEntry {
     logical_key: String,
     physical_key: Option<String>,
     db_schema: Option<String>,
-    origin: deja::SeedOrigin,
+    origin: CertifiedSeedOrigin,
     materialization: SeedMaterializationStatus,
     readback: SeedReadback,
     /// Which mechanism materialized this DB entry's rows. Absent for redis
     /// entries and for entries the seeder never got as far as rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mechanism: Option<SeedEntryMechanism>,
+    /// Why a DB entry yielded no row to seed, as a field a rule can match on
+    /// rather than a sentence it would have to parse. Absent when rows were
+    /// found, and on certificates written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skip_reason: Option<NoSeedableRows>,
+}
+
+/// Where a certified entry's content came from: the plan's [`deja::SeedOrigin`],
+/// plus the one origin only the seeder can name, because only it reads the
+/// replay database's catalog.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CertifiedSeedOrigin {
+    Recording,
+    Ambient,
+    Borrowed {
+        global_sequence: u64,
+    },
+    /// A row the recording asserted without carrying, built from the recorded
+    /// statement's equality binds with every other required column set to a
+    /// neutral value for its type. None of it is recorded row content, and the
+    /// entry says which columns are which.
+    SynthesizedPresence {
+        from: SynthesisSource,
+        columns_from_statement: Vec<String>,
+        columns_defaulted: Vec<String>,
+    },
+}
+
+/// What a synthesized row's non-neutral values were read from.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SynthesisSource {
+    StatementBinds,
+}
+
+impl From<deja::SeedOrigin> for CertifiedSeedOrigin {
+    fn from(origin: deja::SeedOrigin) -> Self {
+        match origin {
+            deja::SeedOrigin::Recording => Self::Recording,
+            deja::SeedOrigin::Ambient => Self::Ambient,
+            deja::SeedOrigin::Borrowed { global_sequence } => Self::Borrowed { global_sequence },
+        }
+    }
+}
+
+impl PartialEq<deja::SeedOrigin> for CertifiedSeedOrigin {
+    fn eq(&self, other: &deja::SeedOrigin) -> bool {
+        match (self, other) {
+            (Self::Recording, deja::SeedOrigin::Recording)
+            | (Self::Ambient, deja::SeedOrigin::Ambient) => true,
+            (
+                Self::Borrowed { global_sequence },
+                deja::SeedOrigin::Borrowed {
+                    global_sequence: other,
+                },
+            ) => global_sequence == other,
+            _ => false,
+        }
+    }
 }
 
 /// How one DB seed entry's rows were materialized. A `Failed` entry carries
@@ -2347,7 +2907,7 @@ enum SeedReadbackStatus {
 
 impl SeedCertificate {
     const SCHEMA_VERSION: u16 = 1;
-    const KIND: &'static str = "seed_certificate";
+    const KIND: &'static str = crate::artifact_kinds::SEED_CERTIFICATE.name;
 
     fn new(recording_id: &str, run_id: &str, seed_db_enabled: bool) -> Self {
         Self {
@@ -2424,16 +2984,31 @@ impl SeedCertificateEntry {
             logical_key: entry.key.clone(),
             physical_key,
             db_schema,
-            origin: entry.origin,
+            origin: entry.origin.into(),
             materialization,
             readback,
             mechanism: None,
+            skip_reason: None,
         }
+    }
+
+    /// Replace the plan's origin when the seeder planted something the plan
+    /// could not name (a synthesized row).
+    fn with_origin(mut self, origin: Option<CertifiedSeedOrigin>) -> Self {
+        if let Some(origin) = origin {
+            self.origin = origin;
+        }
+        self
     }
 
     /// Attach the DB materialization split (see [`SeedEntryMechanism`]).
     fn with_mechanism(mut self, mechanism: Option<SeedEntryMechanism>) -> Self {
         self.mechanism = mechanism;
+        self
+    }
+
+    fn with_skip_reason(mut self, skip_reason: Option<NoSeedableRows>) -> Self {
+        self.skip_reason = skip_reason;
         self
     }
 
@@ -2450,7 +3025,24 @@ impl SeedCertificateEntry {
                 "not a precondition: the read observes this correlation's own prior write of the key"
             }
             deja::NotPreconditionReason::SelfCreatedTable => {
-                "not a precondition: this correlation creates the table's rows itself on replay"
+                "not a precondition: this correlation created rows in this table and the \
+                 create or the read names no rows, so this read cannot be told from a read-back"
+            }
+            deja::NotPreconditionReason::SelfCreatedRow => {
+                "not a precondition: the read returned a row this correlation created, which its \
+                 replayed create rebuilds; seeding this key would collide with it"
+            }
+            deja::NotPreconditionReason::DeleteProvedAbsence => {
+                "not a precondition: the delete found no key, so the recording proves absence"
+            }
+            deja::NotPreconditionReason::ReadFoundNothing => {
+                "not a precondition: the read found nothing, so there is no recorded value to seed"
+            }
+            deja::NotPreconditionReason::EarlierOpDecided => {
+                "not a precondition: an earlier op in this correlation on the key decides it, so the delete proves only what that op left"
+            }
+            deja::NotPreconditionReason::ReadErrored => {
+                "not a precondition: the read errored, and this boundary does not declare whether that means the key was absent or that the call failed"
             }
         };
         Self {
@@ -2459,10 +3051,11 @@ impl SeedCertificateEntry {
             logical_key: key.to_owned(),
             physical_key: None,
             db_schema: None,
-            origin: deja::SeedOrigin::Recording,
+            origin: CertifiedSeedOrigin::Recording,
             materialization: SeedMaterializationStatus::NotAPrecondition,
             readback: SeedReadback::not_run(why),
             mechanism: None,
+            skip_reason: None,
         }
     }
 }
@@ -2695,6 +3288,7 @@ fn materialize_seed_plan(
                         &entry.key,
                         entry.image.as_ref(),
                         &entry.value,
+                        entry.presence.as_ref(),
                     );
                     certificate.push(
                         SeedCertificateEntry::new(
@@ -2705,7 +3299,9 @@ fn materialize_seed_plan(
                             outcome.status,
                             outcome.readback,
                         )
-                        .with_mechanism(outcome.mechanism),
+                        .with_origin(outcome.origin)
+                        .with_mechanism(outcome.mechanism)
+                        .with_skip_reason(outcome.skip_reason),
                     );
                 }
                 "db" => certificate.push(SeedCertificateEntry::new(
@@ -2785,6 +3381,7 @@ fn seed_db(
     key: &str,
     image: Option<&serde_json::Value>,
     envelope: &serde_json::Value,
+    presence: Option<&deja::PresencePredicate>,
 ) -> SeedDbOutcome {
     let target = match db_seed_target_from_key(key) {
         Some(target) => target,
@@ -2795,24 +3392,31 @@ fn seed_db(
             );
         }
     };
-    let rows = image
-        .and_then(|image| db_row_images_from_typed_payload(&target.table, image, catalog))
-        .unwrap_or_else(|| {
-            db_seed_value(envelope)
-                .map(|value| target.filter_rows(db_row_images(&target.table, &value, catalog)))
-                .unwrap_or_default()
-        });
-    if rows.is_empty() {
-        let message = format!(
-            "seed_db {} key {} carried no seedable row payload; skipping",
-            target.kind, key
-        );
-        eprintln!("lifecycle: {message}");
-        return SeedDbOutcome::unrendered(
-            SeedMaterializationStatus::Skipped,
-            SeedReadback::not_run(message),
-        );
-    }
+    let rows = match seedable_rows(&target, image, envelope, catalog) {
+        Ok(rows) => rows,
+        // A presence with no image in scope: the planner read what the
+        // statement requires of the row, and the row is built from that.
+        Err(NoSeedableRows::RecordedPresence) => {
+            let Some(predicate) = presence else {
+                return SeedDbOutcome::skipped_for(
+                    NoSeedableRows::RecordedPresence,
+                    target.kind,
+                    key,
+                );
+            };
+            return match synthesize_presence_row(&target.table, predicate, catalog) {
+                Ok(synthesized) => {
+                    seed_db_synthesized_presence(store, schema, &target, &synthesized)
+                }
+                Err(why) => SeedDbOutcome::skipped_for(
+                    NoSeedableRows::UnsynthesizablePresence(why),
+                    target.kind,
+                    key,
+                ),
+            };
+        }
+        Err(why) => return SeedDbOutcome::skipped_for(why, target.kind, key),
+    };
 
     // Split rows by seeding mechanism: a row carrying a COPY-eligible
     // physical wire image seeds through binary COPY (the store parses its own
@@ -2949,6 +3553,9 @@ struct SeedDbOutcome {
     status: SeedMaterializationStatus,
     readback: SeedReadback,
     mechanism: Option<SeedEntryMechanism>,
+    skip_reason: Option<NoSeedableRows>,
+    /// Set only when the seeder planted content the plan did not carry.
+    origin: Option<CertifiedSeedOrigin>,
 }
 
 impl SeedDbOutcome {
@@ -2959,6 +3566,22 @@ impl SeedDbOutcome {
             status,
             readback,
             mechanism: None,
+            skip_reason: None,
+            origin: None,
+        }
+    }
+
+    /// A DB entry whose recording gave no row to seed, and why.
+    fn skipped_for(why: NoSeedableRows, kind: &str, key: &str) -> Self {
+        let message =
+            format!("seed_db {kind} key {key} carried no seedable row payload: {why}; skipping");
+        eprintln!("lifecycle: {message}");
+        Self {
+            status: SeedMaterializationStatus::Skipped,
+            readback: SeedReadback::not_run(message),
+            mechanism: None,
+            skip_reason: Some(why),
+            origin: None,
         }
     }
 
@@ -2971,6 +3594,8 @@ impl SeedDbOutcome {
             status,
             readback,
             mechanism: Some(mechanism),
+            skip_reason: None,
+            origin: None,
         }
     }
 }
@@ -3500,6 +4125,136 @@ impl DbSeedTarget {
     }
 }
 
+/// Why a db seed entry yielded no row to materialize. These are different facts
+/// about the recording, and only some make the skip correct: a recorded
+/// absence is the precondition, while a recorded `true` or a non-zero count
+/// asserts rows the seeder has no content for.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "cause", content = "detail", rename_all = "snake_case")]
+enum NoSeedableRows {
+    RecordedError,
+    RecordedAbsence,
+    /// `Ok(true)`: a DELETE that removed a row. Zero rows is `NotFound`. Only
+    /// the final cause when the plan carried no statement predicate for it;
+    /// otherwise the row is synthesized, or the next cause says why not.
+    RecordedPresence,
+    /// `Ok(true)` with no image of the row in scope, and no row can be built
+    /// from the recorded statement: its `WHERE` is not a conjunction of
+    /// equality binds, or the table has a required column with no neutral
+    /// value. The detail names which.
+    UnsynthesizablePresence(String),
+    /// `Ok(true)` with no image in scope, but a row seeded before this entry
+    /// already satisfies the statement's `WHERE`: presence holds at seed time,
+    /// and nothing is synthesized over it. Judged before replay, so an earlier
+    /// delete in the replay can still consume that row; the scorer excuses a
+    /// divergence at this key as a seed gap for that reason.
+    PresenceAlreadyHeld,
+    /// An UPDATE or COUNT result. Zero is absence recorded; more asserts rows.
+    RecordedCount(u64),
+    /// Any other scalar: not a row, and no claim about one.
+    RecordedScalar(String),
+    NotRows {
+        values: usize,
+    },
+    NoRowWithKey {
+        rows: usize,
+    },
+}
+
+impl std::fmt::Display for NoSeedableRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordedError => {
+                write!(
+                    f,
+                    "the recorded call returned an error, so there is no row to seed"
+                )
+            }
+            Self::RecordedAbsence => {
+                write!(
+                    f,
+                    "the recording returned no row, so absence is the precondition"
+                )
+            }
+            Self::RecordedPresence => write!(
+                f,
+                "the recording returned true, which asserts a row without carrying one; \
+                 the precondition is presence and nothing here can materialize it"
+            ),
+            Self::UnsynthesizablePresence(why) => write!(
+                f,
+                "the recording returned true, which asserts a row without carrying one, and no \
+                 row can be synthesized from the statement: {why}"
+            ),
+            Self::PresenceAlreadyHeld => write!(
+                f,
+                "the recording returned true, and a row seeded earlier already satisfies the \
+                 statement's WHERE, so presence holds without a synthesized row"
+            ),
+            Self::RecordedCount(0) => {
+                write!(
+                    f,
+                    "the recording counted no rows, so absence is the precondition"
+                )
+            }
+            Self::RecordedCount(rows) => write!(
+                f,
+                "the recording counted {rows} row(s) without carrying them; the precondition \
+                 is their presence and nothing here can materialize it"
+            ),
+            Self::RecordedScalar(value) => {
+                write!(f, "the recording returned {value}, which is not a row")
+            }
+            Self::NotRows { values } => write!(
+                f,
+                "the recording returned {values} value(s), none of them a row of this table"
+            ),
+            Self::NoRowWithKey { rows } => write!(
+                f,
+                "the recording returned {rows} row(s), none with the keyed identity"
+            ),
+        }
+    }
+}
+
+/// The rows a recorded db result gives to seed, or why it gives none.
+fn seedable_rows(
+    target: &DbSeedTarget,
+    image: Option<&serde_json::Value>,
+    envelope: &serde_json::Value,
+    catalog: &DbCatalog,
+) -> Result<Vec<DbRowImage>, NoSeedableRows> {
+    if let Some(rows) =
+        image.and_then(|image| db_row_images_from_typed_payload(&target.table, image, catalog))
+    {
+        return Ok(rows);
+    }
+    let value = db_seed_value(envelope).ok_or(NoSeedableRows::RecordedError)?;
+    let rows = db_row_images(&target.table, &value, catalog);
+    if rows.is_empty() {
+        return Err(match &value {
+            serde_json::Value::Null => NoSeedableRows::RecordedAbsence,
+            serde_json::Value::Array(items) if items.is_empty() => NoSeedableRows::RecordedAbsence,
+            serde_json::Value::Array(items) => NoSeedableRows::NotRows {
+                values: items.len(),
+            },
+            serde_json::Value::Object(_) => NoSeedableRows::NotRows { values: 1 },
+            serde_json::Value::Bool(true) => NoSeedableRows::RecordedPresence,
+            serde_json::Value::Number(count) => count.as_u64().map_or_else(
+                || NoSeedableRows::RecordedScalar(count.to_string()),
+                NoSeedableRows::RecordedCount,
+            ),
+            scalar => NoSeedableRows::RecordedScalar(scalar.to_string()),
+        });
+    }
+    let recorded = rows.len();
+    let rows = target.filter_rows(rows);
+    if rows.is_empty() {
+        return Err(NoSeedableRows::NoRowWithKey { rows: recorded });
+    }
+    Ok(rows)
+}
+
 fn db_seed_target_from_key(key: &str) -> Option<DbSeedTarget> {
     let state_key = match deja::StateKey::parse(key) {
         Ok(state_key) => state_key,
@@ -3567,12 +4322,388 @@ fn db_seed_value(envelope: &serde_json::Value) -> Option<serde_json::Value> {
     }
 }
 
+/// A row built for a presence the recording asserted without carrying: the
+/// statement's bound columns with their bound values, and every other required
+/// column at its type's neutral value. Columns in declaration order.
+#[derive(Debug, Clone, PartialEq)]
+struct SynthesizedPresenceRow {
+    row: DbRowImage,
+    /// The SQL type of each of `row`'s columns, by position, for explicit casts.
+    sql_types: Vec<String>,
+    /// The columns whose values are the statement's binds.
+    columns_from_statement: Vec<String>,
+    /// The statement's equality binds as recorded, for its `WHERE`.
+    statement_binds: Vec<(String, serde_json::Value)>,
+    /// The required columns set to their type's neutral value.
+    columns_defaulted: Vec<String>,
+}
+
+impl SynthesizedPresenceRow {
+    fn origin(&self) -> CertifiedSeedOrigin {
+        CertifiedSeedOrigin::SynthesizedPresence {
+            from: SynthesisSource::StatementBinds,
+            columns_from_statement: self.columns_from_statement.clone(),
+            columns_defaulted: self.columns_defaulted.clone(),
+        }
+    }
+
+    /// The recorded statement's `WHERE`: `column = 'bind'` for each bound
+    /// column, the bind an untyped literal the column's own type resolves, as
+    /// the server resolves the bind. The planner accepted only a conjunction of
+    /// such equalities, so this is that `WHERE`, not a restatement of the
+    /// planted values — a value the plant's cast altered does not match it.
+    fn where_sql(&self) -> Option<String> {
+        let predicates: Vec<String> = self
+            .statement_binds
+            .iter()
+            .map(|(column, bind)| {
+                let text = match bind {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                format!("{} = '{}'", quote_ident(column), text.replace('\'', "''"))
+            })
+            .collect();
+        (!predicates.is_empty()).then(|| predicates.join(" AND "))
+    }
+}
+
+/// The value a required column takes in a synthesized row, chosen by type
+/// alone so the same schema always yields the same row. A type with no
+/// obvious zero refuses, naming itself, rather than guessing.
+fn neutral_value(shape: &DbColumnShape) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let value = match shape.type_name.as_str() {
+        "bytea" => json!(""),
+        "json" | "jsonb" => json!({}),
+        "_json" | "_jsonb" => json!([]),
+        "uuid" => json!("00000000-0000-0000-0000-000000000000"),
+        "date" => json!("1970-01-01"),
+        "time" => json!("00:00:00"),
+        "timetz" => json!("00:00:00+00"),
+        "timestamp" => json!("1970-01-01 00:00:00"),
+        "timestamptz" => json!("1970-01-01 00:00:00+00"),
+        _ => match shape.category {
+            'A' => json!("{}"),
+            'B' => json!(false),
+            'N' => json!(0),
+            'S' => json!(""),
+            'T' => json!("0"),
+            'E' => match &shape.first_enum_label {
+                Some(label) => json!(label),
+                None => {
+                    return Err(format!(
+                        "column {} is an enum of type {} the catalog lists no label for",
+                        shape.name, shape.sql_type
+                    ))
+                }
+            },
+            category => {
+                return Err(format!(
+                    "column {} is NOT NULL with no default, and its type {} (category {category}) \
+                     has no neutral value",
+                    shape.name, shape.sql_type
+                ))
+            }
+        },
+    };
+    Ok(value)
+}
+
+/// Build the row a presence-only statement asserts, from the plan's reading of
+/// the statement and the replay database's catalog. The key columns come from
+/// the statement's own binds and nothing else.
+///
+/// Known limits, which the scorer answers by treating reads near a synthesized
+/// row as seed gaps rather than by any claim made here:
+///
+/// - The neutral columns are visible to reads. A recorded read whose predicate
+///   the real row failed (`deleted = false` where the row was deleted, an
+///   enum's first label, `version = 0`, a timestamp bound the epoch meets)
+///   returned no row, left no image, and so is exactly the case that reaches
+///   synthesis — and at replay the synthesized row can satisfy it and join its
+///   result set.
+/// - Bind fidelity is assumed. The plant and the readback use the same
+///   recorded bind text, so a bind recorded in a form the candidate does not
+///   send (a secret recorded as `***`) plants the wrong key and still
+///   certifies matched. Non-scalar debug forms are refused up front.
+fn synthesize_presence_row(
+    table: &str,
+    predicate: &deja::PresencePredicate,
+    catalog: &DbCatalog,
+) -> Result<SynthesizedPresenceRow, String> {
+    let bound = match predicate {
+        deja::PresencePredicate::Unsatisfiable(why) => return Err(why.clone()),
+        deja::PresencePredicate::Equalities {
+            table: statement_table,
+            columns,
+        } => {
+            if statement_table != table {
+                return Err(format!(
+                    "the statement deletes from {statement_table}, but the entry seeds {table}"
+                ));
+            }
+            columns
+        }
+    };
+    let shapes = catalog
+        .shapes_by_table
+        .get(table)
+        .ok_or_else(|| format!("the replay database's catalog lists no columns for {table}"))?;
+    for (column, _) in bound {
+        if !shapes.iter().any(|shape| &shape.name == column) {
+            return Err(format!(
+                "the statement binds column {column}, which {table} does not have"
+            ));
+        }
+    }
+    let mut columns = Vec::new();
+    let mut sql_types = Vec::new();
+    let mut columns_from_statement = Vec::new();
+    let mut columns_defaulted = Vec::new();
+    for shape in shapes {
+        let value = match bound.iter().find(|(column, _)| *column == shape.name) {
+            Some((_, value)) => {
+                columns_from_statement.push(shape.name.clone());
+                value.clone()
+            }
+            None if shape.required => {
+                columns_defaulted.push(shape.name.clone());
+                neutral_value(shape)?
+            }
+            None => continue,
+        };
+        columns.push(DbColumnImage {
+            metadata: catalog.metadata_for(table, &shape.name),
+            value,
+        });
+        sql_types.push(shape.sql_type.clone());
+    }
+    Ok(SynthesizedPresenceRow {
+        row: DbRowImage {
+            table: table.to_owned(),
+            columns,
+            wire: None,
+        },
+        sql_types,
+        columns_from_statement,
+        statement_binds: bound.clone(),
+        columns_defaulted,
+    })
+}
+
+/// Plant a synthesized row only if nothing already satisfies the statement's
+/// `WHERE`, and report how many rows the insert planted (0 or 1).
+fn build_presence_plant_sql(
+    schema: Option<&str>,
+    synthesized: &SynthesizedPresenceRow,
+) -> Result<String, String> {
+    let row = &synthesized.row;
+    let mut values = Vec::with_capacity(row.columns.len());
+    for (column, sql_type) in row.columns.iter().zip(&synthesized.sql_types) {
+        let literal = sql_literal_for_column(column).ok_or_else(|| {
+            format!(
+                "column {} of type {sql_type} has a synthesized value the renderer refuses",
+                column.metadata.name
+            )
+        })?;
+        values.push(format!("({literal})::{sql_type}"));
+    }
+    let where_sql = synthesized
+        .where_sql()
+        .ok_or("the statement's WHERE cannot be rendered against the synthesized row")?;
+    let columns = row
+        .columns
+        .iter()
+        .map(|column| quote_ident(&column.metadata.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = qualified_table(schema, &row.table);
+    Ok(format!(
+        "WITH planted AS (INSERT INTO {table} ({columns}) SELECT {} \
+         WHERE NOT EXISTS (SELECT 1 FROM {table} WHERE {where_sql}) \
+         ON CONFLICT DO NOTHING RETURNING 1) SELECT COUNT(*) FROM planted;",
+        values.join(", ")
+    ))
+}
+
+fn build_presence_readback_sql(
+    schema: Option<&str>,
+    synthesized: &SynthesizedPresenceRow,
+) -> Option<String> {
+    Some(format!(
+        "SELECT COUNT(*) FROM {} WHERE {};",
+        qualified_table(schema, &synthesized.row.table),
+        synthesized.where_sql()?
+    ))
+}
+
+/// Plant a synthesized presence row and verify exactly one row then satisfies
+/// the recorded statement's `WHERE`.
+fn seed_db_synthesized_presence(
+    store: &StoreExec,
+    schema: Option<&str>,
+    target: &DbSeedTarget,
+    synthesized: &SynthesizedPresenceRow,
+) -> SeedDbOutcome {
+    let mechanism = SeedEntryMechanism {
+        table: target.table.clone(),
+        rows: 1,
+        via_copy: 0,
+        via_insert: 1,
+        physical_image_gap: Some(
+            "synthesized from the statement's binds: the recording carried no row".to_owned(),
+        ),
+    };
+    eprintln!(
+        "lifecycle: seed_db {} {}: synthesizing the row a recorded presence asserts, from \
+         statement column(s) [{}] with [{}] at neutral values",
+        target.kind,
+        target.table,
+        synthesized.columns_from_statement.join(", "),
+        synthesized.columns_defaulted.join(", ")
+    );
+    let failed = |message: String| {
+        eprintln!("lifecycle: {message}; continuing (best-effort)");
+        SeedDbOutcome {
+            origin: Some(synthesized.origin()),
+            ..SeedDbOutcome::rendered(
+                SeedMaterializationStatus::Failed,
+                SeedReadback::error(message),
+                mechanism.clone(),
+            )
+        }
+    };
+    let plant_sql = match build_presence_plant_sql(schema, synthesized) {
+        Ok(sql) => sql,
+        Err(reason) => {
+            return failed(format!(
+                "seed_db {} {} could not render a synthesized row: {reason}",
+                target.kind, target.table
+            ))
+        }
+    };
+    let planted = match run_db_readback_counts(store, &plant_sql, 1) {
+        Ok(counts) => counts[0],
+        Err(message) => {
+            return failed(format!(
+                "seed_db {} {} synthesized insert: {message}",
+                target.kind, target.table
+            ))
+        }
+    };
+    let Some(readback_sql) = build_presence_readback_sql(schema, synthesized) else {
+        return failed("cannot render the synthesized row's readback predicate".to_owned());
+    };
+    let matching = match run_db_readback_counts(store, &readback_sql, 1) {
+        Ok(counts) => counts[0],
+        Err(message) => return failed(message),
+    };
+    presence_outcome(target, synthesized, mechanism, planted, matching)
+}
+
+/// Judge a synthesized plant from how many rows it inserted and how many then
+/// satisfy the statement's `WHERE`. Pure, so every branch has a test.
+fn presence_outcome(
+    target: &DbSeedTarget,
+    synthesized: &SynthesizedPresenceRow,
+    mechanism: SeedEntryMechanism,
+    planted: u64,
+    matching: u64,
+) -> SeedDbOutcome {
+    let expected = serde_json::json!({
+        "rows": 1,
+        "table": target.table,
+        "kind": target.kind,
+        "where": synthesized.columns_from_statement,
+    });
+    let observed = serde_json::json!({"planted": planted, "rows": matching});
+    if planted == 0 && matching > 0 {
+        // An earlier seed already holds a row the statement will find. Nothing
+        // was synthesized, so nothing is claimed to be.
+        let why = NoSeedableRows::PresenceAlreadyHeld;
+        eprintln!("lifecycle: seed_db {} {}: {why}", target.kind, target.table);
+        return SeedDbOutcome {
+            status: SeedMaterializationStatus::Skipped,
+            readback: if matching == 1 {
+                SeedReadback::matched(expected, observed)
+            } else {
+                SeedReadback::mismatched(
+                    expected,
+                    observed,
+                    "more than one seeded row satisfies the statement's WHERE",
+                )
+            },
+            mechanism: None,
+            skip_reason: Some(why),
+            origin: None,
+        };
+    }
+    let (status, readback) = match (planted, matching) {
+        (0, _) => (
+            SeedMaterializationStatus::Failed,
+            SeedReadback::missing(
+                expected,
+                "the synthesized row conflicted with an existing row and was not planted; \
+                 nothing satisfies the statement's WHERE",
+            ),
+        ),
+        (_, 1) => (
+            SeedMaterializationStatus::Materialized,
+            SeedReadback::matched(expected, observed),
+        ),
+        (_, 0) => (
+            SeedMaterializationStatus::Materialized,
+            SeedReadback::missing(
+                expected,
+                "the synthesized row was planted, but nothing satisfies the statement's WHERE",
+            ),
+        ),
+        _ => (
+            SeedMaterializationStatus::Materialized,
+            SeedReadback::mismatched(
+                expected,
+                observed,
+                "more than one row satisfies the statement's WHERE after synthesis",
+            ),
+        ),
+    };
+    SeedDbOutcome {
+        origin: Some(synthesized.origin()),
+        ..SeedDbOutcome::rendered(status, readback, mechanism)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DbCatalog {
     columns_by_table: BTreeMap<String, BTreeMap<String, DbColumnMetadata>>,
+    /// Per table, every column in declaration order with what synthesizing a
+    /// row needs to know of it.
+    shapes_by_table: BTreeMap<String, Vec<DbColumnShape>>,
+}
+
+/// What the catalog says about a column that a synthesized row must respect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbColumnShape {
+    name: String,
+    /// NOT NULL, and nothing (default, identity, generation) fills it.
+    required: bool,
+    /// `pg_type.typname`, e.g. `int4`, `_text`, a user enum's name.
+    type_name: String,
+    /// The column's type as SQL spells it, typmod included (`format_type`
+    /// output, e.g. `character(5)`), for an explicit cast that keeps it.
+    sql_type: String,
+    /// `pg_type.typcategory`.
+    category: char,
+    /// The enum's first label by sort order, for an enum column.
+    first_enum_label: Option<String>,
 }
 
 impl DbCatalog {
+    fn insert_shape(&mut self, table: String, shape: DbColumnShape) {
+        self.shapes_by_table.entry(table).or_default().push(shape);
+    }
+
     fn insert(&mut self, table: String, column: DbColumnMetadata) {
         self.columns_by_table
             .entry(table)
@@ -3640,37 +4771,62 @@ fn register_table_identity(store: &StoreExec) {
     deja::register_table_identity(by_table);
 }
 
+/// The replay DB's column catalog. The cast spelling keeps the typmod
+/// (`format_type`): `regtype` alone turns `char(5)` into `char(1)`, which truncates.
+const DB_CATALOG_SQL: &str =
+    "SELECT cls.relname, attr.attname, typ.oid::int4, typ.typname, (NOT attr.attnotnull), \
+      (attr.atthasdef OR attr.attidentity <> ''), typ.typcategory, \
+      pg_catalog.format_type(attr.atttypid, attr.atttypmod), \
+      COALESCE((SELECT e.enumlabel FROM pg_catalog.pg_enum e \
+      WHERE e.enumtypid = typ.oid ORDER BY e.enumsortorder LIMIT 1), '') \
+     FROM pg_catalog.pg_attribute attr \
+     JOIN pg_catalog.pg_class cls ON cls.oid = attr.attrelid \
+     JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace \
+     JOIN pg_catalog.pg_type typ ON typ.oid = attr.atttypid \
+     WHERE ns.nspname = 'public' \
+       AND attr.attnum > 0 \
+       AND NOT attr.attisdropped \
+       AND cls.relkind IN ('r', 'p') \
+     ORDER BY cls.relname, attr.attnum";
+
+/// One row of [`DB_CATALOG_SQL`]'s tab-separated output, decoded by the
+/// query's column positions: the table, and the column as synthesis and the
+/// renderer each see it. `None` for a row without exactly nine fields.
+fn decode_catalog_row(line: &str) -> Option<(String, DbColumnShape, DbColumnMetadata)> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() != 9 {
+        return None;
+    }
+    let shape = DbColumnShape {
+        name: parts[1].to_string(),
+        required: parse_pg_bool(parts[4]) == Some(false) && parse_pg_bool(parts[5]) == Some(false),
+        type_name: parts[3].to_string(),
+        sql_type: parts[7].to_string(),
+        category: parts[6].chars().next().unwrap_or('X'),
+        first_enum_label: catalog_first_enum_label(parts[6], parts[8]),
+    };
+    let metadata = DbColumnMetadata {
+        name: parts[1].to_string(),
+        type_oid: parts[2].parse().ok(),
+        type_name: nonempty(parts[3]),
+        nullable: parse_pg_bool(parts[4]),
+    };
+    Some((parts[0].to_string(), shape, metadata))
+}
+
 fn load_db_catalog(store: &StoreExec) -> DbCatalog {
-    let sql =
-        "SELECT cls.relname, attr.attname, typ.oid::int4, typ.typname, (NOT attr.attnotnull) \
-               FROM pg_catalog.pg_attribute attr \
-               JOIN pg_catalog.pg_class cls ON cls.oid = attr.attrelid \
-               JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace \
-               JOIN pg_catalog.pg_type typ ON typ.oid = attr.atttypid \
-               WHERE ns.nspname = 'public' \
-                 AND attr.attnum > 0 \
-                 AND NOT attr.attisdropped \
-                 AND cls.relkind IN ('r', 'p') \
-               ORDER BY cls.relname, attr.attnum";
+    let sql = DB_CATALOG_SQL;
     match store.psql(&["-A", "-t", "-F", "\t"], false, sql).output() {
         Ok(output) if output.status.success() => {
             let mut catalog = DbCatalog::default();
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() != 5 {
+                let Some((table, shape, metadata)) = decode_catalog_row(line) else {
                     eprintln!("lifecycle: skipping malformed db catalog row '{line}'");
                     continue;
-                }
-                catalog.insert(
-                    parts[0].to_string(),
-                    DbColumnMetadata {
-                        name: parts[1].to_string(),
-                        type_oid: parts[2].parse().ok(),
-                        type_name: nonempty(parts[3]),
-                        nullable: parse_pg_bool(parts[4]),
-                    },
-                );
+                };
+                catalog.insert_shape(table.clone(), shape);
+                catalog.insert(table, metadata);
             }
             eprintln!(
                 "lifecycle: loaded db catalog metadata for {} table(s), {} column(s)",
@@ -3706,6 +4862,13 @@ fn load_db_catalog(store: &StoreExec) -> DbCatalog {
             DbCatalog::default()
         }
     }
+}
+
+/// The enum's first label from a catalog row. The query spells "no label" as
+/// `''` (a postgres enum label is never empty), so an enum with no labels is
+/// `None` and refuses by name when a row needs one.
+fn catalog_first_enum_label(category: &str, label: &str) -> Option<String> {
+    (category == "E" && !label.is_empty()).then(|| label.to_owned())
 }
 
 fn nonempty(value: &str) -> Option<String> {
@@ -4441,7 +5604,7 @@ fn render_redis_seed_payload(value: &serde_json::Value, method: Option<&str>) ->
     // (e.g. `"0.20"`) is already the raw text redis holds. Preserved
     // byte-for-byte, exactly as before.
     if let serde_json::Value::String(s) = value {
-        return RedisSeedRender::Payload(RedisSeedPayload::String(s.clone()));
+        return RedisSeedRender::Payload(RedisSeedPayload::String(s.as_bytes().to_vec()));
     }
     // A wire shape the canonical type does not model: an explicit, named skip,
     // never a silent stringify of the wrapper.
@@ -4474,12 +5637,12 @@ fn wire_value_seed_render(
         | Wire::BulkString(_)
         | Wire::SimpleString(_)
         | Wire::Double(_)
-        | Wire::Boolean(_) => match value.to_redis_string() {
+        | Wire::Boolean(_) => match value.to_redis_bytes() {
             Some(rendered) => RedisSeedRender::Payload(RedisSeedPayload::String(rendered)),
             // Unreachable for the scalar variants matched above; stated rather
             // than unwrapped so a rendering change cannot panic the seeder.
             None => RedisSeedRender::Unrepresentable(
-                "scalar redis value did not render to a string".to_owned(),
+                "scalar redis value did not render to bytes".to_owned(),
             ),
         },
         Wire::Map(pairs) => {
@@ -4490,7 +5653,7 @@ fn wire_value_seed_render(
             }
             let mut rendered = Vec::with_capacity(pairs.len());
             for (field, field_value) in pairs {
-                match (field.to_redis_string(), field_value.to_redis_string()) {
+                match (field.to_redis_bytes(), field_value.to_redis_bytes()) {
                     (Some(field), Some(field_value)) => rendered.push((field, field_value)),
                     _ => {
                         return RedisSeedRender::Unrepresentable(
@@ -4510,7 +5673,7 @@ fn wire_value_seed_render(
             }
             let mut members = Vec::with_capacity(items.len());
             for item in items {
-                match item.to_redis_string() {
+                match item.to_redis_bytes() {
                     Some(member) => members.push(member),
                     None => {
                         return RedisSeedRender::Unrepresentable(
@@ -4534,7 +5697,7 @@ fn wire_value_seed_render(
             }
             let mut members = Vec::with_capacity(items.len());
             for item in items {
-                match item.to_redis_string() {
+                match item.to_redis_bytes() {
                     Some(member) => members.push(member),
                     None => {
                         return RedisSeedRender::Unrepresentable(
@@ -4884,6 +6047,108 @@ fn tail_logs(demo: &Demo, service: &str) -> String {
     }
 }
 
+/// How the observed stream stood when scoring read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamSettled {
+    /// Quiet, with every lookup it numbered written.
+    Closed,
+    /// Quiet at the bound, with lookups it numbered still unwritten.
+    Open {
+        /// How many; `None` when the stream could not be read to count them.
+        missing: Option<u64>,
+    },
+    /// Still being written when the bound was reached.
+    StillGrowing,
+    /// No stream to wait for.
+    Absent,
+}
+
+/// How long the observed stream must stay unchanged before it is checked.
+const OBSERVED_STREAM_QUIET: Duration = Duration::from_secs(2);
+/// How long scoring waits for the stream to close before it reads it anyway.
+const OBSERVED_STREAM_SETTLE_BOUND: Duration = Duration::from_secs(60);
+
+/// Wait until the stream at `path` is quiet and `missing` reports every lookup
+/// it numbered written, or until `bound` has passed.
+///
+/// The candidate outlives the driver: the last response can return while a
+/// lookup it started, or one a background task started, is still running. A
+/// lookup takes its number as it arrives and writes its observation when it
+/// finishes, so a stream that is merely quiet can still be missing one. Each
+/// time the stream goes quiet it is checked, and a stream quiet but open waits
+/// for the next write before it is checked again.
+pub(crate) fn wait_for_stream_to_settle(
+    path: &std::path::Path,
+    quiet: Duration,
+    bound: Duration,
+    missing: impl Fn() -> Option<u64>,
+) -> StreamSettled {
+    let size = || std::fs::metadata(path).ok().map(|meta| meta.len());
+    let Some(mut last) = size() else {
+        return StreamSettled::Absent;
+    };
+    let deadline = Instant::now() + bound;
+    let mut unchanged_since = Instant::now();
+    let mut checked: Option<(u64, Option<u64>)> = None;
+    loop {
+        std::thread::sleep((quiet / 5).max(Duration::from_millis(10)));
+        let now = size().unwrap_or(last);
+        if now != last {
+            last = now;
+            unchanged_since = Instant::now();
+        } else if unchanged_since.elapsed() >= quiet && checked.is_none_or(|(at, _)| at != last) {
+            let open = missing();
+            if open == Some(0) {
+                return StreamSettled::Closed;
+            }
+            checked = Some((last, open));
+        }
+        if Instant::now() >= deadline {
+            return match checked {
+                Some((at, missing)) if at == last => StreamSettled::Open { missing },
+                _ => StreamSettled::StillGrowing,
+            };
+        }
+    }
+}
+
+/// Wait for the run's observed stream to settle before it is scored, and say
+/// in the run log how that went.
+fn settle_observed_stream(root: &HarnessRoot, ctx: &StoreCtx, run_id: &str) {
+    let started = Instant::now();
+    let path = root.observed_path(run_id);
+    let settled = wait_for_stream_to_settle(
+        &path,
+        OBSERVED_STREAM_QUIET,
+        OBSERVED_STREAM_SETTLE_BOUND,
+        || crate::divergence::missing_lookup_ordinals(&path),
+    );
+    let line = match settled {
+        StreamSettled::Closed => format!(
+            "closed after {:.1}s: every lookup it numbered is written",
+            started.elapsed().as_secs_f64()
+        ),
+        StreamSettled::Open {
+            missing: Some(missing),
+        } => format!(
+            "quiet but open after {}s: {missing} lookup(s) it numbered never wrote an \
+             observation, and read as missing",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
+        ),
+        StreamSettled::Open { missing: None } => format!(
+            "quiet after {}s but could not be read to count its lookups; scoring reads it \
+             as it is",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
+        ),
+        StreamSettled::StillGrowing => format!(
+            "still growing after {}s; lookups still running will read as missing",
+            OBSERVED_STREAM_SETTLE_BOUND.as_secs()
+        ),
+        StreamSettled::Absent => "absent; there is nothing to wait for".to_owned(),
+    };
+    ctx.log("observed stream", &line);
+}
+
 /// Poll a candidate readiness URL until 200 or timeout. The URL is the
 /// caller's: HTTP `/health` on the traffic port for the router; a prism
 /// (tonic) candidate has no HTTP `/health` — its gRPC port refuses a plain
@@ -4917,9 +6182,9 @@ fn wait_s3_objects(recording_id: &str, system: &str, timeout: Duration) -> Resul
     // One call for both halves. Resolving the bucket here and the root at the
     // count below, through two functions, is how a later call site comes to
     // resolve one and forget the other — which is the defect this pair fixes.
-    let (bucket, root) = crate::system::recording_scope(system)?;
+    let (location, root) = crate::system::recording_scope(system)?;
     let mut cfg = crate::s3::S3Config::from_env();
-    cfg.bucket = bucket;
+    location.apply(&mut cfg);
     let deadline = Instant::now() + timeout;
     let mut last = 0usize;
     let mut stable = 0u8;
@@ -4953,6 +6218,63 @@ fn wait_s3_objects(recording_id: &str, system: &str, timeout: Duration) -> Resul
 /// streams the data parts (see `deja-compactor`). The ingest report and the
 /// sealing manifest are persisted next to the events file and registered as
 /// artifacts; the recording catalog row upserts from the manifest.
+/// Whether a name is a GROUP — a deployment and a day — rather than one
+/// recording.
+///
+/// A group is `<revision>-<MMDD>` and a recording is `rec-…` or `run-…`, so the
+/// prefix settles it without a lookup. Deliberately not "does it parse as a
+/// recording id", which would call an unparseable typo a group and then fail
+/// with "names no recordings" instead of saying the id is malformed.
+fn is_group(name: &str) -> bool {
+    !name.starts_with("rec-") && !name.starts_with("run-")
+}
+
+/// Which "nothing to replay" error an empty group resolution deserves, or
+/// `None` when something was kept.
+///
+/// The two empty cases are different and their messages are not
+/// interchangeable. A group whose members all exist but are unsealed should
+/// wait for the sealer. A group that names nothing at all should NOT, because
+/// there is nothing to seal — sending that reader to wait thirty minutes costs
+/// them thirty minutes and tells them nothing true.
+///
+/// Both were present, but the unsealed check ran first and answered for both,
+/// so a mistyped group reported "all 0 of them are still being written". The
+/// message written for that case had become unreachable.
+fn empty_group_error(
+    recording_id: &str,
+    bucket: &str,
+    landing_root: &str,
+    kept: usize,
+    excluded: &[String],
+) -> Option<String> {
+    if kept > 0 {
+        return None;
+    }
+    if excluded.is_empty() {
+        return Some(format!(
+            "group {recording_id} names no recordings in {bucket}/{landing_root} — it may be \
+             a day nothing has sealed yet, or a revision that never ran here"
+        ));
+    }
+    Some(format!(
+        "group {recording_id} has no sealed recordings yet — all {} of them are still being \
+         written, and a replay cannot seal them itself. The sealer runs every 30 minutes.",
+        excluded.len()
+    ))
+}
+
+/// The source the unsealed pull rescans, for a landing prefix located through
+/// `cfg`. The located prefix is relative to the system's root; a source is a
+/// URI, read from the bucket's root, so the prefix is spelled into it once.
+fn unsealed_source(cfg: &crate::s3::S3Config, located: &str) -> crate::S3Source {
+    crate::S3Source {
+        path: cfg.uri(located),
+        region: cfg.region.clone(),
+        endpoint: (!cfg.endpoint.trim().is_empty()).then(|| cfg.endpoint.clone()),
+    }
+}
+
 fn pull_recording(
     root: &HarnessRoot,
     ctx: &StoreCtx,
@@ -4964,9 +6286,22 @@ fn pull_recording(
     // in another system's bucket failed "no landing objects" for a recording the
     // listing had just offered — a failure BEFORE admission, which is why
     // admission's own ingress gap was never the first obstacle.
-    let (bucket, landing_root) = crate::system::recording_scope(system)?;
+    let (location, landing_root) = crate::system::recording_scope(system)?;
     let mut cfg = crate::s3::S3Config::from_env();
-    cfg.bucket = bucket;
+    location.apply(&mut cfg);
+    // WHICH KIND OF NAME IS THIS — asked FIRST, before anything tries to find a
+    // session by it.
+    //
+    // A group names a deployment's day and is not a session, so it has no
+    // manifest: `manifest_key` is `sessions/v1/<id>/manifest.json` and there is
+    // no `sessions/v1/<revision>-<MMDD>`. Asking the manifest first therefore
+    // answered "absent" for EVERY group and sent it down the single-recording
+    // path below, where the prefix scan looks for envelopes carrying that
+    // session id, finds none, and fails with "it was never landed". The group
+    // resolution further down was unreachable for the only input it exists to
+    // serve — dead code that read as live, and the failure named the recording
+    // rather than the dispatch, so it looked like a missing tape.
+    let is_group_name = is_group(recording_id);
     // A recording named by id alone still has to be FOUND. The compactor looks
     // under its own flat layout; the deployed aggregator partitions by date
     // first, so a session it wrote is not there and the pull failed with "no
@@ -4977,7 +6312,7 @@ fn pull_recording(
     // by the session id carried in each envelope. That matters beyond finding
     // it: a session spanning two dates is addressed from the shared parent, so
     // the prefix holds other sessions too, and only content can separate them.
-    if deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
+    if !is_group_name && deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
         // Where this system's recordings land is declared per system, so the
         // root comes from the run's system rather than from one global: a
         // deployment replaying two systems has two answers and a global would
@@ -4986,21 +6321,148 @@ fn pull_recording(
         let prefix = deja_compactor::locate_landing_prefix(&cfg, recording_id, &root_prefix)?
             .ok_or_else(|| {
                 format!(
-                    "recording {recording_id} is not in s3://{}/{root_prefix} — it was never                      landed, or it landed under a different root",
-                    cfg.bucket
+                    "recording {recording_id} is not in {} — it was never                      landed, or it landed under a different root",
+                    cfg.uri(&root_prefix)
                 )
             })?;
-        let source = crate::S3Source {
-            path: format!("s3://{}/{prefix}", cfg.bucket),
-            region: Some(cfg.region.clone()),
-            endpoint: (!cfg.endpoint.trim().is_empty()).then(|| cfg.endpoint.clone()),
-        };
+        let source = unsealed_source(&cfg, &prefix);
         resolve_recording_from_source(root, ctx, &source, Some(recording_id))?;
         return Ok(());
     }
+    // A GROUP names a deployment's day; a plain id names one pod's slice of it.
+    // The members are resolved HERE rather than by the caller so a run records
+    // what it actually drove: a group that has grown since it was chosen
+    // resolves to more members, and the ingest report names every one.
+    // ONE dispatch on ONE value. The single-recording lookup above is guarded by
+    // the same `is_group_name`, so a group cannot reach it — which is the bug
+    // this shape exists to make unrepresentable. `is_group` was already tested
+    // and already correct when group replay was broken for every group: the
+    // predicate was never the defect, the routing that ignored it was, and a
+    // test of the predicate cannot catch that.
+    // Hoisted above the match so it can reach the report. A partial run has to
+    // SAY it was partial in the artifact a reader acts on, not only in a log
+    // line, or the persisted verdict describes a subset as though it were the
+    // whole day.
+    let mut excluded: Vec<String> = Vec::new();
+    let members: Vec<String> = match is_group_name {
+        // Not a group: the caller named one pod's slice, not a day. Left alone.
+        false => vec![recording_id.to_owned()],
+        true => {
+            let found = deja_compactor::list_landed_recordings(&cfg, &landing_root)?;
+            let mut ids: Vec<String> = found
+                .into_iter()
+                .filter(|r| {
+                    crate::group_of(&crate::parse_recording_id(&r.session_id)).as_deref()
+                        == Some(recording_id)
+                })
+                .map(|r| r.session_id)
+                .collect();
+            // Stable order so two runs of the same group produce the same tape,
+            // and so a diff between them is about the recording rather than
+            // about which order the listing happened to return.
+            ids.sort();
+            // A DAY REPLAYS THE PART OF IT THAT IS SEALED, and says which part
+            // it left out.
+            //
+            // A member with no manifest cannot be read without sealing it, and
+            // a replay may not seal — that writes the tape store it is judged
+            // against, and the Job's role forbids it anyway. The choice is
+            // therefore between refusing the whole day and driving the sealed
+            // part of it.
+            //
+            // Driving it, because the alternative blocks a day on its newest
+            // recording indefinitely: the sealer reaches a recording only once
+            // it has gone quiet, so a day always has a youngest member that is
+            // still open, and a rule of "all or nothing" makes today's traffic
+            // permanently unreplayable. What makes the partial run honest is
+            // that the exclusion is NAMED — a verdict over a subset is fine
+            // when the subset is stated, and misleading only when it is
+            // presented as the whole.
+            //
+            // Checked here rather than in the pull because here it can name the
+            // DAY and what was dropped from it; the pull sees one member at a
+            // time and cannot say what it is part of. It costs one small GET
+            // per member instead of a compaction.
+            // One store, one runtime, sixteen GETs in flight — read_manifests'
+            // own concurrency — rather than the connection-per-member, runtime-
+            // per-member cost a member-at-a-time read had here: `read_manifest`
+            // builds both fresh on every call, so a group of N cost N of each,
+            // serially, on this fetch path. A wholesale failure (the store
+            // itself, not any one member) reads as every member unreadable, so
+            // it falls through the same per-member rule below rather than
+            // aborting the pull outright.
+            let members_before = ids.len();
+            let manifests = deja_compactor::read_manifests(&cfg, &ids)
+                .unwrap_or_else(|e| ids.iter().map(|_| Err(e.clone())).collect());
+            let mut kept = Vec::with_capacity(ids.len());
+            for (id, manifest) in ids.into_iter().zip(manifests) {
+                match manifest {
+                    Ok(Some(_)) => kept.push(id),
+                    Ok(None) => excluded.push(id),
+                    // A store that cannot answer is not evidence of an unsealed
+                    // member. Keep it and let the pull produce the real error,
+                    // rather than silently shrinking the day over a transient.
+                    Err(_) => kept.push(id),
+                }
+            }
+            ids = kept;
+            debug_assert_eq!(
+                ids.len() + excluded.len(),
+                members_before,
+                "every member is either kept or named as excluded; \
+                 {members_before} in, {} kept, {} excluded",
+                ids.len(),
+                excluded.len()
+            );
+            if let Some(err) = empty_group_error(
+                recording_id,
+                &cfg.bucket,
+                &cfg.bucket_key(&landing_root),
+                ids.len(),
+                &excluded,
+            ) {
+                return Err(err);
+            }
+            if !excluded.is_empty() {
+                let line = format!(
+                    "group {recording_id}: replaying {} sealed recording(s); excluding {} not \
+                     sealed yet ({})",
+                    ids.len(),
+                    excluded.len(),
+                    excluded.join(", ")
+                );
+                eprintln!("lifecycle: {line}");
+                ctx.log("ingest", &line);
+            }
+            let line = format!(
+                "group {recording_id} resolves to {} recording(s)",
+                ids.len()
+            );
+            eprintln!("lifecycle: {line}");
+            ctx.log("ingest", &line);
+            ids
+        }
+    };
+
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
-    let (report, manifest) = crate::s3::pull_recording(&cfg, recording_id, &landing_root, &dest)?;
-    let gaps: usize = manifest.instances.iter().map(|i| i.gaps.len()).sum();
+    let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+    let (mut report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &dest)?;
+    // Beside `members`, which names what the pull DID draw from. Without this
+    // the artifact describes a partial run as a whole one, and the exclusion
+    // survives only as prose in a log.
+    report.excluded_members = std::mem::take(&mut excluded);
+    // Gaps are per instance and instances do not span members, so the sum over
+    // every member's manifest is the selection's gap count rather than a
+    // double-count.
+    let gaps: usize = manifests
+        .iter()
+        .flat_map(|m| m.instances.iter())
+        .map(|i| i.gaps.len())
+        .sum();
+    let manifest = manifests
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no manifest for {recording_id}"))?;
     let line = format!(
         "ingested {recording_id}: {} landing object(s), {} line(s), {} duplicate(s) dropped → \
          {} event(s), {} correlation(s), {} gap(s), sealed",
@@ -5155,6 +6617,2054 @@ fn resolve_recording_from_source(
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
 
+    /// Scoring waits for the observed stream to stop growing: a stream still
+    /// being written is read once it has been quiet for the window, and one
+    /// that never stops is named when the bound is reached.
+    #[test]
+    fn scoring_waits_for_the_observed_stream_to_settle() {
+        use super::{wait_for_stream_to_settle, StreamSettled};
+        use std::time::Duration;
+        // Margins far wider than a busy machine's scheduling noise: a writer
+        // that pauses 10ms between lines is growing, a 500ms silence is quiet.
+        let quiet = Duration::from_millis(500);
+        let closed = || Some(0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        // A quiet stream with nothing missing is read once the window passes.
+        // Waiting past a quiet stream that is still open is the next test's,
+        // where it does not hang on a thread's scheduling.
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30), closed);
+        assert_eq!(settled, StreamSettled::Closed);
+
+        // A stream that grows every time it is checked is still growing at the
+        // bound, with no thread's timing involved: the check itself writes.
+        let growing = || {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "c").unwrap();
+            Some(1)
+        };
+        let settled = wait_for_stream_to_settle(&path, quiet, Duration::from_millis(1500), growing);
+        assert_eq!(settled, StreamSettled::StillGrowing);
+
+        let missing = dir.path().join("absent.jsonl");
+        assert_eq!(
+            wait_for_stream_to_settle(&missing, quiet, Duration::from_secs(1), closed),
+            StreamSettled::Absent
+        );
+    }
+
+    /// A quiet stream is not a finished one while a lookup it numbered has not
+    /// written its observation: scoring waits for the lookups to close, and
+    /// names how many never did.
+    #[test]
+    fn scoring_waits_for_the_lookups_to_close_not_only_for_quiet() {
+        use super::{wait_for_stream_to_settle, StreamSettled};
+        use std::time::Duration;
+        let quiet = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        std::fs::write(&path, "1\n3\n").unwrap();
+        // Lookup 2 is still running: the stream is quiet with a number missing.
+        let missing = |path: &std::path::Path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            Some(u64::from(!text.lines().any(|line| line == "2")))
+        };
+        let late = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                std::thread::sleep(Duration::from_millis(1200));
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                writeln!(file, "2").unwrap();
+            })
+        };
+        let settled =
+            wait_for_stream_to_settle(&path, quiet, Duration::from_secs(30), || missing(&path));
+        late.join().unwrap();
+        assert_eq!(
+            settled,
+            StreamSettled::Closed,
+            "waited past the first quiet for the late lookup"
+        );
+
+        let open = dir.path().join("open.jsonl");
+        std::fs::write(&open, "1\n3\n").unwrap();
+        assert_eq!(
+            wait_for_stream_to_settle(&open, quiet, Duration::from_millis(1200), || missing(&open)),
+            StreamSettled::Open { missing: Some(1) }
+        );
+    }
+    // -- a skipped db seed says which kind of nothing it carried -------------
+
+    fn seed_target(key: &str) -> super::DbSeedTarget {
+        super::db_seed_target_from_key(key).expect("a typed db key")
+    }
+
+    fn recorded_ok(value: serde_json::Value, type_name: &str) -> serde_json::Value {
+        serde_json::to_value(deja::value::DejaDatabaseResult::ok(value, type_name)).unwrap()
+    }
+
+    fn why_none(key: &str, envelope: serde_json::Value) -> super::NoSeedableRows {
+        super::seedable_rows(
+            &seed_target(key),
+            None,
+            &envelope,
+            &super::DbCatalog::default(),
+        )
+        .expect_err("no seedable rows")
+    }
+
+    fn query_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!(["pro_1"]),
+        )
+    }
+
+    /// `users.id = 1`, the row key the seed-key tests below already use.
+    const ROW_KEY: &str = "deja:state:v1:db_row:7573657273:6964:31";
+
+    /// The bug the old message buried: a DELETE's `Ok(true)` asserts a row
+    /// existed and carries none of it. It must not read like an empty set.
+    #[test]
+    fn a_recorded_bool_is_presence_without_content_not_absence() {
+        let why = why_none(&query_key(), recorded_ok(serde_json::json!(true), "bool"));
+        assert_eq!(why, super::NoSeedableRows::RecordedPresence);
+        let said = why.to_string();
+        assert!(said.contains("asserts a row"), "{said}");
+        assert!(!said.contains("absence"), "{said}");
+    }
+
+    /// The seeder's half of a borrowed row: when the planner attaches another
+    /// correlation's image to a delete's `Ok(true)`, the image is planted and
+    /// the bare `true` no longer decides the outcome.
+    #[test]
+    fn a_borrowed_image_plants_the_row_a_presence_asserted() {
+        let image = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "business_profile",
+            "columns": [
+                {"name": "profile_id", "type_oid": 1043, "value": "pro_1"},
+                {"name": "profile_name", "type_oid": 1043, "value": "v2"},
+            ],
+        });
+        let rows = super::seedable_rows(
+            &seed_target(&query_key()),
+            Some(&image),
+            &recorded_ok(serde_json::json!(true), "bool"),
+            &super::DbCatalog::default(),
+        )
+        .expect("the borrowed row is seedable");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].table, "business_profile");
+    }
+
+    /// The fifteen correct skips: an empty set or no row is absence recorded.
+    #[test]
+    fn a_recorded_empty_set_or_null_is_absence() {
+        for value in [serde_json::json!([]), serde_json::Value::Null] {
+            let why = why_none(&query_key(), recorded_ok(value.clone(), "Vec<Row>"));
+            assert_eq!(why, super::NoSeedableRows::RecordedAbsence, "{value}");
+            assert!(why.to_string().contains("absence is the precondition"));
+        }
+    }
+
+    fn presence_entry() -> deja::SeedEntry {
+        deja::SeedEntry {
+            boundary: "db".to_owned(),
+            key: query_key(),
+            value: recorded_ok(serde_json::json!(true), "bool"),
+            image: None,
+            method: Some("generic_delete".to_owned()),
+            origin: deja::SeedOrigin::Recording,
+            source_sequence: 7,
+            presence: None,
+        }
+    }
+
+    /// The seam between the writer of the seed certificate and the scorer that
+    /// reads it: a presence skip written here must reach the scorer's
+    /// evidence. Both sides name the fields by string, so a rename on either
+    /// would otherwise switch the scorer's demotion off with every test green.
+    #[test]
+    fn the_scorer_reads_a_presence_skip_the_lifecycle_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-seam";
+        let mut certificate = super::SeedCertificate::new("rec-1", run_id, true);
+        let outcome = super::SeedDbOutcome::skipped_for(
+            super::NoSeedableRows::RecordedPresence,
+            "query-fallback",
+            &query_key(),
+        );
+        certificate.push(
+            super::SeedCertificateEntry::new(
+                &Some("c1".to_owned()),
+                &presence_entry(),
+                None,
+                None,
+                outcome.status,
+                outcome.readback,
+            )
+            .with_skip_reason(outcome.skip_reason),
+        );
+        crate::write_json(&root.seed_certificate_path(run_id), &certificate).unwrap();
+
+        let art = crate::divergence::load_artifacts(&root, run_id).unwrap();
+        assert!(
+            art.unplanted_presence.names("c1", &query_key()),
+            "the scorer must see the skip the lifecycle wrote"
+        );
+        assert!(!art.unplanted_presence.names("c2", &query_key()));
+    }
+
+    fn certificate_entry_for(outcome: super::SeedDbOutcome) -> serde_json::Value {
+        let entry = super::SeedCertificateEntry::new(
+            &Some("c1".to_owned()),
+            &presence_entry(),
+            None,
+            None,
+            outcome.status,
+            outcome.readback,
+        )
+        .with_origin(outcome.origin)
+        .with_mechanism(outcome.mechanism)
+        .with_skip_reason(outcome.skip_reason);
+        serde_json::to_value(entry).unwrap()
+    }
+
+    /// A rule keyed on why a seed was skipped matches this field, not the
+    /// sentence beside it.
+    #[test]
+    fn a_skip_carries_its_cause_as_a_field() {
+        let outcome = super::SeedDbOutcome::skipped_for(
+            super::NoSeedableRows::RecordedPresence,
+            "query-fallback",
+            &query_key(),
+        );
+        let entry = certificate_entry_for(outcome);
+        assert_eq!(entry["materialization"], "skipped");
+        assert_eq!(
+            entry["skip_reason"],
+            serde_json::json!({"cause": "recorded_presence"})
+        );
+        let message = entry["readback"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("asserts a row"), "{message}");
+    }
+
+    // -- a presence with no image in scope: synthesized from the statement ----
+
+    fn shape(
+        name: &str,
+        required: bool,
+        type_name: &str,
+        sql_type: &str,
+        category: char,
+    ) -> super::DbColumnShape {
+        super::DbColumnShape {
+            name: name.to_owned(),
+            required,
+            type_name: type_name.to_owned(),
+            sql_type: sql_type.to_owned(),
+            category,
+            first_enum_label: (category == 'E').then(|| "first".to_owned()),
+        }
+    }
+
+    /// A catalog as `load_db_catalog` builds it: shapes in declaration order,
+    /// and the renderer's metadata for the same columns.
+    fn synthesis_catalog(table: &str, shapes: &[(super::DbColumnShape, u32)]) -> super::DbCatalog {
+        let mut catalog = super::DbCatalog::default();
+        for (shape, oid) in shapes {
+            catalog.insert_shape(table.to_owned(), shape.clone());
+            catalog.insert(
+                table.to_owned(),
+                super::DbColumnMetadata {
+                    name: shape.name.clone(),
+                    type_oid: Some(*oid),
+                    type_name: Some(shape.type_name.clone()),
+                    nullable: Some(!shape.required),
+                },
+            );
+        }
+        catalog
+    }
+
+    /// Every NOT NULL type family a synthesized row has to fill, plus the
+    /// columns it must leave alone (nullable, or filled by a default).
+    fn widget_catalog() -> super::DbCatalog {
+        synthesis_catalog(
+            "widget",
+            &[
+                (shape("id", false, "int4", "integer", 'N'), 23),
+                (
+                    shape("profile_id", true, "varchar", "character varying(64)", 'S'),
+                    1043,
+                ),
+                (shape("merchant_id", true, "text", "text", 'S'), 25),
+                (shape("name", false, "text", "text", 'S'), 25),
+                (shape("active", true, "bool", "boolean", 'B'), 16),
+                (shape("version", true, "int4", "integer", 'N'), 23),
+                (shape("secret", true, "bytea", "bytea", 'U'), 17),
+                (
+                    shape(
+                        "created_at",
+                        true,
+                        "timestamp",
+                        "timestamp without time zone",
+                        'D',
+                    ),
+                    1114,
+                ),
+                (shape("meta", true, "jsonb", "jsonb", 'U'), 3802),
+                (
+                    shape("status", true, "widget_status", "widget_status", 'E'),
+                    16_500,
+                ),
+                (shape("tags", true, "_text", "text[]", 'A'), 1009),
+            ],
+        )
+    }
+
+    const WIDGET_DELETE: &str = r#"DELETE FROM "widget" WHERE (("widget"."profile_id" = $1) AND ("widget"."merchant_id" = $2))"#;
+
+    fn widget_presence() -> deja::PresencePredicate {
+        deja::PresencePredicate::Equalities {
+            table: "widget".to_owned(),
+            columns: vec![
+                ("profile_id".to_owned(), serde_json::json!("pro_1")),
+                ("merchant_id".to_owned(), serde_json::json!("m1")),
+            ],
+        }
+    }
+
+    fn widget_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "widget",
+            WIDGET_DELETE,
+            &serde_json::json!(["pro_1", "m1"]),
+        )
+    }
+
+    /// A store no test reaches: a connection to it fails at once.
+    fn unreachable_store() -> super::StoreExec {
+        super::StoreExec::direct(
+            "127.0.0.1".to_owned(),
+            1,
+            "postgresql://deja@127.0.0.1:1/none?connect_timeout=1".to_owned(),
+        )
+    }
+
+    fn synthesized_value(row: &super::SynthesizedPresenceRow, column: &str) -> serde_json::Value {
+        row.row
+            .columns
+            .iter()
+            .find(|c| c.metadata.name == column)
+            .map(|c| c.value.clone())
+            .unwrap_or_else(|| panic!("no column {column} in {row:?}"))
+    }
+
+    /// The statement's binds become the key; every other required column gets
+    /// its type's neutral value; nullable and defaulted columns are left out.
+    #[test]
+    fn a_presence_without_an_image_synthesizes_the_row_its_statement_names() {
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        assert_eq!(row.columns_from_statement, ["profile_id", "merchant_id"]);
+        assert_eq!(
+            row.columns_defaulted,
+            [
+                "active",
+                "version",
+                "secret",
+                "created_at",
+                "meta",
+                "status",
+                "tags"
+            ]
+        );
+        let names: Vec<&str> = row
+            .row
+            .columns
+            .iter()
+            .map(|c| c.metadata.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"id"),
+            "a defaulted column keeps its default"
+        );
+        assert!(!names.contains(&"name"), "a nullable column stays NULL");
+        for (column, value) in [
+            ("profile_id", serde_json::json!("pro_1")),
+            ("merchant_id", serde_json::json!("m1")),
+            ("active", serde_json::json!(false)),
+            ("version", serde_json::json!(0)),
+            ("secret", serde_json::json!("")),
+            ("created_at", serde_json::json!("1970-01-01 00:00:00")),
+            ("meta", serde_json::json!({})),
+            ("status", serde_json::json!("first")),
+            ("tags", serde_json::json!("{}")),
+        ] {
+            assert_eq!(synthesized_value(&row, column), value, "{column}");
+        }
+        let sql = super::build_presence_plant_sql(Some("s1"), &row).unwrap();
+        for rendered in [
+            r#"INSERT INTO "s1"."widget" ("profile_id", "merchant_id", "active""#,
+            "('pro_1')::character varying(64)",
+            "(false)::boolean",
+            "(0)::integer",
+            r"('\x'::bytea)::bytea",
+            "('1970-01-01 00:00:00')::timestamp without time zone",
+            "('{}'::jsonb)::jsonb",
+            "('first')::widget_status",
+            "('{}')::text[]",
+            r#"WHERE NOT EXISTS (SELECT 1 FROM "s1"."widget" WHERE "profile_id" = 'pro_1' AND "merchant_id" = 'm1')"#,
+            "RETURNING 1) SELECT COUNT(*) FROM planted;",
+        ] {
+            assert!(sql.contains(rendered), "missing {rendered} in {sql}");
+        }
+    }
+
+    /// Two equality binds: the planted row satisfies both, and the readback
+    /// asks for both.
+    #[test]
+    fn a_synthesized_row_satisfies_every_equality_in_the_where() {
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        assert_eq!(synthesized_value(&row, "profile_id"), "pro_1");
+        assert_eq!(synthesized_value(&row, "merchant_id"), "m1");
+        let readback = super::build_presence_readback_sql(Some("s1"), &row).unwrap();
+        assert_eq!(
+            readback,
+            r#"SELECT COUNT(*) FROM "s1"."widget" WHERE "profile_id" = 'pro_1' AND "merchant_id" = 'm1';"#
+        );
+    }
+
+    /// A length-limited column keeps its length in the plant's cast: a bare
+    /// `character` cast is `character(1)` and truncates the bind.
+    #[test]
+    fn the_catalog_query_spells_casts_with_their_typmod() {
+        assert!(
+            super::DB_CATALOG_SQL.contains("format_type(attr.atttypid, attr.atttypmod)"),
+            "the cast spelling must keep the typmod"
+        );
+        assert!(!super::DB_CATALOG_SQL.contains("regtype"));
+    }
+
+    #[test]
+    fn a_synthesized_cast_keeps_the_column_typmod() {
+        let catalog = synthesis_catalog(
+            "widget",
+            &[
+                (
+                    shape("profile_id", true, "bpchar", "character(5)", 'S'),
+                    1042,
+                ),
+                (
+                    shape("merchant_id", true, "varchar", "character varying(64)", 'S'),
+                    1043,
+                ),
+                (shape("flags", true, "bit", "bit(3)", 'V'), 1560),
+            ],
+        );
+        let why = super::synthesize_presence_row("widget", &widget_presence(), &catalog)
+            .expect_err("bit has no neutral value");
+        assert!(why.contains("bit(3)"), "{why}");
+        let catalog = synthesis_catalog(
+            "widget",
+            &[
+                (
+                    shape("profile_id", true, "bpchar", "character(5)", 'S'),
+                    1042,
+                ),
+                (
+                    shape("merchant_id", true, "varchar", "character varying(64)", 'S'),
+                    1043,
+                ),
+            ],
+        );
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &catalog).unwrap();
+        let sql = super::build_presence_plant_sql(None, &row).unwrap();
+        assert!(sql.contains("('pro_1')::character(5)"), "{sql}");
+        assert!(sql.contains("('m1')::character varying(64)"), "{sql}");
+    }
+
+    /// An enum with no labels reaches the named refusal: the catalog's `''`
+    /// is no label, not an empty one.
+    #[test]
+    fn an_enum_without_labels_refuses_by_name() {
+        assert_eq!(super::catalog_first_enum_label("E", ""), None);
+        assert_eq!(
+            super::catalog_first_enum_label("E", "active"),
+            Some("active".to_owned())
+        );
+        assert_eq!(super::catalog_first_enum_label("S", "active"), None);
+        let mut status = shape("status", true, "widget_status", "widget_status", 'E');
+        status.first_enum_label = super::catalog_first_enum_label("E", "");
+        let catalog = synthesis_catalog(
+            "widget",
+            &[
+                (
+                    shape("profile_id", true, "varchar", "character varying", 'S'),
+                    1043,
+                ),
+                (shape("merchant_id", true, "text", "text", 'S'), 25),
+                (status, 16_500),
+            ],
+        );
+        let why = super::synthesize_presence_row("widget", &widget_presence(), &catalog)
+            .expect_err("no label to plant");
+        assert!(
+            why.contains("column status is an enum of type widget_status"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_synthesized_row_is_deterministic() {
+        let plant = || {
+            let row =
+                super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+                    .unwrap();
+            let sql = super::build_presence_plant_sql(Some("s1"), &row).unwrap();
+            let target = seed_target(&widget_key());
+            let outcome = super::presence_outcome(
+                &target,
+                &row,
+                super::SeedEntryMechanism {
+                    table: "widget".to_owned(),
+                    rows: 1,
+                    via_copy: 0,
+                    via_insert: 1,
+                    physical_image_gap: None,
+                },
+                1,
+                1,
+            );
+            (
+                sql,
+                serde_json::to_vec(&certificate_entry_for(outcome)).unwrap(),
+            )
+        };
+        assert_eq!(plant(), plant());
+    }
+
+    /// The certificate says the row is synthesized and which columns are
+    /// neutral, so it never reads as recorded content; the readback says
+    /// exactly one row satisfies the statement.
+    #[test]
+    fn a_synthesized_plant_certifies_its_origin_and_readback() {
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        let mechanism = super::SeedEntryMechanism {
+            table: "widget".to_owned(),
+            rows: 1,
+            via_copy: 0,
+            via_insert: 1,
+            physical_image_gap: Some("synthesized".to_owned()),
+        };
+        let outcome = super::presence_outcome(&seed_target(&widget_key()), &row, mechanism, 1, 1);
+        let entry = certificate_entry_for(outcome);
+        assert_eq!(
+            entry["origin"],
+            serde_json::json!({"synthesized_presence": {
+                "from": "statement_binds",
+                "columns_from_statement": ["profile_id", "merchant_id"],
+                "columns_defaulted":
+                    ["active", "version", "secret", "created_at", "meta", "status", "tags"],
+            }})
+        );
+        assert_eq!(entry["materialization"], "materialized");
+        assert_eq!(entry["readback"]["status"], "matched");
+        assert_eq!(entry["readback"]["expected"]["rows"], 1);
+        assert_eq!(
+            entry["readback"]["expected"]["where"],
+            serde_json::json!(["profile_id", "merchant_id"])
+        );
+        assert_eq!(
+            entry["readback"]["observed"],
+            serde_json::json!({"planted": 1, "rows": 1})
+        );
+        assert!(entry.get("skip_reason").is_none());
+    }
+
+    /// Every (planted, matching) pair has a named outcome; only a real plant
+    /// claims a synthesized origin.
+    #[test]
+    fn a_synthesized_plant_names_every_count() {
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        let target = seed_target(&widget_key());
+        let mechanism = super::SeedEntryMechanism {
+            table: "widget".to_owned(),
+            rows: 1,
+            via_copy: 0,
+            via_insert: 1,
+            physical_image_gap: None,
+        };
+        let judge = |planted, matching| {
+            super::presence_outcome(&target, &row, mechanism.clone(), planted, matching)
+        };
+        use super::{SeedMaterializationStatus as M, SeedReadbackStatus as R};
+        let held = judge(0, 1);
+        assert_eq!(
+            (held.status, held.readback.status),
+            (M::Skipped, R::Matched)
+        );
+        assert_eq!(
+            held.skip_reason,
+            Some(super::NoSeedableRows::PresenceAlreadyHeld)
+        );
+        assert_eq!(held.origin, None, "nothing was synthesized");
+        let conflicted = judge(0, 0);
+        assert_eq!(
+            (conflicted.status, conflicted.readback.status),
+            (M::Failed, R::Missing)
+        );
+        let vanished = judge(1, 0);
+        assert_eq!(
+            (vanished.status, vanished.readback.status),
+            (M::Materialized, R::Missing)
+        );
+        let doubled = judge(1, 2);
+        assert_eq!(
+            (doubled.status, doubled.readback.status),
+            (M::Materialized, R::Mismatched)
+        );
+        for outcome in [conflicted, vanished, doubled] {
+            assert!(
+                matches!(
+                    outcome.origin,
+                    Some(super::CertifiedSeedOrigin::SynthesizedPresence { .. })
+                ),
+                "{:?}",
+                outcome.origin
+            );
+        }
+    }
+
+    /// A WHERE the planner could not reduce stays skipped, under its own cause,
+    /// and the certificate carries why.
+    #[test]
+    fn an_unsatisfiable_where_stays_skipped_with_its_own_cause() {
+        let outcome = super::seed_db(
+            &unreachable_store(),
+            Some("s1"),
+            &widget_catalog(),
+            &widget_key(),
+            None,
+            &recorded_ok(serde_json::json!(true), "bool"),
+            Some(&deja::PresencePredicate::Unsatisfiable(
+                "the WHERE is not a conjunction of column = bind terms: it continues at `OR`"
+                    .to_owned(),
+            )),
+        );
+        assert_eq!(outcome.status, super::SeedMaterializationStatus::Skipped);
+        assert_eq!(outcome.origin, None);
+        let entry = certificate_entry_for(outcome);
+        assert_eq!(entry["skip_reason"]["cause"], "unsynthesizable_presence");
+        let detail = entry["skip_reason"]["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("`OR`"), "{detail}");
+        assert_eq!(entry["origin"], "recording");
+    }
+
+    /// A required column whose type has no neutral value refuses, by name,
+    /// rather than guessing — the same named skip.
+    #[test]
+    fn a_required_column_without_a_neutral_value_is_named() {
+        let catalog = synthesis_catalog(
+            "widget",
+            &[
+                (
+                    shape("profile_id", true, "varchar", "character varying", 'S'),
+                    1043,
+                ),
+                (shape("merchant_id", true, "text", "text", 'S'), 25),
+                (shape("spot", true, "point", "point", 'G'), 600),
+            ],
+        );
+        let why = super::synthesize_presence_row("widget", &widget_presence(), &catalog)
+            .expect_err("no neutral point");
+        assert!(
+            why.contains("column spot") && why.contains("point"),
+            "{why}"
+        );
+        let missing = super::synthesize_presence_row(
+            "widget",
+            &deja::PresencePredicate::Equalities {
+                table: "widget".to_owned(),
+                columns: vec![("nope".to_owned(), serde_json::json!(1))],
+            },
+            &catalog,
+        )
+        .expect_err("an unknown column");
+        assert!(missing.contains("column nope"), "{missing}");
+        let other = super::synthesize_presence_row("gadget", &widget_presence(), &catalog)
+            .expect_err("another table");
+        assert!(other.contains("deletes from widget"), "{other}");
+    }
+
+    /// A satisfiable predicate takes the entry to the synthesizer, not to a
+    /// skip: against a store that refuses, it fails as a synthesized plant.
+    #[test]
+    fn a_presence_predicate_reaches_the_synthesizer() {
+        let outcome = super::seed_db(
+            &unreachable_store(),
+            Some("s1"),
+            &widget_catalog(),
+            &widget_key(),
+            None,
+            &recorded_ok(serde_json::json!(true), "bool"),
+            Some(&widget_presence()),
+        );
+        assert_eq!(outcome.status, super::SeedMaterializationStatus::Failed);
+        assert_eq!(outcome.skip_reason, None);
+        assert!(
+            matches!(
+                outcome.origin,
+                Some(super::CertifiedSeedOrigin::SynthesizedPresence { .. })
+            ),
+            "{:?}",
+            outcome.origin
+        );
+    }
+
+    /// With no statement predicate on the entry, a presence is still skipped
+    /// as `RecordedPresence`, as before.
+    #[test]
+    fn a_presence_without_a_predicate_is_still_recorded_presence() {
+        let outcome = super::seed_db(
+            &unreachable_store(),
+            Some("s1"),
+            &widget_catalog(),
+            &widget_key(),
+            None,
+            &recorded_ok(serde_json::json!(true), "bool"),
+            None,
+        );
+        assert_eq!(
+            outcome.skip_reason,
+            Some(super::NoSeedableRows::RecordedPresence)
+        );
+    }
+
+    /// Route D first at the seeder too: an image on the entry is planted as
+    /// the row, whatever predicate rides along.
+    #[test]
+    fn an_image_wins_over_the_statement_at_the_seeder() {
+        let image = serde_json::json!({
+            "deja_image": "db_row",
+            "version": 1,
+            "table": "widget",
+            "columns": [
+                {"name": "profile_id", "type_oid": 1043, "value": "pro_1"},
+                {"name": "merchant_id", "type_oid": 25, "value": "m1"},
+            ],
+        });
+        let outcome = super::seed_db(
+            &unreachable_store(),
+            Some("s1"),
+            &widget_catalog(),
+            &widget_key(),
+            Some(&image),
+            &recorded_ok(serde_json::json!(true), "bool"),
+            Some(&widget_presence()),
+        );
+        assert_eq!(
+            outcome.origin, None,
+            "the image is planted, not synthesized"
+        );
+        assert_eq!(outcome.skip_reason, None);
+        let mechanism = outcome.mechanism.expect("the image was rendered");
+        assert_eq!(mechanism.via_insert, 1);
+        assert!(!mechanism
+            .physical_image_gap
+            .unwrap_or_default()
+            .contains("synthesized"),);
+    }
+
+    /// The seam for the new cause: an unsynthesizable presence the lifecycle
+    /// writes is one the scorer reads as unplanted, and a synthesized plant is
+    /// not.
+    #[test]
+    fn the_scorer_reads_an_unsynthesizable_presence_and_not_a_synthesized_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-seam-synth";
+        let mut certificate = super::SeedCertificate::new("rec-1", run_id, true);
+        let skipped = super::SeedDbOutcome::skipped_for(
+            super::NoSeedableRows::UnsynthesizablePresence("why".to_owned()),
+            "query-fallback",
+            &query_key(),
+        );
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        let planted = super::presence_outcome(
+            &seed_target(&widget_key()),
+            &row,
+            super::SeedEntryMechanism {
+                table: "widget".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
+            1,
+            1,
+        );
+        for (corr, outcome) in [("c1", skipped), ("c2", planted)] {
+            certificate.push(
+                super::SeedCertificateEntry::new(
+                    &Some(corr.to_owned()),
+                    &presence_entry(),
+                    None,
+                    None,
+                    outcome.status,
+                    outcome.readback,
+                )
+                .with_origin(outcome.origin)
+                .with_skip_reason(outcome.skip_reason),
+            );
+        }
+        crate::write_json(&root.seed_certificate_path(run_id), &certificate).unwrap();
+        let art = crate::divergence::load_artifacts(&root, run_id).unwrap();
+        assert!(art.unplanted_presence.names("c1", &query_key()));
+        assert!(
+            !art.unplanted_presence.names("c2", &query_key()),
+            "a synthesized row was planted"
+        );
+    }
+
+    /// Against a real Postgres: the catalog load, the plant and the readback,
+    /// then the recorded DELETE itself finds the row. Needs a database the test
+    /// may create tables in; it fails, not skips, when run without one.
+    #[test]
+    #[ignore = "needs a disposable Postgres at DEJA_TEST_DATABASE_URL"]
+    fn a_synthesized_row_plants_in_postgres_and_the_delete_finds_it() {
+        let url = std::env::var("DEJA_TEST_DATABASE_URL")
+            .expect("DEJA_TEST_DATABASE_URL names a disposable Postgres");
+        let store = super::StoreExec::direct("127.0.0.1".to_owned(), 1, url);
+        let psql = |sql: &str| {
+            let output = store.psql(&["-A", "-t"], true, sql).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{sql}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        psql(
+            "DROP SCHEMA IF EXISTS deja_synth CASCADE; DROP TABLE IF EXISTS public.widget; \
+             DROP TYPE IF EXISTS widget_status; \
+             CREATE TYPE widget_status AS ENUM ('first', 'second'); \
+             CREATE TABLE public.widget ( \
+               id serial PRIMARY KEY, profile_id char(5) NOT NULL, merchant_id text NOT NULL, \
+               name text, active bool NOT NULL, version int4 NOT NULL, amount numeric NOT NULL, \
+               small int2 NOT NULL, big int8 NOT NULL, ratio float8 NOT NULL, \
+               secret bytea NOT NULL, created_at timestamp NOT NULL, \
+               updated_at timestamptz NOT NULL, born date NOT NULL, at_time time NOT NULL, \
+               span interval NOT NULL, meta jsonb NOT NULL, meta_json json NOT NULL, \
+               status widget_status NOT NULL, tags text[] NOT NULL, jtags jsonb[] NOT NULL, \
+               ident uuid NOT NULL, code char(3) NOT NULL, \
+               note text NOT NULL DEFAULT 'x', \
+               UNIQUE (profile_id));",
+        );
+        let catalog = super::load_db_catalog(&store);
+        super::create_db_schema(&store, "deja_synth", &["widget".to_owned()]);
+        let seed = || {
+            super::seed_db(
+                &store,
+                Some("deja_synth"),
+                &catalog,
+                &widget_key(),
+                None,
+                &recorded_ok(serde_json::json!(true), "bool"),
+                Some(&widget_presence()),
+            )
+        };
+        let outcome = seed();
+        assert_eq!(
+            outcome.status,
+            super::SeedMaterializationStatus::Materialized,
+            "{:?}",
+            outcome.readback
+        );
+        assert_eq!(outcome.readback.status, super::SeedReadbackStatus::Matched);
+        let entry = certificate_entry_for(outcome);
+        eprintln!("{}", serde_json::to_string_pretty(&entry).unwrap());
+        assert_eq!(
+            entry["origin"]["synthesized_presence"]["columns_defaulted"],
+            serde_json::json!([
+                "active",
+                "version",
+                "amount",
+                "small",
+                "big",
+                "ratio",
+                "secret",
+                "created_at",
+                "updated_at",
+                "born",
+                "at_time",
+                "span",
+                "meta",
+                "meta_json",
+                "status",
+                "tags",
+                "jtags",
+                "ident",
+                "code"
+            ])
+        );
+        let again = seed();
+        assert_eq!(
+            again.skip_reason,
+            Some(super::NoSeedableRows::PresenceAlreadyHeld),
+            "a second entry for the same statement plants nothing over the first"
+        );
+        assert_eq!(
+            psql(
+                "SET search_path TO deja_synth, public; \
+                 WITH gone AS (DELETE FROM widget WHERE profile_id = 'pro_1' AND merchant_id = 'm1' \
+                 RETURNING 1) SELECT COUNT(*) FROM gone;"
+            ),
+            "1",
+            "the recorded DELETE removes exactly the planted row"
+        );
+        psql("DROP SCHEMA deja_synth CASCADE; DROP TABLE public.widget; DROP TYPE widget_status;");
+    }
+
+    /// Every field of the catalog query's row, decoded by position, from a canned
+    /// line. This pins what each index MEANS, not that the query selects them in
+    /// that order — the line here is written in the decoder's own order, so a
+    /// reordered SELECT leaves it green. The order is pinned separately, by
+    /// `the_catalog_query_selects_the_columns_the_decode_reads`.
+    #[test]
+    fn the_catalog_decode_reads_every_field_by_position() {
+        let decode = |line: &str| super::decode_catalog_row(line).expect("nine fields");
+        let column =
+            |name: &str, oid: u32, type_name: &str, nullable: bool| super::DbColumnMetadata {
+                name: name.to_owned(),
+                type_oid: Some(oid),
+                type_name: Some(type_name.to_owned()),
+                nullable: Some(nullable),
+            };
+        let shape = |name: &str,
+                     required: bool,
+                     type_name: &str,
+                     sql_type: &str,
+                     category: char,
+                     label: Option<&str>| super::DbColumnShape {
+            name: name.to_owned(),
+            required,
+            type_name: type_name.to_owned(),
+            sql_type: sql_type.to_owned(),
+            category,
+            first_enum_label: label.map(str::to_owned),
+        };
+        assert_eq!(
+            decode("widget\tprofile_id\t1043\tvarchar\tf\tf\tS\tcharacter varying(64)\t"),
+            (
+                "widget".to_owned(),
+                shape(
+                    "profile_id",
+                    true,
+                    "varchar",
+                    "character varying(64)",
+                    'S',
+                    None
+                ),
+                column("profile_id", 1043, "varchar", false),
+            )
+        );
+        assert_eq!(
+            decode("widget\tname\t25\ttext\tt\tf\tS\ttext\t"),
+            (
+                "widget".to_owned(),
+                shape("name", false, "text", "text", 'S', None),
+                column("name", 25, "text", true),
+            ),
+            "nullable, so not required"
+        );
+        assert_eq!(
+            decode("widget\tid\t23\tint4\tf\tt\tN\tinteger\t"),
+            (
+                "widget".to_owned(),
+                shape("id", false, "int4", "integer", 'N', None),
+                column("id", 23, "int4", false),
+            ),
+            "NOT NULL but defaulted, so not required"
+        );
+        assert_eq!(
+            decode("widget\tstatus\t16500\twidget_status\tf\tf\tE\twidget_status\tactive"),
+            (
+                "widget".to_owned(),
+                shape(
+                    "status",
+                    true,
+                    "widget_status",
+                    "widget_status",
+                    'E',
+                    Some("active")
+                ),
+                column("status", 16_500, "widget_status", false),
+            )
+        );
+        assert_eq!(
+            decode("widget\tbare\t16501\tbare_enum\tf\tf\tE\tpublic.bare_enum\t"),
+            (
+                "widget".to_owned(),
+                shape("bare", true, "bare_enum", "public.bare_enum", 'E', None),
+                column("bare", 16_501, "bare_enum", false),
+            ),
+            "an enum with no labels"
+        );
+        assert_eq!(
+            super::decode_catalog_row("widget\tid\t23\tint4\tf\tt\tN\tinteger"),
+            None
+        );
+    }
+
+    /// The expressions `DB_CATALOG_SQL` selects, in order, with runs of
+    /// whitespace collapsed. Commas inside parentheses do not split, so
+    /// `format_type(a, b)` and the `COALESCE` subquery stay whole.
+    fn catalog_select_list() -> Vec<String> {
+        let sql = super::DB_CATALOG_SQL;
+        let open = sql.find("SELECT ").expect("the query selects") + "SELECT ".len();
+        let close = sql
+            .find(" FROM pg_catalog.pg_attribute")
+            .expect("the query reads pg_attribute");
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        for ch in sql[open..close].chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    out.push(std::mem::take(&mut current));
+                }
+                _ => current.push(ch),
+            }
+        }
+        out.push(current);
+        out.iter()
+            .map(|e| e.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// `decode_catalog_row` reads the catalog row BY POSITION, and until this
+    /// test nothing pinned the query's column order: swapping two expressions in
+    /// the SELECT left the whole workspace green, because the canned-line test
+    /// writes its line in the decoder's order and the only other assertion is
+    /// that the text contains `format_type(...)` somewhere. A swap re-types every
+    /// column silently — category becomes the first letter of a type name, so
+    /// `neutral_value` refuses, and every presence-only delete goes back to
+    /// `unsynthesizable_presence` with the feature inert.
+    #[test]
+    fn the_catalog_query_selects_the_columns_the_decode_reads() {
+        assert_eq!(
+            catalog_select_list(),
+            vec![
+                "cls.relname".to_owned(),
+                "attr.attname".to_owned(),
+                "typ.oid::int4".to_owned(),
+                "typ.typname".to_owned(),
+                "(NOT attr.attnotnull)".to_owned(),
+                "(attr.atthasdef OR attr.attidentity <> '')".to_owned(),
+                "typ.typcategory".to_owned(),
+                "pg_catalog.format_type(attr.atttypid, attr.atttypmod)".to_owned(),
+                "COALESCE((SELECT e.enumlabel FROM pg_catalog.pg_enum e WHERE \
+                 e.enumtypid = typ.oid ORDER BY e.enumsortorder LIMIT 1), '')"
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ],
+            "the SELECT list moved; decode_catalog_row reads these by index"
+        );
+    }
+
+    fn synthesized_entry(corr: &str, planted: u64, matching: u64) -> super::SeedCertificateEntry {
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &widget_catalog())
+            .unwrap();
+        let outcome = super::presence_outcome(
+            &seed_target(&widget_key()),
+            &row,
+            super::SeedEntryMechanism {
+                table: "widget".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
+            planted,
+            matching,
+        );
+        super::SeedCertificateEntry::new(
+            &Some(corr.to_owned()),
+            &presence_entry(),
+            None,
+            None,
+            outcome.status,
+            outcome.readback,
+        )
+        .with_origin(outcome.origin)
+        .with_mechanism(outcome.mechanism)
+        .with_skip_reason(outcome.skip_reason)
+    }
+
+    /// A synthesis that goes wrong never scores worse than no synthesis: each
+    /// unmatched shape, written and read back as a certificate, excuses its
+    /// key, and only the matched plant leaves it to the candidate.
+    #[test]
+    fn every_unverified_synthesis_is_excused_through_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-unverified-synthesis";
+        let mut certificate = super::SeedCertificate::new("rec-1", run_id, true);
+        let shapes = [
+            ("conflicted", 0, 0, "failed", "missing"),
+            ("vanished", 1, 0, "materialized", "missing"),
+            ("doubled", 1, 2, "materialized", "mismatched"),
+            ("verified", 1, 1, "materialized", "matched"),
+        ];
+        for (corr, planted, matching, materialization, readback) in shapes {
+            let entry = synthesized_entry(corr, planted, matching);
+            let json = serde_json::to_value(&entry).unwrap();
+            assert_eq!(json["materialization"], materialization, "{corr}");
+            assert_eq!(json["readback"]["status"], readback, "{corr}");
+            certificate.push(entry);
+        }
+        crate::write_json(&root.seed_certificate_path(run_id), &certificate).unwrap();
+        let art = crate::divergence::load_artifacts(&root, run_id).unwrap();
+        for corr in ["conflicted", "vanished", "doubled"] {
+            assert!(art.unplanted_presence.names(corr, &query_key()), "{corr}");
+        }
+        assert!(!art.unplanted_presence.names("verified", &query_key()));
+    }
+
+    /// A cast that truncates the bind is not certified matched: the plant
+    /// stores `pro`, the recorded WHERE asks for `pro_1`.
+    #[test]
+    fn a_truncating_cast_is_not_certified_matched() {
+        let catalog = synthesis_catalog(
+            "widget",
+            &[
+                (
+                    shape("profile_id", true, "bpchar", "character(3)", 'S'),
+                    1042,
+                ),
+                (shape("merchant_id", true, "text", "text", 'S'), 25),
+            ],
+        );
+        let row = super::synthesize_presence_row("widget", &widget_presence(), &catalog).unwrap();
+        let plant = super::build_presence_plant_sql(None, &row).unwrap();
+        assert!(plant.contains("('pro_1')::character(3)"), "{plant}");
+        assert_eq!(
+            super::build_presence_readback_sql(None, &row).unwrap(),
+            r#"SELECT COUNT(*) FROM "widget" WHERE "profile_id" = 'pro_1' AND "merchant_id" = 'm1';"#,
+            "the readback asks the recorded bind, not the planted value"
+        );
+        let outcome = super::presence_outcome(
+            &seed_target(&widget_key()),
+            &row,
+            super::SeedEntryMechanism {
+                table: "widget".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
+            1,
+            0,
+        );
+        assert_eq!(
+            (outcome.status, outcome.readback.status),
+            (
+                super::SeedMaterializationStatus::Materialized,
+                super::SeedReadbackStatus::Missing
+            )
+        );
+    }
+
+    /// The truncating cast against a real Postgres: planted, not matched.
+    #[test]
+    #[ignore = "needs a disposable Postgres at DEJA_TEST_DATABASE_URL"]
+    fn a_truncating_cast_in_postgres_reads_back_missing() {
+        let url = std::env::var("DEJA_TEST_DATABASE_URL")
+            .expect("DEJA_TEST_DATABASE_URL names a disposable Postgres");
+        let store = super::StoreExec::direct("127.0.0.1".to_owned(), 1, url);
+        let psql = |sql: &str| {
+            let output = store.psql(&["-A", "-t"], true, sql).output().unwrap();
+            assert!(output.status.success(), "psql failed");
+        };
+        // Its own table, so it can run beside the other Postgres test.
+        psql(
+            "DROP SCHEMA IF EXISTS deja_trunc CASCADE; DROP TABLE IF EXISTS public.gizmo; \
+             CREATE TABLE public.gizmo (profile_id char(3) NOT NULL, merchant_id text NOT NULL);",
+        );
+        let catalog = super::load_db_catalog(&store);
+        super::create_db_schema(&store, "deja_trunc", &["gizmo".to_owned()]);
+        let presence = deja::PresencePredicate::Equalities {
+            table: "gizmo".to_owned(),
+            columns: vec![
+                ("profile_id".to_owned(), serde_json::json!("pro_1")),
+                ("merchant_id".to_owned(), serde_json::json!("m1")),
+            ],
+        };
+        let key = deja::db::query_state_key(
+            "generic_delete",
+            "gizmo",
+            "DELETE FROM gizmo WHERE profile_id = $1 AND merchant_id = $2",
+            &serde_json::json!(["pro_1", "m1"]),
+        );
+        let outcome = super::seed_db(
+            &store,
+            Some("deja_trunc"),
+            &catalog,
+            &key,
+            None,
+            &recorded_ok(serde_json::json!(true), "bool"),
+            Some(&presence),
+        );
+        psql("DROP SCHEMA deja_trunc CASCADE; DROP TABLE public.gizmo;");
+        assert_eq!(
+            (outcome.status, outcome.readback.status),
+            (
+                super::SeedMaterializationStatus::Materialized,
+                super::SeedReadbackStatus::Missing
+            )
+        );
+    }
+
+    #[test]
+    fn a_count_skip_serializes_its_detail() {
+        let outcome =
+            super::SeedDbOutcome::skipped_for(super::NoSeedableRows::RecordedCount(0), "row", "k");
+        let entry = certificate_entry_for(outcome);
+        assert_eq!(
+            entry["skip_reason"],
+            serde_json::json!({"cause": "recorded_count", "detail": 0})
+        );
+    }
+
+    /// Certificates written before the field existed still parse, as no skip
+    /// reason, and an entry that found rows writes no such key at all.
+    #[test]
+    fn a_certificate_without_the_field_still_parses_and_rows_add_none() {
+        let outcome = super::SeedDbOutcome::rendered(
+            super::SeedMaterializationStatus::Materialized,
+            super::SeedReadback::matched(
+                serde_json::json!({"id": 1}),
+                serde_json::json!({"id": 1}),
+            ),
+            super::SeedEntryMechanism {
+                table: "users".to_owned(),
+                rows: 1,
+                via_copy: 0,
+                via_insert: 1,
+                physical_image_gap: None,
+            },
+        );
+        let entry = certificate_entry_for(outcome);
+        assert!(entry.get("skip_reason").is_none());
+        let parsed: super::SeedCertificateEntry = serde_json::from_value(entry).unwrap();
+        assert_eq!(parsed.skip_reason, None);
+    }
+
+    /// A count's meaning is its value: zero rows is absence recorded, more is
+    /// rows asserted and not carried. Neither is the delete's `true`.
+    #[test]
+    fn a_recorded_count_says_absence_at_zero_and_presence_above_it() {
+        let zero = why_none(&query_key(), recorded_ok(serde_json::json!(0), "usize"));
+        assert_eq!(zero, super::NoSeedableRows::RecordedCount(0));
+        assert!(
+            zero.to_string().contains("absence is the precondition"),
+            "{zero}"
+        );
+        let three = why_none(&query_key(), recorded_ok(serde_json::json!(3), "usize"));
+        assert_eq!(three, super::NoSeedableRows::RecordedCount(3));
+        assert!(three.to_string().contains("3 row(s)"), "{three}");
+        assert!(!three.to_string().contains("absence"), "{three}");
+    }
+
+    /// Other scalars assert nothing about rows.
+    #[test]
+    fn other_scalars_are_not_rows_and_claim_nothing() {
+        // A count is a non-negative integer; anything else is not one.
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!("done"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let why = why_none(&query_key(), recorded_ok(value.clone(), "other"));
+            assert_eq!(
+                why,
+                super::NoSeedableRows::RecordedScalar(value.to_string())
+            );
+            let said = why.to_string();
+            assert!(
+                !said.contains("absence") && !said.contains("presence"),
+                "{said}"
+            );
+        }
+        let object = why_none(&query_key(), recorded_ok(serde_json::json!({}), "Unit"));
+        assert_eq!(object, super::NoSeedableRows::NotRows { values: 1 });
+    }
+
+    #[test]
+    fn a_recorded_error_seeds_nothing_and_says_so() {
+        let envelope = serde_json::to_value(deja::value::DejaDatabaseResult {
+            version: deja::value::DejaDatabaseResult::VERSION,
+            payload: deja::value::DejaDatabaseResultPayload::Err {
+                kind: "NotFound".to_owned(),
+                message: "no row".to_owned(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            why_none(&query_key(), envelope),
+            super::NoSeedableRows::RecordedError
+        );
+    }
+
+    #[test]
+    fn values_that_are_not_rows_are_counted() {
+        let why = why_none(
+            &query_key(),
+            recorded_ok(serde_json::json!([1, 2]), "Vec<i64>"),
+        );
+        assert_eq!(why, super::NoSeedableRows::NotRows { values: 2 });
+    }
+
+    /// A row key whose identity is not among the recorded rows.
+    #[test]
+    fn rows_without_the_keyed_identity_are_counted() {
+        let rows = serde_json::json!([{"id": 2}, {"id": 3}]);
+        let why = why_none(ROW_KEY, recorded_ok(rows, "Vec<User>"));
+        assert_eq!(why, super::NoSeedableRows::NoRowWithKey { rows: 2 });
+    }
+
+    /// The control: a recorded row still seeds, and the keyed one is kept.
+    #[test]
+    fn a_recorded_row_still_seeds() {
+        let rows = serde_json::json!([{"id": 2}, {"id": 1}]);
+        let seeded = super::seedable_rows(
+            &seed_target(ROW_KEY),
+            None,
+            &recorded_ok(rows, "Vec<User>"),
+            &super::DbCatalog::default(),
+        )
+        .unwrap();
+        assert_eq!(seeded.len(), 1);
+        let id = seeded[0]
+            .columns
+            .iter()
+            .find(|column| column.metadata.name == "id")
+            .map(|column| column.value.clone());
+        assert_eq!(
+            id,
+            Some(serde_json::json!(1)),
+            "the keyed row is the one kept"
+        );
+    }
+
+    /// A typed row image is seeded ahead of the envelope, even when the
+    /// envelope alone would have said absence.
+    #[test]
+    fn a_typed_image_is_seeded_ahead_of_the_envelope() {
+        let image = deja::db::DbRowImage::new(
+            "users",
+            vec![deja::db::DbColumnImage {
+                wire: None,
+                name: "id".into(),
+                type_oid: None,
+                type_name: Some("int8".into()),
+                nullable: None,
+                value: serde_json::json!(1),
+            }],
+        )
+        .to_value();
+        let seeded = super::seedable_rows(
+            &seed_target(ROW_KEY),
+            Some(&image),
+            &recorded_ok(serde_json::json!([]), "Vec<User>"),
+            &super::DbCatalog::default(),
+        )
+        .expect("the typed image carries the row");
+        assert_eq!(seeded.len(), 1);
+    }
+
+    /// The rendered lookup table must not outlive the stage that writes it.
+    ///
+    /// It is over a gigabyte of owned structures, and the stage bodies that
+    /// used to bind it do not return until scoring has finished — scoring
+    /// being the step that re-reads the same file into a second, independent
+    /// copy. Nothing in the type system stops the next caller from binding it
+    /// again, and no behavioural test would fail if they did: the run stays
+    /// correct, it just costs twice the memory, which is invisible until a
+    /// runner is killed on a node that cannot hold both. So the seam is
+    /// enforced where it can be, against the source.
+    ///
+    /// The needle is assembled rather than written out, so that this test does
+    /// not count itself.
+    /// A group that names NOTHING has nothing for the sealer to seal, so the
+    /// "wait 30 minutes" message sends the reader to wait on the wrong thing.
+    /// The fresh group from a custom build is an identifier nobody has typed
+    /// before, which makes a typo the likeliest first failure.
+    /// A system in a shared bucket rescans its landing at the prefixed key,
+    /// and one with a bucket of its own at exactly the key it always did.
+    #[test]
+    fn the_unsealed_pull_spells_the_systems_prefix_into_its_source() {
+        let cfg = |prefix: &str| crate::s3::S3Config {
+            endpoint: String::new(),
+            bucket: "shared".to_owned(),
+            prefix: prefix.to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: Some("ap-south-2".to_owned()),
+            allow_http: false,
+        };
+        let located = "landing/v1/dt=2026-09-28/session=rec-a";
+        assert_eq!(
+            super::unsealed_source(&cfg("prism/"), located).path,
+            "s3://shared/prism/landing/v1/dt=2026-09-28/session=rec-a"
+        );
+        assert_eq!(
+            super::unsealed_source(&cfg(""), located).path,
+            "s3://shared/landing/v1/dt=2026-09-28/session=rec-a"
+        );
+    }
+
+    #[test]
+    fn an_empty_group_is_not_told_to_wait_for_the_sealer() {
+        let err = super::empty_group_error("grp-typo", "bkt", "landing/v1", 0, &[])
+            .expect("a group that resolves to nothing is an error");
+        assert!(
+            err.contains("names no recordings"),
+            "an empty group gets the message written for it, got: {err}"
+        );
+        assert!(
+            !err.contains("sealer"),
+            "there is nothing to seal, so do not send the reader to wait for one: {err}"
+        );
+    }
+
+    /// The other empty case, which the message above must not swallow: every
+    /// member exists and none is sealed yet. Waiting IS the right advice here.
+    #[test]
+    fn a_wholly_unsealed_group_is_told_to_wait_for_the_sealer() {
+        let excluded = vec!["rec-a".to_owned(), "rec-b".to_owned()];
+        let err = super::empty_group_error("grp-today", "bkt", "landing/v1", 0, &excluded)
+            .expect("keeping nothing is an error");
+        assert!(
+            err.contains("no sealed recordings yet"),
+            "an unsealed group gets the sealer message, got: {err}"
+        );
+        assert!(
+            err.contains("all 2 of them"),
+            "the count names how many are being waited on, got: {err}"
+        );
+    }
+
+    /// A partial day is not an error at all — that is the whole point of the
+    /// change this guards.
+    #[test]
+    fn a_group_with_one_sealed_member_is_not_an_error() {
+        assert!(
+            super::empty_group_error("g", "bkt", "landing/v1", 1, &["rec-open".to_owned()])
+                .is_none(),
+            "one sealed member is enough to replay"
+        );
+    }
+
+    /// A three-event recording on disk, opened at whole-session scope.
+    fn three_event_recording() -> (
+        tempfile::TempDir,
+        crate::HarnessRoot,
+        crate::scope::ScopedRecording,
+    ) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let tape = crate::scope::TapeSlot::for_write(&root, "rec-1");
+        std::fs::create_dir_all(tape.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&tape).unwrap();
+        for seq in 0..3u64 {
+            let event = serde_json::json!({
+                "record_kind": "boundary_event",
+                "global_sequence": seq,
+                "request_sequence": seq,
+                "correlation_id": "c-1",
+                "timestamp_ns": 0,
+                "recording_run_id": "r",
+                "boundary": "db",
+                "trait_name": "T",
+                "method_name": "m",
+                "call_file": "x.rs",
+                "call_line": 10,
+                "call_column": 4,
+                "request": null,
+                "args": { "k": seq },
+                "response": null,
+                "result": { "inner": [118, 49, 58], "id": seq },
+                "is_error": false,
+                "duration_us": 0,
+                "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                "provenance": "recorded",
+                "recon": "lossless",
+                "replay_strategy": "substitute",
+                "callsite_identity": null
+            });
+            writeln!(f, "{event}").unwrap();
+        }
+        drop(f);
+        let recording = crate::scope::ScopedRecording::open(
+            &root,
+            "rec-1",
+            crate::scope::RunScope::entire_session(),
+        )
+        .unwrap();
+        (dir, root, recording)
+    }
+
+    /// The table the candidate reads is written without whitespace, and the
+    /// candidate's own loader still reads it back whole.
+    ///
+    /// Pretty-printing put every element of a byte array on its own indented
+    /// line, which made the file roughly 2.5x its content. The candidate reads
+    /// the whole file into one buffer that coexists with the parsed table at
+    /// boot, so that whitespace was resident for no reason.
+    #[test]
+    fn the_lookup_table_is_written_compact_and_loads_back() {
+        let (_dir, root, recording) = three_event_recording();
+        let entries =
+            super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
+                .unwrap()
+                .entries;
+        assert!(entries > 0, "the fixture renders entries");
+
+        let bytes = std::fs::read(root.lookup_table_path("run-1")).unwrap();
+        assert!(
+            !bytes.contains(&b'\n'),
+            "the lookup table must be written compact, found a newline in {} bytes",
+            bytes.len()
+        );
+        let mut source = deja::LocalFileLookupSource::new(root.lookup_table_path("run-1"));
+        let table = deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(
+            table.entries.len(),
+            entries,
+            "the candidate loads every entry"
+        );
+        assert!(
+            table
+                .entries
+                .iter()
+                .any(|e| *e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })),
+            "results survive the compact encoding"
+        );
+    }
+
+    /// The shared-results table is written beside the table, and it is what
+    /// the candidate's own loader reads: writer and loader agree on its name.
+    #[test]
+    fn the_shared_table_is_written_beside_the_table_and_is_what_a_candidate_loads() {
+        let (_dir, root, recording) = three_event_recording();
+        let persisted =
+            super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        let (entries, shared_bytes) = (persisted.entries, persisted.shared_bytes);
+        let path = root.lookup_table_path("run-1");
+        let sibling = deja::shared_results_path(&path);
+        assert_eq!(std::fs::metadata(&sibling).unwrap().len(), shared_bytes);
+        let mut source = deja::LocalFileLookupSource::new(&path);
+        let table = deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(source.loaded_from(), Some(sibling.as_path()));
+        assert_eq!(table.entries.len(), entries);
+        assert!(table
+            .entries
+            .iter()
+            .any(|e| *e.result == serde_json::json!({ "inner": [118, 49, 58], "id": 1 })));
+    }
+
+    /// A shared-results table that does not expand to the table it was built
+    /// from is refused rather than written.
+    #[test]
+    fn a_shared_table_that_does_not_expand_to_its_table_is_refused() {
+        use crate::lookup::render_lookup_table as render;
+        let (_dir, _root, recording) = three_event_recording();
+        let table = render(&recording, "rec-1").unwrap();
+        let legacy = serde_json::to_vec(&table).unwrap();
+        super::finish_shared(super::build_shared(&table, &legacy).unwrap(), &legacy)
+            .expect("a table and its own bytes agree");
+
+        // Built against bytes that are not this table's: refused at the call
+        // the write goes through, not only by the check on its own.
+        let mut other = legacy.clone();
+        let at = other.len() - 3;
+        other[at] ^= 1;
+        let err =
+            super::finish_shared(super::build_shared(&table, &other).unwrap(), &other).unwrap_err();
+        assert!(err.contains("does not expand"), "{err}");
+
+        // A result changed to one exactly as long: the digest, not the length,
+        // refuses it.
+        let mut shared = deja::SharedResultsTable::from_table(&table, &legacy).unwrap();
+        let first = serde_json::to_string(&shared.results[0]).unwrap();
+        let swapped = first.replacen("118", "119", 1);
+        assert_eq!(first.len(), swapped.len());
+        shared.results[0] = serde_json::from_str(&swapped).unwrap();
+        let err = super::expands_to(shared, &legacy).unwrap_err();
+        assert!(err.contains("does not expand"), "{err}");
+    }
+
+    /// A shared file left at the path by an earlier write is replaced.
+    #[test]
+    fn a_stale_shared_file_is_replaced() {
+        let (_dir, root, recording) = three_event_recording();
+        let path = root.lookup_table_path("run-1");
+        let sibling = deja::shared_results_path(&path);
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&sibling, b"left from an earlier run").unwrap();
+        super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", u64::MAX).unwrap();
+        let mut source = deja::LocalFileLookupSource::new(&path);
+        deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(source.loaded_from(), Some(sibling.as_path()));
+    }
+
+    /// A table refused for its size leaves no shared-results table either.
+    #[test]
+    fn a_refused_table_writes_no_shared_table() {
+        let (_dir, root, recording) = three_event_recording();
+        super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 16).unwrap_err();
+        assert!(!deja::shared_results_path(&root.lookup_table_path("run-1")).exists());
+    }
+
+    /// Three events that recorded the same large value, the shape that makes
+    /// a one-result-per-entry table big and its shared form small.
+    fn repeated_result_recording() -> (
+        tempfile::TempDir,
+        crate::HarnessRoot,
+        crate::scope::ScopedRecording,
+    ) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::HarnessRoot::new(dir.path()).unwrap();
+        let tape = crate::scope::TapeSlot::for_write(&root, "rec-1");
+        std::fs::create_dir_all(tape.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&tape).unwrap();
+        for seq in 0..3u64 {
+            let event = serde_json::json!({
+                "record_kind": "boundary_event", "global_sequence": seq, "request_sequence": seq,
+                "correlation_id": "c-1", "timestamp_ns": 0, "recording_run_id": "r",
+                "boundary": "imc", "trait_name": "T", "method_name": "m",
+                "call_file": "x.rs", "call_line": 10, "call_column": 4,
+                "request": null, "args": { "k": seq }, "response": null,
+                "result": { "graph": "g".repeat(4096) },
+                "is_error": false, "duration_us": 0,
+                "event_schema_version": deja::CURRENT_EVENT_SCHEMA_VERSION,
+                "provenance": "recorded", "recon": "lossless", "replay_strategy": "substitute",
+                "callsite_identity": null
+            });
+            writeln!(f, "{event}").unwrap();
+        }
+        drop(f);
+        let recording = crate::scope::ScopedRecording::open(
+            &root,
+            "rec-1",
+            crate::scope::RunScope::entire_session(),
+        )
+        .unwrap();
+        (dir, root, recording)
+    }
+
+    /// Over the budget, only the shared form is written, at the table's own
+    /// path, when it fits: a candidate that reads it runs, and one that reads
+    /// only the one-result-per-entry form cannot parse it and refuses to boot.
+    #[test]
+    fn over_the_budget_only_the_shared_form_is_written_at_the_table_path() {
+        let (_dir, root, recording) = repeated_result_recording();
+        let sizes =
+            super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        assert!(
+            sizes.shared_bytes < sizes.legacy_bytes,
+            "the fixture's shared form is smaller"
+        );
+        assert!(!sizes.shared_only);
+
+        let written = super::persist_lookup_table_within(
+            &root,
+            "run-1",
+            &recording,
+            "rec-1",
+            sizes.shared_bytes,
+        )
+        .expect("a table whose shared form fits is written");
+        assert!(written.shared_only);
+        let path = root.lookup_table_path("run-1");
+        assert!(
+            !deja::shared_results_path(&path).exists(),
+            "nothing beside it"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, sizes.shared_bytes);
+        assert!(
+            serde_json::from_slice::<deja::LookupTable>(&bytes).is_err(),
+            "a loader that knows only the one-result-per-entry form cannot parse it"
+        );
+        let mut source = deja::LocalFileLookupSource::new(&path);
+        let table = deja::LookupTableSource::load(&mut source).unwrap();
+        assert_eq!(source.loaded_from(), Some(path.as_path()));
+        assert_eq!(table.entries.len(), written.entries);
+    }
+
+    /// When the shared form is over the budget too, the run is refused and
+    /// the refusal names both sizes.
+    #[test]
+    fn a_table_whose_shared_form_is_over_the_budget_too_is_refused() {
+        let (_dir, root, recording) = repeated_result_recording();
+        let sizes =
+            super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        let err = super::persist_lookup_table_within(
+            &root,
+            "run-1",
+            &recording,
+            "rec-1",
+            sizes.shared_bytes - 1,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(&sizes.legacy_bytes.to_string())
+                && err.contains(&sizes.shared_bytes.to_string()),
+            "{err}"
+        );
+        assert!(!root.lookup_table_path("run-1").exists());
+    }
+
+    /// The run log says when only the shared form was written, with both sizes.
+    #[test]
+    fn the_run_log_says_when_only_the_shared_form_was_written() {
+        let _env = LOOKUP_TABLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_dir, root, recording) = repeated_result_recording();
+        let sizes =
+            super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                .unwrap();
+        std::env::set_var(
+            super::LOOKUP_TABLE_MAX_BYTES_ENV,
+            sizes.shared_bytes.to_string(),
+        );
+        let rendered = super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1");
+        std::env::remove_var(super::LOOKUP_TABLE_MAX_BYTES_ENV);
+        let rendered = rendered.unwrap();
+        assert!(rendered.shared_only);
+        assert!(
+            rendered
+                .report
+                .contains("only the shared-results table was written")
+                && rendered.report.contains(&sizes.legacy_bytes.to_string())
+                && rendered.report.contains(&sizes.shared_bytes.to_string()),
+            "{}",
+            rendered.report
+        );
+    }
+
+    /// A table exactly at the budget is written in both forms, whichever form
+    /// is larger: only a table over it is written shared-only.
+    #[test]
+    fn a_table_at_the_budget_is_written_in_both_forms() {
+        for (name, (_dir, root, recording)) in [
+            ("distinct results", three_event_recording()),
+            ("repeated results", repeated_result_recording()),
+        ] {
+            let sizes =
+                super::persist_lookup_table_within(&root, "run-0", &recording, "rec-1", u64::MAX)
+                    .unwrap();
+            let written = super::persist_lookup_table_within(
+                &root,
+                "run-1",
+                &recording,
+                "rec-1",
+                sizes.legacy_bytes,
+            )
+            .unwrap_or_else(|e| panic!("{name}: a table at the budget is written: {e}"));
+            assert!(!written.shared_only, "{name}");
+            let path = root.lookup_table_path("run-1");
+            assert!(
+                deja::shared_results_path(&path).exists(),
+                "{name}: the shared form beside it"
+            );
+            assert!(
+                serde_json::from_slice::<deja::LookupTable>(&std::fs::read(&path).unwrap()).is_ok(),
+                "{name}: the table itself is the one-result-per-entry form"
+            );
+        }
+    }
+
+    /// Both drive paths hand the runner the render's suspects, not only the
+    /// schema's. No test reaches a drive path, so this holds them at the source.
+    #[test]
+    fn both_drive_paths_take_the_render_suspect() {
+        let needle = format!(
+            "let suspect = {}(&recording_id, &rendered);",
+            "render_suspect"
+        );
+        assert_eq!(include_str!("mod.rs").matches(&needle).count(), 2);
+    }
+
+    /// Both suspects, when both apply, are named together.
+    #[test]
+    fn a_schema_suspect_and_a_shared_only_render_are_named_together() {
+        let rendered = super::RenderedTable {
+            report: String::new(),
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION - 1),
+            shared_only: true,
+        };
+        let suspect = super::render_suspect("rec", &rendered).unwrap();
+        assert!(
+            suspect.contains("event schema") && suspect.contains("only the shared-results"),
+            "{suspect}"
+        );
+        assert!(
+            suspect.contains("smaller runs"),
+            "names a remedy: {suspect}"
+        );
+    }
+
+    /// A candidate that never becomes healthy after a shared-only render is
+    /// told why it may not have been able to read the table.
+    #[test]
+    fn a_shared_only_render_is_a_named_suspect() {
+        let rendered = |shared_only| super::RenderedTable {
+            report: String::new(),
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+            shared_only,
+        };
+        let suspect = super::render_suspect("rec", &rendered(true)).expect("a suspect");
+        assert!(suspect.contains("only the shared-results"), "{suspect}");
+        assert_eq!(super::render_suspect("rec", &rendered(false)), None);
+    }
+
+    /// A table over the budget fails the run before the candidate boots, and
+    /// says what to do about it.
+    #[test]
+    fn an_oversized_lookup_table_fails_the_run_before_the_candidate_boots() {
+        let (_dir, root, recording) = three_event_recording();
+        let err = super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 16)
+            .expect_err("a table over the budget is refused");
+        for needle in [
+            "bytes",
+            "16",
+            super::LOOKUP_TABLE_MAX_BYTES_ENV,
+            "smaller runs",
+        ] {
+            assert!(err.contains(needle), "the refusal names `{needle}`: {err}");
+        }
+        assert!(
+            !root.lookup_table_path("run-1").exists(),
+            "a refused table is not left where the candidate would load it"
+        );
+    }
+
+    /// The same table under a budget it fits is written as before.
+    #[test]
+    fn a_lookup_table_within_the_budget_is_written() {
+        let (_dir, root, recording) = three_event_recording();
+        super::persist_lookup_table_within(&root, "run-1", &recording, "rec-1", 1 << 20)
+            .expect("a table under the budget is written");
+        let len = std::fs::metadata(root.lookup_table_path("run-1"))
+            .unwrap()
+            .len();
+        assert!(
+            len > 16,
+            "the fixture table is larger than the refusal test's budget"
+        );
+        super::persist_lookup_table_within(&root, "run-2", &recording, "rec-1", len)
+            .expect("a table exactly at the budget is written");
+    }
+
+    /// Held by any test that sets the budget variable.
+    static LOOKUP_TABLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The run path reads the budget from the variable the refusal names.
+    #[test]
+    fn the_run_path_enforces_the_budget_it_names() {
+        let _env = LOOKUP_TABLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_dir, root, recording) = three_event_recording();
+
+        std::env::set_var(super::LOOKUP_TABLE_MAX_BYTES_ENV, "16");
+        let err = super::render_and_persist_lookup_table(&root, "run-1", &recording, "rec-1")
+            .expect_err("a 16-byte budget from the environment is enforced");
+        assert!(
+            err.contains(super::LOOKUP_TABLE_MAX_BYTES_ENV) && err.contains("16 bytes"),
+            "the refusal names the variable that set its budget: {err}"
+        );
+
+        std::env::set_var(super::LOOKUP_TABLE_MAX_BYTES_ENV, "0");
+        let report = super::render_and_persist_lookup_table(&root, "run-2", &recording, "rec-1");
+        std::env::remove_var(super::LOOKUP_TABLE_MAX_BYTES_ENV);
+        let report = report.expect("0 disables the check").report;
+        assert!(
+            report.contains("bytes compact")
+                && report.contains("disables it")
+                && report.contains("compared against the budget")
+                && report.contains("information only"),
+            "a written table reports its size and the budget in force: {report}"
+        );
+    }
+
+    /// An override that did not take effect says so.
+    #[test]
+    fn an_unparseable_budget_is_named_in_the_run_log() {
+        let (max, said) = super::describe_lookup_table_budget(Some("70MB"));
+        assert_eq!(max, Some(super::DEFAULT_LOOKUP_TABLE_MAX_BYTES));
+        assert!(
+            said.contains("\"70MB\"") && said.contains("ignored"),
+            "the raw value and that it was ignored: {said}"
+        );
+        let (_, said) = super::describe_lookup_table_budget(None);
+        assert!(said.contains("default"), "{said}");
+        let (_, said) = super::describe_lookup_table_budget(Some("123"));
+        assert!(said.starts_with("123 bytes"), "{said}");
+    }
+
+    /// The budget comes from the environment when it says something usable.
+    #[test]
+    fn the_lookup_table_budget_reads_its_override() {
+        assert_eq!(
+            super::lookup_table_budget_from(None),
+            Some(super::DEFAULT_LOOKUP_TABLE_MAX_BYTES)
+        );
+        assert_eq!(super::lookup_table_budget_from(Some("123")), Some(123));
+        assert_eq!(super::lookup_table_budget_from(Some(" 123 ")), Some(123));
+        assert_eq!(
+            super::lookup_table_budget_from(Some("0")),
+            None,
+            "0 disables"
+        );
+        assert_eq!(
+            super::lookup_table_budget_from(Some("70MB")),
+            Some(super::DEFAULT_LOOKUP_TABLE_MAX_BYTES),
+            "an unparseable value keeps the default rather than disabling the guard"
+        );
+    }
+
+    #[test]
+    fn only_one_place_in_the_lifecycle_renders_the_lookup_table() {
+        let lifecycle_source = include_str!("mod.rs");
+        let needle = format!("crate::lookup::{}(", "render_lookup_table");
+        let calls = lifecycle_source.matches(&needle).count();
+        assert_eq!(
+            calls, 1,
+            "the renderer is reached from exactly one place in this module, the body of \
+             `persist_lookup_table_within`, which returns a summary so that no caller can \
+             hold the table; {calls} call sites means a stage body is binding it again"
+        );
+    }
+
+    /// A recording from another schema, or none, names the cause a candidate's
+    /// silent boot refusal would otherwise hide behind a health timeout; a
+    /// recording from this runner's schema names nothing.
+    #[test]
+    fn a_recording_from_another_schema_names_the_suspect_behind_a_health_timeout() {
+        let current = deja::CURRENT_EVENT_SCHEMA_VERSION;
+        assert_eq!(schema_suspect("rec", Some(current)), None);
+        for (schema, says) in [
+            (Some(current - 1), format!("event schema v{}", current - 1)),
+            (Some(current + 1), format!("event schema v{}", current + 1)),
+            (None, "no declared event schema".to_owned()),
+        ] {
+            let suspect = schema_suspect("rec", schema).expect("a suspect");
+            assert!(
+                suspect.contains(&says) && suspect.contains(&format!("v{current}")),
+                "{suspect}"
+            );
+            let failure = with_suspect(
+                "candidate not healthy within timeout".to_owned(),
+                Some(&suspect),
+            );
+            assert!(failure.starts_with("candidate not healthy") && failure.contains(&suspect));
+        }
+        assert_eq!(with_suspect("unchanged".to_owned(), None), "unchanged");
+    }
+
+    /// The probe is the instrument every memory measurement here is read
+    /// through, so a silent `None` would turn each later reading into an
+    /// absence nobody notices. On Linux it has to produce a reading.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_resident_probe_reads_this_process() {
+        let (rss, peak) = super::resident_mib().expect(
+            "/proc/self/status is readable on linux; a None here is the probe failing, not the \
+             platform lacking it",
+        );
+        assert!(rss > 0, "a running process has a non-zero resident set");
+        assert!(
+            peak >= rss,
+            "peak {peak} MiB cannot be below the current {rss} MiB"
+        );
+        let fact = super::resident_fact().expect("a reading carries its fact");
+        assert!(
+            fact.contains("rss ") && fact.contains("peak "),
+            "the fact names both readings: {fact}"
+        );
+    }
+
+    /// Dropping the trace has to stop its thread and return. It samples on a
+    /// two-second period, so a drop that waited for the current period would
+    /// add that to every run; and one that never joined would let a sample
+    /// interleave with whatever the next stage prints.
+    #[test]
+    fn the_resident_trace_stops_when_dropped() {
+        let started = std::time::Instant::now();
+        {
+            let _trace = super::ResidentTrace::start("test");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "drop returned in {:?}, so it waited out a sampling period",
+            started.elapsed()
+        );
+    }
+
+    /// A group name and a recording id are told apart by their PREFIX, not by
+    /// whether they parse. A malformed id must report itself malformed rather
+    /// than be mistaken for a group and fail later with "names no recordings",
+    /// which sends a reader looking for a day that was never the question.
+    #[test]
+    fn a_group_is_told_from_a_recording_by_its_prefix() {
+        assert!(super::is_group("4157177-0910"), "a deployment's day");
+        assert!(!super::is_group("rec-4157177-09101430-xc"), "one pod");
+        assert!(!super::is_group("run-1788907613122648573"), "boot-derived");
+        assert!(
+            !super::is_group("rec-typo"),
+            "a malformed recording id is a recording, not a group"
+        );
+    }
+
     /// The refusal reaches the PULL PATH, not just the resolver.
     ///
     /// An undeclared system must refuse rather than poll the deployment's own
@@ -5259,9 +8769,10 @@ mod tests {
         let mut kinds = std::collections::BTreeSet::new();
         // Both StoreCtx registration forms — the local path form and the
         // sink-published uri form — pass the kind as the 2nd arg. A call whose
-        // kind is a VARIABLE (the REPLAY_STREAM_ARTIFACTS loop) is skipped here;
-        // those kinds are added from the const below. (Markers are built with
-        // concat! so this scanner never matches its own source text.)
+        // kind is a VARIABLE (the artifact-kind table's publish steps) is
+        // skipped here; those kinds are added from the table below. (Markers
+        // are built with concat! so this scanner never matches its own source
+        // text.)
         for marker in [
             concat!("ctx", ".artifact("),
             concat!("ctx", ".artifact_uri("),
@@ -5281,8 +8792,12 @@ mod tests {
                 kinds.insert(after_quote[..end].to_owned());
             }
         }
-        // The stream artifacts are published from the const via a variable kind.
-        kinds.extend(REPLAY_STREAM_ARTIFACTS.iter().map(|(k, _)| (*k).to_owned()));
+        // The table's kinds are published through a variable kind.
+        kinds.extend(
+            crate::artifact_kinds::RUN_ARTIFACT_KINDS
+                .iter()
+                .map(|kind| kind.name.to_owned()),
+        );
         kinds
     }
 
@@ -5376,6 +8891,7 @@ mod tests {
             method: None,
             origin: deja::SeedOrigin::Recording,
             source_sequence: 0,
+            presence: None,
         }
     }
 
@@ -5878,12 +9394,16 @@ mod tests {
         Run {
             run_id: "r1".into(),
             spec: RunSpec {
+                label: None,
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Record,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: None,
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: None,
                 workload,
@@ -5950,12 +9470,16 @@ mod tests {
         Run {
             run_id: "run-backstop".into(),
             spec: RunSpec {
+                label: None,
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: RunMode::Replay,
                 system_under_test: None,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 candidate_repo: None,
                 recording_id: Some(recording_id.to_owned()),
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: filter,
                 workload: serde_json::Value::Null,
@@ -6045,6 +9569,9 @@ mod tests {
         excluded: &[(&str, crate::s3::AdmissionTest)],
     ) {
         let report = crate::s3::IngestReport {
+            members: vec!["rec-fixture".to_owned()],
+            excluded_members: Vec::new(),
+            member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
             lines_in: 16258,
@@ -6068,6 +9595,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             },
+            renumbered: Vec::new(),
         };
         let path = crate::scope::TapeSlot::ingest_report_path(root, recording_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -6678,6 +10206,9 @@ mod tests {
         let run = Run {
             run_id: run_id.to_owned(),
             spec: RunSpec {
+                label: None,
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: crate::RunMode::Replay,
                 system_under_test: None,
@@ -6686,6 +10217,7 @@ mod tests {
                 },
                 candidate_repo: None,
                 recording_id: Some(recording_id.to_owned()),
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: Some(vec!["c-driven-1".to_owned(), "c-driven-2".to_owned()]),
                 workload: serde_json::Value::Null,
@@ -6900,9 +10432,125 @@ mod tests {
 
     /// Scalar rendering shorthand: the `SET` payload's value, when the render
     /// is one.
+    /// Decode a RESP array of bulk strings back to argv, so a test can assert
+    /// the command rather than the framing. Round-tripping is the point: it
+    /// checks `encode_resp` against an independent reader instead of against a
+    /// byte string someone wrote by hand.
+    fn decode_resp(frames: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        assert_eq!(frames[i], b'*', "a command is a RESP array");
+        let nl = frames[i..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("array header")
+            + i;
+        let count: usize = std::str::from_utf8(&frames[i + 1..nl - 1])
+            .expect("array count is ascii")
+            .parse()
+            .expect("array count parses");
+        i = nl + 1;
+        for _ in 0..count {
+            assert_eq!(frames[i], b'$', "each argument is a bulk string");
+            let nl = frames[i..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .expect("bulk header")
+                + i;
+            let len: usize = std::str::from_utf8(&frames[i + 1..nl - 1])
+                .expect("bulk length is ascii")
+                .parse()
+                .expect("bulk length parses");
+            i = nl + 1;
+            out.push(String::from_utf8_lossy(&frames[i..i + len]).into_owned());
+            i += len + 2; // payload + CRLF
+        }
+        assert_eq!(i, frames.len(), "no trailing bytes after the command");
+        out
+    }
+
+    /// The defect this transport exists for: a recorded value that is not
+    /// UTF-8 and contains a zero byte.
+    ///
+    /// The locker holds encrypted payment-method payloads, and one of them —
+    /// `BulkString([171, 143, 136, 250, 10, 45, 0, 5, …])` — failed to seed at
+    /// all, because a zero byte cannot be carried in a process argument
+    /// (`Command` refuses with "nul byte found in provided data"). Two such
+    /// seeds failed on one run and the reads that depended on them pruned 67
+    /// calls out of the comparison.
+    ///
+    /// Asserted on the bytes rather than on a rendering: a lossy decode would
+    /// make both sides of this test agree while the value on the wire was
+    /// wrong, which is exactly the failure being removed.
+    #[test]
+    fn a_binary_value_survives_the_write_intact() {
+        let binary: Vec<u8> = vec![171, 143, 136, 250, 10, 45, 0, 5, 193, 114, 0, 0, 255];
+        let payload = RedisSeedPayload::String(binary.clone());
+        let frames = payload.write_frames("locker:key");
+
+        // The framing carries the length, so the zero bytes and the embedded
+        // newline are payload rather than delimiters.
+        let header = format!(
+            "*3\r\n$3\r\nSET\r\n$10\r\nlocker:key\r\n${}\r\n",
+            binary.len()
+        );
+        assert!(
+            frames.starts_with(header.as_bytes()),
+            "the command is framed by length"
+        );
+        assert!(
+            frames.ends_with(b"\r\n"),
+            "the bulk string is terminated after its declared length"
+        );
+        assert_eq!(
+            &frames[header.len()..frames.len() - 2],
+            binary.as_slice(),
+            "the recorded bytes reach the wire unchanged"
+        );
+
+        // The readback compares as bytes, so a mangled value can no longer
+        // pass. Checked on a newline-free value deliberately: the READ side is
+        // still `redis-cli --raw`, which is newline-delimited, so an element
+        // containing a newline is indistinguishable from two elements. That is
+        // a separate, pre-existing limitation of the read transport — the write
+        // above carries the newline correctly, and this test does not pretend
+        // the readback can yet verify it.
+        let no_newline: Vec<u8> = binary.iter().copied().filter(|b| *b != b'\n').collect();
+        let payload = RedisSeedPayload::String(no_newline.clone());
+        assert!(
+            payload.compare(&no_newline).is_ok(),
+            "identical bytes match"
+        );
+        let lossy = String::from_utf8_lossy(&no_newline)
+            .into_owned()
+            .into_bytes();
+        assert_ne!(lossy, no_newline, "the fixture is genuinely not UTF-8");
+        assert!(
+            payload.compare(&lossy).is_err(),
+            "a lossily-decoded readback must NOT compare equal — that agreement \
+             is what made a corrupted seed report as matched"
+        );
+    }
+
+    /// `to_redis_bytes` must hand back exactly what the tape holds, where the
+    /// string form cannot.
+    #[test]
+    fn the_wire_value_yields_its_bytes_not_a_lossy_string() {
+        let binary: Vec<u8> = vec![171, 143, 136, 250];
+        let wire = deja::value::RedisWireValue::BulkString(binary.clone());
+        assert_eq!(wire.to_redis_bytes(), Some(binary.clone()));
+        assert_ne!(
+            wire.to_redis_string().map(String::into_bytes),
+            Some(binary),
+            "the string form is lossy here — that is why the byte form exists"
+        );
+    }
+
     fn rendered_string(value: &serde_json::Value) -> Option<String> {
         match render_redis_seed_payload(value, None) {
-            RedisSeedRender::Payload(RedisSeedPayload::String(s)) => Some(s),
+            RedisSeedRender::Payload(RedisSeedPayload::String(s)) => {
+                Some(String::from_utf8_lossy(&s).into_owned())
+            }
             _ => None,
         }
     }
@@ -6996,7 +10644,7 @@ mod tests {
             other => panic!("a Map must render a write payload, got {other:?}"),
         };
         assert_eq!(
-            payload.write_args("k"),
+            decode_resp(&payload.write_frames("k")),
             ["HSET", "k", "f1", "v1", "f2", "7"],
             "HSET carries the pairs in recorded order"
         );
@@ -7023,7 +10671,7 @@ mod tests {
             other => panic!("an Array must render a write payload, got {other:?}"),
         };
         assert_eq!(
-            payload.write_args("k"),
+            decode_resp(&payload.write_frames("k")),
             ["RPUSH", "k", "a", "c", "b"],
             "RPUSH pushes members in recorded order"
         );
@@ -7048,7 +10696,10 @@ mod tests {
             RedisSeedRender::Payload(payload) => payload,
             other => panic!("a zset Array must render a write payload, got {other:?}"),
         };
-        assert_eq!(payload.write_args("k"), ["ZADD", "k", "0", "m1", "1", "m2"]);
+        assert_eq!(
+            decode_resp(&payload.write_frames("k")),
+            ["ZADD", "k", "0", "m1", "1", "m2"]
+        );
         assert_eq!(payload.readback_args("k"), ["ZRANGE", "k", "0", "-1"]);
         assert!(payload.compare(b"m1\nm2").is_ok());
         assert!(
@@ -7068,7 +10719,10 @@ mod tests {
             RedisSeedRender::Payload(payload) => payload,
             other => panic!("a Set must render a write payload, got {other:?}"),
         };
-        assert_eq!(payload.write_args("k"), ["SADD", "k", "b", "a"]);
+        assert_eq!(
+            decode_resp(&payload.write_frames("k")),
+            ["SADD", "k", "b", "a"]
+        );
         assert_eq!(payload.readback_args("k"), ["SMEMBERS", "k"]);
         assert!(
             payload.compare(b"a\nb").is_ok(),
@@ -7318,6 +10972,7 @@ mod tests {
             method: None,
             origin: deja::SeedOrigin::Recording,
             source_sequence: 0,
+            presence: None,
         });
         plan.upsert(deja::SeedEntry {
             boundary: "db".to_owned(),
@@ -7327,6 +10982,7 @@ mod tests {
             method: None,
             origin: deja::SeedOrigin::Recording,
             source_sequence: 0,
+            presence: None,
         });
 
         let query_seed = plan.resolve("db", &query_key).expect("query seed present");
@@ -7393,6 +11049,7 @@ mod tests {
             method: None,
             origin: deja::SeedOrigin::Recording,
             source_sequence: seq,
+            presence: None,
         };
         let row_key = |table: &str, val: &str| {
             deja::StateKey::DbRow {
@@ -8013,13 +11670,13 @@ mod tests {
     fn redis_seed_image_keeps_physical_key_typed_payload_and_ttl_advisory() {
         let image = RedisSeedImage {
             physical_key: "corr:settlement_rate_default".to_owned(),
-            payload: RedisSeedPayload::String("0.10".to_owned()),
+            payload: RedisSeedPayload::String(b"0.10".to_vec()),
             ttl_seconds: None,
         };
 
         assert_eq!(image.physical_key, "corr:settlement_rate_default");
         assert_eq!(
-            image.payload.write_args(&image.physical_key),
+            decode_resp(&image.payload.write_frames(&image.physical_key)),
             ["SET", "corr:settlement_rate_default", "0.10"]
         );
         assert_eq!(image.ttl_seconds, None);
@@ -8516,6 +12173,69 @@ mod tests {
                 "\\copy _deja_wire_seed from pstdin with (format binary)".to_string(),
                 "INSERT INTO \"corr_1\".\"payment_attempt\" (\"attempt_id\", \"connector_transaction_id\") SELECT \"attempt_id\", \"connector_transaction_id\" FROM _deja_wire_seed ON CONFLICT DO NOTHING".to_string(),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage_timing {
+    use super::*;
+    use crate::{CandidateSpec, Run, RunMode, RunSpec, RunStatus};
+
+    /// Every stage transition must carry the PREVIOUS stage's duration.
+    ///
+    /// The value cannot be asserted (it is wall-clock), so the assertion is on
+    /// the shape: a second `set_stage` reports the first stage by name, and the
+    /// first reports nothing because it has no predecessor. Without this a
+    /// regression that drops the arithmetic is invisible — which is exactly the
+    /// state this change is fixing.
+    #[test]
+    fn a_stage_transition_reports_the_previous_stage() {
+        let dir = std::env::temp_dir().join(format!("deja-stage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let root = HarnessRoot { root: dir };
+        let mut run = Run {
+            run_id: "run-timing".into(),
+            spec: RunSpec {
+                label: None,
+                delta_against: None,
+                purpose: None,
+                scored_span_namespaces: Vec::new(),
+                mode: RunMode::Replay,
+                system_under_test: None,
+                candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
+                candidate_repo: None,
+                recording_id: Some("rec".to_owned()),
+                recording_group: None,
+                s3_source: None,
+                correlation_filter: None,
+                workload: serde_json::Value::Null,
+            },
+            status: RunStatus::Pending,
+            recording_id: Some("rec".to_owned()),
+            candidate_image: None,
+            failure_reason: None,
+            stage: None,
+            step: 0,
+            steps_total: 0,
+            stage_updated_ms: 0,
+        };
+        let ctx = StoreCtx::disabled("timing");
+
+        assert_eq!(
+            run.stage_updated_ms, 0,
+            "a fresh run has no stage to report"
+        );
+        set_stage(&root, &mut run, &ctx, 1, 2, "first");
+        assert_eq!(run.stage.as_deref(), Some("first"));
+        let after_first = run.stage_updated_ms;
+        assert!(after_first > 0, "the stage clock must start");
+
+        set_stage(&root, &mut run, &ctx, 2, 2, "second");
+        assert_eq!(run.stage.as_deref(), Some("second"));
+        assert!(
+            run.stage_updated_ms >= after_first,
+            "the clock must advance so the next duration is measurable"
         );
     }
 }

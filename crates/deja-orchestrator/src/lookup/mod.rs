@@ -3,7 +3,7 @@
 //!
 //! The renderer and the candidate's `LookupTableHook` MUST construct keys
 //! identically, or every lookup silently misses. That shared logic lives in
-//! `deja-runtime` (`addresses_for`, `canonical_args_hash`, `KeyStamper`); this
+//! `deja-runtime` (`loci_for`, `canonical_args_hash`, `KeyStamper`); this
 //! renderer is just the recording-side driver that feeds it.
 //!
 //! For each non-`http_incoming` event the renderer emits ONE `LookupEntry` per
@@ -12,10 +12,9 @@
 //! the first hit, so registering all ranks lets a single recording satisfy a
 //! candidate however much call-site metadata it carries.
 
-use std::collections::HashMap;
 use std::io;
 
-use deja::{addresses_for, canonical_args_hash, KeyStamper, LookupEntry, LookupTable};
+use deja::{canonical_args_hash, loci_for, CallIdentity, KeyStamper, LookupEntry, LookupTable};
 
 use crate::scope::{ScopedRecording, TapeItem};
 
@@ -58,21 +57,55 @@ use crate::scope::{ScopedRecording, TapeItem};
 /// the scorer classifies those as environmental misses instead of resolving
 /// them. The day the record side starts emitting uncorrelated events, this
 /// paragraph is what stops being true — not the scoping guarantee above.
+/// # The enveloped form is the ONLY output, and that is load-bearing
+///
+/// This returns a whole `LookupTable` — `{recording_id, policy_version,
+/// event_schema_version, entries}` — and the orchestrator serializes it as one
+/// document. There is no
+/// JSONL writer anywhere in this crate, and there must not be one.
+///
+/// The reason is [`deja::replay::check_policy_version`]. It refuses a table
+/// whose declared policy differs from the one this build implements, which is
+/// what stops a stale table degrading into a mass miss that presents as a total
+/// candidate regression. But the loader's JSONL fallback carries no envelope and
+/// therefore no declared versions: it TAKES the current matching policy rather
+/// than refusing — sound only while nothing emits JSONL — and leaves the event
+/// schema undeclared, which a candidate refuses.
+///
+/// Adding a JSONL writer here would silently remove the version guard from that
+/// path, and the failure mode is precisely the one the refusal exists to
+/// prevent. If a streaming form is ever needed, give it an envelope carrying
+/// `policy_version` first.
+///
+/// The rendered table is stamped with [`deja::POLICY_VERSION`], the version
+/// THIS BUILD implements and the one-result-per-entry form every candidate pin
+/// reads, rather than a version the caller chooses.
+///
+/// It used to be a parameter, and every caller passed a literal `1`. That makes
+/// the declared version a claim about the caller's intent instead of a fact
+/// about the keys in the table, so a build whose matching policy had moved on
+/// would still stamp `1` and the load-time guard would wave it through. The
+/// version has to come from the same place the keys do.
 pub fn render_lookup_table(
     recording: &ScopedRecording,
     recording_id: &str,
-    policy_version: u32,
 ) -> io::Result<LookupTable> {
+    let policy_version = deja::POLICY_VERSION;
     // Shared occurrence assigner — advanced for every rank on every event, in
     // lockstep with how the hook advances at replay.
     let mut stamper = KeyStamper::new();
-    // Per-correlation sequence over the SAME event subset the hook sees (it
-    // never looks up the kernel-driven `http_incoming` event), so the rank-6
-    // `Address::Sequence` aligns instead of being offset by the incoming hop.
-    let mut request_seq: HashMap<Option<String>, u64> = HashMap::new();
     let mut entries = Vec::new();
+    // The second lookup, by identity, for the events identity applies to. The
+    // candidate addresses a call identity applies to by identity alone, so
+    // both sides number exactly those.
+    let mut identity_stamper = KeyStamper::new();
+    let mut identity_entries = Vec::new();
     let (mut dbg_ok, mut dbg_skip): (u64, u64) = (0, 0);
     let mut dbg_first_err: Option<String> = None;
+    // Every schema the recording's events were captured under. The candidate
+    // refuses a table from another schema, so this is read off the events
+    // rather than assumed.
+    let mut schemas: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
 
     // Streams: `EntireSession` on a live recording is 171,234 events off a
     // 361 MB tape, so the renderer never holds the tape in memory.
@@ -84,6 +117,7 @@ pub fn render_lookup_table(
         let event = match item {
             TapeItem::Event(event) => {
                 dbg_ok += 1;
+                schemas.insert(event.event_schema_version);
                 *event
             }
             TapeItem::Malformed { error, excerpt, .. } => {
@@ -101,19 +135,17 @@ pub fn render_lookup_table(
             continue;
         }
 
-        let seq_slot = request_seq.entry(event.correlation_id.clone()).or_insert(0);
-        let request_sequence = *seq_slot;
-        *seq_slot += 1;
-
         let args_hash = canonical_args_hash(&event.args);
         let location = Some((event.call_file.as_str(), event.call_line, event.call_column));
-        let addresses = addresses_for(
-            &event.boundary,
-            &event.method_name,
-            event.callsite_identity.as_ref(),
-            location,
-            request_sequence,
-        );
+        let loci = loci_for(event.callsite_identity.as_ref(), location);
+        // The renderer and the hook must derive identity from the same three
+        // fields or no key ever compares. Both read them off the boundary spec
+        // the macro emitted, so they agree by construction.
+        let identity = CallIdentity {
+            boundary: &event.boundary,
+            component: &event.trait_name,
+            operation: &event.method_name,
+        };
 
         let bucket_id = event
             .bucket_id
@@ -121,18 +153,37 @@ pub fn render_lookup_table(
             .or(event.task_bucket.as_deref())
             .unwrap_or("root");
         let fork_seq = event.fork_seq.unwrap_or(0);
+        // One value per event, shared by the entry for each of its ranks.
+        let result = std::sync::Arc::new(event.result.to_value());
         for key in stamper.stamp(
             event.correlation_id.as_deref(),
             Some(bucket_id),
             fork_seq,
-            &addresses,
+            identity,
+            &loci,
             args_hash,
         ) {
             entries.push(LookupEntry {
                 key,
-                result: event.result.clone(),
+                result: std::sync::Arc::clone(&result),
                 source_event_global_sequence: event.global_sequence,
             });
+        }
+        if deja::identity::identity_applies(&event.args) {
+            for key in identity_stamper.stamp(
+                event.correlation_id.as_deref(),
+                Some(bucket_id),
+                fork_seq,
+                identity,
+                &loci,
+                deja::identity::identity_args_hash(&event.args),
+            ) {
+                identity_entries.push(LookupEntry {
+                    key,
+                    result: std::sync::Arc::clone(&result),
+                    source_event_global_sequence: event.global_sequence,
+                });
+            }
         }
     }
 
@@ -159,10 +210,24 @@ pub fn render_lookup_table(
             ),
         ));
     }
+    // A recording captured across builds of two schemas has no single encoding
+    // the candidate could match against, so it renders nothing.
+    if schemas.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "recording {} mixes event schemas {schemas:?}; its argument images were \
+                 encoded two ways, so no candidate matches all of them — re-record it",
+                recording.recording_id()
+            ),
+        ));
+    }
     Ok(LookupTable {
         recording_id: recording_id.to_owned(),
         policy_version,
+        event_schema_version: schemas.first().copied(),
         entries,
+        identity_entries,
     })
 }
 
@@ -223,6 +288,27 @@ mod tests {
         })
     }
 
+    /// The rendered table is the legacy format every candidate pin reads, and
+    /// an event's entries, one per rank, share its one recorded value. The
+    /// version is a literal: a candidate on an older pin accepts exactly 2.
+    #[test]
+    fn the_renderer_writes_the_legacy_format_with_one_value_per_event() {
+        let (_dir, recording) = write_events(&[event("redis", 0, serde_json::Value::Null)]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        assert_eq!(table.policy_version, 2);
+        assert!(
+            table.entries.len() >= 2,
+            "the fixture renders several ranks"
+        );
+        assert!(
+            table
+                .entries
+                .windows(2)
+                .all(|pair| std::sync::Arc::ptr_eq(&pair[0].result, &pair[1].result)),
+            "an event's rank entries share one value"
+        );
+    }
+
     /// The lookup table IS the substitution material the candidate replays
     /// against, so it must carry the run's correlations and nothing else.
     /// Rendering it off the whole session put every recorded request's args and
@@ -240,7 +326,7 @@ mod tests {
             &[driven, foreign],
             crate::scope::RunScope::from_filter(Some(&["c-driven".to_owned()])),
         );
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert!(
             table
                 .entries
@@ -287,7 +373,7 @@ mod tests {
 
         let keys_of_driven = |scope: crate::scope::RunScope| {
             let (_dir, recording) = write_events_scoped(&build(), scope);
-            let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+            let table = render_lookup_table(&recording, "rec-1").unwrap();
             table
                 .entries
                 .iter()
@@ -338,7 +424,7 @@ mod tests {
         };
         let ambient_keys = |scope: crate::scope::RunScope| {
             let (_dir, recording) = write_events_scoped(&build(), scope);
-            let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+            let table = render_lookup_table(&recording, "rec-1").unwrap();
             table
                 .entries
                 .iter()
@@ -360,32 +446,46 @@ mod tests {
     }
 
     #[test]
-    fn renderer_skips_http_incoming_and_emits_one_entry_per_rank() {
-        // http_incoming (skipped) + one redis event with no callsite identity,
-        // so the redis event addresses at rank 5 (location) and rank 6 (sequence).
+    fn an_event_with_no_identity_at_all_is_still_addressable() {
+        // THE GUARANTEE deleting `Locus::Sequence` could have removed silently.
+        //
+        // Sequence was pushed unconditionally, so every call was certain to have
+        // at least one address. With it gone, an event carrying NO callsite
+        // identity would produce an empty locus list — no keys, so the call
+        // could never resolve, with nothing to observe but a permanent miss.
+        // `Locus::Unlocated` is now the unconditional floor, which is why this
+        // event still addresses.
+        //
+        // http_incoming is skipped (the kernel drives it); the redis event has
+        // no identity, so it addresses at rank 5 (location) and rank 3 (floor).
         let (_dir, recording) = write_events(&[
             event("http_incoming", 0, serde_json::Value::Null),
             event("redis", 1, serde_json::Value::Null),
         ]);
 
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert_eq!(
             table.entries.len(),
             2,
-            "redis event yields rank-5 + rank-6 entries"
+            "an identity-less event yields the location and the floor"
         );
         assert!(table
             .entries
             .iter()
             .all(|e| e.source_event_global_sequence == 1));
-        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.address.rank()).collect();
-        assert!(ranks.contains(&5) && ranks.contains(&6));
+        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.locus.rank()).collect();
         assert!(
-            table.entries.iter().any(|e| matches!(
-                &e.key.address,
-                deja::Address::Sequence { boundary, .. } if boundary == "redis"
-            )),
-            "rank-6 sequence address names the boundary"
+            !ranks.is_empty(),
+            "an event with no identity must NEVER end up unaddressable"
+        );
+        assert!(ranks.contains(&3) && ranks.contains(&5), "{ranks:?}");
+        // The boundary is on the KEY now, not inside the rank-6 locus. Asserted
+        // across EVERY entry rather than `any`: identity used to be recoverable
+        // only from the one variant that happened to carry it, and the point of
+        // moving it is that every key has it.
+        assert!(
+            table.entries.iter().all(|e| e.key.boundary == "redis"),
+            "every key carries the boundary as identity, whatever its locus"
         );
     }
 
@@ -401,27 +501,24 @@ mod tests {
         let (_dir, recording) =
             write_events(&[ingress, event("redis", 1, serde_json::Value::Null)]);
 
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert_eq!(table.entries.len(), 2, "only the redis event renders");
         assert!(table
             .entries
             .iter()
             .all(|e| e.source_event_global_sequence == 1));
         assert!(
-            table.entries.iter().any(|e| matches!(
-                &e.key.address,
-                deja::Address::Sequence {
-                    request_sequence: 0,
-                    ..
-                }
-            )),
+            table
+                .entries
+                .iter()
+                .any(|e| matches!(&e.key.locus, deja::Locus::Unlocated)),
             "the egress event is sequence 0 of the hook-visible subset"
         );
         // Without the role, an unrecognized boundary is NOT skipped — the
         // legacy behavior for every non-ingress event.
         let (_dir2, recording2) =
             write_events(&[event("grpc_incoming", 0, serde_json::Value::Null)]);
-        let table2 = render_lookup_table(&recording2, "rec-1", 1).unwrap();
+        let table2 = render_lookup_table(&recording2, "rec-1").unwrap();
         assert!(
             !table2.entries.is_empty(),
             "role-less unknown boundary renders like any egress event"
@@ -440,7 +537,7 @@ mod tests {
         ev["value_digest"] = serde_json::json!("12345678901234567890");
         let (_dir, recording) = write_events(&[ev]);
         // Must NOT drop the event -> render succeeds and yields entries.
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         assert!(
             !table.entries.is_empty(),
             "a stringified-u64 event must render, not drop"
@@ -457,7 +554,7 @@ mod tests {
             "global_sequence": "not-a-number"
         });
         let (_dir, recording) = write_events(&[good, bad]);
-        let err = render_lookup_table(&recording, "rec-1", 1).unwrap_err();
+        let err = render_lookup_table(&recording, "rec-1").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("INCOMPLETE"),
@@ -465,9 +562,582 @@ mod tests {
         );
     }
 
+    /// The table declares the schema its recording was captured under, read off
+    /// the events rather than this build's own, so the candidate can refuse a
+    /// recording from another schema. A recording that mixes two renders
+    /// nothing.
     #[test]
-    fn renderer_emits_lexical_rank_when_identity_present() {
-        // A redis event carrying a lexical path also gets a rank-3 entry.
+    fn the_table_declares_the_schema_its_recording_was_captured_under() {
+        let current = deja::CURRENT_EVENT_SCHEMA_VERSION;
+        let older = current - 1;
+        let mut old = event("redis", 1, serde_json::Value::Null);
+        old["event_schema_version"] = serde_json::json!(older);
+
+        let (_dir, recording) = write_events(std::slice::from_ref(&old));
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        assert!(!table.entries.is_empty(), "the event rendered at all");
+        assert_eq!(table.event_schema_version, Some(older));
+
+        let (_mixed_dir, mixed) = write_events(&[old, event("redis", 2, serde_json::Value::Null)]);
+        let message = render_lookup_table(&mixed, "rec-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("mixes event schemas")
+                && message.contains(&older.to_string())
+                && message.contains(&current.to_string()),
+            "the refusal names both schemas: {message}"
+        );
+    }
+
+    struct TableSource(Option<LookupTable>);
+    impl deja::LookupTableSource for TableSource {
+        fn load(&mut self) -> io::Result<LookupTable> {
+            Ok(self.0.take().expect("loaded once"))
+        }
+    }
+
+    /// Render a recording holding one uncorrelated call with `recorded` args,
+    /// install it in a candidate's hook, and make the same call with
+    /// `observed` args: the value served, and the call the candidate observed.
+    fn replay_one_call(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> (Option<serde_json::Value>, Vec<deja::ObservedCall>) {
+        use deja::DejaHook;
+        let mut recorded_event = event("redis", 1, serde_json::Value::Null);
+        recorded_event["correlation_id"] = serde_json::Value::Null;
+        recorded_event["args"] = recorded;
+        recorded_event["result"] = serde_json::json!("served");
+        let (_dir, recording) = write_events(&[recorded_event]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let calls = sink.handle();
+        let hook =
+            deja::LookupTableHook::from_source(TableSource(Some(table)), sink).expect("install");
+        let served = hook.try_replay_with_context(deja::ReplayLookup {
+            boundary: "redis",
+            trait_name: "T",
+            method_name: "m",
+            args: &observed,
+            callsite_identity: None,
+            caller_location: None,
+        });
+        let calls = calls.lock().unwrap().clone();
+        (served, calls)
+    }
+
+    /// The same call with its array in another order is the same call. The
+    /// diff has always tolerated the order; the address did not, so the call
+    /// missed and the replay stopped. The address now agrees with the diff.
+    #[test]
+    fn a_call_whose_array_arrived_in_another_order_is_served_its_recording() {
+        let (served, calls) = replay_one_call(
+            serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
+            serde_json::json!({ "ids": ["c", "a", "b"], "q": 1 }),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+        assert!(
+            all_resolved_exactly(&calls),
+            "identity must be what served it, not the args-free fallback"
+        );
+    }
+
+    /// A string that holds a JSON document is the same call when the document
+    /// is the same, whatever order its keys were written in.
+    #[test]
+    fn a_call_whose_embedded_document_was_written_in_another_order_is_served() {
+        let (served, calls) = replay_one_call(
+            serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+        assert!(
+            all_resolved_exactly(&calls),
+            "identity must be what served it, not the args-free fallback"
+        );
+    }
+
+    /// Several uncorrelated calls at one site: render `recorded` (args, result)
+    /// in order, then make the `observed` calls in order; what each was served,
+    /// the table, and the calls the candidate observed.
+    ///
+    /// The observations are returned because an order-tolerance test that only
+    /// checks the VALUE would keep passing if identity stopped matching and the
+    /// args-free fallback served the same value instead — the same assertion for
+    /// a different, weaker reason. `all_resolved_exactly` is what tells them
+    /// apart.
+    fn replay_calls(
+        recorded: &[(serde_json::Value, &str)],
+        observed: &[serde_json::Value],
+    ) -> (
+        Vec<Option<serde_json::Value>>,
+        LookupTable,
+        Vec<deja::ObservedCall>,
+    ) {
+        use deja::DejaHook;
+        let events: Vec<serde_json::Value> = recorded
+            .iter()
+            .enumerate()
+            .map(|(i, (args, result))| {
+                let mut e = event("redis", i as u64 + 1, serde_json::Value::Null);
+                e["correlation_id"] = serde_json::Value::Null;
+                e["args"] = args.clone();
+                e["result"] = serde_json::json!(result);
+                e
+            })
+            .collect();
+        let (_dir, recording) = write_events(&events);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let calls = sink.handle();
+        let hook = deja::LookupTableHook::from_source(TableSource(Some(table.clone())), sink)
+            .expect("install");
+        let served = observed
+            .iter()
+            .map(|args| {
+                hook.try_replay_with_context(deja::ReplayLookup {
+                    boundary: "redis",
+                    trait_name: "T",
+                    method_name: "m",
+                    args,
+                    callsite_identity: None,
+                    caller_location: None,
+                })
+            })
+            .collect();
+        let calls = calls.lock().unwrap().clone();
+        (served, table, calls)
+    }
+
+    /// Every one of these calls found its own row: the address and the arguments
+    /// both, with no args-free fallback standing in for either.
+    fn all_resolved_exactly(calls: &[deja::ObservedCall]) -> bool {
+        !calls.is_empty() && calls.iter().all(|c| c.resolved && !c.arg_divergent)
+    }
+
+    /// Calls that share an identity are one sequence: the k-th is served the
+    /// k-th recording with that identity, whichever exact form either side
+    /// wrote. No recording is served twice, and none is skipped.
+    #[test]
+    fn calls_that_share_an_identity_are_served_in_recorded_order() {
+        for (name, recorded, observed) in [
+            (
+                "the candidate writes the first call in another order",
+                [("a", "b"), ("a", "b")],
+                [("b", "a"), ("a", "b")],
+            ),
+            (
+                "the recording wrote them in two orders",
+                [("a", "b"), ("b", "a")],
+                [("b", "a"), ("b", "a")],
+            ),
+            (
+                "an exact match to the second recording, made first",
+                [("a", "b"), ("b", "a")],
+                [("b", "a"), ("a", "b")],
+            ),
+        ] {
+            let args = |(x, y): (&str, &str)| serde_json::json!({ "ids": [x, y] });
+            let (served, _, calls) = replay_calls(
+                &[(args(recorded[0]), "first"), (args(recorded[1]), "second")],
+                &[args(observed[0]), args(observed[1])],
+            );
+            assert_eq!(
+                served,
+                vec![
+                    Some(serde_json::json!("first")),
+                    Some(serde_json::json!("second"))
+                ],
+                "{name}"
+            );
+            assert!(all_resolved_exactly(&calls), "{name}: by identity, exactly");
+        }
+    }
+
+    /// A call addressed BY IDENTITY advances the args-free sequence too.
+    ///
+    /// That sequence is advanced unconditionally, and this is the half a counter
+    /// living inside either exact assigner would get wrong: a call whose
+    /// arguments identity applies to takes no exact stamp at all, so it would
+    /// advance on some calls and not others. Both calls here hold a set, so both
+    /// route by identity, and both hold an identity the recording never had, so
+    /// both miss. The second must be served the SECOND recording — it is served
+    /// the first if the identity-routed call did not advance the sequence.
+    #[test]
+    fn a_call_addressed_by_identity_advances_the_args_free_sequence_too() {
+        let (served, table, calls) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["c", "d"] }), "second"),
+            ],
+            &[
+                serde_json::json!({ "ids": ["w", "x"] }),
+                serde_json::json!({ "ids": ["y", "z"] }),
+            ],
+        );
+        assert!(
+            !table.identity_entries.is_empty(),
+            "the fixture must reach the identity lookup, or it proves nothing"
+        );
+        assert_eq!(
+            served,
+            vec![
+                Some(serde_json::json!("first")),
+                Some(serde_json::json!("second"))
+            ],
+            "one args-free sequence, walked in recorded order"
+        );
+        assert!(
+            calls.iter().all(|c| c.arg_divergent && !c.resolved),
+            "novel identities do not resolve; each is served args-free and marked"
+        );
+    }
+
+    /// Identity occurrences advance on every call, hit or miss, as the
+    /// renderer's do on every event: the second call with this identity is
+    /// served the second recording even though the first hit exactly.
+    #[test]
+    fn identity_occurrences_advance_on_calls_the_exact_lookup_served() {
+        let (served, _, calls) = replay_calls(
+            &[
+                (serde_json::json!({ "ids": ["a", "b"] }), "first"),
+                (serde_json::json!({ "ids": ["a", "b"] }), "second"),
+            ],
+            &[
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["b", "a"] }),
+            ],
+        );
+        assert_eq!(
+            served,
+            vec![
+                Some(serde_json::json!("first")),
+                Some(serde_json::json!("second"))
+            ]
+        );
+        assert!(all_resolved_exactly(&calls), "by identity, exactly");
+    }
+
+    /// The second lookup holds only the events another call could reach by
+    /// identity alone.
+    #[test]
+    fn identity_entries_are_written_only_where_identity_applies() {
+        let (_, table, _) = replay_calls(
+            &[
+                (serde_json::json!({ "id": 1, "n": [2] }), "plain"),
+                (serde_json::json!({ "ids": ["a", "b"] }), "set"),
+            ],
+            &[],
+        );
+        assert!(!table.identity_entries.is_empty());
+        assert!(
+            table
+                .identity_entries
+                .iter()
+                .all(|e| e.source_event_global_sequence == 2),
+            "only the event holding a set: {:?}",
+            table
+                .identity_entries
+                .iter()
+                .map(|e| e.source_event_global_sequence)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Structured binds as they are captured (a placeholder-keyed object of
+    /// digests, an array bind for a set such as `status = ANY($1)`): a set
+    /// whose members arrived in another order is the same call.
+    #[test]
+    fn a_bound_set_in_another_order_is_served_its_recording() {
+        let binds = |set: [&str; 2]| {
+            serde_json::json!({
+                "sql": "SELECT * FROM payment_intent WHERE status = ANY($1) AND merchant_id = $2",
+                "inputs": { "binds": {
+                    "key_id": "0123456789abcdef",
+                    "binds": { "$1": set, "$2": "h:00000000000000000000000000000002" }
+                } }
+            })
+        };
+        let (served, calls) = replay_one_call(
+            binds([
+                "h:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "h:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ]),
+            binds([
+                "h:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "h:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ]),
+        );
+        assert_eq!(served, Some(serde_json::json!("served")));
+        assert!(
+            all_resolved_exactly(&calls),
+            "identity must be what served it, not the args-free fallback"
+        );
+    }
+
+    /// Calls that share an identity, made from many threads at once, are each
+    /// served a distinct recording: every recording exactly once. The two
+    /// occurrence sequences are taken together under one lock, so no
+    /// interleaving can serve one recording twice.
+    #[test]
+    fn concurrent_calls_sharing_an_identity_are_each_served_once() {
+        use deja::DejaHook;
+        const CALLS: usize = 64;
+        let events: Vec<serde_json::Value> = (0..CALLS)
+            .map(|i| {
+                let mut e = event("redis", i as u64 + 1, serde_json::Value::Null);
+                e["correlation_id"] = serde_json::Value::Null;
+                e["args"] = if i % 2 == 0 {
+                    serde_json::json!({ "ids": ["a", "b"] })
+                } else {
+                    serde_json::json!({ "ids": ["b", "a"] })
+                };
+                e["result"] = serde_json::json!(i);
+                e
+            })
+            .collect();
+        let (_dir, recording) = write_events(&events);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let hook = std::sync::Arc::new(
+            deja::LookupTableHook::from_source(
+                TableSource(Some(table)),
+                deja::InMemoryObservedSink::new(),
+            )
+            .expect("install"),
+        );
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let hook = std::sync::Arc::clone(&hook);
+                std::thread::spawn(move || {
+                    (0..CALLS / 8)
+                        .map(|i| {
+                            let args = if (t + i) % 3 == 0 {
+                                serde_json::json!({ "ids": ["a", "b"] })
+                            } else {
+                                serde_json::json!({ "ids": ["b", "a"] })
+                            };
+                            hook.try_replay_with_context(deja::ReplayLookup {
+                                boundary: "redis",
+                                trait_name: "T",
+                                method_name: "m",
+                                args: &args,
+                                callsite_identity: None,
+                                caller_location: None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut served: Vec<i64> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .map(|value| value.expect("served").as_i64().unwrap())
+            .collect();
+        served.sort_unstable();
+        assert_eq!(
+            served,
+            (0..CALLS as i64).collect::<Vec<_>>(),
+            "every recording, exactly once"
+        );
+    }
+
+    /// End to end, candidate to scorer: a real table, a real hook and the
+    /// scorer, with no hand-built row between them. Two sites call one method
+    /// in the order the recording did not, with their arguments moved. The
+    /// candidate serves each site its own recording; the scorer pairs by first
+    /// call, first recording, with no site. Both calls block, each is named as
+    /// served by its address, and where the two pairings disagree the scorer
+    /// says so.
+    #[test]
+    fn a_real_args_free_serve_blocks_and_its_pick_matches_the_pairing() {
+        use deja::DejaHook;
+        let identity = |name: &str| deja::CallsiteIdentity {
+            version: 1,
+            source: deja::CallsiteSource::Explicit,
+            id: Some(name.to_owned()),
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: Some("request>load".to_owned()),
+        };
+        let site = |name: &str| serde_json::to_value(identity(name)).expect("an identity");
+        let mut first = event("db", 1, site("x"));
+        first["args"] = serde_json::json!({ "amount": 1 });
+        first["result"] = serde_json::json!("x-value");
+        let mut second = event("db", 2, site("y"));
+        second["args"] = serde_json::json!({ "amount": 2 });
+        second["result"] = serde_json::json!("y-value");
+        let (_dir, recording) = write_events(&[first.clone(), second.clone()]);
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let sink = deja::InMemoryObservedSink::new();
+        let handle = sink.handle();
+        let hook = deja::LookupTableHook::from_source_with_policy(
+            TableSource(Some(table.clone())),
+            sink,
+            deja::ArgMismatchPolicy::OnlyForArgful,
+        )
+        .expect("install");
+        let _correlation = deja_context::enter_correlation_id("c-1");
+        // The span path an observation carries comes from the tracing layer, as
+        // in the candidate; the scorer pairs args-free by it.
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(deja::DejaCorrelationLayer);
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let _request = tracing::info_span!("request").entered();
+        let _load = tracing::info_span!("load").entered();
+        for (name, amount) in [("y", 20), ("x", 10)] {
+            let identity = identity(name);
+            let served = hook.try_replay_with_context(deja::ReplayLookup {
+                boundary: "db",
+                trait_name: "T",
+                method_name: "m",
+                args: &serde_json::json!({ "amount": amount }),
+                callsite_identity: Some(&identity),
+                caller_location: None,
+            });
+            assert_eq!(
+                served,
+                Some(serde_json::json!(format!("{name}-value"))),
+                "{name}"
+            );
+        }
+        let observed = handle.lock().unwrap().clone();
+        assert_eq!(observed.len(), 2);
+        assert!(observed
+            .iter()
+            .all(|call| call.arg_divergent && !call.resolved));
+        let events: Vec<deja::BoundaryEvent> = [first, second]
+            .into_iter()
+            .map(|event| serde_json::from_value(event).expect("an event"))
+            .collect();
+        let artifacts = crate::divergence::RunArtifacts {
+            unplanted_presence: Default::default(),
+            scored_span_namespaces: Vec::new(),
+            reply_canons: Default::default(),
+            run_id: "run-1".to_owned(),
+            recording_id: Some("rec-1".to_owned()),
+            table,
+            observed,
+            http_diffs: Vec::new(),
+            record_graph: None,
+            replay_graph: Vec::new(),
+            events,
+            correlation_scope: None,
+            warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
+        };
+        let card = crate::divergence::detect(&artifacts);
+        let rows = crate::divergence::build_ledger(&artifacts).expect("a ledger");
+        let db = &card.per_boundary["db"];
+        assert_eq!(db.matched, 0, "{db:?}");
+        assert_eq!(db.kinds.get("ArgDivergentServe"), Some(&2), "{db:?}");
+        // No disagreement is possible on a successful claim: the pairing now takes
+        // the event the candidate named, so its pick and the twin are the same one.
+        // The check still guards the refused-claim path, where an exact hit owns the
+        // event and the shape search picks another; that path is asserted in
+        // `a_served_claim_on_an_event_an_exact_hit_owns_falls_back_to_the_shape_search`.
+        assert_eq!(db.kinds.get("ArgsServedPairingDisagrees"), None, "{db:?}");
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        let served: Vec<&crate::divergence::CallRecord> =
+            rows.iter().filter(|row| row.boundary == "db").collect();
+        assert_eq!(served.len(), 2, "{rows:?}");
+        for row in served {
+            assert!(row.blocking, "{row:?}");
+            assert!(row.served_event_global_sequence.is_some(), "{row:?}");
+            // The pick and the pairing agree, because the pairing takes the event
+            // the candidate named. The row still shows both, so a future
+            // divergence between them stays visible rather than being assumed away.
+            assert_eq!(
+                row.served_event_global_sequence, row.source_event_global_sequence,
+                "the pairing should take the event the candidate served: {row:?}"
+            );
+        }
+    }
+
+    /// What identity still refuses: a changed member, a changed count, a
+    /// string that is not a document, and a document sent as an object where
+    /// the recording sent it as text.
+    ///
+    /// Refusing is now about the ADDRESS, not about the request's survival. None
+    /// of these resolves — identity does not call them the same call, which is
+    /// the property this test exists for — and each is then served the
+    /// recording's value for that address with `arg_divergent` on it, so the
+    /// divergence is still reported and the request does not die on the way to
+    /// reporting it. Asserting only the value here would have let the address
+    /// silently start matching them.
+    #[test]
+    fn a_call_that_differs_in_anything_but_order_does_not_resolve() {
+        let (served, calls) = replay_one_call(
+            serde_json::json!({ "ids": ["a", "b"] }),
+            serde_json::json!({ "ids": ["a", "b"] }),
+        );
+        assert_eq!(
+            served,
+            Some(serde_json::json!("served")),
+            "control: the fixture serves a call that matches"
+        );
+        assert!(
+            all_resolved_exactly(&calls),
+            "control: a call that matches resolves, and is not marked"
+        );
+        for (name, recorded, observed) in [
+            (
+                "a member changed",
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["a", "c"] }),
+            ),
+            (
+                "a member was dropped",
+                serde_json::json!({ "ids": ["a", "a", "b"] }),
+                serde_json::json!({ "ids": ["a", "b"] }),
+            ),
+            (
+                "a value inside the document changed",
+                serde_json::json!({ "body": r#"{"a":1}"# }),
+                serde_json::json!({ "body": r#"{"a":2}"# }),
+            ),
+            (
+                "text is not a document",
+                serde_json::json!({ "body": "b a" }),
+                serde_json::json!({ "body": "a b" }),
+            ),
+            (
+                "a document as text is not the document as an object",
+                serde_json::json!({ "body": r#"{"a":1}"# }),
+                serde_json::json!({ "body": { "a": 1 } }),
+            ),
+        ] {
+            let (served, calls) = replay_one_call(recorded, observed);
+            let call = calls.last().expect("an observation");
+            assert!(
+                !call.resolved,
+                "{name}: identity must not call these the same call"
+            );
+            assert!(
+                call.arg_divergent,
+                "{name}: served from the same address with other arguments, and marked"
+            );
+            assert_eq!(
+                served,
+                Some(serde_json::json!("served")),
+                "{name}: the request carries on rather than dying at the miss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lexical_path_no_longer_earns_its_own_rank() {
+        // Rank 4 (`LexicalPath`) is GONE. It resolved zero calls in 155,419
+        // measured resolutions, and its module path is a coarser restatement of
+        // the span path that already resolves 99.99% of them.
+        //
+        // The event still addresses — at rank 5 from its location and rank 3
+        // from the unlocated floor — so removing the variant costs reach only
+        // where nothing was reaching.
         let identity = serde_json::json!({
             "version": 1,
             "source": "LexicalPath",
@@ -480,13 +1150,17 @@ mod tests {
         });
         let (_dir, recording) = write_events(&[event("redis", 0, identity)]);
 
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
-        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.address.rank()).collect();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
+        let ranks: Vec<u8> = table.entries.iter().map(|e| e.key.locus.rank()).collect();
         assert!(
-            ranks.contains(&4),
-            "lexical path yields a rank-4 entry: {ranks:?}"
+            !ranks.contains(&4) && !ranks.contains(&6),
+            "ranks 4 and 6 are deleted: {ranks:?}"
         );
-        assert!(ranks.contains(&5) && ranks.contains(&6));
+        assert!(
+            ranks.contains(&3) && ranks.contains(&5),
+            "the event must still address, at the unlocated floor and its \
+             location: {ranks:?}"
+        );
     }
 
     #[test]
@@ -510,11 +1184,11 @@ mod tests {
         detached["fork_seq"] = serde_json::json!(1);
 
         let (_dir, recording) = write_events(&[root, detached]);
-        let table = render_lookup_table(&recording, "rec-1", 1).unwrap();
+        let table = render_lookup_table(&recording, "rec-1").unwrap();
         let location_keys = table
             .entries
             .iter()
-            .filter(|entry| entry.key.address.rank() == 5)
+            .filter(|entry| entry.key.locus.rank() == 5)
             .map(|entry| serde_json::to_value(&entry.key).unwrap())
             .collect::<Vec<_>>();
 

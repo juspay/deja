@@ -168,8 +168,58 @@ fn clear_current_context() {
 }
 
 /// Return the current thread-visible correlation ID.
+///
+/// Panics if called during or after this thread's TLS teardown. Callers that can
+/// run from a destructor must use [`try_current_correlation_id`] instead — see
+/// its docs for why the distinction is load-bearing rather than defensive.
 pub fn current_correlation_id() -> Option<String> {
     CURRENT_CONTEXT.with(|cell| cell.borrow().clone())
+}
+
+/// The current correlation ID, or `None` if this thread cannot answer.
+///
+/// Fallible on both accesses, and neither arm is defensive padding.
+///
+/// `try_with` because a thread-local is DESTROYED during thread teardown, and a
+/// plain `with` panics once it is. A caller reached from a destructor — anything
+/// constructing a collection while a value drops, for one — would panic inside
+/// that drop, and a panic in a destructor ABORTS THE PROCESS rather than failing
+/// the request. Instrumentation must never take the service down.
+///
+/// `try_borrow` because a plain `borrow` panics on a cell that is merely BUSY.
+/// `set_current_context` holds its mutable borrow for a single statement and
+/// cannot re-enter this reader inside it, so that arm is unreachable on the
+/// current shape; it guards the writer that later holds a borrow across a call,
+/// which would otherwise turn a busy cell into a panic rather than a `None`.
+///
+/// `None` is the honest answer to both. A destroyed cell and a busy cell both
+/// mean this thread has no correlation to hand out, which is exactly what an
+/// empty cell means, and every caller already handles that.
+///
+/// # The collapse is safe only while the busy arm is unreachable
+///
+/// Three situations answer `None` here — no correlation, a destroyed cell, and
+/// a busy one — and the caller cannot tell them apart. That is fine today
+/// because the third cannot happen, and it stops being fine the moment the
+/// writer holds a borrow across a call.
+///
+/// The consumer that shows why: a collection facade seeding `HashMap` from the
+/// current correlation maps `None` to RANDOM keys, deliberately, because a
+/// collection built outside a request has no correlation to derive from. For a
+/// destroyed cell that is harmless — nothing built during thread teardown is
+/// part of a recorded request. For a BUSY cell inside a live correlation it
+/// would silently break the determinism the facade exists to provide, and
+/// iteration order is the largest class of replay divergence there is. A loud
+/// panic would become a quiet wrong answer in the one caller that motivates
+/// this function.
+///
+/// So: whoever makes the writer hold a borrow across a call has to give the
+/// busy case its own answer, not just remove the panic.
+pub fn try_current_correlation_id() -> Option<String> {
+    CURRENT_CONTEXT
+        .try_with(|cell| cell.try_borrow().ok().and_then(|cell| cell.clone()))
+        .ok()
+        .flatten()
 }
 
 /// What is physically in the cell, owner and all. Tests only: production code
@@ -996,5 +1046,84 @@ mod tests {
         assert!(gate());
 
         clear_recording_decision(correlation_id);
+    }
+}
+
+#[cfg(test)]
+mod teardown_safety {
+    use super::CURRENT_CONTEXT;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    // Statics, not thread-locals: the observations are made DURING teardown, so
+    // a thread-local used to report them may itself already be destroyed. This
+    // is the same hazard the code under test is about.
+    static PLAIN_PANICKED: AtomicU8 = AtomicU8::new(0);
+    static FALLIBLE_RETURNED_NONE: AtomicU8 = AtomicU8::new(0);
+    static DROP_RAN: AtomicU8 = AtomicU8::new(0);
+
+    struct ReadsOnDrop;
+    impl Drop for ReadsOnDrop {
+        fn drop(&mut self) {
+            DROP_RAN.store(1, Ordering::SeqCst);
+            let plain = std::panic::catch_unwind(super::current_correlation_id);
+            PLAIN_PANICKED.store(u8::from(plain.is_err()), Ordering::SeqCst);
+            let fallible = std::panic::catch_unwind(super::try_current_correlation_id);
+            FALLIBLE_RETURNED_NONE.store(
+                match fallible {
+                    Ok(None) => 1,
+                    Ok(Some(_)) => 2,
+                    Err(_) => 3,
+                },
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    thread_local! {
+        // Declared after CURRENT_CONTEXT, so it is destroyed first and
+        // CURRENT_CONTEXT is already gone when this Drop runs.
+        static GUARD: ReadsOnDrop = const { ReadsOnDrop };
+    }
+
+    /// The property the fallible accessor exists for, DRIVEN rather than assumed.
+    ///
+    /// On every ordinary path the two readers agree, so only teardown can tell
+    /// them apart. The vacuity guard is `DROP_RAN`: without it this test passes
+    /// whenever the destructor never runs, which is the same shape as asserting
+    /// a property of an empty set.
+    #[test]
+    fn the_fallible_reader_survives_teardown_where_the_plain_one_panics() {
+        // `take_hook`/`set_hook` are PROCESS-global and cargo runs this crate's
+        // tests in parallel threads, so another test's panic output can be
+        // suppressed inside this window. It cannot change a result — nothing here
+        // touches `catch_unwind` semantics — but it can swallow a diagnostic from a
+        // DIFFERENT failing test. Left unserialised: the cost is a lost message on a
+        // run that is already failing, and serialising would be a heavier fix than
+        // the problem.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        std::thread::spawn(|| {
+            // Registration order decides destruction order: TLS destructors run
+            // LIFO, so GUARD must register FIRST for CURRENT_CONTEXT to be gone
+            // by the time GUARD's Drop reads it. Touching GUARD before the
+            // correlation is what makes this test reproduce the hazard at all —
+            // with the order reversed, CURRENT_CONTEXT is still alive in the
+            // destructor and the plain reader does not panic.
+            GUARD.with(|_| {});
+            CURRENT_CONTEXT.with(|cell| {
+                *cell.borrow_mut() = Some("corr-teardown-probe".to_owned());
+            });
+        })
+        .join()
+        .expect("the thread joins; the drop's panic is caught inside it");
+        std::panic::set_hook(previous);
+
+        assert_eq!(
+            DROP_RAN.load(Ordering::SeqCst),
+            1,
+            "the destructor never ran, so this test observed nothing"
+        );
+        assert_eq!(PLAIN_PANICKED.load(Ordering::SeqCst), 1, "the plain reader did NOT panic during teardown -- if that is now true, the fallible twin has no reason to exist");
+        assert_eq!(FALLIBLE_RETURNED_NONE.load(Ordering::SeqCst), 1, "the fallible reader must answer None during teardown, not panic (3) and not a value (2)");
     }
 }

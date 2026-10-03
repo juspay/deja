@@ -34,6 +34,13 @@ pub struct JobPatch {
     /// Replaces the candidate's `env`/`envFrom` wholesale before the per-run env
     /// upserts (which therefore win, as the replay overrides must).
     pub config_env: Option<ConfigEnvCopy>,
+    /// Create the Job SUSPENDED: it exists, holds the whole run, and starts no
+    /// pod until the scheduler resumes it. This is the queue — kubernetes' own,
+    /// rather than one kept beside it. `activeDeadlineSeconds` is measured from
+    /// the Job's start time, and suspending resets that, so a run does not spend
+    /// its deadline waiting for a node. False leaves the field unset, which is
+    /// the default and what every non-scheduled launch renders today.
+    pub suspend: bool,
 }
 
 /// The recorded system's own generated container env, copied verbatim.
@@ -117,6 +124,15 @@ impl std::error::Error for PatchError {}
 /// mutated. Fails loudly if any target is absent.
 pub fn apply_job_patch(template: &Value, patch: &JobPatch) -> Result<Value, PatchError> {
     let mut job = template.clone();
+
+    // spec.suspend — written only when suspending, so a launch that does not
+    // queue renders exactly the Job it rendered before this existed.
+    if patch.suspend {
+        job.get_mut("spec")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| PatchError::Shape("spec".into()))?
+            .insert("suspend".into(), Value::Bool(true));
+    }
 
     // metadata.name
     let metadata = job
@@ -641,6 +657,39 @@ mod tests {
         assert_eq!(
             out["spec"]["template"]["metadata"]["labels"]["k"],
             json!("v")
+        );
+    }
+
+    /// The scheduler's entire mechanism is this one field: a Job that exists,
+    /// holds the whole run, and starts no pod until it is resumed. If the patch
+    /// did not write it, every queued run would start at once — the failure the
+    /// queue exists to prevent, and one that looks like no queue at all.
+    #[test]
+    fn a_queued_patch_renders_a_suspended_job() {
+        let patch = JobPatch {
+            job_name: "deja-replay-q".into(),
+            suspend: true,
+            ..Default::default()
+        };
+        let out = apply_job_patch(&template(), &patch).expect("applies");
+        assert_eq!(out["spec"]["suspend"], json!(true));
+    }
+
+    /// And a launch that is not queued renders exactly the Job it rendered
+    /// before suspension existed — no `suspend` key at all, rather than an
+    /// explicit false. A deployment without a capacity must not be able to tell
+    /// that this feature was added.
+    #[test]
+    fn an_unqueued_patch_leaves_suspend_unwritten() {
+        let patch = JobPatch {
+            job_name: "deja-replay-r".into(),
+            ..Default::default()
+        };
+        let out = apply_job_patch(&template(), &patch).expect("applies");
+        assert!(
+            out["spec"].get("suspend").is_none(),
+            "an unscheduled launch must render no suspend field: {:?}",
+            out["spec"]
         );
     }
 }

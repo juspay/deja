@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, RunRow } from "../lib/api";
+import { api, RunSummaryRow } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import {
   attemptOrdinals,
@@ -28,7 +28,7 @@ function when(iso: string): { short: string; full: string } {
 }
 
 /** Everything a substring search should reach on one row. */
-function haystack(r: RunRow): string {
+function haystack(r: RunSummaryRow): string {
   return [
     r.run_id,
     r.recording_id ?? "",
@@ -36,7 +36,7 @@ function haystack(r: RunRow): string {
     systemUnderTest(r),
     r.created_by,
     r.failure?.message ?? "",
-    r.scorecard?.verdict?.reason ?? "",
+    r.scorecard_digest?.reason ?? "",
     r.expectation ?? "",
   ]
     .join(" ")
@@ -140,7 +140,17 @@ export default function RunsPage() {
                 title={`${r.run_id} · ${r.created_by} · ${t.full}`}
               >
                 <span className="rl-when">{t.short}</span>
-                <span className="rl-result"><ResultChip result={res} /></span>
+                <span className="rl-result">
+                  <ResultChip result={res} />
+                  {/* The second verdict, against main, when the run was created
+                      with a baseline. Its own chip: a pass here beside a fail
+                      there is the case the delta exists for. */}
+                  {r.delta_verdict && (
+                    <span className={`chip delta ${r.delta_verdict}`} title="against main at the merge-base">
+                      main: {r.delta_verdict}
+                    </span>
+                  )}
+                </span>
                 <span className="rl-cand mono" title={cand.full}>
                   {cand.label}
                   {/* Only a non-default system is worth a badge — every legacy

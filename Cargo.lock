@@ -542,6 +542,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -549,6 +551,7 @@ name = "deja-compactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "config",
  "flate2",
  "futures",
@@ -594,6 +597,7 @@ dependencies = [
  "bb8",
  "deja-runtime",
  "diesel",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -652,6 +656,8 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tower",
+ "tracing",
+ "tracing-subscriber",
  "ureq",
 ]
 
@@ -665,6 +671,7 @@ dependencies = [
  "deja-derive",
  "serde",
  "serde_json",
+ "siphasher",
  "tempfile",
  "tokio",
  "tracing",
@@ -720,6 +727,7 @@ dependencies = [
  "itoa",
  "pq-sys",
  "r2d2",
+ "serde_json",
 ]
 
 [[package]]
@@ -2556,6 +2564,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -2687,6 +2696,12 @@ name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+
+[[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"

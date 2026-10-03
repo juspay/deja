@@ -34,10 +34,23 @@ export type RunParams = {
   correlation_filter?: string[];
   workload?: unknown;
   expectation?: string;
+  /** The run this one is measured against, three-way with the tape as
+   *  ancestor: main at the merge-base on the same recording. Set by the
+   *  pipeline that created both runs. */
+  delta_against?: string;
+  /** Why the run exists when it is not a candidate under test: `baseline`. */
+  purpose?: string;
+  /** What the candidate is, in the creator's words: a PR number and title,
+   *  or the main commit a baseline stands for. Displayed, never parsed. */
+  label?: string;
 };
 
-/** The request a row carries, or null when it predates the record. */
-export function runParams(run: RunRow): RunParams | null {
+/** The request a row carries, or null when it predates the record.
+ *
+ * Takes `Pick<RunRow, "params">` rather than a whole row: it reads one field,
+ * and the list's `RunSummaryRow` is deliberately not a `RunRow`. Asking for
+ * only what it reads lets both shapes through without a cast. */
+export function runParams(run: Pick<RunRow, "params">): RunParams | null {
   const p = run.params as Partial<RunParams> | null | undefined;
   return p && p.candidate_spec ? (p as RunParams) : null;
 }
@@ -51,6 +64,10 @@ export type RunRow = {
   params: Partial<RunParams> & { [k: string]: unknown };
   state: string;
   verdict: "pass" | "fail" | "inconclusive" | null;
+  /** What the run changed relative to the baseline it was created against
+   *  (params.delta_against): pass, fail, or pending while the baseline is
+   *  still being scored. Absent for a run that names no baseline. */
+  delta_verdict?: "pass" | "fail" | "pending" | "refused" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;
@@ -67,6 +84,40 @@ export type RunRow = {
     failure_reason: string | null;
     candidate_image: { docker_image: string; source_ref: string } | null;
   };
+};
+
+/**
+ * The five scalars a run's RESULT is decided from, without the scorecard.
+ *
+ * Exactly what `resultOf` reads and nothing else, so the list can render a
+ * verdict without the megabytes behind it. `null` for the whole digest means
+ * NO SCORECARD — which `resultOf` reports as "completed but produced no
+ * scorecard", a different and louder thing than a scorecard saying nothing.
+ */
+export type ScorecardDigest = {
+  pass: boolean | null;
+  inconclusive: boolean | null;
+  reason: string | null;
+  total_correlations: number | null;
+  matched_correlations: number | null;
+};
+
+/**
+ * A run as the LIST returns it: every RunRow field except `scorecard`, plus the
+ * digest above.
+ *
+ * `GET /api/v1/runs` does not send scorecards. It used to, and on 2026-09-17
+ * that made the response 46.5 MB — 97.5% of it scorecard, 36.8 MB of that
+ * `per_correlation` — which this page then re-fetched every five seconds from
+ * every open tab on every machine until the orchestrator was OOMKilled ten
+ * times over, two minutes of life apiece.
+ *
+ * If you need a scorecard here, do NOT widen this type: fetch the one run
+ * (`api.run(id)`), which still carries it whole. Widening it is the change that
+ * caused the outage.
+ */
+export type RunSummaryRow = Omit<RunRow, "scorecard"> & {
+  scorecard_digest: ScorecardDigest | null;
 };
 
 export type SessionManifest = {
@@ -252,12 +303,53 @@ export type CallRecord = {
   // differed — the cause), false on the CONSEQUENCE (downstream write). Absent
   // on every other kind.
   origin?: boolean;
+  // The candidate's request STOPPED at this call: a Substitute boundary missed
+  // the tape and failed closed, so there is no replayed result — the finding is
+  // in the arguments. Absent when the call went through.
+  stopped?: boolean;
   resolved_rank?: number;
   recorded?: CallSide;
   observed?: CallSide;
 };
 
 export type JsonFieldDiff = { json_path: string; baseline: unknown; candidate: unknown };
+
+// Did the replay reach what the candidate changed? Computed by the orchestrator
+// from the git host's compare of the candidate against its base branch and the
+// run's own replay graph and call ledger; never part of the verdict.
+export type ChangeReach =
+  | "not_exercised"
+  | "exercised"
+  | "flow_ran"
+  | "flow_ran_weak"
+  | "module_ran"
+  | "unknown";
+
+export type ChangedItem = {
+  path: string;
+  item: string;
+  lines: string;
+  connector?: string;
+  flow?: string;
+  reach: ChangeReach;
+  why: string;
+};
+
+export type ChangeCoverage = {
+  system: string;
+  repo: string;
+  base_ref: string;
+  merge_base: string;
+  head: string;
+  driven_requests: number;
+  items: ChangedItem[];
+  never_ran: number;
+  unproven: number;
+  caveats: string[];
+};
+
+// The endpoint answers with the assessment, or with why there is none.
+export type ChangeCoverageResponse = ChangeCoverage | { unavailable: string };
 
 export type HttpDiff = {
   correlation_id: string;
@@ -355,6 +447,8 @@ export type SystemRow = {
   is_default: boolean;
   configured: boolean;
   s3_bucket?: string | null;
+  /** Directory inside the bucket this system's roots sit under; null is the bucket root. */
+  s3_prefix?: string | null;
   recording_root?: string | null;
   manages_stores: boolean;
   manages_stores_declared?: boolean | null;
@@ -375,7 +469,7 @@ export type SystemRow = {
 export const api = {
   systems: () => request<{ systems: SystemRow[] }>("/api/v1/systems"),
   recordings: () => request<RecordingRow[]>("/api/v1/recordings"),
-  runs: () => request<RunRow[]>("/api/v1/runs"),
+  runs: () => request<RunSummaryRow[]>("/api/v1/runs"),
   run: (id: string) => request<RunRow>(`/api/v1/runs/${id}`),
   stages: (id: string) => request<StageRow[]>(`/api/v1/runs/${id}/stages`),
   logs: (id: string, afterSeq = -1) =>
@@ -393,6 +487,12 @@ export const api = {
   calls: (id: string) => request<CallRecord[]>(`/api/v1/runs/${id}/calls`),
   httpDiffs: (id: string) => request<HttpDiff[]>(`/api/v1/runs/${id}/http-diffs`),
   graph: (id: string) => request<RunGraph>(`/api/v1/runs/${id}/graph`),
+  changeCoverage: (id: string) =>
+    request<ChangeCoverageResponse>(`/api/v1/runs/${id}/change-coverage`),
+  delta: (id: string, against: string) =>
+    request<DeltaResponse>(
+      `/api/v1/runs/${id}/delta?against=${encodeURIComponent(against)}`,
+    ),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
   createRun: (spec: Record<string, unknown>) => {
@@ -486,6 +586,36 @@ export type AvailableRecording = {
    *  reproduced by hand, NOT so a caller has to supply it. Bucket-relative: a
    *  `s3_source.path` needs `bucket/` in front of it. */
   prefix: string;
+  /** Whether the compactor has sealed this session. */
+  sealed?: boolean;
+  /** Correlations the seal counted — test cases in the recording.
+   *
+   *  NULL WHEN UNSEALED, and that is not zero. "Not counted yet" and "counted,
+   *  and there are none" are different answers, and a client that renders the
+   *  first as `0` tells a reader a live recording is worthless. Render null as
+   *  unknown. */
+  correlations?: number | null;
+  /** Boundary events the seal counted. Null when unsealed, same rule. */
+  events?: number | null;
+  /** Capture gaps the seal found — `global_sequence` ranges the recorder
+   *  allocated and the tape never received. Null when unsealed. */
+  gaps?: number | null;
+  /**
+   * The deployment-day this session belongs to: `<revision>-<MMDD>`.
+   *
+   * Derived by the server from the id, which has always carried the minute the
+   * recording started — so this mints nothing and every described recording has
+   * one. It is the unit a replay actually wants: a pod's recording is an
+   * arbitrary slice, because pods are replaced every thirty minutes and the
+   * traffic a deployment served in a day is spread across dozens of them.
+   *
+   * NULL IS A REAL ANSWER and not a gap in the data. A boot-derived id
+   * (`run-<nanos>`) carries no day, so the server declines to group it rather
+   * than guessing one from when it last wrote — which for a session straddling
+   * midnight is not the day it belongs to. Render those as themselves; do not
+   * invent a group for them.
+   */
+  group?: string | null;
 };
 
 export type AvailableRecordingsPage = {
@@ -521,12 +651,46 @@ export const availableRecordings = (limit = 200, offset = 0, system?: string) =>
 // ===========================================================================
 
 /**
- * The recording's correlation ids, in the recording's own order.
+ * One row of the sealed correlations index, as the endpoint actually sends it.
+ *
+ * MIRRORS `deja_compactor::CorrelationSummary`, because the handler serialises
+ * those rows straight into `correlations` — it does not project them down to
+ * ids. This field was typed `string[]` here and TypeScript raised nothing,
+ * which is the point worth keeping: a hand-written wire type checks the client
+ * against its own guess, never against the server. The guess reached the
+ * picker, which rendered a row object as a React child, and the page died with
+ * "Objects are not valid as a React child" listing exactly these keys.
+ */
+export type CorrelationRow = {
+  /** Null on the row that accounts for UNCORRELATED events — ambient traffic
+   *  shared across cases, which is not a test case and cannot be driven. The
+   *  server withholds that row from this endpoint; the type still admits null
+   *  because the sidecar carries it and the field is `Option<String>`. */
+  correlation_id: string | null;
+  /** Boundary events on this correlation. */
+  events: number;
+  /** The correlation's span in the recording's global sequence. */
+  gseq_min: number;
+  gseq_max: number;
+  /** Distinct `boundary` values observed, sorted. EVIDENCE, not a verdict:
+   *  drivability is decided by matching these against the ingress boundary of
+   *  the system that produced the recording. */
+  boundaries: string[];
+  /** Distinct `role` values observed, sorted. Empty on recorders that do not
+   *  stamp roles — which is not the same as "no ingress". */
+  roles: string[];
+  /** `boundaries` is truncated, so a boundary's ABSENCE from it proves
+   *  nothing. Said out loud so a reader never reads a capped set as a "no". */
+  boundaries_truncated: boolean;
+};
+
+/**
+ * The recording's correlation index rows, in the recording's own order.
  *
  * THREE ANSWERS, and they must stay three. A recording can be sealed (the index
  * is final and `correlations` is authoritative), present but not yet sealed (the
  * manifest is written last, so its absence IS "not sealed" — the ids are not
- * knowable cheaply and `correlations` is empty), or unknown (404). The middle
+ * knowable cheaply and `correlations` is null), or unknown (404). The middle
  * one is not "no correlations" and must never be rendered as one.
  *
  * `status` mirrors `SessionManifest.status`, whose sealed value is the literal
@@ -545,8 +709,15 @@ export type RecordingCorrelations = {
   sealed?: boolean;
   /** How many the recording holds. Null when that is not known yet. */
   total: number | null;
-  /** A PAGE of the index, earliest first. Empty when the recording is unsealed. */
-  correlations: string[];
+  /**
+   * A PAGE of the index, earliest first — ROWS, not ids.
+   *
+   * Null when the recording has only landed (the server sends an explicit
+   * `null` there), and ABSENT on a seal written before the index sidecar
+   * existed. Neither is a recording without correlations, so neither may be
+   * rendered as an empty list.
+   */
+  correlations?: CorrelationRow[] | null;
 };
 
 /**
@@ -562,3 +733,131 @@ export const recordingCorrelations = (id: string, limit = 1000, offset = 0) =>
   request<RecordingCorrelations>(
     `/api/v1/recordings/${encodeURIComponent(id)}/correlations?limit=${limit}&offset=${offset}`,
   );
+
+// ---------------------------------------------------------------------------
+// Behaviour delta — what a run changed relative to ANOTHER run of the same
+// tape, three-way against the tape. `GET /runs/{y}/delta?against={m}`.
+// Never part of the tape-relative verdict; shown beside it.
+
+export type DeltaAddress =
+  | {
+      kind: "call";
+      correlation: string;
+      span_path: string;
+      boundary: string;
+      operation: string;
+      /** The recorded event this call paired to; absent for a novel call. */
+      recorded_event?: number;
+      occurrence: number;
+    }
+  | { kind: "status"; correlation: string; request_sequence: number }
+  | { kind: "body"; correlation: string; json_path: string };
+
+/** What one side produced at an address: it reproduced the tape, never
+ *  reached the address, or produced something else (hashed). */
+export type DeltaSide = "tape" | "absent" | { hash: string };
+
+export type DeltaBucket =
+  | "clean"
+  | "inherited"
+  | "introduced"
+  | "resolved"
+  | "changed"
+  | "inherited_novel"
+  | "introduced_novel"
+  | "resolved_novel"
+  | "inherited_omission"
+  | "introduced_omission"
+  | "resolved_omission";
+
+export type DeltaFamily = "clean" | "inherited" | "introduced" | "resolved" | "changed";
+
+export type DeltaRow = {
+  address: DeltaAddress;
+  bucket: DeltaBucket;
+  m: DeltaSide;
+  y: DeltaSide;
+  blocking: boolean;
+  lane?: { connector: string; flow: string } | null;
+};
+
+export type DeltaLane = {
+  lane: { connector: string; flow: string };
+  requests: number;
+  /** Bucket family → addresses. */
+  buckets: Partial<Record<DeltaFamily, number>>;
+  /** Bucket family → requests. Absent from an older server. */
+  requests_by_family?: Partial<Record<DeltaFamily, number>>;
+};
+
+export type DeltaSideInfo = {
+  run: string;
+  tape_verdict: { pass: boolean; inconclusive: boolean; reason: string } | null;
+  candidate: Record<string, unknown> | null;
+};
+
+export type Delta = {
+  m_run: string;
+  y_run: string;
+  canon_version: number;
+  verdict: {
+    pass: boolean;
+    /** Addresses by family: response fields and calls. */
+    introduced: number;
+    changed: number;
+    inherited: number;
+    resolved: number;
+    /** Requests with at least one address in the family: the unit the tape
+     *  verdict counts in. Absent from an older server. */
+    introduced_requests?: number;
+    changed_requests?: number;
+    inherited_requests?: number;
+    resolved_requests?: number;
+    reason: string;
+  };
+  buckets: Partial<Record<DeltaBucket, number>>;
+  lanes: DeltaLane[];
+  rows: DeltaRow[];
+  clean: number;
+  /** Correlations both runs drove: the comparison's domain. */
+  covered_correlations: number;
+  /** Bucket family → requests with at least one address in it; `clean` is
+   *  requests in no other family. Absent from an older server. */
+  requests?: Partial<Record<DeltaFamily, number>>;
+  /** The lane of every covered request, clean ones included. */
+  request_lanes?: Record<string, { connector: string; flow: string }>;
+  /** Requests only one run drove; their addresses are outside every bucket. */
+  uncovered: { m_only: string[]; y_only: string[]; addresses: number };
+  tape: string | null;
+  sides: { m: DeltaSideInfo; y: DeltaSideInfo };
+};
+
+/** Why there is no delta: `pending` clears on its own, `refused` never will. */
+export type DeltaUnavailable = {
+  unavailable: string;
+  /** `tape_mismatch`: the two runs read different tapes. A refusal, and a
+   *  data-integrity warning rather than "not applicable". */
+  unavailable_kind?: "pending" | "refused" | "tape_mismatch";
+};
+export type DeltaResponse = Delta | DeltaUnavailable;
+
+/**
+ * The unavailability a delta response carries, if any. A response that names
+ * no kind is read as refused, so nothing polls on an answer it cannot tell
+ * will change.
+ */
+export function deltaUnavailable(
+  r: DeltaResponse | undefined,
+): { why: string; pending: boolean; tapeMismatch: boolean } | null {
+  if (!r || !("unavailable" in r)) return null;
+  return {
+    why: r.unavailable,
+    pending: r.unavailable_kind === "pending",
+    tapeMismatch: r.unavailable_kind === "tape_mismatch",
+  };
+}
+
+export function deltaFamily(b: DeltaBucket): DeltaFamily {
+  if (b === "clean" || b === "changed") return b;
+  return b.split("_")[0] as DeltaFamily;
+}

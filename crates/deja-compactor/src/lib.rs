@@ -10,6 +10,10 @@
 //!                                    ← per-correlation summary
 //!   sessions/v1/{id}/manifest.json   ← written LAST = the seal
 //!
+//! Both roots sit under the system's `s3_prefix` when it declares one, which
+//! `S3Config::build` applies; every key above, including the ones a manifest
+//! stores, is relative to that prefix.
+//!
 //! The manifest records per-instance `global_sequence` coverage (ranges,
 //! gaps, duplicates dropped), schema versions, code provenance, and counts —
 //! everything the catalog row and replay prep need without re-reading data.
@@ -46,6 +50,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub mod pass;
 pub mod settings;
 
 /// One lock for every test that touches the declared configuration.
@@ -105,18 +110,25 @@ const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const UPLOAD_CONCURRENCY: usize = 4;
 
 /// Connection settings. An EMPTY `endpoint` targets real AWS S3: object_store
-/// derives the virtual-hosted endpoint from `region` and uses the AWS
+/// derives the virtual-hosted endpoint from the region and uses the AWS
 /// credential chain (IRSA/web-identity) when no static credentials are set — so
-/// an in-cluster pod needs only region + bucket. A non-empty `endpoint` (the
-/// demo overlay's MinIO, host-published on 9100 with minioadmin credentials)
+/// an in-cluster pod needs only the bucket. A non-empty `endpoint` (the demo
+/// overlay's MinIO, host-published on 9100 with minioadmin credentials)
 /// overrides that for a self-hosted/S3-compatible store.
+#[derive(Clone)]
 pub struct S3Config {
-    /// Explicit S3 endpoint, or empty to derive the AWS endpoint from `region`.
+    /// Explicit S3 endpoint, or empty to derive the AWS endpoint from the region.
     pub endpoint: String,
     pub bucket: String,
+    /// The key prefix every key this config reads or writes sits under, so one
+    /// bucket can hold several systems. Empty is the bucket root. Applied by
+    /// [`S3Config::build`], never by a caller: see [`S3Config::scope_store`].
+    pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
-    pub region: String,
+    /// An explicitly configured region. `None` means "the bucket's own"; see
+    /// [`choose_region`] for the order the others are tried in.
+    pub region: Option<String>,
     pub allow_http: bool,
 }
 
@@ -128,9 +140,12 @@ impl S3Config {
             // demo overlay sets DEJA_S3_ENDPOINT explicitly for its MinIO.
             endpoint: env("DEJA_S3_ENDPOINT", ""),
             bucket: env("DEJA_S3_BUCKET", "deja-recordings"),
+            // The deployment's own bucket is addressed from its root; a
+            // system's prefix comes from its declaration, not from here.
+            prefix: String::new(),
             access_key: env("DEJA_S3_ACCESS_KEY", "minioadmin"),
             secret_key: env("DEJA_S3_SECRET_KEY", "minioadmin"),
-            region: env("DEJA_S3_REGION", "us-east-1"),
+            region: non_blank(std::env::var("DEJA_S3_REGION").ok().as_deref()),
             // Default true for the demo MinIO (plaintext); a real S3 endpoint
             // sets DEJA_S3_ALLOW_HTTP=false to require TLS.
             allow_http: env("DEJA_S3_ALLOW_HTTP", "true") != "false",
@@ -141,17 +156,47 @@ impl S3Config {
         !self.access_key.trim().is_empty() && !self.secret_key.trim().is_empty()
     }
 
+    fn has_custom_endpoint(&self) -> bool {
+        !self.endpoint.trim().is_empty()
+    }
+
+    /// The region this config talks to, resolved in [`choose_region`]'s order.
+    /// May look the bucket's region up over the network, once per bucket per
+    /// process.
+    pub fn effective_region(&self) -> String {
+        self.effective_region_with(bucket_region, |k| std::env::var(k).ok())
+    }
+
+    /// [`S3Config::effective_region`] over an injected bucket lookup and
+    /// environment, so the wiring into [`choose_region`] is testable without a
+    /// network or a process-global variable.
+    fn effective_region_with(
+        &self,
+        bucket_region: impl FnOnce(&str) -> Option<String>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> String {
+        choose_region(RegionInputs {
+            explicit: self.region.as_deref(),
+            custom_endpoint: self.has_custom_endpoint(),
+            bucket_region: || bucket_region(&self.bucket),
+            aws_region: env("AWS_REGION").as_deref(),
+            aws_default_region: env("AWS_DEFAULT_REGION").as_deref(),
+        })
+        .0
+    }
+
     pub fn build(&self) -> Result<DynStore, String> {
+        let region = self.effective_region();
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&self.bucket)
-            .with_region(&self.region)
+            .with_region(&region)
             .with_allow_http(self.allow_http);
 
         // Empty endpoint → let object_store derive the AWS virtual-hosted
         // endpoint from the region (real S3). A non-empty endpoint overrides it
         // (MinIO / S3-compatible). Passing an empty endpoint would break the
         // derived URL, so only set it when present.
-        if !self.endpoint.trim().is_empty() {
+        if self.has_custom_endpoint() {
             builder = builder.with_endpoint(&self.endpoint);
         }
 
@@ -162,7 +207,229 @@ impl S3Config {
         }
 
         let store = builder.build().map_err(|e| format!("s3 client: {e}"))?;
-        Ok(Arc::new(store))
+        Ok(self.scope_store(Arc::new(store)))
+    }
+
+    /// Confine `store` to this config's prefix.
+    ///
+    /// The one place a system prefix is applied to a key. Every read, write and
+    /// listing in this crate goes through a store from [`S3Config::build`], so
+    /// the landing, the seal's parts and index, and the manifest all move under
+    /// the prefix together, and keys inside deja stay relative to the system's
+    /// root. A listing through the wrapped store comes back relative too, so a
+    /// key read out of one is a key that can be read back through it.
+    ///
+    /// With no prefix the store is returned untouched: the keys are exactly the
+    /// ones a bucket-per-system deployment has always used.
+    pub fn scope_store(&self, store: DynStore) -> DynStore {
+        match layout::system_prefix(&self.prefix) {
+            None => store,
+            Some(prefix) => Arc::new(object_store::prefix::PrefixStore::new(
+                store,
+                prefix.as_str(),
+            )),
+        }
+    }
+
+    /// A key relative to this config's prefix, as the bucket spells it. For a
+    /// key that leaves deja as a string — a URI, a report, an error — since a
+    /// relative key read back without the prefix names a different object.
+    pub fn bucket_key(&self, key: &str) -> String {
+        layout::bucket_key(&self.prefix, key)
+    }
+
+    /// `s3://bucket/<bucket key>` for a key relative to this config's prefix.
+    pub fn uri(&self, key: &str) -> String {
+        format!("s3://{}/{}", self.bucket, self.bucket_key(key))
+    }
+}
+
+fn non_blank(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
+/// The region every earlier default fell back to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Which rule decided a region. Reported so a test, and a log, can say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionSource {
+    /// `DEJA_S3_REGION`, or a region a caller set on the config.
+    Explicit,
+    /// A custom endpoint (MinIO, the demo) with nothing explicit: the old
+    /// default, and no lookup, since that endpoint is not AWS.
+    CustomEndpoint,
+    /// The bucket's own region, from a HeadBucket.
+    Bucket,
+    AwsRegion,
+    AwsDefaultRegion,
+    Default,
+}
+
+/// What [`choose_region`] decides from. `bucket_region` is a closure so that
+/// the rule can be exercised without a network, and so that the lookup is not
+/// made at all when an earlier rule already decided.
+pub struct RegionInputs<'a, F: FnOnce() -> Option<String>> {
+    pub explicit: Option<&'a str>,
+    pub custom_endpoint: bool,
+    pub bucket_region: F,
+    pub aws_region: Option<&'a str>,
+    pub aws_default_region: Option<&'a str>,
+}
+
+/// The region to talk to a bucket in, first rule that answers wins:
+///
+/// 1. an explicit region;
+/// 2. a custom endpoint: [`DEFAULT_REGION`], without a lookup;
+/// 3. the bucket's own region;
+/// 4. `AWS_REGION`, then `AWS_DEFAULT_REGION`;
+/// 5. [`DEFAULT_REGION`].
+///
+/// The bucket comes before the pod's region because they differ exactly when
+/// it matters: an orchestrator in one region reading another region's bucket.
+/// Blank values count as absent.
+pub fn choose_region<F: FnOnce() -> Option<String>>(
+    inputs: RegionInputs<'_, F>,
+) -> (String, RegionSource) {
+    if let Some(r) = non_blank(inputs.explicit) {
+        return (r, RegionSource::Explicit);
+    }
+    if inputs.custom_endpoint {
+        return (DEFAULT_REGION.to_owned(), RegionSource::CustomEndpoint);
+    }
+    if let Some(r) = non_blank((inputs.bucket_region)().as_deref()) {
+        return (r, RegionSource::Bucket);
+    }
+    if let Some(r) = non_blank(inputs.aws_region) {
+        return (r, RegionSource::AwsRegion);
+    }
+    if let Some(r) = non_blank(inputs.aws_default_region) {
+        return (r, RegionSource::AwsDefaultRegion);
+    }
+    (DEFAULT_REGION.to_owned(), RegionSource::Default)
+}
+
+/// How long a failed bucket-region lookup is remembered before it is tried
+/// again. A success is remembered for the life of the process.
+const BUCKET_REGION_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Bounds the lookup so an unreachable endpoint costs seconds, not the client's
+/// default thirty.
+const BUCKET_REGION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum CachedRegion {
+    Found(String),
+    Failed(std::time::Instant),
+}
+
+/// Bucket regions already looked up. A found region is kept; a failure is
+/// kept for [`BUCKET_REGION_RETRY`] and then looked up again. The clock and
+/// the lookup are the caller's, so both rules can be tested without waiting
+/// or a network.
+#[derive(Default)]
+struct RegionCache {
+    entries: std::sync::Mutex<BTreeMap<String, CachedRegion>>,
+}
+
+impl RegionCache {
+    fn region(
+        &self,
+        bucket: &str,
+        now: std::time::Instant,
+        lookup: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Option<String> {
+        let bucket = bucket.trim();
+        if bucket.is_empty() {
+            return None;
+        }
+        {
+            let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            match entries.get(bucket) {
+                Some(CachedRegion::Found(region)) => return Some(region.clone()),
+                Some(CachedRegion::Failed(at))
+                    if now.saturating_duration_since(*at) < BUCKET_REGION_RETRY =>
+                {
+                    return None
+                }
+                _ => {}
+            }
+        }
+        // Not under the lock: a slow lookup for one bucket must not stall every
+        // other bucket's client. Two threads may both look the same bucket up
+        // once; they get the same answer.
+        let looked_up = lookup(bucket);
+        let entry = match &looked_up {
+            Ok(region) => {
+                eprintln!("s3: bucket {bucket} is in {region}");
+                CachedRegion::Found(region.clone())
+            }
+            Err(e) => {
+                eprintln!(
+                    "s3: could not look up the region of bucket {bucket} ({e}); falling back to \
+                     AWS_REGION, AWS_DEFAULT_REGION, then {DEFAULT_REGION}"
+                );
+                CachedRegion::Failed(now)
+            }
+        };
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(bucket.to_owned(), entry);
+        looked_up.ok()
+    }
+}
+
+/// The bucket's region, looked up once per bucket per process. `None` when the
+/// lookup failed; the failure is logged and the caller falls through to the
+/// next rule rather than failing.
+fn bucket_region(bucket: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<RegionCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(RegionCache::default).region(
+        bucket,
+        std::time::Instant::now(),
+        lookup_bucket_region,
+    )
+}
+
+/// One HeadBucket, on a thread of its own with a runtime of its own.
+///
+/// `build` is synchronous and is reached from plain threads, from
+/// `spawn_blocking`, and from the sealer's own runtime setup. Blocking on a
+/// runtime from inside another one panics, so the lookup never shares the
+/// caller's thread: whatever that thread is, this cannot nest.
+fn lookup_bucket_region(bucket: &str) -> Result<String, String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let options = object_store::ClientOptions::new()
+                    .with_timeout(BUCKET_REGION_TIMEOUT)
+                    .with_connect_timeout(BUCKET_REGION_TIMEOUT);
+                runtime()?
+                    .block_on(object_store::aws::resolve_bucket_region(bucket, &options))
+                    .map_err(|e| e.to_string())
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the lookup thread panicked".to_owned()))
+    })
+}
+
+/// Where one system's recordings are kept: its bucket, and the prefix its roots
+/// sit under inside it (empty for the bucket root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingBucket {
+    pub bucket: String,
+    pub prefix: String,
+}
+
+impl RecordingBucket {
+    /// Point `cfg` at these recordings. The bucket and the prefix are set
+    /// together because a config holding one without the other reads the
+    /// right bucket at the wrong keys, and finds nothing without saying so.
+    pub fn apply(&self, cfg: &mut S3Config) {
+        cfg.bucket = self.bucket.clone();
+        cfg.prefix = self.prefix.clone();
     }
 }
 
@@ -252,8 +519,50 @@ pub fn recording_root_for(system: &str) -> Result<String, String> {
 /// The landing layout a system uses unless it declares another.
 pub const DEFAULT_RECORDING_ROOT: &str = "landing/v1";
 
+/// The key prefix `system`'s roots sit under inside its bucket, normalised;
+/// empty for the bucket root.
+///
+/// Optional, unlike the bucket: a system with no prefix owns its bucket and
+/// its roots are at the top, which is how every bucket-per-system deployment
+/// is laid out. The prefix applies to BOTH roots, the landing and the sealed
+/// sessions, so a declared `recording_root` is written without it.
+pub fn prefix_for_system(system: &str) -> Result<String, String> {
+    Ok(settings::load()?
+        .systems
+        .get(system)
+        .and_then(|d| d.s3_prefix.as_deref())
+        .and_then(layout::system_prefix)
+        .unwrap_or_default())
+}
+
 /// Key layout for one session in the bucket.
+///
+/// Every key here is RELATIVE to the system's root. A system that shares a
+/// bucket declares a prefix, and [`crate::S3Config::build`] confines the store
+/// to it, so these functions never see one.
 pub mod layout {
+    /// The root every sealed session lives under.
+    pub const SESSIONS_ROOT: &str = "sessions/v1";
+
+    /// A system's key prefix, normalised, or `None` for the bucket root.
+    ///
+    /// `prism`, `prism/` and `/prism/` are one prefix; blank is none. This is
+    /// the only reading of a declared prefix, used both to confine a store and
+    /// to spell a key in full, so the two cannot disagree.
+    pub fn system_prefix(prefix: &str) -> Option<String> {
+        let p = prefix.trim().trim_matches('/');
+        (!p.is_empty()).then(|| p.to_owned())
+    }
+
+    /// A key relative to a system's root, as the bucket spells it. With no
+    /// prefix, the key unchanged.
+    pub fn bucket_key(prefix: &str, key: &str) -> String {
+        match system_prefix(prefix) {
+            None => key.to_owned(),
+            Some(p) => format!("{p}/{}", key.trim_start_matches('/')),
+        }
+    }
+
     /// The flat landing prefix for a session under an EXPLICIT root. Pure, so
     /// the key shape can be asserted without the environment taking part.
     pub fn landing_prefix_in(root: &str, session_id: &str) -> String {
@@ -261,7 +570,7 @@ pub mod layout {
     }
 
     pub fn session_root(session_id: &str) -> String {
-        format!("sessions/v1/{session_id}")
+        format!("{SESSIONS_ROOT}/{session_id}")
     }
 
     /// The directory component that scopes one seal's objects, or nothing for
@@ -334,6 +643,29 @@ pub struct InstanceCoverage {
     pub events: u64,
     /// Inclusive `[from, to]` ranges missing between gseq_min and gseq_max.
     pub gaps: Vec<[u64; 2]>,
+    /// The subset of [`Self::gaps`] the RECORDER accounted for: sequences it
+    /// shed deliberately because its sink could not keep up, taken from the
+    /// `dropped` markers in the landing.
+    ///
+    /// This exists because a gap alone cannot say what it is. Deliberate
+    /// load-shedding, a pod killed with calls in flight, and an object lost
+    /// between the recorder and the bucket all produce the same hole, and they
+    /// are not the same news: the first is the fail-open contract working as
+    /// designed, the second bounds what the tape can be replayed as, the third
+    /// is a delivery fault. The recorder already distinguished them and said
+    /// so; nothing carried it forward.
+    ///
+    /// An UNEXPLAINED gap — one in `gaps` and not here — is therefore the
+    /// interesting one. Note the recorder cannot account for every drop even in
+    /// principle: only the enqueue path that finds a full channel remembers the
+    /// sequence, while a write to a sink already disabled by an earlier error
+    /// is counted and forgotten. So this is "what the recorder admitted to",
+    /// never "all shedding".
+    ///
+    /// `#[serde(default)]` so a manifest written before markers were read still
+    /// deserialises, reporting no explanation rather than failing.
+    #[serde(default)]
+    pub gaps_accounted: Vec<[u64; 2]>,
     pub duplicates_dropped: u64,
 }
 
@@ -473,6 +805,12 @@ struct EnvelopeProbe<'a> {
     /// while reporting a clean seal.
     #[serde(borrow)]
     node: Option<&'a serde_json::value::RawValue>,
+    /// A loss-accounting marker's body. Markers are not session data and are
+    /// not collated, but a `dropped` one carries the sequence ranges the
+    /// RECORDER shed on purpose, which is the only statement anywhere about
+    /// WHY a gap exists.
+    #[serde(default)]
+    marker: Option<MarkerBody>,
 }
 
 impl<'a> EnvelopeProbe<'a> {
@@ -537,7 +875,23 @@ async fn list_keys(
     Ok(keys)
 }
 
-async fn get_decoded(store: &DynStore, key: &object_store::path::Path) -> Result<Vec<u8>, String> {
+/// Fetch and decompress one object, reporting BOTH sizes.
+///
+/// The fetched length is the bytes that came off the wire, already in hand and
+/// otherwise dropped one line later. `list_keys` discards each `ObjectMeta`
+/// and keeps only the location, so nothing downstream of a listing knows what
+/// an object weighs — `readiness_of` does still hold metas for the objects IT
+/// reads, but those are the newest per instance, not the set compaction reads,
+/// so it cannot answer for a whole landing.
+///
+/// Reporting it is what makes a compression ratio computable at all. The
+/// decompressed side has always been recorded, so a reader can size a memory
+/// budget from history but cannot predict one from a listing — which is
+/// precisely what every "decide before reading" proposal needs.
+async fn get_decoded(
+    store: &DynStore,
+    key: &object_store::path::Path,
+) -> Result<(Vec<u8>, u64), String> {
     let bytes = store
         .get(key)
         .await
@@ -545,26 +899,29 @@ async fn get_decoded(store: &DynStore, key: &object_store::path::Path) -> Result
         .bytes()
         .await
         .map_err(|e| format!("s3 read {key}: {e}"))?;
-    decode_object(key.as_ref(), &bytes)
+    let fetched = bytes.len() as u64;
+    Ok((decode_object(key.as_ref(), bytes)?, fetched))
 }
 
 /// Decode an object's compression by extension, with a magic-byte fallback:
 /// `.zst` = the deja session layout; `.gz`/gzip-magic = deployed Vector
 /// aggregators configured with `compression: gzip` (whose extension is a
 /// Vector default we don't control).
-fn decode_object(key: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn decode_object(key: &str, bytes: bytes::Bytes) -> Result<Vec<u8>, String> {
     if key.ends_with(".zst") {
-        return zstd::stream::decode_all(std::io::Cursor::new(bytes))
+        return zstd::stream::decode_all(std::io::Cursor::new(&bytes[..]))
             .map_err(|e| format!("zstd {key}: {e}"));
     }
     if key.ends_with(".gz") || bytes.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
-        let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
+        let mut decoder = flate2::read::MultiGzDecoder::new(&bytes[..]);
         std::io::Read::read_to_end(&mut decoder, &mut out)
             .map_err(|e| format!("gzip {key}: {e}"))?;
         return Ok(out);
     }
-    Ok(bytes.to_vec())
+    // Takes the fetched buffer over when nothing else holds it, rather than
+    // holding the object twice while copying it.
+    Ok(Vec::from(bytes))
 }
 
 /// Upload one object. Small bodies go up as a single PUT; large ones are
@@ -714,8 +1071,16 @@ impl LandedRecording {
     }
 }
 
-/// Enumerate the recordings present under `root` (default `landing/v1`),
-/// newest first.
+/// Enumerate the recordings present under `root` (default `landing/v1`), by
+/// write date descending and then by session id descending.
+///
+/// Deliberately NOT documented as "newest first": within one date the tiebreak
+/// is the raw session id, and `rec-<revision>-<time>-<instance>` sorts on the
+/// revision hex before the time — so with two revisions live this order does
+/// not track time, and a caller that needs it to must re-order. This crate
+/// cannot do better itself; it carries no deja dependency and so cannot parse
+/// an id. The orchestrator does it in `selection_order_key`, where the parser
+/// is in scope.
 ///
 /// The deployed aggregator writes `landing/v1/dt=<date>/session=<id>/…` while
 /// the session layout writes `landing/v1/session=<id>/…`; both are read here,
@@ -799,7 +1164,11 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
 pub fn get_object_decoded(cfg: &S3Config, key: &str) -> Result<Vec<u8>, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(get_decoded(&store, &object_store::path::Path::from(key)))
+    rt.block_on(async {
+        get_decoded(&store, &object_store::path::Path::from(key))
+            .await
+            .map(|(decoded, _)| decoded)
+    })
 }
 
 /// Upload raw bytes to `key` (no compression). Used to stage a candidate
@@ -847,6 +1216,13 @@ pub fn count_landing_objects(
 /// inference from silence.
 const MARKER_KIND_EOF: &str = "eof";
 
+/// The marker the recorder writes when its sink could not keep up and it shed
+/// records rather than block the request (`deja-runtime`'s
+/// `MarkerKind::Dropped`, written from the FailOpen enqueue path). Its payload
+/// names the sequences it shed, which is what turns an unexplained gap into an
+/// accounted one.
+const MARKER_KIND_DROPPED: &str = "dropped";
+
 #[derive(Deserialize)]
 struct MarkerProbe {
     #[serde(default)]
@@ -863,6 +1239,17 @@ struct MarkerProbe {
 struct MarkerBody {
     #[serde(default)]
     kind: String,
+    /// A `dropped` marker's payload — `{"ranges": [[from, to], ...]}`,
+    /// inclusive, in the recorder's own global sequence. Absent on every other
+    /// marker kind, which is why it is optional rather than a second struct.
+    #[serde(default)]
+    payload: Option<MarkerPayload>,
+}
+
+#[derive(Deserialize)]
+struct MarkerPayload {
+    #[serde(default)]
+    ranges: Vec<[u64; 2]>,
 }
 
 /// What the landing says about whether a session is still being written.
@@ -989,6 +1376,43 @@ fn key_names_session(key: &str, session_id: &str) -> bool {
     !named
 }
 
+/// The `inst=` segment of a landing key, when the layout carries one.
+///
+/// The deployed aggregator partitions below the session by instance, so the
+/// producer set is already in the keys the listing returns.
+/// `LandedRecording::instances` says the same of the same segments: "it costs
+/// nothing: the segments are already in the keys the scan lists."
+fn key_instance(key: &str) -> Option<&str> {
+    key.split('/').find_map(|s| s.strip_prefix("inst="))
+}
+
+/// Every item tied at each group's newest timestamp.
+///
+/// Pure so the rule can be tested directly: an in-memory store stamps objects
+/// written in one test with the same second, which is exactly the tie this
+/// exists to handle, so a store-backed test cannot distinguish "newest" from
+/// "all of them".
+fn newest_tied<T: Copy>(items: &[(&str, i64, T)]) -> BTreeMap<String, Vec<T>> {
+    let mut out: BTreeMap<String, (i64, Vec<T>)> = BTreeMap::new();
+    for (group, ts, item) in items {
+        match out.get_mut(*group) {
+            Some((best, held)) => {
+                if ts > best {
+                    *best = *ts;
+                    held.clear();
+                    held.push(*item);
+                } else if ts == best {
+                    held.push(*item);
+                }
+            }
+            None => {
+                out.insert((*group).to_owned(), (*ts, vec![*item]));
+            }
+        }
+    }
+    out.into_iter().map(|(k, (_, v))| (k, v)).collect()
+}
+
 /// Judge whether a session is finished, from the landing alone.
 ///
 /// Cheap first: quiescence comes from the LISTING (no object is fetched), so a
@@ -1019,13 +1443,19 @@ async fn readiness_of(
         return Ok(SealReadiness::Absent);
     };
 
-    let prefix_path = object_store::path::Path::from(location.prefix.as_str());
-    let metas: Vec<object_store::ObjectMeta> =
-        store
+    let mut metas: Vec<object_store::ObjectMeta> = Vec::new();
+    for prefix in &location.prefixes {
+        let prefix_path = object_store::path::Path::from(prefix.as_str());
+        let page: Vec<object_store::ObjectMeta> = store
             .list(Some(&prefix_path))
             .try_collect()
             .await
-            .map_err(|e| format!("s3 list {}: {e}", location.prefix))?;
+            .map_err(|e| format!("s3 list {prefix}: {e}"))?;
+        metas.extend(page);
+    }
+    // Prefixes cannot overlap — they differ by date partition — but the filter
+    // stays because a prefix match is not a segment match: listing
+    // `…/session=s1` also returns `…/session=s10`.
     let mine: Vec<&object_store::ObjectMeta> = metas
         .iter()
         .filter(|m| key_names_session(m.location.as_ref(), session_id))
@@ -1056,12 +1486,89 @@ async fn readiness_of(
         });
     }
 
-    // Quiet. Now it is worth reading the objects to tell a finished recording
-    // from one whose producer was killed.
-    let mut instances: BTreeSet<String> = BTreeSet::new();
+    // Quiet. Now it is worth reading, to tell a finished recording from one
+    // whose producer was killed — but reading far less than every object.
+    //
+    // Two facts narrow it. The producer set is in the KEYS: `inst=` is a path
+    // segment, so the listing already carries it and no object need be fetched
+    // to learn who wrote this recording. And an end-of-stream marker can only
+    // be in an instance's NEWEST object: `emit_eof_marker` runs in the writer's
+    // Shutdown arm AFTER the final write and flush, so it is the last record
+    // that instance ever produces.
+    //
+    // So the scan is one object per instance rather than all of them. That is
+    // the difference between reading a recording's whole landing on every pass
+    // and reading a handful of objects — on 2026-09-09 the sealer was reading
+    // 47 objects per pass, per candidate, to populate a set that is always
+    // empty in production, because the marker is emitted from `impl Drop for
+    // AsyncRecordWriter` and the recorder lives in a process-global static
+    // whose destructor Rust never runs.
+    //
+    // The full scan remains for a layout whose keys do NOT name an instance.
+    // Attribution then has to come from content, exactly as before, and this
+    // must not guess: a partial key layout would otherwise report a producer
+    // set missing whoever the keys failed to name.
+    let keyed = mine
+        .iter()
+        .all(|m| key_instance(m.location.as_ref()).is_some());
+
+    // The newest objects of each instance — plural, because every object that
+    // TIES on the newest timestamp is kept.
+    //
+    // No tie-break, deliberately. `last_modified` is second-granularity, and the
+    // aggregator names objects `<unix-seconds>-<uuid>`
+    // (infra `vector/sandbox-hyperswitch-art-s3.yaml`: no `filename_time_format`,
+    // so Vector's `%s` default, plus `filename_append_uuid: true`). So two
+    // objects of one instance can share a second, and within that second the
+    // key order is a random uuid — a tie-break on the key would look total and
+    // decide arbitrarily. Scanning the whole tied group instead is one object in
+    // the ordinary case, a few in the rare one, and needs no rule that could
+    // only be wrong.
+    //
+    // Residual, bounded to a warning: `last_modified` is when S3 STORED the
+    // object, not when the aggregator began the batch. If an earlier batch is
+    // retried and lands after the batch carrying the marker, the retry is the
+    // newest and the marker is missed. No sealing decision depends on it, so
+    // this is recorded rather than defended against.
+    let by_instance: Vec<(&str, i64, &object_store::ObjectMeta)> = if keyed {
+        mine.iter()
+            .filter_map(|m| {
+                key_instance(m.location.as_ref())
+                    .map(|inst| (inst, m.last_modified.timestamp(), *m))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let newest_per_instance = newest_tied(&by_instance);
+    // Each object carries the instance ITS KEY named, so an end-of-stream marker
+    // found in it is credited to the same vocabulary the producer set came from.
+    //
+    // This is the whole requirement and it is narrower than "do not union the
+    // two spellings". `without` is `instances` minus `with_eof`; if one side is
+    // key-derived and the other content-derived, they still meet — just across
+    // the subtraction instead of inside one set. A key segment `X` and an
+    // envelope `instance_id: Y` would put `X` in `instances`, `Y` in
+    // `with_eof`, and the eof credit would cancel nothing: `X` sits in
+    // `without` for ever and `Complete` is unreachable the moment markers start
+    // working. Both sides have to speak the same language, not merely avoid
+    // being merged.
+    let to_scan: Vec<(Option<&str>, &object_store::ObjectMeta)> = if keyed {
+        newest_per_instance
+            .iter()
+            .flat_map(|(inst, group)| group.iter().map(move |m| (Some(inst.as_str()), *m)))
+            .collect()
+    } else {
+        mine.iter().map(|m| (None, *m)).collect()
+    };
+
+    // Key-sourced when the keys name instances, and then the scan does not add
+    // to it. Content fills it only in the fallback layout, where content is
+    // also what credits `with_eof`, so the two agree there too.
+    let mut instances: BTreeSet<String> = newest_per_instance.keys().cloned().collect();
     let mut with_eof: BTreeSet<String> = BTreeSet::new();
-    for meta in &mine {
-        let data = get_decoded(store, &meta.location).await?;
+    for (key_instance, meta) in &to_scan {
+        let (data, _) = get_decoded(store, &meta.location).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
@@ -1078,10 +1585,20 @@ async fn readiness_of(
                     continue;
                 }
             }
-            let Some(instance) = probe.instance_id.clone() else {
-                continue;
+            // The key names the instance when the layout provides it, and the
+            // envelope only otherwise. A keyed object therefore does not need
+            // `instance_id` at all — and must not be skipped for lacking it,
+            // which would drop a marker the key could have credited.
+            let instance = match key_instance {
+                Some(inst) => (*inst).to_owned(),
+                None => {
+                    let Some(from_content) = probe.instance_id.clone() else {
+                        continue;
+                    };
+                    instances.insert(from_content.clone());
+                    from_content
+                }
             };
-            instances.insert(instance.clone());
             if probe.artifact_type.as_deref() == Some(ARTIFACT_TYPE_MARKER)
                 && probe.marker.map(|m| m.kind).as_deref() == Some(MARKER_KIND_EOF)
             {
@@ -1141,16 +1658,17 @@ async fn manifest_of(
 /// a PAGE of recordings, so doing this one at a time would be one connection
 /// setup and one round trip per row, serially, on the request path.
 ///
-/// A recording that is not sealed yields `None`; a recording whose manifest
-/// cannot be READ also yields `None`, because a listing that fails wholesale
-/// because one manifest is corrupt tells the caller less than a listing that
-/// reports that row as unsealed. The distinction that matters to a caller —
-/// sealed versus not — is preserved; the distinction between "absent" and
-/// "unreadable" belongs to the single-recording read, which reports it.
+/// Each recording's OWN result is preserved rather than folded to `None`: a
+/// recording that is not sealed is `Ok(None)`, one whose manifest could not be
+/// read is its own `Err`, and a caller that needs to tell "not sealed" from
+/// "could not tell" — a replay deciding which members to keep — is not forced
+/// to guess. A caller that does not care collapses it the way this function
+/// used to: `.map(|r| r.ok().flatten())`. The outer `Result` is only the
+/// store's own construction; it holds nothing about any one recording.
 pub fn read_manifests(
     cfg: &S3Config,
     session_ids: &[String],
-) -> Result<Vec<Option<SessionManifest>>, String> {
+) -> Result<Vec<Result<Option<SessionManifest>, String>>, String> {
     if session_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1162,16 +1680,15 @@ pub fn read_manifests(
 /// The batch read's store-facing half, separated from its connection setup so
 /// the ordering guarantee callers depend on can be tested against a store rather
 /// than asserted about a bucket.
-async fn manifests_of(store: &DynStore, session_ids: &[String]) -> Vec<Option<SessionManifest>> {
+async fn manifests_of(
+    store: &DynStore,
+    session_ids: &[String],
+) -> Vec<Result<Option<SessionManifest>, String>> {
     use futures::StreamExt;
-    futures::stream::iter(
-        session_ids
-            .iter()
-            .map(|id| async { manifest_of(store, id).await.unwrap_or(None) }),
-    )
-    .buffered(MANIFEST_FETCH_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await
+    futures::stream::iter(session_ids.iter().map(|id| manifest_of(store, id)))
+        .buffered(MANIFEST_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
 }
 
 /// Manifest GETs in flight while enriching a listing. Bounded so a large page
@@ -1251,7 +1768,7 @@ async fn correlation_index_of(
             .await
             .map_err(|e| format!("s3 read {path}: {e}"))?,
     };
-    let data = decode_object(path.as_ref(), &bytes)?;
+    let data = decode_object(path.as_ref(), bytes)?;
     let mut rows = Vec::with_capacity(manifest.counts.correlations);
     for line in data.split(|&b| b == b'\n') {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -1281,7 +1798,8 @@ async fn session_lines(
 ) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     for part in &manifest.data_parts {
-        let data = get_decoded(store, &object_store::path::Path::from(part.key.as_str())).await?;
+        let (data, _) =
+            get_decoded(store, &object_store::path::Path::from(part.key.as_str())).await?;
         for line in data.split(|&b| b == b'\n') {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
@@ -1305,18 +1823,142 @@ pub fn compact_session(
 ) -> Result<SessionManifest, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(compact_session_inner(&store, session_id, root))
+    match rt.block_on(compact_session_inner(&store, session_id, root, None))? {
+        Compaction::Sealed { manifest, .. } => Ok(*manifest),
+        // Unreachable: an absent budget refuses nothing. Returned rather than
+        // panicked because the caller is a sealer, and a process that aborts
+        // is the exact failure this module exists to stop producing.
+        Compaction::RefusedTooLarge { .. } => Err(format!(
+            "internal: unbudgeted compaction of {session_id} reported a size refusal"
+        )),
+    }
+}
+
+/// What one compaction attempt did.
+///
+/// A refusal is NOT an error. The recording is intact, the landing is intact,
+/// nothing has been written, and the pass can go on to the next recording. It
+/// is the difference between a named drop and the container being killed with
+/// the shell inside it, which leaves no line saying which recording did it.
+#[derive(Debug)]
+pub enum Compaction {
+    Sealed {
+        /// Boxed only to keep the two variants comparable in size: a manifest
+        /// is an order of magnitude larger than a refusal, and this is
+        /// returned once per recording, so the allocation is free and the lint
+        /// is real.
+        manifest: Box<SessionManifest>,
+        /// What the merge saw while ordering this landing.
+        ///
+        /// `ordered()` false does not mean the seal is wrong — the order is
+        /// repaired before coverage is derived — it means the window was beaten
+        /// and a sort was paid for. Reported rather than logged because a Job's
+        /// stderr is not somewhere a caller, or a test, can read.
+        merge: MergeReport,
+        /// Decompressed bytes this compaction actually held.
+        ///
+        /// Reported on SUCCESS, not only on refusal, because this number is
+        /// what sizes every later decision about this pass — the memory
+        /// budget, and the spill an external merge sort would need. Nobody
+        /// knows the distribution of recording sizes today, and a pass that
+        /// reports bytes only when it refuses can never supply it: the
+        /// recordings that seal ARE the distribution.
+        landing_bytes_read: u64,
+        /// Compressed bytes fetched for the same landing — the other half of
+        /// the ratio.
+        ///
+        /// A pass decides what it can hold by MEASURING as it reads, which
+        /// costs a refused recording up to the budget in fetching before it is
+        /// refused. Every proposal to decide that from a listing instead needs
+        /// a compression ratio, and no ratio has ever been recorded: this side
+        /// of it was discarded in `list_keys` and never reached a ledger row.
+        /// Recording it here does not change any decision today; it is what
+        /// makes the decision measurable when someone wants to.
+        landing_bytes_fetched: u64,
+        /// See `RefusedTooLarge::shared_prefix`. Carried here for the same
+        /// reason: without it `landing_bytes_read` for a straddling session
+        /// reads as that recording's size when it is the whole partition's.
+        shared_prefix: bool,
+    },
+    /// The decompressed landing passed `budget_bytes` while it was being read.
+    ///
+    /// The numbers are what was known AT the refusal: `read_bytes` is a lower
+    /// bound on the landing's true size, never its size, and reporting it as
+    /// the size would understate every recording this refuses.
+    RefusedTooLarge {
+        budget_bytes: u64,
+        read_bytes: u64,
+        /// Stored bytes fetched before the ceiling was hit — a lower bound on
+        /// the landing, exactly as `read_bytes` is.
+        ///
+        /// Reported even though the recording did not seal, because the ratio
+        /// over the objects actually read is a REAL ratio for those objects
+        /// even when the size is only a floor. The sealed population would be
+        /// a biased estimator here: a decision taken from a listing is judged
+        /// on the recordings it would refuse, and those are precisely the ones
+        /// absent from the sealed set.
+        fetched_bytes: u64,
+        objects_read: usize,
+        objects_total: usize,
+        /// Whether the bytes read belong to this recording ALONE.
+        ///
+        /// False is the ordinary case. True means the landing was addressed at
+        /// a shared partition parent, so the objects counted here include every
+        /// other session under it — the refusal is then about the prefix, not
+        /// about this recording, and reading it as this recording's size would
+        /// overstate it by however much its neighbours weigh.
+        shared_prefix: bool,
+    },
+}
+
+/// [`compact_session`] with a ceiling on the decompressed landing it may hold.
+///
+/// The ceiling is MEASURED as objects are read, not predicted from their
+/// compressed size. A prediction needs a compression ratio, and a ratio safe
+/// enough to never let an OOM through is conservative enough to refuse
+/// recordings that would have sealed fine — it would trade a loud failure for
+/// a quiet one. Measuring costs a refused recording up to `max_landing_bytes`
+/// of fetching before it is refused, which is bounded and happens once a pass.
+pub fn compact_session_within(
+    cfg: &S3Config,
+    session_id: &str,
+    root: &str,
+    max_landing_bytes: Option<u64>,
+) -> Result<Compaction, String> {
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    rt.block_on(compact_session_inner(
+        &store,
+        session_id,
+        root,
+        max_landing_bytes,
+    ))
 }
 
 /// Where a session's landing objects actually are, and whether the prefix that
 /// holds them holds anything else.
 struct LandingLocation {
-    prefix: String,
-    /// True when the prefix is a shared partition parent. Attribution then has
-    /// to come from each envelope's `capture.session_id`, never from the key —
-    /// a session that runs across midnight is addressed from the parent of two
-    /// date partitions, and every other session that landed in that window is
-    /// under it too.
+    /// Every prefix that holds part of this session, each naming the session.
+    ///
+    /// More than one when the session spans date partitions: one prefix PER
+    /// partition rather than their shared parent. Addressing the parent meant
+    /// listing and decompressing every other session that landed in that
+    /// window — in sandbox, 32,519 objects for a recording of three — so the
+    /// memory a straddling session cost was created by how it was addressed
+    /// and not by anything about the recording.
+    prefixes: Vec<String>,
+    /// True when a prefix can hold objects belonging to other sessions, so
+    /// attribution has to come from each envelope's `capture.session_id`
+    /// rather than from the key.
+    ///
+    /// **Currently unreachable, and kept deliberately.** Every prefix this
+    /// function builds names the session, because `index_landed_keys` can only
+    /// find a session whose keys carry `session=` in the first place — so
+    /// there is no layout the deployment writes that reaches the content
+    /// filter. It stays because the alternative is deleting
+    /// `select_session_lines` and a field the deployed ledger already carries,
+    /// to buy nothing; but it should be read as a capability with no caller
+    /// rather than as a live branch, and it must not be cited as tested.
     shared: bool,
 }
 
@@ -1336,7 +1978,7 @@ async fn locate_landing(
     let flat = layout::landing_prefix_in(root, session_id);
     if !list_keys(store, &flat).await?.is_empty() {
         return Ok(Some(LandingLocation {
-            prefix: flat,
+            prefixes: vec![flat],
             shared: false,
         }));
     }
@@ -1345,15 +1987,29 @@ async fn locate_landing(
         .into_iter()
         .map(|p| p.as_ref().to_owned())
         .collect();
+    let root = root.trim_end_matches('/');
     Ok(index_landed_keys(root, &keys)
         .into_iter()
         .find(|found| found.session_id == session_id)
-        .map(|found| LandingLocation {
-            // A session under exactly one partition is addressed at
-            // `{root}/dt=…/session={id}`, which names it; one that straddles is
-            // addressed at the root, which does not.
-            shared: found.dates.len() > 1,
-            prefix: found.prefix,
+        .map(|found| {
+            // One prefix per date partition, each naming the session. The
+            // listing already knows which partitions a session appears under,
+            // so the parent never has to be read: `dates` is exactly the set
+            // of `dt=` segments its keys carried.
+            let prefixes: Vec<String> = if found.dates.len() > 1 {
+                found
+                    .dates
+                    .iter()
+                    .map(|date| format!("{root}/dt={date}/session={session_id}"))
+                    .collect()
+            } else {
+                vec![found.prefix]
+            };
+            // Derived from the prefixes rather than from the partition count,
+            // because it is a question about the KEYS: a prefix that names the
+            // session cannot hold another one's objects.
+            let shared = prefixes.iter().any(|p| !p.contains("session="));
+            LandingLocation { prefixes, shared }
         }))
 }
 
@@ -1396,33 +2052,111 @@ async fn compact_session_inner(
     store: &DynStore,
     session_id: &str,
     root: &str,
-) -> Result<SessionManifest, String> {
+    max_landing_bytes: Option<u64>,
+) -> Result<Compaction, String> {
     let Some(location) = locate_landing(store, session_id, root).await? else {
         return Err(format!(
             "no landing objects for session {session_id} under {root} — it was \
              never landed, or it landed under a different root"
         ));
     };
-    let keys = list_keys(store, &location.prefix).await?;
+    // Every prefix the session appears under, and only keys that NAME it: a
+    // prefix match is not a segment match, so listing `…/session=s1` also
+    // returns `…/session=s10`.
+    let mut keys: Vec<object_store::path::Path> = Vec::new();
+    for prefix in &location.prefixes {
+        keys.extend(list_keys(store, prefix).await?);
+    }
+    keys.retain(|k| key_names_session(k.as_ref(), session_id));
+    // Ordered by INSTANCE first, then by key.
+    //
+    // The seal's order is (instance, gseq, kind), and a windowed merge can only
+    // reproduce that if each instance's runs are contiguous. Key order is not:
+    // a key is `…/dt=DATE/session=S/inst=I/OBJECT`, so a session straddling two
+    // partitions interleaves its producers — dt1/A, dt1/B, dt2/A, dt2/B — and
+    // A's runs are separated by B's. Merging that emitted A0, B0, A1, B1 where
+    // the order is all of A then all of B.
+    //
+    // An object belongs to exactly one instance (its key says so), so grouping
+    // runs by instance costs nothing and restores the property the merge needs.
+    // Key order still decides within an instance, which is where it means
+    // something: the aggregator names objects `<unix-seconds>-<uuid>`.
+    keys.sort_by(|a, b| {
+        (key_instance(a.as_ref()), a.as_ref()).cmp(&(key_instance(b.as_ref()), b.as_ref()))
+    });
+    keys.dedup();
     let mut chunks = Vec::with_capacity(keys.len());
-    for key in &keys {
-        chunks.push(get_decoded(store, key).await?);
+    // No budget is `u64::MAX` rather than a branch, so the loop below has one
+    // shape and the unbudgeted path is the same code the budgeted path takes.
+    let budget = max_landing_bytes.unwrap_or(u64::MAX);
+    let mut read_bytes = 0u64;
+    let mut fetched_bytes = 0u64;
+    for (read, key) in keys.iter().enumerate() {
+        let (chunk, fetched) = get_decoded(store, key).await?;
+        read_bytes += chunk.len() as u64;
+        // Accumulated beside the decompressed total so a sealed recording
+        // reports BOTH. One number sizes a budget; the pair is what makes a
+        // ratio, and a ratio is what any decision taken from a LISTING needs.
+        fetched_bytes += fetched;
+        chunks.push(chunk);
+        // Checked after the push, so `read_bytes` is what is actually held
+        // rather than what is about to be.
+        //
+        // The guard is on THIS recording's landing now. It used to also be
+        // the only thing standing between a straddling session and the whole
+        // day's traffic, because such a session was addressed at the partition
+        // parent; `locate_landing` now addresses one prefix per partition, so
+        // what is read here is the session's own objects and nothing else.
+        if read_bytes > budget {
+            return Ok(Compaction::RefusedTooLarge {
+                budget_bytes: budget,
+                read_bytes,
+                fetched_bytes,
+                objects_read: read + 1,
+                objects_total: keys.len(),
+                shared_prefix: location.shared,
+            });
+        }
     }
 
-    let (lines, landing_objects) = if location.shared {
-        select_session_lines(&chunks, session_id)
+    let landing_objects: usize;
+    // Objects stay APART. Each is its own run, so the merge can bound what it
+    // holds by the object rather than by the landing — see `MERGE_WINDOW`.
+    //
+    // The shared-prefix branch cannot: it selects lines by the session id
+    // carried in each envelope, across every object under a parent that holds
+    // other sessions too, so the result is a filtered stream with no object
+    // boundary left in it. One run then means "sort it all", which is what
+    // compaction always did. That branch is documented as having no caller any
+    // deployment reaches, so this costs nothing today; if one ever does, the
+    // selection has to carry boundaries out with it.
+    let collated = if location.shared {
+        let (lines, objects) = select_session_lines(&chunks, session_id);
+        if lines.is_empty() {
+            return Err(format!(
+                "no envelope lines for session {session_id} under {}",
+                location.prefixes.join(", ")
+            ));
+        }
+        landing_objects = objects;
+        collate(lines.into_iter())
     } else {
-        (chunk_lines(&chunks).collect(), keys.len())
+        landing_objects = keys.len();
+        if chunks.iter().all(|c| c.iter().all(u8::is_ascii_whitespace)) {
+            return Err(format!(
+                "no envelope lines for session {session_id} under {}",
+                location.prefixes.join(", ")
+            ));
+        }
+        collate_runs(chunks.iter().map(|c| object_lines(c)))
     };
-    if lines.is_empty() {
-        return Err(format!(
-            "no envelope lines for session {session_id} under {}",
-            location.prefix
-        ));
-    }
-
-    let collated = collate(lines.into_iter());
-    write_seal(store, session_id, collated, landing_objects).await
+    Ok(Compaction::Sealed {
+        merge: collated.merge.clone(),
+        manifest: Box::new(write_seal(store, session_id, collated, landing_objects).await?),
+        landing_bytes_read: read_bytes,
+        landing_bytes_fetched: fetched_bytes,
+        shared_prefix: location.shared,
+    })
 }
 
 /// Seal a recording from envelope lines a caller has ALREADY read.
@@ -1568,14 +2302,212 @@ struct Collated {
     code: Vec<CodeRef>,
     instances: Vec<InstanceCoverage>,
     correlations: Vec<CorrelationSummary>,
+    /// What the merge saw. Carried out rather than only logged: it is the one
+    /// statement about whether the window held on a real landing, a caller
+    /// that wants to act on it cannot read a Job's stderr, and a test cannot
+    /// assert a println.
+    ///
+    /// `ordered()` false does NOT mean the seal is wrong — the order is
+    /// repaired before anything is derived from it. It means the window was
+    /// beaten and a sort was paid for.
+    merge: MergeReport,
+}
+
+/// The order a seal's records are written in: by instance, then by the
+/// recorder's own global sequence, then by kind.
+///
+/// Spelled once because two places must agree about it — the sort that
+/// compaction does today and the merge that replaces it — and an ordering
+/// stated twice is an ordering that will eventually be stated differently.
+/// Dedup uses exactly this key, so after it the order is TOTAL: no two accepted
+/// records compare equal, and "sorted" has one meaning rather than a family of
+/// them.
+fn seal_order(a: &Accepted, b: &Accepted) -> std::cmp::Ordering {
+    (&a.instance_id, a.gseq, a.kind).cmp(&(&b.instance_id, b.gseq, b.kind))
+}
+
+/// How far out of order a run arrived, in positions.
+///
+/// Reported rather than merely detected. A window is chosen from a measurement
+/// of how far events can be displaced, and the only way to learn that a chosen
+/// window is too small is for something to say by how much it was beaten. A
+/// merge that reports "fell back" throws away the one datum nobody can get any
+/// other way.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MergeReport {
+    /// Runs whose own contents were not sorted when handed in, and which the
+    /// merge therefore sorted first.
+    ///
+    /// NOT a fault, and deliberately not part of [`Self::ordered`]. A landing
+    /// object is internally unsorted by construction — `global_sequence` is
+    /// taken when a call starts and the record is written when it finishes — so
+    /// this is normally every run, and a merge that treated it as a problem
+    /// would report a problem on every recording forever. It is a COST signal:
+    /// how much sorting the merge had to do, bounded by one object each.
+    pub unsorted_runs: usize,
+    /// Output positions where the merged stream went backwards. Empty means the
+    /// window held.
+    pub backward_jumps: Vec<BackwardJump>,
+}
+
+/// One place the merged stream went backwards, and by how much.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackwardJump {
+    /// Position in the emitted stream.
+    pub at: usize,
+    pub instance_id: String,
+    /// The sequence already emitted, and the smaller one that followed it.
+    pub previous_gseq: u64,
+    pub arrived_gseq: u64,
+    /// Which run the late record came from, so a reader can size the window in
+    /// the unit the window is expressed in.
+    pub from_run: usize,
+}
+
+impl MergeReport {
+    /// Whether the EMITTED STREAM is in order — the only thing a caller of
+    /// this merge is promised.
+    ///
+    /// Reads `backward_jumps` alone. Whether the inputs arrived sorted is a
+    /// different question and is answered by `unsorted_runs`, which is normally
+    /// non-zero for every landing there is.
+    pub fn ordered(&self) -> bool {
+        self.backward_jumps.is_empty()
+    }
+}
+
+/// Merge per-object runs into one stream in [`seal_order`], holding at most
+/// `window` runs at a time.
+///
+/// WHY THIS CAN BE BOUNDED AT ALL. A landing object is not internally sorted:
+/// `global_sequence` is taken when a boundary call STARTS and the event is
+/// written when it COMPLETES, so a slow call is overtaken by every fast one
+/// beside it. But the displacement is bounded by the call's own duration, and
+/// the connector timeout caps that at 30s against object gaps of 300s (prism)
+/// to 600s (hyperswitch) — measured over 56,867 calls, where nothing at all
+/// exceeded 30.1s and three independent connectors clipped within 8ms of
+/// 30,000. So an event can be displaced across at most ONE object boundary, and
+/// a window of two runs is enough. There is no unbounded case to spill for.
+///
+/// THE WINDOW IS A MEASUREMENT, NOT A PROOF. That bound covers the connector
+/// boundary, which is the slowest instrumented class and the only one in
+/// ClickHouse. Db, redis, clock and uuid boundaries are not measured anywhere;
+/// they are normally sub-millisecond and a pathological one is not excluded.
+/// So the merge CHECKS the property it depends on and reports what it saw
+/// rather than trusting the number — the measurement picks the default, the
+/// check defends it, and a violation names the run that beat it.
+///
+/// Records are yielded in order and the report says whether that order held. A
+/// caller that cannot tolerate a violation should sort the result; the point of
+/// reporting rather than panicking is that a seal is still better than no seal,
+/// and the compactor's contract is that recording never fails the service.
+pub(crate) fn merge_runs(runs: Vec<Vec<Accepted>>, window: usize) -> (Vec<Accepted>, MergeReport) {
+    let mut report = MergeReport::default();
+    // A run that is not itself sorted breaks the merge's precondition, and the
+    // merge cannot repair it by looking at heads alone. Say so and sort it:
+    // one run is bounded by one object, so this is affordable, and a silently
+    // mis-merged seal is the outcome worth spending it to avoid.
+    let runs: Vec<Vec<Accepted>> = runs
+        .into_iter()
+        .map(|mut run| {
+            if !run
+                .windows(2)
+                .all(|w| seal_order(&w[0], &w[1]) != std::cmp::Ordering::Greater)
+            {
+                report.unsorted_runs += 1;
+                run.sort_by(seal_order);
+            }
+            run
+        })
+        .collect();
+
+    let total: usize = runs.iter().map(Vec::len).sum();
+    let mut out: Vec<Accepted> = Vec::with_capacity(total);
+    // Peekable iterators rather than indices: a head has to be COMPARED before
+    // it is taken, and taking must MOVE the record. Indexing would force a
+    // clone of every record — including its whole raw line — which is the cost
+    // this function exists to avoid.
+    let mut runs: Vec<std::iter::Peekable<std::vec::IntoIter<Accepted>>> =
+        runs.into_iter().map(|r| r.into_iter().peekable()).collect();
+    // How many runs have been admitted. `window` of them are kept LIVE — a new
+    // run opens as soon as an open one runs dry, so the window slides along the
+    // landing rather than draining it in batches.
+    //
+    // It has to slide. Admitting only once EVERY open run was exhausted meant
+    // run N was fully drained before run N+1 opened, so a record displaced by
+    // exactly one object — the case the window exists for — was still late by a
+    // whole window. With four runs and a one-object displacement that produced
+    // `[0,1,2,3,4,6,5,7]` and a reported backward jump, which is the merge
+    // correctly reporting its own admission policy as a violation.
+    let window = window.max(1);
+    let mut open: usize = 0;
+    let mut last: Option<(String, u64, RecordKind)> = None;
+
+    loop {
+        // Top up to `window` live runs before choosing, so the next run's head
+        // is visible while the current one still has records.
+        while open < runs.len() {
+            let live = (0..open).filter(|&r| runs[r].peek().is_some()).count();
+            if live >= window {
+                break;
+            }
+            open += 1;
+        }
+        // `peek` needs `&mut`, so two heads cannot be borrowed at once to be
+        // compared. Snapshot the ORDER KEY of each open head instead and pick
+        // from that. The key clones an instance id per open run per record,
+        // which is a pod name against a window of two — a rounding error beside
+        // the full sort and the second copy of every line this replaces.
+        let heads: Vec<Option<(String, u64, RecordKind)>> = (0..open)
+            .map(|r| {
+                runs[r]
+                    .peek()
+                    .map(|a| (a.instance_id.clone(), a.gseq, a.kind))
+            })
+            .collect();
+        let pick: Option<usize> = heads
+            .iter()
+            .enumerate()
+            .filter_map(|(r, k)| k.as_ref().map(|k| (r, k)))
+            .min_by(|(_, a), (_, b)| a.cmp(b))
+            .map(|(r, _)| r);
+        let Some(r) = pick else {
+            // Every admitted run is dry and the top-up above could admit no
+            // more, so the landing is consumed.
+            break;
+        };
+        let rec = runs[r].next().expect("the picked run had a head");
+        // The check is against the WHOLE order, not just gseq within an
+        // instance. Comparing only same-instance sequences left the merge able
+        // to interleave two instances — emitting i1/0, i2/0, i1/1, i2/1 where
+        // the order is all of i1 then all of i2 — and report itself ordered,
+        // because every same-instance step was forward. A guard that cannot
+        // see the axis it is guarding is worse than none: it certifies.
+        if let Some(prev) = &last {
+            if (&rec.instance_id, rec.gseq, rec.kind) < (&prev.0, prev.1, prev.2) {
+                report.backward_jumps.push(BackwardJump {
+                    at: out.len(),
+                    instance_id: rec.instance_id.clone(),
+                    previous_gseq: prev.1,
+                    arrived_gseq: rec.gseq,
+                    from_run: r,
+                });
+            }
+        }
+        last = Some((rec.instance_id.clone(), rec.gseq, rec.kind));
+        out.push(rec);
+    }
+    (out, report)
 }
 
 /// Split landing objects into envelope lines. Blank lines are not lines.
-fn chunk_lines(chunks: &[Vec<u8>]) -> impl Iterator<Item = Cow<'_, str>> {
-    chunks
-        .iter()
-        .flat_map(|chunk| chunk.split(|&b| b == b'\n'))
-        .map(String::from_utf8_lossy)
+/// One landing object's lines, kept apart from its neighbours'.
+///
+/// The object boundary is not incidental: it is the unit displacement is
+/// bounded by, so a merge that wants to hold a window rather than the landing
+/// needs to know where one object ends. Flattening first throws that away.
+fn object_lines(chunk: &[u8]) -> impl Iterator<Item = Cow<'_, str>> {
+    chunk.split(|&b| b == b'\n').map(String::from_utf8_lossy)
 }
 
 /// Parse envelope lines into deduped, sorted records plus the coverage/summary
@@ -1594,10 +2526,56 @@ fn chunk_lines(chunks: &[Vec<u8>]) -> impl Iterator<Item = Cow<'_, str>> {
 /// Graph nodes have their own numbering and no correlation, so folding them in
 /// would invent gaps and an uncorrelated bucket; they still ride in the data
 /// parts, which is what the recording is.
+/// How many landing objects the merge holds at once.
+///
+/// Two, because an event can be displaced across at most one object boundary:
+/// `global_sequence` is taken when a call starts and the record written when it
+/// finishes, so displacement is bounded by the call's duration, and the
+/// connector timeout caps that at 30s against object gaps of 300s (prism) to
+/// 600s (hyperswitch). Measured over 56,867 calls with nothing above 30.1s and
+/// three independent connectors clipping within 8ms of 30,000 — a cliff, not a
+/// tail, which is what makes it safe to depend on.
+///
+/// The number is a default, not a proof: it covers the connector boundary and
+/// nothing measures db, redis, clock or uuid. `MergeReport::backward_jumps` is
+/// what defends it, and names the run that beat it if one ever does.
+const MERGE_WINDOW: usize = 2;
+
+/// Collate ONE run — the whole landing as a single sequence of lines.
+///
+/// Kept so every caller that has lines rather than objects reads unchanged. A
+/// single run merges trivially to "sort that run", which is exactly what this
+/// function did before there were runs at all.
 fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
+    collate_runs(std::iter::once(lines))
+}
+
+/// Collate landing objects, each its own run, and MERGE them into seal order.
+///
+/// Objects are the unit because that is how displacement is bounded: a record
+/// late enough to miss its own object lands in the next one, and no later. So
+/// each object is sorted on its own — bounded by one object — and the runs are
+/// merged through a window, instead of every record in the landing being sorted
+/// together.
+///
+/// Passing one run is not a special case: it degenerates to sorting that run,
+/// which is what compaction always did.
+fn collate_runs<'a, R, L>(runs: R) -> Collated
+where
+    R: Iterator<Item = L>,
+    L: Iterator<Item = Cow<'a, str>>,
+{
     let mut seen: BTreeSet<(String, RecordKind, u64)> = BTreeSet::new();
     let mut dupes_by_instance: BTreeMap<String, u64> = BTreeMap::new();
-    let mut events: Vec<Accepted> = Vec::new();
+    // Sequence ranges the RECORDER says it shed, per instance, from `dropped`
+    // markers. Not sorted or merged here — the recorder may emit several
+    // markers over a session and they arrive in whatever order the objects
+    // did.
+    let mut shed_by_instance: BTreeMap<String, Vec<[u64; 2]>> = BTreeMap::new();
+    // One accumulator PER RUN. Dedup stays global below — a duplicate can
+    // span objects — but ordering is per-run, which is what lets the merge
+    // hold a window instead of the landing.
+    let mut runs_of_events: Vec<Vec<Accepted>> = Vec::new();
     let mut lines_in = 0usize;
     let mut duplicates = 0usize;
     let mut graph_nodes = 0usize;
@@ -1606,72 +2584,132 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
     let mut codes: Vec<CodeRef> = Vec::new();
     let mut capture_mode = String::from("session");
 
-    for line_str in lines {
-        if line_str.trim().is_empty() {
-            continue;
-        }
-        lines_in += 1;
-        let env: EnvelopeProbe = match serde_json::from_str(&line_str) {
-            Ok(e) => e,
-            Err(_) => {
-                eprintln!("compactor: dropping non-envelope line");
+    for lines in runs {
+        // One run per landing object. Pushed empty first so an object that
+        // yields no accepted record still counts as a run — dropping it would
+        // silently change which objects are adjacent, and adjacency is the
+        // whole basis of the window.
+        runs_of_events.push(Vec::new());
+        let current_run = runs_of_events.last_mut().expect("a run was just pushed");
+        for line_str in lines {
+            if line_str.trim().is_empty() {
                 continue;
             }
-        };
-        if env.is_marker() {
-            continue; // loss accounting, not session data (P2.4)
-        }
-        let Some((kind, payload)) = env.payload() else {
-            eprintln!("compactor: dropping envelope without a payload");
-            continue;
-        };
-        let probe: EventProbe = match serde_json::from_str(payload.get()) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("compactor: dropping unparseable event ({e})");
+            lines_in += 1;
+            let env: EnvelopeProbe = match serde_json::from_str(&line_str) {
+                Ok(e) => e,
+                Err(_) => {
+                    eprintln!("compactor: dropping non-envelope line");
+                    continue;
+                }
+            };
+            if env.is_marker() {
+                // Markers are loss accounting, not session data, so none of them
+                // becomes an event. A `dropped` one is still READ before it is
+                // discarded: it carries the sequence ranges the recorder shed on
+                // purpose when its sink could not keep up, and that is the only
+                // statement in the whole pipeline about WHY a gap exists. Throwing
+                // it away left every gap looking identical — deliberate
+                // load-shedding, a pod killed mid-flight, and an object lost in
+                // transit all arriving as the same unexplained hole.
+                if let Some(marker) = env.marker.as_ref() {
+                    if marker.kind == MARKER_KIND_DROPPED {
+                        if let (Some(inst), Some(payload)) =
+                            (env.instance_id.as_ref(), marker.payload.as_ref())
+                        {
+                            shed_by_instance
+                                .entry(inst.clone())
+                                .or_default()
+                                .extend(payload.ranges.iter().copied());
+                        }
+                    }
+                }
                 continue;
             }
-        };
-        let instance_id = env.instance_id.unwrap_or_else(|| "unknown".to_owned());
-        if !seen.insert((instance_id.clone(), kind, probe.global_sequence)) {
-            duplicates += 1;
-            *dupes_by_instance.entry(instance_id).or_default() += 1;
-            continue;
-        }
-        // The two version fields describe the boundary-event stream. A graph
-        // envelope carries its own, unrelated `schema_version`, and folding it
-        // in here would read as the recording spanning two envelope versions.
-        if kind == RecordKind::BoundaryEvent {
-            if let Some(v) = env.schema_version {
-                envelope_versions.insert(v);
+            let Some((kind, payload)) = env.payload() else {
+                eprintln!("compactor: dropping envelope without a payload");
+                continue;
+            };
+            let probe: EventProbe = match serde_json::from_str(payload.get()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("compactor: dropping unparseable event ({e})");
+                    continue;
+                }
+            };
+            let instance_id = env.instance_id.unwrap_or_else(|| "unknown".to_owned());
+            if !seen.insert((instance_id.clone(), kind, probe.global_sequence)) {
+                duplicates += 1;
+                *dupes_by_instance.entry(instance_id).or_default() += 1;
+                continue;
             }
-            if let Some(v) = probe.event_schema_version {
-                event_versions.insert(v);
+            // The two version fields describe the boundary-event stream. A graph
+            // envelope carries its own, unrelated `schema_version`, and folding it
+            // in here would read as the recording spanning two envelope versions.
+            if kind == RecordKind::BoundaryEvent {
+                if let Some(v) = env.schema_version {
+                    envelope_versions.insert(v);
+                }
+                if let Some(v) = probe.event_schema_version {
+                    event_versions.insert(v);
+                }
+            } else {
+                graph_nodes += 1;
             }
-        } else {
-            graph_nodes += 1;
-        }
-        if let Some(code) = env.code {
-            if !codes.contains(&code) {
-                codes.push(code);
+            if let Some(code) = env.code {
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
             }
+            if let Some(mode) = env.capture.and_then(|c| c.mode) {
+                capture_mode = mode;
+            }
+            current_run.push(Accepted {
+                instance_id,
+                kind,
+                gseq: probe.global_sequence,
+                correlation_id: probe.correlation_id,
+                boundary: probe.boundary,
+                role: probe.role,
+                raw_line: line_str.into_owned(),
+            });
         }
-        if let Some(mode) = env.capture.and_then(|c| c.mode) {
-            capture_mode = mode;
-        }
-        events.push(Accepted {
-            instance_id,
-            kind,
-            gseq: probe.global_sequence,
-            correlation_id: probe.correlation_id,
-            boundary: probe.boundary,
-            role: probe.role,
-            raw_line: line_str.into_owned(),
-        });
     }
     // Sequence before kind, so each kind keeps its own order and the kind only
     // breaks the tie between the two spaces.
-    events.sort_by(|a, b| (&a.instance_id, a.gseq, a.kind).cmp(&(&b.instance_id, b.gseq, b.kind)));
+    // Merged rather than sorted. Identical output — the order is the same
+    // total order, stated once in `seal_order` — but expressed as a merge of
+    // per-object runs, which is the shape that can later hold a window instead
+    // of the whole landing.
+    let (events, merge) = merge_runs(runs_of_events, MERGE_WINDOW);
+    let mut events = events;
+    if !merge.ordered() {
+        // THE SEAL MUST NOT LIE ABOUT COVERAGE. The scan below walks events in
+        // order and opens a gap wherever the sequence jumps, so an out-of-order
+        // stream invents gaps over sequences that are present: emitting
+        // 0,2,3,1,4 for a complete run reports gaps [1,1] and [2,3]. That
+        // reaches the dashboard's gap chip, the catalog's gap count, and
+        // `gaps_accounted`, and the manifest is the fast path for ever after.
+        //
+        // "A seal short of perfect order beats no seal" is true of the ORDER
+        // and false of the accounting, so the order is repaired before anything
+        // is derived from it. The repair costs a sort — the thing the merge
+        // exists to avoid — which is exactly why it happens only when the
+        // window was beaten, and why the report below is what says it was.
+        events.sort_by(seal_order);
+        // Loud, and with the distance. The window is a measured default and
+        // this is the only thing that can say it was wrong, so a violation
+        // names what beat it rather than being swallowed silently.
+        for jump in &merge.backward_jumps {
+            eprintln!(
+                "compactor: merge window of {MERGE_WINDOW} was beaten on instance {} — \
+                 gseq {} arrived after {} (run {}, output position {}); the events were \
+                 re-sorted into seal order before coverage was derived, so the seal is \
+                 written in seal order",
+                jump.instance_id, jump.arrived_gseq, jump.previous_gseq, jump.from_run, jump.at
+            );
+        }
+    }
 
     // Per-instance coverage (events are sorted, so gaps fall out of one scan).
     let mut instances: Vec<InstanceCoverage> = Vec::new();
@@ -1693,11 +2731,29 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
                 gseq_max: acc.gseq,
                 events: 1,
                 gaps: Vec::new(),
+                gaps_accounted: Vec::new(),
                 duplicates_dropped: 0,
             }),
         }
     }
     for cov in &mut instances {
+        // Only ranges that are ACTUALLY missing are reported as accounted for.
+        // A recorder can shed a sequence whose event nonetheless arrives — a
+        // later retry, or a marker written before the batch it describes got
+        // through — and claiming such a range as an explained gap would say a
+        // hole exists where the tape is whole. Intersecting with `gaps` keeps
+        // this a statement about holes, and keeps `gaps_accounted` a genuine
+        // subset of `gaps` so their difference means what it says.
+        if let Some(shed) = shed_by_instance.get(&cov.instance_id) {
+            let mut accounted: Vec<[u64; 2]> = shed
+                .iter()
+                .filter(|r| cov.gaps.iter().any(|g| r[0] >= g[0] && r[1] <= g[1]))
+                .copied()
+                .collect();
+            accounted.sort_unstable();
+            accounted.dedup();
+            cov.gaps_accounted = accounted;
+        }
         cov.duplicates_dropped = dupes_by_instance
             .get(&cov.instance_id)
             .copied()
@@ -1772,6 +2828,7 @@ fn collate<'a>(lines: impl Iterator<Item = Cow<'a, str>>) -> Collated {
         code: codes,
         instances,
         correlations,
+        merge,
     }
 }
 
@@ -1954,6 +3011,37 @@ mod tests {
         );
     }
 
+    /// A plain object is handed back in the buffer it was fetched into, not
+    /// copied: a copy held the whole object twice until the caller's write
+    /// finished. The fetched buffer is built the way object_store builds a
+    /// multi-chunk body, and its address is taken before the call.
+    #[test]
+    fn a_plain_object_is_returned_in_its_fetched_buffer() {
+        let payload = b"{\"a\":1}\n{\"b\":2}\n";
+        let mut fetched = Vec::with_capacity(payload.len());
+        fetched.extend_from_slice(payload);
+        let fetched = bytes::Bytes::from(fetched);
+        let before = fetched.as_ptr();
+
+        let out = decode_object("plain.ndjson", fetched).unwrap();
+        assert_eq!(out, payload.to_vec());
+        assert_eq!(out.as_ptr(), before, "the plain path copied the object");
+
+        // A body longer than its length hint leaves spare capacity, which
+        // takes the other buffer representation; that is handed back too.
+        let mut roomy = Vec::with_capacity(payload.len() + 64);
+        roomy.extend_from_slice(payload);
+        let roomy = bytes::Bytes::from(roomy);
+        let before = roomy.as_ptr();
+        let out = decode_object("plain.ndjson", roomy).unwrap();
+        assert_eq!(out, payload.to_vec());
+        assert_eq!(
+            out.as_ptr(),
+            before,
+            "a buffer with spare capacity was copied"
+        );
+    }
+
     #[test]
     fn decode_object_handles_gzip_zstd_and_plain() {
         let payload = b"{\"a\":1}\n{\"b\":2}\n";
@@ -1968,23 +3056,23 @@ mod tests {
             enc.finish().unwrap();
         }
         assert_eq!(
-            decode_object("2026/07/10/x.log.gz", &gz).unwrap(),
+            decode_object("2026/07/10/x.log.gz", gz.clone().into()).unwrap(),
             payload.to_vec()
         );
         assert_eq!(
-            decode_object("2026/07/10/x.log", &gz).unwrap(),
+            decode_object("2026/07/10/x.log", gz.into()).unwrap(),
             payload.to_vec(),
             "gzip magic sniff must decode extension-less keys"
         );
 
         let zst = zstd_encode(payload).unwrap();
         assert_eq!(
-            decode_object("sessions/v1/s/data/part-00000.ndjsonl.zst", &zst).unwrap(),
+            decode_object("sessions/v1/s/data/part-00000.ndjsonl.zst", zst.into()).unwrap(),
             payload.to_vec()
         );
 
         assert_eq!(
-            decode_object("plain.ndjson", payload).unwrap(),
+            decode_object("plain.ndjson", bytes::Bytes::from_static(payload)).unwrap(),
             payload.to_vec()
         );
     }
@@ -2004,9 +3092,10 @@ mod tests {
         let mut cfg = S3Config {
             endpoint: "http://127.0.0.1:9100".to_owned(),
             bucket: "deja-recordings".to_owned(),
+            prefix: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
-            region: "us-east-1".to_owned(),
+            region: Some("us-east-1".to_owned()),
             allow_http: true,
         };
 
@@ -2030,7 +3119,7 @@ mod tests {
         ]
         .join("\n")
         .into_bytes();
-        let c = collate(chunk_lines(&[chunk]));
+        let c = collate(object_lines(&chunk));
         assert_eq!(c.lines_in, 5);
         assert_eq!(c.duplicates_dropped, 1);
         assert_eq!(c.events.len(), 4);
@@ -2081,7 +3170,7 @@ mod tests {
         ]
         .join("\n")
         .into_bytes();
-        let c = collate(chunk_lines(&[chunk]));
+        let c = collate(object_lines(&chunk));
         let order: Vec<&str> = c
             .correlations
             .iter()
@@ -2102,7 +3191,7 @@ mod tests {
         ]
         .join("\n")
         .into_bytes();
-        let c = collate(chunk_lines(&[chunk]));
+        let c = collate(object_lines(&chunk));
         assert_eq!(c.duplicates_dropped, 0);
         assert_eq!(c.events.len(), 2);
         assert_eq!(c.instances.len(), 2);
@@ -2672,6 +3761,506 @@ mod tests {
         )
     }
 
+    /// A `dropped` marker, exactly as the router's Kafka sink writes it:
+    /// `artifact_type: deja_sink_marker`, the instance that shed, and a payload
+    /// naming the inclusive sequence ranges.
+    fn dropped_marker(session: &str, inst: &str, ranges: &[[u64; 2]]) -> String {
+        let ranges_json = ranges
+            .iter()
+            .map(|r| format!("[{},{}]", r[0], r[1]))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_sink_marker","instance_id":"{inst}","capture":{{"mode":"session","session_id":"{session}"}},"marker":{{"kind":"dropped","payload":{{"ranges":[{ranges_json}]}}}}}}"#
+        )
+    }
+
+    /// A gap the recorder ADMITTED to is reported apart from one it did not.
+    ///
+    /// Both are holes in the same sequence and were indistinguishable before:
+    /// a reader saw two gaps and had no way to tell deliberate load-shedding
+    /// from a pod killed with calls in flight. The recorder had already said
+    /// which was which and compaction discarded the statement.
+    #[test]
+    fn a_shed_range_is_reported_as_accounted_and_an_unexplained_one_is_not() {
+        let mut lines: Vec<String> = Vec::new();
+        // 0,1 land; 2..=4 are shed and the recorder says so; 5 lands;
+        // 6..=7 vanish with nothing said about them; 8 lands.
+        for g in [0u64, 1, 5, 8] {
+            lines.push(envelope_for("s1", "i1", g, Some("c1")));
+        }
+        lines.push(dropped_marker("s1", "i1", &[[2, 4]]));
+
+        let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let cov = collated
+            .instances
+            .iter()
+            .find(|c| c.instance_id == "i1")
+            .expect("one instance");
+
+        assert_eq!(
+            cov.gaps,
+            vec![[2, 4], [6, 7]],
+            "both holes are still reported as gaps; explaining one does not hide it"
+        );
+        assert_eq!(
+            cov.gaps_accounted,
+            vec![[2, 4]],
+            "only the range the recorder named is accounted for"
+        );
+        // The difference is the point: what is left is what nobody explained.
+        let unexplained: Vec<[u64; 2]> = cov
+            .gaps
+            .iter()
+            .filter(|g| !cov.gaps_accounted.contains(g))
+            .copied()
+            .collect();
+        assert_eq!(unexplained, vec![[6, 7]]);
+    }
+
+    /// A shed range whose events ARRIVED anyway is not an accounted gap.
+    ///
+    /// The recorder writes the marker when it sheds, but a sequence can still
+    /// reach the tape afterwards. Reporting it as an explained gap would claim
+    /// a hole in a stream that is whole, and would break the one property that
+    /// makes the pair useful: `gaps_accounted` must be a subset of `gaps`, so
+    /// that subtracting gives the unexplained ones.
+    #[test]
+    fn a_shed_range_that_landed_anyway_is_not_a_gap() {
+        let mut lines: Vec<String> = (0u64..=4)
+            .map(|g| envelope_for("s1", "i1", g, Some("c1")))
+            .collect();
+        lines.push(dropped_marker("s1", "i1", &[[2, 3]]));
+
+        let collated = collate(lines.iter().map(|l| Cow::Borrowed(l.as_str())));
+        let cov = collated
+            .instances
+            .iter()
+            .find(|c| c.instance_id == "i1")
+            .expect("one instance");
+        assert!(cov.gaps.is_empty(), "nothing is actually missing");
+        assert!(
+            cov.gaps_accounted.is_empty(),
+            "a shed sequence that arrived is not a hole, whatever the marker said"
+        );
+    }
+
+    fn accepted(inst: &str, gseq: u64) -> Accepted {
+        Accepted {
+            instance_id: inst.to_owned(),
+            kind: RecordKind::BoundaryEvent,
+            gseq,
+            correlation_id: Some("c1".to_owned()),
+            boundary: "http_incoming".to_owned(),
+            role: None,
+            raw_line: format!("{inst}:{gseq}"),
+        }
+    }
+
+    /// Build per-object runs from a flat gseq order, displacing each event by
+    /// at most `jitter` positions WITHIN its object — which is what a landing
+    /// object actually contains, since gseq is taken at call start and the
+    /// record is written at call completion.
+    fn runs_of(per_object: &[&[u64]], inst: &str) -> Vec<Vec<Accepted>> {
+        per_object
+            .iter()
+            .map(|obj| obj.iter().map(|g| accepted(inst, *g)).collect())
+            .collect()
+    }
+
+    /// The order key of each record, which is all these tests compare.
+    fn order_keys(v: &[Accepted]) -> Vec<(String, u64)> {
+        v.iter().map(|a| (a.instance_id.clone(), a.gseq)).collect()
+    }
+
+    /// THE EQUIVALENCE. A windowed merge of per-object runs produces exactly
+    /// what sorting everything produces — the output this replaces.
+    ///
+    /// Asserted against the real sort rather than against a hand-written
+    /// expectation, so the test cannot drift from the thing it is standing in
+    /// for. Objects are given out of order internally, because they are.
+    #[test]
+    fn a_windowed_merge_equals_sorting_the_whole_landing() {
+        let runs = runs_of(
+            &[
+                &[0, 3, 1, 2], // one object, internally unsorted
+                &[6, 4, 7, 5], // the next, likewise
+                &[8, 11, 9, 10],
+            ],
+            "i1",
+        );
+        let flat: Vec<Accepted> = runs
+            .iter()
+            .flatten()
+            .map(|a| accepted(&a.instance_id, a.gseq))
+            .collect();
+        let mut sorted = flat;
+        sorted.sort_by(seal_order);
+
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(report.ordered(), "the window held: {report:?}");
+        assert_eq!(
+            report.unsorted_runs, 3,
+            "each object was internally unsorted"
+        );
+        assert_eq!(
+            order_keys(&merged),
+            order_keys(&sorted),
+            "same total order as the full sort"
+        );
+    }
+
+    /// Displacement ACROSS one object boundary — the case the window exists
+    /// for. gseq 4 is written late and lands in the next object.
+    #[test]
+    fn a_window_of_two_absorbs_a_one_object_displacement() {
+        let runs = runs_of(&[&[0, 1, 2, 3], &[4, 5, 6, 7]], "i1");
+        // Move 3 into the SECOND object: a call that started before the flush
+        // and finished after it.
+        let runs = vec![
+            runs[0][..3]
+                .iter()
+                .map(|a| accepted(&a.instance_id, a.gseq))
+                .collect::<Vec<_>>(),
+            std::iter::once(accepted("i1", 3))
+                .chain(runs[1].iter().map(|a| accepted(&a.instance_id, a.gseq)))
+                .collect(),
+        ];
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(
+            report.ordered(),
+            "a one-object displacement is inside the window"
+        );
+        assert_eq!(
+            order_keys(&merged)
+                .iter()
+                .map(|(_, g)| *g)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    /// Displacement BEYOND the window is reported, not hidden — and the report
+    /// says how far, which is the number that would size a larger window.
+    #[test]
+    fn a_displacement_past_the_window_is_reported_with_its_distance() {
+        // gseq 1 lands THREE runs on. A sliding window of two has admitted and
+        // emitted runs 1 and 2 by the time run 3 opens, so 1 arrives after 3
+        // has already gone out. Note a two-run displacement would NOT do: the
+        // window slides as runs run dry, so a short early run lets it reach
+        // further than its own size suggests — which is why this fixture is
+        // built from the emission order rather than from run indices.
+        let runs = vec![
+            vec![accepted("i1", 0)],
+            vec![accepted("i1", 2), accepted("i1", 3)],
+            vec![accepted("i1", 4), accepted("i1", 5)],
+            vec![accepted("i1", 1), accepted("i1", 6)],
+        ];
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(!report.ordered(), "the window did not hold and must say so");
+        assert_eq!(report.backward_jumps.len(), 1, "{report:?}");
+        let jump = &report.backward_jumps[0];
+        assert_eq!(jump.arrived_gseq, 1, "the late record");
+        assert!(
+            jump.previous_gseq > jump.arrived_gseq,
+            "a jump is backwards by definition: {jump:?}"
+        );
+        assert_eq!(jump.from_run, 3, "names the run that beat the window");
+        // Still emits everything — a seal short of perfect order beats no seal,
+        // and the caller decides what to do with the report.
+        assert_eq!(merged.len(), 7);
+    }
+
+    /// A record displaced ACROSS an object boundary is absorbed by the
+    /// deployed window, through the real compaction.
+    ///
+    /// This is what `MERGE_WINDOW` is for and nothing else pins it: every
+    /// `merge_runs` test passes a window explicitly, so the constant could be
+    /// changed to 1 and the suite would stay green while every real seal paid
+    /// a repair sort and logged a violation on every recording.
+    ///
+    /// gseq 2 is written late and lands in the object after the one that
+    /// carries 3 — a call that started before a flush and finished after it,
+    /// which is the ordinary case, not a pathological one.
+    #[test]
+    fn the_deployed_window_absorbs_a_one_object_displacement() {
+        let store = memory();
+        for (object, seqs) in [
+            ("p0", vec![0u64, 1]),
+            ("p1", vec![3]),
+            ("p2", vec![2, 4]),
+            ("p3", vec![5]),
+        ] {
+            put_object_at(
+                &store,
+                &format!("{DEFAULT_RECORDING_ROOT}/session=s1/inst=i1/{object}.json"),
+                &seqs
+                    .iter()
+                    .map(|g| envelope_for("s1", "i1", *g, Some("c1")))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let (manifest, merge) = match block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            None,
+        ))
+        .unwrap()
+        {
+            Compaction::Sealed {
+                manifest, merge, ..
+            } => (manifest, merge),
+            other => panic!("expected a seal, got {other:?}"),
+        };
+        assert!(
+            merge.ordered(),
+            "a one-object displacement is what the window exists to absorb: {merge:?}"
+        );
+        let cov = &manifest.instances[0];
+        assert_eq!((cov.gseq_min, cov.gseq_max, cov.events), (0, 5, 6));
+        assert!(cov.gaps.is_empty(), "nothing is missing: {cov:?}");
+    }
+
+    /// TWO PRODUCERS ACROSS TWO PARTITIONS seal into one coverage row each.
+    ///
+    /// Through `compact_session_inner`, because the defect lives in the ORDER
+    /// THE RUNS ARE HANDED OVER IN and not in the merge. A key is
+    /// `…/dt=DATE/session=S/inst=I/OBJECT`, so key order interleaves producers
+    /// across dates; merging that emits i1, i2, i1, i2 where the seal order is
+    /// all of i1 then all of i2. The coverage scan then opens a NEW row every
+    /// time the instance changes, so two producers became four rows, each with
+    /// its own gseq_min/max, and a gap spanning the split could not be seen.
+    ///
+    /// Testing `merge_runs` with pre-grouped runs cannot catch this: by then
+    /// the grouping has already happened.
+    #[test]
+    fn two_producers_across_two_dates_seal_into_one_row_each() {
+        let store = memory();
+        // THREE partitions, not two. With two, key order gives four runs and a
+        // sliding window of two happens to reach across them, so the merge
+        // produces the right answer for the wrong reason and the test passes
+        // against ungrouped runs. Three puts i1's last object beyond anything
+        // the window can span — a fixture has to be larger than the window it
+        // is meant to defeat.
+        for (date, inst, gseq) in [
+            ("2026-09-20", "i1", 0u64),
+            ("2026-09-20", "i2", 0),
+            ("2026-09-21", "i1", 1),
+            ("2026-09-21", "i2", 1),
+            ("2026-09-22", "i1", 2),
+            ("2026-09-22", "i2", 2),
+        ] {
+            put_object_at(
+                &store,
+                &format!("{DEFAULT_RECORDING_ROOT}/dt={date}/session=s1/inst={inst}/p.json"),
+                &[envelope_for("s1", inst, gseq, Some("c1"))],
+            );
+        }
+        let (manifest, merge) = match block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            None,
+        ))
+        .unwrap()
+        {
+            Compaction::Sealed {
+                manifest, merge, ..
+            } => (manifest, merge),
+            other => panic!("expected a seal, got {other:?}"),
+        };
+        // The MANIFEST is right either way — an out-of-order merge is repaired
+        // before coverage is derived — so a test reading only the manifest
+        // passes against ungrouped runs and says nothing about the thing it is
+        // named for. What grouping buys is that the window is never beaten:
+        // no violation, no repair sort. That is read from the real call, not
+        // recomputed here, or the test would exercise its own copy of the
+        // ordering rather than the one that ships.
+        assert!(
+            merge.ordered(),
+            "grouping runs by instance means the window is never beaten: {merge:?}"
+        );
+        let rows: Vec<&str> = manifest
+            .instances
+            .iter()
+            .map(|i| i.instance_id.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["i1", "i2"],
+            "one row per producer, not one per (producer, partition)"
+        );
+        for cov in &manifest.instances {
+            assert_eq!(
+                (cov.gseq_min, cov.gseq_max, cov.events),
+                (0, 2, 3),
+                "each producer's whole span in one row: {cov:?}"
+            );
+            assert!(cov.gaps.is_empty(), "nothing is missing: {cov:?}");
+        }
+    }
+
+    /// A BEATEN WINDOW must not invent gaps over sequences that are present.
+    ///
+    /// The coverage scan walks events in order and opens a gap wherever the
+    /// sequence jumps, so an out-of-order stream reports holes in a complete
+    /// run — and the manifest is the fast path for ever after. The order is
+    /// therefore repaired before anything is derived from it, and the report
+    /// is what says the window was beaten.
+    #[test]
+    fn a_beaten_window_does_not_invent_gaps() {
+        // Displaced past a window of two, with every sequence 0..=6 present.
+        let runs: Vec<Vec<String>> = vec![
+            vec![envelope_for("s1", "i1", 0, Some("c1"))],
+            vec![
+                envelope_for("s1", "i1", 2, Some("c1")),
+                envelope_for("s1", "i1", 3, Some("c1")),
+            ],
+            vec![
+                envelope_for("s1", "i1", 4, Some("c1")),
+                envelope_for("s1", "i1", 5, Some("c1")),
+            ],
+            vec![
+                envelope_for("s1", "i1", 1, Some("c1")),
+                envelope_for("s1", "i1", 6, Some("c1")),
+            ],
+        ];
+        let collated = collate_runs(
+            runs.iter()
+                .map(|r| r.iter().map(|l| Cow::Borrowed(l.as_str()))),
+        );
+        let cov = collated
+            .instances
+            .iter()
+            .find(|c| c.instance_id == "i1")
+            .expect("one producer");
+        assert_eq!(
+            (cov.gseq_min, cov.gseq_max, cov.events),
+            (0, 6, 7),
+            "every sequence landed: {cov:?}"
+        );
+        assert!(
+            cov.gaps.is_empty(),
+            "a complete run has no holes, whatever order it arrived in: {cov:?}"
+        );
+    }
+
+    /// A merge that interleaves two instances is a VIOLATION, and the report
+    /// must say so.
+    ///
+    /// This is the case the guard could not see. The order is all of one
+    /// instance then all of the next, but the check compared only same-instance
+    /// sequences, so emitting i1/0, i2/0, i1/1, i2/1 stepped forward at every
+    /// same-instance comparison and reported itself ordered. A guard blind to
+    /// the axis it guards does not merely miss a fault — it certifies one.
+    #[test]
+    fn interleaving_two_instances_is_reported_as_a_violation() {
+        let runs = vec![
+            vec![accepted("i1", 0)],
+            vec![accepted("i2", 0)],
+            vec![accepted("i2", 1)],
+            vec![accepted("i1", 1)],
+        ];
+        // A window of one cannot look past the run it is draining, so it
+        // emits the runs in order and interleaves the instances.
+        let (merged, report) = merge_runs(runs, 1);
+        assert_eq!(
+            order_keys(&merged)
+                .iter()
+                .map(|(i, g)| format!("{i}/{g}"))
+                .collect::<Vec<_>>(),
+            vec!["i1/0", "i2/0", "i2/1", "i1/1"],
+            "the interleaved order this is about"
+        );
+        assert!(
+            !report.ordered(),
+            "an instance emitted after a later one is a violation: {report:?}"
+        );
+    }
+
+    /// Runs grouped by instance merge to exactly the sort, even when the
+    /// landing straddles partitions.
+    ///
+    /// A key is `…/dt=DATE/session=S/inst=I/OBJECT`, so key order interleaves
+    /// producers across dates and an instance's runs are not contiguous. The
+    /// merge needs them to be; `compact_session_inner` orders by instance
+    /// first, and this is that property stated where the merge can see it.
+    #[test]
+    fn instance_grouped_runs_merge_to_exactly_the_sort() {
+        // i1's two objects, then i2's two — what ordering by instance gives.
+        let runs = vec![
+            vec![accepted("i1", 0), accepted("i1", 2)],
+            vec![accepted("i1", 1), accepted("i1", 3)],
+            vec![accepted("i2", 1)],
+            vec![accepted("i2", 0)],
+        ];
+        let mut sorted: Vec<Accepted> = runs
+            .iter()
+            .flatten()
+            .map(|a| accepted(&a.instance_id, a.gseq))
+            .collect();
+        sorted.sort_by(seal_order);
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(report.ordered(), "{report:?}");
+        assert_eq!(order_keys(&merged), order_keys(&sorted));
+    }
+
+    /// The window SLIDES; it does not drain in batches.
+    ///
+    /// Two runs are not enough to tell the difference, which is why the first
+    /// version of this merge shipped the wrong admission policy and its tests
+    /// passed. With four runs and a displacement between the third and fourth,
+    /// a batched window drains run 2 dry before opening run 3, so a record late
+    /// by exactly one object — the case the window exists for — is still late
+    /// by a whole window, and the merge reports its own policy as a violation:
+    /// `[0,1,2,3,4,6,5,7]`.
+    #[test]
+    fn the_window_slides_rather_than_draining_in_batches() {
+        let runs = vec![
+            vec![accepted("i1", 0), accepted("i1", 1)],
+            vec![accepted("i1", 2), accepted("i1", 3)],
+            vec![accepted("i1", 4), accepted("i1", 6)],
+            vec![accepted("i1", 5), accepted("i1", 7)],
+        ];
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(
+            report.ordered(),
+            "a one-object displacement must be absorbed: {report:?}"
+        );
+        assert_eq!(
+            order_keys(&merged)
+                .iter()
+                .map(|(_, g)| *g)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "the late record takes its place, it is not merely tolerated"
+        );
+    }
+
+    /// Several instances interleave without their sequences being compared to
+    /// each other. gseq is per-process, so two instances reuse the same numbers
+    /// and ordering across them would be meaningless.
+    #[test]
+    fn instances_are_ordered_apart_and_never_against_each_other() {
+        let runs = vec![
+            vec![accepted("i2", 0), accepted("i1", 1)],
+            vec![accepted("i1", 0), accepted("i2", 1)],
+        ];
+        let (merged, report) = merge_runs(runs, 2);
+        assert!(report.ordered(), "{report:?}");
+        assert_eq!(
+            order_keys(&merged),
+            vec![
+                ("i1".to_owned(), 0),
+                ("i1".to_owned(), 1),
+                ("i2".to_owned(), 0),
+                ("i2".to_owned(), 1),
+            ],
+            "grouped by instance, ascending within each"
+        );
+    }
+
     fn eof_marker(session: &str, inst: &str) -> String {
         format!(
             r#"{{"schema_version":2,"artifact_type":"deja_sink_marker","instance_id":"{inst}","capture":{{"mode":"session","session_id":"{session}"}},"marker":{{"kind":"eof","last_seq":9,"records_written":9,"records_dropped":0}}}}"#
@@ -2680,6 +4269,16 @@ mod tests {
 
     fn put_object_at(store: &DynStore, key: &str, lines: &[String]) {
         block(put(store, key, lines.join("\n").into_bytes())).unwrap();
+    }
+
+    /// The manifest a compaction produced. A test that passes no budget cannot
+    /// be refused, so a refusal here is a defect in the test rather than an
+    /// outcome the test should be handling.
+    fn sealed(compaction: Compaction) -> SessionManifest {
+        match compaction {
+            Compaction::Sealed { manifest, .. } => *manifest,
+            other => panic!("expected a seal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2765,7 +4364,15 @@ mod tests {
             ],
         );
 
-        let manifest = block(compact_session_inner(&store, "s1", DEFAULT_RECORDING_ROOT)).unwrap();
+        let manifest = sealed(
+            block(compact_session_inner(
+                &store,
+                "s1",
+                DEFAULT_RECORDING_ROOT,
+                None,
+            ))
+            .unwrap(),
+        );
         assert_eq!(manifest.session_id, "s1");
         assert_eq!(manifest.counts.events, 2);
         assert_eq!(manifest.counts.correlations, 1);
@@ -2795,7 +4402,15 @@ mod tests {
             ],
         );
 
-        let manifest = block(compact_session_inner(&store, "s1", DEFAULT_RECORDING_ROOT)).unwrap();
+        let manifest = sealed(
+            block(compact_session_inner(
+                &store,
+                "s1",
+                DEFAULT_RECORDING_ROOT,
+                None,
+            ))
+            .unwrap(),
+        );
         assert_eq!(
             manifest.counts.events, 2,
             "s2's events are a different recording"
@@ -2827,6 +4442,183 @@ mod tests {
             "expected Active, got {readiness:?}"
         );
         assert!(!readiness.should_seal());
+    }
+
+    /// The selection rule, tested where it can actually be seen. An in-memory
+    /// store stamps every object a test writes with the same second, which is
+    /// precisely the tie the rule exists to handle — so a store-backed test
+    /// cannot tell "newest" from "all of them" and would pass either way.
+    #[test]
+    fn only_the_newest_tied_group_of_each_instance_is_selected() {
+        let items = [
+            ("i1", 100, "i1-old"),
+            ("i1", 200, "i1-new-a"),
+            ("i1", 200, "i1-new-b"),
+            ("i2", 50, "i2-only"),
+        ];
+        let got = newest_tied(&items);
+
+        assert_eq!(
+            got.get("i1").map(Vec::as_slice),
+            Some(["i1-new-a", "i1-new-b"].as_slice()),
+            "every object tied at the newest second is kept, and the older one dropped"
+        );
+        assert_eq!(
+            got.get("i2").map(Vec::as_slice),
+            Some(["i2-only"].as_slice())
+        );
+    }
+
+    /// No tie-break, deliberately, and this pins it. `last_modified` is
+    /// second-granularity and the aggregator names objects `<seconds>-<uuid>`,
+    /// so within one second the key order is random. A rule that picked ONE of
+    /// a tied pair would look total and decide arbitrarily; keeping both is
+    /// what makes the outcome independent of the uuid.
+    #[test]
+    fn a_tie_keeps_both_rather_than_picking_by_key() {
+        let ordered = [("i1", 7, "aaa"), ("i1", 7, "zzz")];
+        let reversed = [("i1", 7, "zzz"), ("i1", 7, "aaa")];
+
+        let a = newest_tied(&ordered);
+        let b = newest_tied(&reversed);
+
+        assert_eq!(a.get("i1").map(Vec::len), Some(2), "both are kept");
+        assert_eq!(
+            a.get("i1").map(|v| v.len()),
+            b.get("i1").map(|v| v.len()),
+            "and the count does not depend on which the listing yielded first"
+        );
+    }
+
+    /// THE DELIBERATE NARROWING, end to end. An end-of-stream marker is emitted
+    /// from the writer's Shutdown arm after its final write and flush, so it is
+    /// the last record an instance produces and can only be at that instance's
+    /// newest timestamp. Readiness reads that group rather than every object.
+    ///
+    /// Here both objects share a second — an in-memory store gives them the
+    /// same stamp — so both are in the tied group and the marker IS found. That
+    /// is the rule working, not an exception to it: a tie is scanned whole.
+    #[test]
+    fn a_marker_in_a_tied_object_is_still_found() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/0.json",
+            &[
+                envelope_for("s1", "i1", 0, Some("c1")),
+                eof_marker("s1", "i1"),
+            ],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i1/1.json",
+            &[envelope_for("s1", "i1", 1, Some("c1"))],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(
+            readiness,
+            SealReadiness::Complete {
+                instances: 1,
+                objects: 2
+            },
+            "objects tied at the newest second are all scanned; got {readiness:?}"
+        );
+    }
+
+    /// THE VOCABULARY AGREEMENT, which is the actual requirement and is narrower
+    /// than "do not union the two spellings". `without` is `instances` minus
+    /// `with_eof`. If the producer set is key-derived and the eof credit is
+    /// content-derived, they still meet — across the subtraction rather than
+    /// inside one set — and an eof credited to a name that is not in the
+    /// producer set cancels nothing.
+    ///
+    /// Here the key says `x9` and the envelope says `y4`. Before both sides
+    /// spoke the key's language this yielded `Quiesced { without: ["x9"] }`
+    /// for ever, and `Complete` was unreachable the moment markers began
+    /// working — the exact capability the narrowed scan was kept for.
+    #[test]
+    fn an_eof_is_credited_to_the_key_instance_not_the_envelopes() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=x9/0.json",
+            &[
+                envelope_for("s1", "y4", 0, Some("c1")),
+                eof_marker("s1", "y4"),
+            ],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        assert_eq!(
+            readiness,
+            SealReadiness::Complete {
+                instances: 1,
+                objects: 1
+            },
+            "the marker is the key instance's, whatever the envelope spells; got {readiness:?}"
+        );
+    }
+
+    /// The producer set comes from the KEYS, not from reading objects. Proven by
+    /// giving the content no `instance_id` at all: if the scan were the source,
+    /// the instance would be missing and the recording would report Complete on
+    /// an empty set.
+    #[test]
+    fn instances_are_read_from_the_keys_not_the_content() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/inst=i7/0.json",
+            &[r#"{"schema_version":2,"artifact_type":"deja_artifact_record","capture":{"mode":"session","session_id":"s1"},"event":{"recording_run_id":"s1","global_sequence":0,"correlation_id":"c1","boundary":"http_incoming","event_schema_version":1}}"#.to_owned()],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(
+                instances_without_eof,
+                vec!["i7".to_owned()],
+                "the instance is named by the key alone"
+            ),
+            other => panic!("expected Quiesced naming i7, got {other:?}"),
+        }
+    }
+
+    /// A layout whose keys do NOT name an instance falls back to the full
+    /// content scan. Attribution must not be guessed: reporting a producer set
+    /// missing whoever the keys failed to name would be worse than reading.
+    #[test]
+    fn a_layout_without_inst_keys_still_scans_every_object() {
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/session=s1/1.json",
+            &[
+                envelope_for("s1", "i2", 1, Some("c1")),
+                eof_marker("s1", "i2"),
+            ],
+        );
+
+        let readiness = block(readiness_of(&store, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap();
+        match readiness {
+            SealReadiness::Quiesced {
+                instances_without_eof,
+                ..
+            } => assert_eq!(
+                instances_without_eof,
+                vec!["i1".to_owned()],
+                "both objects were read: i2 signed off, i1 did not"
+            ),
+            other => panic!("expected Quiesced naming only i1, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2939,10 +4731,14 @@ mod tests {
     // -- what a listing can say about a recording without pulling it ----------
 
     #[test]
-    fn a_batch_of_manifests_answers_in_the_order_asked_and_nulls_the_unsealed() {
+    fn a_batch_of_manifests_answers_in_the_order_asked_and_keeps_each_outcome_apart() {
         // The listing enriches a PAGE, so the rows have to line up with the ids
         // by position. An unsealed recording must come back as "not counted",
-        // never as a recording with zero correlations.
+        // never as a recording with zero correlations — and an unparseable one
+        // must come back as ITS OWN error, never folded into "not sealed": a
+        // caller telling "not sealed" from "could not tell" (a replay deciding
+        // which members to keep) needs the two apart, which `.unwrap_or(None)`
+        // used to erase.
         let store = memory();
         // Two sealed recordings with DIFFERENT counts, and the unsealed one off
         // centre: a symmetric fixture would pass just as happily if the batch
@@ -2957,16 +4753,51 @@ mod tests {
         );
         let one = seal(&store, "s2", &[envelope_for("s2", "i2", 0, Some("c9"))]);
         assert_eq!((two.counts.correlations, one.counts.correlations), (2, 1));
+        block(put(
+            &store,
+            &layout::manifest_key("corrupt"),
+            b"not json".to_vec(),
+        ))
+        .unwrap();
 
-        let ids = ["s1".to_owned(), "missing".to_owned(), "s2".to_owned()];
+        let ids = [
+            "s1".to_owned(),
+            "missing".to_owned(),
+            "s2".to_owned(),
+            "corrupt".to_owned(),
+        ];
         let got = block(manifests_of(&store, &ids));
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].as_ref().unwrap().counts.correlations, 2);
-        assert!(
-            got[1].is_none(),
-            "an unsealed recording is not a recording with zero correlations"
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            got[0]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .counts
+                .correlations,
+            2
         );
-        assert_eq!(got[2].as_ref().unwrap().counts.correlations, 1);
+        assert!(
+            matches!(got[1], Ok(None)),
+            "an unsealed recording is not a recording with zero correlations: {:?}",
+            got[1]
+        );
+        assert_eq!(
+            got[2]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .counts
+                .correlations,
+            1
+        );
+        assert!(
+            got[3].is_err(),
+            "an unparseable manifest is its own Err, not Ok(None): {:?}",
+            got[3]
+        );
     }
     // -- a session that resumes after it was sealed ---------------------------
 
@@ -2975,6 +4806,162 @@ mod tests {
         let mut m = seal(&store, "s1", &[envelope_for("s1", "i1", 0, Some("c1"))]);
         m.counts.landing_objects = landing_objects;
         m
+    }
+
+    /// The two byte totals are DIFFERENT NUMBERS, and only a compressed
+    /// landing can show it.
+    ///
+    /// Every other fixture in this crate is stored plain, so `fetched` and
+    /// `read` are equal by construction and any assertion relating them is
+    /// satisfied by either field. That is not a small gap: wiring `read_bytes`
+    /// into the fetched slot, or accumulating the decompressed length in the
+    /// loop, both produce a seal that looks correct in every plain fixture and
+    /// reports a compression ratio of exactly 1.0 for every recording forever.
+    /// A ratio nobody can distinguish from "not measured" is worse than an
+    /// absent field, because it will be divided by.
+    ///
+    /// The third assertion is the one the doc comment on `get_decoded` claims
+    /// and nothing else checks: what compaction reports as fetched is what the
+    /// LISTING says those objects weigh. That is the number a future
+    /// decide-before-reading gate would key on, so the two must agree.
+    #[test]
+    fn a_gzip_landing_reports_what_was_fetched_apart_from_what_was_held() {
+        use futures::TryStreamExt as _;
+        let store = memory();
+        let lines: Vec<String> = (0..40)
+            .map(|n| envelope_for("s1", "i1", n, Some("c1")))
+            .collect();
+        let payload = lines.join("\n").into_bytes();
+        let mut gz = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+        let key = format!("{DEFAULT_RECORDING_ROOT}/session=s1/inst=i1/part-0.log.gz");
+        block(put(&store, &key, gz.clone())).unwrap();
+
+        let listed: u64 = block(async {
+            store
+                .list(Some(&object_store::path::Path::from(
+                    DEFAULT_RECORDING_ROOT,
+                )))
+                .map_ok(|m| m.size as u64)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .sum()
+        });
+
+        match block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            None,
+        ))
+        .unwrap()
+        {
+            Compaction::Sealed {
+                landing_bytes_read,
+                landing_bytes_fetched,
+                ..
+            } => {
+                assert_eq!(
+                    landing_bytes_read,
+                    payload.len() as u64,
+                    "held = the decompressed payload"
+                );
+                assert_eq!(
+                    landing_bytes_fetched,
+                    gz.len() as u64,
+                    "fetched = the bytes actually stored"
+                );
+                assert_eq!(
+                    landing_bytes_fetched, listed,
+                    "fetched must equal what a LISTING reports for the same objects — \
+                     that equality is the whole point of recording it"
+                );
+                assert!(
+                    landing_bytes_fetched < landing_bytes_read,
+                    "gzip must shrink this payload, or the fixture proves nothing"
+                );
+            }
+            other => panic!("expected a seal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_across_two_dates_reads_only_its_own_partitions() {
+        // The straddle case, which sandbox showed is the real cost. A session
+        // that ran across midnight used to be addressed at the PARENT of its
+        // two date partitions, so compaction listed and decompressed every
+        // other session that landed in that window — 32,519 objects for a
+        // recording of two — and was refused for a size that had nothing to do
+        // with it.
+        let store = memory();
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-08/session=s1/inst=i1/0.json",
+            &[envelope_for("s1", "i1", 0, Some("c1"))],
+        );
+        put_object_at(
+            &store,
+            "landing/v1/dt=2026-09-09/session=s1/inst=i1/1.json",
+            &[envelope_for("s1", "i1", 1, Some("c1"))],
+        );
+        // A neighbour under the same root, big enough that reading the parent
+        // would pass the budget below. It sorts BETWEEN the two partitions of
+        // s1, so a root-addressed read reaches it before finishing s1.
+        for n in 0..40 {
+            put_object_at(
+                &store,
+                &format!("landing/v1/dt=2026-09-09/session=other/inst=i9/{n:02}.json"),
+                &[envelope_for("other", "i9", n, Some("c9"))],
+            );
+        }
+
+        let compaction = block(compact_session_inner(
+            &store,
+            "s1",
+            DEFAULT_RECORDING_ROOT,
+            Some(5_000),
+        ))
+        .unwrap();
+        match compaction {
+            Compaction::Sealed {
+                manifest,
+                landing_bytes_read,
+                landing_bytes_fetched,
+                shared_prefix,
+                ..
+            } => {
+                assert_eq!(
+                    manifest.counts.landing_objects, 2,
+                    "its own two objects, not the root's forty-two"
+                );
+                assert_eq!(manifest.counts.events, 2);
+                assert!(
+                    !shared_prefix,
+                    "a per-partition prefix names the session, so nothing else can be under it"
+                );
+                assert!(
+                    landing_bytes_read < 5_000,
+                    "read {landing_bytes_read} bytes; the neighbour was not touched"
+                );
+                // These fixtures are stored PLAIN, so the two sides are equal
+                // here by construction and equality can prove nothing about
+                // which one was measured. Only non-zero is checked; the
+                // separation is pinned by the gzip test below, which is the
+                // only fixture where the two numbers can differ.
+                assert!(
+                    landing_bytes_fetched > 0,
+                    "the fetched side must be measured, not defaulted to zero"
+                );
+            }
+            other => panic!("expected a seal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3211,6 +5198,34 @@ s3_bucket = "ucs-deja"
         out
     }
 
+    /// One bucket, a directory per system: the sealer's scope carries each
+    /// system's prefix, normalised, onto the config it seals with.
+    #[test]
+    fn the_sealer_scopes_a_shared_bucket_by_each_systems_prefix() {
+        let _lock = test_env::env_guard();
+        let doc = "[systems.hyperswitch]\ns3_bucket = \"shared\"\ns3_prefix = \"hyperswitch\"\n\
+                   [systems.prism]\ns3_bucket = \"shared\"\ns3_prefix = \"prism/\"\n\
+                   [systems.solo]\ns3_bucket = \"solo\"\ns3_prefix = \" \"\n";
+        with_doc(doc, || {
+            let (cfg, root) = pass::scope_for_system("prism").unwrap();
+            assert_eq!(
+                (cfg.bucket.as_str(), cfg.prefix.as_str()),
+                ("shared", "prism")
+            );
+            assert_eq!(
+                root, DEFAULT_RECORDING_ROOT,
+                "the root stays relative to the prefix"
+            );
+            assert_eq!(prefix_for_system("hyperswitch").unwrap(), "hyperswitch");
+            assert_eq!(
+                prefix_for_system("solo").unwrap(),
+                "",
+                "blank is the bucket root"
+            );
+            assert_eq!(prefix_for_system("undeclared").unwrap(), "");
+        });
+    }
+
     #[test]
     fn the_sealer_resolves_the_deployed_document_the_way_the_orchestrator_does() {
         // Two readers, one document. The orchestrator resolves a system to
@@ -3225,6 +5240,9 @@ s3_bucket = "ucs-deja"
             // Neither declares a root, so both use the standard layout — the
             // same default `scan_scope` applies.
             assert_eq!(recording_root_for("prism").unwrap(), DEFAULT_RECORDING_ROOT);
+            // Nor a prefix: a bucket per system keeps its roots at the top.
+            assert_eq!(prefix_for_system("prism").unwrap(), "");
+            assert_eq!(pass::scope_for_system("hyperswitch").unwrap().0.prefix, "");
         });
     }
 
@@ -3346,6 +5364,741 @@ s3_bucket = "ucs-deja"
                     "and it is refused when the pass reaches it"
                 );
             },
+        );
+    }
+
+    // -- system prefix ------------------------------------------------------
+
+    fn cfg_at(prefix: &str) -> S3Config {
+        S3Config {
+            endpoint: String::new(),
+            bucket: "shared".to_owned(),
+            prefix: prefix.to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: Some("ap-south-2".to_owned()),
+            allow_http: false,
+        }
+    }
+
+    /// Every key the BUCKET holds, sorted: the view of the store below the
+    /// prefix seam, which is what a recorder writing the landing and an
+    /// operator listing the bucket both see.
+    fn bucket_keys(base: &DynStore) -> Vec<String> {
+        block(list_keys(base, ""))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect()
+    }
+
+    /// One session landed at `{prefix}/landing/v1/...` in `base`, sealed
+    /// through the store `cfg_at(prefix)` scopes, the way the sealer and every
+    /// reader reach it. Returns the manifest.
+    fn land_and_seal_at(base: &DynStore, prefix: &str) -> SessionManifest {
+        let landing = layout::bucket_key(
+            prefix,
+            &format!(
+                "{}/inst=i1/0.ndjson",
+                layout::landing_prefix_in(DEFAULT_RECORDING_ROOT, "s1")
+            ),
+        );
+        put_object_at(
+            base,
+            &landing,
+            &[
+                envelope_for("s1", "i1", 1, Some("c1")),
+                envelope_for("s1", "i1", 2, Some("c2")),
+            ],
+        );
+        let scoped = cfg_at(prefix).scope_store(base.clone());
+        sealed(
+            block(compact_session_inner(
+                &scoped,
+                "s1",
+                DEFAULT_RECORDING_ROOT,
+                None,
+            ))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_prefix_is_read_one_way_whatever_its_slashes() {
+        for p in ["prism", "prism/", "/prism/", " prism/ "] {
+            assert_eq!(layout::system_prefix(p).as_deref(), Some("prism"), "{p:?}");
+        }
+        for p in ["", " ", "/", "//"] {
+            assert_eq!(layout::system_prefix(p), None, "{p:?} is the bucket root");
+        }
+        assert_eq!(
+            layout::bucket_key("prism/", "landing/v1/session=s1"),
+            "prism/landing/v1/session=s1"
+        );
+        assert_eq!(
+            layout::bucket_key("", "landing/v1/session=s1"),
+            "landing/v1/session=s1",
+            "no prefix spells a key exactly as it always was"
+        );
+        assert_eq!(
+            cfg_at("prism/").uri("sessions/v1/s1"),
+            "s3://shared/prism/sessions/v1/s1"
+        );
+        assert_eq!(
+            cfg_at("").uri("sessions/v1/s1"),
+            "s3://shared/sessions/v1/s1"
+        );
+    }
+
+    /// Every root a seal touches moves under the prefix together: the landing
+    /// it reads, the parts, the index and the manifest it writes, and each
+    /// reader of those. Checked from BELOW the seam, in the bucket's own keys.
+    #[test]
+    fn a_prefixed_system_lands_seals_and_reads_under_its_prefix() {
+        let base = memory();
+        let manifest = land_and_seal_at(&base, "prism");
+        let keys = bucket_keys(&base);
+        assert!(
+            keys.iter().all(|k| k.starts_with("prism/")),
+            "nothing is written outside the prefix: {keys:?}"
+        );
+        let expect = [
+            format!("prism/{}", layout::manifest_key("s1")),
+            format!(
+                "prism/{}",
+                layout::correlations_key("s1", &manifest.seal_id)
+            ),
+            format!("prism/{}", layout::part_key("s1", &manifest.seal_id, 0)),
+            "prism/landing/v1/session=s1/inst=i1/0.ndjson".to_owned(),
+        ];
+        for key in &expect {
+            assert!(keys.contains(key), "{key} missing from {keys:?}");
+        }
+        assert_eq!(keys.len(), expect.len(), "{keys:?}");
+
+        // Every reader, through the scoped store.
+        let scoped = cfg_at("prism").scope_store(base.clone());
+        let read = block(manifest_of(&scoped, "s1")).unwrap().expect("sealed");
+        assert_eq!(read.seal_id, manifest.seal_id);
+        let rows = block(correlation_index_of(&scoped, &read)).unwrap();
+        assert_eq!(rows.map(|r| r.len()), Some(2), "the index is found");
+        assert_eq!(block(session_lines(&scoped, &read)).unwrap().len(), 2);
+        let listed: Vec<String> = block(list_keys(&scoped, DEFAULT_RECORDING_ROOT))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect();
+        let landed = index_landed_keys(DEFAULT_RECORDING_ROOT, &listed);
+        assert_eq!(landed.len(), 1);
+        assert_eq!(
+            landed[0].prefix, "landing/v1/session=s1",
+            "a listing comes back relative to the system's root"
+        );
+        assert!(
+            !matches!(
+                block(readiness_of(&scoped, "s1", DEFAULT_RECORDING_ROOT, 0)).unwrap(),
+                SealReadiness::Absent
+            ),
+            "readiness finds the landing"
+        );
+
+        // And the unscoped bucket does not answer as though it were prism's.
+        assert!(block(manifest_of(&base, "s1")).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_move_a_single_key() {
+        let (a, b) = (memory(), memory());
+        let with = land_and_seal_at(&a, "prism");
+        let slashed = land_and_seal_at(&b, "prism/");
+        assert_eq!(bucket_keys(&a), bucket_keys(&b));
+        assert_eq!(with.seal_id, slashed.seal_id);
+    }
+
+    /// An undeclared prefix is today's layout, key for key, and the store is
+    /// handed back untouched rather than wrapped in a no-op.
+    #[test]
+    fn an_empty_prefix_is_todays_keys() {
+        let base = memory();
+        let manifest = land_and_seal_at(&base, "");
+        let mut expect = vec![
+            layout::correlations_key("s1", &manifest.seal_id),
+            layout::part_key("s1", &manifest.seal_id, 0),
+            layout::manifest_key("s1"),
+            "landing/v1/session=s1/inst=i1/0.ndjson".to_owned(),
+        ];
+        expect.sort();
+        assert_eq!(bucket_keys(&base), expect);
+        assert_eq!(
+            layout::manifest_key("s1"),
+            "sessions/v1/s1/manifest.json",
+            "the unprefixed layout itself has not moved"
+        );
+        for blank in ["", " ", "/"] {
+            let scoped = cfg_at(blank).scope_store(base.clone());
+            assert!(Arc::ptr_eq(&scoped, &base), "{blank:?} wraps nothing");
+        }
+    }
+
+    /// The seam's one production call site. The other prefix tests call
+    /// `scope_store` directly, so removing it from `build` broke nothing.
+    /// No network: the builder opens no connection and `cfg_at` pins a region.
+    #[test]
+    fn build_confines_the_store_it_hands_out_to_the_declared_prefix() {
+        assert_eq!(
+            cfg_at("prism").build().expect("builds").to_string(),
+            "PrefixObjectStore(prism)",
+            "a declared prefix must reach the store `build` returns"
+        );
+        assert_eq!(
+            cfg_at("").build().expect("builds").to_string(),
+            "AmazonS3(shared)",
+            "with no prefix the store is the client itself, never a wrapper over it"
+        );
+    }
+
+    /// A manifest's keys are relative to the system's root, so they never
+    /// carry the prefix they were sealed under.
+    #[test]
+    fn a_manifest_sealed_under_a_prefix_stores_keys_without_it() {
+        let (prefixed, bare) = (memory(), memory());
+        let under = land_and_seal_at(&prefixed, "hyperswitch");
+        let root = land_and_seal_at(&bare, "");
+        assert!(!under.data_parts.is_empty());
+        for part in &under.data_parts {
+            assert!(
+                part.key.starts_with("sessions/v1/"),
+                "a part key is relative to the system root: {}",
+                part.key
+            );
+        }
+        let keys = |m: &SessionManifest| {
+            m.data_parts
+                .iter()
+                .map(|p| p.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&under), keys(&root));
+    }
+
+    /// A seal's address is its content. The same lines landed under two
+    /// layouts the sealer CAN see (flat versus date-partitioned, different
+    /// object names) seal to one id; a hash that took in a landing key would
+    /// tell them apart.
+    #[test]
+    fn a_seals_address_does_not_depend_on_where_its_landing_was() {
+        let lines = [
+            envelope_for("s1", "i1", 1, Some("c1")),
+            envelope_for("s1", "i1", 2, Some("c2")),
+        ];
+        let (flat, dated) = (memory(), memory());
+        put_object_at(&flat, "landing/v1/session=s1/inst=i1/0.ndjson", &lines);
+        put_object_at(
+            &dated,
+            "landing/v1/dt=2026-09-28/session=s1/inst=i1/batch-7.log",
+            &lines,
+        );
+        let seal = |store: &DynStore| {
+            sealed(
+                block(compact_session_inner(
+                    store,
+                    "s1",
+                    DEFAULT_RECORDING_ROOT,
+                    None,
+                ))
+                .unwrap(),
+            )
+        };
+        let (a, b) = (seal(&flat), seal(&dated));
+        assert!(!a.seal_id.is_empty());
+        assert_eq!(a.seal_id, b.seal_id, "the address hashes content, not keys");
+    }
+
+    /// The migration: a bucket sealed by today's code, copied verbatim under a
+    /// prefix (`aws s3 sync s3://old/ s3://new/hyperswitch/`), reads back
+    /// through that prefix with nothing rewritten.
+    #[test]
+    fn a_plain_copy_under_a_prefix_reads_without_rewriting() {
+        let old = memory();
+        let manifest = land_and_seal_at(&old, "");
+        let lines = block(session_lines(&old, &manifest)).unwrap();
+
+        let new = memory();
+        for key in bucket_keys(&old) {
+            let bytes = block(async {
+                old.get(&object_store::path::Path::from(key.as_str()))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            });
+            block(new.put(
+                &object_store::path::Path::from(format!("hyperswitch/{key}")),
+                bytes.into(),
+            ))
+            .unwrap();
+        }
+
+        let scoped = cfg_at("hyperswitch").scope_store(new.clone());
+        let read = block(manifest_of(&scoped, "s1"))
+            .unwrap()
+            .expect("the copy is sealed");
+        assert_eq!(
+            read.data_parts[0].key, manifest.data_parts[0].key,
+            "the copied manifest is byte for byte the old one"
+        );
+        assert_eq!(block(session_lines(&scoped, &read)).unwrap(), lines);
+        assert_eq!(
+            block(correlation_index_of(&scoped, &read))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(2)
+        );
+    }
+
+    /// Objects a bucket held before system prefixes existed, byte for byte.
+    ///
+    /// Produced by origin/main f7b60f0's own code, in a scratch worktree: its
+    /// test module gained a one-off test that landed three envelopes as one
+    /// gzip object in the deployed aggregator's dated layout, sealed them with
+    /// `compact_session_inner` against an in-memory store, and wrote every
+    /// object out under its key. Nothing here was written by this revision.
+    const SEALED_AT_F7B60F0: &[(&str, &[u8])] = &[
+        (
+            "landing/v1/dt=2026-09-28/session=rec-fixture/inst=i1/0.log.gz",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/landing/v1/dt=2026-09-28/session=rec-fixture/inst=i1/0.log.gz"),
+        ),
+        (
+            "sessions/v1/rec-fixture/manifest.json",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/sessions/v1/rec-fixture/manifest.json"),
+        ),
+        (
+            "sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst"),
+        ),
+        (
+            "sessions/v1/rec-fixture/index/d0751713beb07ad9/correlations.ndjson.zst",
+            include_bytes!("../fixtures/sealed-at-f7b60f0/sessions/v1/rec-fixture/index/d0751713beb07ad9/correlations.ndjson.zst"),
+        ),
+    ];
+
+    /// The migration against bytes the OLD code wrote: copied verbatim under
+    /// `hyperswitch/`, they read back through s3_prefix=hyperswitch — the seal
+    /// and the landing listing both — with nothing rewritten.
+    #[test]
+    fn a_bucket_sealed_before_prefixes_reads_back_copied_under_one() {
+        let bucket = memory();
+        for (key, bytes) in SEALED_AT_F7B60F0 {
+            block(bucket.put(
+                &object_store::path::Path::from(format!("hyperswitch/{key}")),
+                bytes.to_vec().into(),
+            ))
+            .unwrap();
+        }
+        let scoped = cfg_at("hyperswitch/").scope_store(bucket.clone());
+
+        let manifest = block(manifest_of(&scoped, "rec-fixture"))
+            .unwrap()
+            .expect("the copied seal is found");
+        assert_eq!(manifest.seal_id, "d0751713beb07ad9");
+        assert_eq!(
+            manifest.data_parts[0].key,
+            "sessions/v1/rec-fixture/data/d0751713beb07ad9/part-00000.ndjsonl.zst",
+            "the old manifest's key, unprefixed and unrewritten"
+        );
+        let lines = block(session_lines(&scoped, &manifest)).unwrap();
+        assert_eq!(lines.len(), manifest.counts.events);
+        assert_eq!(lines.len(), 3);
+        let rows = block(correlation_index_of(&scoped, &manifest))
+            .unwrap()
+            .expect("the copied index is found");
+        assert_eq!(
+            rows.iter().filter(|r| r.correlation_id.is_some()).count(),
+            manifest.counts.correlations
+        );
+
+        let listed: Vec<String> = block(list_keys(&scoped, DEFAULT_RECORDING_ROOT))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect();
+        let landed = index_landed_keys(DEFAULT_RECORDING_ROOT, &listed);
+        assert_eq!(landed.len(), 1, "{listed:?}");
+        assert_eq!(landed[0].session_id, "rec-fixture");
+        assert_eq!(landed[0].dates, vec!["2026-09-28".to_owned()]);
+        assert_eq!(
+            landed[0].prefix,
+            "landing/v1/dt=2026-09-28/session=rec-fixture"
+        );
+        assert_eq!(
+            cfg_at("hyperswitch").bucket_key(&landed[0].prefix),
+            "hyperswitch/landing/v1/dt=2026-09-28/session=rec-fixture"
+        );
+        assert!(
+            !matches!(
+                block(readiness_of(
+                    &scoped,
+                    "rec-fixture",
+                    DEFAULT_RECORDING_ROOT,
+                    0
+                ))
+                .unwrap(),
+                SealReadiness::Absent
+            ),
+            "the landing is located through the prefix"
+        );
+    }
+
+    /// Copy one object between stores, key for key, the way a bucket migration
+    /// does.
+    fn copy_key(from: &DynStore, to: &DynStore, src: &str, dst: &str) {
+        let bytes = block(async {
+            from.get(&object_store::path::Path::from(src))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        });
+        block(to.put(&object_store::path::Path::from(dst), bytes.into())).unwrap();
+    }
+
+    /// A seal written before seals were addressed carries an EMPTY id, so its
+    /// parts and index sit at the unscoped keys. The old-release fixture cannot
+    /// cover that shape — its id is content-addressed and non-empty — and it is
+    /// `correlations_key` that derives its key from the id rather than reading it
+    /// from the manifest, so a legacy seal is looked for at keys no seal written
+    /// today uses. Reachable as soon as an existing bucket's recordings move
+    /// under a directory.
+    #[test]
+    fn a_legacy_seal_with_no_id_reads_back_copied_under_a_prefix() {
+        // The keys a pre-addressed sealer actually wrote, spelled out. Deriving
+        // them would make the pins below tautological, and the reads cannot
+        // stand in for them: `Path::from` drops empty segments, so an empty seal
+        // id that began naming a directory reads back identically. S3
+        // distinguishes those keys; `object_store` does not.
+        const LEGACY_PARTS: [&str; 1] = ["sessions/v1/s1/data/part-00000.ndjsonl.zst"];
+        const LEGACY_INDEX: &str = "sessions/v1/s1/index/correlations.ndjson.zst";
+        const LEGACY_MANIFEST: &str = "sessions/v1/s1/manifest.json";
+
+        let old = memory();
+        let addressed = land_and_seal_at(&old, "");
+        assert!(
+            !addressed.seal_id.is_empty(),
+            "the sealer addresses its seals"
+        );
+        assert_eq!(addressed.data_parts.len(), LEGACY_PARTS.len());
+        // The pins hold the key SPELLING; the reads below hold any change that
+        // yields a real segment. Both halves are needed — neither alone covers
+        // an empty seal id ceasing to mean "no seal directory".
+        assert_eq!(layout::part_key("s1", "", 0), LEGACY_PARTS[0]);
+        assert_eq!(layout::correlations_key("s1", ""), LEGACY_INDEX);
+        assert_eq!(layout::manifest_key("s1"), LEGACY_MANIFEST);
+        let lines = block(session_lines(&old, &addressed)).unwrap();
+        let rows = block(correlation_index_of(&old, &addressed))
+            .unwrap()
+            .expect("the seal just written has its index")
+            .len();
+        // Pinned, not just carried: the reads below compare against these, so
+        // without a literal a reader returning nothing satisfies both sides.
+        assert_eq!(lines.len(), 2, "the fixture lands two envelopes");
+        assert_eq!(rows, 2, "both envelopes are indexed");
+        let session = addressed.session_id.clone();
+
+        // Re-lay the same session as an older sealer wrote it: every object at
+        // its unscoped key, and a manifest naming those keys with no id.
+        let legacy_store = memory();
+        let legacy = SessionManifest {
+            seal_id: String::new(),
+            data_parts: addressed
+                .data_parts
+                .iter()
+                .enumerate()
+                .map(|(n, part)| DataPart {
+                    key: LEGACY_PARTS[n].to_owned(),
+                    ..part.clone()
+                })
+                .collect(),
+            ..addressed.clone()
+        };
+        for (n, part) in addressed.data_parts.iter().enumerate() {
+            copy_key(&old, &legacy_store, &part.key, LEGACY_PARTS[n]);
+        }
+        copy_key(
+            &old,
+            &legacy_store,
+            &layout::correlations_key(&session, &addressed.seal_id),
+            LEGACY_INDEX,
+        );
+        // A real legacy manifest OMITS the key rather than carrying an empty one,
+        // and `seal_id` is `#[serde(default)]` so that parses. Write it absent,
+        // so removing that default fails here instead of only in production.
+        let mut doc = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            doc.as_object_mut().unwrap().remove("seal_id").is_some(),
+            "the field has to be there to be removed"
+        );
+        block(legacy_store.put(
+            &object_store::path::Path::from(LEGACY_MANIFEST),
+            serde_json::to_vec(&doc).unwrap().into(),
+        ))
+        .unwrap();
+
+        // Control: the same legacy layout read at the bucket root. Without it a
+        // failure below cannot tell a broken prefix from legacy keys never
+        // resolving at all.
+        assert_eq!(
+            block(session_lines(&legacy_store, &legacy)).unwrap(),
+            lines,
+            "a legacy manifest resolves its parts at the bucket root"
+        );
+        assert_eq!(
+            block(correlation_index_of(&legacy_store, &legacy))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(rows),
+            "an empty seal id resolves its index at the bucket root"
+        );
+
+        // The migration itself: a plain copy of every key under one directory.
+        let migrated = memory();
+        for key in bucket_keys(&legacy_store) {
+            copy_key(
+                &legacy_store,
+                &migrated,
+                &key,
+                &format!("hyperswitch/{key}"),
+            );
+        }
+
+        let scoped = cfg_at("hyperswitch").scope_store(migrated.clone());
+        let read = block(manifest_of(&scoped, &session))
+            .unwrap()
+            .expect("the copy is sealed");
+        assert!(
+            read.seal_id.is_empty(),
+            "the copy is still the legacy shape, not a re-seal"
+        );
+        assert_eq!(
+            block(session_lines(&scoped, &read)).unwrap(),
+            lines,
+            "part keys named by a legacy manifest resolve under the prefix"
+        );
+        assert_eq!(
+            block(correlation_index_of(&scoped, &read))
+                .unwrap()
+                .map(|r| r.len()),
+            Some(rows),
+            "the index key derived from an EMPTY seal id resolves under the prefix"
+        );
+    }
+
+    // -- region -------------------------------------------------------------
+
+    /// An environment holding exactly `vars`.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |k: &str| vars.get(k).cloned()
+    }
+
+    fn unconfigured() -> S3Config {
+        S3Config {
+            region: None,
+            ..cfg_at("")
+        }
+    }
+
+    #[test]
+    fn effective_region_prefers_the_buckets_region_to_the_pods() {
+        let got = unconfigured().effective_region_with(
+            |bucket| {
+                assert_eq!(bucket, "shared", "the lookup is for this config's bucket");
+                Some("ap-south-2".to_owned())
+            },
+            env_of(&[
+                ("AWS_REGION", "ap-south-1"),
+                ("AWS_DEFAULT_REGION", "eu-west-1"),
+            ]),
+        );
+        assert_eq!(got, "ap-south-2");
+    }
+
+    #[test]
+    fn effective_region_falls_back_to_aws_region_then_its_default() {
+        let failed = |_: &str| None;
+        let cfg = unconfigured();
+        assert_eq!(
+            cfg.effective_region_with(
+                failed,
+                env_of(&[
+                    ("AWS_REGION", "ap-south-1"),
+                    ("AWS_DEFAULT_REGION", "eu-west-1")
+                ]),
+            ),
+            "ap-south-1"
+        );
+        assert_eq!(
+            cfg.effective_region_with(failed, env_of(&[("AWS_DEFAULT_REGION", "eu-west-1")])),
+            "eu-west-1"
+        );
+        assert_eq!(
+            cfg.effective_region_with(failed, env_of(&[])),
+            DEFAULT_REGION
+        );
+    }
+
+    #[test]
+    fn effective_region_takes_the_configs_own_region_and_endpoint() {
+        let explicit = S3Config {
+            region: Some("me-south-1".to_owned()),
+            ..cfg_at("")
+        };
+        assert_eq!(
+            explicit.effective_region_with(|_| never(), env_of(&[("AWS_REGION", "x")])),
+            "me-south-1"
+        );
+        let minio = S3Config {
+            endpoint: "http://127.0.0.1:9100".to_owned(),
+            ..unconfigured()
+        };
+        assert_eq!(
+            minio.effective_region_with(|_| never(), env_of(&[("AWS_REGION", "x")])),
+            DEFAULT_REGION
+        );
+    }
+
+    #[test]
+    fn a_found_region_is_looked_up_once_per_bucket() {
+        let cache = RegionCache::default();
+        let calls = std::cell::Cell::new(0);
+        let lookup = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ok("ap-south-2".to_owned())
+        };
+        let t0 = std::time::Instant::now();
+        let later = t0 + BUCKET_REGION_RETRY * 10;
+        assert_eq!(
+            cache.region("shared", t0, lookup).as_deref(),
+            Some("ap-south-2")
+        );
+        assert_eq!(
+            cache.region("shared", later, lookup).as_deref(),
+            Some("ap-south-2")
+        );
+        assert_eq!(calls.get(), 1, "a found region is kept for the process");
+        assert_eq!(
+            cache.region("other", later, lookup).as_deref(),
+            Some("ap-south-2")
+        );
+        assert_eq!(calls.get(), 2, "another bucket is its own lookup");
+    }
+
+    #[test]
+    fn a_failed_lookup_is_retried_only_after_the_window() {
+        let cache = RegionCache::default();
+        let calls = std::cell::Cell::new(0);
+        let failing = |_: &str| {
+            calls.set(calls.get() + 1);
+            Err::<String, String>("unreachable".to_owned())
+        };
+        let t0 = std::time::Instant::now();
+        assert_eq!(cache.region("shared", t0, failing), None);
+        assert_eq!(
+            cache.region("shared", t0 + BUCKET_REGION_RETRY / 2, failing),
+            None
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "inside the window the failure is remembered"
+        );
+        let recovered = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ok("ap-south-2".to_owned())
+        };
+        assert_eq!(
+            cache
+                .region("shared", t0 + BUCKET_REGION_RETRY, recovered)
+                .as_deref(),
+            Some("ap-south-2"),
+            "after the window it is looked up again"
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    fn never() -> Option<String> {
+        panic!("the bucket's region was looked up when an earlier rule had decided")
+    }
+
+    #[test]
+    fn an_explicit_region_wins_and_nothing_is_looked_up() {
+        let got = choose_region(RegionInputs {
+            explicit: Some("ap-south-1"),
+            custom_endpoint: true,
+            bucket_region: never,
+            aws_region: Some("eu-west-1"),
+            aws_default_region: Some("eu-west-2"),
+        });
+        assert_eq!(got, ("ap-south-1".to_owned(), RegionSource::Explicit));
+    }
+
+    #[test]
+    fn a_custom_endpoint_keeps_the_old_default_without_a_lookup() {
+        let got = choose_region(RegionInputs {
+            explicit: Some("  "),
+            custom_endpoint: true,
+            bucket_region: never,
+            aws_region: Some("eu-west-1"),
+            aws_default_region: None,
+        });
+        assert_eq!(
+            got,
+            (DEFAULT_REGION.to_owned(), RegionSource::CustomEndpoint)
+        );
+    }
+
+    #[test]
+    fn the_buckets_region_comes_before_the_pods() {
+        let got = choose_region(RegionInputs {
+            explicit: None,
+            custom_endpoint: false,
+            bucket_region: || Some("ap-south-2".to_owned()),
+            aws_region: Some("ap-south-1"),
+            aws_default_region: Some("ap-south-1"),
+        });
+        assert_eq!(got, ("ap-south-2".to_owned(), RegionSource::Bucket));
+    }
+
+    #[test]
+    fn a_failed_lookup_falls_through_in_order() {
+        let pick = |aws: Option<&str>, default: Option<&str>| {
+            choose_region(RegionInputs {
+                explicit: None,
+                custom_endpoint: false,
+                bucket_region: || None,
+                aws_region: aws,
+                aws_default_region: default,
+            })
+        };
+        assert_eq!(
+            pick(Some("eu-west-1"), Some("eu-west-2")),
+            ("eu-west-1".to_owned(), RegionSource::AwsRegion)
+        );
+        assert_eq!(
+            pick(Some(""), Some("eu-west-2")),
+            ("eu-west-2".to_owned(), RegionSource::AwsDefaultRegion)
+        );
+        assert_eq!(
+            pick(None, None),
+            (DEFAULT_REGION.to_owned(), RegionSource::Default)
+        );
+        assert_eq!(
+            DEFAULT_REGION, "us-east-1",
+            "the default every deployment had"
         );
     }
 }

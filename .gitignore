@@ -1,5 +1,9 @@
-# Build artifacts
+# Build artifacts. `.cargo-target*` covers the per-tree CARGO_TARGET_DIR that
+# concurrent worktrees need: sharing one target dir makes a build silently run
+# against another tree, so each gets its own, and `target/` alone left those
+# untracked-but-visible — a `git add -A` then stages several gigabytes.
 target/
+.cargo-target*/
 __pycache__/
 
 # Vendored Hyperswitch trees (hyperswitch-deja-clean is its own git repo; the

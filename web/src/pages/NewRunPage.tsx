@@ -9,6 +9,7 @@ import { CorrelationPicker } from "../components/CorrelationPicker";
 import { spanOf } from "../lib/recordings";
 import { useSystems } from "../lib/systems";
 import { CORRELATION_CAP, useCorrelationCandidates } from "../lib/correlations";
+import { daySummary, groupRecordings } from "../lib/recordings";
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -59,6 +60,12 @@ export default function NewRunPage() {
   const [params] = useSearchParams();
   const debug = useDebug();
   const [recordingId, setRecordingId] = React.useState(params.get("recording") ?? "");
+  // A DEPLOYMENT DAY, arriving from the recordings page's day band. It names
+  // `<revision>-<MMDD>` and the orchestrator resolves it to every recording that
+  // revision wrote that day, driving them as one run. Mutually exclusive with a
+  // recording id — the orchestrator REFUSES a payload naming both rather than
+  // resolving one silently, so exactly one leaves this form.
+  const [recordingGroup, setRecordingGroup] = React.useState(params.get("group") ?? "");
   // A recordings-page link from a scoped (per-system bucket) listing arrives
   // with `?system=` + `?s3=` already resolved — the row knows its own source,
   // and retyping either is how the wrong-bucket replay happened.
@@ -92,17 +99,45 @@ export default function NewRunPage() {
   // Memoized so the preselect effect below depends on a stable array rather
   // than a fresh `[]` every render.
   const rows = React.useMemo(() => available.data?.recordings ?? [], [available.data]);
+
+  // The days this bucket page holds, newest first, and the one chosen. Derived
+  // from the same rows the picker below lists, so the two cannot disagree about
+  // what exists.
+  const { days } = React.useMemo(() => groupRecordings(rows), [rows]);
+  const chosenDay = days.find((d) => d.group === recordingGroup.trim());
   const chosen = rows.find((r) => r.recording_id === recordingId.trim());
   const picked = recordings.data?.find((r) => r.recording_id === recordingId.trim());
 
-  // Latest preselected. The server returns newest first (last partition, then
-  // id), so the head of the list IS the latest — no client-side re-sort, which
-  // could only disagree with it. Runs once: a refetch must not overwrite a
-  // choice the caller has since made, and `?recording=` arrives already set.
+  // Latest SEALED preselected, not latest outright. The server returns newest
+  // first, so the head of the list is the newest recording — and the newest
+  // recording is always UNSEALED, because sealing waits for the pod to stop
+  // writing plus a quiescence window plus a sealer tick. Preselecting it left
+  // the form in its least useful state: the correlation filter below lists
+  // candidates only for a sealed recording, so the default selection could
+  // never populate it. On the live catalog the first sealed row sat SIXTEEN
+  // rows down, so reaching a usable filter meant scrolling past every
+  // recording still being written.
+  //
+  // Falls back to the head of the list when nothing is sealed, so a fresh
+  // bucket still preselects something rather than nothing. No client-side
+  // re-sort either way: the order is the server's and a local sort could only
+  // disagree with it.
+  //
+  // Runs once — a refetch must not overwrite a choice the caller has since
+  // made, and `?recording=` arrives already set.
   React.useEffect(() => {
-    if (recordingId.trim() || rows.length === 0) return;
-    setRecordingId(rows[0].recording_id);
-  }, [rows, recordingId]);
+    // NOT while a deployment day is chosen. Clearing the recording is how
+    // choosing a day makes the two mutually exclusive, and this effect used to
+    // undo that on the very next render — which left `recordingId` populated,
+    // fetched THAT recording's correlation index, and sent its ids as a
+    // `correlation_filter` alongside `recording_group`. The run then drove a
+    // hundred correlations out of one arbitrary pod while reporting itself a
+    // replay of the whole day, and nothing on the page or in the payload said
+    // so.
+    if (recordingGroup.trim() || recordingId.trim() || rows.length === 0) return;
+    const sealed = rows.find((r) => r.sealed === true && (r.correlations ?? 0) > 0);
+    setRecordingId((sealed ?? rows[0]).recording_id);
+  }, [rows, recordingId, recordingGroup]);
 
   // THE ONE PLACE candidate correlations come from. Swapping in the sealed
   // correlations index later is a change to that hook and to nothing here.
@@ -136,10 +171,18 @@ export default function NewRunPage() {
       // Replay is the only mode this dashboard can produce.
       mode: "replay",
       candidate_spec: candidate,
+    };
+    if (recordingGroup.trim()) {
+      // A day, not a pod's slice of one. Sent INSTEAD of `recording_id`: naming
+      // both is refused by the orchestrator, which is the behaviour we want —
+      // a caller that sent both has not decided, and picking one silently
+      // leaves which one won to be discovered from the tape afterwards.
+      spec.recording_group = recordingGroup.trim();
+    } else {
       // With an S3 source the id is the session filter and may be empty
       // (auto-resolved when the prefix holds exactly one session).
-      recording_id: recordingId.trim() || (s3Path ? null : "<recording_id>"),
-    };
+      spec.recording_id = recordingId.trim() || (s3Path ? null : "<recording_id>");
+    }
     // Only a non-default system is sent, so existing curl recipes and stored
     // rows keep meaning what they meant. Which name that is comes from the
     // orchestrator rather than from a literal here.
@@ -160,10 +203,16 @@ export default function NewRunPage() {
     // rather than a hundred the server chose that the page merely described. On
     // an unsealed recording they are not knowable, so no filter goes out and the
     // orchestrator applies the same limit itself.
-    if (scope.length) spec.correlation_filter = scope;
+    // A GROUP DRIVES THE WHOLE DAY. Correlation candidates are read from ONE
+    // recording's sealed index, so an id list gathered here names cases from a
+    // single member; sending it with a group would scope a day's replay to one
+    // pod's requests and call the result a replay of the day. Refused at the
+    // payload rather than trusted to be empty, because the picker's default is
+    // a non-empty list.
+    if (!recordingGroup.trim() && scope.length) spec.correlation_filter = scope;
     if (expectation) spec.expectation = expectation;
     return spec;
-  }, [candidateRepo, expectation, imageRef, recordingId, s3Path, scope, systemUnderTest]);
+  }, [candidateRepo, expectation, imageRef, recordingGroup, recordingId, s3Path, scope, systemUnderTest]);
 
   const curlCommand = React.useMemo(
     () =>
@@ -192,6 +241,116 @@ export default function NewRunPage() {
           create.mutate();
         }}
       >
+        {/* CHOOSE A DEPLOYMENT DAY, or one recording below.
+
+            Offered FIRST because it is the better default and the page should
+            say so by its order: a recording id is minted once per router
+            process, so picking one row picks an arbitrary pod's slice of the
+            traffic a deployment served. The day is the whole of it.
+
+            Only fully-sealed days are offered. Resolving a group hands every
+            member to one pull and a member without a manifest is compacted
+            INLINE inside the run, so a day still being written would make the
+            run pay for sealing the sealer has already scheduled. A day that is
+            still sealing is listed as unavailable WITH its reason rather than
+            hidden, because a day missing from a list reads as a day that does
+            not exist. */}
+        {days.length > 0 && (
+          <div className="dayfield">
+            <span className="reclabel">
+              deployment day{" "}
+              <span className="hint">(one revision's traffic for one day, every pod)</span>
+            </span>
+            <ul className="daylist">
+              {days.map((d) => {
+                const chosen = d.group === recordingGroup.trim();
+                return (
+                  <li key={d.group} className={chosen ? "daypick chosen" : "daypick"}>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={!d.complete}
+                      title={
+                        d.complete
+                          ? undefined
+                          : `${d.unsealed} of this day's recordings are still sealing — replaying it now would re-compact them inside the run`
+                      }
+                      onClick={() => {
+                        // Mutually exclusive on the wire: the orchestrator
+                        // refuses a payload naming both, so choosing a day
+                        // clears the recording rather than leaving both set.
+                        setRecordingGroup(chosen ? "" : d.group);
+                        if (!chosen) setRecordingId("");
+                      }}
+                    >
+                      {chosen ? "chosen" : d.complete ? "choose" : "still sealing"}
+                    </button>{" "}
+                    <b className="mono">{d.group}</b>{" "}
+                    <span className="hint">{daySummary(d)}</span>
+                  </li>
+                );
+              })}
+            </ul>
+
+            {/* WHAT IS IN THE DAY. The members are listed because "replay a
+                day" is otherwise an instruction to trust a name — and the
+                list is qualified rather than presented as final, since the
+                run resolves the group again when it pulls. A day that has
+                sealed more recordings since it was chosen has more members,
+                and the run reports the ones it actually drove. */}
+            {chosenDay && (
+              <details className="daymembers" open>
+                <summary>
+                  {chosenDay.members.length} recording
+                  {chosenDay.members.length === 1 ? "" : "s"} in{" "}
+                  <b className="mono">{chosenDay.group}</b> — as the bucket reads right now
+                </summary>
+                <ul>
+                  {chosenDay.members.map((m) => (
+                    <li key={m.recording_id}>
+                      <span className="mono">{m.recording_id}</span>{" "}
+                      <span className="hint">
+                        {m.correlations == null
+                          ? "not counted until sealed"
+                          : `${m.correlations.toLocaleString()} correlation${
+                              m.correlations === 1 ? "" : "s"
+                            }`}
+                        {m.instances?.length ? ` · ${m.instances[0]}` : ""}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="hint">
+                  Resolved again when the run pulls, so this is what the day holds now rather than
+                  a promise about what it will drive. A day drives every correlation in it: the
+                  correlation picker below applies to a single recording and is deliberately not
+                  sent with a day, because the ids it offers come from one member's index and would
+                  scope a whole day's replay to that one pod's requests.
+                </p>
+              </details>
+            )}
+
+            {recordingGroup.trim() && (
+              <p>
+                <button type="button" className="btn" onClick={() => setRecordingGroup("")}>
+                  clear the day and pick a single recording
+                </button>
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* MUTUALLY EXCLUSIVE, so the form offers one at a time. The
+            orchestrator refuses a payload naming both a group and a recording,
+            and a form showing a chosen day above a chosen recording is showing
+            a payload it cannot send — with nothing on screen saying which of
+            the two would win. */}
+        {recordingGroup.trim() ? (
+          <p className="hint recinstead">
+            Replaying the whole of <b className="mono">{recordingGroup.trim()}</b>. Clear the day
+            above to pick a single recording instead.
+          </p>
+        ) : (
         <div className="recfield">
           <span className="reclabel">
             recording{" "}
@@ -271,6 +430,7 @@ export default function NewRunPage() {
             </>
           )}
         </div>
+        )}
 
         {/* ESCAPE HATCH. `s3_source` is still a supported spec field — an
             arbitrary bucket/prefix in the deployed aggregator layout — and
@@ -453,7 +613,15 @@ export default function NewRunPage() {
             nothing does not: it takes the default. */}
         <button
           className="btn primary"
-          disabled={create.isPending || (!recordingId.trim() && !s3Path) || overCap}
+          // A DAY IS A NAMED RECORDING TOO. The gate asks whether this run
+          // names something to drive; a group names a whole day of it, so
+          // requiring `recordingId` specifically left the button dead for
+          // every group — the one path the day picker above exists to offer.
+          disabled={
+            create.isPending ||
+            (!recordingGroup.trim() && !recordingId.trim() && !s3Path) ||
+            overCap
+          }
         >
           {create.isPending ? "scheduling…" : "schedule run"}
         </button>

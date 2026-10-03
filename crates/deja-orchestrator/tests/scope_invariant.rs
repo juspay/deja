@@ -130,6 +130,9 @@ fn write_run(root: &HarnessRoot, run_id: &str, recording_id: &str, filter: Optio
     let run = Run {
         run_id: run_id.to_owned(),
         spec: RunSpec {
+            label: None,
+            delta_against: None,
+            purpose: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,
@@ -138,6 +141,7 @@ fn write_run(root: &HarnessRoot, run_id: &str, recording_id: &str, filter: Optio
             },
             candidate_repo: None,
             recording_id: Some(recording_id.to_owned()),
+            recording_group: None,
             s3_source: None,
             correlation_filter: filter,
             workload: serde_json::Value::Null,
@@ -198,16 +202,25 @@ fn every_artifact_a_scoped_run_produces_stays_inside_its_scope() {
 
     // 1. The lookup table: the substitution material the candidate replays
     //    against, and the artifact with the worst blast radius of the three.
-    let table = lookup::render_lookup_table(&recording, recording_id, 1).expect("render");
+    let table = lookup::render_lookup_table(&recording, recording_id).expect("render");
     deja_orchestrator::write_json(&root.lookup_table_path(run_id), &table).expect("write table");
 
     // 2. The record graph: published to S3 and served by an unauthenticated
     //    endpoint.
     let nodes = recording.graph_nodes().expect("scoped record graph");
 
-    // 3. The scorecard and the per-call ledger.
+    // 3. The scorecard and the per-call ledger, the ledger read back from the
+    //    file the scorer published rather than rebuilt.
     let card = divergence::detect_and_score(&root, run_id).expect("score");
-    let ledger = divergence::call_ledger(&root, run_id).expect("ledger");
+    let ledger: Vec<serde_json::Value> = std::fs::read_to_string(root.call_ledger_path(run_id))
+        .expect("the scorer publishes a ledger")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("ledger line"))
+        .collect();
+    assert!(
+        !ledger.is_empty(),
+        "precondition: a ledger with no rows cannot carry a foreign correlation"
+    );
 
     let in_scope: BTreeSet<String> = filter.iter().cloned().collect();
     let artifacts: Vec<(&str, serde_json::Value)> = vec![
@@ -323,7 +336,7 @@ fn a_run_without_a_filter_still_covers_the_entire_session() {
     assert!(scope.is_entire_session());
 
     let recording = ScopedRecording::open(&root, recording_id, scope).expect("open recording");
-    let table = lookup::render_lookup_table(&recording, recording_id, 1).expect("render");
+    let table = lookup::render_lookup_table(&recording, recording_id).expect("render");
     let seen: BTreeSet<Option<String>> = table
         .entries
         .iter()

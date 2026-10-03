@@ -29,17 +29,21 @@ pub use deja_context::{
     clear_recording_decision, recording_decision, recording_decision_for_current,
     set_recording_decision, RecordDecision,
 };
-/// Re-export lookup-table replay primitives (hybrid architecture: in-process
-/// lookup with per-site ReplayStrategy selecting Execute vs Substitute).
-pub use deja_runtime::replay::{
-    addresses_for, canonical_args_hash, Address, FileObservedSink, InMemoryObservedSink,
-    KeyStamper, LocalFileLookupSource, LookupEntry, LookupKey, LookupTable, LookupTableHook,
-    LookupTableSource, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
-};
 pub use deja_runtime::replay::{boundary_execute_mode_for, replay_strategy_to_execute_mode};
 pub use deja_runtime::replay::{
     build_seed_plan, build_write_target_tables, AmbientTemplate, NotPreconditionReason,
-    ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
+    PresencePredicate, ReadClassification, SeedEntry, SeedOrigin, SeedPlan,
+};
+/// Re-export lookup-table replay primitives (hybrid architecture: in-process
+/// lookup with per-site ReplayStrategy selecting Execute vs Substitute).
+pub use deja_runtime::replay::{
+    canonical_args_hash, loci_for, CallIdentity, FileObservedSink, InMemoryObservedSink,
+    KeyStamper, LocalFileLookupSource, Locus, LookupEntry, LookupKey, LookupTable, LookupTableHook,
+    LookupTableSource, LookupTally, ObservedCall, ObservedCallSink, StateKey, StateKeyParseError,
+    POLICY_VERSION, SHARED_RESULTS_POLICY_VERSION,
+};
+pub use deja_runtime::replay::{
+    shared_results_path, LegacyDigest, SharedResultsEntry, SharedResultsTable,
 };
 /// Re-export the generic seed-plan pipeline (pure builder, diverged-read
 /// classification, ambient template) so the harness materializes seeds from
@@ -50,12 +54,27 @@ pub fn runtime_mode_is_disabled() -> bool {
     deja_runtime::runtime_mode().is_disabled()
 }
 
+/// Explicit, per-collection hash seeding: draw a `BuildHasher` whose keys are
+/// recorded and replayed, so a `HashMap`/`HashSet` iterates the same way on
+/// replay as it did when recorded. There is deliberately no `Default` — a
+/// collection cannot become seeded by accident.
+pub use deja_runtime::hash_seed::{
+    hash_seed, DejaBuildHasher, DejaHasher, HashKeys, SeededHashMap, SeededHashSet,
+};
+/// What makes two calls the same call: one order-free identity for the
+/// lookup address and the args diff.
+pub use deja_runtime::identity;
 /// Row identity is read from the schema that owns it, never listed here: the
 /// statement, the registry it feeds, and the lookup consumers use.
 pub use deja_runtime::replay::{
     register_table_identity, table_identity_columns, table_identity_is_registered,
     TABLE_IDENTITY_SQL,
 };
+/// Deterministic values derived from a Substitute miss — the sanctioned way to
+/// total the recording's partial function without invalidating the experiment.
+/// See the module docs for the property ordering (determinism first, honesty
+/// last) and why non-collision is the one that is easy to skip and expensive to.
+pub use deja_runtime::synth;
 /// Re-export the correlation-propagation tracing layer, which mirrors the ingress
 /// `request_id` span field into deja-context so spawned-task boundary events
 /// inherit the request correlation.
@@ -64,14 +83,15 @@ pub use deja_runtime::DejaCorrelationLayer;
 pub use deja_runtime::DejaHook;
 /// Re-export the execution graph tracing layer for framework logger setup.
 pub use deja_runtime::ExecutionGraphLayer;
-/// What a boundary does when its `Substitute` lookup misses. The boundary macro
-/// emits `Absorb` for a site that declares `on_miss`, so the emitted observation
-/// records that the request survived the miss rather than being stopped by it.
-pub use deja_runtime::MissPolicy;
 /// What a `Substitute` boundary missed — the value a boundary's `on_miss`
 /// expression turns into the host's own error. Deja names the miss; the host
 /// decides which of its types can represent one.
 pub use deja_runtime::SubstituteMiss;
+/// How a `Substitute` lookup actually ended — substituted, synthesized, or
+/// stopped. Observed by the seam after the site's reconstruct closure has run,
+/// and stamped onto the emitted observation. Replaces the declared `MissPolicy`,
+/// which could only report what the boundary said it would do.
+pub use deja_runtime::SubstituteOutcome;
 /// Re-export the request-boundary fail-stop guard. A `Substitute` miss stops the
 /// request by panic-unwind (the only type-erased stop available for an arbitrary
 /// return type); actix has no per-request panic isolation, so without this guard
@@ -85,8 +105,8 @@ pub use deja_runtime::{catch_fail_stop, catch_fail_stop_async, FailStop, FAIL_ST
 pub use deja_runtime::{
     flush_global_hook, fork_span, global_hook_from_env, installed_runtime_hook, spawn_fork,
     AsyncRecordWriter, BoundaryEvent, CompositeSink, DejaRecord, DisabledHook, EventBuilder,
-    Fidelity, GraphNodeSink, JsonlSink, LazyEventFinalizer, MarkerKind, Provenance, RecordSink,
-    RecordedOutput, RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot,
+    Fidelity, GraphNodeSink, JsonlSink, LazyEventFinalizer, MarkerKind, Payload, Provenance,
+    RecordSink, RecordedOutput, RecordingHook, SinkPolicy, WriterConfig, WriterStatsSnapshot,
     CURRENT_EVENT_SCHEMA_VERSION, ROLE_INGRESS,
 };
 /// Re-export callsite identity and runtime hook primitives for the
@@ -99,7 +119,8 @@ pub use deja_runtime::{
 };
 /// Re-export replay primitives so `deja::*` consumers get the full replay API.
 pub use deja_runtime::{
-    ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
+    is_pure_boundary, ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook,
+    ReplayReport,
 };
 /// Re-export the declarative boundary primitives: the per-site
 /// [`ReplayStrategy`] enum selects Execute or Substitute behavior, while
@@ -153,6 +174,15 @@ pub fn replay_key_namespace() -> Option<String> {
 #[must_use]
 pub fn current_correlation_id() -> Option<String> {
     deja_context::current_correlation_id()
+}
+
+/// The current correlation ID, or `None` if this thread cannot answer.
+///
+/// The teardown-safe twin of [`current_correlation_id`]. Use this one from any
+/// path that can run inside a destructor; see
+/// [`deja_context::try_current_correlation_id`] for why.
+pub fn try_current_correlation_id() -> Option<String> {
+    deja_context::try_current_correlation_id()
 }
 
 /// The per-correlation **pg schema** name used for DB isolation during replay
@@ -515,6 +545,42 @@ pub mod value {
         /// maps them to their own write commands instead (#39) — and the
         /// non-value shapes (status replies, attribute/verbatim/push frames,
         /// the unsupported catch), which no `SET` can faithfully reproduce.
+        /// The exact bytes `SET key <value>` must write, for the families that
+        /// are one value.
+        ///
+        /// Prefer this over [`to_redis_string`](Self::to_redis_string) on any
+        /// path that writes to redis. A recorded value is frequently NOT UTF-8:
+        /// the locker holds encrypted payment-method payloads, and one of them
+        /// is what showed this up — `BulkString([171, 143, 136, 250, …])`, which
+        /// `from_utf8_lossy` rewrites into replacement characters before the
+        /// seeder ever sees it. The lossy form is the right answer for a log
+        /// line or a certificate field a human reads; it is the wrong answer for
+        /// the write itself, because the value the candidate reads back is then
+        /// not the value the recording captured.
+        ///
+        /// `None` means the same as it does for the string form: nothing to
+        /// write, or not one value.
+        pub fn to_redis_bytes(&self) -> Option<Vec<u8>> {
+            match self {
+                Self::BulkString(bytes) => Some(bytes.clone()),
+                // The remaining single-value families are textual by
+                // construction, so their byte form is their string form.
+                Self::Int(_) | Self::SimpleString(_) | Self::Double(_) | Self::Boolean(_) => {
+                    self.to_redis_string().map(String::into_bytes)
+                }
+                Self::Null
+                | Self::Array(_)
+                | Self::Map(_)
+                | Self::Set(_)
+                | Self::Okay
+                | Self::Queued
+                | Self::Attribute { .. }
+                | Self::VerbatimString { .. }
+                | Self::Push { .. }
+                | Self::UnsupportedSuccessfulValue { .. } => None,
+            }
+        }
+
         pub fn to_redis_string(&self) -> Option<String> {
             match self {
                 Self::Null => None,
@@ -947,7 +1013,7 @@ pub mod codec {
         }
 
         fn reconstruct(recorded: serde_json::Value) -> Option<R> {
-            serde_json::from_value::<R>(recorded).ok()
+            crate::canonical::from_value::<R>(recorded).ok()
         }
     }
 
@@ -1008,7 +1074,7 @@ pub mod codec {
             match object.get("result").and_then(serde_json::Value::as_str) {
                 Some("Ok") => {
                     let value = object.get("value")?;
-                    let inner: T = serde_json::from_value(value.clone()).ok()?;
+                    let inner: T = crate::canonical::from_value(value.clone()).ok()?;
                     Some(Ok(inner))
                 }
                 Some("Err") => {
@@ -1016,7 +1082,7 @@ pub mod codec {
                     // A `kind` that no longer names a variant of the candidate's
                     // error type is a reconstruction FAILURE (never a silent
                     // fabrication) — the seam fail-stops on it.
-                    let context: E = serde_json::from_value(kind.clone()).ok()?;
+                    let context: E = crate::canonical::from_value(kind.clone()).ok()?;
                     Some(Err(error_stack::report!(context)))
                 }
                 _ => None,
@@ -1111,6 +1177,12 @@ pub mod db {
     pub use deja_diesel::{
         first_captured, get_result_captured, get_results_captured, TableIdentityRow,
     };
+
+    /// Capture a query as its statement plus its bind values as plain JSON,
+    /// keyed by placeholder, instead of diesel's `-- binds: [...]` debug
+    /// rendering, which printed a map in its iteration order.
+    #[cfg(feature = "diesel-pg")]
+    pub use deja_diesel::{capture_query, CapturedQuery};
 
     /// Build the database request payload common to Diesel helpers. Borrows
     /// its inputs so boundary-attribute exprs can evaluate it eagerly while the
@@ -1474,9 +1546,6 @@ pub mod db {
     /// partial key does not identify a row — and any bind list that does not
     /// parse yields no keys (never a guess).
     pub fn binds_read_keys(table: &str, sql: &str) -> Vec<String> {
-        let Some(identity) = deja_runtime::replay::table_identity_columns(table) else {
-            return Vec::new();
-        };
         let Some(binds_at) = sql.rfind(" -- binds: ") else {
             return Vec::new();
         };
@@ -1489,76 +1558,15 @@ pub mod db {
             return Vec::new();
         };
 
-        /// Every value this statement binds by equality to `column`, in the
-        /// order the predicates appear.
-        fn bound_values<'a>(
-            query: &str,
-            binds: &'a [serde_json::Value],
-            column: &str,
-        ) -> Vec<&'a serde_json::Value> {
-            let needle = format!("\"{column}\" = $");
-            let mut values = Vec::new();
-            let mut cursor = 0;
-            while let Some(found) = query[cursor..].find(&needle) {
-                let digits_start = cursor + found + needle.len();
-                let digits: String = query[digits_start..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                cursor = digits_start;
-                if let Some(value) = digits
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|position| position.checked_sub(1))
-                    .and_then(|index| binds.get(index))
-                {
-                    values.push(value);
-                }
-            }
-            values
-        }
-
-        // One row per equality predicate on the FIRST key column, each
-        // completed by the other key columns' bound values. A statement that
-        // binds one key column several times (an `IN`-style rewrite) but the
-        // rest only once still addresses one row per leading value, so the
-        // remaining columns reuse their single binding.
-        let mut per_column: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
-        for column in identity {
-            let values = bound_values(query, &binds, &column);
-            if values.is_empty() {
-                // A key column this statement does not constrain: the
-                // predicate cannot name a single row, so produce nothing.
-                return Vec::new();
-            }
-            per_column.push((column, values));
-        }
-        let Some((_, leading)) = per_column.first() else {
-            return Vec::new();
-        };
-
-        let mut keys = Vec::new();
-        for index in 0..leading.len() {
-            let row: serde_json::Map<String, serde_json::Value> = per_column
-                .iter()
-                .map(|(column, values)| {
-                    let value = values.get(index).or_else(|| values.first());
-                    (
-                        column.clone(),
-                        value.map_or(serde_json::Value::Null, |value| (*value).clone()),
-                    )
-                })
-                .collect();
-            if let Some(key) =
-                deja_runtime::replay::db_row_state_key(table, &serde_json::Value::Object(row))
-            {
-                let wire = key.to_wire();
+        deja_runtime::replay::row_keys_for_binds(table, query, &binds)
+            .into_iter()
+            .map(|key| key.to_wire())
+            .fold(Vec::new(), |mut keys, wire| {
                 if !keys.contains(&wire) {
                     keys.push(wire);
                 }
-            }
-        }
-        keys
+                keys
+            })
     }
 
     /// Explicit producer API for one DB query result: the full
@@ -1961,14 +1969,22 @@ pub mod __private {
     // subsumed by `dispatch`).
     #[allow(deprecated)]
     pub use deja_runtime::{
-        boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_or_miss,
-        dispatch_or_miss, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
+        boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_serving,
+        dispatch_serving, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
         fail_stop_absent_executor, fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss,
         finish_boundary_event, next_boundary_occurrence, observation_is_active,
         record_boundary_async, record_boundary_async_lazy, record_boundary_sync,
         record_boundary_sync_lazy, replay_boundary, replay_is_active, runtime_mode,
-        stable_callsite_hash, BoundarySpec, CallsiteIdentity, CallsiteSource, CrossingObservation,
-        ExecuteMode, ExecuteShadowToken, Reconstructed, RecordedOutput, RuntimeMode,
+        stable_callsite_hash, substitute_observe_boundary, substitute_peek_boundary, BoundarySpec,
+        CallsiteIdentity, CallsiteSource, CrossingObservation, ExecuteMode, ExecuteShadowToken,
+        ReconstructInput, Reconstructed, RecordedOutput, RuntimeMode, SubstituteOutcome,
+        SubstitutePeek, SubstituteToken,
+    };
+    // The round-trip comparator every dispatch call passes: the recorder
+    // compares each recorded value with its rebuilt copy.
+    pub use deja_runtime::{
+        compare, round_trip,
+        round_trip::{Comparison, RoundTrip, MAX_CHECKED_BYTES},
     };
     // Declarative boundary model: the per-site `ReplayStrategy` enum selects
     // Execute or Substitute behavior, and `BoundarySemantics` is the descriptor
@@ -2355,5 +2371,65 @@ mod db_result_tests {
             }
             _ => panic!("expected Err payload"),
         }
+    }
+}
+
+#[cfg(test)]
+mod optional_return_round_trip {
+    use crate::codec::{ReplayCodec, SerdeCodec};
+
+    /// A `Substitute` boundary returning `Some(None)` must replay `Some(None)`.
+    ///
+    /// `Cache::get_val<T>` returns `Option<T>`, and a config lookup instantiates
+    /// `T = Option<Config>`, so the captured type is `Option<Option<_>>`. Serde
+    /// flattens both arms onto JSON `null`: a cache HIT holding "this config does
+    /// not exist" records the same byte as a cache MISS, and replay reads the
+    /// miss. The site then runs its populate path — a redis read, a db find and a
+    /// redis write the recording never made — and every one of them is a blocking
+    /// novel call. It was the first divergence in 325 of 376 failing correlations
+    /// on one self-replay.
+    #[test]
+    fn a_present_none_is_not_an_absent_one() {
+        type Cached = Option<Option<String>>;
+        let hit_holding_nothing: Cached = Some(None);
+        let miss: Cached = None;
+
+        let (hit_json, _) = SerdeCodec::<Cached>::capture(&hit_holding_nothing);
+        let (miss_json, _) = SerdeCodec::<Cached>::capture(&miss);
+
+        // Vacuity guard: both must actually capture, or the assertions below
+        // are about a failure to serialise rather than about the encoding.
+        assert!(
+            SerdeCodec::<Cached>::reconstruct(hit_json.clone()).is_some(),
+            "the hit must round-trip at all"
+        );
+
+        assert_ne!(
+            hit_json, miss_json,
+            "a cache hit holding None and a cache miss must not be the same byte"
+        );
+        assert_eq!(
+            SerdeCodec::<Cached>::reconstruct(hit_json),
+            Some(Some(None)),
+            "and the hit must come back as a hit"
+        );
+        assert_eq!(
+            SerdeCodec::<Cached>::reconstruct(miss_json),
+            Some(None),
+            "while the miss still comes back as a miss"
+        );
+    }
+
+    /// Arguments share the result encoding, so two calls that differ only in
+    /// `Some(None)` against `None` get two different lookup keys.
+    #[test]
+    fn an_argument_encodes_a_present_none_as_a_result_does() {
+        let present: Option<Option<String>> = Some(None);
+        let absent: Option<Option<String>> = None;
+        let (as_result, _) = SerdeCodec::<Option<Option<String>>>::capture(&present);
+        assert_ne!(as_result, serde_json::Value::Null);
+        assert_eq!(crate::capture!(present), as_result);
+        assert_eq!(crate::value::serialize(&present), as_result);
+        assert_eq!(crate::capture!(absent), serde_json::Value::Null);
     }
 }

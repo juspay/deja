@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod artifact_kinds;
+pub mod change_coverage;
 pub mod codebundle;
 pub mod config_layer;
 pub mod divergence;
@@ -143,6 +145,130 @@ impl SchemaFingerprint {
     }
 }
 
+/// A run id that is safe to use as a path component: the orchestrator mints
+/// ids from a fixed alphabet, so anything carrying a path separator or a
+/// parent reference is not a run id and should never reach a handler as one.
+///
+/// This is the ONE place that check is spelled out. A handler that names a
+/// file beside a run extracts `Path<RunId>` instead of `Path<String>` — the
+/// validation happens during extraction, before the handler body runs, so
+/// there is nothing for a new handler to remember to call and nothing for an
+/// existing one to have skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RunId(String);
+
+impl RunId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RunId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for RunId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A candidate run id that is not one: empty, too long, carrying a path
+/// separator, a parent reference, or a character outside the id alphabet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidRunId(pub String);
+
+impl std::fmt::Display for InvalidRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run id must be plain: letters, digits, '-', '_' and '.'")
+    }
+}
+
+impl std::error::Error for InvalidRunId {}
+
+impl std::str::FromStr for RunId {
+    type Err = InvalidRunId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let plain = !s.is_empty()
+            && s.len() <= 200
+            && !s.starts_with('.')
+            && !s.contains("..")
+            && !s.contains('/')
+            && !s.contains('\\')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if plain {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(InvalidRunId(s.to_owned()))
+        }
+    }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for RunId
+where
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::response::IntoResponse;
+        let axum::extract::Path(raw) =
+            axum::extract::Path::<String>::from_request_parts(parts, state)
+                .await
+                .map_err(axum::response::IntoResponse::into_response)?;
+        raw.parse::<RunId>().map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": e.to_string() }).to_string(),
+            )
+                .into_response()
+        })
+    }
+}
+
+#[cfg(test)]
+mod run_id_tests {
+    use super::RunId;
+
+    #[test]
+    fn a_run_id_that_could_name_another_path_is_refused() {
+        assert!("rp-sbx-60d382c2ee-unresolved-0916172101607"
+            .parse::<RunId>()
+            .is_ok());
+        assert!("run-1787741712798218945".parse::<RunId>().is_ok());
+        assert!("".parse::<RunId>().is_err());
+        assert!("../runs/other".parse::<RunId>().is_err());
+        assert!("a/b".parse::<RunId>().is_err());
+        assert!("a\\b".parse::<RunId>().is_err());
+        assert!(".hidden".parse::<RunId>().is_err());
+        assert!("x..y".parse::<RunId>().is_err());
+        assert!("id with space".parse::<RunId>().is_err());
+    }
+
+    #[test]
+    fn a_valid_run_id_derefs_to_the_str_a_path_is_built_from() {
+        let id: RunId = "run-1".parse().expect("plain id");
+        let path: &str = &id;
+        assert_eq!(path, "run-1");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
@@ -263,6 +389,20 @@ pub struct RunSpec {
     /// the SESSION FILTER (the envelope's `capture.session_id`); leave unset
     /// to auto-resolve when the scanned prefix holds exactly one session.
     pub recording_id: Option<String>,
+    /// For mode=replay: drive a DEPLOYMENT'S DAY rather than one pod's slice.
+    ///
+    /// `<revision>-<MMDD>`, the value a recording reports as its `group`. The
+    /// recordings of one deployment on one day are spread across however many
+    /// pods served it — seventy-five on the day this was measured, because pods
+    /// are replaced every thirty minutes — so naming one of them replays a
+    /// fraction for no reason a caller could state.
+    ///
+    /// Resolved to its members when the tape is pulled, and the members are
+    /// recorded in the ingest report, so what a run actually drove is
+    /// answerable afterwards rather than inferred from a group name that may
+    /// have grown since. Mutually exclusive with `recording_id`: naming both
+    /// would leave which one won to be discovered.
+    pub recording_group: Option<String>,
     /// For mode=replay: pull the recording from an arbitrary S3 prefix in the
     /// deployed aggregator layout (date-partitioned gzip envelope NDJSON)
     /// instead of the demo MinIO session layout.
@@ -285,9 +425,43 @@ pub struct RunSpec {
     /// namespace (hyperswitch) are untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scored_span_namespaces: Vec<String>,
+    /// For mode=replay: the run this one is to be measured against, three-way
+    /// with the tape as ancestor — main at the merge-base, replayed on the
+    /// same recording. Set by the pipeline that created both runs. The report
+    /// shows the delta beside the tape-relative verdict; nothing that decides
+    /// the tape-relative verdict reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_against: Option<String>,
+    /// Why the run exists, when it is not a candidate under test: `baseline`
+    /// for a replay of main that other runs are measured against. Displayed;
+    /// never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// What the candidate is, in the words of whoever created the run: for
+    /// a pull request its number and title, for a baseline the main commit
+    /// and which branch's merge-base it is. Displayed on the report beside
+    /// the image tag; never parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl RunSpec {
+    /// The span namespaces this run scores: the run's own list when it gave
+    /// one, otherwise the system's declaration.
+    ///
+    /// THE resolution, for every reader. The stored params row already
+    /// resolved it this way, so `/runs/{id}` showed `["ucs::", "connector::"]`
+    /// on every prism run — while the scorer read the raw spec, found the empty
+    /// list a CI-created run carries, and silently checked no span at all. A
+    /// renamed `ucs::` span passed replay on a run whose own record said the
+    /// contract was in force.
+    pub fn effective_scored_span_namespaces(&self) -> Vec<String> {
+        if self.scored_span_namespaces.is_empty() {
+            system::system_config(self.system()).scored_span_namespaces
+        } else {
+            self.scored_span_namespaces.clone()
+        }
+    }
     /// The system under test with the default applied — never read the raw
     /// field for dispatch.
     pub fn system(&self) -> &str {
@@ -361,6 +535,12 @@ pub struct RunParams {
     /// fact about the run, not a field that happens to be missing.
     #[serde(default)]
     pub recording_id: Option<String>,
+    /// The deployment-day group, when the run named one instead of a single
+    /// recording. Recorded for the same reason as `recording_id`, and because
+    /// without it this row cannot say what the run was asked to drive: a group
+    /// run's `recording_id` is unset until the tape is pulled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_source: Option<S3Source>,
     /// The driven test-case subset, normalized. `None` = the entire session,
@@ -373,6 +553,12 @@ pub struct RunParams {
     pub scored_span_namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expectation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_against: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl RunParams {
@@ -384,6 +570,7 @@ impl RunParams {
             system_under_test: spec.system_under_test.clone(),
             candidate_repo: spec.candidate_repo.clone(),
             recording_id: spec.recording_id.clone(),
+            recording_group: spec.recording_group.clone(),
             s3_source: spec.s3_source.clone(),
             correlation_filter: scope::RunScope::of_spec(spec)
                 .ids()
@@ -397,12 +584,11 @@ impl RunParams {
             // reachable only by whoever went through that form. A run created
             // by the API or by CI got an empty list and silently scored
             // nothing, for the same system.
-            scored_span_namespaces: if spec.scored_span_namespaces.is_empty() {
-                system::system_config(spec.system()).scored_span_namespaces
-            } else {
-                spec.scored_span_namespaces.clone()
-            },
+            scored_span_namespaces: spec.effective_scored_span_namespaces(),
             expectation: expectation.map(str::to_owned),
+            delta_against: spec.delta_against.clone(),
+            purpose: spec.purpose.clone(),
+            label: spec.label.clone(),
         }
     }
 
@@ -434,7 +620,8 @@ impl RunParams {
 pub struct S3Source {
     /// `s3://bucket/prefix` (scheme optional).
     pub path: String,
-    /// AWS region; defaults to the orchestrator env's `DEJA_S3_REGION`.
+    /// AWS region; defaults to the orchestrator env's `DEJA_S3_REGION`, then to
+    /// the bucket's own region (see `deja_compactor::choose_region`).
     #[serde(default)]
     pub region: Option<String>,
     /// Custom endpoint (MinIO etc.); defaults to the region's AWS endpoint.
@@ -459,13 +646,23 @@ impl S3Source {
         }
         let mut cfg = s3::S3Config::from_env();
         cfg.bucket = bucket.to_owned();
+        // The path spells its key from the bucket's root, so no system prefix
+        // applies on top of it.
+        cfg.prefix = String::new();
         if let Some(region) = &self.region {
-            cfg.region = region.clone();
+            cfg.region = Some(region.clone());
         }
-        cfg.endpoint = self
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", cfg.region));
+        cfg.endpoint = match &self.endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => {
+                // Cleared before the region is chosen, so the environment's
+                // endpoint cannot decide the region of a bucket it is not for.
+                cfg.endpoint.clear();
+                let region = cfg.effective_region();
+                cfg.region = Some(region.clone());
+                format!("https://s3.{region}.amazonaws.com")
+            }
+        };
         cfg.allow_http = cfg.endpoint.starts_with("http://");
         Ok((cfg, prefix.trim_matches('/').to_owned()))
     }
@@ -549,11 +746,19 @@ pub enum RecordingIdentity {
         instance: String,
     },
     /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
-    /// boot. The prism recorder always mints these — but so did the router
-    /// recorder before ids carried a revision, so the SHAPE alone does not
-    /// name the system; a router tape wearing this id was once badged "prism"
-    /// and replayed against a prism candidate, which reset every connection.
-    /// The `inst=` pod names captured by the scan are the discriminator.
+    /// boot. Both recorders once minted these — prism until it moved to the
+    /// described form, and the router before ids carried a revision — so the
+    /// SHAPE alone does not name the system; a router tape wearing this id was
+    /// once badged "prism" and replayed against a prism candidate, which reset
+    /// every connection. The `inst=` pod names captured by the scan are the
+    /// discriminator.
+    ///
+    /// It is a legacy shape now rather than anyone's default: of the sixteen
+    /// prism recordings live when this was written, fifteen were `rec-` and the
+    /// one boot-derived tape was from a `pi-1-<nanos>` instance outside the
+    /// deployment. Both systems mint described ids today, which is why grouping
+    /// works for both — see `group_of`, which cannot group this variant because
+    /// a boot id carries no day.
     BootDerived {
         /// Nanoseconds since the epoch at recorder boot, as recorded.
         booted_at_nanos: String,
@@ -610,6 +815,47 @@ pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
         revision: revision.to_owned(),
         recorded_at: recorded_at.to_owned(),
         instance: instance.to_owned(),
+    }
+}
+
+/// The deployment-and-day a recording belongs to, or `None` when its id does not
+/// name BOTH a revision and a start date.
+///
+/// Both, and the distinction is live rather than theoretical. A row's
+/// `identity.revision` can come from the MANIFEST when the id does not carry
+/// one (`revision_source: "manifest"`), so a boot-derived recording can report
+/// a revision and still have no group — `run-1789076520165195354` does exactly
+/// that today, with revision `28d8299` and 59 correlations. The manifest
+/// supplies the revision; nothing supplies the day, because the id has no start
+/// date and the recording's own `latest_date` is the day it last WROTE, which
+/// for a session straddling midnight is not the day it belongs to.
+///
+/// Grouping it by the wrong day would put a recording in a selection whose
+/// scope nobody named, which is worse than leaving it ungroupable: the pipeline
+/// already excludes these on the main-deployment test, so nothing is lost by
+/// declining to guess.
+///
+/// `<revision>-<MMDD>`, derived rather than stored. The id ALREADY carries the
+/// minute a recording started, so the day is a prefix of something every
+/// recording has had all along — no new id shape, nothing to mint, and every
+/// recording ever sealed is groupable the moment this ships.
+///
+/// This is the unit a replay actually wants. A pod's recording is an arbitrary
+/// slice: pods are replaced every thirty minutes, so "the traffic this
+/// deployment served that day" is spread across dozens of them — 82 on the day
+/// this was measured — and picking one is picking a fraction for no reason a
+/// caller could state.
+pub fn group_of(identity: &RecordingIdentity) -> Option<String> {
+    match identity {
+        RecordingIdentity::Described {
+            revision,
+            recorded_at,
+            ..
+        } => Some(format!(
+            "{revision}-{}",
+            &recorded_at[..4.min(recorded_at.len())]
+        )),
+        _ => None,
     }
 }
 
@@ -782,6 +1028,19 @@ pub struct HarnessRoot {
     pub root: PathBuf,
 }
 
+/// Where each derived cache sits, named off the file it is built from. The
+/// handlers derive from a resolved path and the accessors from a run id; both
+/// go through these, so the artifact-cache sweep recognises what they write.
+pub fn behaviour_tree_cache_of(ledger: &std::path::Path) -> PathBuf {
+    ledger.with_extension("behaviour-tree.jsonl")
+}
+pub fn delta_cache_of(ledger: &std::path::Path) -> PathBuf {
+    ledger.with_extension("delta.json")
+}
+pub fn change_coverage_cache_of(observed: &std::path::Path) -> PathBuf {
+    observed.with_extension("change-coverage.json")
+}
+
 impl HarnessRoot {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
@@ -834,6 +1093,20 @@ impl HarnessRoot {
         self.root
             .join("runs")
             .join(format!("{run_id}.call-ledger.jsonl"))
+    }
+    /// The run as a behaviour tree (one address per line), the projection two
+    /// runs on one tape are compared through. Named off the ledger it is
+    /// built from.
+    pub fn behaviour_tree_path(&self, run_id: &str) -> PathBuf {
+        behaviour_tree_cache_of(&self.call_ledger_path(run_id))
+    }
+    /// The cached delta document for a run measured against its baseline.
+    pub fn delta_cache_path(&self, run_id: &str) -> PathBuf {
+        delta_cache_of(&self.call_ledger_path(run_id))
+    }
+    /// The cached change-coverage document for a run.
+    pub fn change_coverage_path(&self, run_id: &str) -> PathBuf {
+        change_coverage_cache_of(&self.observed_path(run_id))
     }
     /// Record-side execution-graph nodes for a run, extracted from the recording
     /// tape (span STRUCTURE only — no boundary payloads). Published as a run
@@ -1147,11 +1420,48 @@ mod system_env_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod s3_source_tests {
+    use super::*;
+
+    /// The unsealed pull hands a located landing prefix to the prefix scan as
+    /// a URI. The prefix it located is relative to the system's root; the URI
+    /// is read from the bucket's root. So the system prefix goes into the URI
+    /// once, and the config parsed back out of it applies none of its own.
+    #[test]
+    fn a_located_prefix_round_trips_through_its_uri() {
+        let located = s3::S3Config {
+            endpoint: String::new(),
+            bucket: "shared".to_owned(),
+            prefix: "prism/".to_owned(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: Some("ap-south-2".to_owned()),
+            allow_http: false,
+        };
+        let source = S3Source {
+            path: located.uri("landing/v1/session=s1"),
+            region: located.region.clone(),
+            endpoint: None,
+        };
+        let (cfg, prefix) = source.to_config().unwrap();
+        assert_eq!(source.path, "s3://shared/prism/landing/v1/session=s1");
+        assert_eq!(cfg.bucket, "shared");
+        assert_eq!(cfg.prefix, "", "the URI already spells the prefix");
+        assert_eq!(prefix, "prism/landing/v1/session=s1");
+        assert_eq!(cfg.endpoint, "https://s3.ap-south-2.amazonaws.com");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod run_params_tests {
     use super::*;
 
     fn replay_spec() -> RunSpec {
         RunSpec {
+            label: None,
+            delta_against: None,
+            purpose: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,
             system_under_test: None,
@@ -1160,6 +1470,7 @@ mod run_params_tests {
             },
             candidate_repo: None,
             recording_id: None,
+            recording_group: None,
             s3_source: Some(S3Source {
                 path: "s3://deja/recordings/2026-08-05".to_owned(),
                 region: None,
@@ -1173,6 +1484,33 @@ mod run_params_tests {
             ]),
             workload: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn a_run_records_what_it_is_measured_against_and_why_it_exists() {
+        let mut spec = replay_spec();
+        spec.delta_against = Some("rp-sbx-main-1".into());
+        spec.purpose = Some("baseline".into());
+        spec.label = Some("main at 147f435ade, merge-base of PR #2338".into());
+        let params = RunParams::resolved(&spec, None);
+        assert_eq!(params.delta_against.as_deref(), Some("rp-sbx-main-1"));
+        assert_eq!(params.purpose.as_deref(), Some("baseline"));
+        assert!(params.label.as_deref().unwrap().starts_with("main at"));
+        let back = RunParams::from_stored(&params.to_json()).unwrap();
+        assert_eq!(back, params, "both fields survive the stored row");
+        let plain = RunParams::resolved(&replay_spec(), None).to_json();
+        assert!(
+            plain.get("delta_against").is_none(),
+            "absent fields are not written"
+        );
+        assert!(plain.get("purpose").is_none());
+        assert!(
+            plain.get("label").is_none(),
+            "an unlabelled run serialises as before"
+        );
+        // The spec is persisted too, inside every run record.
+        let spec = serde_json::to_value(replay_spec()).unwrap();
+        assert!(spec.get("label").is_none(), "nor does an unlabelled spec");
     }
 
     #[test]
@@ -1241,6 +1579,29 @@ mod run_params_tests {
             serde_json::to_value(&spec.candidate_spec).unwrap(),
             serde_json::to_value(&params.candidate_spec).unwrap()
         );
+    }
+
+    /// The row is the only durable record of what a run was asked to drive, and
+    /// a GROUP run's `recording_id` is unset until the tape is pulled — so a row
+    /// without the group says nothing about what that run was for, and a report
+    /// built from it (or a rerun posted from it) would name the wrong thing.
+    #[test]
+    fn a_group_run_records_the_group_it_was_asked_to_drive() {
+        let mut spec = replay_spec();
+        spec.recording_group = Some("9e7e428a89-0917".to_owned());
+        spec.recording_id = None;
+
+        let stored = RunParams::resolved(&spec, Some("pass")).to_json();
+
+        assert_eq!(
+            stored.get("recording_group").and_then(|v| v.as_str()),
+            Some("9e7e428a89-0917")
+        );
+        // …and the row still reads back as a request the create endpoint takes,
+        // group included, so a run is reproducible from its own record.
+        let reposted: RunSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(reposted.recording_group, spec.recording_group);
+        assert_eq!(reposted.recording_id, None);
     }
 
     #[test]

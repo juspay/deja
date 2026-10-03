@@ -63,12 +63,49 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `serde_json::Value`. `result` receives `__deja_result` as `&Output` and must
 /// return `(serde_json::Value, bool)`, where the bool marks errors.
 ///
+/// # `site` — naming a call site yourself
+///
+/// ```ignore
+/// #[deja::boundary(boundary = "imc", site = "routing::eligible_connectors")]
+/// async fn get_val<T>(&self, key: CacheKey) -> Option<T> { … }
+/// ```
+///
+/// Every locus deja uses is normally DERIVED — it works out where a call is
+/// from the span stack, the module path, the source location. Derivation is
+/// right almost always: span paths resolve 99.99% of calls across 155,419
+/// measured resolutions. `site` is the escape hatch for the cases where it is
+/// not, such as a call reached from many spans that should be treated as one
+/// site.
+///
+/// A declared site is the STRONGEST locus (rank 1) and purely ADDITIVE: every
+/// derived locus is still emitted behind it, so a name present on only one side
+/// — because someone added or renamed it — misses at rank 1 and falls through
+/// rather than invalidating the tape.
+///
+/// The cost is that the name must be kept stable by hand, which is why it is
+/// opt-in and expected to stay rare. Prefer letting deja derive the locus; reach
+/// for this when you have evidence derivation is addressing a site wrongly.
+///
 /// # `on_miss` — a declared Substitute-miss value
 ///
 /// By default a `Substitute` boundary whose replay lookup MISSES fail-stops: it
 /// panics, the host's request guard contains the unwind, and the correlation is
 /// scored as a stop. `on_miss = <expr>` replaces that continuation with a value
-/// the DECLARATION SITE supplies:
+/// the DECLARATION SITE supplies.
+///
+/// Mechanically it is sugar for the MISS ARM of the reconstruct closure the
+/// macro already emits: `on_miss = <expr>` becomes
+/// `Reconstructed::Synthesized(<expr>)`, and declaring nothing becomes
+/// `Reconstructed::NoValue`, which is the fail-stop. Both go through one seam.
+///
+/// The value must be a function of the miss — see `__deja_miss` below — and not
+/// of anything ambient. Determinism is the property that matters, ahead of
+/// honesty: replay needs `same query -> same value, every run`, or two replays
+/// of one candidate against one tape disagree with each other and "the candidate
+/// changed" cannot be told apart from "the fabrication changed". Answering a
+/// miss by running the real computation is the most honest option and the worst
+/// one — at a `deja::id` seam it reintroduces exactly the entropy the seam
+/// exists to remove, on the calls the seam failed to cover.
 ///
 /// ```ignore
 /// #[deja::boundary(boundary = "imc", replay = Substitute, on_miss = None)]
@@ -83,18 +120,23 @@ pub fn recordable(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// constructs the host's error: it cannot name an `E` a `replay_ok` site never
 /// declares. The site can, which is the whole inversion.
 ///
-/// This does NOT hide the miss. The blocking NovelCall divergence is emitted by
-/// the lookup before `on_miss` is reached; only the continuation changes, so the
-/// subtree that needed the value diverges and the graph tier localises it
-/// instead of the request dying with no response at all.
+/// This does NOT hide the miss. The seam emits the NovelCall divergence before
+/// it returns the value; only the continuation changes, so the subtree that
+/// needed the value diverges and the graph tier localises it instead of the
+/// request dying with no response at all. That row is NON-blocking, which is
+/// the same fact said twice: a novel call blocks only when it stopped the
+/// request.
 ///
 /// Legality is the declaration's burden. `None` from a cache read is honest —
 /// it means "not in cache", which is TRUE on replay, and the caller's fallback
 /// is separately instrumented. A fabricated egress response is not: it claims a
 /// third party answered when none did, and launders the divergence into a false
-/// pass. Egress (http/grpc) keeps the fail-stop default. `on_miss` on a site
-/// that resolves to `replay = Execute` is rejected at build: that branch never
-/// reaches the Substitute-miss arm, so the declaration would be dead.
+/// pass. Egress (http/grpc) declares no `on_miss`. A call there whose address
+/// the recording holds under other args is served that recording by the lookup
+/// hook and marked `arg_divergent`, which the orchestrator scores as a blocking
+/// divergence; a call the recording never made still fail-stops. `on_miss` on
+/// a site that resolves to `replay = Execute` is rejected at build: that branch
+/// never reaches the Substitute-miss arm, so the declaration would be dead.
 #[proc_macro_attribute]
 pub fn boundary(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as boundary::BoundaryArgs);

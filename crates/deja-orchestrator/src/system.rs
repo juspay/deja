@@ -87,6 +87,9 @@ pub struct SystemConfig {
     /// `DEJA_<SYSTEM>_RECORDING_ROOT`. `None` = the deployment-wide root. The
     /// key LAYOUT is shared across systems; only the bucket is per-system.
     pub recording_root: Option<String>,
+    /// The directory inside the bucket this system's roots sit under,
+    /// normalised (no trailing slash). `None` = the bucket root.
+    pub s3_prefix: Option<String>,
     /// Whether the harness migrates this system's postgres, gates its schema
     /// fingerprint, flushes redis and materialises the seed plan.
     pub manages_stores: bool,
@@ -107,9 +110,23 @@ pub struct SystemConfig {
     /// minted a recording when the source bucket does not say. `None` means no
     /// guess is possible, which must read as "unknown", never as "the default".
     pub instance_pattern: Option<String>,
+    /// The anchored prefix of its primary deployment's pod names. Keeps
+    /// recording SELECTION on the main pods and off custom ones, which run
+    /// their own code and whose tapes are not what a pull-request replay wants
+    /// to be compared against. `None` means undeclared, and a caller asking to
+    /// be restricted to main instances is refused naming this field rather than
+    /// served every pod's recordings.
+    pub main_instance_prefix: Option<String>,
     /// Span-name prefixes this system's instrumentation contract declares as
     /// scored. Deja does not know these; the system does, so it declares them.
     pub scored_span_namespaces: Vec<String>,
+    /// `owner/name` of the candidate's source repository, for change coverage.
+    /// `None` = undeclared; the run's `candidate_repo` or `DEJA_CANDIDATE_REPO`
+    /// may still supply it.
+    pub source_repo: Option<String>,
+    /// The branch a candidate's change set is measured against for change
+    /// coverage. `main` when undeclared.
+    pub change_base_ref: String,
     /// Reply canons declared per boundary, in the recorder's own grammar. See
     /// `SystemDeclaration::reply_canons`.
     pub reply_canons: std::collections::BTreeMap<String, String>,
@@ -291,6 +308,10 @@ pub fn system_config(name: &str) -> SystemConfig {
         is_default,
         s3_bucket: clean(d.s3_bucket),
         recording_root: clean(d.recording_root),
+        s3_prefix: d
+            .s3_prefix
+            .as_deref()
+            .and_then(deja_compactor::layout::system_prefix),
         manages_stores: d.manages_stores.unwrap_or(is_default),
         manages_stores_declared: d.manages_stores,
         has_code_bundle: d.has_code_bundle.unwrap_or(is_default),
@@ -302,7 +323,10 @@ pub fn system_config(name: &str) -> SystemConfig {
         candidate_image_repo: clean(d.candidate_image_repo)
             .map(|v| v.trim_end_matches('/').to_owned()),
         instance_pattern: clean(d.instance_pattern),
+        main_instance_prefix: clean(d.main_instance_prefix),
         scored_span_namespaces: d.scored_span_namespaces.unwrap_or_default(),
+        source_repo: clean(d.source_repo),
+        change_base_ref: clean(d.change_base_ref).unwrap_or_else(|| "main".to_owned()),
         reply_canons: reply_canons_resolved.clone(),
         candidate_config_files: d.candidate_config_files,
         code_bundle_uri_env: clean(d.code_bundle_uri_env),
@@ -339,7 +363,11 @@ pub fn system_config(name: &str) -> SystemConfig {
 /// No fallback to the deployment's own bucket. A system that has not declared
 /// where its recordings are is refused BY NAME, because scanning somebody
 /// else's bucket under this system's label does not fail — it answers wrongly.
-pub fn recording_scope(system: &str) -> Result<(String, String), String> {
+///
+/// The bucket comes back with the system's prefix inside it, as one value a
+/// caller applies to its config whole (`RecordingBucket::apply`), and the root
+/// is relative to that prefix.
+pub fn recording_scope(system: &str) -> Result<(RecordingBucket, String), String> {
     let profile = system_config(system);
     let bucket = profile.s3_bucket.ok_or_else(|| {
         format!(
@@ -350,11 +378,20 @@ pub fn recording_scope(system: &str) -> Result<(String, String), String> {
         .recording_root
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_RECORDING_ROOT.to_owned());
-    Ok((bucket, root))
+    Ok((
+        RecordingBucket {
+            bucket,
+            prefix: profile.s3_prefix.unwrap_or_default(),
+        },
+        root,
+    ))
 }
 
-/// The key root a system falls back to when it declares none.
-pub const DEFAULT_RECORDING_ROOT: &str = "landing/v1";
+pub use deja_compactor::RecordingBucket;
+
+/// The key root a system falls back to when it declares none. The compactor's,
+/// so the sealer and the readers cannot disagree about it.
+pub use deja_compactor::DEFAULT_RECORDING_ROOT;
 
 #[must_use]
 pub fn registry() -> Vec<SystemConfig> {
@@ -474,6 +511,28 @@ mod tests {
             "declared, not inherited"
         );
         assert_eq!(h.job_template_key.as_deref(), Some("job.json"));
+        const MAIN: &str = "sbx-hyperswitch-server-";
+        assert_eq!(
+            h.main_instance_prefix.as_deref(),
+            Some(MAIN),
+            "recording selection needs to know which pods are the main deployment"
+        );
+        // The anchor is the point of the field, so the test states it: the
+        // custom deployments must fail this prefix. If someone ever shortens the
+        // declaration to the bare service name, this is what fails.
+        for custom in [
+            "sbx-custom-cug-hyperswitch-server-54d4746479-d2qr7",
+            "sbx-custom-vbt-hyperswitch-server-f984678bf-57vvv",
+        ] {
+            assert!(
+                custom.contains("hyperswitch-server"),
+                "precondition: the custom pod carries the bare service name"
+            );
+            assert!(
+                !custom.starts_with(MAIN),
+                "`{custom}` must not read as the main deployment"
+            );
+        }
         // The document and the comparator are checked against each other here:
         // this is the exact string a deployment writes, in the exact grammar the
         // recorder mints, so the move to a vendor declaration is a copy.
@@ -501,7 +560,36 @@ mod tests {
         assert_eq!(p.s3_bucket.as_deref(), Some("ucs-deja"));
         assert!(!p.manages_stores && !p.has_code_bundle);
         assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
+        // Declared, so a caller asking to be restricted to main instances is
+        // served rather than refused. Asserted as the SELECTION it performs and
+        // not as a string, because the string alone cannot fail usefully: the
+        // prefix has to admit the pods UCS actually deploys and reject a tape
+        // written outside that deployment, and both of those are live today.
+        let main_pods = p
+            .main_instance_prefix
+            .as_deref()
+            .expect("prism declares its primary deployment");
+        assert!(
+            "sbx-custom-hyperswitch-ucs-5dd9b6457d-tbvn6".starts_with(main_pods),
+            "the prefix must admit a UCS deployment pod"
+        );
+        assert!(
+            !"pi-1-1787741712798221595".starts_with(main_pods),
+            "a tape from outside the deployment must not pass as a main instance"
+        );
+        // Anchored, not a substring — the distinction that keeps this from
+        // behaving like `instance_pattern` above.
+        assert!(
+            !"prod-sbx-custom-hyperswitch-ucs-1".starts_with(main_pods),
+            "the prefix is anchored at the start of the pod name"
+        );
         assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
+        assert_eq!(p.source_repo.as_deref(), Some("juspay/hyperswitch-prism"));
+        assert_eq!(
+            h.source_repo, None,
+            "the default system declares none and keeps DEJA_CANDIDATE_REPO"
+        );
+        assert_eq!(p.change_base_ref, "main", "undeclared, so the default");
         assert!(
             p.reply_canons.is_empty(),
             "a canon declared for one system must not reach another"
@@ -542,6 +630,12 @@ candidate_env_prefix = "ROUTER__"
 manages_stores = true
 has_code_bundle = true
 job_template_key = "job.json"
+# Which pods are the PRIMARY deployment. Sandbox also runs custom pods
+# (sbx-custom-cug-…, sbx-custom-vbt-…) which carry their own code and whose
+# tapes are not what a pull-request replay wants to be compared against.
+# Anchored, and it has to be: the custom names contain the bare service name
+# `hyperswitch-server`, so only the `sbx-` boundary separates them.
+main_instance_prefix = "sbx-hyperswitch-server-"
 candidate_config_files = [
   "config/deployments/sandbox.toml",
   "config/deployments/production.toml",
@@ -577,7 +671,18 @@ manages_stores = false
 has_code_bundle = false
 job_template_key = "job.prism.json"
 instance_pattern = "ucs"
-scored_span_namespaces = ["ucs::", "connector::"]"#;
+# Which pods are the PRIMARY deployment. Note this is a `sbx-custom-` name,
+# which for hyperswitch above marks a pod to EXCLUDE: there, custom pods carry
+# their own code and the main deployment is `sbx-hyperswitch-server-`. UCS has
+# no such pair — every pod it records from is `sbx-custom-hyperswitch-ucs-`, so
+# for this system that prefix IS the primary deployment rather than the thing
+# selection avoids. Do not "correct" it to match hyperswitch's shape.
+# What it excludes is the other kind of stray: recordings written outside the
+# deployment entirely, like `pi-1-<nanos>`, which is a boot-derived local tape
+# no pull-request replay wants to be compared against.
+main_instance_prefix = "sbx-custom-hyperswitch-ucs-"
+scored_span_namespaces = ["ucs::", "connector::"]
+source_repo = "juspay/hyperswitch-prism""#;
 
     #[test]
     fn a_declared_system_resolves_every_field() {
@@ -587,6 +692,7 @@ scored_span_namespaces = ["ucs::", "connector::"]"#;
 [systems.regsys-full]
 s3_bucket = "regsys-bucket"
 recording_root = "landing/v9"
+s3_prefix = "regsys/"
 candidate_image_repo = "registry.example/repo/"
 candidate_env_prefix = "X__"
 candidate_run_id_env = "LEGACY_RUN"
@@ -607,6 +713,7 @@ scored_span_namespaces = ["a::", "b::"]
         assert!(!c.is_default);
         assert_eq!(c.s3_bucket.as_deref(), Some("regsys-bucket"));
         assert_eq!(c.recording_root.as_deref(), Some("landing/v9"));
+        assert_eq!(c.s3_prefix.as_deref(), Some("regsys"));
         // Trailing slash stripped, so joining a reference cannot double it.
         assert_eq!(
             c.candidate_image_repo.as_deref(),
@@ -656,17 +763,17 @@ scored_span_namespaces = ["a::", "b::"]
         clear();
 
         assert_eq!(
-            prism.as_ref().map(|(b, _)| b.as_str()),
+            prism.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("ucs-deja"),
             "a prism run pulls from prism's bucket"
         );
         assert_eq!(
-            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("hyperswitch-art")
         );
         assert_ne!(
-            prism.as_ref().map(|(b, _)| b.as_str()),
-            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            prism.as_ref().map(|(b, _)| b.bucket.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
             "and not from each other's"
         );
         assert_eq!(

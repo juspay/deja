@@ -134,10 +134,12 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // boundary calls — that is what a PR is — and the fail-stop default answers
     // the first one by unwinding the request, which censors every other signal in
     // the run. A boundary whose caller has an honest degraded path declares the
-    // value that path expects; the miss is STILL scored (the blocking NovelCall
-    // divergence is emitted by the lookup, before `on_miss` is ever reached), so
-    // the subtree that depended on the missing value diverges and the graph tier
-    // localises it, instead of the whole correlation dying as a 500.
+    // value that path expects; the miss is STILL scored — the lookup emits its
+    // NovelCall divergence before `on_miss` is ever reached — so the subtree
+    // that depended on the value diverges and the graph tier localises it,
+    // instead of the whole correlation dying as a 500. That row is
+    // NON-blocking, and for the same reason: a novel call blocks only when it
+    // stopped the request, and this one continued.
     //
     // This is legal ONLY where the value asserts nothing untrue. `None` from a
     // cache read means "not in cache", which IS true on replay, and the caller's
@@ -146,23 +148,42 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // gave and launders the divergence into a false pass. Egress stays fail-stop;
     // the declaration site, which knows its own return type, decides.
     let on_miss_expr = args.on_miss;
+    let neutral_error_expr = args.neutral_error;
+    let execute_declared = match args.replay.as_ref() {
+        Some(id) => id == "Execute",
+        None => matches!(preset, Preset::Redis),
+    };
+    // A `Substitute` site already returns whatever was recorded, error or not,
+    // and never re-runs; a `neutral_error` there would do nothing, which reads
+    // as protection it is not.
+    if neutral_error_expr.is_some() && !execute_declared {
+        return syn::Error::new_spanned(
+            &sig.ident,
+            "`neutral_error` decides whether an `Execute` site re-runs a recorded \
+             error; a `Substitute` site never re-runs. Declare `replay = Execute` or drop \
+             `neutral_error`",
+        )
+        .to_compile_error();
+    }
+    let (dispatch_async_fn, dispatch_fn, neutral_arg) = match &neutral_error_expr {
+        Some(expr) => (
+            quote!(dispatch_async_serving),
+            quote!(dispatch_serving),
+            quote!(::std::option::Option::Some(#expr),),
+        ),
+        None => (quote!(dispatch_async), quote!(dispatch), quote!()),
+    };
     // `on_miss` under Execute would be dead code: the Execute branch either runs
     // live behind a shadow token or fail-stops on an unavailable one, and never
     // reaches the Substitute-miss arm. A declaration that does nothing is a
     // silent skip, so reject it here rather than let it read as protection.
-    if on_miss_expr.is_some() {
-        let execute_declared = match args.replay.as_ref() {
-            Some(id) => id == "Execute",
-            None => matches!(preset, Preset::Redis),
-        };
-        if execute_declared {
-            return syn::Error::new_spanned(
-                &sig.ident,
-                "`on_miss` applies to the Substitute-miss branch, which an `Execute` \
-                 site never reaches; declare `replay = Substitute` or drop `on_miss`",
-            )
-            .to_compile_error();
-        }
+    if on_miss_expr.is_some() && execute_declared {
+        return syn::Error::new_spanned(
+            &sig.ident,
+            "`on_miss` applies to the Substitute-miss branch, which an `Execute` \
+             site never reaches; declare `replay = Substitute` or drop `on_miss`",
+        )
+        .to_compile_error();
     }
 
     let state_read = args.state_read;
@@ -220,6 +241,28 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // The correlation id used for the occurrence bucket is the explicit
     // correlation (if any) falling back to the ambient one — the same value the
     // recorded event carries — so the renderer and hook bucket identically.
+    // `site = "name"` makes the author's name the call site's identity: source
+    // becomes Explicit and `id` carries the name, which is what lets
+    // `loci_for` emit `Locus::DeclaredSite`. Everything else is unchanged and
+    // still emitted, so a declared site GAINS rank 1 and keeps every derived
+    // locus as fallback — a tag present on only one side degrades to the
+    // derived loci instead of failing.
+    //
+    // The occurrence source moves with it. `next_boundary_occurrence` buckets on
+    // (correlation, source, scope), so leaving the source as `SyntacticHash`
+    // while the identity says `Explicit` would count this site's occurrences in
+    // a bucket nothing else reads. Record and replay both run this same macro,
+    // so they move together.
+    let (identity_source, identity_id) = match &args.site {
+        Some(site) => (
+            quote!(::deja::__private::CallsiteSource::Explicit),
+            quote!(::std::option::Option::Some(#site.to_string())),
+        ),
+        None => (
+            quote!(::deja::__private::CallsiteSource::SyntacticHash),
+            quote!(::std::option::Option::None),
+        ),
+    };
     let identity_build: TokenStream = quote! {
         let __deja_identity_scope: ::std::string::String = { #identity_scope_expr };
         let __deja_identity_correlation: ::std::option::Option<::std::string::String> =
@@ -229,12 +272,12 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
             };
         let __deja_identity = ::deja::__private::CallsiteIdentity {
             version: 1,
-            source: ::deja::__private::CallsiteSource::SyntacticHash,
-            id: ::std::option::Option::None,
+            source: #identity_source,
+            id: #identity_id,
             scope: ::std::option::Option::Some(__deja_identity_scope.clone()),
             occurrence: ::deja::__private::next_boundary_occurrence(
                 __deja_identity_correlation.as_deref(),
-                ::deja::__private::CallsiteSource::SyntacticHash,
+                #identity_source,
                 ::std::option::Option::Some(__deja_identity_scope.as_str()),
             ),
             caller_function: ::std::option::Option::Some(::std::module_path!().to_string()),
@@ -370,7 +413,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                             )
                         );
                     }
-                    match ::serde_json::from_value::<#ok_ty>(__deja_recorded) {
+                    match ::deja::canonical::from_value::<#ok_ty>(__deja_recorded) {
                         ::std::result::Result::Ok(__deja_replayed) =>
                             ::deja::__private::Reconstructed::Value(::std::result::Result::Ok(__deja_replayed)),
                         ::std::result::Result::Err(__deja_err) => ::deja::__private::Reconstructed::Failed(
@@ -385,7 +428,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         }
         CaptureMode::Serde => quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja::__private::Reconstructed<#recon_ty> {
-                match ::serde_json::from_value::<#recon_ty>(__deja_recorded) {
+                match ::deja::canonical::from_value::<#recon_ty>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja::__private::Reconstructed::Value(__deja_replayed),
                     ::std::result::Result::Err(__deja_err) => ::deja::__private::Reconstructed::Failed(
@@ -432,53 +475,59 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         }))
     };
 
-    // Which dispatch seam the shape below names, and the extra argument it takes.
-    // With no `on_miss` this is `dispatch` / `dispatch_async` and an EMPTY extra
-    // argument — byte-identical tokens to before, so no existing boundary changes
-    // behaviour. With `on_miss` it is the `_or_miss` twin plus the miss thunk.
+    // The MISS arm of the same closure. `on_miss = <expr>` is sugar for
+    // "synthesize this"; declaring nothing is sugar for "there is nothing
+    // deterministic to give here, stop" — the pre-existing default, now spelled
+    // as a value the site returns instead of a policy the seam infers.
     //
-    // The marker is built INSIDE the thunk (cold path) but its args image has to
-    // be cloned outside it, because the args value is moved into the lazy args
-    // thunk the seam consumes. That clone is paid per active-path call, so it is
-    // emitted ONLY when the miss expression actually names `__deja_miss`: a miss
-    // value that needs no attribution (`on_miss = None`) costs nothing.
-    let (sync_seam, async_seam, miss_prelude, miss_arg) = match &on_miss_expr {
-        None => (
-            quote!(dispatch),
-            quote!(dispatch_async),
-            TokenStream::new(),
-            TokenStream::new(),
-        ),
-        Some(expr) => {
-            let (prelude, thunk_body) = if mentions_miss_marker(expr) {
-                (
-                    quote! {
-                        let __deja_miss_args = ::std::clone::Clone::clone(&__deja_boundary_args);
-                    },
-                    quote! {
-                        let __deja_miss = ::deja::SubstituteMiss::new(
-                            #boundary,
-                            #component,
-                            #operation,
-                            __deja_miss_args,
-                        );
-                        #expr
-                    },
-                )
-            } else {
-                (TokenStream::new(), quote!(#expr))
-            };
-            // `MissPolicy::Absorb` rides alongside the thunk so the OBSERVATION
-            // can say the miss was absorbed. The hook writes that observation
-            // before the seam ever reaches its miss branch, so without this a
-            // miss the request survived and a miss that killed it are identical
-            // on the wire, and a run gets quieter and less trustworthy at once.
-            (
-                quote!(dispatch_or_miss),
-                quote!(dispatch_async_or_miss),
-                prelude,
-                quote!(::deja::MissPolicy::Absorb, move || { #thunk_body },),
-            )
+    // The seam builds the marker itself and only on the miss branch, so the
+    // args clone that used to be paid on EVERY active call at a boundary with
+    // an `on_miss` is now paid only when a call actually misses. The
+    // `mentions_miss_marker` gate is kept so an `on_miss` that needs no
+    // attribution still costs nothing at all.
+    let miss_arm: TokenStream = match &on_miss_expr {
+        None => quote! {
+            let _ = __deja_miss;
+            ::deja::__private::Reconstructed::NoValue
+        },
+        Some(expr) if mentions_miss_marker(expr) => quote! {
+            let __deja_miss = ::std::clone::Clone::clone(__deja_miss);
+            ::deja::__private::Reconstructed::Synthesized({ #expr })
+        },
+        Some(expr) => quote! {
+            let _ = __deja_miss;
+            ::deja::__private::Reconstructed::Synthesized({ #expr })
+        },
+    };
+
+    // The round-trip check: the recorder rebuilds each value it records
+    // through the site's reconstruct closure and compares the two, when the
+    // type offers a way to compare. A record-only site declares no codec.
+    let compare_closure: TokenStream = match &capture_mode {
+        CaptureMode::Debug => quote! {
+            ::deja::__private::RoundTrip::<
+                fn(&#recon_ty, &#recon_ty) -> ::deja::__private::Comparison
+            >::RecordOnly
+        },
+        _ => quote! { ::deja::__private::round_trip!(#recon_ty) },
+    };
+
+    // ONE closure answers both halves of the lookup. The four capture-mode
+    // closures above stay exactly as they were — they are the HIT arm — and are
+    // wrapped here rather than each growing a miss branch of its own.
+    let reconstruct_closure: TokenStream = {
+        let hit_arm = reconstruct_closure;
+        quote! {
+            |__deja_input: ::deja::__private::ReconstructInput<'_>|
+                -> ::deja::__private::Reconstructed<#recon_ty>
+            {
+                match __deja_input {
+                    ::deja::__private::ReconstructInput::Hit(__deja_recorded) => {
+                        (#hit_arm)(__deja_recorded)
+                    }
+                    ::deja::__private::ReconstructInput::Miss(__deja_miss) => { #miss_arm }
+                }
+            }
         }
     };
 
@@ -514,14 +563,15 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
-                            #miss_prelude
-                            ::deja::__private::#async_seam(
+
+                            ::deja::__private::#dispatch_async_fn(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-                                #miss_arg
+                                #compare_closure,
+                                #neutral_arg
                             ).await
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -549,14 +599,15 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
-                            #miss_prelude
-                            ::std::boxed::Box::pin(::deja::__private::#async_seam(
+
+                            ::std::boxed::Box::pin(::deja::__private::#dispatch_async_fn(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 move || async move { #block.await },
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-                                #miss_arg
+                                #compare_closure,
+                                #neutral_arg
                             ))
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -581,14 +632,15 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                     match #firewalled_prep {
                         ::std::result::Result::Ok((__deja_observation, __deja_boundary_args)) => {
                             #canon_prelude
-                            #miss_prelude
-                            ::deja::__private::#sync_seam(
+
+                            ::deja::__private::#dispatch_fn(
                                 __deja_observation,
                                 move || __deja_boundary_args,
                                 || #block,
                                 #reconstruct_closure,
                                 move |__deja_result| { #result_expr },
-                                #miss_arg
+                                #compare_closure,
+                                #neutral_arg
                             )
                         }
                         ::std::result::Result::Err(_) => { #block }
@@ -1147,6 +1199,27 @@ pub struct InstrumentArgs {
     pub boundary: Option<LitStr>,
     pub component: Option<LitStr>,
     pub operation: Option<LitStr>,
+    /// `site = "name"` — the author NAMES this call site, and that name becomes
+    /// its strongest locus (`Locus::DeclaredSite`, rank 1).
+    ///
+    /// Opt-in and expected to stay rare. Every other locus is DERIVED — deja
+    /// works out where a call is from the span stack, the module path, the
+    /// source location — and derivation is right almost always: span paths
+    /// resolve 99.99% of calls across 155,419 measured resolutions. This is the
+    /// escape hatch for the sites where derivation is wrong, such as a call
+    /// reached from many spans that should be treated as one site.
+    ///
+    /// Before this existed the runtime had the variant and nothing could emit
+    /// it: the macro hardcoded `CallsiteSource::SyntacticHash` with `id: None`,
+    /// so rank 1 was unreachable from any `#[deja::boundary]` and had never
+    /// resolved a single call. A capability nobody can reach is not a
+    /// capability.
+    ///
+    /// The name must be STABLE by hand — that is its cost, and the reason it is
+    /// not the default. Changing it addresses the site somewhere new, so an
+    /// existing tape stops matching it at rank 1 and falls through to the
+    /// derived loci; it degrades rather than breaking.
+    pub site: Option<LitStr>,
     pub args: Option<Expr>,
     pub result: Option<Expr>,
     pub correlation: Option<Expr>,
@@ -1182,6 +1255,15 @@ pub struct InstrumentArgs {
     /// `__deja_result`; the marker is built only when the expression mentions
     /// it, so a miss value that needs no attribution costs no args clone.
     pub on_miss: Option<Expr>,
+    /// STATE-NEUTRAL RECORDED ERROR. `neutral_error = <predicate>`: a closure
+    /// over the boundary's rebuilt return value that says whether a recorded
+    /// error is one that changed no state (a unique violation wrote no row).
+    /// When it holds, an `Execute` site returns this call's own recorded error
+    /// in replay instead of re-running, so the replay does not write a row the
+    /// recording never wrote. Only an `Execute` site re-runs, so it is refused
+    /// on any other. On a generic return type the closure needs its parameter
+    /// annotated (`|out: &Captured<StorageResult<R>>| ...`), or a named fn.
+    pub neutral_error: Option<Expr>,
     pub state_read: Option<Expr>,
     pub state_write: Option<Expr>,
     pub state_touch: Option<Expr>,
@@ -1247,12 +1329,14 @@ impl Parse for InstrumentArgs {
                     input.parse::<Token![=]>()?;
                     match key_string.as_str() {
                         "boundary" => args.boundary = Some(input.parse()?),
+                        "site" => args.site = Some(input.parse()?),
                         "component" => args.component = Some(input.parse()?),
                         "operation" => args.operation = Some(input.parse()?),
                         "args" => args.args = Some(input.parse()?),
                         "result" => args.result = Some(input.parse()?),
                         "codec" => args.codec = Some(input.parse()?),
                         "on_miss" => args.on_miss = Some(input.parse()?),
+                        "neutral_error" => args.neutral_error = Some(input.parse()?),
                         "state_read" => args.state_read = Some(input.parse()?),
                         "state_write" => args.state_write = Some(input.parse()?),
                         "state_touch" => args.state_touch = Some(input.parse()?),
@@ -1441,11 +1525,16 @@ mod tests {
         syn::parse2(src).expect("parse fn")
     }
 
-    /// `on_miss` routes to the `_or_miss` seam; its absence must leave the
-    /// emitted seam name exactly as it was, so no existing boundary's
-    /// continuation changes.
+    /// `on_miss` decides the miss arm's VALUE, not which seam is called.
+    ///
+    /// This replaces an assertion that a declared `on_miss` reached a
+    /// `dispatch_async_or_miss` twin. There is no twin any more: both shapes
+    /// call the same seam and differ only in what the reconstruct closure
+    /// returns for a miss. That is the point of the change — a site's
+    /// continuation is now something it RETURNS, so the observation can record
+    /// what actually happened instead of what the declaration promised.
     #[test]
-    fn on_miss_routes_to_the_or_miss_seam_and_its_absence_does_not() {
+    fn on_miss_decides_the_miss_arm_not_the_seam() {
         let declared = generate(
             parse_args(quote!(
                 boundary = "imc",
@@ -1460,8 +1549,12 @@ mod tests {
         )
         .to_string();
         assert!(
-            declared.contains("dispatch_async_or_miss"),
-            "a declared `on_miss` must reach the graceful seam: {declared}"
+            declared.contains("Synthesized"),
+            "a declared `on_miss` must make the miss arm synthesize: {declared}"
+        );
+        assert!(
+            !declared.contains("NoValue"),
+            "and must NOT also emit the stopping arm: {declared}"
         );
 
         let undeclared = generate(
@@ -1474,15 +1567,32 @@ mod tests {
         )
         .to_string();
         assert!(
-            !undeclared.contains("or_miss"),
-            "an undeclared site must keep the fail-stop seam: {undeclared}"
+            undeclared.contains("NoValue"),
+            "an undeclared site must keep stopping on a miss: {undeclared}"
         );
+        assert!(
+            !undeclared.contains("Synthesized"),
+            "an undeclared site must never synthesize: {undeclared}"
+        );
+
+        for (label, expanded) in [("declared", &declared), ("undeclared", &undeclared)] {
+            assert!(
+                !expanded.contains("or_miss"),
+                "{label}: the `_or_miss` seam is gone; both shapes call one seam: {expanded}"
+            );
+        }
     }
 
-    /// The marker costs an args clone, so it is built ONLY when the miss
-    /// expression asks for it.
+    /// The marker costs a clone, so it is bound ONLY when the miss expression
+    /// asks for it — and that clone is now on the COLD path.
+    ///
+    /// It used to be paid per active call: the seam knew nothing about the
+    /// marker, so the macro had to clone the args image outside the miss thunk,
+    /// before anyone knew whether the call would miss. The seam builds the
+    /// marker itself now, from the spec it already holds, so `__deja_miss_args`
+    /// is gone entirely and only a genuine miss pays anything.
     #[test]
-    fn the_miss_marker_is_built_only_when_the_expression_names_it() {
+    fn the_miss_marker_is_bound_only_when_the_expression_names_it() {
         let plain = generate(
             parse_args(quote!(
                 boundary = "imc",
@@ -1497,8 +1607,8 @@ mod tests {
         )
         .to_string();
         assert!(
-            !plain.contains("SubstituteMiss"),
-            "a miss value that needs no attribution must not pay for the marker: {plain}"
+            !plain.contains("clone (__deja_miss)"),
+            "a miss value that needs no attribution must not clone the marker: {plain}"
         );
 
         let attributed = generate(
@@ -1515,13 +1625,124 @@ mod tests {
         )
         .to_string();
         assert!(
-            attributed.contains("SubstituteMiss"),
-            "an expression naming `__deja_miss` must get the marker: {attributed}"
+            attributed.contains("clone (__deja_miss)"),
+            "an expression naming `__deja_miss` must get an owned marker, so the \
+             expression it was written against still compiles: {attributed}"
+        );
+
+        for (label, expanded) in [("plain", &plain), ("attributed", &attributed)] {
+            assert!(
+                !expanded.contains("__deja_miss_args"),
+                "{label}: the per-active-call args clone must be gone — the seam \
+                 builds the marker on the miss branch now: {expanded}"
+            );
+        }
+    }
+
+    /// `site = "name"` is what makes rank 1 reachable at all.
+    ///
+    /// Before it existed the runtime had `Locus::DeclaredSite` and the macro
+    /// could not emit it — `CallsiteSource::SyntacticHash` and `id: None` were
+    /// hardcoded — so no `#[deja::boundary]` site could ever address at rank 1.
+    /// That is why rank 1 has resolved zero calls in 155,419 measured
+    /// resolutions: not because it is weak, because it was unreachable.
+    #[test]
+    fn a_declared_site_makes_rank_one_reachable() {
+        let undeclared = generate(
+            parse_args(quote!(boundary = "imc", replay = Substitute)),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            undeclared.contains("SyntacticHash")
+                && !undeclared.contains("CallsiteSource :: Explicit"),
+            "an undeclared site must keep deriving its locus: {undeclared}"
+        );
+
+        let declared = generate(
+            parse_args(quote!(
+                boundary = "imc",
+                replay = Substitute,
+                site = "routing::eligible_connectors"
+            )),
+            parse_fn(quote!(
+                async fn get(key: String) -> Option<u64> {
+                    None
+                }
+            )),
+        )
+        .to_string();
+        assert!(
+            declared.contains("CallsiteSource :: Explicit"),
+            "a declared site must emit an Explicit identity, or the runtime \
+             cannot build a DeclaredSite locus: {declared}"
+        );
+        assert!(
+            declared.contains(r#""routing::eligible_connectors""#),
+            "and must carry the author's name as the id, verbatim — it is a \
+             string literal, so it stays one token: {declared}"
+        );
+        assert!(
+            !declared.contains("SyntacticHash"),
+            "the occurrence source must move with the identity — bucketing on \
+             SyntacticHash while the identity says Explicit counts this site's \
+             occurrences where nothing reads them: {declared}"
+        );
+        assert!(
+            declared.contains("span_path") && declared.contains("lexical_path"),
+            "a declared site GAINS rank 1 and keeps every derived locus as \
+             fallback, so a tag present on one side only degrades rather than \
+             failing: {declared}"
         );
     }
 
     /// `on_miss` under Execute would never fire. A declaration that does nothing
     /// reads as protection, so it is rejected instead of silently ignored.
+    /// `neutral_error` decides whether an `Execute` site re-runs; a
+    /// `Substitute` site never re-runs, so a declaration there would do
+    /// nothing and is refused.
+    #[test]
+    fn neutral_error_on_a_substitute_site_is_a_build_error() {
+        let expand = |args| {
+            generate(
+                parse_args(args),
+                parse_fn(quote!(
+                    async fn insert(row: String) -> Result<u64, String> {
+                        Ok(1)
+                    }
+                )),
+            )
+            .to_string()
+        };
+        let refused = expand(quote!(
+            boundary = "db",
+            replay = Substitute,
+            neutral_error = |_| true
+        ));
+        assert!(
+            refused.contains("compile_error") && refused.contains("neutral_error"),
+            "{refused}"
+        );
+
+        let declared = expand(quote!(
+            boundary = "db",
+            replay = Execute,
+            neutral_error = |_| true
+        ));
+        assert!(!declared.contains("compile_error"), "{declared}");
+        assert!(declared.contains("dispatch_async_serving"), "{declared}");
+
+        let undeclared = expand(quote!(boundary = "db", replay = Execute));
+        assert!(
+            !undeclared.contains("dispatch_async_serving"),
+            "{undeclared}"
+        );
+    }
+
     #[test]
     fn on_miss_on_an_execute_site_is_a_build_error() {
         let expanded = generate(
@@ -1989,5 +2210,36 @@ mod tests {
                 .contains("unsupported deja instrument argument"),
             "{err}"
         );
+    }
+
+    /// Both serde reconstruct arms decode through `canonical::from_value`, the
+    /// one reader of the present-`Option` marker the capture side writes. A bare
+    /// `serde_json::from_value` would read the marker as a value and a recorded
+    /// `Some(None)` would stop replaying as itself.
+    #[test]
+    fn serde_reconstruction_reads_the_canonical_marker() {
+        for (codec, output) in [
+            (quote!(SerdeCodec), quote!(Option<Option<u64>>)),
+            (
+                quote!(ResultOkCodec),
+                quote!(CustomResult<Option<Option<u64>>, E>),
+            ),
+        ] {
+            let args = parse_args(quote!(boundary = "imc", replay = Substitute, codec = #codec));
+            let func = parse_fn(quote!(
+                fn get(k: String) -> #output {
+                    unimplemented!()
+                }
+            ));
+            let expanded = generate(args, func).to_string();
+            assert!(
+                expanded.contains(":: deja :: canonical :: from_value"),
+                "{codec} must reconstruct through the canonical decoder: {expanded}"
+            );
+            assert!(
+                !expanded.contains(":: serde_json :: from_value"),
+                "{codec} must not reconstruct through bare serde_json: {expanded}"
+            );
+        }
     }
 }

@@ -11,7 +11,7 @@
 //!   - resolved hit                         → matched (recorded per address rank)
 //!   - resolved only at rank 6 (sequence)   → Recovered (fragility flag)
 //!   - candidate call with no table hit     → NovelCall (reported, not scored)
-//!     …absorbed by a declared `on_miss`     → NovelCallAbsorbed (request survived)
+//!     …answered by a synthesized value     → NovelCallAbsorbed (request survived)
 //!     …uncorrelated (background work)      → NovelCallTolerated
 //!     …on an egress boundary               → EnvironmentalMiss (tolerated)
 //!     …after a truncated recording tail    → InconclusiveTailGap (inconclusive)
@@ -38,14 +38,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 
-use deja::{Address, LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
+use deja::{LocalFileLookupSource, LookupTable, LookupTableSource, ObservedCall};
 use deja_kernel::{HttpDiff, JsonFieldDiff};
 use serde::{Deserialize, Serialize};
 
 use crate::HarnessRoot;
 
+pub mod behaviour_tree;
+pub mod delta;
 pub mod ledger;
 pub mod span_shape;
+pub mod tape;
 pub use ledger::CallRecord;
 
 /// Boundaries whose live calls cannot run in the harness (egress is blocked).
@@ -54,7 +57,7 @@ fn tier_for(boundary: &str) -> Tier {
     match boundary {
         "http_outgoing" | "http_client" | "grpc" => Tier::Environmental,
         "redis" | "db" | "database" | "storage" | "pg" => Tier::Stateful,
-        "time" | "id" | "id_generation" | "uuid" | "rng" => Tier::Pure,
+        pure if deja::is_pure_boundary(pure) => Tier::Pure,
         _ => Tier::Unknown,
     }
 }
@@ -62,9 +65,20 @@ fn tier_for(boundary: &str) -> Tier {
 /// A boundary whose recorded-vs-replayed mismatch is NOT a real divergence and so
 /// must not block the verdict:
 ///   - `Tier::Pure` (time/id/rng): an entropy SEAM whose recorded value is
-///     substituted on replay, after which everything downstream is pure. These are
-///     fully substituted in practice (they never miss), so the non-blocking status
-///     is a safety net, not a load-bearing exclusion.
+///     SUBSTITUTED on replay, after which everything downstream is pure.
+///
+///     The premise is the substitution, not the tier. A seam that missed and
+///     FABRICATED a value satisfies neither half: the value is not the
+///     recording's, so what follows it is not pure, and a seam with an
+///     `on_miss` arm misses on every call of a tape recorded before it existed
+///     rather than never. This was written when these seams could not miss in
+///     practice, which made it a safety net; a declared `on_miss` turned it
+///     into a load-bearing exclusion, and a clock read into an outgoing request
+///     body then reached a verdict of "every side-effect call resolved" about a
+///     request that ran on a number the recording never held.
+///
+///     So [`observed_miss_is_excused`] tests the OUTCOME rather than the tier
+///     alone, and a synthesized pure miss is scored as the fabrication it is.
 ///   - ingress: the request boundary the kernel re-drives by construction,
 ///     not a side effect at all. Self-described by `role: "ingress"`; the
 ///     legacy `http_incoming` name keeps pre-`role` tapes working.
@@ -81,6 +95,35 @@ fn is_nonblocking_boundary(boundary: &str, role: Option<&str>) -> bool {
     tier_for(boundary) == Tier::Pure
         || role == Some(deja::ROLE_INGRESS)
         || boundary == "http_incoming"
+}
+
+/// Whether a call the candidate made, and that missed, is excused as no
+/// divergence at all.
+///
+/// A pure boundary's miss is excused on the premise that re-drawing a clock or
+/// an id changes nothing the run compares. That premise is about the value the
+/// call returned, so the OUTCOME decides, not the boundary alone.
+///
+/// `Substituted` is the excused case, and the only one. It is also what a
+/// recorded-side omission carries, since the field defaults to it.
+///
+/// `Stopped` is not: the miss is the reason the response is missing and the
+/// later calls never ran, so excusing it leaves a verdict made entirely of its
+/// consequences — an unused id draw read as a run of status mismatches and
+/// omitted calls, with the draw itself named nowhere.
+///
+/// `Synthesized` is not either, and that is the newer half. The site answered a
+/// miss with a value it derived rather than one the recording held, so nothing
+/// downstream of it is the recording's — the premise above simply does not
+/// apply. Excusing it let two tolerations compose: a fabricated clock reading
+/// flowed into an outgoing request, which the environmental tier excuses in
+/// turn, and a run that continued on a value the recording never held reported
+/// "full-mock replay clean: http responses match and every side-effect call
+/// resolved". It now reaches the absorbed-miss arm instead, which counts it,
+/// names its site, and makes the run inconclusive rather than clean.
+pub(crate) fn observed_miss_is_excused(call: &ObservedCall) -> bool {
+    call.outcome == deja::SubstituteOutcome::Substituted
+        && is_nonblocking_boundary(&call.boundary, call.role.as_deref())
 }
 
 /// Whether replay is *incapable* of producing a counterpart for this boundary,
@@ -148,10 +191,10 @@ fn rank_label(rank: u8) -> String {
     format!("rank_{rank}")
 }
 
-/// The weakest, positional `Address` rank (`Address::Sequence`) — a match here
+/// The weakest, positional `Locus` rank (`Locus::Sequence`) — a match here
 /// means the call resolved only by its boundary+method+request-sequence position,
 /// which is fragile to any upstream reorder. Tracked as "Recovered" (a fragility
-/// signal), not a divergence. MUST equal `Address::Sequence`'s `rank()`; bump this
+/// signal), not a divergence. MUST equal `Locus::Sequence`'s `rank()`; bump this
 /// in lock-step if the rank ladder is renumbered again.
 const POSITIONAL_FALLBACK_RANK: u8 = 6;
 
@@ -164,6 +207,32 @@ const UNDECLARED_CONCURRENCY_WARNING: &str = "undeclared_concurrency";
 /// declaration, not about the candidate, so it is counted without being charged
 /// as a divergence.
 const INAPPLICABLE_REPLY_CANON_WARNING: &str = "inapplicable_reply_canon";
+
+/// A call served the recording's value because only its ARGUMENTS moved.
+///
+/// Named without being charged. The serve is scored on its own row, by the arms
+/// above and independently of this — a `ValueDiverged` where it pairs with a
+/// recorded twin, and whatever the unpaired arms make of it where it does not.
+/// Charging it here as well would charge one call twice. These four kinds exist
+/// so a reader can see WHAT a substitution could have carried into, which no
+/// divergence count says.
+const ARG_DIVERGENT_SERVE: &str = "ArgDivergentServe";
+/// A serve with no correlation, and so no request to bound a reach within.
+const ARG_DIVERGENT_SERVE_UNATTRIBUTABLE: &str = "ArgDivergentServeUnattributable";
+/// A call an earlier argument-divergent serve in its correlation could have
+/// reached. Not a divergence, and not evidence of one.
+const ARG_DIVERGENCE_REACH: &str = "ArgDivergenceReach";
+/// A reached call the graph puts on the serve's own span node or under it.
+const ARG_DIVERGENCE_REACH_WITHIN_SPAN: &str = "ArgDivergenceReachWithinSpan";
+/// A reached call the graph declined to place, so the run says where it could
+/// not look rather than reporting a structural claim it never made.
+const ARG_DIVERGENCE_REACH_UNPLACED: &str = "ArgDivergenceReachUnplaced";
+
+/// A counter the scorecard omits when it has nothing to report, so a run with
+/// no argument-divergent serve serializes exactly as it did before they existed.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
 
 // ---------------------------------------------------------------------------
 // Scorecard data model (`replay-scorecard/v1`)
@@ -185,6 +254,10 @@ pub struct Scorecard {
     pub correlation_scope: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Where the candidate's lookups ended, counted from the ordinal each
+    /// observation carries. Absent when the candidate numbers none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_tally: Option<deja::LookupTally>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -209,9 +282,13 @@ pub struct Summary {
     ///   methods that both resolved every call; a content difference is counted
     ///   under `value_divergences` instead.
     pub side_effect_divergences: u64,
-    /// Misses the REQUEST SURVIVED: a boundary declared `on_miss`, the declared
-    /// value was returned, and the correlation continued on an answer the
-    /// recording never held.
+    /// Misses the REQUEST SURVIVED: the boundary's miss arm SYNTHESIZED a value,
+    /// it was returned, and the correlation continued on an answer the recording
+    /// never held.
+    ///
+    /// Read off what the site returned, not off what it declared. The two used
+    /// to be the same thing — a declared `on_miss` always produced a value — but
+    /// a miss arm can now decline, so the observation carries the outcome.
     ///
     /// Projection of `per_boundary[*].kinds["NovelCallAbsorbed"]`, and it has to
     /// be a projection: a kind with no folded summary field never reaches the
@@ -258,10 +335,59 @@ pub struct Summary {
     /// counterpart. Projection of `per_boundary[*].kinds["IdentitySkew"]`.
     #[serde(default)]
     pub identity_skews: u64,
-    /// Legacy persisted-scorecard field. UPDATE results now compare only columns
-    /// assigned by the statement, so inherited-row ordering noise is equivalent
-    /// directly and every remaining UPDATE value mismatch is blocking. New
-    /// scorecards always write zero.
+    /// Calls served the recording's value because only their ARGUMENTS moved.
+    ///
+    /// Not a term in any divergence counter: each serve is scored on its own row
+    /// independently of these four, and the `arg_divergence_*` counters are
+    /// attribution — which of the run stands on a value nobody checked — not a
+    /// second verdict. Making them block would turn one argument divergence into
+    /// a cascade of failures and bury the row naming the cause.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergentServe"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergent_serves: u64,
+    /// Of those, the ones with no correlation, and so no request to bound a
+    /// reach within. Held apart so a reach of zero is never read as "nothing
+    /// could be affected" when the truth is "this could not be answered".
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergentServeUnattributable"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergent_serves_unattributable: u64,
+    /// Calls that ran after an argument-divergent serve in the same correlation
+    /// and COULD have consumed the substituted value. An over-approximation
+    /// bounded by position, because deja records execution and not value
+    /// provenance — see `ArgDivergenceReach`.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergenceReach"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergence_reach_calls: u64,
+    /// Of those, the ones the graph puts on the serve's own span node or under
+    /// it: the value got here without leaving the span it was produced in, most
+    /// often by being returned and used in the same frame. A subset of
+    /// `arg_divergence_reach_calls`.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergenceReachWithinSpan"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergence_reach_within_span: u64,
+    /// And the ones the graph declined to place at all — a flat-scored
+    /// correlation, or a call with no node. Counted apart from the two structural
+    /// answers so that "outside the serve's span", which is a claim, is never
+    /// read off a number that also holds the cases nobody looked at. The
+    /// remainder, `reach_calls - within_span - unplaced`, is the outside set.
+    ///
+    /// Projection of `per_boundary[*].kinds["ArgDivergenceReachUnplaced"]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergence_reach_unplaced: u64,
+    /// Response body rows the order-canonical recompute reported at a region the
+    /// kernel judged the same, and which therefore did not count: an encoded
+    /// value whose serialisation order differed (a hash-ordered map inside an
+    /// embedded document, distinct form keys), or a path the run's body
+    /// allowlist covers. Named so a suite that leans on that judgment leaves a
+    /// trace. Folds from `OrderNondeterministicWarning` on `http_incoming`.
+    ///
+    /// Formerly UPDATE inherited-row ordering noise, retired when UPDATE results
+    /// began comparing only assigned columns. Every scorecard since wrote zero,
+    /// so a non-zero value has only ever carried this meaning.
     #[serde(default)]
     pub order_nondeterminism_warnings: u64,
     /// Schema-derived DB and response occurrences. DB INSERT evidence is
@@ -293,6 +419,17 @@ pub struct Summary {
     /// divergence. Substitute hits do not contribute seed gaps.
     #[serde(default)]
     pub inconclusive_seed_gaps: u64,
+    /// Correlations with calls that never ran because a seed gap cut them off.
+    /// Those calls are inconclusive rather than blocking; a correlation that
+    /// also diverged elsewhere still fails. How much of the verdict rests on
+    /// that inheritance.
+    #[serde(default)]
+    pub seed_gap_cascade_correlations: u64,
+    /// The calls those correlations did not run, counted rather than inferred:
+    /// the cascade can over-apply to a concurrent task's omissions, never to a
+    /// pass, and this is the number that shows by how much.
+    #[serde(default)]
+    pub seed_gap_cascade_calls: u64,
     /// Calls that could not be conclusively classified because the RECORDING for
     /// their correlation stops at request teardown — the recorder releases the
     /// correlation at the API-lock release, so the post-response work the request
@@ -369,6 +506,16 @@ impl BoundaryStats {
         *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
         self.diverged += 1;
     }
+
+    /// Name a kind WITHOUT counting a divergence: for a call the same-multiset
+    /// rule says is not a difference — an order-only absorption, whose call is
+    /// matched and stays matched. Naming it through `bump_kind` counted one call
+    /// as both matched and diverged, so it read as a red divergence everywhere
+    /// `diverged` is summed while its name reached only the warnings.
+    /// `matched + diverged` over a boundary is the number of calls scored on it.
+    fn note_kind(&mut self, kind: &str) {
+        *self.kinds.entry(kind.to_owned()).or_insert(0) += 1;
+    }
 }
 
 /// How many calls across every boundary were classified `kind`.
@@ -412,6 +559,12 @@ pub struct CorrelationOutcome {
     /// how much this correlation's verdict is worth and belongs beside it.
     #[serde(default)]
     pub absorbed_misses: u64,
+    /// How many of this correlation's calls were served the recording's value on
+    /// moved arguments. Beside `absorbed_misses` for the same reason: what the
+    /// correlation's verdict is worth belongs next to it, and a request that ran
+    /// on a stale value is a request whose later work nobody checked.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arg_divergent_serves: u64,
     pub passed: bool,
 }
 
@@ -460,6 +613,7 @@ impl Scorecard {
             },
             correlation_scope: None,
             warnings: Vec::new(),
+            lookup_tally: None,
         }
     }
 
@@ -516,6 +670,31 @@ impl Scorecard {
             &["ValueDivergedOrigin", "ValueDiverged"],
         );
         folds("identity_skews", s.identity_skews, &["IdentitySkew"]);
+        folds(
+            "arg_divergent_serves",
+            s.arg_divergent_serves,
+            &[ARG_DIVERGENT_SERVE],
+        );
+        folds(
+            "arg_divergent_serves_unattributable",
+            s.arg_divergent_serves_unattributable,
+            &[ARG_DIVERGENT_SERVE_UNATTRIBUTABLE],
+        );
+        folds(
+            "arg_divergence_reach_calls",
+            s.arg_divergence_reach_calls,
+            &[ARG_DIVERGENCE_REACH],
+        );
+        folds(
+            "arg_divergence_reach_within_span",
+            s.arg_divergence_reach_within_span,
+            &[ARG_DIVERGENCE_REACH_WITHIN_SPAN],
+        );
+        folds(
+            "arg_divergence_reach_unplaced",
+            s.arg_divergence_reach_unplaced,
+            &[ARG_DIVERGENCE_REACH_UNPLACED],
+        );
         folds(
             "inconclusive_seed_gaps",
             s.inconclusive_seed_gaps,
@@ -596,6 +775,35 @@ impl Scorecard {
         // skew is a disagreement about pairing ORDER between two methods that
         // both resolved every call, so it cannot be hiding a content difference —
         // that would be counted under `value_divergences`.
+        // The reach's two containments, which its four counters can violate while
+        // each fold above still agrees with its own kind. A serve that could not
+        // be attributed cannot be more numerous than the serves; a reached call
+        // the graph placed relative to a serve cannot be more numerous than the
+        // reached. And a reach with no serve to have come from is a reach
+        // attributed to nothing.
+        if s.arg_divergent_serves_unattributable > s.arg_divergent_serves {
+            out.push(format!(
+                "summary.arg_divergent_serves_unattributable = {}, more than the {} serve(s) it \
+                 is part of",
+                s.arg_divergent_serves_unattributable, s.arg_divergent_serves
+            ));
+        }
+        let placed = s.arg_divergence_reach_within_span + s.arg_divergence_reach_unplaced;
+        if placed > s.arg_divergence_reach_calls {
+            out.push(format!(
+                "summary.arg_divergence_reach_within_span + arg_divergence_reach_unplaced = \
+                 {placed}, more than the {} reached call(s) they are part of",
+                s.arg_divergence_reach_calls
+            ));
+        }
+        if s.arg_divergence_reach_calls > 0 && s.arg_divergent_serves == 0 {
+            out.push(format!(
+                "summary.arg_divergence_reach_calls = {}, but no serve is reported for them to \
+                 be downstream of",
+                s.arg_divergence_reach_calls
+            ));
+        }
+
         let blocking = s.omitted_calls + s.value_divergences;
         if s.side_effect_divergences != blocking {
             out.push(format!(
@@ -647,9 +855,195 @@ impl Scorecard {
 // Detection
 // ---------------------------------------------------------------------------
 
+/// Keys whose recorded presence the seeder could not guarantee at replay, per
+/// correlation, and the tables a synthesized row could have leaked into. A
+/// divergence at one of them describes the seed, not the candidate.
+///
+/// A key counts when its seed-certificate entry is skipped as
+/// `recorded_presence` (no statement to build the row from),
+/// `unsynthesizable_presence` (a statement no row can be built from) or
+/// `presence_already_held` (an earlier seeded row satisfied the statement at
+/// seed time, but an earlier delete in the replay may consume it first); or
+/// when its row was synthesized and the readback did not match, since a
+/// synthesis that goes wrong must never score worse than no synthesis.
+///
+/// A synthesized row also makes every OTHER read of its table in that
+/// correlation inconclusive: its neutral columns can satisfy a predicate the
+/// recorded row did not (`deleted = false`, an enum's first label, a zero
+/// version), so such a read can return a row the recording never saw.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnplantedPresence {
+    keys: BTreeSet<(String, String)>,
+    /// `(correlation, table)` → the synthesized entries' own keys on it.
+    synthesized: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+impl UnplantedPresence {
+    /// The seed-certificate skip causes that mean a recorded presence was not
+    /// guaranteed at replay.
+    pub const UNPLANTED_CAUSES: [&'static str; 3] = [
+        "recorded_presence",
+        "unsynthesizable_presence",
+        "presence_already_held",
+    ];
+
+    /// From a seed certificate's JSON. Every other skip, and every planted
+    /// entry that is not synthesized, is left to judge its divergence as
+    /// before.
+    pub fn from_certificate(cert: &serde_json::Value) -> Self {
+        let mut this = Self::default();
+        for e in cert["entries"].as_array().into_iter().flatten() {
+            if e["boundary"] != "db" {
+                continue;
+            }
+            let (Some(correlation), Some(key)) =
+                (e["correlation_id"].as_str(), e["logical_key"].as_str())
+            else {
+                continue;
+            };
+            let key = canonical_key(key);
+            let skipped_unplanted = e["materialization"] == "skipped"
+                && e["skip_reason"]["cause"]
+                    .as_str()
+                    .is_some_and(|cause| Self::UNPLANTED_CAUSES.contains(&cause));
+            let is_synthesized = e["origin"].get("synthesized_presence").is_some();
+            let synthesis_unverified = is_synthesized && e["readback"]["status"] != "matched";
+            if skipped_unplanted || synthesis_unverified {
+                this.keys.insert((correlation.to_owned(), key.clone()));
+            }
+            if is_synthesized {
+                let table = e["mechanism"]["table"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| key_table(&key));
+                if let Some(table) = table {
+                    this.synthesized
+                        .entry((correlation.to_owned(), table))
+                        .or_default()
+                        .insert(key);
+                }
+            }
+        }
+        this
+    }
+
+    #[cfg(test)]
+    pub(crate) fn names(&self, correlation: &str, key: &str) -> bool {
+        self.keys
+            .contains(&(correlation.to_owned(), canonical_key(key)))
+    }
+
+    /// Whether `event`, recorded in `correlation`, read a key the seeder could
+    /// not guarantee, or another key of a table it synthesized a row into.
+    pub fn read_by(&self, correlation: Option<&str>, event: Option<&deja::BoundaryEvent>) -> bool {
+        let (Some(correlation), Some(event)) = (correlation, event) else {
+            return false;
+        };
+        if self.keys.is_empty() && self.synthesized.is_empty() {
+            return false;
+        }
+        event.read_set.iter().any(|key| {
+            let key = canonical_key(key);
+            if self.keys.contains(&(correlation.to_owned(), key.clone())) {
+                return true;
+            }
+            key_table(&key)
+                .and_then(|table| self.synthesized.get(&(correlation.to_owned(), table)))
+                .is_some_and(|own| !own.contains(&key))
+        })
+    }
+}
+
+/// The db table a state key names, if it names one.
+fn key_table(key: &str) -> Option<String> {
+    deja::StateKey::parse(key)
+        .ok()?
+        .db_table()
+        .map(str::to_owned)
+}
+
+/// Correlations whose FIRST divergence is a seed gap the harness could not
+/// plant, with the recorded sequence of that call. The calls recorded after it
+/// that never ran were cut off by the missing seed, not by the candidate, so
+/// they inherit its inconclusive status instead of blocking.
+///
+/// "First divergence" is the earliest, by recorded sequence, among the calls
+/// that ran and diverged, however they are later classified; and any call the
+/// candidate added before it in the replay, whatever it is later classified
+/// as, refuses the cascade. Both err toward keeping the rows below blocking,
+/// never toward excusing them. The scorecard and the ledger each build this
+/// from the same artifacts, so they agree.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeedGapCascade(BTreeMap<String, u64>);
+
+impl SeedGapCascade {
+    pub(crate) fn build(art: &RunArtifacts) -> Self {
+        let by_seq: HashMap<u64, &deja::BoundaryEvent> = art
+            .events
+            .iter()
+            .map(|ev| (ev.global_sequence, ev))
+            .collect();
+        // Per correlation: the earliest divergence among the calls that ran,
+        // by RECORDED sequence (replay order can interleave under
+        // concurrency), and whether a call the candidate added came before it
+        // in the replay.
+        struct First {
+            seq: u64,
+            stream_index: usize,
+        }
+        let mut first: HashMap<&str, First> = HashMap::new();
+        for (stream_index, obs) in art.observed.iter().enumerate() {
+            let (Some(corr), true) = (obs.correlation_id.as_deref(), obs.resolved) else {
+                continue;
+            };
+            let Some(seq) = obs.source_event_global_sequence else {
+                continue;
+            };
+            if observed_is_ingress(obs) || !observed_value_diverged(obs, by_seq.get(&seq).copied())
+            {
+                continue;
+            }
+            if first.get(corr).is_none_or(|f| seq < f.seq) {
+                first.insert(corr, First { seq, stream_index });
+            }
+        }
+        let mut starts = BTreeMap::new();
+        for (corr, f) in first {
+            let event = by_seq.get(&f.seq).copied();
+            if !art.unplanted_presence.read_by(Some(corr), event) {
+                continue;
+            }
+            // Any call the candidate added before the gap, whatever it is later
+            // classified as, may be what stopped the request: no cascade.
+            let added_before = art.observed[..f.stream_index].iter().any(|o| {
+                !o.resolved && !observed_is_ingress(o) && o.correlation_id.as_deref() == Some(corr)
+            });
+            if !added_before {
+                starts.insert(corr.to_owned(), f.seq);
+            }
+        }
+        Self(starts)
+    }
+
+    /// Whether the recorded call at `seq` in `correlation` was cut off by its
+    /// correlation's seed gap: recorded after it.
+    pub(crate) fn covers(&self, correlation: Option<&str>, seq: u64) -> bool {
+        correlation
+            .and_then(|c| self.0.get(c))
+            .is_some_and(|start| seq > *start)
+    }
+}
+
+fn canonical_key(key: &str) -> String {
+    deja::StateKey::parse(key)
+        .map(|state_key| state_key.to_wire())
+        .unwrap_or_else(|_| key.to_owned())
+}
+
 /// The artifact streams a run produces, loaded into memory.
 pub struct RunArtifacts {
     pub run_id: String,
+    pub unplanted_presence: UnplantedPresence,
     pub recording_id: Option<String>,
     pub table: LookupTable,
     pub observed: Vec<ObservedCall>,
@@ -676,6 +1070,9 @@ pub struct RunArtifacts {
     /// canon, which is the behaviour for a system that declares nothing.
     pub reply_canons: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<String>,
+    /// Lookups the candidate dropped before they finished. They close the
+    /// lookup count and are not scored: the call never completed.
+    pub cancelled_lookups: Vec<ObservedCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -684,12 +1081,8 @@ struct GraphCorrelationPlan {
     novel_replay_events: HashSet<usize>,
     scoring_mode: deja_forest::ScoringMode,
     alignment: Option<deja_forest::Alignment>,
-    record: Option<deja_forest::ActivationForest>,
     replay: Option<deja_forest::ActivationForest>,
     flat_replay_nodes: HashSet<u64>,
-    flat_record_nodes: HashSet<u64>,
-    flat_record_events: HashSet<u64>,
-    flat_replay_events: HashSet<usize>,
 }
 
 /// The single record/replay graph seam shared by scorecard and call-ledger
@@ -855,83 +1248,77 @@ impl GraphScoringPlan {
                 })
                 .unwrap_or_default();
 
-            let (scoring_mode, alignment, flat_replay_nodes, flat_record_nodes) =
-                if let Some(reason) = reason {
-                    (
-                        deja_forest::ScoringMode::Flat { reason },
-                        None,
-                        HashSet::new(),
-                        HashSet::new(),
-                    )
-                } else {
-                    let record_forest = record.as_ref().expect("graph mode has a record forest");
-                    let replay_forest = replay.as_ref().expect("graph mode has a replay forest");
-                    let mut alignment = deja_forest::align(record_forest, replay_forest);
-                    alignment
-                        .flat_tier_events
-                        .extend(flat_record_events.iter().copied());
-                    alignment
-                        .flat_tier_events
-                        .extend(flat_replay_events.iter().map(|index| *index as u64));
-                    alignment.flat_tier_events.sort_unstable();
-                    alignment.flat_tier_events.dedup();
-                    let mut flat_replay_nodes = HashSet::new();
-                    let mut flat_record_nodes = HashSet::new();
-                    let mut paired_fallback_metadata = Vec::new();
-                    for row in &alignment.nodes {
-                        let (Some(record_node), Some(replay_node)) =
-                            (row.record_node, row.replay_node)
-                        else {
-                            continue;
-                        };
-                        if record_forest.nodes[&record_node].events.len() != 1
-                            || replay_forest.nodes[&replay_node].events.len() != 1
-                        {
-                            flat_record_nodes.insert(record_node);
-                            flat_replay_nodes.insert(replay_node);
-                            paired_fallback_metadata
-                                .extend(record_forest.nodes[&record_node].events.iter().copied());
-                            paired_fallback_metadata
-                                .extend(replay_forest.nodes[&replay_node].events.iter().copied());
-                        }
+            let (scoring_mode, alignment, flat_replay_nodes) = if let Some(reason) = reason {
+                (
+                    deja_forest::ScoringMode::Flat { reason },
+                    None,
+                    HashSet::new(),
+                )
+            } else {
+                let record_forest = record.as_ref().expect("graph mode has a record forest");
+                let replay_forest = replay.as_ref().expect("graph mode has a replay forest");
+                let mut alignment = deja_forest::align(record_forest, replay_forest);
+                alignment
+                    .flat_tier_events
+                    .extend(flat_record_events.iter().copied());
+                alignment
+                    .flat_tier_events
+                    .extend(flat_replay_events.iter().map(|index| *index as u64));
+                alignment.flat_tier_events.sort_unstable();
+                alignment.flat_tier_events.dedup();
+                let mut flat_replay_nodes = HashSet::new();
+                let mut paired_fallback_metadata = Vec::new();
+                for row in &alignment.nodes {
+                    let (Some(record_node), Some(replay_node)) = (row.record_node, row.replay_node)
+                    else {
+                        continue;
+                    };
+                    if record_forest.nodes[&record_node].events.len() != 1
+                        || replay_forest.nodes[&replay_node].events.len() != 1
+                    {
+                        flat_replay_nodes.insert(replay_node);
+                        paired_fallback_metadata
+                            .extend(record_forest.nodes[&record_node].events.iter().copied());
+                        paired_fallback_metadata
+                            .extend(replay_forest.nodes[&replay_node].events.iter().copied());
                     }
-                    alignment.flat_tier_events.extend(paired_fallback_metadata);
-                    alignment.flat_tier_events.sort_unstable();
-                    alignment.flat_tier_events.dedup();
-                    let served: BTreeMap<u64, u64> = replay_forest
-                        .nodes
-                        .values()
-                        .filter(|node| !flat_replay_nodes.contains(&node.node_id))
-                        .filter_map(|node| match node.events.as_slice() {
-                            [index] => art
-                                .observed
-                                .get(*index as usize)
-                                .and_then(|observed| observed.source_event_global_sequence)
-                                .map(|sequence| (node.node_id, sequence)),
-                            _ => None,
-                        })
-                        .collect();
-                    deja_forest::reconcile_serving(&mut alignment, &served, record_forest);
-                    let record_skeleton_nodes = record_forest
-                        .nodes
-                        .values()
-                        .filter(|node| node.subtree_events > 0)
-                        .count() as u64;
-                    let replay_skeleton_nodes = replay_forest
-                        .nodes
-                        .values()
-                        .filter(|node| node.subtree_events > 0)
-                        .count() as u64;
-                    alignment
-                        .balance(record_skeleton_nodes, replay_skeleton_nodes)
-                        .expect("graph alignment must account for both event-bearing skeletons");
-                    (
-                        deja_forest::ScoringMode::Graph,
-                        Some(alignment),
-                        flat_replay_nodes,
-                        flat_record_nodes,
-                    )
-                };
+                }
+                alignment.flat_tier_events.extend(paired_fallback_metadata);
+                alignment.flat_tier_events.sort_unstable();
+                alignment.flat_tier_events.dedup();
+                let served: BTreeMap<u64, u64> = replay_forest
+                    .nodes
+                    .values()
+                    .filter(|node| !flat_replay_nodes.contains(&node.node_id))
+                    .filter_map(|node| match node.events.as_slice() {
+                        [index] => art
+                            .observed
+                            .get(*index as usize)
+                            .and_then(|observed| observed.source_event_global_sequence)
+                            .map(|sequence| (node.node_id, sequence)),
+                        _ => None,
+                    })
+                    .collect();
+                deja_forest::reconcile_serving(&mut alignment, &served, record_forest);
+                let record_skeleton_nodes = record_forest
+                    .nodes
+                    .values()
+                    .filter(|node| node.subtree_events > 0)
+                    .count() as u64;
+                let replay_skeleton_nodes = replay_forest
+                    .nodes
+                    .values()
+                    .filter(|node| node.subtree_events > 0)
+                    .count() as u64;
+                alignment
+                    .balance(record_skeleton_nodes, replay_skeleton_nodes)
+                    .expect("graph alignment must account for both event-bearing skeletons");
+                (
+                    deja_forest::ScoringMode::Graph,
+                    Some(alignment),
+                    flat_replay_nodes,
+                )
+            };
             let mut pruned_record_events = HashSet::new();
             let mut novel_replay_events = HashSet::new();
             if let Some(alignment) = &alignment {
@@ -961,12 +1348,8 @@ impl GraphScoringPlan {
                 GraphCorrelationPlan {
                     scoring_mode,
                     alignment,
-                    record,
                     replay,
                     flat_replay_nodes,
-                    flat_record_nodes,
-                    flat_record_events,
-                    flat_replay_events,
                     pruned_record_events,
                     novel_replay_events,
                 },
@@ -1004,19 +1387,6 @@ impl GraphScoringPlan {
             .find(|row| row.replay_node == Some(replay_node))
     }
 
-    pub(crate) fn recorded_sequence_for_replay_node(
-        &self,
-        correlation_id: &str,
-        replay_node: u64,
-    ) -> Option<u64> {
-        let entry = self.correlations.get(correlation_id)?;
-        let record_node = self
-            .alignment_row_for_replay_node(correlation_id, replay_node)?
-            .record_node?;
-        let events = &entry.record.as_ref()?.nodes.get(&record_node)?.events;
-        (events.len() == 1).then(|| events[0])
-    }
-
     pub(crate) fn replay_node_uses_flat_tier(
         &self,
         correlation_id: &str,
@@ -1027,24 +1397,30 @@ impl GraphScoringPlan {
             .is_some_and(|entry| entry.flat_replay_nodes.contains(&replay_node))
     }
 
-    pub(crate) fn alignment_row_uses_flat_tier(
+    /// The observed calls that ran inside `replay_node`'s span or below it.
+    ///
+    /// `None` when the correlation is not graph-scored or the node is not in its
+    /// replay forest (an annexed call has no node there). An absent answer makes
+    /// the reach annotation absent, never the reach itself — structure does not
+    /// bound what a returned value could reach. See [`ArgDivergenceReach`].
+    fn replay_subtree_observed(
         &self,
         correlation_id: &str,
-        row: &deja_forest::AlignedNode,
-    ) -> bool {
-        self.correlations.get(correlation_id).is_some_and(|entry| {
-            row.record_node
-                .is_some_and(|node| entry.flat_record_nodes.contains(&node))
-                || row
-                    .replay_node
-                    .is_some_and(|node| entry.flat_replay_nodes.contains(&node))
-        })
-    }
-
-    pub(crate) fn record_event_uses_flat_tier(&self, correlation_id: &str, sequence: u64) -> bool {
-        self.correlations
-            .get(correlation_id)
-            .is_some_and(|entry| entry.flat_record_events.contains(&sequence))
+        replay_node: u64,
+    ) -> Option<HashSet<u64>> {
+        let entry = self.correlations.get(correlation_id)?;
+        if !matches!(entry.scoring_mode, deja_forest::ScoringMode::Graph) {
+            return None;
+        }
+        let replay = entry.replay.as_ref()?;
+        if !replay.nodes.contains_key(&replay_node) {
+            return None;
+        }
+        Some(
+            forest_event_sequences(replay, replay_node, true)
+                .into_iter()
+                .collect(),
+        )
     }
 
     fn recorded_event_is_pruned(&self, correlation_id: &str, sequence: u64) -> bool {
@@ -1057,79 +1433,6 @@ impl GraphScoringPlan {
         self.correlations
             .get(correlation_id)
             .is_some_and(|entry| entry.novel_replay_events.contains(&index))
-    }
-
-    pub(crate) fn replay_event_uses_flat_tier(&self, correlation_id: &str, index: usize) -> bool {
-        self.correlations
-            .get(correlation_id)
-            .is_some_and(|entry| entry.flat_replay_events.contains(&index))
-    }
-
-    pub(crate) fn recorded_event_sequences(
-        &self,
-        correlation_id: &str,
-        record_node: u64,
-        include_subtree: bool,
-    ) -> Vec<u64> {
-        let Some(forest) = self
-            .correlations
-            .get(correlation_id)
-            .and_then(|entry| entry.record.as_ref())
-        else {
-            return Vec::new();
-        };
-        forest_event_sequences(forest, record_node, include_subtree)
-    }
-
-    pub(crate) fn replay_event_indices(
-        &self,
-        correlation_id: &str,
-        replay_node: u64,
-        include_subtree: bool,
-    ) -> Vec<usize> {
-        let Some(forest) = self
-            .correlations
-            .get(correlation_id)
-            .and_then(|entry| entry.replay.as_ref())
-        else {
-            return Vec::new();
-        };
-        forest_event_sequences(forest, replay_node, include_subtree)
-            .into_iter()
-            .map(|index| index as usize)
-            .collect()
-    }
-
-    pub(crate) fn alignment_recorded_sequences(
-        &self,
-        correlation_id: &str,
-        row: &deja_forest::AlignedNode,
-    ) -> Vec<u64> {
-        row.record_node
-            .map(|node| {
-                self.recorded_event_sequences(
-                    correlation_id,
-                    node,
-                    matches!(&row.outcome, deja_forest::NodeOutcome::PrunedSubtree { .. }),
-                )
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn alignment_replay_indices(
-        &self,
-        correlation_id: &str,
-        row: &deja_forest::AlignedNode,
-    ) -> Vec<usize> {
-        row.replay_node
-            .map(|node| {
-                self.replay_event_indices(
-                    correlation_id,
-                    node,
-                    matches!(&row.outcome, deja_forest::NodeOutcome::NovelSubtree { .. }),
-                )
-            })
-            .unwrap_or_default()
     }
 
     fn scored_alignment(
@@ -1165,6 +1468,48 @@ impl GraphScoringPlan {
         }
         Some(alignment)
     }
+}
+
+/// A tape whose recorded events do not have unique sequence numbers.
+///
+/// `global_sequence` is a per-process counter. A recording pulled from several
+/// recorder processes places each stream on its own range at ingest
+/// (`s3::Renumbering`); a tape materialized before that existed still carries
+/// every stream counting from zero. The lookup is keyed by correlation and
+/// serves correctly either way, but this module keys recorded events by bare
+/// sequence in a dozen places — the ledger's recorded side, the consumed and
+/// expected sets, the forest's event refs, the rank-2 span paths — and each of
+/// them answers with whichever stream's event was inserted last. That is a
+/// wrong recorded twin on a matched row, a hidden omission, an ingress event
+/// reported as an omitted side-effect call. Named here so the scorecard says
+/// which of its rows can be trusted, and what to do: re-ingest.
+fn tape_identity_warning(events: &[deja::BoundaryEvent]) -> Option<String> {
+    let mut streams_by_sequence: HashMap<u64, BTreeSet<Option<&str>>> = HashMap::new();
+    for event in events {
+        streams_by_sequence
+            .entry(event.global_sequence)
+            .or_default()
+            .insert(event.recording_run_id.as_deref());
+    }
+    let colliding = streams_by_sequence
+        .values()
+        .filter(|streams| streams.len() > 1)
+        .count();
+    if colliding == 0 {
+        return None;
+    }
+    let streams: BTreeSet<Option<&str>> = events
+        .iter()
+        .map(|event| event.recording_run_id.as_deref())
+        .collect();
+    Some(format!(
+        "{colliding} recorded sequence number(s) are shared by events from different producer \
+         streams ({} stream(s) on this tape): the tape was materialized before its streams were \
+         placed on one sequence space, so a recorded twin, a recorded span path or an omitted \
+         call may name another request's event — re-ingest the recording; the verdict's \
+         http rows and lookup resolutions are unaffected",
+        streams.len()
+    ))
 }
 
 fn event_bearing_ingress_root(forest: &deja_forest::ActivationForest) -> bool {
@@ -1843,7 +2188,7 @@ impl Canon for CanonPreset {
     fn equivalent(&self, recorded: &serde_json::Value, observed: &serde_json::Value) -> bool {
         match self {
             Self::Sequence => recorded == observed,
-            Self::Bag => bag_canon(recorded) == bag_canon(observed),
+            Self::Bag => deja::identity::same(recorded, observed),
             // A per-path clause makes no whole-body claim; it is consulted per
             // difference, not here.
             Self::BagPaths(_) => false,
@@ -2205,16 +2550,268 @@ enum ValueAbsorption {
     /// the candidate: a replay-local SERIAL, an error's diagnostic text, an
     /// `UPDATE … RETURNING` whose returned rows the statement itself explains.
     DbInfrastructure,
+    /// The candidate served this call's own recorded error instead of running
+    /// it, because the site declared that error state-neutral. The value is
+    /// the recording's by construction, so it is not compared; it is counted,
+    /// so a run shows how many calls it did not re-run.
+    ServedRecordedError,
+    /// A paired request whose args have the recorded call's identity: an array
+    /// in another order, or an embedded document written in another order.
+    ArgsIdentity,
+    /// A value holding a JSON document in a string written differently: the
+    /// document is the recording's, its text is not. With the source of any
+    /// ordering beside it.
+    DocumentText(Option<ValueCanonSource>),
 }
 
 /// The comparison of a matched call's recorded and observed values, with its
-/// reason. Callers that only need the bool use [`values_diverge_under_event`];
-/// callers that need to SAY why a difference stopped counting use this.
+/// reason, so a caller can SAY why a difference stopped counting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueVerdict {
     Equal,
     Absorbed(ValueAbsorption),
     Diverged,
+}
+
+/// What a pair SENT, judged. A pair is one call whose address missed only by its
+/// arguments, and its arguments are the outgoing request: the part of the call
+/// the candidate produced, and so the part it is asserted on. Its result is what
+/// came back IN from the boundary — an input to the candidate, not an output of
+/// it — so a pair whose arguments agree missed its address by position alone,
+/// and is a match whatever it got back.
+///
+/// Order is judged by the identity the lookup address uses
+/// ([`deja::identity`]), so the diff and the address cannot disagree: a request
+/// whose identity is the recording's is absorbed and counted, and one whose
+/// identity differs is never forgiven as order by the diff alone. A
+/// recorder-declared clause and replay-local database infrastructure are
+/// absorbed as they are anywhere else ([`value_verdict`]).
+fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+    // A call served by its address alone had its arguments rejected by every
+    // rank of the candidate's own lookup, the exact key and the identity both,
+    // and it ran on a value recorded for other arguments. Nothing may forgive
+    // that: not the replay-local id rule, and not a clause.
+    if call.arg_divergent {
+        return ValueVerdict::Diverged;
+    }
+    request_verdict(call, twin)
+}
+
+/// What [`pair_request_verdict`] would say of a call's arguments if it had not
+/// been served by its address alone: the absorber that would have forgiven
+/// them, named on the warning so the reason stays visible.
+fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+    let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
+    match deja::identity::identity_differences(&recorded, &call.args).as_deref() {
+        // The same identity as written: the request is the recording's, even
+        // where its renderings differ (a form body's field order).
+        Some([]) => return ValueVerdict::Equal,
+        Some(_) => return ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity),
+        None => {}
+    }
+    // Different identities: the diff's own order rule is the same identity,
+    // so it cannot forgive them as order; a declared clause or replay-local
+    // database infrastructure still can.
+    value_verdict(
+        &call.boundary,
+        &recorded,
+        &call.args,
+        twin,
+        call.args.get("sql").and_then(serde_json::Value::as_str),
+    )
+}
+
+/// How many times each lookup number appears among `calls`.
+fn lookup_ordinals_seen<'a>(calls: impl Iterator<Item = &'a ObservedCall>) -> HashMap<u64, u64> {
+    let mut seen = HashMap::new();
+    for ordinal in calls.filter_map(|call| call.lookup_ordinal) {
+        *seen.entry(ordinal).or_insert(0) += 1;
+    }
+    seen
+}
+
+/// The numbers from one to the highest seen that no call carries.
+fn missing_ordinals(seen: &HashMap<u64, u64>) -> u64 {
+    let highest = seen.keys().copied().max().unwrap_or_default();
+    (1..=highest)
+        .filter(|ordinal| !seen.contains_key(ordinal))
+        .count() as u64
+}
+
+/// The lookups the observed stream at `path` has not closed: numbered, and
+/// neither finished nor cancelled. Counted exactly as the scorer counts a gap,
+/// finished and cancelled alike, so waiting for it to reach zero waits for what
+/// the scorer will check. Reads only each observation's number, so checking a
+/// large stream costs a pass over its lines, not a decode of every call. `None`
+/// when the stream cannot be read, which is never taken for closed.
+pub(crate) fn missing_lookup_ordinals(path: &std::path::Path) -> Option<u64> {
+    use std::io::BufRead;
+    #[derive(serde::Deserialize)]
+    struct Numbered {
+        record_kind: String,
+        #[serde(default)]
+        lookup_ordinal: Option<u64>,
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut seen: HashMap<u64, u64> = HashMap::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.ok()?;
+        let Ok(record) = serde_json::from_str::<Numbered>(&line) else {
+            continue;
+        };
+        if let (true, Some(ordinal)) = (record.record_kind == "observed", record.lookup_ordinal) {
+            *seen.entry(ordinal).or_insert(0) += 1;
+        }
+    }
+    Some(missing_ordinals(&seen))
+}
+
+/// The candidate's lookups, counted from the ordinals its observations carry,
+/// with each way the count fails to close named as a reason. `None`, with a
+/// warning, when the candidate numbered none.
+fn account_lookups(
+    observed: &[ObservedCall],
+    cancelled: &[ObservedCall],
+    reasons: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Option<deja::LookupTally> {
+    if !cancelled.is_empty() {
+        warnings.push(format!(
+            "{} lookup(s) were cancelled before they finished, their future dropped (a \
+             sibling's error in a join, a client that went away, a panic): they close the \
+             lookup count and are not scored",
+            cancelled.len()
+        ));
+    }
+    let numbered: Vec<&ObservedCall> = observed
+        .iter()
+        .chain(cancelled)
+        .filter(|call| call.lookup_ordinal.is_some())
+        .collect();
+    if numbered.is_empty() {
+        if !observed.is_empty() {
+            warnings.push(
+                "the candidate numbers no lookup, so the lookups it made are not accounted \
+                 for: a candidate built before lookups were numbered writes none"
+                    .to_owned(),
+            );
+        }
+        return None;
+    }
+    let seen = lookup_ordinals_seen(numbered.iter().copied());
+    let highest = seen.keys().copied().max().unwrap_or_default();
+    let repeated = seen.values().filter(|count| **count > 1).count();
+    let missing = missing_ordinals(&seen);
+    if repeated > 0 {
+        reasons.push(format!(
+            "{repeated} lookup number(s) repeat: the candidate started over during the run, so \
+             its observations come from more than one process"
+        ));
+    }
+    if missing > 0 {
+        reasons.push(format!(
+            "{missing} of the candidate's {highest} lookup(s) wrote no observation: lost with \
+             a process that died mid-call, or still running when the run was scored"
+        ));
+    }
+    // A cancelled lookup still ended in an arm: the arms describe where each
+    // lookup was resolved, which happened before it was dropped. Each arm is
+    // counted on its own, so a call claiming two arms unbalances the tally.
+    let arm = |resolved: bool, arg_divergent: bool| {
+        numbered
+            .iter()
+            .filter(|call| call.resolved == resolved && call.arg_divergent == arg_divergent)
+            .count() as u64
+    };
+    let tally = deja::LookupTally {
+        total: seen.len() as u64,
+        exact: arm(true, false),
+        arg_free: arm(false, true),
+        missed: arm(false, false),
+    };
+    if repeated == 0 && !tally.balances() {
+        reasons.push(format!(
+            "the candidate's lookups do not sum to their count: {} exact, {} args-free and {} \
+             missed of {}, so a call claims more than one arm",
+            tally.exact, tally.arg_free, tally.missed, tally.total
+        ));
+    }
+    Some(deja::LookupTally {
+        total: highest,
+        ..tally
+    })
+}
+
+/// Why a served call's arguments would otherwise have passed, for its warning.
+fn args_served_reason(verdict: ValueVerdict) -> &'static str {
+    match verdict {
+        ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure) => {
+            "its arguments differ only where replay-local database infrastructure is \
+             forgiven, which cannot be confirmed for a value recorded against other arguments"
+        }
+        ValueVerdict::Absorbed(ValueAbsorption::Canon(_)) => {
+            "a declared clause would have forgiven the difference, but not for a value \
+             recorded against other arguments"
+        }
+        _ => "its arguments differ from the recorded call's",
+    }
+}
+
+/// A reported path with every array index written `[]`, so a row reordered
+/// in place (`$.rows[]`) and the rows reordered (`$.rows`) stay two sites.
+fn site_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find(']') {
+            Some(close)
+                if !after[..close].is_empty()
+                    && after[..close].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                out.push_str("[]");
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The kind a call read by its args' identity is counted under.
+fn args_identity_kind(change: &deja::identity::IdentityChange) -> &'static str {
+    match change {
+        deja::identity::IdentityChange::ArrayOrder(_) => "ArgsOrderAbsorbed",
+        deja::identity::IdentityChange::DocumentText(_) => "ArgsDocumentAbsorbed",
+    }
+}
+
+/// Count a toleration by SITE: the call site, the kind and the path in its
+/// args, none of which moves between runs. The kind ticks once per site per
+/// run, however many calls reach it, so the set can be validated once and a
+/// new site is what a later run shows; the warning carries the call count.
+fn note_identity_site(
+    stats: &mut BoundaryStats,
+    seen: &mut BTreeMap<(String, &'static str, String), u64>,
+    obs: &ObservedCall,
+    change: &deja::identity::IdentityChange,
+) {
+    let kind = args_identity_kind(change);
+    // The path without the index a run happened to reorder at, so the key is
+    // the same on every run: a set that can be validated once, where a new
+    // member is the signal.
+    let calls = seen
+        .entry((call_site_label(obs), kind, site_path(change.path())))
+        .or_insert(0);
+    if *calls == 0 {
+        stats.note_kind(kind);
+    }
+    *calls += 1;
 }
 
 fn value_verdict(
@@ -2253,26 +2850,29 @@ fn value_verdict(
     // permutation absorbed in one and blocking in the other is one fact with
     // two answers depending on where it happened to be compared.
     if json_order_only_difference(recorded, observed) {
+        // A document held in a string written differently is not ordering.
+        // Any ordering beside it is the clause's when the clause explains the
+        // two once each document stands as its identity, and the default's
+        // otherwise.
+        let (texts, orders) = identity_sites("$", recorded, observed);
+        if !texts.is_empty() {
+            let ordering = (!orders.is_empty()).then(|| {
+                let clauses = event.map(event_value_clauses).unwrap_or_default();
+                if declared_clauses_equivalent(
+                    &clauses,
+                    &documents_as_identities(recorded),
+                    &documents_as_identities(observed),
+                ) {
+                    ValueCanonSource::Recorder
+                } else {
+                    ValueCanonSource::Default
+                }
+            });
+            return ValueVerdict::Absorbed(ValueAbsorption::DocumentText(ordering));
+        }
         return ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
     }
     ValueVerdict::Diverged
-}
-
-/// Whether a matched call's values diverge — the bool a caller that only routes
-/// on the outcome needs. A caller that has to REPORT why a difference did not
-/// count must use [`value_verdict`] instead: taking this bool because it is
-/// here is how a reason gets discarded on the way to the scorecard.
-pub(crate) fn values_diverge_under_event(
-    boundary: &str,
-    recorded: &serde_json::Value,
-    observed: &serde_json::Value,
-    event: Option<&deja::BoundaryEvent>,
-    observed_sql: Option<&str>,
-) -> bool {
-    matches!(
-        value_verdict(boundary, recorded, observed, event, observed_sql),
-        ValueVerdict::Diverged
-    )
 }
 
 /// [`value_verdict`] for an execute-shadow observed call against its recorded
@@ -2282,6 +2882,9 @@ fn observed_value_verdict(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
 ) -> Option<ValueVerdict> {
+    if obs.resolved && obs.provenance == deja::Provenance::ServedRecordedError {
+        return Some(ValueVerdict::Absorbed(ValueAbsorption::ServedRecordedError));
+    }
     if !obs.resolved || obs.provenance != deja::Provenance::Shadow {
         return None;
     }
@@ -2297,8 +2900,10 @@ fn observed_value_verdict(
     }
 }
 
-/// See [`values_diverge_under_event`] for why a caller needing the reason must
-/// not take this bool.
+/// Whether a resolved call's executed value diverged — a bool for callers that
+/// only route on the outcome. A caller that has to REPORT why a difference did
+/// not count must use [`value_verdict`] instead: taking this bool because it is
+/// here is how a reason gets discarded on the way to the scorecard.
 pub(crate) fn observed_value_diverged(
     obs: &ObservedCall,
     event: Option<&deja::BoundaryEvent>,
@@ -2572,27 +3177,36 @@ impl<'a> ArgsFreePairing<'a> {
         // entry, boundary and method off the rank-6 `Sequence` address (which
         // every event emits). A sequence the table covers only at a weaker rank
         // has no boundary/method and does not pair.
-        struct Addressed {
-            correlation: Option<String>,
-            boundary: Option<String>,
-            method: Option<String>,
+        // Borrowed for the same reason as `Expected` above: one entry per
+        // lookup-table entry, and three owned Strings each is a second copy of
+        // the table's identity columns for no benefit.
+        struct Addressed<'a> {
+            correlation: Option<&'a str>,
+            boundary: &'a str,
+            method: &'a str,
         }
-        let mut addressed: BTreeMap<u64, Addressed> = BTreeMap::new();
+        let mut addressed: BTreeMap<u64, Addressed<'_>> = BTreeMap::new();
         for entry in &table.entries {
-            let slot = addressed
+            // FIRST entry per sequence wins. In a rendered table every rank of
+            // one event carries that event's own boundary and operation — the
+            // ranks differ in the ADDRESS they are looked up by, not in whose
+            // call it is — so which one lands here does not matter.
+            //
+            // That is a property of the renderer, not something this loop
+            // checks, and it cannot be asserted here: the test fixtures build
+            // their rank-2 entries by copying a rank-6 one and overwriting the
+            // boundary (`span_entry`), so a `debug_assert_eq!` on identity
+            // across an event's entries fails 32 tests on fixture artifacts
+            // while saying nothing about real tables. Pinning it properly means
+            // selecting by rank rather than by position, which `Locus` cannot
+            // express today (it has no rank-6 variant).
+            addressed
                 .entry(entry.source_event_global_sequence)
                 .or_insert(Addressed {
-                    correlation: entry.key.correlation_id.clone(),
-                    boundary: None,
-                    method: None,
+                    correlation: entry.key.correlation_id.as_deref(),
+                    boundary: entry.key.boundary.as_str(),
+                    method: entry.key.operation.as_str(),
                 });
-            if let Address::Sequence {
-                boundary, method, ..
-            } = &entry.key.address
-            {
-                slot.boundary = Some(boundary.clone());
-                slot.method = Some(method.clone());
-            }
         }
 
         // `addressed` is ordered by sequence, so each queue comes out in source
@@ -2601,27 +3215,38 @@ impl<'a> ArgsFreePairing<'a> {
         // never select that later occurrence.
         let mut queues: BTreeMap<_, std::collections::VecDeque<ArgsFreeTwin<'a>>> = BTreeMap::new();
         for (seq, entry) in &addressed {
-            let (Some(boundary), Some(method)) = (&entry.boundary, &entry.method) else {
-                continue;
-            };
+            // Identity is no longer optional here. It used to be gated on the
+            // entry being the rank-6 positional one, which was the only variant
+            // carrying the boundary — so `None` meant "this event is covered
+            // only at a weaker rank" and the event did not pair.
+            //
+            // That gate was vacuous. Measured on a real rendered table
+            // (`rec-215423c-09111036-3q`, 16,815 entries): every one of the
+            // 3,363 events had an entry at EVERY rank, five apiece, no
+            // exceptions — so the filter never excluded anything in production
+            // and only ever discriminated in hand-built partial test tables.
+            //
+            // Identity is now on every key and is IDENTICAL across an event's
+            // entries, so `or_insert` taking it from whichever comes first is
+            // exactly-once and order-independent, not arbitrary.
+            let (boundary, method) = (&entry.boundary, &entry.method);
             let Some(span) = span_paths.get(seq) else {
                 continue;
             };
             let event = events_by_seq.get(seq).copied();
-            let shape =
-                event.map(|ev| pairing_shape(&ev.args, entry.correlation.as_deref(), provenance));
+            let shape = event.map(|ev| pairing_shape(&ev.args, entry.correlation, provenance));
             queues
                 .entry((
-                    entry.correlation.clone(),
+                    entry.correlation.map(str::to_owned),
                     span.clone(),
-                    boundary.clone(),
-                    method.clone(),
+                    (*boundary).to_owned(),
+                    (*method).to_owned(),
                     shape,
                 ))
                 .or_default()
                 .push_back(ArgsFreeTwin {
                     sequence: *seq,
-                    args: event.map(|ev| &ev.args),
+                    args: event.map(|ev| &*ev.args),
                 });
         }
         Self { queues, provenance }
@@ -2681,6 +3306,475 @@ impl<'a> ArgsFreePairing<'a> {
     }
 }
 
+/// How every call the candidate made pairs with the recording — decided ONCE,
+/// from the addresses, and read by both the scorecard and the ledger, so the two
+/// can never pair one call two ways.
+///
+/// A resolved call is paired with the event its address served. An unresolved
+/// call is then paired by its address minus its args — the same correlation,
+/// span, boundary and operation, first unclaimed — which makes it ONE call whose
+/// input changed rather than a novel call beside an omitted one. Identity is
+/// never relaxed, so a call only ever pairs with the same call. The forest's span
+/// alignment is not consulted: a span holding one event on each side says nothing
+/// about whether those two are one call, and treating it as if it did paired a
+/// uuid draw with an outbound HTTP call.
+///
+/// Every resolved claim is taken before the first twin, so no unresolved call
+/// can take an event a later resolved call owns — the double claim behind the
+/// run-0810 phantom, which is why the scorecard pairs in two passes.
+pub(crate) struct CallPairing {
+    twins: HashMap<usize, ArgsFreePairingResult>,
+    /// Pairs that are the displaced half of an order change another pair already
+    /// reports. See [`CallPairing::changed`].
+    displaced: HashSet<usize>,
+}
+
+impl CallPairing {
+    pub(crate) fn build(
+        table: &LookupTable,
+        events: &[deja::BoundaryEvent],
+        observed: &[ObservedCall],
+        provenance: &CorrelationColumnProvenance,
+    ) -> Self {
+        // Resolved claims first: an exact hit IS its recorded event, and nothing
+        // below may take that event from it.
+        let mut claimed: HashSet<u64> = observed
+            .iter()
+            .filter(|call| call.resolved && !observed_is_ingress(call))
+            .filter_map(|call| call.source_event_global_sequence)
+            .collect();
+        // Then a call the candidate served args-free, which says which recorded
+        // event it was answered from, pairs with exactly that one. It is not
+        // searched for by shape: the request it changed may have gained or lost a
+        // field, and a shape that differs finds nothing — the call then read as
+        // an egress miss beside an omitted call. The event it names joins the
+        // claimed set, so the shape search below cannot hand it to a sibling.
+        //
+        // The claim holds only if the event is still free. An args-free serve
+        // counts every call at its address, so it can name an event that an exact
+        // hit also owns (the candidate sent one recorded call's args at another's
+        // position). The exact hit keeps it, and the served call falls back to
+        // the shape search like any other unresolved call. Same guard as the
+        // shape search: an uncorrelated call has no request to pair within.
+        let mut served: Vec<(usize, ArgsFreePairingResult)> = Vec::new();
+        for (index, call) in observed.iter().enumerate() {
+            if !call.arg_divergent || observed_is_ingress(call) || call.correlation_id.is_none() {
+                continue;
+            }
+            let Some(sequence) = call.served_event_global_sequence else {
+                continue;
+            };
+            if claimed.insert(sequence) {
+                served.push((
+                    index,
+                    ArgsFreePairingResult {
+                        sequence,
+                        order_mismatch: false,
+                    },
+                ));
+            }
+        }
+        let served_calls: HashSet<usize> = served.iter().map(|(index, _)| *index).collect();
+        let mut pool = ArgsFreePairing::build(table, events, provenance);
+        // An uncorrelated call has no correlation in its address to pair within.
+        let mut twins: Vec<(usize, ArgsFreePairingResult)> = observed
+            .iter()
+            .enumerate()
+            .filter(|(index, call)| {
+                !call.resolved
+                    && !observed_is_ingress(call)
+                    && call.correlation_id.is_some()
+                    && !served_calls.contains(index)
+            })
+            .filter_map(|(index, call)| pool.take_twin(call, &claimed).map(|twin| (index, twin)))
+            .collect();
+        twins.extend(served);
+        pairing_balance(observed, &twins)
+            .expect("every recorded event is paired with at most one observed call");
+
+        // Pairing is FIFO, so two requests sent in swapped order produce two
+        // pairs: the one that jumped ahead is flagged out of order, and the one
+        // it displaced is left paired with the other's recorded request. The
+        // second is the SAME change, not another. A request an out-of-order pair
+        // claimed can explain exactly one displaced call in its pool; a call that
+        // matches none of them changed what it sent, and still counts.
+        let events_by_sequence: HashMap<u64, &deja::BoundaryEvent> = events
+            .iter()
+            .map(|event| (event.global_sequence, event))
+            .collect();
+        let pool_of = |call: &ObservedCall| {
+            (
+                call.correlation_id.clone(),
+                call.span_path.clone(),
+                call.boundary.clone(),
+                call.method_name.clone(),
+            )
+        };
+        let mut claimed_out_of_order: HashMap<_, Vec<&deja::BoundaryEvent>> = HashMap::new();
+        for (index, twin) in twins.iter().filter(|(_, twin)| twin.order_mismatch) {
+            if let Some(event) = events_by_sequence.get(&twin.sequence) {
+                claimed_out_of_order
+                    .entry(pool_of(&observed[*index]))
+                    .or_default()
+                    .push(event);
+            }
+        }
+        let mut displaced = HashSet::new();
+        for (index, _) in twins.iter().filter(|(_, twin)| !twin.order_mismatch) {
+            let call = &observed[*index];
+            let Some(requests) = claimed_out_of_order.get_mut(&pool_of(call)) else {
+                continue;
+            };
+            let same_request = requests.iter().position(|event| {
+                !matches!(
+                    pair_request_verdict(call, Some(event)),
+                    ValueVerdict::Diverged
+                )
+            });
+            if let Some(at) = same_request {
+                requests.remove(at);
+                displaced.insert(*index);
+            }
+        }
+        Self {
+            twins: twins.into_iter().collect(),
+            displaced,
+        }
+    }
+
+    /// Whether the pair at `index` changed what it sent: it went out of order,
+    /// or its request is not the one the recording sent there. The displaced
+    /// half of an order change another pair reports is that same change, and is
+    /// not counted twice. Both the scorecard and the ledger decide through here.
+    pub(crate) fn changed(
+        &self,
+        index: usize,
+        request_diverged: bool,
+        order_mismatch: bool,
+    ) -> bool {
+        order_mismatch || (request_diverged && !self.displaced.contains(&index))
+    }
+
+    /// The recorded event the call at `index` pairs with by its address minus its
+    /// args, if any. A resolved call's pair is its own served event.
+    pub(crate) fn twin(&self, index: usize) -> Option<&ArgsFreePairingResult> {
+        self.twins.get(&index)
+    }
+}
+
+/// What the attribution had to say about one argument-divergent serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServeReach {
+    /// Later calls in the serve's correlation that could have consumed the
+    /// substituted value. Zero is an EMPTY reach — the serve was the last call
+    /// its correlation made — and not an absent one.
+    Calls(u64),
+    /// The serve carries no correlation, so there is no request to bound a reach
+    /// within. Named rather than reported as a reach of zero.
+    NoCorrelation,
+}
+
+/// Where the graph puts a reached call relative to the serve that reached it.
+///
+/// Three states and not a bool, for the reason [`ServeReach::NoCorrelation`] is
+/// not a reach of zero: a structural claim and the absence of one are different
+/// facts, and sharing `false` between them tells a reader the run decided
+/// something it never looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachPlacement {
+    /// On the serve's own span node, or under it: the substituted value got here
+    /// without leaving the span it was produced in.
+    ///
+    /// Emphatically NOT "passed down". A boundary call and a consumer in the same
+    /// function body attach to the SAME span node, and the walk behind this set
+    /// takes a node's own events before descending — so the commonest shape in
+    /// here is a value RETURNED by the serve and used a line later, in one frame.
+    WithinServeSpan,
+    /// Outside that subtree: the value was returned out of the serve's span and
+    /// carried here through a caller.
+    OutsideServeSpan,
+    /// The graph could not say — the correlation is not graph-scored, one of the
+    /// two calls carries no node, or the caller supplied no plan. The absence of
+    /// a structural claim, never a negative one.
+    Unplaced,
+}
+
+/// One call an earlier argument-divergent serve could have reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReachedCall {
+    /// What the graph had to say about how the value could have got here. The
+    /// graph annotates the reach; it does not bound it, so `Unplaced` narrows
+    /// nothing.
+    pub(crate) placement: ReachPlacement,
+}
+
+/// Which calls an argument-divergent substitution COULD have reached.
+///
+/// A candidate whose arguments moved at an address the recording does hold is
+/// served the recording's value and marked `arg_divergent`. That value is the
+/// RECORDING's, not this run's, and the request continues on it. Marking the
+/// serve says one call diverged; it does not say which of the work after it
+/// stands on a value nobody checked, and a stale value propagating into
+/// downstream computation is the whole reason the silent version of this
+/// substitution was a lie. This says it.
+///
+/// Reach is bounded by POSITION — the later calls of the same correlation.
+/// deja records the execution graph, not value provenance: no edge says which
+/// call consumed what. So this is an over-approximation and is named as one
+/// wherever it is reported. A reached call COULD be affected; nothing here
+/// claims it was, or that anything divergent was observed in it.
+///
+/// Containment deliberately does not bound it, which is the one place this
+/// departs from `pruned_subtree`. A served value RETURNS to its caller, so it can
+/// leave the span it was produced in: the serve runs inside a helper, the value
+/// goes back to the handler, and the handler's next call sits under a span that is
+/// a SIBLING of the helper's. A subtree walk rooted at the serve cannot see that
+/// call, so the reach would be short by however much of the request came after
+/// the helper returned — and short without saying so.
+///
+/// The level at hand is not the problem, and the distinction matters because the
+/// obvious argument for this design gets it wrong. A consumer in the serve's OWN
+/// frame attaches to the same span node as the serve, and the walk takes a node's
+/// own events before it descends, so containment does see that one. What it
+/// cannot see is one level up. The graph is therefore an ANNOTATION rather than a
+/// bound: [`ReachPlacement`] says which of the two shapes a reached call is, or
+/// that this run could not tell.
+///
+/// A call after two serves is charged to the NEAREST, so the per-serve reaches
+/// partition the reached calls instead of overlapping, and their sum is the
+/// total. A serve is itself reached by any serve before it in its correlation.
+///
+/// Nothing here blocks. The serve is classified on its own row by the arms that
+/// already existed — a blocking `ValueDiverged` where it pairs with a recorded
+/// twin, and whatever the unpaired arms make of it where it does not — so the
+/// finding is reported without this. Making its reach block as well would turn
+/// one argument divergence into a cascade of failures and bury the row that names
+/// the cause, which is the complaint `pruned_subtree` already draws.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ArgDivergenceReach {
+    serves: BTreeMap<usize, ServeReach>,
+    reached: BTreeMap<usize, ReachedCall>,
+}
+
+impl ArgDivergenceReach {
+    /// Read from one place by the scorecard and by the ledger, for the reason
+    /// [`CallPairing`] is: a run whose counts and whose rows disagree about what
+    /// a substitution could have touched describes itself two ways.
+    pub(crate) fn build(observed: &[ObservedCall], plan: Option<&GraphScoringPlan>) -> Self {
+        let mut serves: BTreeMap<usize, ServeReach> = BTreeMap::new();
+        let mut reached: BTreeMap<usize, ReachedCall> = BTreeMap::new();
+        // The nearest serve so far in each correlation, with the observed calls
+        // the graph puts on its span node or under it. Computed once per serve
+        // rather than per reached call, and `None` where the graph declined to
+        // answer — an empty set would claim it answered "none of them".
+        let mut open: HashMap<&str, (usize, Option<HashSet<u64>>)> = HashMap::new();
+        for (index, call) in observed.iter().enumerate() {
+            if observed_is_ingress(call) {
+                // The boundary the kernel re-drives, not a call the candidate
+                // made. It neither serves nor consumes.
+                continue;
+            }
+            let Some(correlation_id) = call.correlation_id.as_deref() else {
+                if call.arg_divergent {
+                    serves.insert(index, ServeReach::NoCorrelation);
+                }
+                continue;
+            };
+            if let Some((serve, within)) = open.get(correlation_id) {
+                reached.insert(
+                    index,
+                    ReachedCall {
+                        placement: match within {
+                            // The replay forest carries each observed call's INDEX
+                            // as its event sequence (see `GraphScoringPlan::build`),
+                            // which is what makes this comparison meaningful. A
+                            // forest that moved to a real sequence space here would
+                            // match nothing and read as `OutsideServeSpan`.
+                            Some(within) if within.contains(&(index as u64)) => {
+                                ReachPlacement::WithinServeSpan
+                            }
+                            Some(_) => ReachPlacement::OutsideServeSpan,
+                            None => ReachPlacement::Unplaced,
+                        },
+                    },
+                );
+                if let Some(ServeReach::Calls(count)) = serves.get_mut(serve) {
+                    *count += 1;
+                }
+            }
+            if call.arg_divergent {
+                serves.insert(index, ServeReach::Calls(0));
+                let within = call.graph_node_id.and_then(|node| {
+                    plan.and_then(|plan| plan.replay_subtree_observed(correlation_id, node))
+                });
+                open.insert(correlation_id, (index, within));
+            }
+        }
+        let reach = Self { serves, reached };
+        reach
+            .balance(observed)
+            .expect("argument-divergence reach must account for the calls it speaks about");
+        reach
+    }
+
+    /// Every claim this makes, recomputed from the observed stream and compared.
+    ///
+    /// Independent of how [`Self::build`] walks: the serve set by the flag alone,
+    /// the reached set as each correlation's calls after its FIRST serve (where
+    /// `build` charges each to its nearest), the per-serve counts against the
+    /// reached set they partition, and each serve's count against the calls
+    /// between it and the next serve — which is what "nearest" means, recomputed
+    /// from the positions. A call charged twice, charged to a serve in another
+    /// correlation, or dropped is a failure here rather than a total that quietly
+    /// does not add up.
+    fn balance(&self, observed: &[ObservedCall]) -> Result<(), String> {
+        let declared = observed
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.arg_divergent && !observed_is_ingress(call))
+            .count();
+        if declared != self.serves.len() {
+            return Err(format!(
+                "{declared} call(s) report moved arguments but {} were attributed",
+                self.serves.len()
+            ));
+        }
+        let mut by_correlation: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, call) in observed.iter().enumerate() {
+            if observed_is_ingress(call) {
+                continue;
+            }
+            if let Some(correlation_id) = call.correlation_id.as_deref() {
+                by_correlation
+                    .entry(correlation_id)
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        for (index, call) in observed.iter().enumerate() {
+            if !call.arg_divergent || observed_is_ingress(call) {
+                continue;
+            }
+            if let Some(correlation_id) = call.correlation_id.as_deref() {
+                first.entry(correlation_id).or_insert(index);
+            }
+        }
+        let after_first = observed
+            .iter()
+            .enumerate()
+            .filter(|(index, call)| {
+                !observed_is_ingress(call)
+                    && call
+                        .correlation_id
+                        .as_deref()
+                        .and_then(|id| first.get(id))
+                        .is_some_and(|serve| serve < index)
+            })
+            .count();
+        if after_first != self.reached.len() {
+            return Err(format!(
+                "{after_first} call(s) follow a serve in their correlation but {} were attributed",
+                self.reached.len()
+            ));
+        }
+        let charged: u64 = self
+            .serves
+            .values()
+            .map(|reach| match reach {
+                ServeReach::Calls(count) => *count,
+                ServeReach::NoCorrelation => 0,
+            })
+            .sum();
+        if charged != self.reached.len() as u64 {
+            return Err(format!(
+                "the serves account for {charged} reached call(s), but {} carry the attribution",
+                self.reached.len()
+            ));
+        }
+        for (index, call) in observed.iter().enumerate() {
+            if !call.arg_divergent || observed_is_ingress(call) {
+                continue;
+            }
+            let Some(correlation_id) = call.correlation_id.as_deref() else {
+                continue;
+            };
+            let calls = &by_correlation[correlation_id];
+            let next = calls
+                .iter()
+                .copied()
+                .find(|&at| at > index && observed[at].arg_divergent);
+            let owned = calls
+                .iter()
+                .copied()
+                .filter(|&at| at > index && next.is_none_or(|next| at <= next))
+                .count() as u64;
+            let charged = match self.serves.get(&index) {
+                Some(ServeReach::Calls(count)) => *count,
+                _ => 0,
+            };
+            if owned != charged {
+                return Err(format!(
+                    "the serve at {index} owns {owned} call(s) up to the next serve but was \
+                     charged {charged}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The call at `index` was served the recording's value on moved arguments,
+    /// and this is what its reach came to. `None` says the call is not a serve.
+    pub(crate) fn serve(&self, index: usize) -> Option<ServeReach> {
+        self.serves.get(&index).copied()
+    }
+
+    /// An argument-divergent serve earlier in this call's correlation could have
+    /// reached it. `None` says nothing upstream of it was served that way.
+    pub(crate) fn reached(&self, index: usize) -> Option<ReachedCall> {
+        self.reached.get(&index).copied()
+    }
+}
+
+/// One recorded event, one observed call: recomputed from what [`CallPairing`]
+/// produced rather than trusted from how it was built. `twins` is keyed by the
+/// observed call, so an event two calls claim is a state it can represent, and
+/// the scorer's consumed-set would absorb the duplicate silently — a spurious
+/// `matched` row with nothing to say it was one event twice. Checked here: no
+/// event pairs twice, none a resolved call owns, and no call pairs twice.
+fn pairing_balance(
+    observed: &[ObservedCall],
+    twins: &[(usize, ArgsFreePairingResult)],
+) -> Result<(), String> {
+    let owned: HashSet<u64> = observed
+        .iter()
+        .filter(|call| call.resolved && !observed_is_ingress(call))
+        .filter_map(|call| call.source_event_global_sequence)
+        .collect();
+    let mut paired: HashSet<u64> = HashSet::new();
+    let mut pairing_calls: HashSet<usize> = HashSet::new();
+    for (index, twin) in twins {
+        if !pairing_calls.insert(*index) {
+            return Err(format!("call {index} paired twice"));
+        }
+        if owned.contains(&twin.sequence) {
+            return Err(format!(
+                "call {index} paired with event {} that a resolved call owns",
+                twin.sequence
+            ));
+        }
+        if !paired.insert(twin.sequence) {
+            return Err(format!(
+                "call {index} paired with event {}, which another call already paired with",
+                twin.sequence
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn args_free_effective_values(
     recorded_result: &serde_json::Value,
     obs: &ObservedCall,
@@ -2730,22 +3824,6 @@ fn parse_project_canon(id: &str) -> Option<CanonPreset> {
 /// difference.
 fn sort_as_bag(items: &mut [serde_json::Value]) {
     items.sort_by_cached_key(|item| serde_json::to_string(item).unwrap_or_default());
-}
-
-fn bag_canon(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(items) => {
-            let mut items: Vec<_> = items.iter().map(bag_canon).collect();
-            sort_as_bag(&mut items);
-            serde_json::Value::Array(items)
-        }
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.iter()
-                .map(|(key, value)| (key.clone(), bag_canon(value)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
 }
 
 fn final_state_canon(value: &serde_json::Value) -> serde_json::Value {
@@ -3621,7 +4699,7 @@ fn order_canonical_diff(
             // re-describe it as however many positions this run's two orders
             // happened to disagree on — which is the count that will not sit
             // still between runs.
-            if bag_canon(baseline) == bag_canon(candidate) {
+            if deja::identity::same(baseline, candidate) {
                 out.push(JsonFieldDiff {
                     json_path: path.to_owned(),
                     baseline: baseline.clone(),
@@ -3635,35 +4713,11 @@ fn order_canonical_diff(
             // however far apart they sit, so substituting one element of nine
             // is one difference and not the run of positional disagreements
             // that the substitution shifted everything else into.
-            let key = |value: &serde_json::Value| {
-                serde_json::to_string(&bag_canon(value)).unwrap_or_default()
-            };
-            let mut unmatched_candidates: BTreeMap<String, Vec<&serde_json::Value>> =
-                BTreeMap::new();
-            for item in c {
-                unmatched_candidates
-                    .entry(key(item))
-                    .or_default()
-                    .push(item);
-            }
-            let mut only_baseline: Vec<&serde_json::Value> = Vec::new();
-            for item in b {
-                // Cancel against an equal member wherever it sits. Popping one
-                // occurrence rather than all of them is what keeps this a
-                // multiset difference: a lost duplicate still surfaces.
-                match unmatched_candidates.get_mut(&key(item)) {
-                    Some(pool) if !pool.is_empty() => {
-                        pool.pop();
-                    }
-                    _ => only_baseline.push(item),
-                }
-            }
-            let mut only_candidate: Vec<&serde_json::Value> =
-                unmatched_candidates.into_values().flatten().collect();
-            // Both residues in canonical order, so the pairing below — and
-            // every path it names — is the same on every run.
-            only_baseline.sort_by_cached_key(|item| key(item));
-            only_candidate.sort_by_cached_key(|item| key(item));
+            let (only_baseline, only_candidate) = cancel_common(b, c);
+            // Pair each leftover member with the one it shares most with, so a
+            // member that changed one field reports that field alone; order-free,
+            // so the paths it names are the same on every run.
+            let (only_baseline, only_candidate) = pair_residues(only_baseline, only_candidate);
             for index in 0..only_baseline.len().max(only_candidate.len()) {
                 // The index is into the residue, not into the original array:
                 // once order carries no information, a position cannot be
@@ -3706,25 +4760,640 @@ pub(crate) fn json_order_only_difference(
     recorded: &serde_json::Value,
     observed: &serde_json::Value,
 ) -> bool {
-    recorded != observed && bag_canon(recorded) == bag_canon(observed)
+    recorded != observed && deja::identity::same(recorded, observed)
 }
 
+/// A hash of a member as written, every rendering included, and key order
+/// too unless `keys_sorted`.
+fn written_hash(member: &serde_json::Value, keys_sorted: bool) -> u64 {
+    use sha2::{Digest, Sha256};
+    fn feed(hasher: &mut Sha256, value: &serde_json::Value, keys_sorted: bool) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut members: Vec<_> = map.iter().collect();
+                if keys_sorted {
+                    members.sort_by(|a, b| a.0.cmp(b.0));
+                }
+                hasher.update(b"{");
+                for (key, member) in members {
+                    hasher.update(serde_json::to_vec(key).unwrap_or_default());
+                    hasher.update(b":");
+                    feed(hasher, member, keys_sorted);
+                    hasher.update(b",");
+                }
+                hasher.update(b"}");
+            }
+            serde_json::Value::Array(items) => {
+                hasher.update(b"[");
+                for item in items {
+                    feed(hasher, item, keys_sorted);
+                    hasher.update(b",");
+                }
+                hasher.update(b"]");
+            }
+            scalar => hasher.update(serde_json::to_vec(scalar).unwrap_or_default()),
+        }
+    }
+    let mut hasher = Sha256::new();
+    feed(&mut hasher, member, keys_sorted);
+    u64::from_le_bytes(
+        hasher.finalize()[..8]
+            .try_into()
+            .expect("a sha256 digest is 32 bytes"),
+    )
+}
+
+/// Cancel the members two arrays share, one partner each and the closest
+/// first: one written identically, then one written identically but for key
+/// order, then one the exact hash reads alike (a body in another rendering),
+/// then one of the same identity written another way. Each tier holds the one
+/// before it. Both sides are read in content order (identity, exact hash, key
+/// order aside, as written), so which member cancels and which is left never
+/// depends on the order either side wrote them in, and a lost duplicate still
+/// surfaces. Returns each side's leftovers in that order.
+fn cancel_common<'a>(
+    baseline: &'a [serde_json::Value],
+    candidate: &'a [serde_json::Value],
+) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
+    use std::collections::VecDeque;
+    type Keyed<'a> = (u64, u64, u64, u64, &'a serde_json::Value);
+    let in_content_order = |members: &'a [serde_json::Value]| {
+        let mut keyed: Vec<Keyed<'a>> = members
+            .iter()
+            .map(|member| {
+                (
+                    deja::identity::element_hash(member),
+                    deja::canonical_args_hash(member),
+                    written_hash(member, true),
+                    written_hash(member, false),
+                    member,
+                )
+            })
+            .collect();
+        keyed.sort_by_key(|&(identity, exact, sorted, written, _)| {
+            (identity, exact, sorted, written)
+        });
+        keyed
+    };
+    let (baseline, candidate) = (in_content_order(baseline), in_content_order(candidate));
+    let queues = |key: fn(&Keyed<'a>) -> u64| {
+        let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
+        for (index, member) in candidate.iter().enumerate() {
+            queues.entry(key(member)).or_default().push_back(index);
+        }
+        queues
+    };
+    let mut used = vec![false; candidate.len()];
+    let mut cancelled = vec![false; baseline.len()];
+    let written: fn(&Keyed<'a>) -> u64 = |&(_, _, _, written, _)| written;
+    let sorted: fn(&Keyed<'a>) -> u64 = |&(_, _, sorted, _, _)| sorted;
+    let exact: fn(&Keyed<'a>) -> u64 = |&(_, exact, _, _, _)| exact;
+    let identity: fn(&Keyed<'a>) -> u64 = |&(identity, _, _, _, _)| identity;
+    for key in [written, sorted, exact, identity] {
+        let mut queues = queues(key);
+        for (index, member) in baseline.iter().enumerate() {
+            if cancelled[index] {
+                continue;
+            }
+            let Some(queue) = queues.get_mut(&key(member)) else {
+                continue;
+            };
+            while queue.front().is_some_and(|&other| used[other]) {
+                queue.pop_front();
+            }
+            // Past the front only on a hash shared by another identity.
+            let found = queue.iter().position(|&other| {
+                !used[other] && deja::identity::same(member.4, candidate[other].4)
+            });
+            if let Some(other) = found.and_then(|found| queue.remove(found)) {
+                used[other] = true;
+                cancelled[index] = true;
+            }
+        }
+    }
+    let left = |members: Vec<Keyed<'a>>, gone: Vec<bool>| {
+        members
+            .into_iter()
+            .zip(gone)
+            .filter_map(|((_, _, _, _, member), gone)| (!gone).then_some(member))
+            .collect()
+    };
+    (left(baseline, cancelled), left(candidate, used))
+}
+
+/// Pair two arrays' leftover members for the report, each taken in content
+/// order: each recorded member with the observed member sharing the most
+/// fields with it, ties to the earliest. A field is an object's member, read
+/// with its key so a byte string keeps its order, or an array's member.
+/// Nothing here depends on the order either side wrote its members in. Each
+/// member's fields are read once. Past a bound on the work (every recorded
+/// member's fields against every observed member) the members pair in content
+/// order unscored, and a leftover paired with a stranger reports each field
+/// they differ in. Returns the two sides aligned by index; unpaired members
+/// follow.
+fn pair_residues<'a>(
+    baseline: Vec<&'a serde_json::Value>,
+    candidate: Vec<&'a serde_json::Value>,
+) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
+    const MAX_WORK: usize = 1 << 22;
+    let fields = |member: &serde_json::Value| -> HashMap<u64, usize> {
+        let hashes: Vec<u64> = match member {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(key, value)| {
+                    let mut field = serde_json::Map::new();
+                    field.insert(key.clone(), value.clone());
+                    deja::identity::element_hash(&serde_json::Value::Object(field))
+                })
+                .collect(),
+            serde_json::Value::Array(items) => {
+                items.iter().map(deja::identity::element_hash).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut counts = HashMap::new();
+        for hash in hashes {
+            *counts.entry(hash).or_insert(0) += 1;
+        }
+        counts
+    };
+    let width = |member: &serde_json::Value| match member {
+        serde_json::Value::Object(map) => map.len(),
+        serde_json::Value::Array(items) => items.len(),
+        _ => 0,
+    };
+    let work = baseline
+        .iter()
+        .map(|member| width(member) + 1)
+        .sum::<usize>()
+        .saturating_mul(candidate.len());
+    if work > MAX_WORK {
+        return (baseline, candidate);
+    }
+    let own: Vec<HashMap<u64, usize>> = baseline.iter().map(|member| fields(member)).collect();
+    let mut candidates: Vec<(&'a serde_json::Value, HashMap<u64, usize>)> = candidate
+        .into_iter()
+        .map(|member| (member, fields(member)))
+        .collect();
+    let mut paired = Vec::with_capacity(candidates.len());
+    for own in &own {
+        if candidates.is_empty() {
+            break;
+        }
+        let shared = |other: &HashMap<u64, usize>| -> usize {
+            own.iter()
+                .map(|(hash, count)| (*count).min(other.get(hash).copied().unwrap_or(0)))
+                .sum()
+        };
+        let (mut best, mut best_score) = (0, shared(&candidates[0].1));
+        for (index, (_, other)) in candidates.iter().enumerate().skip(1) {
+            let score = shared(other);
+            if score > best_score {
+                (best, best_score) = (index, score);
+            }
+        }
+        paired.push(candidates.remove(best).0);
+    }
+    paired.extend(candidates.into_iter().map(|(member, _)| member));
+    (baseline, paired)
+}
+
+/// The same predicate as [`json_order_only_difference`], for a reported row.
 fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
-    matches!(
-        (&row.baseline, &row.candidate),
-        (serde_json::Value::Array(_), serde_json::Value::Array(_))
-    ) && row.baseline != row.candidate
-        && bag_canon(&row.baseline) == bag_canon(&row.candidate)
+    json_order_only_difference(&row.baseline, &row.candidate)
+}
+
+/// How a document held in a string is read, for the warnings that name one.
+const DOCUMENT_TEXT_READING: &str = "the document it holds is the recording's, read as JSON, so \
+    order, key order and spacing inside the text are set aside, and a fractional number is \
+    compared as a float. A consumer reading the string as text sees the change";
+
+/// Record an absorbed row by what the identity read differently in it. Its
+/// ordering is named as a pure reorder's is, once at the row's own path under
+/// `source`, and each string holding a document written differently is named
+/// as document text at its own site. So a row with both reasons names both,
+/// and a document string adds a site without changing the ordering's.
+fn absorb_by_identity(
+    classification: &mut HttpBodyClassification,
+    body: &JsonFieldDiff,
+    source: ClauseSource,
+) {
+    let (texts, orders) = identity_sites(&body.json_path, &body.baseline, &body.candidate);
+    if texts.is_empty() || !orders.is_empty() {
+        classification
+            .canon_absorbed
+            .push((body.json_path.clone(), source));
+    }
+    classification.document_text_paths.extend(texts);
+}
+
+/// `value` with each string holding a JSON document replaced by a marker of
+/// that document's identity, so a comparison that reads strings as text sees
+/// two writings of one document as equal and judges only what else differs.
+fn documents_as_identities(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) if deja::identity::embedded_document(text).is_some() => {
+            serde_json::Value::String(format!(
+                "\u{1}document {:016x}",
+                deja::identity::element_hash(value)
+            ))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(documents_as_identities).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, member)| (key.clone(), documents_as_identities(member)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Where two values of one identity at `path` were read differently: the
+/// sites of strings holding a document written differently, and of arrays that
+/// only moved, each with its indices written `[]`.
+fn identity_sites(
+    path: &str,
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    let (mut texts, mut orders) = (Vec::new(), Vec::new());
+    for change in deja::identity::identity_differences(baseline, candidate).unwrap_or_default() {
+        match change {
+            deja::identity::IdentityChange::DocumentText(inner) => {
+                texts.push(site_path(&format!(
+                    "{path}{}",
+                    inner.trim_start_matches('$')
+                )));
+            }
+            deja::identity::IdentityChange::ArrayOrder(inner) => {
+                orders.push(site_path(&format!(
+                    "{path}{}",
+                    inner.trim_start_matches('$')
+                )));
+            }
+        }
+    }
+    (texts, orders)
+}
+
+/// Larger bodies are not scanned for embedded documents; they compare as text.
+const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
+
+/// A page carrying more documents than this compares as text.
+const MAX_EMBEDDED_DOCUMENTS: usize = 16;
+
+/// A document nested deeper than this compares as text: the structural
+/// comparison costs size times depth squared.
+const MAX_EMBEDDED_DEPTH: usize = 32;
+
+/// A non-JSON text split into the JSON objects embedded in it and the text
+/// around them. A document starts at a `{` that begins a complete JSON object
+/// and runs to that object's end; any other brace stays text.
+#[derive(Debug, PartialEq)]
+struct EmbeddedDocuments<'a> {
+    text: Vec<&'a str>,
+    documents: Vec<serde_json::Value>,
+    /// Each document as written.
+    written: Vec<&'a str>,
+}
+
+fn embedded_documents(text: &str) -> EmbeddedDocuments<'_> {
+    let (mut pieces, mut documents, mut written) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut piece_start, mut cursor) = (0, 0);
+    while let Some(offset) = text[cursor..].find('{') {
+        let start = cursor + offset;
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(document)) => {
+                pieces.push(&text[piece_start..start]);
+                documents.push(document);
+                cursor = start + stream.byte_offset();
+                written.push(&text[start..cursor]);
+                piece_start = cursor;
+            }
+            _ => cursor = start + 1,
+        }
+    }
+    pieces.push(&text[piece_start..]);
+    EmbeddedDocuments {
+        text: pieces,
+        documents,
+        written,
+    }
+}
+
+/// How many objects and arrays deep a value nests.
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The lexemes of a JSON text as written, in order: strings with their
+/// escapes, numbers as spelled, literals, and punctuation.
+fn written_lexemes(json: &str) -> Vec<&str> {
+    let bytes = json.as_bytes();
+    let (mut lexemes, mut at) = (Vec::new(), 0);
+    while at < bytes.len() {
+        let start = at;
+        match bytes[at] {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                at += 1;
+                continue;
+            }
+            b'"' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                at += 1;
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => at += 1,
+            _ => {
+                while at < bytes.len()
+                    && !matches!(
+                        bytes[at],
+                        b' ' | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'{'
+                            | b'}'
+                            | b'['
+                            | b']'
+                            | b':'
+                            | b','
+                            | b'"'
+                    )
+                {
+                    at += 1;
+                }
+            }
+        }
+        lexemes.push(&json[start..at.min(bytes.len())]);
+    }
+    lexemes
+}
+
+/// A JSON text as written, with its arrangement taken out: every value keeps
+/// its exact spelling (escapes, number forms, duplicate keys, a null), and
+/// only the order of object members and of array members is canonical. Two
+/// documents with the same written form differ in arrangement alone.
+fn written_form(json: &str) -> String {
+    fn value(lexemes: &mut std::iter::Peekable<std::vec::IntoIter<&str>>) -> String {
+        match lexemes.next() {
+            Some("{") => {
+                let mut members = Vec::new();
+                while let Some(&next) = lexemes.peek() {
+                    if next == "}" {
+                        lexemes.next();
+                        break;
+                    }
+                    if next == "," {
+                        lexemes.next();
+                        continue;
+                    }
+                    let key = lexemes.next().unwrap_or_default();
+                    lexemes.next(); // ':'
+                    members.push(format!("{key}:{}", value(lexemes)));
+                }
+                members.sort();
+                format!("{{{}}}", members.join(","))
+            }
+            Some("[") => {
+                let mut members = Vec::new();
+                while let Some(&next) = lexemes.peek() {
+                    if next == "]" {
+                        lexemes.next();
+                        break;
+                    }
+                    if next == "," {
+                        lexemes.next();
+                        continue;
+                    }
+                    members.push(value(lexemes));
+                }
+                members.sort();
+                format!("[{}]", members.join(","))
+            }
+            Some(scalar) => scalar.to_owned(),
+            None => String::new(),
+        }
+    }
+    value(&mut written_lexemes(json).into_iter().peekable())
+}
+
+/// The embedded documents of two texts, paired, when everything around them
+/// is byte-identical. Pairing is positional only because the surrounding text
+/// is equal: the k-th document on one side sits exactly where the k-th sits on
+/// the other. `None` when anything else differs, which includes two differing
+/// texts with no document in them.
+fn embedded_document_pairs(
+    baseline: &str,
+    candidate: &str,
+) -> Option<Vec<(serde_json::Value, serde_json::Value)>> {
+    if baseline.len().max(candidate.len()) > MAX_EMBEDDED_SCAN_BYTES {
+        return None;
+    }
+    let (baseline, candidate) = (embedded_documents(baseline), embedded_documents(candidate));
+    if baseline.text != candidate.text || baseline.documents.len() > MAX_EMBEDDED_DOCUMENTS {
+        return None;
+    }
+    // A document that opens a quoted string (`'…'`, a template literal) sits
+    // in a context a quote inside one of its values can end, so its order can
+    // change how the page parses. The texts are equal, so one side decides.
+    if baseline.text[..baseline.documents.len()]
+        .iter()
+        .any(|before| before.trim_end().ends_with(['\'', '"', '`']))
+    {
+        return None;
+    }
+    // Read as JSON only where the documents differ in arrangement alone: the
+    // same values as written, each keeping its spelling, and the same document
+    // apart from array order. Not where a document holds markup: its order can
+    // change where the page's parser ends a script. Anything else keeps the
+    // whole-page comparison.
+    let arrangement_only = baseline
+        .written
+        .iter()
+        .zip(&candidate.written)
+        .zip(baseline.documents.iter().zip(&candidate.documents))
+        .all(|((bw, cw), (b, c))| {
+            json_depth(b) <= MAX_EMBEDDED_DEPTH
+                && json_depth(c) <= MAX_EMBEDDED_DEPTH
+                && !bw.contains('<')
+                && !cw.contains('<')
+                && written_form(bw) == written_form(cw)
+                && deja::identity::same(b, c)
+        });
+    if !arrangement_only {
+        return None;
+    }
+    Some(
+        baseline
+            .documents
+            .into_iter()
+            .zip(candidate.documents)
+            .collect(),
+    )
 }
 
 /// The response's body difference, recomputed with array order handled
-/// structurally. `None` when the run predates full bodies being recorded
-/// alongside the diff, in which case the kernel's own rows are used unchanged.
-fn order_canonical_body_diff(diff: &HttpDiff) -> Option<Vec<JsonFieldDiff>> {
+/// structurally and held to the kernel's findings. `None` when the run predates
+/// full bodies being recorded alongside the diff, in which case the kernel's own
+/// rows are used unchanged.
+///
+/// The recompute RE-SHAPES the kernel's differences; it does not get a second,
+/// independent opinion about whether they exist. See [`reconciled_with_kernel`].
+fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
-    order_canonical_diff(baseline, candidate, "$", &mut rows);
-    Some(rows)
+    // A non-JSON body carrying JSON documents is compared as those documents,
+    // when the text around them is identical. Only at the root: a JSON body is
+    // never re-scanned.
+    let embedded = match (baseline, candidate) {
+        (serde_json::Value::String(b), serde_json::Value::String(c)) if b != c => {
+            embedded_document_pairs(b, c)
+        }
+        _ => None,
+    };
+    let embedded_document_paths = match &embedded {
+        Some(pairs) => {
+            for (index, (b, c)) in pairs.iter().enumerate() {
+                order_canonical_diff(b, c, &format!("$.~embedded[{index}]"), &mut rows);
+            }
+            vec!["$".to_owned()]
+        }
+        None => {
+            order_canonical_diff(baseline, candidate, "$", &mut rows);
+            Vec::new()
+        }
+    };
+    let mut reconciled = reconciled_with_kernel(rows, &diff.body_diff);
+    reconciled.embedded_document_paths = embedded_document_paths;
+    // The invariant holds in BOTH directions: the recompute may re-shape the
+    // kernel's findings and may not invent one — and may not erase one either.
+    // A kernel row that no surviving recompute row speaks about was not
+    // re-shaped, it was dropped; it stands as the kernel wrote it. Exact, row by
+    // row: a backed row beside it must not decide its fate. Judged against the
+    // recompute's survivors alone, so that two unspoken-for kernel rows in one
+    // collection cannot speak for each other and lose one.
+    let unspoken_for: Vec<JsonFieldDiff> = diff
+        .body_diff
+        .iter()
+        .filter(|found| {
+            !reconciled
+                .rows
+                .iter()
+                .any(|row| paths_overlap(&row.json_path, &found.json_path))
+                // A text read as its embedded documents is spoken for by that
+                // reading, including when the documents are equal as JSON.
+                && !reconciled
+                    .embedded_document_paths
+                    .iter()
+                    .any(|path| path_covers(path, &found.json_path))
+        })
+        .cloned()
+        .collect();
+    reconciled.rows.extend(unspoken_for);
+    Some(reconciled)
+}
+
+/// The rows of [`reconciled_body_diff`] alone, for tests that assert on shape.
+#[cfg(test)]
+fn order_canonical_body_diff(diff: &HttpDiff) -> Option<Vec<JsonFieldDiff>> {
+    reconciled_body_diff(diff).map(|reconciled| reconciled.rows)
+}
+
+/// What holding the recompute to the kernel's findings produced.
+struct Reconciliation {
+    /// The recompute's rows that some kernel row backs.
+    rows: Vec<JsonFieldDiff>,
+    /// Paths the recompute reported a difference at and the kernel judged the
+    /// same. Named, never silently dropped: a run that leans on that judgment on
+    /// every response must not read identically to one whose bodies agreed.
+    kernel_equivalent_paths: Vec<String>,
+    /// Texts that were compared as the JSON documents embedded in them.
+    embedded_document_paths: Vec<String>,
+}
+
+/// Is a difference reported at `inner` the same difference as, or part of, one
+/// reported at `outer`? Prefix by PATH SEGMENT, so `$.ab` is never read as
+/// sitting under `$.a`.
+fn path_covers(outer: &str, inner: &str) -> bool {
+    outer == inner
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+}
+
+/// Do two reported paths speak about the same region of the body?
+///
+/// Compared as DECLARATIONS ([`canonical_set_path`]), because the two engines
+/// describe one difference at whatever depth and position their own reading
+/// reached it. Alignment moves a changed member to the position it aligned to,
+/// so the kernel's `$.items[1]` and this engine's `$.items[2]` are the same
+/// collection's difference; decoding moves an encoded document's difference
+/// inward, so `$.echo` and `$.echo.headers.Authorization` are the same field's.
+/// Either direction of containment counts, for the same reason.
+fn paths_overlap(left: &str, right: &str) -> bool {
+    let (left, right) = (canonical_set_path(left), canonical_set_path(right));
+    path_covers(&left, &right) || path_covers(&right, &left)
+}
+
+/// Hold the recompute to the kernel's findings.
+///
+/// Two engines read the same response. The kernel's `diff_json` decides WHETHER
+/// two bodies differ and is the authority on that: it sees through the encodings
+/// a value is carried in, and it alone applies the run's body allowlist. This
+/// recompute exists for one narrower job — to say WHERE a difference belongs
+/// once ordering is resolved, so that a permutation is one difference at its
+/// collection instead of however many positions this run's two orders happened
+/// to scatter it across. Re-describing a difference is its whole remit.
+///
+/// Nothing held it to that. A recompute row over a region where the kernel found
+/// nothing is a difference the authority never saw, manufactured by the
+/// less-informed engine, and it blocked the candidate: prism's
+/// `rawConnectorRequest` echo carries a headers map whose key order is seeded per
+/// process, the kernel read the embedded document and reported nothing, this
+/// engine read the same string as bytes, and a replay of a recording BY THE IMAGE
+/// THAT RECORDED IT failed 99 of its 100 correlations. So a row no kernel row
+/// backs is set aside, and NAMED: the paths come back beside the rows so the
+/// scorecard can say the judgment was leaned on. No encoding has to be taught to
+/// two engines for them to agree.
+///
+/// This engine recurses the same structure the kernel does, so in practice every
+/// region the kernel reports in already carries a row here. That is not what the
+/// safety of setting rows aside rests on: [`reconciled_body_diff`] carries every
+/// kernel row that nothing here speaks about through as the kernel wrote it.
+///
+/// A kernel row at the root (`$`) backs every recompute row, which is the
+/// conservative direction. Pairwise over the two row sets; bodies are small.
+fn reconciled_with_kernel(
+    recomputed: Vec<JsonFieldDiff>,
+    kernel: &[JsonFieldDiff],
+) -> Reconciliation {
+    let mut rows = Vec::new();
+    let mut kernel_equivalent_paths = Vec::new();
+    for row in recomputed {
+        let backed = kernel
+            .iter()
+            .any(|found| paths_overlap(&row.json_path, &found.json_path));
+        if backed {
+            rows.push(row);
+        } else {
+            kernel_equivalent_paths.push(row.json_path);
+        }
+    }
+    Reconciliation {
+        rows,
+        kernel_equivalent_paths,
+        embedded_document_paths: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3742,6 +5411,18 @@ struct HttpBodyClassification {
     /// a disagreement about what a path means must never decide that a
     /// difference does not exist.
     canon_conflicts: Vec<String>,
+    /// Paths the order-canonical recompute reported at and the kernel judged the
+    /// same — an encoded value whose serialisation order differed, or a path the
+    /// run's body allowlist covers. Named and NOT counted as blocking.
+    kernel_equivalent_paths: Vec<String>,
+    /// Texts compared as the JSON documents embedded in them. Named and NOT
+    /// counted as blocking; what differs inside the documents is classified
+    /// like any other row.
+    embedded_document_paths: Vec<String>,
+    /// Strings holding a JSON document written differently, at each string's
+    /// own site. Named and NOT counted as blocking: the document is the same,
+    /// its text is not.
+    document_text_paths: Vec<String>,
 }
 
 /// A JSON path reduced to the form a declaration is written in: every array
@@ -3811,16 +5492,22 @@ fn classify_http_body_diff(
     // below sees the path a difference will be reported at rather than
     // whichever positions this run's ordering scattered it across.
     let mut conflicted = false;
-    let canonical = order_canonical_body_diff(diff);
-    let rows = canonical.as_deref().unwrap_or(&diff.body_diff);
+    let reconciled = reconciled_body_diff(diff);
+    let rows: &[JsonFieldDiff] = reconciled.as_ref().map_or(&diff.body_diff, |r| &r.rows);
+    classification.kernel_equivalent_paths = reconciled
+        .as_ref()
+        .map(|r| r.kernel_equivalent_paths.clone())
+        .unwrap_or_default();
+    classification.embedded_document_paths = reconciled
+        .as_ref()
+        .map(|r| r.embedded_document_paths.clone())
+        .unwrap_or_default();
     for body in rows {
         // Existing explicit absorptions retain precedence over schema
         // provenance; one leaf is classified exactly once.
         match canon_verdict_for(diff, recorded_http, body, ctx.document_clauses) {
             CanonVerdict::Absorbed(source) => {
-                classification
-                    .canon_absorbed
-                    .push((body.json_path.clone(), source));
+                absorb_by_identity(&mut classification, body, source);
                 continue;
             }
             // Falls through to ordinary classification, so it still blocks.
@@ -3850,9 +5537,7 @@ fn classify_http_body_diff(
                 // all: two sources disagreeing about what a path MEANS must not
                 // be settled by a rule that says nothing about it.
                 if !conflicted {
-                    classification
-                        .canon_absorbed
-                        .push((body.json_path.clone(), ClauseSource::Default));
+                    absorb_by_identity(&mut classification, body, ClauseSource::Default);
                     continue;
                 }
                 classification.order_only_paths.push(body.json_path.clone());
@@ -4104,29 +5789,6 @@ impl TailGapEvidence {
             .and_then(|correlation| self.tail_begins_at.get(correlation))
             .is_some_and(|tail_begins_at| observed_index >= *tail_begins_at)
     }
-
-    /// Re-express these indices against a FILTERED observed stream, where
-    /// `retained` lists — ascending — the original indices that survived.
-    ///
-    /// The graph-mode ledger scores flat-tier correlations through a rebuilt
-    /// sub-stream, and an index means nothing outside the stream it was taken
-    /// from. Handing the original indices to that sub-stream would demote
-    /// whichever calls happened to land on those positions, which is the
-    /// divergence-hiding failure this class exists to avoid.
-    pub(crate) fn remap_to(&self, retained: &[usize]) -> TailGapEvidence {
-        TailGapEvidence {
-            tail_begins_at: self
-                .tail_begins_at
-                .iter()
-                .map(|(correlation, original)| {
-                    (
-                        correlation.clone(),
-                        retained.partition_point(|index| index < original),
-                    )
-                })
-                .collect(),
-        }
-    }
 }
 
 /// Build [`TailGapEvidence`]. A correlation qualifies only when ALL of these
@@ -4252,34 +5914,40 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut per_boundary: BTreeMap<String, BoundaryStats> = BTreeMap::new();
 
     // --- expected side-effect calls, deduped by source event -----------------
-    // Each recorded event yields up to one entry per address rank; we collapse
-    // them by `source_event_global_sequence`. The boundary AND method live on the
-    // rank-6 `Sequence` address, which every event always emits. We also carry the
-    // recorded `result` here — the recorded operand the args-free pairing compares
-    // an execute-shadow `observed_result` against to classify ValueDiverged.
-    struct Expected {
-        boundary: Option<String>,
-        method: Option<String>,
-        correlation: Option<String>,
-        result: serde_json::Value,
+    // Each recorded event yields one entry per LOCUS; we collapse them by
+    // `source_event_global_sequence`. Boundary and method are IDENTITY and now
+    // live on every key, so they are read from whichever entry lands first —
+    // exactly-once via `or_insert`, and order-independent because every entry
+    // for one event carries the same identity. They used to live only on the
+    // rank-6 `Sequence` address, which is why they were `Option` and why this
+    // comment used to have to explain that every event always emits one.
+    // We also carry the recorded `result` — the operand the args-free pairing
+    // compares an execute-shadow `observed_result` against for ValueDiverged.
+    // BORROWED, not cloned. This map has one entry per lookup-table entry, and
+    // cloning `result` here duplicated every recorded result in memory — a full
+    // second copy of the table's heaviest field, built and then mostly unread.
+    // On a 214 MB table that is what put the runner over its limit and OOMKilled
+    // it in this phase. The table is borrowed for the whole function, so the map
+    // can point into it and the copy simply stops existing.
+    struct Expected<'a> {
+        boundary: &'a str,
+        // NOTE: `method` was here and is gone — it was written and never read,
+        // on main too. It was invisible while the write was conditional on the
+        // rank-6 locus (dead stores behind a branch do not warn); making
+        // identity unconditional surfaced it.
+        correlation: Option<&'a str>,
+        result: &'a serde_json::Value,
     }
-    let mut expected: BTreeMap<u64, Expected> = BTreeMap::new();
+    let mut expected: BTreeMap<u64, Expected<'_>> = BTreeMap::new();
     for entry in &art.table.entries {
         let slot = expected
             .entry(entry.source_event_global_sequence)
             .or_insert(Expected {
-                boundary: None,
-                method: None,
-                correlation: entry.key.correlation_id.clone(),
-                result: entry.result.clone(),
+                boundary: entry.key.boundary.as_str(),
+                correlation: entry.key.correlation_id.as_deref(),
+                result: &entry.result,
             });
-        if let Address::Sequence {
-            boundary, method, ..
-        } = &entry.key.address
-        {
-            slot.boundary = Some(boundary.clone());
-            slot.method = Some(method.clone());
-        }
+        let _ = slot;
     }
     let uncorrelated_events_seen = expected
         .values()
@@ -4315,13 +5983,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // pairing shapes and can absorb same-correlation response leaves. It never
     // classifies inherited returned-row state or infers provenance.
     let column_provenance = correlation_column_provenance(&art.events, &art.observed);
-    let mut recorded_pairing = ArgsFreePairing::build(&art.table, &art.events, &column_provenance);
+    let pairing = CallPairing::build(&art.table, &art.events, &art.observed, &column_provenance);
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
     let mut graph_value_nodes: BTreeMap<String, HashSet<u64>> = BTreeMap::new();
     let mut identity_skews = 0u64;
-    let order_nondeterminism_warnings = 0u64;
+    let mut order_nondeterminism_warnings = 0u64;
     let mut idempotent_delete_warnings = 0u64;
     // Schema-derived divergences, counted by the column they name so that
     // fifteen inserts disagreeing about one column default read as one fact —
@@ -4333,6 +6001,14 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut args_served_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut pairing_disagreements: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+    let mut value_document_absorbed_seen: BTreeMap<String, u64> = BTreeMap::new();
+    // Resolved calls whose args were read by identity to find their recording,
+    // by call site, kind and path; and resolved calls whose args are another
+    // call under identity, which neither lookup can have served.
+    let mut args_identity_seen: BTreeMap<(String, &'static str, String), u64> = BTreeMap::new();
+    let mut identity_unconfirmed_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_columns_seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut schema_default_unconfirmed = 0u64;
     // Race evidence needs to be discovered before HTTP body classification:
@@ -4389,6 +6065,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_seed_gaps = 0u64;
+    let seed_gap_cascade = SeedGapCascade::build(art);
+    let mut cascade_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_races = 0u64;
     // Expected events claimed by a ValueDiverged pairing: counted as the
     // divergence, NOT as an OmittedCall in the omitted pass below.
@@ -4407,6 +6085,14 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // diverge" but "how much of what it did ran on values the recording never
     // held".
     let mut corr_absorbed: BTreeMap<String, u64> = BTreeMap::new();
+    // Seed gaps per correlation: a correlation carrying one rests on a call
+    // whose precondition was never established, so it cannot be a pass.
+    let mut corr_seed_gaps: BTreeMap<String, u64> = BTreeMap::new();
+    // Absorbed misses per CALL SITE, for the verdict's reason line. A count
+    // with no location is not an explanation: a run can carry hundreds from one
+    // uncovered seam, and "412 absorbed miss(es)" reads the same as a broken
+    // scorer. The site turns the number into something a reader can act on.
+    let mut absorbed_sites: BTreeMap<String, u64> = BTreeMap::new();
 
     // PASS 1 — resolved calls claim their recorded events. The verdict must be
     // a function of the two SETS (recorded events × observed calls), never of
@@ -4421,62 +6107,44 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         if observed_is_ingress(obs) {
             continue;
         }
-        if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
-            graph_plan.replay_event_is_novel(correlation_id, observed_index)
-        }) {
-            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-            if tier_for(&obs.boundary) == Tier::Environmental {
-                stats.bump_kind("EnvironmentalMiss");
-                environmental_misses += 1;
-            } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
-                stats.bump_kind("DeterministicMiss");
-            } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
-                // The recording for this correlation stopped at request teardown
-                // and this call comes after it. There is no baseline to judge it
-                // against, so it is neither novel nor matched — see TailGapEvidence.
-                stats.bump_kind("InconclusiveTailGap");
-                if let Some(correlation_id) = &obs.correlation_id {
-                    tail_gap_correlations.insert(correlation_id.clone());
-                }
-            } else {
-                // Shown, not scored — the graph tier's form of the same call the
-                // flat arm below makes. A novel subtree is added work, at a
-                // coarser granularity than a novel call and of the same kind, so
-                // it is counted and named and charged to nothing. See the note on
-                // the `NovelCall` arm.
-                stats.bump_kind("NovelSubtree");
-            }
-            continue;
-        }
-        if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
-            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-            // ORDER, AND ONLY ORDER. A skew means both sides made the same
-            // calls and each one resolved to its own recorded event — the two
-            // PAIRING methods disagree about which goes with which. The lookup
-            // pairs by args and is order-independent; the graph aligner pairs
-            // structurally by position. Run the same work concurrently and the
-            // two disagree, which is the skew.
-            //
-            // A skew therefore cannot hide a content difference. Under Execute
-            // the candidate runs the real boundary and a differing result is
-            // `ValueDivergedOrigin`; under Substitute the recorded value is
-            // served and there is nothing to differ. Either way the mechanism
-            // that would catch content is elsewhere and still blocking.
-            //
-            // So this is the rule c7c8918 already established for arrays —
-            // "a permutation of an identical multiset is not a difference" —
-            // reaching graph pairing. Counted and named, charged to nothing.
-            stats.bump_kind("IdentitySkew");
-            identity_skews += 1;
-            consumed.extend(aligned_event);
-            consumed.extend(served_event);
-            continue;
-        }
+        // The address pairs a call, before structure is consulted. A resolved
+        // call is paired with the event it resolved to, wherever the aligner put
+        // its span; an unresolved call is paired in pass 2, once every resolved
+        // claim is in.
         if !obs.resolved {
             deferred.push((observed_index, obs));
             continue;
         }
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+        // The aligner bound this call's span crosswise to the event its address
+        // served. That is a fact about structure, not about the call: the call is
+        // paired by its address and scored below, and the crosswise binding is
+        // named and charged to nothing.
+        if graph_identity_skew(graph_plan, obs).is_some() {
+            stats.note_kind("IdentitySkew");
+            identity_skews += 1;
+        }
+        // Read off the row itself: the exact lookup cannot serve args whose
+        // arrays moved or whose embedded documents were rewritten, so a
+        // resolved call that differs that way was served by its identity.
+        if let Some(event) = obs
+            .source_event_global_sequence
+            .and_then(|seq| events_by_seq.get(&seq).copied())
+        {
+            match deja::identity::identity_differences(&event.args, &obs.args) {
+                Some(changes) => {
+                    for change in changes {
+                        note_identity_site(stats, &mut args_identity_seen, obs, &change);
+                    }
+                }
+                None => {
+                    stats.note_kind("ArgsIdentityUnconfirmed");
+                    *identity_unconfirmed_seen
+                        .entry(call_site_label(obs))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
         {
             // The recorded baseline was found (args still aligned). Under lookup
             // mode observed_result == recorded_result (substituted) so this is a
@@ -4490,10 +6158,26 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .and_then(|seq| events_by_seq.get(&seq).copied()),
             );
             if let Some(ValueVerdict::Absorbed(ValueAbsorption::Canon(source))) = verdict {
-                stats.bump_kind("ValueCanonAbsorbed");
+                stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
+            }
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::ServedRecordedError)) = verdict {
+                stats.note_kind("ServedRecordedError");
+            }
+            if let Some(ValueVerdict::Absorbed(ValueAbsorption::DocumentText(ordering))) = verdict {
+                stats.note_kind("ValueDocumentAbsorbed");
+                *value_document_absorbed_seen
+                    .entry(call_site_label(obs))
+                    .or_insert(0) += 1;
+                // An array beside the document that moved is still ordering.
+                if let Some(source) = ordering {
+                    stats.note_kind("ValueCanonAbsorbed");
+                    *value_canon_absorbed_seen
+                        .entry((call_site_label(obs), source.label()))
+                        .or_insert(0) += 1;
+                }
             }
             let diverged = matches!(verdict, Some(ValueVerdict::Diverged));
             if diverged {
@@ -4559,6 +6243,26 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                         continue;
                     }
                 }
+                // The seeder recorded that it could not plant a key this call's
+                // recorded event read: the result differs because the row is
+                // missing, so the divergence is the missing seed's. Only here —
+                // a paired call's divergence is a changed request, which no
+                // missing seed explains.
+                if art.unplanted_presence.read_by(
+                    obs.correlation_id.as_deref(),
+                    obs.source_event_global_sequence
+                        .and_then(|seq| events_by_seq.get(&seq).copied()),
+                ) {
+                    stats.bump_kind("InconclusiveSeedGap");
+                    inconclusive_seed_gaps += 1;
+                    if let Some(corr) = &obs.correlation_id {
+                        *corr_seed_gaps.entry(corr.clone()).or_insert(0) += 1;
+                    }
+                    if let Some(seq) = obs.source_event_global_sequence {
+                        consumed.insert(seq);
+                    }
+                    continue;
+                }
                 // The args-aligned execute divergence is the ORIGIN of a
                 // total-derivative cascade: the candidate ran the REAL boundary
                 // (typically a READ) and got a value differing from the recorded
@@ -4602,37 +6306,11 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // occurrence stable). `consumed` is complete: no pairing decision below
     // can bind a recorded event that a resolved call owns.
     for (observed_index, obs) in deferred {
-        if let Some((aligned_event, served_event)) = graph_identity_skew(graph_plan, obs) {
-            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-            // Order only — see the note on the pass-1 arm.
-            stats.bump_kind("IdentitySkew");
-            identity_skews += 1;
-            paired_consumed.extend(aligned_event);
-            paired_consumed.extend(served_event);
-            continue;
-        }
-        let graph_mode = graph_plan.is_graph(obs.correlation_id.as_deref())
-            && obs.correlation_id.as_deref().is_some_and(|correlation_id| {
-                !graph_plan.replay_event_uses_flat_tier(correlation_id, observed_index)
-                    && obs.graph_node_id.is_some_and(|node_id| {
-                        !graph_plan.replay_node_uses_flat_tier(correlation_id, node_id)
-                    })
-            });
-        let paired_twin = if graph_mode {
-            obs.correlation_id
-                .as_deref()
-                .zip(obs.graph_node_id)
-                .and_then(|(correlation_id, node_id)| {
-                    graph_plan.recorded_sequence_for_replay_node(correlation_id, node_id)
-                })
-                .map(|sequence| ArgsFreePairingResult {
-                    sequence,
-                    order_mismatch: false,
-                })
-        } else {
-            recorded_pairing.take_twin(obs, &consumed)
-        }
-        .map(|twin| {
+        // Paired before any policy is asked (see `CallPairing`). A pair is one
+        // call whose input changed, and that is a divergence at whatever tier
+        // the boundary sits: an outbound request the candidate altered is its
+        // own output, not the environment's.
+        let paired_twin = pairing.twin(observed_index).map(|twin| {
             let result = expected
                 .get(&twin.sequence)
                 .map(|exp| exp.result.clone())
@@ -4640,19 +6318,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             (twin.sequence, twin.order_mismatch, result)
         });
         let stats = boundary_entry(&mut per_boundary, &obs.boundary);
-        if tier_for(&obs.boundary) == Tier::Environmental {
-            stats.bump_kind("EnvironmentalMiss");
-            environmental_misses += 1;
-        } else if is_nonblocking_boundary(&obs.boundary, obs.role.as_deref()) {
-            // Deterministic-live (crypto/time/id/rng) or the request boundary
-            // (ingress) — not a real divergence. See is_nonblocking_boundary.
-            stats.bump_kind("DeterministicMiss");
-        } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
-            // Background-task call with no correlation — tolerated in V1. Named
-            // apart from the blocking `NovelCall` because it is a different
-            // thing, not a different count of the same thing.
-            stats.bump_kind("NovelCallTolerated");
-        } else if let Some((twin_seq, order_mismatch, recorded)) = paired_twin {
+        if let Some((twin_seq, order_mismatch, recorded)) = paired_twin {
             // GOTCHA #1 resolution: this unresolved observed call pairs args-free
             // (correlation+boundary+method, FIFO occurrence) with a recorded twin
             // that the candidate "omitted" because its args were re-keyed. The
@@ -4661,20 +6327,53 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let verdict = value_verdict(
-                &obs.boundary,
-                &recorded_val,
-                &observed_val,
-                twin_event,
-                obs.args.get("sql").and_then(serde_json::Value::as_str),
-            );
+            let verdict = pair_request_verdict(obs, twin_event);
+            if obs.arg_divergent
+                && obs
+                    .served_event_global_sequence
+                    .is_some_and(|served| served != twin_seq)
+            {
+                // The candidate ran on one recording's value and the pairing
+                // judged the call against another. Both rows say which; this
+                // says that they differ.
+                stats.note_kind("ArgsServedPairingDisagrees");
+                let served = obs.served_event_global_sequence.unwrap_or_default();
+                pairing_disagreements
+                    .entry(call_site_label(obs))
+                    .or_insert((0, served, twin_seq))
+                    .0 += 1;
+            }
+            if obs.arg_divergent {
+                // The kind is not noted here. `summary.arg_divergent_serves` is documented as
+                // the projection of this kind, and the reach pass notes it once per serve in
+                // lockstep with that counter. Noting it again here would count every serve
+                // twice and break the fold that checks the projection.
+                *args_served_seen
+                    .entry((
+                        call_site_label(obs),
+                        args_served_reason(request_verdict(obs, twin_event)),
+                    ))
+                    .or_insert(0) += 1;
+            }
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
-                stats.bump_kind("ValueCanonAbsorbed");
+                stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
             }
-            let value_diverged = order_mismatch || matches!(verdict, ValueVerdict::Diverged);
+            if let ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity) = verdict {
+                let recorded = twin_event.map_or(serde_json::Value::Null, |e| e.args.to_value());
+                for change in
+                    deja::identity::identity_differences(&recorded, &obs.args).unwrap_or_default()
+                {
+                    note_identity_site(stats, &mut args_identity_seen, obs, &change);
+                }
+            }
+            let value_diverged = pairing.changed(
+                observed_index,
+                matches!(verdict, ValueVerdict::Diverged),
+                order_mismatch,
+            );
             if value_diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -4691,7 +6390,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             }
             // An exact later-args match is direct order evidence. Result/schema
             // equivalence and race demotion must not absorb that blocking signal.
-            let schema_default = if value_diverged && !order_mismatch {
+            let schema_default = if value_diverged && !order_mismatch && !obs.arg_divergent {
                 schema_default_divergence(
                     &obs.boundary,
                     twin_event
@@ -4719,6 +6418,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .or_insert(0) += 1;
             } else if value_diverged {
                 if !order_mismatch
+                    && !obs.arg_divergent
                     && inconclusive_race
                         .attributable_downstream(obs.correlation_id.as_deref(), &obs.args)
                 {
@@ -4734,19 +6434,92 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     }
                 }
             } else {
-                // Re-keyed but identical value — the write reproduced. Count it as
-                // a (recovered) match rather than a Novel+Omitted split.
+                // It sent what the recording sent; its address missed by position
+                // alone. A (recovered) match, not a Novel+Omitted split.
                 stats.matched += 1;
                 matched_side_effect_calls += 1;
             }
             // Either way the recorded twin is accounted for here, not omitted.
             paired_consumed.insert(twin_seq);
+        } else if obs.arg_divergent {
+            // Served by its address alone, with no recorded call left to pair it
+            // with. The candidate found one at that address, so this is a call
+            // the recording holds, run on a value recorded for other arguments.
+            // It blocks, ahead of every arm that tolerates a miss: before the
+            // fallback those arms never saw it, because the call stopped.
+            // Counted as the value divergence it is, and named for how it
+            // arose.
+            stats.bump_kind("ValueDiverged");
+            stats.note_kind("ArgsServedUnpaired");
+            *args_served_seen
+                .entry((
+                    call_site_label(obs),
+                    "no recorded call was left to pair it with",
+                ))
+                .or_insert(0) += 1;
+            value_divergences += 1;
+            blocking_side_effect += 1;
+            if let Some(corr) = &obs.correlation_id {
+                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+            }
+        } else if obs.correlation_id.as_deref().is_some_and(|correlation_id| {
+            graph_plan.replay_event_is_novel(correlation_id, observed_index)
+        }) {
+            // Unpaired, inside a subtree the recording never had. Structure names
+            // WHERE the added work is; it is the graph tier's form of the same
+            // unpaired call the arms below classify.
+            if tier_for(&obs.boundary) == Tier::Environmental {
+                stats.bump_kind("EnvironmentalMiss");
+                environmental_misses += 1;
+            } else if observed_miss_is_excused(obs) {
+                stats.bump_kind("DeterministicMiss");
+            } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
+                // The recording for this correlation stopped at request teardown
+                // and this call comes after it. There is no baseline to judge it
+                // against, so it is neither novel nor matched — see TailGapEvidence.
+                stats.bump_kind("InconclusiveTailGap");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    tail_gap_correlations.insert(correlation_id.clone());
+                }
+            } else if obs.absorbed {
+                // A miss the request survived, wherever it lands, carried the
+                // correlation on a value the recording never held. Same
+                // classification as the `absorbed` arm below, so a novel subtree
+                // cannot turn it into a pass.
+                stats.bump_kind("NovelCallAbsorbed");
+                if let Some(correlation_id) = &obs.correlation_id {
+                    *corr_absorbed.entry(correlation_id.clone()).or_insert(0) += 1;
+                }
+                *absorbed_sites.entry(call_site_label(obs)).or_insert(0) += 1;
+            } else {
+                // Shown, not scored. A novel subtree is added work, at a coarser
+                // granularity than a novel call and of the same kind, so it is
+                // counted and named and charged to nothing. See the note on the
+                // `NovelCall` arm.
+                stats.bump_kind("NovelSubtree");
+            }
+        } else if tier_for(&obs.boundary) == Tier::Environmental {
+            stats.bump_kind("EnvironmentalMiss");
+            environmental_misses += 1;
+        } else if observed_miss_is_excused(obs) {
+            // Deterministic-live (crypto/time/id/rng) or the request boundary
+            // (ingress) — not a real divergence, unless the miss stopped the
+            // request. See observed_miss_is_excused.
+            stats.bump_kind("DeterministicMiss");
+        } else if obs.correlation_id.is_none() && uncorrelated_tolerated {
+            // Background-task call with no correlation — tolerated in V1. Named
+            // apart from the blocking `NovelCall` because it is a different
+            // thing, not a different count of the same thing.
+            stats.bump_kind("NovelCallTolerated");
         } else if obs.seed_gap {
             // Execute-mode State call that ran the REAL boundary but found no
             // recorded baseline to compare against (no pairing either). Surface as
             // inconclusive rather than a false Novel — see InconclusiveSeedGap.
             stats.bump_kind("InconclusiveSeedGap");
             inconclusive_seed_gaps += 1;
+            if let Some(corr) = &obs.correlation_id {
+                *corr_seed_gaps.entry(corr.clone()).or_insert(0) += 1;
+            }
         } else if tail_gap.covers(obs.correlation_id.as_deref(), observed_index) {
             // Last resort before charging the candidate: the recording for this
             // correlation stopped at request teardown and this call comes after
@@ -4758,17 +6531,17 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 tail_gap_correlations.insert(corr.clone());
             }
         } else if obs.absorbed {
-            // A miss the REQUEST SURVIVED: the boundary declared `on_miss`, the
-            // declared value was returned, and everything after it in this
+            // A miss the REQUEST SURVIVED: the boundary's miss arm SYNTHESIZED
+            // a value, it was returned, and everything after it in this
             // correlation ran on an answer the recording never held.
             //
             // Named apart from `NovelCall` for the reason `NovelCallTolerated`
             // is: it is a different thing, not a different count of the same
             // thing. A reader deciding whether to trust a clean-looking body diff
             // has to be able to see that the run continued on a supplied value —
-            // and it is invisible everywhere else, because the observation is
-            // written before the seam reaches its miss branch and carries
-            // `resolved: false` and `Provenance::Recorded` either way.
+            // and it is invisible everywhere else, because a miss carries
+            // `resolved: false` and `Provenance::Recorded` whether the request
+            // survived it or died on it.
             //
             // Blocking treatment is deliberately UNCHANGED here: this change
             // makes absorption visible, it does not decide what a novel call
@@ -4787,6 +6560,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             if let Some(corr) = &obs.correlation_id {
                 *corr_absorbed.entry(corr.clone()).or_insert(0) += 1;
             }
+            *absorbed_sites.entry(call_site_label(obs)).or_insert(0) += 1;
         } else {
             // SHOWN, NOT SCORED. A candidate that calls something the recording
             // never held has ADDED a call, and adding one is what a change is —
@@ -4811,19 +6585,36 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // here is what collapses a re-keyed write's Omitted+Novel split into ONE
     // ValueDiverged instead of double-counting.
     for (seq, exp) in &expected {
-        let pruned = exp.correlation.as_deref().is_some_and(|correlation_id| {
+        let pruned = exp.correlation.is_some_and(|correlation_id| {
             graph_recorded_event_is_pruned(graph_plan, correlation_id, *seq)
         });
-        if !pruned && (consumed.contains(seq) || paired_consumed.contains(seq)) {
+        // Claimed by an address — resolved, or paired minus its args — is
+        // accounted for, whatever structure concluded about its span.
+        if consumed.contains(seq) || paired_consumed.contains(seq) {
             continue;
         }
-        let boundary = exp.boundary.clone().unwrap_or_else(|| "unknown".to_owned());
+        // No `"unknown"` fallback any more. That string existed because the
+        // boundary was only recoverable from the rank-6 locus, so an event
+        // covered at a weaker rank got filed under a placeholder that then had
+        // to be scored like a boundary. Identity is on every key, so every
+        // omission is attributable to the boundary that actually made it.
+        let boundary = exp.boundary;
         // One classification, named for what it counts. Lumping the tolerated
         // omissions — uncorrelated background work, and non-blocking boundaries
         // — under the same name as the blocking ones is what let this table and
         // the summary give a report two answers for one set of calls.
-        let blocking = omission_is_blocking(exp.correlation.as_deref(), &boundary, None);
-        let stats = boundary_entry(&mut per_boundary, &boundary);
+        let blocking = omission_is_blocking(exp.correlation, boundary, None);
+        let stats = boundary_entry(&mut per_boundary, boundary);
+        // Cut off by the correlation's seed gap: no evidence about the
+        // candidate, so inconclusive, never blocking and never a pass.
+        if blocking && seed_gap_cascade.covers(exp.correlation, *seq) {
+            stats.bump_kind("InconclusiveSeedGapCascade");
+            if let Some(corr) = exp.correlation {
+                *corr_seed_gaps.entry(corr.to_owned()).or_insert(0) += 1;
+                cascade_correlations.insert(corr.to_owned());
+            }
+            continue;
+        }
         stats.bump_kind(if blocking && pruned {
             "PrunedSubtree"
         } else if blocking {
@@ -4833,8 +6624,55 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         });
         if blocking {
             blocking_side_effect += 1;
-            if let Some(corr) = &exp.correlation {
-                *corr_side_effect.entry(corr.clone()).or_insert(0) += 1;
+            if let Some(corr) = exp.correlation {
+                *corr_side_effect.entry(corr.to_owned()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // --- reach of an argument-divergent substitution -------------------------
+    // Which of the candidate's work could have consumed a value it was served
+    // because only its arguments moved. Attribution, from the seam the ledger
+    // reads: named through `note_kind` so `matched + diverged` over a boundary
+    // is untouched and nothing here can change a verdict. See
+    // `ArgDivergenceReach` for why position bounds this and containment does not.
+    let arg_divergence = ArgDivergenceReach::build(&art.observed, Some(graph_plan));
+    let mut arg_divergent_serves = 0u64;
+    let mut arg_divergent_serves_unattributable = 0u64;
+    let mut arg_divergence_reach_calls = 0u64;
+    let mut arg_divergence_reach_within_span = 0u64;
+    let mut arg_divergence_reach_unplaced = 0u64;
+    let mut corr_arg_divergent_serves: BTreeMap<String, u64> = BTreeMap::new();
+    for (observed_index, obs) in art.observed.iter().enumerate() {
+        if let Some(reach) = arg_divergence.serve(observed_index) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            stats.note_kind(ARG_DIVERGENT_SERVE);
+            arg_divergent_serves += 1;
+            if reach == ServeReach::NoCorrelation {
+                stats.note_kind(ARG_DIVERGENT_SERVE_UNATTRIBUTABLE);
+                arg_divergent_serves_unattributable += 1;
+            }
+            if let Some(corr) = &obs.correlation_id {
+                *corr_arg_divergent_serves.entry(corr.clone()).or_insert(0) += 1;
+            }
+        }
+        if let Some(reached) = arg_divergence.reached(observed_index) {
+            let stats = boundary_entry(&mut per_boundary, &obs.boundary);
+            stats.note_kind(ARG_DIVERGENCE_REACH);
+            arg_divergence_reach_calls += 1;
+            match reached.placement {
+                ReachPlacement::WithinServeSpan => {
+                    stats.note_kind(ARG_DIVERGENCE_REACH_WITHIN_SPAN);
+                    arg_divergence_reach_within_span += 1;
+                }
+                ReachPlacement::Unplaced => {
+                    stats.note_kind(ARG_DIVERGENCE_REACH_UNPLACED);
+                    arg_divergence_reach_unplaced += 1;
+                }
+                // The outside set is the remainder, so it carries no kind of its
+                // own: a third name would be a third number saying what two
+                // already say, and the folds would then have to agree three ways.
+                ReachPlacement::OutsideServeSpan => {}
             }
         }
     }
@@ -4865,6 +6703,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         kind_total(&per_boundary, "NovelCall") + kind_total(&per_boundary, "NovelSubtree");
     let novel_calls_tolerated = kind_total(&per_boundary, "NovelCallTolerated");
     let absorbed_misses = kind_total(&per_boundary, "NovelCallAbsorbed");
+    let seed_gap_cascade_calls = kind_total(&per_boundary, "InconclusiveSeedGapCascade");
+    let seed_gap_cascade_correlations = cascade_correlations.len() as u64;
     let inconclusive_tail_gaps = kind_total(&per_boundary, "InconclusiveTailGap");
 
     // --- post-finalization correlated work warnings --------------------------
@@ -4896,6 +6736,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // that the entry is redundant and can go.
     let mut canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
     let mut canon_conflict_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    // Paths the order-canonical recompute saw differ and the kernel judged the
+    // same. Not counted, but SAID: a suite that leans on that judgment on every
+    // response must not read identically to one whose bodies agreed.
+    let mut kernel_equivalent_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut embedded_document_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut document_text_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
         for diff in &art.http_diffs {
@@ -4944,13 +6790,26 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
             }
             for (path, source) in body_classification.canon_absorbed {
-                stats.bump_kind("ReplyCanonAbsorbed");
+                stats.note_kind("ReplyCanonAbsorbed");
                 *canon_absorbed_seen
                     .entry((path, source.label()))
                     .or_insert(0) += 1;
             }
             for path in body_classification.canon_conflicts {
                 *canon_conflict_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.kernel_equivalent_paths {
+                stats.note_kind("OrderNondeterministicWarning");
+                order_nondeterminism_warnings += 1;
+                *kernel_equivalent_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.embedded_document_paths {
+                stats.note_kind("EmbeddedJsonCompared");
+                *embedded_document_paths_seen.entry(path).or_insert(0) += 1;
+            }
+            for path in body_classification.document_text_paths {
+                stats.note_kind("ReplyDocumentAbsorbed");
+                *document_text_paths_seen.entry(path).or_insert(0) += 1;
             }
             let slot = corr_http
                 .entry(diff.correlation_id.clone())
@@ -4969,6 +6828,9 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut novel_scored_spans = 0u64;
     let mut span_field_divergences = 0u64;
     let mut warnings_extra: Vec<String> = Vec::new();
+    if let Some(warning) = tape_identity_warning(&art.events) {
+        warnings_extra.push(warning);
+    }
     let mut span_shapes: BTreeMap<String, span_shape::CorrelationSpanShape> = BTreeMap::new();
     if !art.scored_span_namespaces.is_empty() {
         match art.record_graph.as_ref() {
@@ -5025,6 +6887,22 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         }
     }
 
+    // Calls the replay stopped at. A stop means the task it ran in fail-stopped,
+    // so whatever came after it in that task never ran; when that task was a
+    // forked background one, the response had already gone and still matches.
+    // What the stop meant is not judged here — only that "matched" cannot stand
+    // beside it, so it makes its correlation, and the run, at least unjudgeable.
+    let mut corr_stopped: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut stopped_calls = 0u64;
+    for call in &art.observed {
+        if call.outcome == deja::SubstituteOutcome::Stopped {
+            stopped_calls += 1;
+            if let Some(correlation_id) = call.correlation_id.as_deref() {
+                *corr_stopped.entry(correlation_id).or_insert(0) += 1;
+            }
+        }
+    }
+
     // --- per-correlation outcomes --------------------------------------------
     let mut per_correlation = Vec::new();
     let mut matched_correlations = 0u64;
@@ -5036,7 +6914,27 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         // there would have handed this correlation a clean `passed` — the
         // silent-absorption failure — so the unjudgeable state is carried
         // explicitly instead.
-        let inconclusive = tail_gap_correlations.contains(corr);
+        // An absorbed miss makes its correlation unjudgeable for the same
+        // reason it makes the run unjudgeable: this correlation continued on a
+        // value the recording never held, so "matched" would be a claim about
+        // a trace that is partly fabricated. Without this the run verdict says
+        // inconclusive while `matched_correlations` still counts the
+        // correlation as clean — a headline contradicting its own verdict.
+        // Blocking WINS, mirroring the run rule, where `inconclusive` is
+        // guarded on `blocking_reasons == 0` so a real divergence is never
+        // reported as an unjudgeable. Without the same guard here a
+        // correlation carrying both reported `inconclusive: true`: `passed`
+        // was still false and no count was wrong, but a reader filtering
+        // failures on `!inconclusive` dropped a real divergence into the
+        // "could not tell" bucket. The two levels must not disagree about
+        // which answer wins.
+        let has_blocking =
+            !*status_match || !*body_match || side_effect_divergences > 0 || !span_shape_clean;
+        let inconclusive = !has_blocking
+            && (tail_gap_correlations.contains(corr)
+                || corr_absorbed.get(corr).is_some_and(|&n| n > 0)
+                || corr_seed_gaps.get(corr).is_some_and(|&n| n > 0)
+                || corr_stopped.get(corr.as_str()).is_some_and(|&n| n > 0));
         let passed = *status_match
             && *body_match
             && side_effect_divergences == 0
@@ -5059,6 +6957,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             span_shape: span_shapes.remove(corr),
             inconclusive,
             absorbed_misses: corr_absorbed.get(corr).copied().unwrap_or(0),
+            arg_divergent_serves: corr_arg_divergent_serves.get(corr).copied().unwrap_or(0),
             passed,
         });
     }
@@ -5124,20 +7023,50 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // the alternative is a run that got quieter without saying why. Everything
     // after an absorbed miss ran on a value the recording never held.
     if absorbed_misses > 0 {
+        // Highest count first, then by name, so one dominant uncovered seam
+        // leads the line and the line itself is stable between two replays of
+        // one candidate.
+        let mut sites: Vec<(&String, &u64)> = absorbed_sites.iter().collect();
+        sites.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let named: Vec<String> = sites
+            .iter()
+            .take(2)
+            .map(|(site, count)| format!("{site} {count}"))
+            .collect();
+        let rest = sites.len().saturating_sub(named.len());
+        let at = if rest > 0 {
+            format!(" at {} and {rest} other site(s)", named.join(", "))
+        } else {
+            format!(" at {}", named.join(", "))
+        };
         reasons.push(format!(
-            "{absorbed_misses} absorbed miss(es): the request continued on a \
+            "{absorbed_misses} absorbed miss(es){at}: the request continued on a \
              declared value the recording did not hold"
         ));
     }
-    // Seed gaps are reported but do NOT by themselves fail the verdict — a
-    // missing baseline is inconclusive, not a divergence.
+    if stopped_calls > 0 {
+        reasons.push(format!(
+            "{stopped_calls} call(s) stopped by a replay fail-stop: the task each ran in \
+             ended there, so its correlation has not been shown to match, whatever its \
+             response looked like"
+        ));
+    }
+    // Seed gaps are reported and do not fail the verdict — a missing baseline
+    // is not a divergence — but they force it inconclusive (below).
     if inconclusive_seed_gaps > 0 {
         reasons.push(format!(
             "{inconclusive_seed_gaps} inconclusive seed gap(s) (non-blocking)"
         ));
     }
+    if seed_gap_cascade_calls > 0 {
+        reasons.push(format!(
+            "{seed_gap_cascade_calls} call(s) in {seed_gap_cascade_correlations} correlation(s) \
+             never ran because a seed gap cut them off (non-blocking): nothing here is \
+             evidence about the candidate"
+        ));
+    }
     // A truncated recording tail is reported and does NOT fail the verdict — but
-    // it does not pass either, so unlike a seed gap it forces `inconclusive`.
+    // it does not pass either, so, like a seed gap, it forces `inconclusive`.
     if inconclusive_tail_gaps > 0 {
         reasons.push(format!(
             "{inconclusive_tail_gaps} inconclusive tail-gap call(s) across \
@@ -5172,11 +7101,23 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // candidate caused; exclude them from the blocking count so a run whose
     // only "reasons" are those still avoids a blocking failure (race becomes an
     // explicit inconclusive verdict).
+    // Every lookup the candidate made, counted from the ordinal it took as it
+    // arrived. The ordinals on the stream must be one to the highest, once
+    // each: a gap is a lookup that wrote no observation, and a repeat is a
+    // candidate that started over, so its stream holds two processes' lookups.
+    let lookup_tally = account_lookups(
+        &art.observed,
+        &art.cancelled_lookups,
+        &mut reasons,
+        &mut warnings_extra,
+    );
     let blocking_reasons = reasons.len()
         - usize::from(novel_calls > 0)
         - usize::from(absorbed_misses > 0)
+        - usize::from(stopped_calls > 0)
         - usize::from(identity_skews > 0)
         - usize::from(inconclusive_seed_gaps > 0)
+        - usize::from(seed_gap_cascade_calls > 0)
         - usize::from(inconclusive_tail_gaps > 0)
         - usize::from(inconclusive_races > 0)
         - usize::from(idempotent_delete_warnings > 0)
@@ -5185,10 +7126,29 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // A tail gap joins a race in forcing INCONCLUSIVE rather than merely
     // declining to block: the candidate's post-response work went unrecorded, so
     // a run carrying one has not been shown to be clean and must never report a
-    // pass. A seed gap deliberately does not do this — its missing baseline is a
-    // single call's, not a whole correlation's unjudged tail.
+    // pass. A seed gap joins them: its missing baseline is one call's rather than
+    // a whole tail, which is why it does not block, but a verdict resting on a
+    // call whose precondition was never established cannot tell, so it is not
+    // a pass either.
+    // An absorbed miss joins them, and for the tail gap's exact reason. It is
+    // deliberately NOT a blocking term — an absorbed miss is an added call the
+    // process survived, so it cannot cost more than an unabsorbed one, which
+    // costs nothing. What it costs is CONFIDENCE, and confidence is what this
+    // term means: the run continued on a value the recording never held, so it
+    // has not been SHOWN to be clean whatever its responses looked like.
+    // Subtracting it from `blocking_reasons` while `pass` is
+    // `blocking_reasons == 0` had the effect of excusing it from the only test a
+    // pass applies, so the verdict read "1 absorbed miss(es): the request
+    // continued on a declared value the recording did not hold" beside
+    // `pass: true`.
     let inconclusive = nothing
-        || ((inconclusive_races > 0 || inconclusive_tail_gaps > 0) && blocking_reasons == 0);
+        || ((inconclusive_races > 0
+            || inconclusive_tail_gaps > 0
+            || absorbed_misses > 0
+            || inconclusive_seed_gaps > 0
+            || seed_gap_cascade_calls > 0
+            || stopped_calls > 0)
+            && blocking_reasons == 0);
     let pass = !inconclusive && blocking_reasons == 0;
     let reason = if nothing {
         NO_ARTIFACTS_REASON.to_owned()
@@ -5203,6 +7163,42 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
 
     let mut warnings = art.warnings.clone();
     warnings.extend(warnings_extra);
+    // The call each request STOPPED at. The transport warning can only say that
+    // no response came back; the runtime recorded why, and the reason is what a
+    // reader acts on. Grouped by call site, so a hundred requests ending at one
+    // line read as one fact rather than a hundred.
+    {
+        let mut stops: BTreeMap<(&str, &str, String, bool), BTreeSet<&str>> = BTreeMap::new();
+        for call in &art.observed {
+            if call.outcome != deja::SubstituteOutcome::Stopped {
+                continue;
+            }
+            let Some(correlation_id) = call.correlation_id.as_deref() else {
+                continue;
+            };
+            let site = match (call.call_file.as_deref(), call.call_line) {
+                (Some(file), Some(line)) => format!("{file}:{line}"),
+                _ => "an unrecorded location".to_owned(),
+            };
+            stops
+                .entry((&call.boundary, &call.method_name, site, call.resolved))
+                .or_default()
+                .insert(correlation_id);
+        }
+        for ((boundary, method, site, resolved), requests) in &stops {
+            warnings.push(format!(
+                "{} request(s) stopped at {boundary}/{method} ({site}): {} — the missing \
+                 response and every call after it follow from this one stop, not from \
+                 separate changes",
+                requests.len(),
+                if *resolved {
+                    "its recorded value would not rebuild"
+                } else {
+                    "the recording holds no value for this call"
+                },
+            ));
+        }
+    }
     for (seq, row) in &inconclusive_race.row_labels {
         warnings.push(format!(
             "inconclusive_race event {seq} on db row {row}: auto-rerun recommended"
@@ -5249,6 +7245,72 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // subtracted: a difference that stopped counting is still a difference that
     // happened, and a reader has to be able to see which declaration decided it
     // did not matter.
+    for ((call_site, kind, path), calls) in &args_identity_seen {
+        let what = if *kind == "ArgsOrderAbsorbed" {
+            "the array at {path} in another order"
+        } else {
+            "the JSON document in the string at {path} written differently"
+        }
+        .replace("{path}", path);
+        warnings.push(format!(
+            "call {call_site} held {what} on {calls} call(s) and was matched to its recording by \
+             the args' identity rather than their exact form, either served by the identity \
+             lookup or paired afterwards. The two are equal under the identity rule (array \
+             order, and how an embedded document is written, set aside); a change the rule \
+             sees would still miss. A document is parsed as JSON numbers, so a difference only \
+             in digits beyond a float's precision is one the rule cannot see"
+        ));
+    }
+    if arg_divergent_serves > 0 {
+        // Said in prose because the number a reader needs is not a divergence
+        // count: the serves are already charged, and what this adds is how much
+        // of the run was standing on a value nobody checked. The wording is
+        // "could" throughout on purpose — see `ArgDivergenceReach`.
+        let outside = arg_divergence_reach_calls
+            .saturating_sub(arg_divergence_reach_within_span)
+            .saturating_sub(arg_divergence_reach_unplaced);
+        let unattributable = if arg_divergent_serves_unattributable > 0 {
+            format!(
+                "; {arg_divergent_serves_unattributable} of the serves carry no correlation, so \
+                 there is no request to bound their reach within"
+            )
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "{arg_divergent_serves} call(s) were served the recording's value because only their \
+             arguments moved, and are scored on their own rows independently of this line. \
+             {arg_divergence_reach_calls} later call(s) in the same correlations COULD have \
+             consumed a substituted value. The graph places \
+             {arg_divergence_reach_within_span} of them on the serve's own span or under it, so \
+             the value reached them without leaving the span it was produced in; it places \
+             {outside} of them outside it, reached only after the value was returned to a caller; \
+             and it could not place {arg_divergence_reach_unplaced}, whose correlation is scored \
+             flat or whose calls carry no node. Which of them actually consumed anything is not \
+             something this run can answer — deja records execution, not value provenance — so \
+             none of these is counted as a divergence{unattributable}"
+        ));
+    }
+    for (call_site, calls) in &identity_unconfirmed_seen {
+        warnings.push(format!(
+            "matched call {call_site} resolved on {calls} call(s) with args whose identity differs \
+             from the recorded event it was served; neither lookup can serve that, so the table \
+             and the recording disagree"
+        ));
+    }
+    for (call_site, (calls, served, paired)) in &pairing_disagreements {
+        warnings.push(format!(
+            "call {call_site} was served one recording's value and judged against another on \
+             {calls} call(s), first serving recorded event {served} and pairing with {paired}: \
+             the candidate picks by site and the scorer by order, and here they differ"
+        ));
+    }
+    for ((call_site, reason), calls) in &args_served_seen {
+        warnings.push(format!(
+            "call {call_site} was served the recording's value for its address on {calls} \
+             call(s) although its arguments differed, and it blocks: {reason}"
+        ));
+    }
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
         let by = if *source == "default" {
             "no clause asserts an order for it, and order carries no meaning unless one does"
@@ -5260,6 +7322,12 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "matched call {call_site} differed by ordering alone on {calls} call(s) and was not \
              counted: {by}. The members are identical as a multiset, so any added, removed or \
              altered member would still block"
+        ));
+    }
+    for (call_site, calls) in &value_document_absorbed_seen {
+        warnings.push(format!(
+            "matched call {call_site} returned a JSON document held in a string whose text changed \
+             on {calls} call(s) and was not counted: {DOCUMENT_TEXT_READING}"
         ));
     }
     for ((path, source), responses) in &canon_absorbed_seen {
@@ -5276,6 +7344,33 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             "response body path {path} differed by ordering alone on {responses} response(s) and \
              was not counted: {by}. The members are identical as a multiset, so any added, \
              removed or altered member would still block"
+        ));
+    }
+    for (path, responses) in &document_text_paths_seen {
+        warnings.push(format!(
+            "response body path {path} held a JSON document whose text changed on {responses} \
+             response(s) and was not counted: {DOCUMENT_TEXT_READING}"
+        ));
+    }
+    // What the recompute saw differ and the kernel judged the same. Named rather
+    // than dropped, for the same reason as above: a difference that stopped
+    // counting is still a difference that happened, and a reader has to be able
+    // to see that the kernel's judgment was leaned on, and where.
+    for (path, responses) in &kernel_equivalent_paths_seen {
+        warnings.push(format!(
+            "response body path {path} differed as bytes on {responses} response(s) and was not \
+             counted: the kernel, which alone reads an encoded value as the document it carries \
+             and alone applies the run's body allowlist, judged the region the same. A member \
+             added, removed or altered inside it would still block"
+        ));
+    }
+    for (path, responses) in &embedded_document_paths_seen {
+        warnings.push(format!(
+            "response body {path} is not JSON but carries JSON documents; on {responses} \
+             response(s) the text around them was identical and the documents differed only in \
+             arrangement, so they were compared as JSON at {path}.~embedded[n]: key order and \
+             whitespace were ignored, and array order was judged as in a JSON body. Any other \
+             difference keeps the whole-page comparison and blocks"
         ));
     }
     // Two sources describing one path differently. Absorbed by neither, on
@@ -5346,11 +7441,18 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             novel_calls_tolerated,
             value_divergences,
             identity_skews,
+            arg_divergent_serves,
+            arg_divergent_serves_unattributable,
+            arg_divergence_reach_calls,
+            arg_divergence_reach_within_span,
+            arg_divergence_reach_unplaced,
             order_nondeterminism_warnings,
             schema_default_divergences,
             idempotent_delete_warnings,
             undeclared_concurrency_warnings,
             inconclusive_seed_gaps,
+            seed_gap_cascade_correlations,
+            seed_gap_cascade_calls,
             inconclusive_tail_gaps,
             inconclusive_races,
             missing_scored_spans,
@@ -5374,6 +7476,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             .as_ref()
             .map(|scope| scope.iter().cloned().collect()),
         warnings,
+        lookup_tally,
     }
 }
 
@@ -5385,6 +7488,41 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
 /// (or unavailable for the optional record graph); parse failures are surfaced
 /// as `warnings` rather than silently dropped, so corruption cannot masquerade
 /// as a clean run.
+/// Reports what each artifact costs to load, as it is loaded.
+///
+/// `load_artifacts` materialises five things before classification begins, and
+/// a replay runner dies right here — the process grows by more than a gigabyte
+/// inside a few seconds. Which of the five did it is not something any external
+/// instrument can answer: the container metric samples far too slowly to see
+/// the climb at all, and a process total says only that it happened. The split
+/// has so far been estimated rather than measured, and an estimate is not a
+/// basis for rewriting the scorer, so it is measured here instead.
+struct LoadCost(u64);
+
+impl LoadCost {
+    fn start() -> Self {
+        Self(
+            crate::lifecycle::resident_mib()
+                .map(|(rss, _peak)| rss)
+                .unwrap_or(0),
+        )
+    }
+
+    /// One artifact: how many items it carries, and the resident growth since
+    /// the previous report. Silent where the probe is unavailable — a missing
+    /// measurement never changes what scoring does.
+    fn report(&mut self, what: &str, count: usize) {
+        let Some((rss, _peak)) = crate::lifecycle::resident_mib() else {
+            return;
+        };
+        eprintln!(
+            "divergence: loaded {what} ({count}) — rss {rss} MiB, +{} MiB",
+            rss.saturating_sub(self.0)
+        );
+        self.0 = rss;
+    }
+}
+
 pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifacts> {
     let run = crate::read_json::<crate::Run>(&root.run_path(run_id)).ok();
     let recording_id = run.as_ref().and_then(|run| {
@@ -5399,9 +7537,12 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .map(crate::scope::RunScope::of)
         .unwrap_or_else(crate::scope::RunScope::entire_session);
     let correlation_scope: Option<std::collections::BTreeSet<String>> = scope.ids().cloned();
+    // Resolved the same way the params row was, so what the run's record says
+    // is scored and what the scorer scores cannot differ — see
+    // `RunSpec::effective_scored_span_namespaces`.
     let scored_span_namespaces = run
         .as_ref()
-        .map(|run| run.spec.scored_span_namespaces.clone())
+        .map(|run| run.spec.effective_scored_span_namespaces())
         .unwrap_or_default();
     // The system's own declaration, not the run's: whether an array is a set is
     // a property of the recorded system's contract, so it is read from the
@@ -5411,11 +7552,23 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         .map(|run| crate::system::system_config(run.spec.system()).reply_canons)
         .unwrap_or_default();
     let mut warnings = Vec::new();
+    let mut cost = LoadCost::start();
     let mut table = load_table(&root.lookup_table_path(run_id), &mut warnings);
-    let (observed, mut replay_graph) =
-        load_replay_stream(&root.observed_path(run_id), &mut warnings);
+    cost.report("lookup table", table.entries.len());
+    let ReplayStream {
+        observed,
+        graph: mut replay_graph,
+        cancelled: cancelled_lookups,
+    } = load_replay_stream(&root.observed_path(run_id), &mut warnings);
+    cost.report("observed calls", observed.len());
+    cost.report("replay graph nodes", replay_graph.len());
     let mut record_graph = load_record_graph(&root.record_graph_path(run_id), &mut warnings);
+    cost.report(
+        "record graph nodes",
+        record_graph.as_ref().map_or(0, Vec::len),
+    );
     let http_diffs = load_jsonl::<HttpDiff>(&root.http_diff_path(run_id), &mut warnings);
+    cost.report("http diffs", http_diffs.len());
 
     // The record graph could not be built for this run: the extract left the
     // reason in a note instead of failing the run, and this is where the note
@@ -5435,8 +7588,10 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
     // that fact reaches the same page as the verdict it re-frames. Parsed
     // loosely (the certificate is the lifecycle's type, this is a reader) —
     // absence of the file, an old shape, or zero failures all mean no warning.
+    let mut unplanted_presence = UnplantedPresence::default();
     if let Ok(text) = std::fs::read_to_string(root.seed_certificate_path(run_id)) {
         if let Ok(cert) = serde_json::from_str::<serde_json::Value>(&text) {
+            unplanted_presence = UnplantedPresence::from_certificate(&cert);
             let failed = cert["summary"]["failed"].as_u64().unwrap_or(0);
             if failed > 0 {
                 let mut tables: Vec<String> = cert["entries"]
@@ -5528,7 +7683,18 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
                 Ok(stream) => {
                     for item in stream {
                         match item {
-                            crate::scope::TapeItem::Event(event) => events.push(*event),
+                            crate::scope::TapeItem::Event(event) => {
+                                // `request` and `response` arrive as separate
+                                // allocations holding the same bytes as `args`
+                                // and `result`, because the two fields are
+                                // captured independently from the JSON. This is
+                                // the bulk read the sharing exists for: every
+                                // event of the run is held at once from here
+                                // until scoring finishes.
+                                let mut event = *event;
+                                event.share_duplicate_payloads();
+                                events.push(event);
+                            }
                             crate::scope::TapeItem::Malformed { line_no, error, .. } => warnings
                                 .push(format!("recording {rec}:{line_no}: parse error: {error}")),
                         }
@@ -5540,6 +7706,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
             Err(e) => warnings.push(format!("open recording {rec} failed: {e}")),
         }
     }
+    cost.report("recorded events", events.len());
 
     if let Some(ids) = scope.ids() {
         // The lookup table on disk is still the whole session's (it is written
@@ -5565,6 +7732,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 
     Ok(RunArtifacts {
         run_id: run_id.to_owned(),
+        unplanted_presence,
         recording_id,
         table,
         observed,
@@ -5576,13 +7744,8 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         scored_span_namespaces,
         reply_canons,
         warnings,
+        cancelled_lookups,
     })
-}
-
-/// Load + detect (read-through). Used by `GET /runs/{id}/scorecard`.
-pub fn scorecard(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecard> {
-    let art = load_artifacts(root, run_id)?;
-    Ok(detect(&art))
 }
 
 /// Compute the scorecard and persist it next to the run record. Called by the
@@ -5599,13 +7762,11 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     crate::write_json(&path, &card)?;
 
     // Ledger: the per-call detail the scorecard summary drops. Best-effort.
-    match build_ledger_with_plan(&art, &graph_plan) {
-        Ok(rows) => {
-            if let Err(e) = write_ledger(&root.call_ledger_path(run_id), &rows) {
-                eprintln!("divergence: ledger write failed for {run_id}: {e}");
-            }
-        }
-        Err(e) => eprintln!("divergence: ledger build failed for {run_id}: {e}"),
+    // Streamed straight to the file. Collecting first held every resolved row —
+    // each carrying the recorded side's full `args` and `result` — alongside the
+    // parsed table and graph, which is what OOMKilled the runner on a dense tape.
+    if let Err(e) = stream_ledger(&root.call_ledger_path(run_id), &art, &graph_plan) {
+        eprintln!("divergence: ledger stream failed for {run_id}: {e}");
     }
     Ok(card)
 }
@@ -5621,13 +7782,19 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 /// drove attached to its ledger rows.
 pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     let graph_plan = GraphScoringPlan::build(art);
-    build_ledger_with_plan(art, &graph_plan)
+    let mut rows = Vec::new();
+    build_ledger_into(art, &graph_plan, &mut |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
 }
 
-pub(crate) fn build_ledger_with_plan(
+pub(crate) fn build_ledger_into(
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
-) -> io::Result<Vec<CallRecord>> {
+    sink: &mut dyn FnMut(CallRecord) -> io::Result<()>,
+) -> io::Result<()> {
     let events = &art.events;
     let span_paths = ledger::recorded_span_paths(&art.table);
     // Mirror scorecard classification: discover race evidence under status-clean
@@ -5672,35 +7839,36 @@ pub(crate) fn build_ledger_with_plan(
             &document_clauses_for(&art.reply_canons, "http_incoming"),
         ),
     );
-    Ok(ledger::build_with_plan(
+    ledger::build_with_plan_into(
         events,
         &art.observed,
         &art.table,
         &idempotent_delete,
         &inconclusive_race,
         &tail_gap,
+        &art.unplanted_presence,
+        &SeedGapCascade::build(art),
         graph_plan,
-    ))
+        sink,
+    )
 }
 
-/// Read-through ledger for `GET /runs/{id}/calls` (recomputes from artifacts;
-/// works for runs scored before the sidecar existed).
-pub fn call_ledger(root: &HarnessRoot, run_id: &str) -> io::Result<Vec<CallRecord>> {
-    let art = load_artifacts(root, run_id)?;
-    build_ledger(&art)
-}
-
-fn write_ledger(path: &std::path::Path, rows: &[CallRecord]) -> io::Result<()> {
+/// Build and write the ledger without ever holding it whole.
+fn stream_ledger(
+    path: &std::path::Path,
+    art: &RunArtifacts,
+    graph_plan: &GraphScoringPlan,
+) -> io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    for row in rows {
-        let line = serde_json::to_vec(row).map_err(io::Error::other)?;
+    build_ledger_into(art, graph_plan, &mut |row| {
+        let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
         out.write_all(&line)?;
-        out.write_all(b"\n")?;
-    }
+        out.write_all(b"\n")
+    })?;
     out.flush()
 }
 
@@ -5708,7 +7876,10 @@ fn load_table(path: &std::path::Path, warnings: &mut Vec<String>) -> LookupTable
     let empty = || LookupTable {
         recording_id: String::new(),
         policy_version: 0,
+        // No table was read, so no schema is known; the scorer never consults it.
+        event_schema_version: None,
         entries: Vec::new(),
+        identity_entries: Vec::new(),
     };
     if !path.exists() {
         return empty();
@@ -5785,14 +7956,22 @@ fn stream_deja_records(
     true
 }
 
+/// The replay's shared tagged stream, split.
+struct ReplayStream {
+    /// The calls that finished, which are scored.
+    observed: Vec<ObservedCall>,
+    graph: Vec<deja_core::ExecutionGraphNode>,
+    /// Lookups dropped before they finished: counted, never scored.
+    cancelled: Vec<ObservedCall>,
+}
+
 /// Split the replay's shared tagged stream in one pass.
-fn load_replay_stream(
-    path: &std::path::Path,
-    warnings: &mut Vec<String>,
-) -> (Vec<ObservedCall>, Vec<deja_core::ExecutionGraphNode>) {
+fn load_replay_stream(path: &std::path::Path, warnings: &mut Vec<String>) -> ReplayStream {
     let mut observed = Vec::new();
     let mut graph = Vec::new();
+    let mut cancelled = Vec::new();
     if !stream_deja_records(path, warnings, |record| match record {
+        deja::DejaRecord::Observed(call) if call.cancelled => cancelled.push(*call),
         deja::DejaRecord::Observed(call) => observed.push(*call),
         deja::DejaRecord::GraphNode(node) => graph.push(*node),
         deja::DejaRecord::BoundaryEvent(_) => {}
@@ -5801,8 +7980,13 @@ fn load_replay_stream(
         // masquerade as a complete, smaller replay.
         observed.clear();
         graph.clear();
+        cancelled.clear();
     }
-    (observed, graph)
+    ReplayStream {
+        observed,
+        graph,
+        cancelled,
+    }
 }
 
 /// Load the optional record-side tagged graph stream. Missing or unreadable is
@@ -5825,7 +8009,22 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use deja::{LookupEntry, LookupKey};
+
+    /// Whether two values diverge under the comparison every value goes through
+    /// ([`value_verdict`]), as a bool, for tests that pin the comparison itself.
+    fn values_diverge_under_event(
+        boundary: &str,
+        recorded: &serde_json::Value,
+        observed: &serde_json::Value,
+        event: Option<&deja::BoundaryEvent>,
+        observed_sql: Option<&str>,
+    ) -> bool {
+        matches!(
+            value_verdict(boundary, recorded, observed, event, observed_sql),
+            ValueVerdict::Diverged
+        )
+    }
+    use deja::{Locus, LookupEntry, LookupKey};
     use deja_kernel::JsonFieldDiff;
 
     /// Row identity is read from the schema at run time (see
@@ -5877,6 +8076,42 @@ mod tests {
             disagreements.join("; ")
         );
         card
+    }
+
+    /// The scorer reads a run's lookup table for what the RECORDING held. Which
+    /// schema that recording was captured under is the replaying candidate's
+    /// question, not the scorer's, so a table from another schema still scores.
+    #[test]
+    fn the_scorer_reads_a_table_from_any_event_schema() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("lookup.json");
+        let mut table = serde_json::json!({
+            "recording_id": "rec-1",
+            "policy_version": deja::POLICY_VERSION,
+            "entries": [serde_json::to_value(seq_entry_method_res(
+                Some("c1"),
+                "db",
+                "find",
+                1,
+                serde_json::json!({"result": "Ok"}),
+            ))
+            .expect("entry")],
+        });
+        for schema in [
+            Some(deja::CURRENT_EVENT_SCHEMA_VERSION - 1),
+            Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+            None,
+        ] {
+            table["event_schema_version"] = serde_json::json!(schema);
+            std::fs::write(&path, table.to_string()).expect("write");
+            let mut warnings = Vec::new();
+            let loaded = load_table(&path, &mut warnings);
+            assert_eq!(
+                (loaded.entries.len(), warnings.len()),
+                (1, 0),
+                "schema {schema:?}: {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -6022,7 +8257,7 @@ mod tests {
             0,
             1,
         );
-        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql}).into();
 
         assert!(
             !values_diverge_under_event("db", &recorded, &observed, Some(&event), Some(sql)),
@@ -6085,7 +8320,7 @@ mod tests {
             0,
             1,
         );
-        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        event.args = serde_json::json!({"table": "payment_attempt", "sql": sql}).into();
 
         assert!(
             values_diverge_under_event("db", &recorded, &observed, Some(&event), Some(sql)),
@@ -6179,12 +8414,17 @@ mod tests {
             span_path: None,
             graph_node_id: None,
             synthesized: false,
+            outcome: deja::SubstituteOutcome::default(),
             real_impl_will_fail: false,
             recorded_result: None,
             observed_result: None,
             provenance: deja::Provenance::default(),
             seed_gap: false,
             absorbed: false,
+            arg_divergent: false,
+            served_event_global_sequence: None,
+            lookup_ordinal: None,
+            cancelled: false,
         }
     }
 
@@ -6200,7 +8440,7 @@ mod tests {
     /// entry's result per source sequence.
     fn span_entry(corr: Option<&str>, src: u64, path: &str) -> LookupEntry {
         let mut entry = seq_entry(corr, "span", src);
-        entry.key.address = Address::SpanPath {
+        entry.key.locus = Locus::SpanPath {
             path: path.to_owned(),
         };
         entry
@@ -6210,6 +8450,90 @@ mod tests {
     fn with_span(mut o: ObservedCall, path: &str) -> ObservedCall {
         o.span_path = Some(path.to_owned());
         o
+    }
+
+    fn run_with_namespaces(
+        root: &HarnessRoot,
+        run_id: &str,
+        namespaces: Vec<String>,
+    ) -> crate::RunSpec {
+        let spec = crate::RunSpec {
+            label: None,
+            delta_against: None,
+            purpose: None,
+            scored_span_namespaces: namespaces,
+            mode: crate::RunMode::Replay,
+            system_under_test: Some("prism".to_owned()),
+            candidate_spec: crate::CandidateSpec::PrebuiltImage {
+                image: "deja-demo".to_owned(),
+            },
+            candidate_repo: None,
+            recording_id: Some("rec-ns".to_owned()),
+            recording_group: None,
+            s3_source: None,
+            correlation_filter: None,
+            workload: serde_json::Value::Null,
+        };
+        crate::write_json(
+            &root.run_path(run_id),
+            &crate::Run {
+                run_id: run_id.to_owned(),
+                spec: spec.clone(),
+                status: crate::RunStatus::Completed,
+                recording_id: Some("rec-ns".to_owned()),
+                candidate_image: None,
+                failure_reason: None,
+                stage: None,
+                step: 0,
+                steps_total: 0,
+                stage_updated_ms: 0,
+            },
+        )
+        .unwrap();
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: "rec-ns".to_owned(),
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+                entries: vec![],
+                identity_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+        spec
+    }
+
+    /// The namespaces the scorer checks are the ones the run's own params row
+    /// says it checks. The row resolved an empty spec to the system's
+    /// declaration while the scorer read the raw spec: every CI-created prism
+    /// run showed `["ucs::", "connector::"]` and scored no span at all.
+    #[test]
+    fn the_scorer_checks_the_namespaces_the_params_row_says_it_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+
+        let explicit = run_with_namespaces(&root, "run-ns-explicit", vec!["x::".to_owned()]);
+        let art = load_artifacts(&root, "run-ns-explicit").unwrap();
+        assert_eq!(art.scored_span_namespaces, vec!["x::".to_owned()]);
+        assert_eq!(
+            art.scored_span_namespaces,
+            crate::RunParams::resolved(&explicit, None).scored_span_namespaces
+        );
+
+        // An empty spec — what the API and CI send — resolves through the same
+        // seam as the params row, so the two cannot disagree whatever the
+        // system declares in this environment.
+        let empty = run_with_namespaces(&root, "run-ns-empty", Vec::new());
+        let art = load_artifacts(&root, "run-ns-empty").unwrap();
+        assert_eq!(
+            art.scored_span_namespaces,
+            crate::RunParams::resolved(&empty, None).scored_span_namespaces
+        );
+        assert_eq!(
+            art.scored_span_namespaces,
+            empty.effective_scored_span_namespaces()
+        );
     }
 
     /// A correlation filter must scope scoring to the DRIVEN subset: an
@@ -6225,6 +8549,9 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    label: None,
+                    delta_against: None,
+                    purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
@@ -6233,6 +8560,7 @@ mod tests {
                     },
                     candidate_repo: None,
                     recording_id: Some("rec-scope".to_owned()),
+                    recording_group: None,
                     s3_source: None,
                     correlation_filter: Some(vec!["c-keep".to_owned(), " ".to_owned()]),
                     workload: serde_json::Value::Null,
@@ -6252,12 +8580,14 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: "rec-scope".to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
                     seq_entry(None, "db", 3),
                 ],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -6344,6 +8674,9 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    label: None,
+                    delta_against: None,
+                    purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
@@ -6352,6 +8685,7 @@ mod tests {
                     },
                     candidate_repo: None,
                     recording_id: Some(recording_id.to_owned()),
+                    recording_group: None,
                     s3_source: None,
                     correlation_filter: Some(vec!["c-keep".to_owned()]),
                     workload: serde_json::Value::Null,
@@ -6371,11 +8705,13 @@ mod tests {
             &root.lookup_table_path(run_id),
             &LookupTable {
                 recording_id: recording_id.to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries: vec![
                     seq_entry(Some("c-keep"), "db", 1),
                     seq_entry(Some("c-drop"), "db", 2),
                 ],
+                identity_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -6425,16 +8761,23 @@ mod tests {
             key: LookupKey {
                 correlation_id: corr.map(str::to_owned),
                 bucket_id: Some("root".to_owned()),
+                // The caller's `boundary` belongs here. It used to ride inside
+                // the rank-6 locus; stamping a constant instead would make
+                // every fixture share identity and the pairing tests would
+                // agree with a collision rather than detect one.
+                boundary: boundary.to_owned(),
+                component: "tests".to_owned(),
+                // "m" is the method the pre-split fixture put inside
+                // `Address::Sequence`; the orchestrator's args-free pairing
+                // joins on it, so changing it silently re-partitions every
+                // pairing test built on this helper.
+                operation: "m".to_owned(),
                 fork_seq: 0,
-                address: Address::Sequence {
-                    boundary: boundary.to_owned(),
-                    method: "m".to_owned(),
-                    request_sequence: 0,
-                },
+                locus: Locus::Unlocated,
                 args_hash: 0,
                 occurrence: 0,
             },
-            result,
+            result: std::sync::Arc::new(result),
             source_event_global_sequence: src,
         }
     }
@@ -6449,14 +8792,17 @@ mod tests {
             key: LookupKey {
                 correlation_id: corr.map(str::to_owned),
                 bucket_id: Some("root".to_owned()),
+                boundary: "test".to_owned(),
+                component: "tests".to_owned(),
+                operation: "op".to_owned(),
                 fork_seq: 0,
-                address: Address::SpanPath {
+                locus: Locus::SpanPath {
                     path: path.to_owned(),
                 },
                 args_hash: 0,
                 occurrence: 0,
             },
-            result,
+            result: std::sync::Arc::new(result),
             source_event_global_sequence: src,
         }
     }
@@ -6528,6 +8874,9 @@ mod tests {
             &crate::Run {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
+                    label: None,
+                    delta_against: None,
+                    purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
                     system_under_test: None,
@@ -6536,6 +8885,7 @@ mod tests {
                     },
                     candidate_repo: None,
                     recording_id: None,
+                    recording_group: None,
                     s3_source: None,
                     correlation_filter: filter,
                     workload: serde_json::Value::Null,
@@ -6676,7 +9026,9 @@ mod tests {
         write_jsonl_rows(&path, &rows);
         let mut warnings = Vec::new();
 
-        let (observed, graph) = load_replay_stream(&path, &mut warnings);
+        let ReplayStream {
+            observed, graph, ..
+        } = load_replay_stream(&path, &mut warnings);
         assert!(warnings.is_empty());
         assert_eq!(
             observed
@@ -6698,10 +9050,11 @@ mod tests {
         src: u64,
         result: serde_json::Value,
     ) -> LookupEntry {
+        // The method is identity and lives on the key; it used to be reachable
+        // only by matching the rank-6 locus, which is why this helper existed in
+        // this shape.
         let mut entry = seq_entry_res(corr, boundary, src, result);
-        if let Address::Sequence { method: m, .. } = &mut entry.key.address {
-            *m = method.to_owned();
-        }
+        entry.key.operation = method.to_owned();
         entry
     }
 
@@ -6762,14 +9115,17 @@ mod tests {
         http: Vec<HttpDiff>,
     ) -> RunArtifacts {
         RunArtifacts {
+            unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
+                identity_entries: Vec::new(),
             },
             observed,
             http_diffs: http,
@@ -6778,6 +9134,7 @@ mod tests {
             events: Vec::new(),
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         }
     }
 
@@ -7288,6 +9645,29 @@ mod tests {
         );
     }
 
+    /// The diff reads order by the one identity: a result holding a JSON
+    /// document written in another order is an order-only difference, as a
+    /// permuted array is, and a changed document still diverges.
+    #[test]
+    fn a_result_documents_order_is_read_by_the_one_identity() {
+        let doc = |text: &str| serde_json::json!({ "result": "Ok", "value": { "raw": text } });
+        let card = scored_matched_call(
+            None,
+            doc(r#"{"ids":["a","b"],"n":1}"#),
+            doc(r#"{"n":1,"ids":["b","a"]}"#),
+        );
+        // The string's text changed, so it is document text, not ordering.
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        let card = scored_matched_call(
+            None,
+            doc(r#"{"ids":["a","b"],"n":1}"#),
+            doc(r#"{"n":2,"ids":["b","a"]}"#),
+        );
+        assert!(!card.verdict.pass, "a changed document still diverges");
+    }
+
     fn scored_matched_call(
         declaration: Option<&str>,
         recorded: serde_json::Value,
@@ -7312,6 +9692,68 @@ mod tests {
             vec![],
             vec![event],
         ))
+    }
+
+    /// ACCOUNTING THAT MUST BALANCE. One observed call is either matched or
+    /// diverged, never both, so `matched + diverged` over a boundary equals the
+    /// calls scored on it. An order-only absorption is recorded through
+    /// `bump_kind`, which also increments `diverged`, and the absorbed branch
+    /// then falls through to `matched += 1` — the one call is counted twice,
+    /// and reads as a red divergence in every bar and chip that sums
+    /// `diverged`, while its name appears only in the warnings. Asserted on
+    /// the raw counters, not through any helper that would restate the sum.
+    #[test]
+    fn an_absorbed_ordering_is_counted_once_so_matched_plus_diverged_equals_calls() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            rows(&["b", "a"]),
+            rows(&["a", "b"]),
+        );
+        // PRECONDITION: the absorption happened, or the sum below is trivially
+        // right for the wrong reason.
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+
+        let db = &card.per_boundary["db"];
+        assert_eq!(
+            db.matched + db.diverged,
+            1,
+            "exactly ONE call was observed on db, so it cannot be both matched \
+             ({}) and diverged ({}) — a named-not-scored kind must not bump \
+             `diverged`",
+            db.matched,
+            db.diverged
+        );
+    }
+
+    /// A call the candidate served from its own recorded error is counted
+    /// under its own name, once, and blocks nothing: never silent, never a
+    /// divergence.
+    #[test]
+    fn a_served_recorded_error_is_counted_by_name_and_does_not_diverge() {
+        let unique =
+            serde_json::json!({ "version": 1, "result": "Err", "kind": "UniqueViolation" });
+        let mut event = db_read_declaring("");
+        event.correlation_id = Some("c1".to_owned());
+        event.global_sequence = 1;
+        event.declaration = None;
+        let mut served = exec_obs(
+            "db",
+            Some("c1"),
+            true,
+            Some(1),
+            Some(unique.clone()),
+            unique,
+        );
+        served.provenance = deja::Provenance::ServedRecordedError;
+        let card = detect(&art_with_events(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![served],
+            vec![],
+            vec![event],
+        ));
+        assert_eq!(kind_count(&card, "db", "ServedRecordedError"), 1);
+        let db = &card.per_boundary["db"];
+        assert_eq!((db.matched, db.diverged), (1, 0));
     }
 
     fn value_canon_warning(card: &Scorecard) -> Option<&String> {
@@ -7642,6 +10084,228 @@ mod tests {
         assert_eq!(counts, vec![1, 1, 1, 1], "same count for every permutation");
     }
 
+    // --- the recompute may re-shape the kernel's findings, never invent one ---
+
+    /// THE INVARIANT, stated directly and without reference to any encoding: if
+    /// the authority on whether two bodies differ found nothing, nothing blocks.
+    /// Whatever the recompute makes of the bytes, it is re-shaping a set of
+    /// differences that is empty.
+    ///
+    /// This is also what makes the run's body allowlist mean what it says. The
+    /// allowlist is applied inside the kernel, and this engine has never seen
+    /// it, so an allowlisted path reaching here is the same shape of bug.
+    #[test]
+    fn a_recompute_row_the_kernel_never_reported_does_not_block() {
+        // Bodies that differ byte for byte, with the kernel reporting nothing —
+        // exactly what an engine that sees through an encoding hands us.
+        let diff = http_with_bodies(
+            "unbacked",
+            true,
+            Vec::new(),
+            serde_json::json!({ "echo": "{\"a\":1,\"b\":2}" }),
+            serde_json::json!({ "echo": "{\"b\":2,\"a\":1}" }),
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert!(
+            rows.is_empty(),
+            "the recompute may not manufacture a difference the kernel never found: {rows:?}"
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 0);
+        assert!(classification.canon_absorbed.is_empty());
+        assert!(classification.order_only_paths.is_empty());
+        // Set aside is not dropped: the path is named, so the scorecard can say
+        // the kernel's judgment was leaned on here.
+        assert_eq!(classification.kernel_equivalent_paths, vec!["$.echo"]);
+    }
+
+    /// The invariant holds in BOTH directions. The recompute may not invent a
+    /// difference, and it may not erase one: a kernel row that nothing the
+    /// recompute produced speaks about stands as the kernel wrote it, blocking
+    /// as it would have.
+    #[test]
+    fn a_kernel_row_nothing_speaks_about_stands_as_the_kernel_wrote_it() {
+        let kernel = vec![JsonFieldDiff {
+            json_path: "$.beta".to_owned(),
+            baseline: serde_json::json!(1),
+            candidate: serde_json::json!(2),
+        }];
+        // Bodies that differ somewhere the kernel did not report, beside a
+        // kernel row somewhere the bodies do not differ: no row can back
+        // another. Only a broken artifact produces this; the scorer must still
+        // not turn it into a pass.
+        let diff = http_with_bodies(
+            "erase",
+            true,
+            kernel.clone(),
+            serde_json::json!({ "alpha": "x" }),
+            serde_json::json!({ "alpha": "y" }),
+        );
+        assert_eq!(
+            order_canonical_body_diff(&diff).expect("bodies present"),
+            kernel,
+            "the kernel's row is carried through, at its path and with its values"
+        );
+        let classification = classify_body(&diff);
+        assert_eq!(
+            classification.blocking_leaf_count, 1,
+            "the kernel's row blocks"
+        );
+        // The recompute's own row had no kernel row behind it, so it is set aside
+        // and named — which is the accurate reading of this fixture.
+        assert_eq!(classification.kernel_equivalent_paths, vec!["$.alpha"]);
+    }
+
+    /// Exact, not all-or-nothing: one kernel row the recompute backs must not
+    /// decide the fate of another it does not. And the unspoken-for rows are
+    /// judged against the recompute's survivors alone, so two of them in one
+    /// collection cannot speak for each other and lose one.
+    #[test]
+    fn a_backed_kernel_row_does_not_decide_the_fate_of_an_unbacked_one() {
+        let row = |path: &str| JsonFieldDiff {
+            json_path: path.to_owned(),
+            baseline: serde_json::json!(1),
+            candidate: serde_json::json!(2),
+        };
+        let kernel = vec![row("$.alpha"), row("$.beta[0]"), row("$.beta[1]")];
+        // The bodies differ only at `$.alpha`, so the recompute backs that row
+        // and nothing else.
+        let diff = http_with_bodies(
+            "partial",
+            true,
+            kernel,
+            serde_json::json!({ "alpha": "x" }),
+            serde_json::json!({ "alpha": "y" }),
+        );
+        let paths: Vec<String> = order_canonical_body_diff(&diff)
+            .expect("bodies present")
+            .into_iter()
+            .map(|row| row.json_path)
+            .collect();
+        assert_eq!(paths, vec!["$.alpha", "$.beta[0]", "$.beta[1]"]);
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 3);
+        assert!(
+            classification.kernel_equivalent_paths.is_empty(),
+            "every recompute row was backed; nothing was set aside"
+        );
+    }
+
+    /// What the kernel judged the same is SAID on the scorecard, not dropped:
+    /// the counter that reports it folds from a named kind, the fold agrees with
+    /// itself, and the warning names the path. A suite leaning on that judgment
+    /// on every response no longer reads identically to one whose bodies agreed.
+    #[test]
+    fn the_scorecard_names_what_the_kernel_judged_the_same() {
+        let recorded = serde_json::json!({ "echo": "{\"a\":1,\"b\":2}" });
+        let replayed = serde_json::json!({ "echo": "{\"b\":2,\"a\":1}" });
+        let card = detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]));
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(card.summary.http_body_mismatches, 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "OrderNondeterministicWarning"),
+            1
+        );
+        assert_eq!(card.summary.order_nondeterminism_warnings, 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "the summary field folds from the kind: {:?}",
+            card.counter_disagreements()
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("$.echo")
+                && w.contains("judged the region the same")
+                && w.contains("would still block")),
+            "warnings: {:?}",
+            card.warnings
+        );
+        assert!(card.verdict.pass, "named, not counted");
+    }
+
+    /// The measured incident, as the pipeline really builds it. A system echoes
+    /// the connector request it built as a serialized document; the `headers`
+    /// object inside is iterated from a hash map, so its key order is seeded per
+    /// process and differs between two runs of ONE image. The kernel reads the
+    /// embedded document and reports nothing. Nothing blocks.
+    #[test]
+    fn a_hash_ordered_map_inside_an_echoed_document_does_not_block() {
+        let recorded = "{\"url\":\"https://connector.example/v2/payments/authorizations/abc\",\
+\"method\":\"GET\",\"headers\":{\"Request-Id\":\"pay_1\",\"Prefer\":\"return=representation\",\
+\"Authorization\":\"Bearer token-synthesized\",\"via\":\"HyperSwitch\",\
+\"Content-Type\":\"application/json\"},\"body\":null}";
+        let replayed = "{\"url\":\"https://connector.example/v2/payments/authorizations/abc\",\
+\"method\":\"GET\",\"headers\":{\"via\":\"HyperSwitch\",\"Content-Type\":\"application/json\",\
+\"Authorization\":\"Bearer token-synthesized\",\"Request-Id\":\"pay_1\",\
+\"Prefer\":\"return=representation\"},\"body\":null}";
+        let diff = body_pair(
+            serde_json::json!({ "status": "CHARGED", "rawConnectorRequest": { "value": recorded } }),
+            serde_json::json!({ "status": "CHARGED", "rawConnectorRequest": { "value": replayed } }),
+        );
+        assert!(
+            diff.body_diff.is_empty(),
+            "the kernel judges these the same document; the fixture must reflect that"
+        );
+        assert!(order_canonical_body_diff(&diff)
+            .expect("bodies present")
+            .is_empty());
+        let classification = classify_body(&diff);
+        assert_eq!(classification.blocking_leaf_count, 0);
+        assert_eq!(
+            classification.kernel_equivalent_paths,
+            vec!["$.rawConnectorRequest.value"],
+            "the echo is named as the path the kernel's judgment was leaned on"
+        );
+    }
+
+    /// Holding the recompute to the kernel's findings is not tolerance. A value
+    /// that genuinely changed inside the same echoed document still blocks, and
+    /// the row that survives is the one this engine produced.
+    #[test]
+    fn a_real_change_inside_an_echoed_document_still_blocks() {
+        let diff = body_pair(
+            serde_json::json!({ "echo":
+                "{\"method\":\"POST\",\"headers\":{\"Authorization\":\"Bearer old\"}}" }),
+            serde_json::json!({ "echo":
+                "{\"headers\":{\"Authorization\":\"Bearer new\"},\"method\":\"POST\"}" }),
+        );
+        assert!(
+            !diff.body_diff.is_empty(),
+            "the kernel finds the changed value inside the document"
+        );
+        let rows = order_canonical_body_diff(&diff).expect("bodies present");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].json_path, "$.echo");
+        assert_eq!(classify_body(&diff).blocking_leaf_count, 1);
+    }
+
+    /// One difference, described by two engines that reached it differently:
+    /// deeper (the kernel decoded an encoded document), shallower (this engine
+    /// stopped at the encoding), or at another position of the same collection
+    /// (alignment moved a changed member). All three are the same difference.
+    /// Pinned because reading any of them as unrelated drops a row the sibling
+    /// alignment tests require.
+    #[test]
+    fn a_difference_described_two_ways_is_one_difference() {
+        assert!(paths_overlap("$.echo", "$.echo.headers.Authorization"));
+        assert!(paths_overlap("$.tags[1].id", "$.tags[1]"));
+        assert!(paths_overlap("$.items[1]", "$.items[2]"));
+        assert!(paths_overlap("$.a", "$.a"));
+        assert!(!paths_overlap("$.items", "$.tags"));
+    }
+
+    /// Path coverage is by SEGMENT: a sibling whose name merely starts with
+    /// another's is not part of it, so its difference can never stand in for
+    /// one at an unrelated path.
+    #[test]
+    fn coverage_is_by_path_segment_not_by_string_prefix() {
+        assert!(path_covers("$.a", "$.a"));
+        assert!(path_covers("$.a", "$.a.b"));
+        assert!(path_covers("$.a", "$.a[0]"));
+        assert!(!path_covers("$.a", "$.ab"));
+        assert!(!path_covers("$.a.b", "$.a"));
+        assert!(!paths_overlap("$.a", "$.ab"));
+    }
+
     /// THE GUARD on the default. A permutation is absorbed and NAMED, never
     /// silently dropped: the scorecard says a difference was seen and why it
     /// did not count. What still blocks is a change of membership, which the
@@ -7936,6 +10600,577 @@ mod tests {
         );
     }
 
+    /// A page shaped like the collect-link page: a style block whose braces
+    /// are not JSON, and a script that assigns one embedded document.
+    fn page_embedding(document: &str, heading: &str) -> serde_json::Value {
+        serde_json::Value::String(format!(
+            "<!DOCTYPE html>\n<html><head><style>\nbody {{ height: 100%; }}\n\
+             @media only screen {{ .main {{ min-width: 300px; }} }}\n</style></head>\n\
+             <body><h1>{heading}</h1><div id=\"collect\"></div>\n\
+             <script>window.__DETAILS = {document}\n// @ts-check\nvar widgets = null;\n\
+             function mount() {{ return widgets; }}</script></body></html>"
+        ))
+    }
+
+    fn embedded_card(recorded: serde_json::Value, replayed: serde_json::Value) -> Scorecard {
+        detect(&art(vec![], vec![], vec![body_pair(recorded, replayed)]))
+    }
+
+    /// An HTML page embedding a JSON document whose arrays were permuted is
+    /// compared as JSON inside the page: the permutation is absorbed and
+    /// named at the document's own path, and the page is counted as read
+    /// through an embedded document.
+    #[test]
+    fn an_embedded_document_whose_arrays_moved_is_compared_as_json() {
+        let card = embedded_card(
+            page_embedding(
+                r##"{"theme":"#4285F4","enabled_payment_methods":[{"payment_method":"card","payment_method_types":["debit","credit"]},{"payment_method":"bank_transfer","payment_method_types":["bacs","ach","sepa"]}]}"##,
+                "Collect",
+            ),
+            page_embedding(
+                r##"{"theme":"#4285F4","enabled_payment_methods":[{"payment_method":"card","payment_method_types":["credit","debit"]},{"payment_method":"bank_transfer","payment_method_types":["sepa","ach","bacs"]}]}"##,
+                "Collect",
+            ),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("$.~embedded[0].enabled_payment_methods")),
+            "the absorption is named inside the document: {:?}",
+            card.warnings
+        );
+    }
+
+    /// Keys in another order inside an embedded document are the same
+    /// document: compared as JSON, counted, not blocking.
+    #[test]
+    fn an_embedded_document_whose_keys_moved_is_compared_as_json() {
+        let card = embedded_card(
+            page_embedding(r#"{"a":1,"b":{"x":1,"y":2}}"#, "Collect"),
+            page_embedding(r#"{"b":{"y":2,"x":1},"a":1}"#, "Collect"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("embedded")),
+            "and it is said: {:?}",
+            card.warnings
+        );
+    }
+
+    /// Whitespace between a document's lexemes is formatting, and an escaped
+    /// quote stays inside its string: both are read through.
+    #[test]
+    fn an_embedded_document_is_read_through_whitespace_and_escaped_quotes() {
+        let card = embedded_card(
+            page_embedding(r#"{"m":["a\"b","c"],"k":1}"#, "Collect"),
+            page_embedding(r#"{ "k": 1, "m": ["c", "a\"b"] }"#, "Collect"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+            1
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// `{"d":{"d":…{"m":array}…}}`, `depth` objects deep.
+    fn nested(depth: usize, array: &str) -> String {
+        format!(
+            "{}{{\"m\":{array}}}{}",
+            "{\"d\":".repeat(depth - 1),
+            "}".repeat(depth - 1)
+        )
+    }
+
+    /// A page whose script holds a document inside a quoted string.
+    fn quoted_embedding(quote: char, document: &str) -> serde_json::Value {
+        serde_json::Value::String(format!(
+            "<html><body><script>var s = {quote}{document}{quote};</script></body></html>"
+        ))
+    }
+
+    /// Keys moved inside an array member are read as a JSON body reads them:
+    /// by key, so the page is compared through its document, as a JSON body
+    /// whose reordered members had keys moved is absorbed.
+    #[test]
+    fn keys_moved_inside_an_array_member_read_as_in_a_json_body() {
+        for replayed in [
+            r#"{"m":[{"a":0,"b":1},{"a":5}]}"#,
+            r#"{"m":[{"a":5},{"a":0,"b":1}]}"#,
+        ] {
+            let page = embedded_card(
+                page_embedding(r#"{"m":[{"b":1,"a":0},{"a":5}]}"#, "Collect"),
+                page_embedding(replayed, "Collect"),
+            );
+            assert!(page.verdict.pass, "{}", page.verdict.reason);
+            assert_eq!(
+                kind_count(&page, "http_incoming", "EmbeddedJsonCompared"),
+                1
+            );
+        }
+        let body = embedded_card(
+            serde_json::json!({"m": [{"b": 1, "a": 0}, {"a": 5}]}),
+            serde_json::json!({"m": [{"a": 5}, {"a": 0, "b": 1}]}),
+        );
+        assert!(body.verdict.pass, "{}", body.verdict.reason);
+        assert_eq!(kind_count(&body, "http_incoming", "BodyMismatch"), 0);
+        assert_eq!(
+            kind_count(&body, "http_incoming", "ReplyCanonAbsorbed"),
+            1,
+            "counted, never a silent pass"
+        );
+    }
+
+    /// A row holding both a rewritten document string and a reordered array
+    /// names both, each at its own site: neither hides the other.
+    #[test]
+    fn a_row_with_document_text_and_a_reorder_names_both() {
+        let card = embedded_card(
+            serde_json::json!({"m": [{"s": "[1,2]", "t": [1, 2]}, {"a": 5}]}),
+            serde_json::json!({"m": [{"a": 5}, {"s": "[2,1]", "t": [2, 1]}]}),
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        // Ordering is named as a pure reorder names it, once at the row, so a
+        // document string beside it adds a site and changes none.
+        let control = embedded_card(
+            serde_json::json!({"m": [{"s": "[1,2]", "t": [1, 2]}, {"a": 5}]}),
+            serde_json::json!({"m": [{"a": 5}, {"s": "[1,2]", "t": [2, 1]}]}),
+        );
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"),
+            kind_count(&control, "http_incoming", "ReplyCanonAbsorbed"),
+        );
+        assert_eq!(kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"), 1);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("path $.m ") && w.contains("ordering alone")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A declared bag governs ordering alone: a document string rewritten at a
+    /// declared path is named as document text, not as the clause's ordering.
+    #[test]
+    fn a_declared_bag_does_not_name_document_text_as_ordering() {
+        let corr = "bag-document-text";
+        let recorded = serde_json::json!({ "ids": "[1,2]" });
+        let replayed = serde_json::json!({ "ids": "[2,1]" });
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                902,
+                Some("bag:$.ids"),
+                recorded,
+            )],
+        ));
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        assert!(
+            !card.warnings.iter().any(|w| w.contains("ordering alone")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A matched call's result holding both a rewritten document string and a
+    /// moved array names both.
+    #[test]
+    fn a_result_with_document_text_and_a_reorder_names_both() {
+        let card = scored_matched_call(
+            None,
+            db_envelope(serde_json::json!([{ "doc": "[1,2]" }, { "x": 1 }])),
+            db_envelope(serde_json::json!([{ "x": 1 }, { "doc": "[2,1]" }])),
+        );
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+    }
+
+    /// A declared bag keeps its own source for the array it governs when the
+    /// row also holds a rewritten document string.
+    #[test]
+    fn a_declared_bag_keeps_its_source_beside_document_text() {
+        let corr = "bag-beside-document-text";
+        let recorded = serde_json::json!({"m": [{"s": "[1,2]"}, {"a": 5}]});
+        let replayed = serde_json::json!({"m": [{"a": 5}, {"s": "[2,1]"}]});
+        let card = detect(&art_with_events(
+            vec![],
+            vec![],
+            vec![http_with_bodies(
+                corr,
+                true,
+                deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                recorded.clone(),
+                replayed,
+            )],
+            vec![http_incoming_ev_with_reply_canon(
+                corr,
+                903,
+                Some("bag:$.m"),
+                recorded,
+            )],
+        ));
+        assert_eq!(
+            kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        let ordering: Vec<&String> = card
+            .warnings
+            .iter()
+            .filter(|w| w.contains("path $.m ") && w.contains("ordering alone"))
+            .collect();
+        assert_eq!(ordering.len(), 1, "{:?}", card.warnings);
+        assert!(ordering[0].contains("bag"), "{}", ordering[0]);
+        assert!(!ordering[0].contains("no path asserts"), "{}", ordering[0]);
+    }
+
+    /// A declared bag is credited with the row it governs, once, whether or
+    /// not a document string sits in it: never with a nested array it did not
+    /// name as a separate site.
+    #[test]
+    fn a_declared_bag_row_is_one_site_with_or_without_document_text() {
+        let count = |doc: &str| {
+            let corr = "bag-row-sites";
+            let recorded = serde_json::json!({"m": [{"s": "[1,2]", "n": [1, 2]}, {"a": 5}]});
+            let replayed = serde_json::json!({"m": [{"a": 5}, {"s": doc, "n": [2, 1]}]});
+            let card = detect(&art_with_events(
+                vec![],
+                vec![],
+                vec![http_with_bodies(
+                    corr,
+                    true,
+                    deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                    recorded.clone(),
+                    replayed,
+                )],
+                vec![http_incoming_ev_with_reply_canon(
+                    corr,
+                    904,
+                    Some("bag:$.m"),
+                    recorded,
+                )],
+            ));
+            kind_count(&card, "http_incoming", "ReplyCanonAbsorbed")
+        };
+        assert_eq!(count("[2,1]"), 1);
+        assert_eq!(count("[1,2]"), 1);
+    }
+
+    /// A whole-body bag names document text as document text, as every other
+    /// absorbing branch does: a clause about order does not make text order.
+    #[test]
+    fn a_whole_body_bag_names_document_text_as_document_text() {
+        let card = |doc: &str, moved: bool| {
+            let corr = "whole-body-bag-text";
+            let recorded = serde_json::json!({"m": [{"s": "[1,2]", "n": [1, 2]}, {"a": 5}]});
+            let member = serde_json::json!({"s": doc, "n": [1, 2]});
+            let replayed = if moved {
+                serde_json::json!({"m": [{"a": 5}, member]})
+            } else {
+                serde_json::json!({"m": [member, {"a": 5}]})
+            };
+            detect(&art_with_events(
+                vec![],
+                vec![],
+                vec![http_with_bodies(
+                    corr,
+                    true,
+                    deja_kernel::diff_json(&recorded, &replayed, "$", &[]),
+                    recorded.clone(),
+                    replayed,
+                )],
+                vec![http_incoming_ev_with_reply_canon(
+                    corr,
+                    905,
+                    Some("bag"),
+                    recorded,
+                )],
+            ))
+        };
+        let text_only = card("[2,1]", false);
+        assert_eq!(
+            kind_count(&text_only, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        assert_eq!(
+            kind_count(&text_only, "http_incoming", "ReplyCanonAbsorbed"),
+            0
+        );
+        let both = card("[2,1]", true);
+        assert_eq!(
+            kind_count(&both, "http_incoming", "ReplyDocumentAbsorbed"),
+            1
+        );
+        assert_eq!(kind_count(&both, "http_incoming", "ReplyCanonAbsorbed"), 1);
+    }
+
+    /// A recorder clause over a result's rows keeps its label for their order
+    /// when a document string in one of them was written differently.
+    #[test]
+    fn a_result_clause_keeps_its_source_beside_document_text() {
+        let card = scored_matched_call(
+            Some(deja::codec::UNORDERED_VALUE_ROWS_CANON),
+            db_envelope(serde_json::json!([{ "ref": "a", "doc": "[1,2]" }, { "ref": "b" }])),
+            db_envelope(serde_json::json!([{ "ref": "b" }, { "ref": "a", "doc": "[2,1]" }])),
+        );
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 1);
+        let warning = value_canon_warning(&card).expect("the ordering is named");
+        assert!(warning.contains("recorder"), "{warning}");
+        assert!(!warning.contains("no clause asserts"), "{warning}");
+    }
+
+    /// A matched call's result holding a document written differently is
+    /// counted as document text, not as ordering.
+    #[test]
+    fn a_result_document_string_rewritten_is_named_as_document_text() {
+        let card = scored_matched_call(
+            None,
+            db_envelope(serde_json::json!([{ "doc": "[1,2]" }])),
+            db_envelope(serde_json::json!([{ "doc": "[2,1]" }])),
+        );
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "db", "ValueDocumentAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "db", "ValueCanonAbsorbed"), 0);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("text"))
+                && !card.warnings.iter().any(|w| w.contains("ordering alone")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A string in a JSON body holding a document written differently is
+    /// counted as document text, at the string's own path, never as ordering
+    /// alone: its text changed, though the document it holds did not.
+    #[test]
+    fn a_document_string_rewritten_in_a_body_is_named_as_document_text() {
+        for (recorded, replayed, site, reordered) in [
+            (
+                serde_json::json!({"ids": "[1,2]"}),
+                serde_json::json!({"ids": "[2,1]"}),
+                "$.ids",
+                0,
+            ),
+            (
+                serde_json::json!({"m": [{"s": "[1,2]"}, {"a": 5}]}),
+                serde_json::json!({"m": [{"a": 5}, {"s": "[2,1]"}]}),
+                "$.m[].s",
+                1,
+            ),
+        ] {
+            let card = embedded_card(recorded, replayed);
+            assert!(card.verdict.pass, "{site}: {}", card.verdict.reason);
+            assert_eq!(
+                kind_count(&card, "http_incoming", "ReplyDocumentAbsorbed"),
+                1,
+                "{site}"
+            );
+            // Only an array that moved is ordering, never the string.
+            assert_eq!(
+                kind_count(&card, "http_incoming", "ReplyCanonAbsorbed"),
+                reordered,
+                "{site}"
+            );
+            assert!(
+                card.warnings
+                    .iter()
+                    .any(|w| w.contains(site) && w.contains("text")),
+                "{site}: {:?}",
+                card.warnings
+            );
+            assert!(
+                !card
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("ordering alone") && w.contains(&format!("{site} "))),
+                "{site}: {:?}",
+                card.warnings
+            );
+        }
+    }
+
+    /// What the embedded comparison still refuses. Each of these blocks on
+    /// `main` and must keep blocking: the documents are only paired when
+    /// everything around them is byte-identical, only objects are read as
+    /// documents, and a JSON body is never re-scanned.
+    #[test]
+    fn an_embedded_document_is_not_compared_when_anything_else_differs() {
+        let permuted_a = r#"{"m":["a","b"]}"#;
+        let permuted_b = r#"{"m":["b","a"]}"#;
+        for (name, recorded, replayed) in [
+            (
+                "text around the document differs",
+                page_embedding(permuted_a, "Collect"),
+                page_embedding(permuted_b, "Collected"),
+            ),
+            (
+                "a value inside the document changed",
+                page_embedding(r#"{"m":["a","b"],"n":1}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":2}"#, "Collect"),
+            ),
+            (
+                "an embedded top-level array is code, not a document",
+                page_embedding(r#"["a","b"]"#, "Collect"),
+                page_embedding(r#"["b","a"]"#, "Collect"),
+            ),
+            (
+                "the number of documents differs",
+                page_embedding(permuted_a, "Collect"),
+                page_embedding(&format!("{permuted_b}; var more = {{\"k\":1}}"), "Collect"),
+            ),
+            (
+                "an escape changed: bytes a script reads",
+                page_embedding(r#"{"m":["a","b"],"s":"<\/script>"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"s":"</script>"}"#, "Collect"),
+            ),
+            (
+                "a null moved to another object",
+                page_embedding(r#"{"m":["a","b"],"a":null,"b":{"z":1}}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"b":{"a":null,"z":1}}"#, "Collect"),
+            ),
+            (
+                "a null moved to another array",
+                page_embedding(r#"{"m":["a","b"],"a":[null],"b":[]}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"a":[],"b":[null]}"#, "Collect"),
+            ),
+            (
+                "a document nested deeper than a page is read for",
+                page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["a","b"]"#), "Collect"),
+                page_embedding(&nested(MAX_EMBEDDED_DEPTH, r#"["b","a"]"#), "Collect"),
+            ),
+            (
+                "an escape moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":"a\/b","y":"a/b"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":"a/b","y":"a\/b"}"#, "Collect"),
+            ),
+            (
+                "a unicode escape moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":"\u0061","y":"a"}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":"a","y":"\u0061"}"#, "Collect"),
+            ),
+            (
+                "a number's spelling moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":1.0,"y":1.00}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":1.00,"y":1.0}"#, "Collect"),
+            ),
+            (
+                "a negative zero moved between members",
+                page_embedding(r#"{"m":["a","b"],"x":-0.0,"y":0.0}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"x":0.0,"y":-0.0}"#, "Collect"),
+            ),
+            (
+                "a duplicate key moved to another object",
+                page_embedding(
+                    r#"{"m":["a","b"],"k":{"a":1,"a":2},"j":{"a":3}}"#,
+                    "Collect",
+                ),
+                page_embedding(
+                    r#"{"m":["b","a"],"k":{"a":2},"j":{"a":1,"a":3}}"#,
+                    "Collect",
+                ),
+            ),
+            (
+                "markup inside a document: order can change how the page parses",
+                page_embedding(r#"{"a":"</script>","c":"<img>"}"#, "Collect"),
+                page_embedding(r#"{"c":"<img>","a":"</script>"}"#, "Collect"),
+            ),
+            (
+                "a document inside a template literal: a quote in a value ends it",
+                quoted_embedding('`', r#"{"a":"`+x+`","m":["x","y"]}"#),
+                quoted_embedding('`', r#"{"m":["y","x"],"a":"`+x+`"}"#),
+            ),
+            (
+                "a document inside a single-quoted string",
+                quoted_embedding('\'', r#"{"a":"'","b":"-x-'","m":["x","y"]}"#),
+                quoted_embedding('\'', r#"{"b":"-x-'","a":"'","m":["y","x"]}"#),
+            ),
+            (
+                "a number was written differently",
+                page_embedding(r#"{"m":["a","b"],"n":1.0}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":1.00}"#, "Collect"),
+            ),
+            (
+                "a number beyond a float's precision changed",
+                page_embedding(r#"{"m":["a","b"],"n":12345678901234567890123}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":12345678901234567890124}"#, "Collect"),
+            ),
+            (
+                "a duplicate key was dropped",
+                page_embedding(r#"{"m":["a","b"],"n":1,"n":2}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"],"n":2}"#, "Collect"),
+            ),
+            (
+                "a null member was dropped",
+                page_embedding(r#"{"m":["a","b"],"n":null}"#, "Collect"),
+                page_embedding(r#"{"m":["b","a"]}"#, "Collect"),
+            ),
+            (
+                "more documents than a page is read for",
+                page_embedding(
+                    &vec![permuted_a; MAX_EMBEDDED_DOCUMENTS + 1].join(";"),
+                    "Collect",
+                ),
+                page_embedding(
+                    &vec![permuted_b; MAX_EMBEDDED_DOCUMENTS + 1].join(";"),
+                    "Collect",
+                ),
+            ),
+            (
+                "a body over the scan limit compares as text",
+                page_embedding(permuted_a, &"x".repeat(MAX_EMBEDDED_SCAN_BYTES)),
+                page_embedding(permuted_b, &"x".repeat(MAX_EMBEDDED_SCAN_BYTES)),
+            ),
+            (
+                "a JSON body is never re-scanned",
+                serde_json::json!({ "html": page_embedding(permuted_a, "Collect") }),
+                serde_json::json!({ "html": page_embedding(permuted_b, "Collect") }),
+            ),
+        ] {
+            let card = embedded_card(recorded, replayed);
+            assert!(
+                kind_count(&card, "http_incoming", "BodyMismatch") >= 1,
+                "{name}: still blocks"
+            );
+            assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
+            assert_eq!(
+                kind_count(&card, "http_incoming", "EmbeddedJsonCompared"),
+                0,
+                "{name}: not read through an embedded document"
+            );
+        }
+    }
+
     #[test]
     fn scorer_does_not_treat_script_text_as_form_inputs() {
         let baseline = r#"<!DOCTYPE html><html><body><form><script>const fields = ['<input type="hidden" name="a" value="1">', '<input type="hidden" name="b" value="2">'];</script><input type="hidden" name="token" value="abc"></form></body></html>"#;
@@ -7992,7 +11227,7 @@ mod tests {
         ev.boundary = "http_incoming".to_owned();
         ev.trait_name = "HttpIngress".to_owned();
         ev.method_name = "reply".to_owned();
-        ev.result = recorded_body;
+        ev.result = recorded_body.into();
         ev.read_set.clear();
         ev.write_set.clear();
         ev.declaration = reply_canon.map(|canon| {
@@ -8117,14 +11352,17 @@ mod tests {
         assert!(!card.verdict.pass, "real status drift must still block");
 
         let rows = build_ledger(&RunArtifacts {
+            unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
                 recording_id: "rec-1".to_owned(),
-                policy_version: 1,
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
                 entries,
+                identity_entries: Vec::new(),
             },
             observed,
             http_diffs: vec![http(corr, true, vec![])],
@@ -8133,6 +11371,7 @@ mod tests {
             events: events.clone(),
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         })
         .unwrap();
         let volatile_row = rows
@@ -9193,7 +12432,135 @@ mod tests {
         );
     }
 
-    /// An observed call that MISSED and was absorbed by a declared `on_miss`.
+    /// An observed call that MISSED and was answered by a synthesized value.
+    /// Two tolerations compose into a pass, and the pure-tier exclusion's
+    /// stated premise is what lets them.
+    ///
+    /// `divergence/mod.rs` justifies excusing `Tier::Pure` on the grounds that
+    /// such a seam is "an entropy SEAM whose recorded value is substituted on
+    /// replay, after which everything downstream is pure … fully substituted in
+    /// practice (they never miss), so the non-blocking status is a safety net,
+    /// not a load-bearing exclusion."
+    ///
+    /// A clock seam that reads a duration into an OUTGOING REQUEST BODY breaks
+    /// both halves. Its value is not downstream-pure — reaching the body is the
+    /// whole reason it matters — and on a tape recorded before the seam existed
+    /// it misses on every call rather than never.
+    ///
+    /// What saves the first case below is incidental: the recording had a
+    /// counterpart the candidate's changed request could not claim, and an
+    /// unconsumed recorded side-effect call blocks whatever tier it sits at. Take
+    /// that away and nothing is left to block — the clock miss is excused as a
+    /// `DeterministicMiss` and the outgoing call is excused as an
+    /// `EnvironmentalMiss`. The run then reports a PASS whose reason reads
+    /// "every side-effect call resolved", about a request that continued on a
+    /// value the recording never held.
+    ///
+    /// FIXED. This test pinned the hole first and now pins its absence: a
+    /// synthesized pure miss is no longer excused, so it reaches the
+    /// absorbed-miss arm, and the run it belongs to can no longer call itself
+    /// clean. The environmental toleration downstream is unchanged and still
+    /// correct on its own — what was wrong was the first toleration, not the
+    /// second, and only their composition made a pass.
+    #[test]
+    fn a_synthesized_pure_miss_reaching_an_outgoing_request_is_not_excused() {
+        let clock_miss = |corr: &str| {
+            let mut call = obs("time", Some(corr), false, None, None);
+            // The miss arm answered. `stamp_outcome` sets all three of these
+            // together and `the_derived_flags_never_disagree_with_the_outcome`
+            // pins that they cannot drift, so a fixture setting fewer of them
+            // builds a call the runtime cannot emit.
+            call.outcome = deja::SubstituteOutcome::Synthesized;
+            call.absorbed = true;
+            call.synthesized = true;
+            call
+        };
+        let carrying_call = |corr: &str| {
+            let mut call = obs("http_outgoing", Some(corr), false, None, None);
+            call.args = serde_json::json!({"body": {"elapsed": 0}});
+            call
+        };
+
+        // The recording expected a call here and the candidate's differs, so a
+        // recorded call is left unconsumed.
+        let with_twin = detect(&art(
+            vec![seq_entry(Some("c1"), "http_outgoing", 1)],
+            vec![clock_miss("c1"), carrying_call("c1")],
+            vec![http("c1", true, vec![])],
+        ));
+        assert_eq!(
+            with_twin.summary.omitted_calls, 1,
+            "the fixture must leave a recorded call unconsumed, or it proves nothing"
+        );
+        assert!(
+            !with_twin.verdict.pass,
+            "an unconsumed recorded side-effect call blocks: {}",
+            with_twin.verdict.reason
+        );
+        // A genuine divergence outranks an unjudgeable, so this stays a
+        // FAILURE rather than softening to "could not tell".
+        assert!(
+            !with_twin.verdict.inconclusive,
+            "a run that diverged for a real reason is not inconclusive: {}",
+            with_twin.verdict.reason
+        );
+        // But both facts are on the line. The run failed for the omission AND
+        // separately ran partly on a fabricated value, and neither may hide the
+        // other — this is the only place the two rules meet.
+        assert!(
+            with_twin.verdict.reason.contains("omitted"),
+            "the blocking reason is still stated: {}",
+            with_twin.verdict.reason
+        );
+        assert!(
+            with_twin.verdict.reason.contains("absorbed miss")
+                && with_twin.verdict.reason.contains("time::m"),
+            "and so is the fabrication, named at its site: {}",
+            with_twin.verdict.reason
+        );
+
+        // The same fabricated value, reaching a call the recording never made.
+        // Nothing is omitted, so nothing blocks.
+        let without_twin = detect(&art(
+            vec![],
+            vec![clock_miss("c2"), carrying_call("c2")],
+            vec![http("c2", true, vec![])],
+        ));
+        assert_eq!(
+            without_twin.summary.environmental_misses, 1,
+            "the outgoing call is tolerated as an environmental miss"
+        );
+        assert_eq!(
+            without_twin.summary.omitted_calls, 0,
+            "and nothing is left over to block"
+        );
+        // Vacuity guard: with nothing omitted and the outgoing call tolerated,
+        // the ONLY thing left that can stop this being a pass is the clock
+        // miss. If it stopped being counted the assertions below would pass
+        // for the wrong reason.
+        assert_eq!(
+            without_twin.summary.absorbed_misses, 1,
+            "the fabricated clock reading must be counted, not excused"
+        );
+        assert!(
+            !without_twin.verdict.pass,
+            "a run that continued on a fabricated value is not clean: {}",
+            without_twin.verdict.reason
+        );
+        assert!(
+            without_twin.verdict.inconclusive,
+            "and the honest verdict is inconclusive — nothing here diverged, \
+             the run simply cannot say it was clean: {}",
+            without_twin.verdict.reason
+        );
+        assert!(
+            without_twin.verdict.reason.contains("time::m"),
+            "naming the seam, so a reader of a wholly inconclusive run knows \
+             which one went uncovered rather than suspecting the scorer: {}",
+            without_twin.verdict.reason
+        );
+    }
+
     fn absorbed_obs(boundary: &str, corr: &str) -> ObservedCall {
         let mut o = obs(boundary, Some(corr), false, None, None);
         o.absorbed = true;
@@ -9248,16 +12615,186 @@ mod tests {
              which costs nothing. What it costs is confidence, and that is \
              carried by absorbed_misses rather than by this counter"
         );
+        // CONTRACT CHANGED. This asserted `c1.passed` on the grounds that the
+        // response matched and every recorded call resolved. Both are still
+        // true, and they are no longer sufficient: the correlation continued on
+        // a value the recording never held, so counting it in
+        // `matched_correlations` states that a partly fabricated trace matched.
+        // It is not a FAILURE either — the candidate did not diverge — which is
+        // what `inconclusive` is for.
         assert!(
-            c1.passed,
-            "the response matched and every recorded call resolved: {}",
+            !c1.passed,
+            "a correlation that ran on a fabricated value cannot be counted \
+             matched: {}",
             card.verdict.reason
+        );
+        assert!(
+            c1.inconclusive,
+            "and the reason must be that it cannot be judged, not that it \
+             diverged: {}",
+            card.verdict.reason
+        );
+        assert_eq!(
+            card.summary.matched_correlations, 0,
+            "the headline must not contradict its own verdict"
         );
         assert!(
             card.verdict.reason.contains("absorbed miss"),
             "and the verdict must SAY so rather than leaving it to a breakdown \
              nobody reads: {}",
             card.verdict.reason
+        );
+    }
+
+    /// A run that continued on a value the recording never held has not been
+    /// shown to be clean, and must not report a pass.
+    ///
+    /// `absorbed_misses` is subtracted out of `blocking_reasons`, which is right
+    /// — an absorbed miss is an added call the process SURVIVED, so it cannot
+    /// cost more than an unabsorbed one, which costs nothing. But `pass` is
+    /// `!inconclusive && blocking_reasons == 0`, so subtracting it from the only
+    /// term that gates a pass makes the run pass. The reason line says "absorbed
+    /// miss" and the verdict says `pass: true` beside it.
+    ///
+    /// What an absorbed miss costs is CONFIDENCE — the scorecard's own words at
+    /// the subtraction — and confidence is what `inconclusive` already means
+    /// here: a tail gap forces it on exactly this ground, that the run "has not
+    /// been shown to be clean and must never report a pass". An absorbed miss is
+    /// the same statement about what the run is a verdict OVER, so it belongs in
+    /// the same term, not in the blocking count.
+    ///
+    /// This mattered little while a declined miss ended the request. It stops
+    /// being little the moment the miss fallback answers by default.
+    #[test]
+    fn a_run_that_continued_on_a_fabricated_value_is_not_a_pass() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1")],
+            vec![http("c1", true, vec![])],
+        ));
+
+        // Vacuity guard FIRST: this asserts a property of a run carrying an
+        // absorbed miss, so a run carrying none would satisfy it for free.
+        assert_eq!(
+            card.summary.absorbed_misses, 1,
+            "the fixture must actually carry an absorbed miss"
+        );
+        assert_eq!(
+            card.summary.side_effect_divergences, 0,
+            "and nothing else may be wrong with it, or the verdict would be decided by something other than the absorbed miss"
+        );
+
+        assert!(
+            !card.verdict.pass,
+            "a run that ran on a fabricated value must not report a pass: {:?}",
+            card.verdict
+        );
+        assert!(
+            card.verdict.inconclusive,
+            "and the honest verdict is INCONCLUSIVE rather than a failure — the              candidate did not diverge, the run simply cannot say it was clean:              {:?}",
+            card.verdict
+        );
+    }
+
+    /// The reason must name WHERE the fabrication happened, not only how much.
+    ///
+    /// An absorbed miss now forces inconclusive, and the elapsed seam declares
+    /// `on_miss` at a site every connector call passes through — so every tape
+    /// A run can carry hundreds of them, and a line reading "412 absorbed
+    /// miss(es)" with no location is indistinguishable from a broken scorer.
+    /// The same line naming `redis::get_key` tells the reader which seam went
+    /// uncovered, which is the thought they need to have.
+    #[test]
+    fn the_absorbed_miss_reason_names_the_sites_not_just_the_count() {
+        let site = |boundary: &str, method: &str| {
+            let mut o = absorbed_obs(boundary, "c1");
+            o.method_name = method.to_owned();
+            o
+        };
+        let card = detect(&art(
+            vec![],
+            vec![
+                site("redis", "get_key"),
+                site("redis", "get_key"),
+                site("db", "find_one"),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+
+        // Vacuity guard: the property is about absorbed misses, so a run with
+        // none would satisfy every assertion below for free.
+        assert_eq!(
+            card.summary.absorbed_misses, 3,
+            "the fixture must carry absorbed misses at more than one site"
+        );
+
+        let reason = &card.verdict.reason;
+        assert!(
+            reason.contains("redis::get_key"),
+            "the reason must name the site the fabrication happened at: {reason}"
+        );
+        assert!(
+            reason.contains("redis::get_key 2"),
+            "with how many were at it, so one dominant seam is visible: {reason}"
+        );
+        // The BUSIEST site leads. Sorting the other way still mentions both
+        // here, so an assertion on presence alone would not notice.
+        let lead = reason
+            .find("redis::get_key")
+            .expect("the dominant site is named");
+        let tail = reason
+            .find("db::find_one")
+            .expect("the lesser site is named");
+        assert!(
+            lead < tail,
+            "the site with the most absorbed misses must come first: {reason}"
+        );
+        assert!(
+            reason.contains("3 absorbed miss(es)"),
+            "without losing the total: {reason}"
+        );
+    }
+
+    /// A correlation that genuinely diverged is a DIVERGENCE, not an
+    /// unjudgeable, even when it also carries an absorbed miss.
+    ///
+    /// The run rule already says this — `inconclusive` there is guarded on
+    /// `blocking_reasons == 0`, so a real divergence wins. The correlation term
+    /// had no such guard, so a correlation with both reported
+    /// `inconclusive: true`. `passed` is false either way and no count is
+    /// wrong, but a reader or UI filtering failures on `!inconclusive` drops a
+    /// real divergence into the "could not tell" bucket. The two levels should
+    /// not disagree about which answer wins.
+    #[test]
+    fn a_correlation_that_diverged_is_not_excused_by_an_absorbed_miss() {
+        let card = detect(&art(
+            vec![],
+            vec![absorbed_obs("redis", "c1")],
+            vec![http("c1", false, vec![])],
+        ));
+
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+
+        // Vacuity guard: both halves must actually be present, or this asserts
+        // a property of a correlation that had nothing to weigh.
+        assert_eq!(
+            c1.absorbed_misses, 1,
+            "the fixture must carry an absorbed miss"
+        );
+        assert!(
+            !c1.http_status_match || !c1.http_body_match,
+            "and a genuine blocking divergence beside it"
+        );
+
+        assert!(!c1.passed, "it did not pass");
+        assert!(
+            !c1.inconclusive,
+            "and it is a divergence rather than an unjudgeable — blocking wins, \
+             as it already does at the run level"
         );
     }
 
@@ -9423,7 +12960,7 @@ mod tests {
         let c_recorded_read = serde_json::json!({"c_seen": "derived-from-recorded"});
         let c_candidate_read = serde_json::json!({"c_seen": "derived-from-candidate"});
 
-        let card = detect(&art(
+        let mut artifacts = art(
             vec![
                 seq_entry_method_res(Some(corr), "storage", "write_a", 10, a_write_ack.clone()),
                 seq_entry_method_res(Some(corr), "redis", "read_a", 11, b_recorded_read.clone()),
@@ -9486,7 +13023,26 @@ mod tests {
                 ),
             ],
             vec![http(corr, true, vec![])],
-        ));
+        );
+        // B' and C were re-keyed by B's changed read: what each SENT carries the
+        // value it was derived from, recorded on the tape and changed by the
+        // candidate. That difference is where the two pairs are judged.
+        let recorded_request = |sequence, boundary, operation: &str| {
+            let mut event = omitted_ev(sequence, boundary, Some(corr));
+            event.method_name = operation.to_owned();
+            event.args = serde_json::json!({"b_prime": "derived-from-recorded"}).into();
+            event
+        };
+        artifacts.events = vec![
+            recorded_request(12, "storage", "write_b_prime"),
+            recorded_request(13, "db", "read_b_prime"),
+        ];
+        for call in &mut artifacts.observed {
+            if matches!(call.method_name.as_str(), "write_b_prime" | "read_b_prime") {
+                call.args = serde_json::json!({"b_prime": "derived-from-candidate"});
+            }
+        }
+        let card = detect(&artifacts);
 
         assert_eq!(card.summary.http_status_mismatches, 0);
         assert_eq!(card.summary.http_body_mismatches, 0);
@@ -9594,6 +13150,14 @@ mod tests {
         );
         downstream_observation.args = serde_json::json!({"source": envelope(raced_row.clone())});
 
+        // What the downstream write SENT in the recording: the row it read before
+        // the conflicting write landed.
+        let mut recorded_downstream = omitted_ev(302, "storage", Some(corr));
+        recorded_downstream.method_name = "write_branch".to_owned();
+        recorded_downstream.args = serde_json::json!({
+            "source": envelope(serde_json::json!({"attempt_id": "pay_1", "status": "pending"}))
+        })
+        .into();
         let card = detect(&art_with_events(
             vec![
                 seq_entry_method_res(
@@ -9607,7 +13171,7 @@ mod tests {
             ],
             vec![read_observation, downstream_observation],
             vec![http(corr, true, vec![])],
-            vec![read_event, conflicting_write],
+            vec![read_event, conflicting_write, recorded_downstream],
         ));
         let wire = serde_json::to_value(&card).unwrap();
 
@@ -9634,6 +13198,109 @@ mod tests {
                     && warning.contains("auto-rerun")),
             "warnings should carry an auto-rerun diagnostic: {:?}",
             card.warnings
+        );
+    }
+
+    /// A served call whose arguments a concurrent write raced is not demoted to
+    /// an inconclusive race: it ran on a value recorded for other arguments,
+    /// and blocks as it did before the fallback.
+    #[test]
+    fn a_served_call_is_not_demoted_to_an_inconclusive_race() {
+        register_test_schema_identity();
+        let corr = "race-served";
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "pending"});
+        let raced_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let read_event = with_event_lineage(
+            db_read_ev(
+                corr,
+                "payment_attempt",
+                300,
+                recorded_row.clone(),
+                100,
+                300,
+                "root",
+                0,
+            ),
+            "root",
+            None,
+            "root",
+            0,
+        );
+        let conflicting_write = with_event_lineage(
+            declared_db_update_ev(corr, "payment_attempt", 301, raced_row.clone(), 150, 250),
+            "detached-writer",
+            Some("root"),
+            "detached-writer-bucket",
+            1,
+        );
+        let read_observation = exec_obs(
+            "db",
+            Some(corr),
+            true,
+            Some(300),
+            Some(envelope(recorded_row)),
+            envelope(raced_row.clone()),
+        );
+        let mut served = with_span(
+            exec_obs_method(
+                "storage",
+                Some(corr),
+                "write_branch",
+                false,
+                None,
+                None,
+                serde_json::json!({"branch": "pending"}),
+            ),
+            "root>flow>write_branch",
+        );
+        served.args = serde_json::json!({"source": envelope(raced_row)});
+        served.arg_divergent = true;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let mut recorded_downstream = omitted_ev(302, "storage", Some(corr));
+        recorded_downstream.method_name = "write_branch".to_owned();
+        recorded_downstream.args = serde_json::json!({
+            "source": envelope(serde_json::json!({"attempt_id": "pay_1", "status": "pending"}))
+        })
+        .into();
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "storage",
+                    "write_branch",
+                    302,
+                    serde_json::json!({"branch": "pending"}),
+                ),
+                span_entry(Some(corr), 302, "root>flow>write_branch"),
+            ],
+            vec![read_observation, served],
+            vec![http(corr, true, vec![])],
+            vec![read_event, conflicting_write, recorded_downstream],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "storage", "InconclusiveRace"),
+            0,
+            "{:?}",
+            card.per_boundary
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "ValueDiverged"),
+            1,
+            "{:?}",
+            card.per_boundary
+        );
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let storage: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| row.boundary == "storage")
+            .collect();
+        assert!(!storage.is_empty(), "{rows:?}");
+        assert!(
+            storage
+                .iter()
+                .all(|row| row.kind == "value_diverged" && row.blocking),
+            "{storage:?}"
         );
     }
 
@@ -9782,7 +13449,8 @@ mod tests {
 
         let table = LookupTable {
             recording_id: recording_id.to_owned(),
-            policy_version: 1,
+            policy_version: deja::POLICY_VERSION,
+            event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
             entries: vec![
                 seq_entry_method_res(
                     Some(corr),
@@ -9811,6 +13479,7 @@ mod tests {
                     raced_result.clone(),
                 ),
             ],
+            identity_entries: Vec::new(),
         };
         let observed = vec![
             exec_obs(
@@ -9847,6 +13516,7 @@ mod tests {
             }],
         )];
         let art = RunArtifacts {
+            unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
             run_id: run_id.to_owned(),
@@ -9859,6 +13529,7 @@ mod tests {
             events: recorded_events,
             correlation_scope: None,
             warnings: Vec::new(),
+            cancelled_lookups: Vec::new(),
         };
 
         let rows = build_ledger(&art).unwrap();
@@ -10132,13 +13803,49 @@ mod tests {
         );
     }
 
+    /// Every field in `IDENTITY_FIELDS` must SEPARATE, not merely survive.
+    ///
+    /// The test above asserts a re-keyed cache write keeps its twin —
+    /// `shape(cache=A,key=a) == shape(cache=A,key=b)` — which stays true when
+    /// `cache` is dropped from the identity altogether, because both sides
+    /// collapse to `key`. An equality is the one assertion that cannot notice a
+    /// field going missing, so `cache` was covered in the only direction that
+    /// could not fail. `endpoint` and `operation` had no assertion at all.
+    ///
+    /// All three name a distinct call in production: `cache` from
+    /// `storage_impl/src/redis/cache.rs`, `endpoint` from
+    /// `common_utils/src/keymanager.rs`, and `operation` from every diesel
+    /// generic via `deja/src/lib.rs` — `generic_insert` and `generic_delete`
+    /// are different calls on one table.
+    #[test]
+    fn each_identity_field_separates_calls_that_differ_only_in_it() {
+        let provenance = CorrelationColumnProvenance::default();
+        let shape = |args: &serde_json::Value| pairing_shape(args, None, &provenance);
+
+        assert_ne!(
+            shape(&serde_json::json!({"cache": "ACCOUNTS_CACHE", "key": "a"})),
+            shape(&serde_json::json!({"cache": "CONFIG_CACHE", "key": "a"})),
+            "two different caches are two different calls"
+        );
+        assert_ne!(
+            shape(&serde_json::json!({"endpoint": "/key/transfer", "id": "m1"})),
+            shape(&serde_json::json!({"endpoint": "/key/rotate", "id": "m1"})),
+            "two different keymanager endpoints are two different calls"
+        );
+        assert_ne!(
+            shape(&serde_json::json!({"operation": "generic_insert", "table": "payment_attempt"})),
+            shape(&serde_json::json!({"operation": "generic_delete", "table": "payment_attempt"})),
+            "an insert and a delete on one table are two different calls"
+        );
+    }
+
     #[test]
     fn rekeyed_write_pairs_args_free_into_one_value_divergence() {
         // GOTCHA #1: the diverged WRITE carries a mutated operand, so its args
         // miss the recorded baseline → recorded twin would be Omitted, the execute
         // call would be Novel. The args-free pairing must collapse them into ONE
         // ValueDiverged (NOT Novel+Omitted), and flip the correlation to diverged.
-        let card = detect(&art(
+        let mut artifacts = art(
             vec![
                 seq_entry_res(Some("c1"), "storage", 7, serde_json::json!(100)),
                 span_entry(Some("c1"), 7, "root>write_amount"),
@@ -10155,7 +13862,14 @@ mod tests {
                 "root>write_amount", // same call site — the identity that pairs
             )],
             vec![http("c1", true, vec![])],
-        ));
+        );
+        // The operand is part of what each side SENT, which is where a pair is
+        // judged: the recorded write sent 100, the candidate's sends 200.
+        let mut recorded = omitted_ev(7, "storage", Some("c1"));
+        recorded.args = serde_json::json!({"amount": 100}).into();
+        artifacts.events.push(recorded);
+        artifacts.observed[0].args = serde_json::json!({"amount": 200});
+        let card = detect(&artifacts);
         assert_eq!(card.summary.value_divergences, 1, "one value divergence");
         assert_eq!(card.summary.novel_calls, 0, "not a Novel");
         assert_eq!(card.summary.omitted_calls, 0, "not an Omitted");
@@ -10233,32 +13947,82 @@ mod tests {
         assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
+    fn seed_gap_obs() -> ObservedCall {
+        // Execute-mode State call that ran the real boundary but found NO
+        // recorded baseline and no args-free twin to pair with.
+        exec_obs(
+            "storage",
+            Some("c1"),
+            false,
+            None,
+            None, // seed gap
+            serde_json::json!("fresh"),
+        )
+    }
+
+    /// A call whose precondition could not be established leaves its
+    /// correlation's verdict resting on an untested call: that is "cannot
+    /// tell", never "passed". Non-blocking, and inconclusive at both levels.
     #[test]
-    fn execute_seed_gap_is_inconclusive_not_blocking() {
-        // Execute-mode State call ran the real boundary but found NO recorded
-        // baseline AND no args-free twin to pair with → InconclusiveSeedGap, which
-        // is reported but does NOT fail the verdict.
+    fn a_seed_gap_is_inconclusive_never_a_pass() {
         let card = detect(&art(
             vec![], // nothing recorded → no twin to pair
-            vec![exec_obs(
-                "storage",
-                Some("c1"),
-                false,
-                None,
-                None, // seed gap
-                serde_json::json!("fresh"),
-            )],
+            vec![seed_gap_obs()],
             vec![http("c1", true, vec![])],
         ));
         assert_eq!(card.summary.inconclusive_seed_gaps, 1);
         assert_eq!(card.summary.value_divergences, 0);
         assert_eq!(card.summary.novel_calls, 0, "seed gap is not a Novel");
-        assert!(
-            card.verdict.pass,
-            "seed gap is non-blocking: {}",
-            card.verdict.reason
-        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert!(card.verdict.inconclusive, "{}", card.verdict.reason);
         assert!(card.verdict.reason.contains("seed gap"));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 scored");
+        assert!(!c1.passed, "the correlation is not a pass either");
+        assert!(c1.inconclusive);
+        assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// A seed gap makes its OWN correlation inconclusive, not the others: a
+    /// clean correlation beside it still passes and is still counted.
+    #[test]
+    fn a_seed_gap_leaves_other_correlations_passing() {
+        let card = detect(&art(
+            vec![],
+            vec![seed_gap_obs()],
+            vec![http("c1", true, vec![]), http("c2", true, vec![])],
+        ));
+        let c2 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c2")
+            .expect("c2 scored");
+        assert!(c2.passed, "a clean correlation beside a seed gap passes");
+        assert!(!c2.inconclusive);
+        assert_eq!(card.summary.matched_correlations, 1);
+        assert!(card.verdict.inconclusive, "the run still cannot tell");
+    }
+
+    /// Blocking still wins: a seed gap beside a real divergence is a failure,
+    /// not a "cannot tell".
+    #[test]
+    fn a_seed_gap_beside_a_divergence_is_still_a_failure() {
+        let card = detect(&art(
+            vec![],
+            vec![seed_gap_obs()],
+            vec![http("c1", false, vec![])],
+        ));
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert!(!card.verdict.inconclusive, "{}", card.verdict.reason);
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 scored");
+        assert!(!c1.inconclusive, "a divergence is not a cannot-tell");
     }
 
     // -----------------------------------------------------------------------
@@ -10275,7 +14039,7 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut ev = omitted_ev(seq, boundary, Some(corr));
         ev.method_name = method.to_owned();
-        ev.args = args;
+        ev.args = args.into();
         ev
     }
 
@@ -10615,7 +14379,9 @@ mod tests {
     /// a novel call no longer self-flags seed_gap) and NO recorded twin to pair
     /// with must be a BLOCKING NovelCall — the extra-call catch. Before the fix the
     /// peek set seed_gap=true for this case, so the tally swallowed it as a
-    /// non-blocking InconclusiveSeedGap (verdict PASS, catch masked).
+    /// non-blocking InconclusiveSeedGap, which then scored as a pass and masked
+    /// the catch. (A seed gap now forces an inconclusive verdict; it never
+    /// passes.)
     #[test]
     fn novel_execute_call_without_seed_gap_is_a_novel_call_not_a_seed_gap() {
         // Build the observation exactly as the FIXED execute-shadow path emits it:
@@ -10680,33 +14446,699 @@ mod tests {
         assert!(card.verdict.pass, "{}", card.verdict.reason);
     }
 
-    #[test]
-    fn rekeyed_write_with_same_value_is_recovered_match_not_split() {
-        // A re-keyed call (args missed) whose VALUE nonetheless reproduced is
-        // paired args-free and counted as a match — never a Novel+Omitted split.
-        let card = detect(&art(
+    /// A write whose address missed, recorded under `root>write_v` with
+    /// `recorded_args`, and the candidate's unresolved call there with
+    /// `observed_args`. Both got back the same value.
+    fn paired_write(
+        recorded_args: Option<serde_json::Value>,
+        observed_args: serde_json::Value,
+    ) -> RunArtifacts {
+        let mut call = with_span(
+            exec_obs(
+                "storage",
+                Some("c1"),
+                false,
+                None,
+                None,
+                serde_json::json!("v"),
+            ),
+            "root>write_v",
+        );
+        call.args = observed_args;
+        let events = recorded_args
+            .map(|args| {
+                let mut event = omitted_ev(7, "storage", Some("c1"));
+                event.args = args.into();
+                vec![event]
+            })
+            .unwrap_or_default();
+        art_with_events(
             vec![
                 seq_entry_res(Some("c1"), "storage", 7, serde_json::json!("v")),
                 span_entry(Some("c1"), 7, "root>write_v"),
             ],
-            vec![with_span(
-                exec_obs(
-                    "storage",
-                    Some("c1"),
-                    false,
-                    None,
-                    None,
-                    serde_json::json!("v"),
-                ),
-                "root>write_v",
-            )],
+            vec![call],
             vec![http("c1", true, vec![])],
+            events,
+        )
+    }
+
+    /// A resolved call at seq 7 whose recorded args are `recorded` and whose
+    /// candidate sent `observed`.
+    fn resolved_with_args(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+    ) -> RunArtifacts {
+        let mut call = exec_obs(
+            "storage",
+            Some("c1"),
+            true,
+            Some(7),
+            Some(serde_json::json!("v")),
+            serde_json::json!("v"),
+        );
+        call.args = observed;
+        let mut event = omitted_ev(7, "storage", Some("c1"));
+        event.args = recorded.into();
+        art_with_events(
+            vec![seq_entry_res(
+                Some("c1"),
+                "storage",
+                7,
+                serde_json::json!("v"),
+            )],
+            vec![call],
+            vec![http("c1", true, vec![])],
+            vec![event],
+        )
+    }
+
+    /// A call served because its identity matched, not its exact args, says
+    /// so: counted under its own kind, the path named, nothing blocking.
+    #[test]
+    fn a_call_served_by_its_identity_is_counted_and_named() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "ids": ["a", "b", "c"], "q": 1 }),
+            serde_json::json!({ "q": 1, "ids": ["c", "a", "b"] }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("$.ids")),
+            "the path is named: {:?}",
+            card.warnings
+        );
+
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# }),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// A site does not carry the array index a run happened to reorder at:
+    /// rows reordered inside at two indices are one site, `$.rows[]`, and
+    /// the rows themselves reordered are another, `$.rows`.
+    #[test]
+    fn a_site_key_does_not_carry_array_indices() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "rows": [["a", "b"], ["c", "d"], ["e", "f"]] }),
+            serde_json::json!({ "rows": [["a", "b"], ["d", "c"], ["f", "e"]] }),
+        ));
+        assert_eq!(
+            kind_count(&card, "storage", "ArgsOrderAbsorbed"),
+            1,
+            "{:?}",
+            card.warnings
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("at $.rows[] in")),
+            "{:?}",
+            card.warnings
+        );
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "rows": [["a", "b"], ["c", "d"]] }),
+            serde_json::json!({ "rows": [["d", "c"], ["a", "b"]] }),
+        ));
+        assert_eq!(
+            kind_count(&card, "storage", "ArgsOrderAbsorbed"),
+            2,
+            "{:?}",
+            card.warnings
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("at $.rows in")),
+            "{:?}",
+            card.warnings
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("at $.rows[] in")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// The HTTP body reads order-only by the same predicate as the value path:
+    /// a row holding one document written two ways is order-only in both.
+    #[test]
+    fn an_http_bodys_document_in_a_string_reads_as_the_value_path_does() {
+        let (recorded, replayed) = (
+            serde_json::json!(r#"{"a":1,"b":2}"#),
+            serde_json::json!(r#"{"b":2,"a":1}"#),
+        );
+        assert!(
+            json_order_only_difference(&recorded, &replayed),
+            "the value path"
+        );
+        let row = JsonFieldDiff {
+            json_path: "$.m".to_owned(),
+            baseline: recorded,
+            candidate: replayed,
+        };
+        assert!(
+            is_order_only_difference(&row),
+            "the HTTP body, the same answer"
+        );
+    }
+
+    /// Pairing many leftover members stays cheap: each is scored once per
+    /// candidate, and a document in a string is not re-parsed per comparison.
+    #[test]
+    fn many_residues_pair_quickly() {
+        let side = |offset: i64| {
+            serde_json::Value::Array(
+                (0..1_000)
+                    .map(|i| {
+                        serde_json::json!({
+                            "id": i,
+                            "doc": format!(r#"{{"k":{i},"v":[1,2,3]}}"#),
+                            "v": i + offset,
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        let rows = body_pair(side(0), side(1_000_000));
+        let started = std::time::Instant::now();
+        let diff = order_canonical_body_diff(&rows).expect("bodies");
+        assert!(!diff.is_empty(), "precondition: every member changed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Residues pair by what they share, not by the order a run wrote them, so
+    /// members that differ in one field report that field alone.
+    #[test]
+    fn residues_pair_by_what_they_share() {
+        let rows = body_pair(
+            serde_json::json!([{"a": ["x", "y"], "v": 1}, {"a": ["y", "z"], "v": 2}]),
+            serde_json::json!([{"a": ["y", "x"], "v": 10}, {"a": ["z", "y"], "v": 20}]),
+        );
+        let mut changed: Vec<(serde_json::Value, serde_json::Value)> =
+            order_canonical_body_diff(&rows)
+                .expect("bodies")
+                .into_iter()
+                .filter(|row| row.json_path.ends_with(".v"))
+                .map(|row| (row.baseline, row.candidate))
+                .collect();
+        changed.sort_by_key(|(b, _)| b.as_i64());
+        assert_eq!(
+            changed,
+            vec![
+                (serde_json::json!(1), serde_json::json!(10)),
+                (serde_json::json!(2), serde_json::json!(20)),
+            ],
+            "each member paired with the one it shares its other field with"
+        );
+    }
+
+    /// The rows of one array comparison, as `(path, baseline, candidate)`.
+    fn array_rows(
+        baseline: serde_json::Value,
+        candidate: serde_json::Value,
+    ) -> Vec<(String, serde_json::Value, serde_json::Value)> {
+        let mut rows = Vec::new();
+        order_canonical_diff(&baseline, &candidate, "$", &mut rows);
+        rows.into_iter()
+            .map(|row| (row.json_path, row.baseline, row.candidate))
+            .collect()
+    }
+
+    /// Members that cancel are chosen by content, never by the order either
+    /// side wrote them in: an exact partner before one of the same identity
+    /// written differently, and among those the same one every time.
+    #[test]
+    fn what_cancels_does_not_depend_on_written_order() {
+        let x = serde_json::json!({"d": r#"{"a":1,"b":2}"#, "k": 1});
+        let x_other = serde_json::json!({"d": r#"{"b":2,"a":1}"#, "k": 1});
+        let x_third = serde_json::json!({"d": r#"{"b":2, "a":1}"#, "k": 1});
+        let b = serde_json::json!({"d": r#"{"a":1,"b":2}"#, "k": 2});
+        let one = array_rows(serde_json::json!([x, b]), serde_json::json!([x_other, x]));
+        let other = array_rows(serde_json::json!([x, b]), serde_json::json!([x, x_other]));
+        assert!(!one.is_empty(), "precondition: the arrays differ");
+        assert_eq!(
+            one, other,
+            "the exact partner cancels, whichever came first"
+        );
+        let one = array_rows(
+            serde_json::json!([b, x]),
+            serde_json::json!([x_other, x_third, x]),
+        );
+        let other = array_rows(
+            serde_json::json!([x, b]),
+            serde_json::json!([x_third, x, x_other]),
+        );
+        assert_eq!(one, other, "and the same leftovers on every run");
+    }
+
+    /// An exact partner cancels before one of the same identity written
+    /// another way, from either side, so the member left over is the one
+    /// written differently.
+    #[test]
+    fn an_exact_partner_cancels_first() {
+        let x = serde_json::json!({"d": r#"{"a":1,"b":2}"#, "k": 1});
+        let x_other = serde_json::json!({"d": r#"{"b":2,"a":1}"#, "k": 1});
+        let b = serde_json::json!({"d": r#"{"a":1,"b":3}"#, "k": 2});
+        for (kept, written) in [(&x, &x_other), (&x_other, &x)] {
+            let rows = array_rows(
+                serde_json::json!([kept, b]),
+                serde_json::json!([written, kept]),
+            );
+            assert!(
+                rows.iter()
+                    .any(|(path, _, candidate)| path == "$[0].d" && candidate == &written["d"]),
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// The closest partner cancels first: one written identically, then one
+    /// that differs only in key order, which is never reported, then one whose
+    /// embedded document was written another way.
+    #[test]
+    fn the_closest_partner_cancels_first() {
+        for a in 0..40 {
+            let p = serde_json::json!({"a": a, "b": r#"{"x":1,"y":2}"#});
+            let mut keys_moved = serde_json::Map::new();
+            keys_moved.insert("b".to_owned(), p["b"].clone());
+            keys_moved.insert("a".to_owned(), p["a"].clone());
+            let text_moved = serde_json::json!({"a": a, "b": r#"{"y":2,"x":1}"#});
+            let rows = array_rows(
+                serde_json::json!([p, 7]),
+                serde_json::json!([serde_json::Value::Object(keys_moved), text_moved]),
+            );
+            assert!(
+                rows.iter()
+                    .any(|(_, _, candidate)| candidate["b"] == text_moved["b"]),
+                "a = {a}: {rows:?}"
+            );
+            // A body written identically before one the exact hash reads alike.
+            let body = |b: [i64; 2], text: String| serde_json::json!({"kind": "JsonRequestBody", "json": {"a": a, "b": b}, "text": text});
+            let (same_text, other_text, json_moved) = (
+                body([1, 2], format!(r#"{{"a":{a},"b":[1,2]}}"#)),
+                body([1, 2], format!(r#"{{"b":[1,2],"a":{a}}}"#)),
+                body([2, 1], format!(r#"{{"a":{a},"b":[2,1]}}"#)),
+            );
+            // And a body whose keys alone moved before one whose text moved.
+            let mut keys_moved = serde_json::Map::new();
+            for key in ["text", "json", "kind"] {
+                keys_moved.insert(key.to_owned(), same_text[key].clone());
+            }
+            let keys_moved = serde_json::Value::Object(keys_moved);
+            // Each pair: a partner in one tier, and one in the next.
+            for (closer, further) in [
+                (&same_text, &keys_moved),
+                (&keys_moved, &other_text),
+                (&other_text, &json_moved),
+            ] {
+                for candidate in [[closer, further], [further, closer]] {
+                    let rows = array_rows(
+                        serde_json::json!([same_text, 7]),
+                        serde_json::json!(candidate),
+                    );
+                    // Compared as written: a value ignores its key order.
+                    let written = |value: &serde_json::Value| value.to_string();
+                    assert!(
+                        rows.iter()
+                            .any(|(_, _, left)| written(left) == written(further)),
+                        "a = {a}: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Members the exact hash reads alike but written differently (a body's
+    /// text beside the same document, an object's keys in another order) are
+    /// still told apart by what was written, so the rows and their rendering
+    /// do not depend on written order.
+    #[test]
+    fn members_written_differently_are_ordered_by_what_was_written() {
+        let body = |text: &str| {
+            serde_json::json!({
+                "kind": "JsonRequestBody",
+                "json": {"a": 1, "b": 2},
+                "text": text,
+            })
+        };
+        let form =
+            |text: &str| serde_json::json!({"kind": "FormUrlEncodedRequestBody", "text": text});
+        let keyed = |first: &str, second: &str| {
+            let mut map = serde_json::Map::new();
+            map.insert(first.to_owned(), serde_json::json!(first));
+            map.insert(second.to_owned(), serde_json::json!(second));
+            serde_json::Value::Object(map)
+        };
+        let cases = [
+            (body(r#"{"a":1,"b":2}"#), body(r#"{"b":2,"a":1}"#)),
+            (form("a=1&b=2"), form("b=2&a=1")),
+            (keyed("a", "b"), keyed("b", "a")),
+        ];
+        for (one, two) in cases {
+            // Beside a partner for one of them, and with both left over.
+            for baseline in [serde_json::json!([one, 7]), serde_json::json!([7])] {
+                let render = |candidate: serde_json::Value| {
+                    serde_json::to_string(&array_rows(baseline.clone(), candidate))
+                        .expect("rows render")
+                };
+                assert_eq!(
+                    render(serde_json::json!([one, two])),
+                    render(serde_json::json!([two, one])),
+                    "{one} beside {two}"
+                );
+            }
+        }
+    }
+
+    /// Cancelling many members of one identity takes each partner in constant
+    /// time, including when the identity pass meets members the exact pass
+    /// already took.
+    #[test]
+    fn cancelling_many_equal_members_is_linear() {
+        // Four times the members may take about four times as long, never
+        // sixteen: a ratio, so a slow machine or build does not decide it.
+        let grows_linearly =
+            |label: &str,
+             size: usize,
+             pair: &dyn Fn(usize) -> (serde_json::Value, serde_json::Value)| {
+                let time = |size: usize| {
+                    let (baseline, candidate) = pair(size);
+                    let started = std::time::Instant::now();
+                    let rows = array_rows(baseline, candidate);
+                    assert_eq!(rows.len(), 1, "precondition: all but one member cancel");
+                    started.elapsed()
+                };
+                let linear = |small: std::time::Duration, large: std::time::Duration| {
+                    large < (small * 8).max(std::time::Duration::from_millis(200))
+                };
+                let (small, large) = (time(size), time(size * 4));
+                // Measured once more before failing, so one busy moment on a
+                // shared machine does not decide it.
+                if !linear(small, large) {
+                    let (small, large) = (time(size), time(size * 4));
+                    assert!(
+                        linear(small, large),
+                        "{label}: {small:?} at {size}, {large:?} at four times that"
+                    );
+                }
+            };
+        for (taken, left) in [([1, 2, 3], [3, 2, 1]), ([3, 2, 1], [1, 2, 3])] {
+            let side = |size: usize, other: [i64; 3], extra: i64| {
+                serde_json::Value::Array(
+                    std::iter::repeat_n(serde_json::json!(taken), size)
+                        .chain(std::iter::repeat_n(serde_json::json!(other), size))
+                        .chain([serde_json::json!(extra)])
+                        .collect(),
+                )
+            };
+            grows_linearly("past members the exact pass took", 12_500, &|size| {
+                (side(size, left, 9), side(size, [2, 1, 3], 10))
+            });
+        }
+        let many = |size: usize, extra: Option<i64>| {
+            serde_json::Value::Array(
+                std::iter::repeat_n(serde_json::json!(1), size)
+                    .chain(extra.map(serde_json::Value::from))
+                    .collect(),
+            )
+        };
+        grows_linearly("one identity, many members", 50_000, &|size| {
+            (many(size, Some(2)), many(size, None))
+        });
+    }
+
+    /// The pairing bound counts the work, members times their fields, not the
+    /// members alone.
+    #[test]
+    fn wide_residues_pair_within_a_bound() {
+        let side = |offset: i64| {
+            serde_json::Value::Array(
+                (0..1_024)
+                    .map(|i| {
+                        serde_json::Value::Object(
+                            (0..300)
+                                .map(|f| {
+                                    (format!("f{f}"), serde_json::json!(i * 1_000 + f + offset))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let started = std::time::Instant::now();
+        let rows = array_rows(side(0), side(1));
+        assert!(!rows.is_empty(), "precondition: every member changed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A member that is itself an array pairs by the members it shares, so a
+    /// row that changed one element reports that element alone.
+    #[test]
+    fn tuple_residues_pair_by_their_members() {
+        let mut rows = array_rows(
+            serde_json::json!([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]),
+            serde_json::json!([[1, 2, 30], [4, 50, 6], [70, 8, 9], [10, 110, 12]]),
+        );
+        rows.sort_by_key(|(_, baseline, _)| baseline.as_i64());
+        let changed: Vec<(serde_json::Value, serde_json::Value)> =
+            rows.into_iter().map(|(_, b, c)| (b, c)).collect();
+        assert_eq!(
+            changed,
+            vec![
+                (serde_json::json!(3), serde_json::json!(30)),
+                (serde_json::json!(5), serde_json::json!(50)),
+                (serde_json::json!(7), serde_json::json!(70)),
+                (serde_json::json!(11), serde_json::json!(110)),
+            ]
+        );
+        // A repeated member counts as often as both sides hold it.
+        let rows = array_rows(
+            serde_json::json!([[1, 1, 1, 5]]),
+            serde_json::json!([[1, 1, 1, 6], [1, 5, 8, 9]]),
+        );
+        assert!(
+            rows.iter()
+                .any(|(_, b, c)| (b, c) == (&serde_json::json!(5), &serde_json::json!(6))),
+            "{rows:?}"
+        );
+    }
+
+    /// Pairing reads a byte string in order, as `same` does: a permuted byte
+    /// string is not a shared field.
+    #[test]
+    fn residue_pairing_reads_a_byte_string_in_order() {
+        for (first, second) in [([1, 2], [2, 1]), ([2, 1], [1, 2])] {
+            let mut rows = array_rows(
+                serde_json::json!([
+                    {"raw_bytes": first, "v": 1},
+                    {"raw_bytes": second, "v": 2},
+                ]),
+                serde_json::json!([
+                    {"raw_bytes": second, "v": 20},
+                    {"raw_bytes": first, "v": 10},
+                ]),
+            );
+            rows.sort_by_key(|(_, baseline, _)| baseline.as_i64());
+            let changed: Vec<(serde_json::Value, serde_json::Value)> =
+                rows.into_iter().map(|(_, b, c)| (b, c)).collect();
+            assert_eq!(
+                changed,
+                vec![
+                    (serde_json::json!(1), serde_json::json!(10)),
+                    (serde_json::json!(2), serde_json::json!(20)),
+                ]
+            );
+        }
+    }
+
+    /// Tolerations are counted by SITE: three calls reordered at one site are
+    /// one site, and the warning carries the three calls.
+    #[test]
+    fn a_toleration_is_counted_once_per_site() {
+        let call = |seq: u64| {
+            let mut call = exec_obs(
+                "storage",
+                Some("c1"),
+                true,
+                Some(seq),
+                Some(serde_json::json!("v")),
+                serde_json::json!("v"),
+            );
+            call.args = serde_json::json!({ "ids": ["b", "a"] });
+            call
+        };
+        let event = |seq: u64| {
+            let mut event = omitted_ev(seq, "storage", Some("c1"));
+            event.args = serde_json::json!({ "ids": ["a", "b"] }).into();
+            event
+        };
+        let card = detect(&art_with_events(
+            (7..10)
+                .map(|seq| seq_entry_res(Some("c1"), "storage", seq, serde_json::json!("v")))
+                .collect(),
+            (7..10).map(call).collect(),
+            vec![http("c1", true, vec![])],
+            (7..10).map(event).collect(),
+        ));
+        assert_eq!(
+            card.summary.matched_side_effect_calls, 3,
+            "precondition: three calls"
+        );
+        assert_eq!(
+            kind_count(&card, "storage", "ArgsOrderAbsorbed"),
+            1,
+            "one site"
+        );
+        assert!(
+            card.warnings
+                .iter()
+                .any(|w| w.contains("$.ids") && w.contains("on 3 call(s)")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// Equal args, and args that differ only in key order, are nothing to
+    /// report: the exact lookup served them.
+    #[test]
+    fn a_call_served_by_its_exact_args_reports_no_identity() {
+        for (recorded, observed) in [
+            (
+                serde_json::json!({ "ids": ["a", "b"] }),
+                serde_json::json!({ "ids": ["a", "b"] }),
+            ),
+            (
+                serde_json::json!({ "a": 1, "b": 2 }),
+                serde_json::json!({ "b": 2, "a": 1 }),
+            ),
+        ] {
+            let card = detect(&resolved_with_args(recorded, observed));
+            assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 0);
+            assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 0);
+            assert_eq!(kind_count(&card, "storage", "ArgsIdentityUnconfirmed"), 0);
+            assert!(card.verdict.pass, "{}", card.verdict.reason);
+        }
+    }
+
+    /// A resolved call whose args are a different call under identity cannot
+    /// have been served by either lookup. It is named, never passed silently.
+    #[test]
+    fn a_resolved_call_whose_args_are_another_call_is_named() {
+        let card = detect(&resolved_with_args(
+            serde_json::json!({ "ids": ["a", "b"] }),
+            serde_json::json!({ "ids": ["a", "c"] }),
+        ));
+        assert_eq!(kind_count(&card, "storage", "ArgsIdentityUnconfirmed"), 1);
+        assert!(
+            card.warnings.iter().any(|w| w.contains("identity")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A call that missed its address but sent what the recording sent — the same
+    /// arguments at a shifted position — is paired and matched: never a
+    /// Novel+Omitted split.
+    #[test]
+    fn a_paired_call_that_sent_the_same_request_is_a_recovered_match() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({"value": 1})),
+            serde_json::json!({"value": 1}),
         ));
         assert_eq!(card.summary.value_divergences, 0);
         assert_eq!(card.summary.novel_calls, 0);
         assert_eq!(card.summary.omitted_calls, 0);
         assert_eq!(card.summary.matched_side_effect_calls, 1);
         assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// What goes out is asserted; what comes back is not. A call that sent a
+    /// different request diverges even though the boundary answered it with the
+    /// value the recording got — judging it by that value called it a match.
+    #[test]
+    fn a_paired_call_that_sent_a_different_request_diverges_whatever_came_back() {
+        let art = paired_write(
+            Some(serde_json::json!({"value": 1})),
+            serde_json::json!({"value": 2}),
+        );
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 0);
+        assert!(!card.verdict.pass);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let changed: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(changed.len(), 1, "{rows:?}");
+        assert!(changed[0].blocking);
+    }
+
+    /// A pair's request is judged by the identity its address uses, so the
+    /// diff and the lookup cannot disagree: the same members in another order
+    /// are the same request, counted under the identity kinds.
+    #[test]
+    fn a_paired_request_is_judged_by_its_identity() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "ids": ["a", "b"] })),
+            serde_json::json!({ "ids": ["b", "a"] }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "storage", "ValueCanonAbsorbed"), 0);
+
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "body": r#"{"a":1,"b":["x","y"]}"# })),
+            serde_json::json!({ "body": r#"{"b":["y","x"],"a":1}"# }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "storage", "ArgsDocumentAbsorbed"), 1);
+    }
+
+    /// A pair whose request the exact hash already finds the same, a form
+    /// body's fields in another order, sent the same request.
+    #[test]
+    fn a_paired_request_the_exact_hash_finds_the_same_is_a_match() {
+        let form = |text: &str| serde_json::json!({ "body": { "kind": "FormUrlEncodedRequestBody", "text": text } });
+        let card = detect(&paired_write(Some(form("a=1&b=2")), form("b=2&a=1")));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(
+            kind_count(&card, "storage", "ValueCanonAbsorbed"),
+            0,
+            "the same request, not an absorbed reordering"
+        );
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// Every array is a multiset, numbers included: a paired request whose
+    /// numeric array arrived in another order sent the same request, counted.
+    #[test]
+    fn a_paired_request_with_a_reordered_numeric_array_is_absorbed() {
+        let card = detect(&paired_write(
+            Some(serde_json::json!({ "bytes": [1, 2, 3] })),
+            serde_json::json!({ "bytes": [3, 1, 2] }),
+        ));
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "storage", "ArgsOrderAbsorbed"), 1);
+        assert!(card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// A pair whose recorded request the tape does not hold cannot be shown to
+    /// have sent what the recording sent, and is not assumed to have.
+    #[test]
+    fn a_pair_whose_recorded_request_is_not_on_the_tape_is_not_assumed_to_agree() {
+        let card = detect(&paired_write(None, serde_json::json!({"value": 1})));
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.matched_side_effect_calls, 0);
     }
 
     /// The run-0810 phantom-lock shape. An error path makes a novel call of a
@@ -10819,7 +15251,7 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut ev = db_update_ev(corr, "payment_intent", seq, row, 100, 110);
         ev.method_name = "generic_insert".to_owned();
-        ev.args = serde_json::json!({"table": "payment_intent", "sql": sql});
+        ev.args = serde_json::json!({"table": "payment_intent", "sql": sql}).into();
         ev
     }
 
@@ -11251,6 +15683,624 @@ mod tests {
         ))
     }
 
+    // -- route C: a divergence at a key the seeder could not plant -----------
+
+    fn unplanted_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!(["pro_1"]),
+        )
+    }
+
+    fn certificate(entries: serde_json::Value) -> UnplantedPresence {
+        UnplantedPresence::from_certificate(&serde_json::json!({ "entries": entries }))
+    }
+
+    fn cert_entry(corr: &str, materialization: &str, cause: Option<&str>) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "correlation_id": corr,
+            "boundary": "db",
+            "logical_key": unplanted_key(),
+            "materialization": materialization,
+        });
+        if let Some(cause) = cause {
+            entry["skip_reason"] = serde_json::json!({ "cause": cause });
+        }
+        entry
+    }
+
+    /// A recorded `Ok(true)` DELETE whose replay found nothing to delete: the
+    /// shape the seeder cannot plant a row for.
+    fn unplanted_delete(evidence: UnplantedPresence) -> (Scorecard, Vec<CallRecord>) {
+        let corr = "c1";
+        let seq = 5;
+        let recorded = serde_json::json!({"result": "Ok", "value": true, "type_name": "bool"});
+        let observed = serde_json::json!({"result": "Err", "kind": "NotFound", "message": "none"});
+        let mut event = db_read_ev(
+            corr,
+            "business_profile",
+            seq,
+            serde_json::json!({}),
+            100,
+            110,
+            "root",
+            0,
+        );
+        event.method_name = "generic_delete".to_owned();
+        event.read_set = vec![unplanted_key()];
+        let mut a = art_with_events(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "generic_delete",
+                seq,
+                recorded.clone(),
+            )],
+            vec![exec_obs_method(
+                "db",
+                Some(corr),
+                "generic_delete",
+                true,
+                Some(seq),
+                Some(recorded),
+                observed,
+            )],
+            vec![http(corr, true, vec![])],
+            vec![event],
+        );
+        a.unplanted_presence = evidence;
+        let card = detect(&a);
+        let rows = build_ledger(&a).unwrap();
+        (card, rows)
+    }
+
+    fn assert_blocking_divergence(card: &Scorecard, rows: &[CallRecord]) {
+        assert_eq!(card.summary.value_divergences, 1, "{}", card.verdict.reason);
+        assert_eq!(card.summary.inconclusive_seed_gaps, 0);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == "value_diverged" && r.blocking),
+            "{rows:?}"
+        );
+    }
+
+    /// The seeder recorded that it could not plant this key: the divergence is
+    /// the missing seed's, so it is a seed gap, and the verdict cannot tell.
+    #[test]
+    fn unplanted_presence_makes_its_divergence_a_seed_gap() {
+        // Spelled out, not read from the constant: a test that iterates the
+        // constant cannot notice a cause dropped from it.
+        for cause in [
+            "recorded_presence",
+            "unsynthesizable_presence",
+            // Held at seed time only: an earlier replayed delete can consume
+            // the row this key relied on, so a miss here is the seed's.
+            "presence_already_held",
+        ] {
+            unplanted_presence_is_a_seed_gap(cause);
+        }
+    }
+
+    fn unplanted_presence_is_a_seed_gap(cause: &str) {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c1",
+            "skipped",
+            Some(cause)
+        )])));
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "{cause}: {}",
+            card.verdict.reason
+        );
+        assert_eq!(card.summary.inconclusive_seed_gaps, 1);
+        assert!(
+            card.verdict.inconclusive && !card.verdict.pass,
+            "{}",
+            card.verdict.reason
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.kind == "inconclusive_seed_gap")
+            .expect("a seed-gap row");
+        assert!(!row.blocking);
+        assert!(!rows.iter().any(|r| r.kind == "value_diverged"), "{rows:?}");
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1");
+        assert!(
+            c1.inconclusive && !c1.passed,
+            "the correlation cannot tell either"
+        );
+        assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    // -- a seed gap's cascade: what it cut off is inconclusive, not failed ------
+
+    fn unplanted_key_n(n: u32) -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!([format!("pro_{n}")]),
+        )
+    }
+
+    const DELETE_OK: fn() -> serde_json::Value =
+        || serde_json::json!({"result": "Ok", "value": true, "type_name": "bool"});
+    const DELETE_MISSED: fn() -> serde_json::Value =
+        || serde_json::json!({"result": "Err", "kind": "NotFound", "message": "none"});
+
+    /// A recorded db call at `seq` in c1 reading `key`, and its table entry.
+    fn recorded_at(seq: u64, key: Option<String>) -> (LookupEntry, deja::BoundaryEvent) {
+        let mut event = db_read_ev(
+            "c1",
+            "business_profile",
+            seq,
+            serde_json::json!({}),
+            100,
+            110,
+            "root",
+            0,
+        );
+        event.method_name = "generic_delete".to_owned();
+        event.read_set = key.into_iter().collect();
+        (
+            seq_entry_method_res(Some("c1"), "db", "generic_delete", seq, DELETE_OK()),
+            event,
+        )
+    }
+
+    /// The replayed call for the recorded one at `seq`, diverging or not.
+    fn replayed_at(seq: u64, diverges: bool) -> ObservedCall {
+        exec_obs_method(
+            "db",
+            Some("c1"),
+            "generic_delete",
+            true,
+            Some(seq),
+            Some(DELETE_OK()),
+            if diverges {
+                DELETE_MISSED()
+            } else {
+                DELETE_OK()
+            },
+        )
+    }
+
+    /// `seeded` names the keys the certificate says could not be planted.
+    fn cascade_card(
+        recorded: Vec<(LookupEntry, deja::BoundaryEvent)>,
+        replayed: Vec<ObservedCall>,
+        unplanted: &[u32],
+    ) -> (Scorecard, Vec<CallRecord>) {
+        let (entries, events): (Vec<_>, Vec<_>) = recorded.into_iter().unzip();
+        let mut a = art_with_events(entries, replayed, vec![http("c1", true, vec![])], events);
+        let cert: Vec<serde_json::Value> = unplanted
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "correlation_id": "c1", "boundary": "db",
+                    "logical_key": unplanted_key_n(*n), "materialization": "skipped",
+                    "skip_reason": {"cause": "recorded_presence"},
+                })
+            })
+            .collect();
+        a.unplanted_presence =
+            UnplantedPresence::from_certificate(&serde_json::json!({ "entries": cert }));
+        (detect(&a), build_ledger(&a).unwrap())
+    }
+
+    fn c1(card: &Scorecard) -> &CorrelationOutcome {
+        card.per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1")
+    }
+
+    /// The seed gap at 5, then two calls the replay never reached.
+    fn gap_then_unreached() -> (Scorecard, Vec<CallRecord>) {
+        cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(6, None),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true)],
+            &[1],
+        )
+    }
+
+    /// The calls a seed gap cut off inherit its status: inconclusive, charged
+    /// to nothing, and the correlation is counted as resting on the cascade.
+    #[test]
+    fn cascade_calls_cut_off_by_a_seed_gap_are_inconclusive() {
+        let (card, rows) = gap_then_unreached();
+        assert_eq!(card.summary.omitted_calls, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 1);
+        assert!(card.verdict.inconclusive, "{}", card.verdict.reason);
+        assert!(c1(&card).inconclusive);
+        let cascaded: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "inconclusive_seed_gap_cascade")
+            .collect();
+        assert_eq!(cascaded.len(), 2, "{rows:?}");
+        assert!(cascaded.iter().all(|r| !r.blocking));
+    }
+
+    /// THE guard: whatever the cascade relabels, the correlation never passes.
+    #[test]
+    fn cascade_never_makes_a_pass() {
+        let (card, _) = gap_then_unreached();
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+        assert!(!c1(&card).passed, "the correlation is not a pass");
+        assert_eq!(card.summary.matched_correlations, 0);
+    }
+
+    /// Why the run-level cascade term is redundant today: a cascade's origin
+    /// is always booked as a seed gap by the first pass, which already forces
+    /// the run inconclusive. If a new demotion ever reaches the origin first,
+    /// this fails, and the run-level term has become load-bearing.
+    #[test]
+    fn cascade_origin_is_booked_as_a_seed_gap() {
+        for (card, rows) in [
+            gap_then_unreached(),
+            cascade_card(
+                vec![
+                    recorded_at(5, Some(unplanted_key_n(1))),
+                    recorded_at(7, None),
+                    recorded_at(9, Some(unplanted_key_n(2))),
+                ],
+                vec![replayed_at(5, true), replayed_at(9, true)],
+                &[1, 2],
+            ),
+        ] {
+            assert!(
+                card.summary.seed_gap_cascade_correlations > 0,
+                "precondition: a cascade"
+            );
+            let origin = rows
+                .iter()
+                .find(|r| r.source_event_global_sequence == Some(5))
+                .expect("the origin row");
+            assert_eq!(origin.kind, "inconclusive_seed_gap", "{rows:?}");
+            assert!(
+                card.summary.inconclusive_seed_gaps >= card.summary.seed_gap_cascade_correlations
+            );
+        }
+        let (card, _) = gap_then_unreached();
+        assert_eq!(card.summary.seed_gap_cascade_calls, 2);
+    }
+
+    /// A real divergence before the seed gap: the candidate may have caused
+    /// what followed, so the unreached calls stay blocking.
+    #[test]
+    fn cascade_only_from_a_seed_gap_that_comes_first() {
+        let (card, rows) = cascade_card(
+            vec![
+                recorded_at(3, None),
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(3, true), replayed_at(5, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 0);
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.kind != "inconclusive_seed_gap_cascade"),
+            "{rows:?}"
+        );
+    }
+
+    /// Replay order is not recorded order under concurrency: a call recorded
+    /// BEFORE the gap that diverged but was replayed after it still comes
+    /// first, and refuses the cascade.
+    #[test]
+    fn cascade_first_divergence_is_by_recorded_order_not_replay_order() {
+        let (card, rows) = cascade_card(
+            vec![
+                recorded_at(3, None),
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true), replayed_at(3, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 0);
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+        assert!(
+            rows.iter()
+                .all(|r| r.kind != "inconclusive_seed_gap_cascade"),
+            "{rows:?}"
+        );
+    }
+
+    /// A call the candidate added before the gap may be what stopped the
+    /// request: no cascade.
+    #[test]
+    fn cascade_refused_after_a_call_the_candidate_added() {
+        let mut added = exec_obs_method(
+            "db",
+            Some("c1"),
+            "generic_insert",
+            false,
+            None,
+            None,
+            DELETE_OK(),
+        );
+        added.seed_gap = false;
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![added, replayed_at(5, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 0);
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+    }
+
+    /// Only calls recorded AFTER the gap inherit: one before it was reachable.
+    #[test]
+    fn cascade_never_reaches_back_before_the_gap() {
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(4, None),
+                recorded_at(5, Some(unplanted_key_n(1))),
+            ],
+            vec![replayed_at(5, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.omitted_calls, 1, "{}", card.verdict.reason);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+    }
+
+    /// A call after the gap that RAN and diverged is evidence; it still blocks.
+    #[test]
+    fn cascade_never_excuses_a_divergence_after_the_gap() {
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(6, None),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true), replayed_at(6, true)],
+            &[1],
+        );
+        assert_eq!(card.summary.value_divergences, 1, "{}", card.verdict.reason);
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(!c1(&card).passed && !c1(&card).inconclusive);
+    }
+
+    /// A call the candidate added after the gap is still counted as novel,
+    /// never folded into the cascade.
+    #[test]
+    fn cascade_never_absorbs_a_novel_call() {
+        let mut novel = exec_obs_method(
+            "db",
+            Some("c1"),
+            "generic_insert",
+            false,
+            None,
+            None,
+            DELETE_OK(),
+        );
+        novel.seed_gap = false;
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+            ],
+            vec![replayed_at(5, true), novel],
+            &[1],
+        );
+        assert_eq!(card.summary.novel_calls, 1, "{}", card.verdict.reason);
+    }
+
+    /// Two seed gaps: the FIRST governs, so a call between them inherits.
+    #[test]
+    fn cascade_runs_from_the_first_of_two_seed_gaps() {
+        let (card, _) = cascade_card(
+            vec![
+                recorded_at(5, Some(unplanted_key_n(1))),
+                recorded_at(7, None),
+                recorded_at(9, Some(unplanted_key_n(2))),
+            ],
+            vec![replayed_at(5, true), replayed_at(9, true)],
+            &[1, 2],
+        );
+        assert_eq!(card.summary.omitted_calls, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.seed_gap_cascade_correlations, 1);
+    }
+
+    /// No certificate, or an old one: nothing to go on, so nothing demotes.
+    #[test]
+    fn unplanted_nothing_without_a_certificate_entry() {
+        let (card, rows) = unplanted_delete(UnplantedPresence::default());
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A skip for any other cause is not this fact. (`presence_already_held`
+    /// is one: see `unplanted_presence_makes_its_divergence_a_seed_gap`.)
+    #[test]
+    fn unplanted_only_for_an_unplanted_presence() {
+        for cause in ["recorded_absence", "recorded_count", "recorded_scalar"] {
+            let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+                "c1",
+                "skipped",
+                Some(cause)
+            )])));
+            assert_blocking_divergence(&card, &rows);
+        }
+    }
+
+    /// A key the seeder did plant stays the candidate's to answer for.
+    #[test]
+    fn unplanted_never_for_a_planted_key() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c1",
+            "materialized",
+            None
+        )])));
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A planted key stays the candidate's even if an inconsistent certificate
+    /// also names a presence cause against it.
+    #[test]
+    fn unplanted_never_for_a_planted_key_whatever_the_cause_says() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c1",
+            "materialized",
+            Some("recorded_presence")
+        )])));
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A paired divergence is a changed REQUEST: the candidate sent another
+    /// statement to its recorded twin. A seed the harness could not plant does
+    /// not explain that, so it stays the candidate's even at an unplanted key.
+    #[test]
+    fn unplanted_never_excuses_a_changed_request() {
+        let corr = "c1";
+        let seq = 8;
+        let recorded = serde_json::json!({"result": "Ok", "value": true, "type_name": "bool"});
+        let observed = serde_json::json!({"result": "Err", "kind": "NotFound", "message": "none"});
+        let sql = "DELETE FROM business_profile WHERE profile_id = $1";
+        let mut event = db_read_ev(
+            corr,
+            "business_profile",
+            seq,
+            serde_json::json!({}),
+            100,
+            110,
+            "root",
+            0,
+        );
+        event.method_name = "generic_delete".to_owned();
+        event.read_set = vec![unplanted_key()];
+        event.result = recorded.clone().into();
+        event.args =
+            serde_json::json!({"table": "business_profile", "sql": sql, "inputs": ["pro_1"]})
+                .into();
+        let mut replayed = exec_obs_method(
+            "db",
+            Some(corr),
+            "generic_delete",
+            false,
+            None,
+            None,
+            observed,
+        );
+        replayed.seed_gap = false;
+        replayed.args =
+            serde_json::json!({"table": "business_profile", "sql": sql, "inputs": ["pro_2"]});
+        let replayed = with_span(replayed, "root>delete_profile");
+        let mut a = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "generic_delete", seq, recorded),
+                span_entry(Some(corr), seq, "root>delete_profile"),
+            ],
+            vec![replayed],
+            vec![http(corr, true, vec![])],
+            vec![event],
+        );
+        a.unplanted_presence = certificate(serde_json::json!([cert_entry(
+            "c1",
+            "skipped",
+            Some("recorded_presence")
+        )]));
+        let card = detect(&a);
+        let rows = build_ledger(&a).unwrap();
+        assert_blocking_divergence(&card, &rows);
+    }
+
+    /// A matched synthesized row on `business_profile` in `corr`, keyed by `key`.
+    fn synthesized_cert_entry(corr: &str, key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "correlation_id": corr,
+            "boundary": "db",
+            "logical_key": key,
+            "materialization": "materialized",
+            "origin": {"synthesized_presence": {
+                "from": "statement_binds",
+                "columns_from_statement": ["profile_id"],
+                "columns_defaulted": ["deleted"],
+            }},
+            "readback": {"status": "matched"},
+            "mechanism": {"table": "business_profile", "rows": 1, "via_copy": 0, "via_insert": 1},
+        })
+    }
+
+    fn other_profile_key() -> String {
+        deja::db::query_state_key(
+            "generic_delete",
+            "business_profile",
+            "DELETE FROM business_profile WHERE profile_id = $1",
+            &serde_json::json!(["pro_9"]),
+        )
+    }
+
+    /// A synthesized row's neutral columns can join another read of its
+    /// table, so in that correlation such a read's divergence is the seed's.
+    #[test]
+    fn a_synthesized_row_makes_other_reads_of_its_table_a_seed_gap() {
+        let (card, _) = unplanted_delete(certificate(serde_json::json!([synthesized_cert_entry(
+            "c1",
+            &other_profile_key()
+        )])));
+        assert_eq!(card.summary.value_divergences, 0, "{}", card.verdict.reason);
+        assert_eq!(card.summary.inconclusive_seed_gaps, 1);
+    }
+
+    /// A verified synthesized row's own key stays the candidate's to answer
+    /// for, and so does the same table in another correlation.
+    #[test]
+    fn a_verified_synthesis_excuses_neither_its_own_key_nor_another_correlation() {
+        for entry in [
+            synthesized_cert_entry("c1", &unplanted_key()),
+            synthesized_cert_entry("c2", &other_profile_key()),
+        ] {
+            let (card, rows) = unplanted_delete(certificate(serde_json::json!([entry])));
+            assert_blocking_divergence(&card, &rows);
+        }
+    }
+
+    /// The same key in ANOTHER correlation is another request's precondition.
+    #[test]
+    fn unplanted_is_per_correlation() {
+        let (card, rows) = unplanted_delete(certificate(serde_json::json!([cert_entry(
+            "c2",
+            "skipped",
+            Some("recorded_presence")
+        )])));
+        assert_blocking_divergence(&card, &rows);
+    }
+
     #[test]
     fn schema_derived_set_column_does_not_rekey_args_free_pairing() {
         let card = schema_rekeyed_update_card(PAYMENT_INTENT_UPDATE_BINDING_LABEL);
@@ -11318,7 +16368,7 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut ev = db_update_ev(corr, "payment_attempt", seq, row, 100, 110);
         ev.method_name = "generic_update".to_owned();
-        ev.args = serde_json::json!({"table": "payment_attempt", "sql": sql});
+        ev.args = serde_json::json!({"table": "payment_attempt", "sql": sql}).into();
         ev
     }
 
@@ -11417,9 +16467,18 @@ mod tests {
         let rows = build_ledger(&art).expect("ledger builds");
         let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
         assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        // Nothing upstream of this write returned a different value, so the
+        // changed operand did not arrive from anywhere — the candidate produced
+        // it. That makes the write the origin. It used to be labelled a
+        // consequence regardless, and the viewer then pointed at "an origin
+        // above it" that did not exist.
         assert!(
-            !diverged[0].origin,
-            "the write is the consequence, not the cause"
+            diverged[0].origin,
+            "a re-keyed write with no origin upstream is itself the origin"
+        );
+        assert!(
+            !diverged[0].stopped,
+            "an execute-mode write ran; it was not refused"
         );
         assert_eq!(
             diverged[0].source_event_global_sequence,
@@ -11429,6 +16488,259 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.kind != "omitted"),
             "the twin is accounted for by the pair, not omitted as well"
+        );
+    }
+
+    /// The same re-keyed write, with an executed read upstream in the same
+    /// correlation that returned a different row. Now the write's changed
+    /// operand has a source, and the write is the consequence of it.
+    #[test]
+    fn a_rekeyed_write_downstream_of_a_diverged_read_stays_a_consequence() {
+        let corr = "c1";
+        let read_seq = 6;
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed_row = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        let mut read_event = omitted_ev(read_seq, "db", Some(corr));
+        read_event.method_name = "generic_find_one".to_owned();
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    read_seq,
+                    envelope(recorded_row.clone()),
+                ),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    7,
+                    envelope(recorded_row.clone()),
+                ),
+                span_entry(Some(corr), 7, "root>update_attempt"),
+            ],
+            vec![
+                exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(read_seq),
+                    Some(envelope(recorded_row.clone())),
+                    envelope(observed_row.clone()),
+                ),
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, observed_row),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                read_event,
+                attempt_update_ev(corr, 7, ATTEMPT_UPDATE_STATUS, recorded_row),
+            ],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let read = rows
+            .iter()
+            .find(|r| r.method_name == "generic_find_one")
+            .expect("the read has a row");
+        assert_eq!(read.kind, "value_diverged");
+        assert!(
+            read.origin,
+            "the executed read that returned a different row is the origin"
+        );
+        let write = rows
+            .iter()
+            .find(|r| r.method_name == "generic_update")
+            .expect("the write has a row");
+        assert_eq!(write.kind, "value_diverged");
+        assert!(
+            !write.origin,
+            "with a diverged read upstream, the re-keyed write is its consequence"
+        );
+    }
+
+    /// "Upstream" must mean upstream, not "anywhere in this correlation".
+    ///
+    /// `correlations_with_a_value_origin` collects the correlation ids in which
+    /// SOME executed boundary diverged and compares nothing else. A divergence
+    /// that happened AFTER the re-keyed call therefore demotes that call from
+    /// origin to consequence, and the viewer sends the reader hunting for a
+    /// cause above a row whose only candidate cause is below it — the same
+    /// complaint this commit set out to fix, with the order reversed.
+    ///
+    /// `observed_index` is already in scope where the flag is set
+    /// (`ledger.rs:317`), so the comparison is available.
+    #[test]
+    fn a_rekeyed_write_is_the_origin_when_the_only_divergence_came_after_it() {
+        let corr = "c1";
+        let write_seq = 6;
+        let read_seq = 7;
+        let recorded_row = serde_json::json!({"attempt_id": "pay_1", "status": "charged"});
+        let observed_row = serde_json::json!({"attempt_id": "pay_1", "status": "refunded"});
+        let mut read_event = omitted_ev(read_seq, "db", Some(corr));
+        read_event.method_name = "generic_find_one".to_owned();
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    write_seq,
+                    envelope(recorded_row.clone()),
+                ),
+                span_entry(Some(corr), write_seq, "root>update_attempt"),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_find_one",
+                    read_seq,
+                    envelope(recorded_row.clone()),
+                ),
+            ],
+            // The candidate WROTE first, and only then read a differing row.
+            vec![
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS_REKEYED, observed_row.clone()),
+                exec_obs_method(
+                    "db",
+                    Some(corr),
+                    "generic_find_one",
+                    true,
+                    Some(read_seq),
+                    Some(envelope(recorded_row.clone())),
+                    envelope(observed_row.clone()),
+                ),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                attempt_update_ev(corr, write_seq, ATTEMPT_UPDATE_STATUS, recorded_row),
+                read_event,
+            ],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let write = rows
+            .iter()
+            .find(|r| r.method_name == "generic_update")
+            .expect("the write has a row");
+        assert_eq!(write.kind, "value_diverged");
+        assert!(
+            write.origin,
+            "nothing diverged before this write, so the write is the finding itself"
+        );
+    }
+
+    /// A `Substitute` egress boundary (an outbound call) whose arguments
+    /// miss the tape fails closed: the call is refused and the request stops.
+    /// The request is the candidate's own output — an input to the boundary — so
+    /// the changed arguments are a blocking divergence on the scorecard, not an
+    /// environmental miss beside an omitted call, and the ledger row agrees. It
+    /// must say the request stopped here, name the row the origin (nothing
+    /// upstream changed — the candidate built a different request), and pair it
+    /// with the recorded call at the same span, by its address minus its
+    /// arguments, so the argument diff is the recorded request against the
+    /// attempted one.
+    #[test]
+    fn a_refused_substitute_miss_is_an_origin_that_stopped_the_request() {
+        let corr = "refused-request";
+        let sequence = 801;
+        let recorded_args = serde_json::json!({
+            "url": "https://upstream.example/v1/orders",
+            "method": "POST",
+            "body": {"Json": {"items": [{"order_id": "order-1"}]}},
+        });
+        let attempted_args = serde_json::json!({
+            "url": "https://upstream.example/v1/orders",
+            "method": "POST",
+            "body": {"Json": {"items": [{"order_id": "order-1-v2"}]}},
+        });
+        let recorded_result = serde_json::json!({"kind": "ok", "status_code": 201});
+        let mut event = omitted_ev(sequence, "http_outgoing", Some(corr));
+        event.method_name = "send_request".to_owned();
+        event.args = recorded_args.into();
+        event.result = recorded_result.clone().into();
+        event.graph_node_id = Some(111);
+        let mut call = obs("http_outgoing", Some(corr), false, None, None);
+        call.method_name = "send_request".to_owned();
+        call.args = attempted_args;
+        call.outcome = deja::SubstituteOutcome::Stopped;
+        call.graph_node_id = Some(211);
+        // Both sides carry the span their call ran under, as a real address does:
+        // "the same span" is how the attempted call finds its recorded twin.
+        let span = "request>call_upstream";
+        call.span_path = Some(span.to_owned());
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(
+                        Some(corr),
+                        "http_outgoing",
+                        "send_request",
+                        sequence,
+                        recorded_result,
+                    ),
+                    span_entry(Some(corr), sequence, span),
+                ],
+                vec![call],
+                vec![http(corr, false, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(111, corr, None, 0, "call_upstream")],
+            vec![graph_span(211, corr, None, 0, "call_upstream")],
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+            0,
+            "a request the candidate changed is not the environment's miss"
+        );
+        assert_eq!(
+            card.summary.value_divergences, 1,
+            "the scorecard names the changed request, as the ledger row does"
+        );
+        assert!(
+            !card.verdict.pass,
+            "the refused request's status mismatch fails the run"
+        );
+
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let diverged: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(diverged.len(), 1, "rows: {rows:?}");
+        let row = diverged[0];
+        assert!(row.stopped, "the request stopped at this call");
+        assert!(
+            row.origin,
+            "nothing upstream changed; the attempted request is the finding"
+        );
+        assert_eq!(
+            row.source_event_global_sequence,
+            Some(sequence),
+            "paired with the recorded call at the same span"
+        );
+        assert_eq!(
+            row.recorded
+                .as_ref()
+                .and_then(|side| side.args.as_ref())
+                .and_then(|args| args.pointer("/body/Json/items/0/order_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("order-1"),
+            "the recorded side carries the request the tape holds"
+        );
+        assert_eq!(
+            row.observed
+                .as_ref()
+                .and_then(|side| side.args.as_ref())
+                .and_then(|args| args.pointer("/body/Json/items/0/order_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("order-1-v2"),
+            "the observed side carries the request the candidate attempted"
+        );
+        assert!(
+            row.observed
+                .as_ref()
+                .is_none_or(|side| side.result.is_none()),
+            "a refused call has no replayed result"
         );
     }
     fn graph_span(
@@ -11455,8 +16767,8 @@ mod tests {
     ) -> deja::BoundaryEvent {
         let mut event = omitted_ev(global_sequence, "db", Some(correlation_id));
         event.method_name = method.to_owned();
-        event.args = args;
-        event.result = result;
+        event.args = args.into();
+        event.result = result.into();
         event.graph_node_id = Some(graph_node_id);
         event
     }
@@ -11863,6 +17175,181 @@ mod tests {
         );
         assert!(outcome.alignment.is_none());
     }
+
+    /// One graph-scored correlation whose novel subtree holds a single call
+    /// that missed and was absorbed, on `boundary`, as method `novel`. With
+    /// `after_teardown`, the correlation's recording ends at its API-lock
+    /// release, which the candidate reproduces before the absorbed call, and
+    /// the tape runs on for another correlation: the tail-gap shape.
+    fn absorbed_in_novel_subtree(corr: &str, boundary: &str, after_teardown: bool) -> RunArtifacts {
+        let result = serde_json::json!({"result": "Ok"});
+        let lock = serde_json::json!({"key": "API_LOCK_merchant_1_payments_pay_x"});
+        let mut novel = obs(boundary, Some(corr), false, None, None);
+        novel.method_name = "novel".to_owned();
+        novel.graph_node_id = Some(15);
+        novel.absorbed = true;
+        let mut entries = vec![seq_entry_method_res(
+            Some(corr),
+            "db",
+            "root",
+            401,
+            result.clone(),
+        )];
+        let mut observed = vec![graph_observed(
+            corr,
+            14,
+            401,
+            "root",
+            serde_json::json!({}),
+            result.clone(),
+        )];
+        let mut events = vec![graph_event(
+            corr,
+            401,
+            4,
+            "root",
+            serde_json::json!({}),
+            result.clone(),
+        )];
+        let mut http_diffs = vec![http(corr, true, vec![])];
+        if after_teardown {
+            entries.push(seq_entry_method_res(
+                Some(corr),
+                "redis",
+                "delete_key",
+                402,
+                result.clone(),
+            ));
+            entries.push(seq_entry_method_res(
+                Some("later"),
+                "db",
+                "m",
+                403,
+                result.clone(),
+            ));
+            let mut teardown =
+                graph_observed(corr, 14, 402, "delete_key", lock.clone(), result.clone());
+            teardown.boundary = "redis".to_owned();
+            observed.push(teardown);
+            let mut teardown_event = graph_event(corr, 402, 4, "delete_key", lock, result.clone());
+            teardown_event.boundary = "redis".to_owned();
+            events.push(teardown_event);
+            events.push(tail_ev(403, "later", "db", "m", serde_json::json!({})));
+            http_diffs.push(http("later", true, vec![]));
+        }
+        observed.push(novel);
+        if after_teardown {
+            observed.push(obs("db", Some("later"), true, Some(1), Some(403)));
+        }
+        with_graphs(
+            art_with_events(entries, observed, http_diffs, events),
+            vec![graph_span(4, corr, None, 0, "request")],
+            vec![
+                graph_span(14, corr, None, 0, "request"),
+                graph_span(15, corr, Some(14), 1, "new-subtree"),
+            ],
+        )
+    }
+
+    /// A miss the request survived is an absorbed miss wherever it lands. Inside
+    /// a subtree the recording never had, it is still a call that returned a
+    /// value the recording never held, so the correlation cannot read passed.
+    #[test]
+    fn an_absorbed_miss_inside_a_novel_subtree_is_still_absorbed() {
+        let corr = "novel-absorbed";
+        let artifacts = absorbed_in_novel_subtree(corr, "db", false);
+        let card = detect(&artifacts);
+        let outcome = card
+            .per_correlation
+            .iter()
+            .find(|outcome| outcome.correlation_id == corr)
+            .expect("scored");
+        assert_eq!(
+            outcome.scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "the case under test is the graph tier's novel-subtree branch"
+        );
+        assert_eq!(
+            kind_count(&card, "db", "NovelSubtree") + kind_count(&card, "db", "NovelCallAbsorbed"),
+            1,
+            "one call, one classification"
+        );
+        assert_eq!(card.summary.absorbed_misses, 1);
+        assert_eq!(outcome.absorbed_misses, 1);
+        assert!(
+            !outcome.passed && outcome.inconclusive,
+            "a correlation that continued on a fabricated value is inconclusive: {}",
+            card.verdict.reason
+        );
+        assert!(
+            card.verdict.reason.contains("absorbed miss")
+                && card.verdict.reason.contains("db::novel"),
+            "the verdict names the site that absorbed it: {}",
+            card.verdict.reason
+        );
+        assert!(card.counter_disagreements().is_empty());
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let row = rows
+            .iter()
+            .find(|row| row.method_name == "novel")
+            .expect("the absorbed call has a ledger row");
+        assert_eq!(
+            (row.kind.as_str(), row.blocking),
+            ("novel_absorbed", false),
+            "the row the viewer routes on agrees with the scorecard"
+        );
+    }
+
+    /// The ledger asks the scorecard's questions in the scorecard's order. An
+    /// egress or excused call is classified before absorption is asked about,
+    /// so its ledger row must not claim an absorbed miss the scorecard never
+    /// counted.
+    #[test]
+    fn the_ledger_classifies_an_absorbed_egress_or_excused_miss_as_the_scorecard_does() {
+        // An egress call, and a clock call whose outcome reads Substituted, as
+        // an observation from a runtime that predates the outcome field does.
+        for (boundary, kind) in [
+            ("http_outgoing", "EnvironmentalMiss"),
+            ("time", "DeterministicMiss"),
+        ] {
+            let artifacts = absorbed_in_novel_subtree("novel-early", boundary, false);
+            let card = detect(&artifacts);
+            assert_eq!(kind_count(&card, boundary, kind), 1, "{boundary}");
+            assert_eq!(card.summary.absorbed_misses, 0, "{boundary}");
+            let rows = build_ledger(&artifacts).expect("ledger builds");
+            let row = rows
+                .iter()
+                .find(|row| row.method_name == "novel")
+                .expect("the call has a ledger row");
+            assert_eq!(row.kind, "novel_subtree", "{boundary}: {row:?}");
+            assert!(!row.blocking, "{boundary}: {row:?}");
+        }
+    }
+
+    /// Past the point where the recording stopped, there is no baseline, so the
+    /// tail gap is decided before absorption in both the scorecard and the
+    /// ledger: a call nothing could have recorded is inconclusive on its own
+    /// account, not an absorbed miss.
+    #[test]
+    fn a_tail_gap_is_decided_before_absorption_in_a_novel_subtree() {
+        let artifacts = absorbed_in_novel_subtree("novel-tail", "db", true);
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "InconclusiveTailGap"),
+            1,
+            "{:?}",
+            card.verdict
+        );
+        assert_eq!(card.summary.absorbed_misses, 0);
+        let rows = build_ledger(&artifacts).expect("ledger builds");
+        let row = rows
+            .iter()
+            .find(|row| row.method_name == "novel")
+            .expect("the call has a ledger row");
+        assert_eq!(row.kind, "inconclusive_tail_gap", "{row:?}");
+        assert!(!row.blocking, "{row:?}");
+    }
+
     #[test]
     fn mixed_graph_and_flat_correlations_keep_weighted_accounting_independent() {
         let graph_corr = "mixed-graph";
@@ -11999,17 +17486,17 @@ mod tests {
     }
     /// A bind-order swap is a SKEW and not a divergence.
     ///
-    /// This fixture is the change's best evidence, which is why it is rewritten
-    /// rather than deleted: two sibling spans with identical names, the recorded
-    /// side pairing 51→501 (bind a) and 52→502 (bind b), the observed side
-    /// serving them the other way round. Every call resolved to its own recorded
-    /// event; the two PAIRING methods disagree, and that disagreement is the
-    /// skew. It is the same shape as a concurrent fan-out reordering work both
-    /// sides performed.
+    /// Two sibling spans with identical names, the recorded side attaching
+    /// 51→501 (bind a) and 52→502 (bind b), the observed side resolving them the
+    /// other way round. Every call resolved to its own recorded event, so each
+    /// is MATCHED by its address; the aligner's structural binding of the two
+    /// spans is crosswise to what the addresses served, and that disagreement
+    /// is the skew. It is the same shape as a concurrent fan-out reordering work
+    /// both sides performed.
     ///
     /// Both bindings are still asserted below. If this test could pass without
-    /// naming the skew, the change would be untested — the classification is the
-    /// thing that has to survive, only its cost changes.
+    /// naming the skew, the change would be untested: the skew is named beside
+    /// the match, never instead of it.
     #[test]
     fn same_statement_bind_order_swap_is_a_tolerated_identity_skew() {
         let corr = "identity-swap";
@@ -12110,7 +17597,11 @@ mod tests {
              cannot be hiding one"
         );
         assert_eq!(kind_count(&card, "db", "ValueDivergedOrigin"), 0);
-        assert_eq!(card.summary.matched_side_effect_calls, 0);
+        assert_eq!(
+            card.summary.matched_side_effect_calls, 2,
+            "each call matched the event its address resolved to; where the \
+             aligner placed the spans does not unmake that"
+        );
         assert!(
             outcome.passed,
             "the response matched and every call resolved; the order the two \
@@ -12124,6 +17615,1704 @@ mod tests {
         );
         assert!(card.counter_disagreements().is_empty());
     }
+    /// #124 taught the SCORECARD that an identity skew is order, not a
+    /// difference: charged to nothing, reported on the verdict line. The
+    /// LEDGER is what the viewer routes on, and it was not taught — it still
+    /// writes the skew row with `blocking = true`, so one skew is tolerated on
+    /// the scorecard and a blocking finding in the viewer. The agreement test
+    /// above this one exercises matched rows only; a skew row is the case it
+    /// was always missing. Same fixture as the tolerated-skew test, read from
+    /// the ledger side.
+    #[test]
+    fn the_ledger_agrees_a_tolerated_identity_skew_is_not_blocking() {
+        let corr = "identity-swap-ledger";
+        let result = serde_json::json!({"result": "Ok", "value": []});
+        let events = vec![
+            graph_event(
+                corr,
+                501,
+                51,
+                "same_statement",
+                serde_json::json!({"bind": "a"}),
+                result.clone(),
+            ),
+            graph_event(
+                corr,
+                502,
+                52,
+                "same_statement",
+                serde_json::json!({"bind": "b"}),
+                result.clone(),
+            ),
+        ];
+        let observed = vec![
+            graph_observed(
+                corr,
+                61,
+                502,
+                "same_statement",
+                serde_json::json!({"bind": "b"}),
+                result.clone(),
+            ),
+            graph_observed(
+                corr,
+                62,
+                501,
+                "same_statement",
+                serde_json::json!({"bind": "a"}),
+                result.clone(),
+            ),
+        ];
+        let artifacts = with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(corr), "db", "same_statement", 501, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "same_statement", 502, result),
+                ],
+                observed,
+                vec![http(corr, true, vec![])],
+                events,
+            ),
+            vec![
+                graph_span(50, corr, None, 0, "request"),
+                graph_span(51, corr, Some(50), 1, "same-span"),
+                graph_span(52, corr, Some(50), 2, "same-span"),
+            ],
+            vec![
+                graph_span(60, corr, None, 0, "request"),
+                graph_span(61, corr, Some(60), 1, "same-span"),
+                graph_span(62, corr, Some(60), 2, "same-span"),
+            ],
+        );
+        let card = detect(&artifacts);
+        // PRECONDITION: the scorecard half tolerates it, or there is nothing
+        // for the ledger to agree with.
+        assert_eq!(kind_count(&card, "db", "IdentitySkew"), 2);
+        assert_eq!(card.summary.side_effect_divergences, 0);
+
+        let rows = build_ledger(&artifacts).expect("shared graph plan builds a ledger");
+        let skews: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == "identity_skew")
+            .collect();
+        assert_eq!(skews.len(), 2, "the ledger must still NAME the skew");
+        for row in skews {
+            assert!(
+                !row.blocking,
+                "the scorecard charges an identity skew to nothing, so the ledger row \
+                 the viewer routes on must not be blocking either — one fact, two \
+                 answers, and the viewer shows the wrong one: {row:?}"
+            );
+        }
+    }
+
+    /// An args-free serve whose request gained a field. Its args no longer have
+    /// the recording's shape, so the search for a twin by shape finds nothing:
+    /// without the event it was served, the call reads as an egress miss beside
+    /// an omitted call, and the reach attributed to it hangs off a row that is
+    /// not a divergence. Naming the served event pairs it with exactly that
+    /// one — one call whose input changed, blocking, both requests on its row.
+    #[test]
+    fn an_args_free_serve_whose_request_gained_a_field_pairs_with_the_event_it_was_served() {
+        let recorded = serde_json::json!({"body": {"card": {"number": "4111"}}});
+        let changed = serde_json::json!({
+            "body": {"card": {"number": "4111", "customer": {"merchant_customer_id": "cus_1"}}}
+        });
+        let run = |served_from: Option<u64>| {
+            let recorded = recorded.clone();
+            let changed = changed.clone();
+            in_both_tiers(move || {
+                // Exactly as `LookupTableHook::resolve` shapes an args-free serve.
+                let mut call = added_draw(
+                    "http_outgoing",
+                    "send_request",
+                    deja::SubstituteOutcome::Substituted,
+                );
+                call.args = changed.clone();
+                call.resolved = false;
+                call.arg_divergent = true;
+                call.served_event_global_sequence = served_from;
+                call.source_event_global_sequence = None;
+                one_span_recording(("http_outgoing", "send_request"), recorded.clone(), call)
+            })
+        };
+
+        // Vacuity guard: without the served event, shape pairing finds nothing, so
+        // the serve stays unpaired. It says so itself rather than scoring as a
+        // tolerated miss — an arg-divergent serve blocks ahead of those arms.
+        for (tier, art) in run(None) {
+            let card = detect(&art);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "ArgsServedUnpaired"),
+                1,
+                "{tier}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                1,
+                "{tier}"
+            );
+        }
+
+        for (tier, art) in run(Some(UPSTREAM_CALL)) {
+            let card = detect(&art);
+            let kinds = &card.per_boundary.get("http_outgoing").map(|b| &b.kinds);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{tier}: {kinds:?}");
+            assert_eq!(
+                card.summary.arg_divergent_serves, 1,
+                "{tier}: the reach still counts the serve it attributes to"
+            );
+            assert!(
+                card.counter_disagreements().is_empty(),
+                "{tier}: {:?}",
+                card.counter_disagreements()
+            );
+
+            let rows = build_ledger(&art).expect("ledger builds");
+            let call: Vec<_> = rows
+                .iter()
+                .filter(|r| r.boundary == "http_outgoing")
+                .collect();
+            assert_eq!(call.len(), 1, "{tier}: one call, one row: {rows:?}");
+            assert_eq!(call[0].kind, "value_diverged", "{tier}: {rows:?}");
+            assert!(call[0].blocking, "{tier}");
+            assert_eq!(
+                call[0].source_event_global_sequence,
+                Some(UPSTREAM_CALL),
+                "{tier}"
+            );
+            assert_eq!(
+                call[0].recorded.as_ref().and_then(|side| side.args.clone()),
+                Some(recorded.clone()),
+                "{tier}: the recorded request is on the row"
+            );
+            assert_eq!(
+                call[0].observed.as_ref().and_then(|side| side.args.clone()),
+                Some(changed.clone()),
+                "{tier}: the candidate's request is on the row"
+            );
+        }
+    }
+
+    const SERVED_CORR: &str = "served-claim";
+    const SERVED_SPAN: &str = "request>call_upstream";
+
+    /// An args-free serve observed at `SERVED_SPAN`, answered from `served_from`.
+    fn args_free_serve(args: serde_json::Value, served_from: u64) -> ObservedCall {
+        let mut call = unresolved_call(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            SERVED_SPAN,
+            args,
+        );
+        call.arg_divergent = true;
+        call.served_event_global_sequence = Some(served_from);
+        call
+    }
+
+    /// The rows the ledger writes against `sequence`.
+    fn rows_for(rows: &[CallRecord], sequence: u64) -> Vec<&CallRecord> {
+        rows.iter()
+            .filter(|row| row.source_event_global_sequence == Some(sequence))
+            .collect()
+    }
+
+    /// A served call names event 701, and a sibling in the same pool has
+    /// exactly 701's args, so the search by shape would hand 701 to the
+    /// sibling. The served call keeps the event it was answered from; the
+    /// sibling is left unpaired rather than read as a match. This re-pairs a
+    /// case that already paired, deliberately: before, the sibling took 701 by
+    /// shape and the served call went unpaired.
+    #[test]
+    fn a_served_event_is_not_handed_to_a_sibling_that_matches_its_shape() {
+        let recorded = serde_json::json!({"body": {"n": 1}});
+        let (entries, event) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            701,
+            SERVED_SPAN,
+            recorded.clone(),
+        );
+        // A second recorded call with the SERVED call's shape: the search by
+        // shape would pair the served call here too if it were let in.
+        let (other_entries, other) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            702,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 2, "extra": "y"}}),
+        );
+        let mut entries = entries;
+        entries.extend(other_entries);
+        let sibling = unresolved_call(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            SERVED_SPAN,
+            recorded.clone(),
+        );
+        let served = args_free_serve(serde_json::json!({"body": {"n": 1, "extra": "x"}}), 701);
+        let art = art_with_events(
+            entries,
+            // The sibling first, so the shape search would reach 701 before the
+            // served call's claim did if the claim did not hold it.
+            vec![sibling, served],
+            vec![http(SERVED_CORR, true, vec![])],
+            vec![event, other],
+        );
+
+        let card = detect(&art);
+        assert_eq!(
+            card.per_boundary["http_outgoing"].matched, 0,
+            "{:?}",
+            card.per_boundary
+        );
+        assert_eq!(card.summary.value_divergences, 1, "{:?}", card.per_boundary);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let on_701 = rows_for(&rows, 701);
+        assert_eq!(
+            on_701.len(),
+            1,
+            "event 701 is claimed exactly once: {rows:?}"
+        );
+        assert_eq!(on_701[0].kind, "value_diverged", "{rows:?}");
+        assert!(on_701[0].blocking);
+        assert_eq!(
+            on_701[0]
+                .observed
+                .as_ref()
+                .and_then(|side| side.args.clone()),
+            Some(serde_json::json!({"body": {"n": 1, "extra": "x"}})),
+            "and the call on it is the served one, not the sibling"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "the sibling is not read as a match of an event it was not answered from: {rows:?}"
+        );
+        let on_702 = rows_for(&rows, 702);
+        assert_eq!(on_702.len(), 1, "{rows:?}");
+        assert_eq!(
+            on_702[0].kind, "omitted",
+            "the served call pairs once, with the event it named: {rows:?}"
+        );
+    }
+
+    /// An exact hit owns its event before any serve is considered. Here the
+    /// candidate made 701's call exactly, and a second call, served args-free,
+    /// names 701 too: the args-free counter numbers every call at the address,
+    /// so it can land on an event an exact hit also took. The exact hit keeps
+    /// 701, and the served call falls back to the search by shape, where it
+    /// finds 702.
+    #[test]
+    fn a_served_claim_on_an_event_an_exact_hit_owns_falls_back_to_the_shape_search() {
+        let (mut entries, first) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            701,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 1}}),
+        );
+        let (second_entries, second) = addressed_event(
+            "http_outgoing",
+            Some(SERVED_CORR),
+            "send_request",
+            702,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 2}}),
+        );
+        entries.extend(second_entries);
+        let mut exact = obs("http_outgoing", Some(SERVED_CORR), true, Some(1), Some(701));
+        exact.method_name = "send_request".to_owned();
+        exact.span_path = Some(SERVED_SPAN.to_owned());
+        exact.args = serde_json::json!({"body": {"n": 1}});
+        let served = args_free_serve(serde_json::json!({"body": {"n": 3}}), 701);
+        let art = art_with_events(
+            entries,
+            vec![exact, served],
+            vec![http(SERVED_CORR, true, vec![])],
+            vec![first, second],
+        );
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        let on_701 = rows_for(&rows, 701);
+        assert_eq!(on_701.len(), 1, "701 is the exact hit's alone: {rows:?}");
+        assert_eq!(on_701[0].kind, "matched", "{rows:?}");
+        let on_702 = rows_for(&rows, 702);
+        assert_eq!(on_702.len(), 1, "{rows:?}");
+        assert_eq!(on_702[0].kind, "value_diverged", "{rows:?}");
+        assert_eq!(
+            on_702[0]
+                .observed
+                .as_ref()
+                .and_then(|side| side.args.clone()),
+            Some(serde_json::json!({"body": {"n": 3}})),
+            "the served call paired by shape once its named event was taken"
+        );
+        // The one path where the candidate's pick and the pairing can differ:
+        // the call ran on 701's value and is judged against 702. The row shows
+        // both, and the scorecard says they differ.
+        assert_eq!(
+            on_702[0].served_event_global_sequence,
+            Some(701),
+            "the row names the recording the call ran on: {rows:?}"
+        );
+        let card = detect(&art);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        assert_eq!(
+            kind_count(&card, "http_outgoing", "ArgsServedPairingDisagrees"),
+            1,
+            "{:?}",
+            card.per_boundary["http_outgoing"]
+        );
+        assert!(
+            card.warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("first serving recorded event 701 and pairing with 702")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// A served call with no correlation is not paired by the event it names,
+    /// just as the search by shape does not pair one: pairing is always within
+    /// one request, and a call that carries none has no request to pair in.
+    #[test]
+    fn an_uncorrelated_serve_is_not_paired_by_the_event_it_names() {
+        let (entries, event) = addressed_event(
+            "http_outgoing",
+            None,
+            "send_request",
+            701,
+            SERVED_SPAN,
+            serde_json::json!({"body": {"n": 1}}),
+        );
+        let mut served = args_free_serve(serde_json::json!({"body": {"n": 1, "extra": "x"}}), 701);
+        served.correlation_id = None;
+        let art = art_with_events(entries, vec![served], Vec::new(), vec![event]);
+
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(
+            !rows.iter().any(|row| row.kind == "value_diverged"),
+            "an uncorrelated serve was paired: {rows:?}"
+        );
+        // The claim is that it is not PAIRED. It still blocks: an arg-divergent
+        // serve blocks whether or not a recorded call is left to pair it with.
+        assert_eq!(
+            kind_count(&detect(&art), "http_outgoing", "ArgsServedUnpaired"),
+            1,
+            "an uncorrelated serve must stay unpaired"
+        );
+    }
+
+    #[test]
+    fn an_args_free_serve_is_scored_and_charged_as_a_value_divergence() {
+        // The load-bearing claim behind serving a call whose arguments moved. The
+        // candidate returns the recording's value for that address so the request
+        // does not die, and reports `resolved: false` so that the divergence is
+        // still scored — by machinery that already existed, with no change here.
+        //
+        // The row shape is NEW and could not occur before: unresolved, yet
+        // carrying a recorded result equal to its observed result, because under
+        // lookup the served value IS both sides. Equal results are exactly what
+        // could have made this quiet, so the claim needs its own row: the pair is
+        // judged on what the call SENT — its arguments — not on what came back.
+        //
+        // `resolved` is what makes an orchestrator older than the candidate
+        // score this as a divergence. `arg_divergent` is what makes this one
+        // refuse every absorber on the way: see the two tests that follow.
+        let corr = "argfree-serve";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let mut recorded = omitted_ev(701, "db", Some(corr));
+        recorded.method_name = "load".to_owned();
+        // Not an integer `id`: that is replay-local DB infrastructure the value
+        // comparison normalizes away on purpose, so a fixture built on it would
+        // score matched for a reason that has nothing to do with this change.
+        recorded.args = serde_json::json!({"amount": 100}).into();
+        recorded.result = result.clone().into();
+
+        // Exactly as `LookupTableHook::resolve` now shapes an args-free serve.
+        let mut served = substituted_obs_method("db", Some(corr), "load", 701, result.clone());
+        served.args = serde_json::json!({"amount": 200});
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>load");
+
+        let artifacts = art_with_events(
+            // The rank-2 entry is what makes the recorded event poolable for
+            // args-free pairing; the identity columns come off the first entry
+            // for the sequence, which is the one before it.
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 701, result.clone()),
+                span_entry_res(Some(corr), 701, "request>load", result.clone()),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![recorded],
+        );
+        let card = detect(&artifacts);
+        let rows = build_ledger(&artifacts).expect("a ledger");
+
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "the scorecard must charge the changed arguments: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.per_boundary["db"].matched, 0,
+            "a served call whose arguments moved is not a match"
+        );
+        let diverged: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| row.kind == "value_diverged")
+            .collect();
+        assert_eq!(diverged.len(), 1, "{rows:?}");
+        assert!(
+            diverged[0].blocking,
+            "the request surviving must not make the divergence non-blocking: {:?}",
+            diverged[0]
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "no row may read as matched: {rows:?}"
+        );
+        // The reach attribution runs over this row too, and has nothing after the
+        // serve to attribute. An empty reach, said rather than left absent — and
+        // the totals still close with the four new counters in them.
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 0);
+        assert_eq!(
+            diverged[0].arg_divergence_reach,
+            Some(ServeReach::Calls(0)),
+            "the serve's reach is empty, not absent: {:?}",
+            diverged[0]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// An args-free serve exactly as `LookupTableHook::resolve` shapes one:
+    /// unresolved, marked, carrying the recording's value as both sides (under
+    /// lookup the served value IS both), and claiming no recorded twin of its own.
+    fn arg_divergent_serve(
+        corr: Option<&str>,
+        method: &str,
+        node: Option<u64>,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> ObservedCall {
+        let mut served = substituted_obs_method("db", corr, method, 0, result);
+        served.args = args;
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        served.graph_node_id = node;
+        served
+    }
+
+    fn db_event(
+        corr: &str,
+        seq: u64,
+        method: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    ) -> deja::BoundaryEvent {
+        let mut event = omitted_ev(seq, "db", Some(corr));
+        event.method_name = method.to_owned();
+        event.args = args.into();
+        event.result = result.into();
+        event
+    }
+
+    /// A graph-scored correlation whose serve is followed by one call under its
+    /// span and one beside it. The `beside` call is the shape that decides the
+    /// design: it sits under a SIBLING span, so the substituted value could only
+    /// have reached it by being returned past the serve's span, where a subtree
+    /// walk rooted at the serve cannot see it and position can.
+    ///
+    /// `serve_node` is the node the serve reports. `Some(15)` puts it in the
+    /// replay forest, which is the ordinary shape; a node the forest does not
+    /// hold is the annexed serve the reach cannot place.
+    fn arg_divergent_reach_run_with_serve_node(serve_node: Option<u64>) -> RunArtifacts {
+        let corr = "reach-graph";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let args = serde_json::json!({"amount": 100});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                serve_node,
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        // On the serve's OWN span node: one function body, the value returned by
+        // the serve and used a line later. This is what `WithinServeSpan` mostly
+        // means, and the reason its gloss is not "passed down".
+        let same_frame = graph_observed(
+            corr,
+            15,
+            804,
+            "same_frame",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        let within = graph_observed(
+            corr,
+            16,
+            802,
+            "child",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        let beside = graph_observed(
+            corr,
+            17,
+            803,
+            "sibling",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(Some(corr), "db", "load", 801, result.clone()),
+                    span_entry_res(Some(corr), 801, "request>load", result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "same_frame", 804, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "child", 802, result.clone()),
+                    seq_entry_method_res(Some(corr), "db", "sibling", 803, result.clone()),
+                ],
+                vec![served, same_frame, within, beside],
+                vec![http(corr, true, vec![])],
+                vec![
+                    graph_event(corr, 801, 5, "load", args, result.clone()),
+                    graph_event(
+                        corr,
+                        804,
+                        5,
+                        "same_frame",
+                        serde_json::json!({}),
+                        result.clone(),
+                    ),
+                    graph_event(corr, 802, 6, "child", serde_json::json!({}), result.clone()),
+                    graph_event(corr, 803, 7, "sibling", serde_json::json!({}), result),
+                ],
+            ),
+            vec![
+                graph_span(4, corr, None, 0, "request"),
+                graph_span(5, corr, Some(4), 1, "load"),
+                graph_span(6, corr, Some(5), 2, "child"),
+                graph_span(7, corr, Some(4), 3, "sibling"),
+            ],
+            vec![
+                graph_span(14, corr, None, 0, "request"),
+                graph_span(15, corr, Some(14), 1, "load"),
+                graph_span(16, corr, Some(15), 2, "child"),
+                graph_span(17, corr, Some(14), 3, "sibling"),
+            ],
+        )
+    }
+
+    fn arg_divergent_reach_run() -> RunArtifacts {
+        arg_divergent_reach_run_with_serve_node(Some(15))
+    }
+
+    #[test]
+    fn an_arg_divergent_serve_names_the_work_it_could_have_reached() {
+        let artifacts = arg_divergent_reach_run();
+        let card = detect(&artifacts);
+        // Vacuity guard. The placement is the only thing the graph tier
+        // contributes, so a flat fallback would satisfy every assertion about it
+        // by reporting `Unplaced` throughout.
+        assert_eq!(
+            card.per_correlation[0].scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "{:?}",
+            card.per_correlation[0]
+        );
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergent_serves_unattributable, 0);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 3,
+            "every later call could have consumed the substituted value: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 2,
+            "the serve's own frame and the span it called; only the sibling needed \
+             the value returned past the serve's span: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 0,
+            "the graph placed both: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.per_correlation[0].arg_divergent_serves, 1);
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let row = |method: &str| {
+            rows.iter()
+                .find(|row| row.method_name == method)
+                .unwrap_or_else(|| panic!("a row for {method}: {rows:?}"))
+        };
+        let serve = row("load");
+        assert_eq!(serve.arg_divergence_reach, Some(ServeReach::Calls(3)));
+        // The commonest shape, and the one whose meaning is easiest to state
+        // backwards: the consumer shares the serve's span node, so the value was
+        // RETURNED to it rather than passed into it, and it is still WITHIN the span.
+        let same_frame = row("same_frame");
+        assert_eq!(
+            same_frame.arg_divergence_placement,
+            Some(ReachPlacement::WithinServeSpan),
+            "{same_frame:?}"
+        );
+        assert!(
+            !serve.could_be_affected_by_arg_divergence,
+            "a serve is not downstream of itself: {serve:?}"
+        );
+        let child = row("child");
+        assert!(child.could_be_affected_by_arg_divergence, "{child:?}");
+        assert_eq!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::WithinServeSpan),
+            "{child:?}"
+        );
+        let sibling = row("sibling");
+        assert!(sibling.could_be_affected_by_arg_divergence, "{sibling:?}");
+        // A CLAIM that it sits outside, not the absence of one — which is the
+        // whole reason the placement is three states and not a flag.
+        assert_eq!(
+            sibling.arg_divergence_placement,
+            Some(ReachPlacement::OutsideServeSpan),
+            "{sibling:?}"
+        );
+        // Attribution, not a finding. Both reached calls resolved to their own
+        // recorded events and stay matched: charging them would turn one argument
+        // divergence into three failures and bury the row naming the cause.
+        for reached in [same_frame, child, sibling] {
+            assert_eq!(reached.kind, "matched", "{reached:?}");
+            assert!(!reached.blocking, "{reached:?}");
+            assert!(
+                reached.arg_divergence_reach.is_none(),
+                "a reached call is not itself a serve: {reached:?}"
+            );
+        }
+        assert_eq!(card.summary.matched_side_effect_calls, 3);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    #[test]
+    fn a_flat_correlation_attributes_the_reach_without_the_graph_annotation() {
+        // The guard's own row. The serve carries a node, but the correlation has
+        // no forest, so the structural question cannot be asked: the annotation
+        // goes absent and the attribution does NOT. Reading it the other way
+        // round would make a flat correlation report nothing suspect at all.
+        let corr = "reach-flat";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                Some(15),
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let mut after = substituted_obs_method("db", Some(corr), "child", 802, result.clone());
+        after.graph_node_id = Some(16);
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 801, result.clone()),
+                span_entry_res(Some(corr), 801, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "child", 802, result.clone()),
+            ],
+            vec![served, after],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(
+                    corr,
+                    801,
+                    "load",
+                    serde_json::json!({"amount": 100}),
+                    result.clone(),
+                ),
+                db_event(corr, 802, "child", serde_json::json!({}), result),
+            ],
+        );
+        let card = detect(&artifacts);
+        // Vacuity guard, the mirror of the graph case's: on a graph-scored
+        // correlation the absent annotation below would prove nothing.
+        assert!(
+            matches!(
+                card.per_correlation[0].scoring_mode,
+                deja_forest::ScoringMode::Flat { .. }
+            ),
+            "{:?}",
+            card.per_correlation[0]
+        );
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 1,
+            "position bounds the reach on this path too: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 0,
+            "the graph placed nothing: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 1,
+            "and it says so, rather than leaving the reached call looking like it \
+             was placed outside the serve's span: {:?}",
+            card.per_boundary["db"]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let child = rows
+            .iter()
+            .find(|row| row.method_name == "child")
+            .expect("a row for child");
+        assert!(child.could_be_affected_by_arg_divergence, "{child:?}");
+        assert_eq!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::Unplaced),
+            "{child:?}"
+        );
+        // Vacuity guard on the split this variant exists for: "could not say" must
+        // not be the same value the graph-scored case uses for "outside".
+        assert_ne!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::OutsideServeSpan)
+        );
+        assert_eq!(child.kind, "matched", "{child:?}");
+    }
+
+    #[test]
+    fn a_serve_whose_node_left_the_replay_forest_is_unplaced_not_outside() {
+        // The second producer of `Unplaced`, and the one that is easy to read as
+        // its opposite. The correlation IS graph-scored, so the mode guard lets
+        // this through; what is missing is the serve's own node, because an
+        // annexed call has no node in the forest. There is nothing to root a
+        // subtree walk on, and the reach has to say it could not tell — reporting
+        // every later call as sitting outside a span this run never looked at
+        // would be a structural claim about a structure it does not have.
+        const ANNEXED: u64 = 99;
+        let artifacts = arg_divergent_reach_run_with_serve_node(Some(ANNEXED));
+        let plan = GraphScoringPlan::build(&artifacts);
+        let entry = plan
+            .correlations
+            .get("reach-graph")
+            .expect("the fixture's correlation is planned");
+        // Vacuity guards, in the order the guard under test reads its inputs.
+        // Flat scoring or an absent forest would produce `Unplaced` for the OTHER
+        // guard's reason and prove nothing about this one.
+        assert_eq!(
+            entry.scoring_mode,
+            deja_forest::ScoringMode::Graph,
+            "{:?}",
+            entry.scoring_mode
+        );
+        let replay = entry
+            .replay
+            .as_ref()
+            .expect("a graph-scored correlation has a replay forest");
+        assert!(
+            !replay.nodes.is_empty(),
+            "an empty forest would satisfy the premise below by absence"
+        );
+        assert!(
+            !replay.nodes.contains_key(&ANNEXED),
+            "the premise: the serve's node is not in the forest, which holds {:?}",
+            replay.nodes.keys().collect::<Vec<_>>()
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 3,
+            "position bounds the reach whether or not the graph can annotate it: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 0,
+            "the graph placed nothing: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 3,
+            "and every reached call says so: {:?}",
+            card.per_boundary["db"]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let reached: Vec<&CallRecord> = rows
+            .iter()
+            .filter(|row| ["same_frame", "child", "sibling"].contains(&row.method_name.as_str()))
+            .collect();
+        assert_eq!(reached.len(), 3, "{rows:?}");
+        for row in reached {
+            assert!(row.could_be_affected_by_arg_divergence, "{row:?}");
+            assert_eq!(
+                row.arg_divergence_placement,
+                Some(ReachPlacement::Unplaced),
+                "{row:?}"
+            );
+            // The split the widening exists for. `sibling` really does sit outside
+            // the serve's span in this shape and `child` really does not, and
+            // saying either here would be a claim nothing computed.
+            assert_ne!(
+                row.arg_divergence_placement,
+                Some(ReachPlacement::OutsideServeSpan),
+                "{row:?}"
+            );
+            assert_ne!(
+                row.arg_divergence_placement,
+                Some(ReachPlacement::WithinServeSpan),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_correlation_that_has_a_replay_forest_is_unplaced_too() {
+        // The mode guard's own row, which the missing-forest case above cannot
+        // reach: that one is unplaced because there is no forest at all, and it
+        // passes with this guard gone. Here the forest is there and the serve's
+        // node is in it, so the walk would answer happily — but the correlation
+        // fell back to the flat tier, and structure the run declined to trust
+        // cannot be read back out as a structural claim.
+        //
+        // The shape is a record side carrying no graph (an old tape, a record
+        // graph refused at load) against a candidate that emitted one, which is
+        // `FlatReason::MissingForest` with the replay half still present.
+        let corr = "reach-flat-forest";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                Some(15),
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let under = graph_observed(
+            corr,
+            16,
+            802,
+            "child",
+            serde_json::json!({}),
+            result.clone(),
+        );
+        let mut artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 801, result.clone()),
+                span_entry_res(Some(corr), 801, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "child", 802, result.clone()),
+            ],
+            vec![served, under],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(
+                    corr,
+                    801,
+                    "load",
+                    serde_json::json!({"amount": 100}),
+                    result.clone(),
+                ),
+                db_event(corr, 802, "child", serde_json::json!({}), result),
+            ],
+        );
+        // The replay half alone. `child` hangs UNDER the serve's node, so a run
+        // that read this forest would call it `WithinServeSpan` — which is what
+        // makes the absence of an answer a different fact from that one.
+        artifacts.replay_graph = vec![
+            graph_span(14, corr, None, 0, "request"),
+            graph_span(15, corr, Some(14), 1, "load"),
+            graph_span(16, corr, Some(15), 2, "child"),
+        ];
+        assert!(
+            artifacts.record_graph.is_none(),
+            "the record half is what is missing here"
+        );
+
+        let plan = GraphScoringPlan::build(&artifacts);
+        let entry = plan
+            .correlations
+            .get(corr)
+            .expect("the fixture's correlation is planned");
+        // Vacuity guards. Without the forest, or without the serve's node in it,
+        // the node guard below would answer `Unplaced` first and this test would
+        // pass for the other guard's reason — which is exactly how the
+        // missing-forest case fails to exercise this one.
+        assert_eq!(
+            entry.scoring_mode,
+            deja_forest::ScoringMode::Flat {
+                reason: deja_forest::FlatReason::MissingForest
+            },
+            "{:?}",
+            entry.scoring_mode
+        );
+        assert!(
+            entry.alignment.is_none(),
+            "the flat tier scored this correlation"
+        );
+        let replay = entry
+            .replay
+            .as_ref()
+            .expect("the replay half built a forest of its own");
+        assert!(
+            replay.nodes.contains_key(&15) && replay.nodes.contains_key(&16),
+            "the serve's node and the call under it are both there: {:?}",
+            replay.nodes.keys().collect::<Vec<_>>()
+        );
+
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(
+            card.summary.arg_divergence_reach_calls, 1,
+            "position bounds the reach on this path too: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_within_span, 0,
+            "a forest the run did not score by cannot place anything: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            card.summary.arg_divergence_reach_unplaced, 1,
+            "and it says so: {:?}",
+            card.per_boundary["db"]
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let child = rows
+            .iter()
+            .find(|row| row.method_name == "child")
+            .unwrap_or_else(|| panic!("a row for child: {rows:?}"));
+        assert!(child.could_be_affected_by_arg_divergence, "{child:?}");
+        assert_eq!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::Unplaced),
+            "{child:?}"
+        );
+        // The value reading the untrusted forest would have produced, named so
+        // the assertion above cannot agree with it by coincidence.
+        assert_ne!(
+            child.arg_divergence_placement,
+            Some(ReachPlacement::WithinServeSpan),
+            "{child:?}"
+        );
+        assert_eq!(child.kind, "matched", "{child:?}");
+    }
+
+    #[test]
+    fn a_reached_call_that_diverged_on_its_own_is_counted_once() {
+        // The row this exists for: downstream of a substitution AND a divergence
+        // in its own right. The attribution is additive, so it must not produce a
+        // second row, a second charge, or a third ValueDiverged.
+        let corr = "reach-both";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let recorded = serde_json::json!({"amount": 100});
+        let served = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                None,
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let mut changed = obs("db", Some(corr), false, None, None);
+        changed.method_name = "save".to_owned();
+        changed.args = serde_json::json!({"amount": 300});
+        let changed = with_span(changed, "request>save");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 901, result.clone()),
+                span_entry_res(Some(corr), 901, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "save", 902, result.clone()),
+                span_entry_res(Some(corr), 902, "request>save", result.clone()),
+            ],
+            vec![served, changed],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(corr, 901, "load", recorded.clone(), result.clone()),
+                db_event(corr, 902, "save", recorded, result),
+            ],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            2,
+            "two calls changed what they sent: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.summary.value_divergences, 2);
+        assert_eq!(card.summary.omitted_calls, 0);
+        // The headline still closes over the two, with the reach counted in
+        // neither term.
+        assert_eq!(card.summary.side_effect_divergences, 2);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert_eq!(rows.len(), 2, "one row per call, not a split: {rows:?}");
+        let save = rows
+            .iter()
+            .find(|row| row.method_name == "save")
+            .expect("a row for save");
+        assert_eq!(save.kind, "value_diverged", "{save:?}");
+        assert!(save.blocking, "{save:?}");
+        assert!(
+            save.could_be_affected_by_arg_divergence,
+            "it is also downstream of the serve: {save:?}"
+        );
+        // Vacuity guard on the pair of markers: being reached must not be
+        // recorded as being a serve, or the two counters measure one thing.
+        assert!(save.arg_divergence_reach.is_none(), "{save:?}");
+    }
+
+    #[test]
+    fn a_second_serve_is_reached_by_the_first_and_owns_what_follows_it() {
+        // Ownership is by the NEAREST serve, so the per-serve reaches partition
+        // the reached calls instead of overlapping. Charged to the FIRST instead,
+        // the tail would be counted under both and no total would close.
+        let corr = "reach-chain";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let recorded = serde_json::json!({"amount": 100});
+        let first = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "load",
+                None,
+                serde_json::json!({"amount": 200}),
+                result.clone(),
+            ),
+            "request>load",
+        );
+        let second = with_span(
+            arg_divergent_serve(
+                Some(corr),
+                "reload",
+                None,
+                serde_json::json!({"amount": 300}),
+                result.clone(),
+            ),
+            "request>reload",
+        );
+        let tail = substituted_obs_method("db", Some(corr), "tail", 913, result.clone());
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 911, result.clone()),
+                span_entry_res(Some(corr), 911, "request>load", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "reload", 912, result.clone()),
+                span_entry_res(Some(corr), 912, "request>reload", result.clone()),
+                seq_entry_method_res(Some(corr), "db", "tail", 913, result.clone()),
+            ],
+            vec![first, second, tail],
+            vec![http(corr, true, vec![])],
+            vec![
+                db_event(corr, 911, "load", recorded.clone(), result.clone()),
+                db_event(corr, 912, "reload", recorded.clone(), result.clone()),
+                db_event(corr, 913, "tail", recorded, result),
+            ],
+        );
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 2);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 2);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        let row = |method: &str| {
+            rows.iter()
+                .find(|row| row.method_name == method)
+                .unwrap_or_else(|| panic!("a row for {method}: {rows:?}"))
+        };
+        // One each, not two and one: the nearest serve owns the tail.
+        assert_eq!(row("load").arg_divergence_reach, Some(ServeReach::Calls(1)));
+        assert_eq!(
+            row("reload").arg_divergence_reach,
+            Some(ServeReach::Calls(1))
+        );
+        assert!(
+            !row("load").could_be_affected_by_arg_divergence,
+            "nothing precedes the first serve: {:?}",
+            row("load")
+        );
+        assert!(
+            row("reload").could_be_affected_by_arg_divergence,
+            "a serve is reached by the serve before it: {:?}",
+            row("reload")
+        );
+        assert!(row("tail").could_be_affected_by_arg_divergence);
+        assert!(row("tail").arg_divergence_reach.is_none());
+    }
+
+    #[test]
+    fn a_serve_with_no_correlation_says_its_reach_could_not_be_bounded() {
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let served = arg_divergent_serve(
+            None,
+            "load",
+            None,
+            serde_json::json!({"amount": 200}),
+            result,
+        );
+        let artifacts = art(Vec::new(), vec![served], Vec::new());
+        let card = detect(&artifacts);
+        assert_eq!(card.summary.arg_divergent_serves, 1);
+        assert_eq!(card.summary.arg_divergent_serves_unattributable, 1);
+        assert_eq!(card.summary.arg_divergence_reach_calls, 0);
+        assert!(
+            card.warnings
+                .iter()
+                .any(|warning| warning.contains("no correlation")),
+            "the empty reach must name its cause: {:?}",
+            card.warnings
+        );
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].arg_divergence_reach,
+            Some(ServeReach::NoCorrelation),
+            "{:?}",
+            rows[0]
+        );
+        // Vacuity guard: "could not be bounded" and "bounded, and empty" are two
+        // statements, and reporting either as the other is the failure this
+        // variant exists to prevent.
+        assert_ne!(rows[0].arg_divergence_reach, Some(ServeReach::Calls(0)));
+    }
+
+    #[test]
+    fn a_run_with_no_arg_divergent_serve_says_nothing_about_reach() {
+        let corr = "no-reach";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let artifacts = art_with_events(
+            vec![seq_entry_method_res(
+                Some(corr),
+                "db",
+                "load",
+                921,
+                result.clone(),
+            )],
+            vec![substituted_obs_method(
+                "db",
+                Some(corr),
+                "load",
+                921,
+                result.clone(),
+            )],
+            vec![http(corr, true, vec![])],
+            vec![db_event(
+                corr,
+                921,
+                "load",
+                serde_json::json!({"amount": 100}),
+                result,
+            )],
+        );
+        let card = detect(&artifacts);
+        let json = serde_json::to_string(&card).expect("a scorecard serializes");
+        assert!(
+            !json.contains("arg_diverg"),
+            "a run with no serve must read exactly as it did before the \
+             attribution existed: {json}"
+        );
+        for row in &build_ledger(&artifacts).expect("a ledger") {
+            let row = serde_json::to_string(row).expect("a row serializes");
+            assert!(!row.contains("arg_diverg"), "{row}");
+            assert!(!row.contains("could_be_affected"), "{row}");
+        }
+        // Every new counter defaults, so a document written without them reads
+        // back as zero rather than failing to parse.
+        let back: Scorecard = serde_json::from_str(&json).expect("a scorecard round-trips");
+        assert_eq!(back.summary.arg_divergent_serves, 0);
+        assert_eq!(back.summary.arg_divergence_reach_calls, 0);
+        assert_eq!(back.per_correlation[0].arg_divergent_serves, 0);
+        // Vacuity guard: the keys DO appear once there is something to report, so
+        // the absence above is the skip and not a needle nothing would match.
+        let reach = serde_json::to_string(&detect(&arg_divergent_reach_run()))
+            .expect("a scorecard serializes");
+        assert!(reach.contains("arg_divergence_reach_calls"), "{reach}");
+        assert!(reach.contains("arg_divergent_serves"), "{reach}");
+    }
+
+    /// An args-free serve scored against its recorded twin, with the args each
+    /// side sent and the recorded event's declaration, as `LookupTableHook`
+    /// shapes the call.
+    fn args_free_served(
+        recorded_args: serde_json::Value,
+        served_args: serde_json::Value,
+        declaration: Option<&str>,
+    ) -> (Scorecard, Vec<CallRecord>) {
+        let corr = "argfree-absorber";
+        let result = serde_json::json!({"result": "Ok", "value": 9});
+        let mut recorded = omitted_ev(702, "db", Some(corr));
+        recorded.method_name = "load".to_owned();
+        recorded.args = recorded_args.into();
+        recorded.result = result.clone().into();
+        if let Some(declaration) = declaration {
+            recorded.declaration = db_read_declaring(declaration).declaration;
+        }
+        let mut served = substituted_obs_method("db", Some(corr), "load", 702, result.clone());
+        served.args = served_args;
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.resolved_rank = Some(1);
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>load");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(Some(corr), "db", "load", 702, result.clone()),
+                span_entry_res(Some(corr), 702, "request>load", result),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![recorded],
+        );
+        (
+            detect(&artifacts),
+            build_ledger(&artifacts).expect("a ledger"),
+        )
+    }
+
+    /// A call served by its address alone had its arguments rejected by every
+    /// rank of the candidate's lookup, so no absorber may forgive them. It
+    /// blocks, and is named for what it is.
+    fn assert_args_free_serve_blocks(
+        name: &str,
+        recorded: serde_json::Value,
+        served: serde_json::Value,
+        declaration: Option<&str>,
+    ) {
+        let (card, rows) = args_free_served(recorded, served, declaration);
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "{name}: {:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(card.per_boundary["db"].matched, 0, "{name}");
+        assert_eq!(kind_count(&card, "db", "ArgDivergentServe"), 1, "{name}");
+        assert!(!card.verdict.pass, "{name}: {}", card.verdict.reason);
+        assert!(!rows.is_empty(), "{name}");
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "value_diverged" && row.blocking),
+            "{name}: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.kind == "matched"),
+            "{name}: {rows:?}"
+        );
+    }
+
+    /// A call served by its address alone with no recorded call left to pair it
+    /// with blocks, on a stateful boundary and on a pure one, where a miss the
+    /// request survived would otherwise be excused.
+    #[test]
+    fn an_unpaired_args_free_serve_blocks() {
+        for boundary in ["db", "id"] {
+            let corr = "argfree-unpaired";
+            let result = serde_json::json!({"result": "Ok", "value": 9});
+            let mut served =
+                substituted_obs_method(boundary, Some(corr), "load", 703, result.clone());
+            served.args = serde_json::json!({"prefix": "pay"});
+            served.resolved = false;
+            served.arg_divergent = true;
+            served.resolved_rank = Some(1);
+            served.source_event_global_sequence = None;
+            served.outcome = deja::SubstituteOutcome::Substituted;
+            let artifacts = art_with_events(
+                vec![],
+                vec![with_span(served, "request>load")],
+                vec![http(corr, true, vec![])],
+                vec![],
+            );
+            let card = detect(&artifacts);
+            let rows = build_ledger(&artifacts).expect("a ledger");
+            assert_eq!(
+                kind_count(&card, boundary, "ArgsServedUnpaired"),
+                1,
+                "{boundary}"
+            );
+            assert_eq!(
+                kind_count(&card, boundary, "ValueDiverged"),
+                1,
+                "{boundary}"
+            );
+            assert_eq!(
+                kind_count(&card, boundary, "DeterministicMiss"),
+                0,
+                "{boundary}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{boundary}");
+            assert!(!card.verdict.pass, "{boundary}: {}", card.verdict.reason);
+            assert!(!rows.is_empty(), "{boundary}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.kind == "args_served_unpaired" && row.blocking),
+                "{boundary}: {rows:?}"
+            );
+            assert!(
+                card.warnings
+                    .iter()
+                    .any(|w| w.contains("no recorded call was left")),
+                "{boundary}"
+            );
+        }
+    }
+
+    /// A served write whose rows differ only where the schema filled a column
+    /// is not demoted to a schema default: it ran on a value recorded for other
+    /// arguments, and blocks as it did before the fallback.
+    #[test]
+    fn a_served_call_is_not_demoted_to_a_schema_default() {
+        let corr = "c1";
+        let ev = db_insert_ev(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+        );
+        let mut served = db_exec_obs_with_sql(
+            corr,
+            7,
+            PAYMENT_INTENT_INSERT,
+            payment_intent_row(serde_json::Value::Null),
+            payment_intent_row(serde_json::json!("default")),
+        );
+        served.resolved = false;
+        served.arg_divergent = true;
+        served.source_event_global_sequence = None;
+        served.outcome = deja::SubstituteOutcome::Substituted;
+        let served = with_span(served, "request>insert");
+        let artifacts = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_insert",
+                    7,
+                    envelope(payment_intent_row(serde_json::Value::Null)),
+                ),
+                span_entry(Some(corr), 7, "request>insert"),
+            ],
+            vec![served],
+            vec![http(corr, true, vec![])],
+            vec![ev],
+        );
+        let rows = build_ledger(&artifacts).expect("a ledger");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "value_diverged" && row.blocking),
+            "{rows:?}"
+        );
+        let card = detect(&artifacts);
+        assert_eq!(
+            kind_count(&card, "db", "SchemaDefaultDivergence"),
+            0,
+            "{:?}",
+            card.per_boundary["db"]
+        );
+        assert_eq!(
+            kind_count(&card, "db", "ValueDiverged"),
+            1,
+            "{:?}",
+            card.per_boundary["db"]
+        );
+        assert!(!card.verdict.pass, "{}", card.verdict.reason);
+    }
+
+    /// The lookups a run made are counted from the ordinal on each observation:
+    /// every ordinal from one to the highest, once each. A gap is a lookup that
+    /// wrote no observation, a repeat is a candidate that started over, and
+    /// either fails the run, named.
+    #[test]
+    fn lookups_are_accounted_by_their_ordinals() {
+        let call = |ordinal: u64, arg_divergent: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.arg_divergent = arg_divergent;
+            call.lookup_ordinal = Some(ordinal);
+            call
+        };
+        let card = |observed: Vec<ObservedCall>| super::detect(&art(vec![], observed, vec![]));
+        let whole = card(vec![call(1, false), call(2, false)]);
+        let tally = whole
+            .lookup_tally
+            .expect("a numbered run reports its tally");
+        assert_eq!(tally.total, 2);
+        assert!(tally.balances(), "{tally:?}");
+        assert!(
+            !whole.verdict.reason.contains("lookup"),
+            "{}",
+            whole.verdict.reason
+        );
+        for (name, observed, cause) in [
+            (
+                "a gap",
+                vec![call(1, false), call(3, false)],
+                "wrote no observation",
+            ),
+            (
+                "a repeat",
+                vec![call(1, false), call(1, false)],
+                "started over",
+            ),
+        ] {
+            let card = card(observed);
+            assert!(!card.verdict.pass, "{name}");
+            assert!(
+                card.verdict.reason.contains(cause),
+                "{name}: {}",
+                card.verdict.reason
+            );
+        }
+        let unnumbered = card(vec![substituted_obs_method(
+            "db",
+            Some("c1"),
+            "load",
+            1,
+            serde_json::json!(1),
+        )]);
+        assert!(unnumbered.lookup_tally.is_none());
+        assert!(
+            unnumbered
+                .warnings
+                .iter()
+                .any(|w| w.contains("numbers no lookup")),
+            "{:?}",
+            unnumbered.warnings
+        );
+    }
+
+    /// A cancelled lookup is a named drop: its number closes the count, and its
+    /// call is not scored, because it never finished.
+    #[test]
+    fn a_cancelled_lookup_closes_the_count_and_is_not_scored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let numbered = |ordinal: u64, cancelled: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.lookup_ordinal = Some(ordinal);
+            call.cancelled = cancelled;
+            deja::DejaRecord::Observed(Box::new(call))
+        };
+        let lines: Vec<String> = [numbered(1, true), numbered(2, false)]
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let mut warnings = Vec::new();
+        let stream = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(stream.observed.len(), 1, "a cancelled call is not scored");
+        assert_eq!(stream.cancelled.len(), 1);
+        let mut artifacts = art(vec![], stream.observed, vec![]);
+        artifacts.cancelled_lookups = stream.cancelled;
+        let card = super::detect(&artifacts);
+        let tally = card.lookup_tally.expect("a tally");
+        assert_eq!(tally.total, 2);
+        assert!(
+            !card.verdict.reason.contains("wrote no observation"),
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            card.warnings.iter().any(|w| w.contains("cancelled")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// The lookups a stream has not closed, counted as the scorer counts them:
+    /// a cancelled lookup closes its number, a gap does not.
+    #[test]
+    fn missing_lookups_are_counted_off_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let numbered = |ordinal: u64, cancelled: bool| {
+            let mut call =
+                substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+            call.lookup_ordinal = Some(ordinal);
+            call.cancelled = cancelled;
+            serde_json::to_string(&deja::DejaRecord::Observed(Box::new(call))).unwrap()
+        };
+        let stream = |lines: Vec<String>| {
+            let path = dir.path().join(format!("observed-{}.jsonl", lines.len()));
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path
+        };
+        let gap = stream(vec![numbered(1, false), numbered(3, false)]);
+        assert_eq!(missing_lookup_ordinals(&gap), Some(1));
+        let closed = stream(vec![
+            numbered(1, false),
+            numbered(2, true),
+            numbered(3, false),
+        ]);
+        assert_eq!(missing_lookup_ordinals(&closed), Some(0));
+        // The scorer's own count agrees, over the same stream.
+        let mut warnings = Vec::new();
+        let loaded = load_replay_stream(&gap, &mut warnings);
+        assert_eq!(
+            missing_ordinals(&lookup_ordinals_seen(
+                loaded.observed.iter().chain(&loaded.cancelled)
+            )),
+            1
+        );
+        // A stream that cannot be read is not taken for closed.
+        let torn = dir.path().join("torn.jsonl");
+        let mut bytes = [numbered(1, false), numbered(3, false)]
+            .join("\n")
+            .into_bytes();
+        bytes.extend_from_slice(b"\n\xff\xfe");
+        std::fs::write(&torn, bytes).unwrap();
+        assert_eq!(missing_lookup_ordinals(&torn), None);
+        assert_eq!(
+            missing_lookup_ordinals(&dir.path().join("gone.jsonl")),
+            None
+        );
+    }
+
+    /// The ordinal survives the stream: written by the candidate's file sink,
+    /// read back by the scorer's loader.
+    #[test]
+    fn a_lookup_ordinal_rides_the_observed_stream() {
+        use deja::ObservedCallSink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observed.jsonl");
+        let sink = deja::FileObservedSink::create(&path).expect("a sink");
+        let mut call = substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+        call.lookup_ordinal = Some(7);
+        call.served_event_global_sequence = Some(3);
+        sink.observed(call);
+        sink.flush().expect("flush");
+        let mut warnings = Vec::new();
+        let ReplayStream { observed, .. } = load_replay_stream(&path, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].lookup_ordinal, Some(7));
+        assert_eq!(observed[0].served_event_global_sequence, Some(3));
+    }
+
+    /// A call claiming two arms, resolved and served by its address alone,
+    /// unbalances the tally rather than hiding in a remainder.
+    #[test]
+    fn a_call_claiming_two_arms_unbalances_the_lookup_count() {
+        let mut call = substituted_obs_method("db", Some("c1"), "load", 1, serde_json::json!(1));
+        call.lookup_ordinal = Some(1);
+        call.resolved = true;
+        call.arg_divergent = true;
+        let card = super::detect(&art(vec![], vec![call], vec![]));
+        assert!(!card.verdict.pass);
+        assert!(
+            card.verdict.reason.contains("more than one arm"),
+            "{}",
+            card.verdict.reason
+        );
+    }
+
+    /// The replay-local id rule does not forgive a served call's arguments.
+    #[test]
+    fn an_args_free_serve_is_not_forgiven_as_a_replay_local_id() {
+        assert_args_free_serve_blocks(
+            "an integer id the database rule strips",
+            serde_json::json!({"amount": 100, "id": 41}),
+            serde_json::json!({"amount": 100, "id": 42}),
+            None,
+        );
+    }
+
+    /// A recorder's clause, which is applied to arguments too, does not
+    /// forgive a served call's arguments.
+    #[test]
+    fn an_args_free_serve_is_not_forgiven_by_a_recorder_clause() {
+        assert_args_free_serve_blocks(
+            "a field a recorder clause projects away",
+            serde_json::json!({"amount": 100, "nonce": "a"}),
+            serde_json::json!({"amount": 100, "nonce": "b"}),
+            Some("project:!nonce"),
+        );
+    }
+
     #[test]
     fn scorecard_and_ledger_classifications_agree_in_graph_and_flat_tiers() {
         let graph_corr = "agreement-graph";
@@ -12139,7 +19328,7 @@ mod tests {
         );
         let mut flat_event = omitted_ev(602, "db", Some(flat_corr));
         flat_event.method_name = "load".to_owned();
-        flat_event.result = result.clone();
+        flat_event.result = result.clone().into();
         let graph_observed = graph_observed(
             graph_corr,
             81,
@@ -12325,6 +19514,652 @@ mod tests {
             .expect("the graph call has one ledger row");
         assert_eq!(row.kind, "schema_default");
         assert!(!row.blocking);
+    }
+
+    // --- one span, two identities ---------------------------------------------
+    //
+    // A candidate adds an id draw at the top of a span; the draw misses and stops
+    // the request, and the outbound call the recording made under that same span
+    // never happens. Each span then carries exactly ONE boundary event, and the
+    // two events are different calls.
+
+    const ADDED_CALL_CORR: &str = "added-call";
+    const UPSTREAM_CALL: u64 = 900;
+    const UPSTREAM_SPAN: &str = "request>handle>call_upstream";
+
+    /// A graph-mode run whose recorded span holds the outbound call and
+    /// whose replayed span holds `observed` instead.
+    fn one_span_two_identities(observed: ObservedCall) -> RunArtifacts {
+        one_span_recording(
+            ("http_outgoing", "send_request"),
+            serde_json::json!({}),
+            observed,
+        )
+    }
+
+    /// A graph-mode run whose recorded span holds one call, `(boundary,
+    /// operation)` made with `recorded_args`, and whose replayed span holds
+    /// `observed` instead. Both sides carry the span path, as a real table and a
+    /// real observation do, so a call can pair by its address minus its args.
+    fn one_span_recording(
+        (boundary, operation): (&str, &str),
+        recorded_args: serde_json::Value,
+        observed: ObservedCall,
+    ) -> RunArtifacts {
+        let corr = ADDED_CALL_CORR;
+        let response = serde_json::json!({"status": 200, "body": "ok"});
+        let mut event = omitted_ev(UPSTREAM_CALL, boundary, Some(corr));
+        event.method_name = operation.to_owned();
+        event.args = recorded_args.into();
+        event.result = response.clone().into();
+        event.graph_node_id = Some(111);
+        with_graphs(
+            art_with_events(
+                vec![
+                    seq_entry_method_res(
+                        Some(corr),
+                        boundary,
+                        operation,
+                        UPSTREAM_CALL,
+                        envelope(response),
+                    ),
+                    span_entry(Some(corr), UPSTREAM_CALL, UPSTREAM_SPAN),
+                ],
+                vec![observed],
+                vec![http(corr, false, vec![])],
+                vec![event],
+            ),
+            vec![graph_span(111, corr, None, 0, "call_upstream")],
+            vec![graph_span(211, corr, None, 0, "call_upstream")],
+        )
+    }
+
+    /// The call the candidate added: an unresolved draw at a line the
+    /// recording never reached.
+    fn added_draw(boundary: &str, method: &str, outcome: deja::SubstituteOutcome) -> ObservedCall {
+        let mut call = obs(boundary, Some(ADDED_CALL_CORR), false, None, None);
+        call.trait_name = "common_utils".to_owned();
+        call.method_name = method.to_owned();
+        call.graph_node_id = Some(211);
+        call.span_path = Some(UPSTREAM_SPAN.to_owned());
+        call.call_file = Some("src/handler.rs".to_owned());
+        call.call_line = Some(42);
+        call.outcome = outcome;
+        call
+    }
+
+    /// Two events sharing a span are not thereby the same call. Pairing a uuid
+    /// draw with the recorded outbound call reported a `value_diverged` row whose
+    /// "recorded" side was an HTTP request body, and consumed that call so its
+    /// omission vanished from the ledger while the scorecard still counted it.
+    #[test]
+    fn a_call_is_never_paired_with_a_recorded_call_of_another_identity() {
+        let art =
+            one_span_two_identities(added_draw("id", "new_id", deja::SubstituteOutcome::Stopped));
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(
+            rows.iter()
+                .all(|r| !(r.boundary == "id"
+                    && r.source_event_global_sequence == Some(UPSTREAM_CALL))),
+            "an id draw was paired with the recorded outbound call: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.kind != "value_diverged"),
+            "no value was compared across two different calls: {rows:?}"
+        );
+        let upstream: Vec<_> = rows
+            .iter()
+            .filter(|r| r.source_event_global_sequence == Some(UPSTREAM_CALL))
+            .collect();
+        assert_eq!(upstream.len(), 1, "the outbound call has one row: {rows:?}");
+        assert_eq!(upstream[0].boundary, "http_outgoing");
+        assert!(
+            matches!(upstream[0].kind.as_str(), "omitted" | "pruned_subtree"),
+            "the recorded call the candidate never made is reported as not made: {rows:?}"
+        );
+        let card = detect(&art);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        // The correlation is still scored as a graph. Only the two events leave
+        // the graph tier's event pairing, as a multi-event span's always have.
+        assert_eq!(
+            card.per_correlation[0].scoring_mode,
+            deja_forest::ScoringMode::Graph
+        );
+    }
+
+    /// The scorecard holds the same line. A stateful call in that position is not
+    /// excused the way a pure draw is, so it is where a pairing across identity
+    /// would surface as a value divergence against an unrelated outbound call.
+    #[test]
+    fn the_scorecard_does_not_pair_across_identity_either() {
+        let art = one_span_two_identities(added_draw(
+            "redis",
+            "get_key",
+            deja::SubstituteOutcome::Stopped,
+        ));
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "a redis read was compared against an outbound HTTP call"
+        );
+        assert_eq!(kind_count(&card, "redis", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "http_outgoing", "OmittedCall"), 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+    }
+
+    /// A miss at a pure boundary was excused as "not a real divergence". That
+    /// holds only while the process survives it. This one STOPPED the request —
+    /// the runtime says so — so it is the reason the response is missing, and
+    /// excusing it leaves a verdict made entirely of its consequences.
+    #[test]
+    fn a_miss_that_stopped_the_request_is_a_blocking_novel_call() {
+        let art =
+            one_span_two_identities(added_draw("id", "new_id", deja::SubstituteOutcome::Stopped));
+        let card = detect(&art);
+        assert_eq!(kind_count(&card, "id", "DeterministicMiss"), 0);
+        assert_eq!(kind_count(&card, "id", "NovelCall"), 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        let draw: Vec<_> = rows
+            .iter()
+            .filter(|r| r.boundary == "id" && r.method_name == "new_id")
+            .collect();
+        assert_eq!(draw.len(), 1, "rows: {rows:?}");
+        assert_eq!(draw[0].kind, "novel");
+        assert!(draw[0].blocking, "the stop is blocking: {rows:?}");
+    }
+
+    /// The same rule where the stopping draw sits inside a subtree the recording
+    /// never had. A novel subtree is added work and is charged to nothing, for
+    /// every boundary alike; a pure boundary's stop gets that treatment too, not
+    /// a separate excusal that names it a deterministic miss.
+    #[test]
+    fn a_stopping_miss_inside_a_novel_subtree_is_not_excused_either() {
+        let mut draw = added_draw("id", "new_id", deja::SubstituteOutcome::Stopped);
+        draw.graph_node_id = Some(212);
+        let mut art = one_span_two_identities(draw);
+        art.replay_graph
+            .push(graph_span(212, ADDED_CALL_CORR, Some(211), 1, "added_work"));
+        let card = detect(&art);
+        assert_eq!(kind_count(&card, "id", "DeterministicMiss"), 0);
+        assert_eq!(kind_count(&card, "id", "NovelSubtree"), 1);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        let draw: Vec<_> = rows.iter().filter(|r| r.boundary == "id").collect();
+        assert_eq!(draw.len(), 1, "rows: {rows:?}");
+        assert_eq!(draw[0].kind, "novel_subtree");
+        assert!(draw[0].blocking, "the stop is blocking: {rows:?}");
+    }
+
+    /// The same run scored both ways — as a graph, and flat with its forests
+    /// withheld — so a test can hold that how a call pairs does not depend on
+    /// which tier scored its correlation.
+    fn in_both_tiers(build: impl Fn() -> RunArtifacts) -> [(&'static str, RunArtifacts); 2] {
+        let mut flat = build();
+        flat.record_graph = None;
+        flat.replay_graph = Vec::new();
+        [("graph", build()), ("flat", flat)]
+    }
+
+    /// The candidate sends its outbound request with one header
+    /// changed. The request is the candidate's own output — an input to the
+    /// boundary — so the change is a blocking divergence at that one call, found
+    /// by its address minus its args. It is not an egress miss beside an omitted
+    /// call: those were two rows describing one call whose input changed.
+    #[test]
+    fn a_changed_outbound_request_is_one_blocking_divergence() {
+        let headers = |accept: &str| serde_json::json!({"headers": [["Accept", accept]]});
+        for (tier, art) in in_both_tiers(|| {
+            let mut call = added_draw(
+                "http_outgoing",
+                "send_request",
+                deja::SubstituteOutcome::Stopped,
+            );
+            call.args = headers("text/plain");
+            one_span_recording(
+                ("http_outgoing", "send_request"),
+                headers("application/json"),
+                call,
+            )
+        }) {
+            let card = detect(&art);
+            let kinds = &card.per_boundary.get("http_outgoing").map(|b| &b.kinds);
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "EnvironmentalMiss"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(
+                kind_count(&card, "http_outgoing", "OmittedCall"),
+                0,
+                "{tier}: {kinds:?}"
+            );
+            assert_eq!(card.summary.value_divergences, 1, "{tier}: {kinds:?}");
+            assert!(!card.verdict.pass, "{tier}");
+            assert!(
+                card.counter_disagreements().is_empty(),
+                "{tier}: {:?}",
+                card.counter_disagreements()
+            );
+
+            let rows = build_ledger(&art).expect("ledger builds");
+            let call: Vec<_> = rows
+                .iter()
+                .filter(|r| r.boundary == "http_outgoing")
+                .collect();
+            assert_eq!(call.len(), 1, "{tier}: one call, one row: {rows:?}");
+            assert_eq!(call[0].kind, "value_diverged", "{tier}: {rows:?}");
+            assert!(call[0].blocking, "{tier}");
+            assert_eq!(
+                call[0].source_event_global_sequence,
+                Some(UPSTREAM_CALL),
+                "{tier}"
+            );
+            assert_eq!(
+                call[0].recorded.as_ref().and_then(|side| side.args.clone()),
+                Some(headers("application/json")),
+                "{tier}: the recorded input is on the row"
+            );
+            assert_eq!(
+                call[0].observed.as_ref().and_then(|side| side.args.clone()),
+                Some(headers("text/plain")),
+                "{tier}: the candidate's input is on the row"
+            );
+        }
+    }
+
+    // --- pairing is by address -------------------------------------------------
+
+    /// An unresolved call on its boundary, made under `span` with `args`.
+    fn unresolved_call(
+        boundary: &str,
+        corr: Option<&str>,
+        operation: &str,
+        span: &str,
+        args: serde_json::Value,
+    ) -> ObservedCall {
+        let mut call = obs(boundary, corr, false, None, None);
+        call.method_name = operation.to_owned();
+        call.span_path = Some(span.to_owned());
+        call.args = args;
+        call
+    }
+
+    /// A recorded call and the table entries that address it under `span`.
+    fn addressed_event(
+        boundary: &str,
+        corr: Option<&str>,
+        operation: &str,
+        sequence: u64,
+        span: &str,
+        args: serde_json::Value,
+    ) -> (Vec<LookupEntry>, deja::BoundaryEvent) {
+        let result = serde_json::json!({"rows": 1});
+        let mut event = omitted_ev(sequence, boundary, corr);
+        event.method_name = operation.to_owned();
+        event.args = args.into();
+        event.result = result.clone().into();
+        (
+            vec![
+                seq_entry_method_res(corr, boundary, operation, sequence, envelope(result)),
+                span_entry(corr, sequence, span),
+            ],
+            event,
+        )
+    }
+
+    /// The boundary is identity as much as the operation is. Two boundaries can
+    /// share an operation name, and a call on one must never pair with a call on
+    /// the other, however alike their spans and names.
+    #[test]
+    fn a_call_is_not_paired_with_the_same_operation_on_another_boundary() {
+        let corr = Some("same-name");
+        let span = "request>load";
+        let (entries, event) =
+            addressed_event("redis", corr, "get", 700, span, serde_json::json!({"k": 1}));
+        let art = art_with_events(
+            entries,
+            vec![unresolved_call(
+                "db",
+                corr,
+                "get",
+                span,
+                serde_json::json!({"k": 2}),
+            )],
+            vec![http("same-name", true, vec![])],
+            vec![event],
+        );
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "a db call was compared against a redis call"
+        );
+        assert_eq!(kind_count(&card, "db", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "redis", "OmittedCall"), 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(rows.iter().all(|r| r.kind != "value_diverged"), "{rows:?}");
+    }
+
+    /// Every resolved claim is in before the first pairing by address minus
+    /// args. Here the call whose input changed comes FIRST in the stream, and the
+    /// head of its pool is the event a later call resolved to. Taking the head
+    /// would pair one recorded event with two calls; it must pair with the next.
+    #[test]
+    fn a_changed_call_never_takes_the_event_a_later_call_resolved_to() {
+        let corr = "claims-first";
+        let span = "request>load";
+        let (mut entries, first) = addressed_event(
+            "db",
+            Some(corr),
+            "load",
+            901,
+            span,
+            serde_json::json!({"id": "a"}),
+        );
+        let (more, second) = addressed_event(
+            "db",
+            Some(corr),
+            "load",
+            902,
+            span,
+            serde_json::json!({"id": "b"}),
+        );
+        entries.extend(more);
+        let changed = unresolved_call(
+            "db",
+            Some(corr),
+            "load",
+            span,
+            serde_json::json!({"id": "c"}),
+        );
+        let mut resolved = substituted_obs_method(
+            "db",
+            Some(corr),
+            "load",
+            901,
+            serde_json::json!({"rows": 1}),
+        );
+        resolved.args = serde_json::json!({"id": "a"});
+        resolved.span_path = Some(span.to_owned());
+        let art = art_with_events(
+            entries,
+            vec![changed, resolved],
+            vec![http(corr, true, vec![])],
+            vec![first, second],
+        );
+
+        let card = detect(&art);
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(card.summary.value_divergences, 1);
+        assert_eq!(card.summary.omitted_calls, 0);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let changed = rows
+            .iter()
+            .find(|r| r.kind == "value_diverged")
+            .expect("the changed call is one pair");
+        assert_eq!(changed.source_event_global_sequence, Some(902), "{rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.source_event_global_sequence == Some(901))
+                .count(),
+            1,
+            "one recorded event, one row: {rows:?}"
+        );
+    }
+
+    /// A call with no correlation has no correlation in its address to pair
+    /// within, so it is not paired at all: it stays the tolerated background
+    /// call it has always been, rather than becoming a blocking divergence.
+    #[test]
+    fn an_uncorrelated_call_is_never_paired() {
+        let span = "background>sweep";
+        let (entries, event) = addressed_event(
+            "db",
+            None,
+            "sweep",
+            950,
+            span,
+            serde_json::json!({"batch": 1}),
+        );
+        let art = art_with_events(
+            entries,
+            vec![unresolved_call(
+                "db",
+                None,
+                "sweep",
+                span,
+                serde_json::json!({"batch": 2}),
+            )],
+            vec![],
+            vec![event],
+        );
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(card.summary.novel_calls_tolerated, 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(rows.iter().all(|r| r.kind != "value_diverged"), "{rows:?}");
+    }
+
+    /// Structure never unmakes a pair. A call that resolved to its recorded event
+    /// under a span the aligner could not match — renamed, say — is MATCHED: the
+    /// address found it. The rename is a fact about spans, reported as one; it is
+    /// not a novel call beside a pruned one.
+    #[test]
+    fn a_call_that_resolved_under_a_renamed_span_is_matched() {
+        let corr = "renamed-span";
+        let result = serde_json::json!({"result": "Ok", "value": 7});
+        let event = graph_event(
+            corr,
+            900,
+            111,
+            "load",
+            serde_json::json!({"id": 7}),
+            result.clone(),
+        );
+        let call = graph_observed(
+            corr,
+            211,
+            900,
+            "load",
+            serde_json::json!({"id": 7}),
+            result.clone(),
+        );
+        let art = with_graphs(
+            art_with_events(
+                vec![seq_entry_method_res(Some(corr), "db", "load", 900, result)],
+                vec![call],
+                vec![http(corr, true, vec![])],
+                vec![event],
+            ),
+            vec![
+                graph_span(110, corr, None, 0, "request"),
+                graph_span(111, corr, Some(110), 1, "load_before"),
+            ],
+            vec![
+                graph_span(210, corr, None, 0, "request"),
+                graph_span(211, corr, Some(210), 1, "load_after"),
+            ],
+        );
+
+        let card = detect(&art);
+        assert_eq!(
+            card.per_correlation[0].scoring_mode,
+            deja_forest::ScoringMode::Graph
+        );
+        assert_eq!(card.summary.matched_side_effect_calls, 1);
+        assert_eq!(kind_count(&card, "db", "NovelSubtree"), 0);
+        assert_eq!(kind_count(&card, "db", "PrunedSubtree"), 0);
+        assert_eq!(card.summary.omitted_calls, 0);
+        assert!(
+            card.counter_disagreements().is_empty(),
+            "{:?}",
+            card.counter_disagreements()
+        );
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].kind, "matched", "{rows:?}");
+        assert_eq!(rows[0].source_event_global_sequence, Some(900));
+    }
+
+    /// The runtime records the call each request stopped at. A report that says
+    /// only "no response from the candidate" sends the reader to find it; name
+    /// it, once per call site however many requests it stopped.
+    #[test]
+    fn the_report_names_the_call_each_request_stopped_at() {
+        let mut art =
+            one_span_two_identities(added_draw("id", "new_id", deja::SubstituteOutcome::Stopped));
+        let mut again = added_draw("id", "new_id", deja::SubstituteOutcome::Stopped);
+        again.correlation_id = Some("added-call-again".to_owned());
+        again.graph_node_id = None;
+        art.observed.push(again);
+
+        let card = detect(&art);
+        let stops: Vec<_> = card
+            .warnings
+            .iter()
+            .filter(|w| w.contains("stopped at"))
+            .collect();
+        assert_eq!(
+            stops.len(),
+            1,
+            "one line per call site: {:?}",
+            card.warnings
+        );
+        assert!(
+            stops[0].starts_with("2 request(s) stopped at"),
+            "{}",
+            stops[0]
+        );
+        assert!(stops[0].contains("id/new_id"), "{}", stops[0]);
+        assert!(stops[0].contains("src/handler.rs:42"), "{}", stops[0]);
+    }
+
+    /// Only a stop is named as one. A draw the site answered let its request go
+    /// on, and saying it stopped would send a reader after a cause that is not
+    /// there.
+    #[test]
+    fn a_request_the_site_answered_is_not_named_as_stopped() {
+        let mut draw = added_draw("id", "new_id", deja::SubstituteOutcome::Synthesized);
+        draw.absorbed = true;
+        let card = detect(&one_span_two_identities(draw));
+        assert!(
+            card.warnings.iter().all(|w| !w.contains("stopped at")),
+            "{:?}",
+            card.warnings
+        );
+    }
+
+    /// The guard for the rule above: it keys on the request STOPPING, not on a
+    /// pure boundary missing. A miss with no recorded stop is still excused —
+    /// and that is every miss in an observed artifact written before the runtime
+    /// reported stops, whose absent outcome reads as `substituted`. Re-scoring
+    /// such a run must not turn its clock and id misses into findings.
+    #[test]
+    fn a_substituted_pure_miss_is_still_excused() {
+        // Renamed with the rule it pins: "did not stop" used to be sufficient,
+        // and is not any more — a synthesized miss did not stop either. What
+        // earns the excusal is that the value came from the recording.
+        let art = one_span_two_identities(added_draw(
+            "id",
+            "new_id",
+            deja::SubstituteOutcome::default(),
+        ));
+        let card = detect(&art);
+        assert_eq!(kind_count(&card, "id", "DeterministicMiss"), 1);
+        assert_eq!(kind_count(&card, "id", "NovelCall"), 0);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let draw: Vec<_> = rows.iter().filter(|r| r.boundary == "id").collect();
+        assert_eq!(draw.len(), 1, "rows: {rows:?}");
+        assert_eq!(draw[0].kind, "deterministic", "{rows:?}");
+        assert!(!draw[0].blocking, "{rows:?}");
+    }
+
+    /// Identity is the operation as well as the boundary. Two different calls on
+    /// one boundary that share a span are still two calls, and the flat tier's
+    /// pairing, keyed on the operation, would never join them.
+    #[test]
+    fn a_call_is_not_paired_with_another_operation_on_its_own_boundary() {
+        let art = one_span_recording(
+            ("db", "generic_find_one"),
+            serde_json::json!({}),
+            added_draw("db", "generic_insert", deja::SubstituteOutcome::default()),
+        );
+        let card = detect(&art);
+        assert_eq!(
+            card.summary.value_divergences, 0,
+            "an insert was compared against a find"
+        );
+        assert_eq!(kind_count(&card, "db", "NovelCall"), 1);
+        assert_eq!(kind_count(&card, "db", "OmittedCall"), 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        assert!(rows.iter().all(|r| r.kind != "value_diverged"), "{rows:?}");
+    }
+
+    /// Not counting the displaced half of a swap twice must never hide a request
+    /// the candidate changed. Here it sends statement A twice where the recording
+    /// sent A then B. The first A resolves; the second pairs with B and matches
+    /// nothing an out-of-order pair claimed, so it is exactly what it looks like:
+    /// B was never sent, and A went out in its place.
+    #[test]
+    fn a_repeated_request_in_place_of_another_is_still_a_change() {
+        let corr = "repeated-request";
+        let result = serde_json::json!({"rows_affected": 1});
+        let mut resolved = attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS, result.clone());
+        resolved.resolved = true;
+        resolved.resolved_rank = Some(2);
+        resolved.source_event_global_sequence = Some(810);
+        let art = art_with_events(
+            vec![
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    810,
+                    envelope(result.clone()),
+                ),
+                span_entry(Some(corr), 810, "root>update_attempt"),
+                seq_entry_method_res(
+                    Some(corr),
+                    "db",
+                    "generic_update",
+                    811,
+                    envelope(result.clone()),
+                ),
+                span_entry(Some(corr), 811, "root>update_attempt"),
+            ],
+            vec![
+                resolved,
+                attempt_update_obs(corr, ATTEMPT_UPDATE_STATUS, result.clone()),
+            ],
+            vec![http(corr, true, vec![])],
+            vec![
+                attempt_update_ev(corr, 810, ATTEMPT_UPDATE_STATUS, result.clone()),
+                attempt_update_ev(corr, 811, ATTEMPT_UPDATE_STATUS_REKEYED, result),
+            ],
+        );
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 1, "{:?}", card.per_boundary);
+        assert_eq!(card.summary.omitted_calls, 0);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let changed: Vec<_> = rows.iter().filter(|r| r.kind == "value_diverged").collect();
+        assert_eq!(changed.len(), 1, "{rows:?}");
+        assert_eq!(changed[0].source_event_global_sequence, Some(811));
     }
 
     #[test]
@@ -12998,5 +20833,105 @@ mod tests {
             assert_eq!(card.summary.side_effect_divergences, 0);
             assert!(card.verdict.pass, "{}", card.verdict.reason);
         }
+    }
+
+    /// A call the replay stopped at: resolved nothing, and fail-stopped the task
+    /// it ran in. On `db` a miss is charged to nothing, so only the stop itself
+    /// can keep its correlation from passing.
+    fn stopped_obs(corr: Option<&str>) -> ObservedCall {
+        let mut stopped = obs("db", corr, false, None, None);
+        stopped.method_name = "stopped".to_owned();
+        stopped.outcome = deja::SubstituteOutcome::Stopped;
+        stopped
+    }
+
+    /// A correlation whose replay fail-stopped a call cannot read passed, even
+    /// when its response matched. The measured case: the stop happened in a
+    /// forked background task, after the response was sent, so nothing the
+    /// response carried shows it. What the stop meant is not decided here, only
+    /// that a verdict of "matched" cannot stand beside it.
+    #[test]
+    fn a_correlation_whose_replay_stopped_a_call_is_not_passed() {
+        let card = detect(&art(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![
+                obs("db", Some("c1"), true, Some(1), Some(1)),
+                stopped_obs(Some("c1")),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert!(
+            c1.http_status_match && c1.http_body_match && c1.side_effect_divergences == 0,
+            "precondition: nothing else keeps c1 from passing"
+        );
+        assert!(!c1.passed, "a stopped call cannot sit inside a pass");
+        assert!(c1.inconclusive, "and it is not a divergence either");
+        assert_eq!(card.summary.matched_correlations, 0);
+        assert!(
+            !card.verdict.pass && card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+        assert!(
+            card.verdict.reason.contains("stopped"),
+            "the verdict says why: {}",
+            card.verdict.reason
+        );
+    }
+
+    /// A stop does not soften a real divergence: blocking wins, at the
+    /// correlation and the run, exactly as it does over an absorbed miss.
+    #[test]
+    fn a_stopped_call_does_not_turn_a_divergence_into_inconclusive() {
+        let card = detect(&art(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![
+                obs("db", Some("c1"), true, Some(1), Some(1)),
+                stopped_obs(Some("c1")),
+            ],
+            vec![http("c1", false, vec![])],
+        ));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert!(!c1.passed && !c1.inconclusive, "blocking wins");
+        assert!(
+            !card.verdict.pass && !card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
+    }
+
+    /// A stop outside any correlation still keeps the run from passing: the
+    /// replay fail-stopped a task, so the run did not happen as recorded,
+    /// whichever request it belonged to.
+    #[test]
+    fn an_uncorrelated_stop_keeps_the_run_from_passing() {
+        let card = detect(&art(
+            vec![seq_entry(Some("c1"), "db", 1)],
+            vec![
+                obs("db", Some("c1"), true, Some(1), Some(1)),
+                stopped_obs(None),
+            ],
+            vec![http("c1", true, vec![])],
+        ));
+        let c1 = card
+            .per_correlation
+            .iter()
+            .find(|c| c.correlation_id == "c1")
+            .expect("c1 is scored");
+        assert!(c1.passed, "c1 itself stopped nothing");
+        assert!(
+            !card.verdict.pass && card.verdict.inconclusive,
+            "{}",
+            card.verdict.reason
+        );
     }
 }

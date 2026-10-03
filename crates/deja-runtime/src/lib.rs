@@ -42,7 +42,11 @@ use tracing::Instrument;
 pub mod canonical;
 pub mod correlation_layer;
 pub mod graph;
+pub mod hash_seed;
+pub mod identity;
 pub mod replay;
+pub mod round_trip;
+pub mod synth;
 pub mod wire_capture;
 pub mod writer;
 pub use correlation_layer::{current_span_path, DejaCorrelationLayer};
@@ -51,7 +55,8 @@ pub use graph::{
     GraphNodeSink,
 };
 pub use replay::{
-    ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
+    is_pure_boundary, ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook,
+    ReplayReport,
 };
 pub use writer::{
     AsyncRecordWriter, CompositeSink, JsonlSink, MarkerKind, RecordSink, SinkPolicy, WriterConfig,
@@ -70,6 +75,182 @@ pub(crate) fn current_recording_run_id() -> Option<String> {
 // ---------------------------------------------------------------------------
 // Core event type
 // ---------------------------------------------------------------------------
+
+/// A JSON payload kept as the text it was recorded as, parsed only when a
+/// caller needs its structure.
+///
+/// Memory is the reason this type exists. Scoring holds every recorded event
+/// and every observed call of a run at once, and a parsed `serde_json::Value`
+/// costs many times the text it came from: one measured run spent 764 MiB on
+/// 15,195 events' payloads and a further 604 MiB on 9,076 observed calls,
+/// reached 2.4 GiB, and was killed by the OOM killer partway through
+/// classifying them. Most of those payloads are never looked inside — they are
+/// carried so that the few which ARE compared can be.
+///
+/// Equality is STRUCTURAL, not textual, and that is the whole care of this
+/// type. Comparing two `Value`s — what every call site did before — normalizes
+/// things the raw bytes do not: the order of an object's keys, insignificant
+/// whitespace, and the spelling of a float (`1.0` against `1.00`). Those
+/// distinctions do not survive parsing, so they have never reached a verdict.
+/// Comparing text instead would turn each of them into a divergence, which is a
+/// change to what this harness reports dressed up as a memory optimization. So
+/// `PartialEq` parses.
+///
+/// What parsing does NOT normalize is worth stating, because it is easy to
+/// assume otherwise: `serde_json` keeps an integer and a float apart, so `1`
+/// and `1.0` are not equal, and neither are `1` and `1e0`. This type inherits
+/// that exactly, which is the point — it is defined to agree with the `Value`
+/// comparison it replaces, including where that comparison is strict.
+#[derive(Debug, Clone)]
+pub struct Payload {
+    /// Plain text rather than a `serde_json` `RawValue`. `RawValue`'s whole
+    /// value is its magic serialize/deserialize path, and this type cannot use
+    /// that path — see the note above the serde impls — so it would have bought
+    /// a wrapper, a validation pass over text that came from a `Value` already,
+    /// and a `serde_json` feature flag on a crate the recorded service links.
+    text: std::sync::Arc<str>,
+    /// Populated the first time a caller needs structure, and only then. A
+    /// payload nobody looks inside — `request` and `response` are copies of
+    /// `args` and `result` kept for readability, and scoring reads neither —
+    /// costs its text and nothing more.
+    parsed: std::sync::OnceLock<serde_json::Value>,
+}
+
+impl std::ops::Deref for Payload {
+    type Target = serde_json::Value;
+
+    /// Parses on first use and caches, so every `Value` method a caller already
+    /// writes keeps working. This is what makes the representation change cheap
+    /// at the call sites: the storage moves, the vocabulary does not.
+    fn deref(&self) -> &serde_json::Value {
+        self.parsed
+            .get_or_init(|| serde_json::from_str(&self.text).unwrap_or(serde_json::Value::Null))
+    }
+}
+
+// Both directions go through `Value` rather than through `RawValue`'s own
+// impls, and that is forced rather than chosen. Every event travels inside
+// `DejaRecord`, which is internally tagged (`#[serde(tag = "record_kind")]`),
+// and serde buffers an internally-tagged body through its `Content` type before
+// replaying it into the variant. A `RawValue` cannot survive that buffer — it
+// is captured by a private newtype token that only `serde_json`'s own
+// deserializer emits, so replaying it yields `invalid type: newtype struct,
+// expected any valid JSON value`, and every event fails to parse.
+//
+// So a `Value` is built transiently at the boundary and dropped immediately;
+// what this type STORES is still the text. That is the whole saving: the
+// transient costs one payload at a time, where the old field cost every payload
+// of every event at once, for the life of the run.
+impl Serialize for Payload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Payload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self::from(serde_json::Value::deserialize(deserializer)?))
+    }
+}
+
+impl Payload {
+    fn from_text(text: std::sync::Arc<str>) -> Self {
+        Self {
+            text,
+            parsed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The payload's JSON text.
+    ///
+    /// Deliberately not named `get`: a caller reaching for `get` on a payload
+    /// almost always means `Value::get(key)`, and a same-named method taking no
+    /// key would let that compile into something else entirely at any site
+    /// where the argument happened to fit.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Parse the payload into a `Value`.
+    ///
+    /// Infallible in practice: the stored text is always rendered from a
+    /// `Value`, so no path stores text this cannot read back. The impossible
+    /// branch yields `Value::Null` rather than panicking, because a payload
+    /// must never be able to kill a scoring run.
+    pub fn to_value(&self) -> serde_json::Value {
+        (**self).clone()
+    }
+
+    /// The JSON `null` payload, which is also [`Default`].
+    pub fn null() -> Self {
+        Self::from_text(std::sync::Arc::from("null"))
+    }
+
+    /// Whether the payload is JSON `null`, without paying a full parse.
+    pub fn is_null(&self) -> bool {
+        self.text.trim() == "null"
+    }
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
+impl From<serde_json::Value> for Payload {
+    fn from(value: serde_json::Value) -> Self {
+        match serde_json::to_string(&value) {
+            Ok(text) => Self::from_text(std::sync::Arc::from(text.as_str())),
+            // Serializing fails only where the value cannot be serialized,
+            // which a `Value` always can.
+            Err(_) => Self::null(),
+        }
+    }
+}
+
+impl From<Payload> for serde_json::Value {
+    fn from(payload: Payload) -> Self {
+        payload.to_value()
+    }
+}
+
+impl PartialEq for Payload {
+    fn eq(&self, other: &Self) -> bool {
+        // Shared storage, then identical text, then structure. The first two
+        // are exact answers rather than approximations: the same allocation and
+        // the same bytes are both the same JSON. Only differing text has to be
+        // parsed — see the type's documentation for why textual equality alone
+        // is the wrong answer.
+        std::sync::Arc::ptr_eq(&self.text, &other.text)
+            || self.text == other.text
+            || **self == **other
+    }
+}
+
+impl Eq for Payload {}
+
+/// Comparing a payload against a bare `Value`, which is what a caller holding
+/// one side already parsed does. Structural, exactly as [`Payload`]'s own
+/// equality is — the point of these impls is that moving a field onto this type
+/// changes no call site's MEANING, only where the parse happens.
+impl PartialEq<serde_json::Value> for Payload {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<Payload> for serde_json::Value {
+    fn eq(&self, other: &Payload) -> bool {
+        *self == **other
+    }
+}
 
 /// A single semantic operation captured at the trait boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,15 +316,15 @@ pub struct BoundaryEvent {
     pub call_column: u32,
     /// Receiver/decorator context captured before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub receiver: Option<serde_json::Value>,
+    pub receiver: Option<Payload>,
     /// Request-like method input payload. Kept alongside `args` for readability.
-    pub request: serde_json::Value,
+    pub request: Payload,
     /// Serialized key arguments (JSON).
-    pub args: serde_json::Value,
+    pub args: Payload,
     /// Response-like method output payload. Kept alongside `result` for readability.
-    pub response: serde_json::Value,
+    pub response: Payload,
     /// Serialized result (JSON). For errors, contains `{"error": "..."}`.
-    pub result: serde_json::Value,
+    pub result: Payload,
     /// Whether the operation returned an error.
     pub is_error: bool,
     /// Wall-clock duration in microseconds.
@@ -161,20 +342,18 @@ pub struct BoundaryEvent {
     /// boundary during replay. Lets the post-hoc tally pair recorded vs shadow
     /// events to classify [`ValueDiverged`](crate::DivergenceKind::ValueDiverged).
     pub provenance: Provenance,
-    /// Reconstructability of `result`: whether it round-trips losslessly, only
-    /// structurally, or is opaque. Inert in M1 (always [`Fidelity::Lossless`]);
-    /// carried so later stages can mark partial captures. Wire name pinned to
-    /// the `recon` wire name so current readers and writers agree.
+    /// Whether `result` rebuilds as the value it was captured from, as measured
+    /// by the recorder; see [`Fidelity`]. Wire name pinned to `recon`.
     #[serde(rename = "recon")]
     pub fidelity: Fidelity,
     /// Post-image of affected state after this operation, when explicitly
     /// captured by the boundary instrumentation. Omitted for legacy/plain events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_image: Option<serde_json::Value>,
+    pub result_image: Option<Payload>,
     /// Pre-image of affected state before this operation, when explicitly
     /// captured by the boundary instrumentation. Omitted for legacy/plain events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pre_image: Option<serde_json::Value>,
+    pub pre_image: Option<Payload>,
     /// Explicit state keys this crossing READ, when supplied by instrumentation.
     /// Empty means the boundary did not provide read capture; the recorder never
     /// infers keys from boundary or method names.
@@ -234,6 +413,30 @@ pub struct BoundaryEvent {
     /// un-back-fillable, so captured now for latency/interleaving replay modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_timestamp_ns: Option<u64>,
+}
+
+impl BoundaryEvent {
+    /// Collapse the payload pairs this type records as copies of one another
+    /// onto shared storage.
+    ///
+    /// `request` is written as a clone of `args`, and `response` as a clone of
+    /// `result` — one construction site, unconditionally — so every event holds
+    /// each of those payloads twice. Building an event already shares them,
+    /// because a `Payload` clone is a refcount bump. Reading one back does not:
+    /// the two fields are captured independently from the JSON and land in two
+    /// allocations. A bulk reader calls this so that a tape's events cost what
+    /// their DISTINCT payloads cost.
+    ///
+    /// Only an exact byte match is shared, so this can never change what an
+    /// event says, and a tape whose fields genuinely differ keeps both.
+    pub fn share_duplicate_payloads(&mut self) {
+        if self.request.text() == self.args.text() {
+            self.request = self.args.clone();
+        }
+        if self.response.text() == self.result.text() {
+            self.response = self.result.clone();
+        }
+    }
 }
 
 /// One record on the recording stream. The tape carries every record kind
@@ -317,7 +520,15 @@ impl DejaRecord {
 ///   comparison must be gated on the RECORDING's `event_schema_version >= 9`.
 ///
 /// Self-consistent within a v9 recording, exactly as v6 was for `capture!`.
-pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 9;
+///
+/// v10 records a present `Option` whose contents serialise to `null` — a cache
+/// hit holding `None` — as `{"deja:some": null}` ([`canonical::PRESENT_KEY`])
+/// instead of the bare `null` that also means `None`, in `args` and `result`
+/// alike. Like v9 it adds no field. A pre-v10 tape still decodes, bare `null`
+/// as `None`, so its collapsed values stay collapsed, and an argument holding
+/// such a value hashes differently across the line. **A pre-v10 recording is
+/// re-recorded rather than replayed against a v10 candidate**, as for v9.
+pub const CURRENT_EVENT_SCHEMA_VERSION: u16 = 10;
 
 /// The [`BoundaryEvent::role`] value marking a correlation's ingress root.
 pub const ROLE_INGRESS: &str = "ingress";
@@ -348,22 +559,43 @@ pub enum Provenance {
     /// Shadow capture from an execute-mode dispatch running the real boundary.
     #[serde(rename = "execute_shadow")]
     Shadow,
+    /// An execute-mode dispatch that served this call's own recorded error
+    /// instead of re-running it, because the site declared that error
+    /// state-neutral (see [`serves_recorded_error`]).
+    ServedRecordedError,
 }
 
-/// Reconstructability of a captured `result`.
+/// Whether a captured `result` rebuilds as the value it was captured from.
 ///
-/// Inert in M1 (always [`Fidelity::Lossless`]); carried additively so later
-/// stages can flag captures that only round-trip structurally or not at all.
+/// Measured, not declared: the recorder rebuilds each value it records on a
+/// `Substitute` site through that site's own `reconstruct` and compares the two
+/// (see [`round_trip`]). Tapes recorded before the check existed say `lossless`
+/// on every event without having checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Fidelity {
-    /// Result round-trips byte-for-byte / value-for-value.
-    #[default]
+    /// Rebuilt, and equal to the value captured by the strongest comparison its
+    /// type offers (see [`round_trip`]): its own `PartialEq`, or else its serde
+    /// image. The second cannot see what serialisation does not carry — a
+    /// `#[serde(skip)]` field, a value that serialises masked — so for such a
+    /// type this says the serialised form survived, not the whole value.
     Lossless,
     /// Result round-trips structurally but not losslessly.
     Structured,
-    /// Result cannot be reconstructed from the capture.
+    /// The capture does not rebuild: a `Substitute` site that declares no
+    /// replay codec, or a codec that failed or panicked on a value it recorded.
     Opaque,
+    /// Rebuilt, and DIFFERENT from the value captured: replay would hand the
+    /// service something the recording never saw.
+    Lossy,
+    /// Not checked: an `Execute` site, an error arm, or a type that offers
+    /// nothing to compare by.
+    #[default]
+    Unverified,
+    /// A verdict this build does not know, written by a newer one. Read so an
+    /// event is never dropped for it; never written.
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -711,8 +943,92 @@ pub enum ExecuteMode {
 /// macro only moves it from `peek` into `observe`.
 pub struct ExecuteShadowToken {
     /// The observation to emit once the real result is known. `observed_result`
-    /// is `None` here and filled by [`DejaHook::execute_shadow_observe`].
-    observed: crate::replay::ObservedCall,
+    /// is `None` here and filled by [`DejaHook::execute_shadow_observe`]. Taken
+    /// when the token is consumed, so a token dropped unconsumed still holds it.
+    observed: Option<crate::replay::ObservedCall>,
+    /// Where a token dropped unconsumed writes its observation, marked
+    /// cancelled; see [`ExecuteShadowToken::written_on_cancel_to`].
+    on_cancel: Option<std::sync::Arc<dyn crate::replay::ObservedCallSink>>,
+}
+
+/// A resolved-but-unemitted `Substitute` lookup, carried across the seam's
+/// decision. The lookup twin of [`ExecuteShadowToken`].
+///
+/// The Substitute path used to emit its observation inside the lookup, before
+/// the seam had decided anything, which is why the miss policy had to be
+/// DECLARED on the query and carried forward — the outcome was not yet
+/// knowable. Deferring the emission the way the execute path always has makes
+/// the outcome observable instead.
+///
+/// The seam owns the fail-stop: a [`Reconstructed::NoValue`] or
+/// [`Reconstructed::Failed`] causes the SEAM to emit and then panic, in that
+/// order. But the lookup was already counted, and a future dropped before the
+/// seam decides (a sibling's error in a join, a client that went away, a panic
+/// elsewhere) would leave it counted and never written. So a token dropped
+/// unconsumed writes its observation, marked cancelled, where the hook asked.
+pub struct SubstituteToken {
+    observed: Option<crate::replay::ObservedCall>,
+    on_cancel: Option<std::sync::Arc<dyn crate::replay::ObservedCallSink>>,
+}
+
+impl SubstituteToken {
+    /// Build a token from a resolved [`ObservedCall`](crate::replay::ObservedCall)
+    /// whose outcome fields are not yet stamped.
+    pub fn new(observed: crate::replay::ObservedCall) -> Self {
+        Self {
+            observed: Some(observed),
+            on_cancel: None,
+        }
+    }
+
+    /// Write the observation to `sink`, marked cancelled, if this token is
+    /// dropped without being consumed.
+    pub fn written_on_cancel_to(
+        mut self,
+        sink: std::sync::Arc<dyn crate::replay::ObservedCallSink>,
+    ) -> Self {
+        self.on_cancel = Some(sink);
+        self
+    }
+
+    /// Consume the token, stamping what the seam ACTUALLY did, and return the
+    /// completed observation ready to emit.
+    pub fn into_observed(mut self, outcome: SubstituteOutcome) -> crate::replay::ObservedCall {
+        let mut observed = self
+            .observed
+            .take()
+            .expect("a token holds its observation until it is consumed");
+        observed.stamp_outcome(outcome);
+        observed
+    }
+}
+
+impl Drop for SubstituteToken {
+    fn drop(&mut self) {
+        write_cancelled(self.observed.take(), self.on_cancel.take());
+    }
+}
+
+/// A lookup's observation written by the token it was left in, marked
+/// cancelled, when the future carrying it was dropped before it finished.
+fn write_cancelled(
+    observed: Option<crate::replay::ObservedCall>,
+    sink: Option<std::sync::Arc<dyn crate::replay::ObservedCallSink>>,
+) {
+    if let (Some(mut observed), Some(sink)) = (observed, sink) {
+        observed.cancelled = true;
+        sink.observed(observed);
+    }
+}
+
+/// Result of [`DejaHook::substitute_peek`]: the recorded value if the lookup
+/// hit, plus the observation still waiting on the seam's decision.
+pub struct SubstitutePeek {
+    /// The recorded baseline, `None` on a miss.
+    pub recorded: Option<serde_json::Value>,
+    /// The pending observation, or `None` when the hook does not implement the
+    /// two-phase lifecycle and has already emitted eagerly.
+    pub token: Option<SubstituteToken>,
 }
 
 impl ExecuteShadowToken {
@@ -721,7 +1037,21 @@ impl ExecuteShadowToken {
     /// (or `None` + `seed_gap = true` when no baseline was found), and a `None`
     /// `observed_result` (filled at observe time).
     pub fn new(observed: crate::replay::ObservedCall) -> Self {
-        Self { observed }
+        Self {
+            observed: Some(observed),
+            on_cancel: None,
+        }
+    }
+
+    /// Write the observation to `sink`, marked cancelled, if this token is
+    /// dropped without being consumed: the real call it waits on may never
+    /// return, when the future running it is dropped.
+    pub fn written_on_cancel_to(
+        mut self,
+        sink: std::sync::Arc<dyn crate::replay::ObservedCallSink>,
+    ) -> Self {
+        self.on_cancel = Some(sink);
+        self
     }
 
     /// Consume the token, attaching the real boundary's `observed_result`, and
@@ -730,8 +1060,36 @@ impl ExecuteShadowToken {
         mut self,
         observed_result: serde_json::Value,
     ) -> crate::replay::ObservedCall {
-        self.observed.observed_result = Some(observed_result);
-        self.observed
+        let mut observed = self
+            .observed
+            .take()
+            .expect("a token holds its observation until it is consumed");
+        observed.observed_result = Some(observed_result);
+        observed
+    }
+
+    /// The recorded result the peek resolved for THIS call, if it found one.
+    pub fn recorded_result(&self) -> Option<&serde_json::Value> {
+        self.observed.as_ref()?.recorded_result.as_ref()
+    }
+
+    /// The rank the peek resolved this call at, if it resolved.
+    fn resolved_rank(&self) -> Option<u8> {
+        self.observed.as_ref()?.resolved_rank
+    }
+
+    /// Mark the call as served from its recorded result rather than re-run.
+    fn served(mut self) -> Self {
+        if let Some(observed) = self.observed.as_mut() {
+            observed.provenance = Provenance::ServedRecordedError;
+        }
+        self
+    }
+}
+
+impl Drop for ExecuteShadowToken {
+    fn drop(&mut self) {
+        write_cancelled(self.observed.take(), self.on_cancel.take());
     }
 }
 
@@ -823,14 +1181,6 @@ where
 /// Hooks that opt into context-aware replay implement
 /// [`DejaHook::try_replay_with_context`].
 pub struct ReplayLookup<'a> {
-    /// What this boundary does when the lookup MISSES.
-    ///
-    /// Carried on the query rather than derived later because it is only knowable
-    /// here: the observation is written by the hook BEFORE the seam reaches its
-    /// miss branch, so nothing downstream can tell a miss the process absorbed
-    /// from one that killed the request. Both leave `resolved: false` and
-    /// `Provenance::Recorded`. See [`MissPolicy`].
-    pub miss_policy: MissPolicy,
     /// Boundary tag (e.g. `"storage"`, `"redis"`, `"http_client"`).
     pub boundary: &'a str,
     /// Trait name at the boundary.
@@ -845,29 +1195,34 @@ pub struct ReplayLookup<'a> {
     pub caller_location: Option<&'a std::panic::Location<'a>>,
 }
 
-/// What a `Substitute` boundary does when its replay lookup MISSES.
+/// How a `Substitute` lookup actually ended — the OBSERVED outcome, decided by
+/// the site's reconstruct closure and stamped onto the observation afterwards.
 ///
-/// This is a property of the DECLARATION, not of the call: a boundary either has
-/// a caller with an honest degraded path (and declares `on_miss`, so a miss is
-/// absorbed and the request continues) or it does not (and a miss stops the
-/// request). It rides the [`ReplayLookup`] so the emitted observation can say
-/// which of the two happened.
-///
-/// Why it has to be carried rather than worked out afterwards: the miss is
-/// recorded before the seam decides. A run whose absorbed misses are
-/// indistinguishable from its fatal ones gets quieter and less trustworthy at the
-/// same time, which is the failure this exists to prevent.
+/// This replaces the declared `MissPolicy` that shipped in #84. That flag rode
+/// the query because the observation was emitted BEFORE the seam reached its
+/// miss branch, so the only thing available to stamp was what the boundary had
+/// DECLARED it would do. That was tolerable only while a declared `on_miss`
+/// always produced a value: declaration and outcome could not disagree.
+/// [`Reconstructed::NoValue`] makes them disagree — a site may inspect the query
+/// and decline — so the outcome has to be observed. The Substitute lookup is now
+/// two-phase (resolve, decide, then emit), mirroring the execute-shadow
+/// lifecycle that has always worked this way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MissPolicy {
-    /// A miss stops the request. The default, and right wherever no value is
-    /// honest — egress, and anything whose absence would silently condition the
-    /// rest of the correlation on a value the recording never held.
+pub enum SubstituteOutcome {
+    /// The lookup HIT and the recorded value was rebuilt and returned.
     #[default]
-    FailStop,
-    /// A miss returns the declared value and the request continues. The miss is
-    /// still scored; only the continuation changes.
-    Absorb,
+    Substituted,
+    /// The lookup MISSED and the site derived a value from the query alone. The
+    /// request continued on a value the recording never held; the miss is still
+    /// scored, only the continuation changes.
+    Synthesized,
+    /// The request STOPPED here — either a miss the site declined to answer
+    /// ([`Reconstructed::NoValue`]) or a hit whose payload would not rebuild
+    /// ([`Reconstructed::Failed`]). The second case used to be invisible: the
+    /// observation said `resolved: true` and the seam then panicked, so the
+    /// ledger showed a cleanly-served call for a request that died.
+    Stopped,
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1372,29 @@ pub trait DejaHook: Send + Sync {
     fn execute_shadow_peek(&self, _query: ReplayLookup<'_>) -> Option<ExecuteShadowToken> {
         None
     }
+
+    /// First half of a `Substitute` lookup: resolve the recorded baseline
+    /// WITHOUT emitting, returning it alongside the observation the seam will
+    /// complete once it knows what it did with the result.
+    ///
+    /// The default keeps the one-phase behaviour by delegating to
+    /// [`DejaHook::try_replay_with_context`], which emits eagerly. Such a hook
+    /// returns no token and therefore cannot report the outcome — its
+    /// observations carry the default [`SubstituteOutcome::Substituted`]. Hooks
+    /// that emit `ObservedCall`s should override BOTH halves.
+    fn substitute_peek(&self, query: ReplayLookup<'_>) -> SubstitutePeek {
+        SubstitutePeek {
+            recorded: self.try_replay_with_context(query),
+            token: None,
+        }
+    }
+
+    /// Second half of a `Substitute` lookup: stamp the observed outcome onto the
+    /// pending observation and emit it. Called by the seam after the site's
+    /// reconstruct closure has run — including on the paths that then fail-stop,
+    /// which is why a stopped request still reports its blocking divergence.
+    /// The default is a no-op, matching the default `substitute_peek`.
+    fn substitute_observe(&self, _token: SubstituteToken, _outcome: SubstituteOutcome) {}
 
     /// Second half of an execute-mode dispatch: stamp the REAL boundary's
     /// `observed_result` onto the token's carried observation and emit it
@@ -1541,6 +1919,24 @@ impl DejaHook for RuntimeHook {
         }
     }
 
+    fn substitute_peek(&self, query: ReplayLookup<'_>) -> SubstitutePeek {
+        match self {
+            RuntimeHook::Recording(h) => h.substitute_peek(query),
+            RuntimeHook::Replay(h) => h.substitute_peek(query),
+            RuntimeHook::LookupReplay(h) => h.substitute_peek(query),
+            RuntimeHook::Disabled(h) => h.substitute_peek(query),
+        }
+    }
+
+    fn substitute_observe(&self, token: SubstituteToken, outcome: SubstituteOutcome) {
+        match self {
+            RuntimeHook::Recording(h) => h.substitute_observe(token, outcome),
+            RuntimeHook::Replay(h) => h.substitute_observe(token, outcome),
+            RuntimeHook::LookupReplay(h) => h.substitute_observe(token, outcome),
+            RuntimeHook::Disabled(h) => h.substitute_observe(token, outcome),
+        }
+    }
+
     fn execute_shadow_peek(&self, query: ReplayLookup<'_>) -> Option<ExecuteShadowToken> {
         match self {
             RuntimeHook::Recording(h) => h.execute_shadow_peek(query),
@@ -1854,6 +2250,8 @@ pub struct EventBuilder {
     /// Structural role stamped onto the emitted event (see [`BoundaryEvent::role`]).
     /// `None` by default; ingress recorders opt in via [`Self::with_role`].
     role: Option<&'static str>,
+    /// See [`BoundaryEvent::fidelity`].
+    fidelity: Fidelity,
 }
 
 /// Stable content digest over `(args, result)`, reusing the same canonical
@@ -1971,6 +2369,7 @@ impl EventBuilder {
             callsite_identity: None,
             semantics: BoundarySemantics::undeclared(),
             role: None,
+            fidelity: Fidelity::default(),
         }
     }
 
@@ -1993,6 +2392,12 @@ impl EventBuilder {
     /// (see [`BoundaryEvent::role`]); everything else leaves this unset.
     pub fn with_role(mut self, role: &'static str) -> Self {
         self.role = Some(role);
+        self
+    }
+
+    /// Stamp the measured round-trip fidelity of the result.
+    pub fn with_fidelity(mut self, fidelity: Fidelity) -> Self {
+        self.fidelity = fidelity;
         self
     }
 
@@ -2128,6 +2533,7 @@ impl EventBuilder {
             callsite_identity,
             semantics,
             role,
+            fidelity,
             ..
         } = self;
 
@@ -2160,6 +2566,12 @@ impl EventBuilder {
             fork_seq,
         } = current_task_metadata(correlation_id.as_deref());
 
+        // `request` and `response` are the same payloads as `args` and `result`
+        // under their readable names, so they are built once and shared: a
+        // `Payload` clone is a refcount bump, not a second copy of the text.
+        let args = Payload::from(args);
+        let result = Payload::from(result);
+
         let event = BoundaryEvent {
             global_sequence,
             request_sequence,
@@ -2179,7 +2591,7 @@ impl EventBuilder {
             call_file: call_file.to_string(),
             call_line,
             call_column,
-            receiver,
+            receiver: receiver.map(Payload::from),
             request: args.clone(),
             args,
             response: result.clone(),
@@ -2189,9 +2601,9 @@ impl EventBuilder {
             event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
             callsite_identity,
             provenance: Provenance::default(),
-            fidelity: Fidelity::default(),
-            result_image: explicit_result_image,
-            pre_image: explicit_pre_image,
+            fidelity,
+            result_image: (explicit_result_image).map(Payload::from),
+            pre_image: (explicit_pre_image).map(Payload::from),
             read_set,
             write_set,
             value_digest,
@@ -2951,14 +3363,12 @@ pub fn replay_boundary(
     spec: &BoundarySpec,
     args: &serde_json::Value,
     identity: Option<&CallsiteIdentity>,
-    miss_policy: MissPolicy,
 ) -> Option<serde_json::Value> {
     let hook = global_runtime_hook_from_env()?;
     if !hook.is_active() {
         return None;
     }
     hook.try_replay_with_context(ReplayLookup {
-        miss_policy,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -3011,7 +3421,6 @@ pub fn execute_shadow_peek_boundary(
         return None;
     }
     hook.execute_shadow_peek(ReplayLookup {
-        miss_policy: crate::MissPolicy::FailStop,
         boundary: spec.boundary,
         trait_name: spec.trait_name,
         method_name: spec.method_name,
@@ -3019,6 +3428,49 @@ pub fn execute_shadow_peek_boundary(
         callsite_identity: identity,
         caller_location: Some(caller),
     })
+}
+
+/// First half of a `Substitute` lookup for an instrumented boundary: resolve the
+/// recorded baseline WITHOUT emitting the observation, so the seam can stamp
+/// what it actually did before the observation goes out.
+///
+/// With no hook configured, or an inactive one, this reports a MISS with no
+/// pending observation — the same continuation the one-phase seam produced when
+/// `replay_boundary` returned `None`.
+#[track_caller]
+pub fn substitute_peek_boundary(
+    caller: &'static Location<'static>,
+    spec: &BoundarySpec,
+    args: &serde_json::Value,
+    identity: Option<&CallsiteIdentity>,
+) -> SubstitutePeek {
+    let inactive = SubstitutePeek {
+        recorded: None,
+        token: None,
+    };
+    let Some(hook) = global_runtime_hook_from_env() else {
+        return inactive;
+    };
+    if !hook.is_active() {
+        return inactive;
+    }
+    hook.substitute_peek(ReplayLookup {
+        boundary: spec.boundary,
+        trait_name: spec.trait_name,
+        method_name: spec.method_name,
+        args,
+        callsite_identity: identity,
+        caller_location: Some(caller),
+    })
+}
+
+/// Second half of a `Substitute` lookup: stamp the seam's outcome onto the
+/// pending observation and emit it. Called on EVERY outcome, including the two
+/// that then fail-stop.
+pub fn substitute_observe_boundary(token: SubstituteToken, outcome: SubstituteOutcome) {
+    if let Some(hook) = global_runtime_hook_from_env() {
+        hook.substitute_observe(token, outcome);
+    }
 }
 
 /// Second half of an execute-mode dispatch for an instrumented boundary: emit
@@ -3248,45 +3700,6 @@ impl CrossingObservation {
     }
 }
 
-/// The ONE replay-facing seam the boundary macro calls.
-///
-/// Recording captures raw observations; replay performs all interpretation
-/// (design §1). This function owns ALL of the run/skip/shadow/record control
-/// flow internally, so the macro emits a single mode-agnostic shape and names
-/// ZERO replay-only operations. Removing every replay hook would leave this a
-/// plain "run + (maybe) record" function and change the macro's emitted tokens
-/// by zero.
-///
-/// The four closures the macro supplies:
-/// - `args` — LAZY structured-args serialization. NOT evaluated when the hook
-///   is inactive, preserving the zero-overhead fast path
-///   (`start_boundary_event_lazy`'s laziness, design §3 / major #5).
-/// - `run` — the real boundary block.
-/// - `reconstruct` — turns a recorded JSON value back into `T` on a lookup hit.
-///   It returns [`Reconstructed::Value`] when the payload rebuilds cleanly and
-///   [`Reconstructed::Failed`] when the payload is malformed or incompatible; a
-///   failed reconstruction fail-stops before live execution.
-/// - `extract` — the lossless result image AND the `is_error` flag, as the
-///   existing record/shadow seams expect. Fidelity is fixed by the macro, not
-///   chosen by a replay flag.
-///
-/// Internally this is implemented in terms of the recording event seam plus the
-/// deprecated replay/shadow seams [`replay_boundary`] and `execute_shadow_*`.
-/// The outer branch is always the explicit [`RuntimeMode`], so record/no-op never
-/// ask replay helpers for a verdict.
-///
-/// Control flow (all owned here, never named by the macro):
-/// - **NoOp** → call the lazy record-only path, which runs `run()` and evaluates
-///   `args` only if a standalone recorder is actually active.
-/// - **Record** → call the same lazy record-only path; no replay lookup and no
-///   execute-shadow lookup run in record mode.
-/// - **Replay + Execute** → run `run()` only after an execute-shadow token is
-///   returned, shadow-observe `extract(&out)`, and suppress the normal record.
-/// - **Replay + Substitute hit** → reconstruct the recorded value WITHOUT
-///   calling `run()`; `Failed` fail-stops. Live replay execution is reserved for
-///   declared `Execute`.
-/// - **Replay + Substitute miss** → fail-stop; there is no recorded value to
-///   serve and live execution would be unsafe.
 // NOTE: no `#[track_caller]` — the authoritative invocation address is
 // `obs.caller`, captured by the macro at its own `#[track_caller]` entry and
 // threaded through `CrossingObservation`. The internal seams receive it
@@ -3302,10 +3715,74 @@ impl CrossingObservation {
 /// three debugging cycles (`DirValue::Connector`'s `skip_deserializing`, twice,
 /// then `Encryptable`'s two-halves change). The reason is built only on the
 /// failure path, which is cold and terminal.
+///
+/// The four variants are the product of two independent questions: did the
+/// lookup HIT, and does the site have a usable value? A hit that rebuilds is
+/// `Value`; a hit that will not rebuild is `Failed`. A miss the site can answer
+/// deterministically is `Synthesized`; a miss it cannot is `NoValue`. Only the
+/// first two were reachable before per-site synthesis existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconstructed<T> {
+    /// Lookup HIT; the recorded payload rebuilt cleanly. Provenance: recorded.
     Value(T),
+    /// Lookup MISSED; the site derived this value from the query ALONE.
+    ///
+    /// The value must be a pure function of the [`SubstituteMiss`] handed to the
+    /// closure. That is the load-bearing property and it is not honesty — it is
+    /// determinism. Two replays of one candidate against one tape must agree
+    /// with each other, or "the candidate changed" cannot be separated from
+    /// "the fabrication changed" and self-replay never comes out clean. It is
+    /// also what keeps two DIFFERENT candidates comparable past the edge of the
+    /// tape: same query, same synthesized value, so the region the recording
+    /// does not cover still compares.
+    ///
+    /// Answering a miss by running the real computation is the most honest
+    /// option available and the worst one: a fresh uuid at a `deja::id` seam
+    /// reintroduces exactly the nondeterminism the seam exists to remove, on
+    /// precisely the calls the seam failed to cover.
+    Synthesized(T),
+    /// Lookup HIT but the recorded payload could not be rebuilt. Carries WHY.
+    ///
+    /// The reason used to be discarded at the codec seam, leaving an operator
+    /// with only `server closed the connection without writing a response` — a
+    /// codec incompatibility that reads exactly like a network fault. That
+    /// anonymity cost three debugging cycles (`DirValue::Connector`'s
+    /// `skip_deserializing`, twice, then `Encryptable`'s two-halves change).
+    /// Built only on the failure path, which is cold and terminal.
     Failed(String),
+    /// Lookup MISSED and the site has nothing deterministic to offer, so the
+    /// request stops.
+    ///
+    /// The right answer wherever no value is honest AND none is derivable:
+    /// egress (no function of the query yields a plausible gateway reply), and
+    /// anything whose fabrication would be a lie with consequences — the
+    /// enumeration's standing example being `get_temp_password`, where a
+    /// content-addressed value is by construction a value anyone who knows the
+    /// query can predict.
+    NoValue,
+}
+
+/// What a `Substitute` lookup handed the site's reconstruct closure.
+///
+/// One closure now answers both halves of the lookup. The two arms are made
+/// exclusive BY TYPE rather than by convention: a `(Option<Value>, &Miss)` pair
+/// would let a miss arm read a recorded value that is not there and a hit arm
+/// consult a query it should not need, and neither mistake would be caught.
+///
+/// It is also what keeps the marker off the hot path — `Miss` borrows a
+/// [`SubstituteMiss`] the seam builds only when the lookup actually missed.
+pub enum ReconstructInput<'a> {
+    /// The lookup HIT; here is the recorded payload to rebuild.
+    Hit(serde_json::Value),
+    /// The lookup MISSED; here are the facts about the call that missed.
+    ///
+    /// Anything returned from this arm must be a function of THIS value and
+    /// nothing else. The signature is the whole enforcement — reaching past it
+    /// for a clock or an RNG is easy to write and meant to look wrong — but it
+    /// is not a proof: a closure can still capture its environment. See
+    /// [`Reconstructed::Synthesized`] for why determinism is the property that
+    /// matters more than honesty.
+    Miss(&'a SubstituteMiss),
 }
 
 /// Replay fail-stop on a Substitute-miss (the partial-function model).
@@ -3377,6 +3854,21 @@ pub struct SubstituteMiss {
     /// The structured args image that found no recorded answer — the same value
     /// the lookup was keyed on, so a miss can be matched against the tape.
     pub args: serde_json::Value,
+    /// Which call to this site within the correlation this was (0 for the first).
+    ///
+    /// Carried so [`crate::synth`] can separate two misses that are otherwise
+    /// identical — same site, same args — and so a site with an advancing value
+    /// (a clock, a sequence) has something to advance ON. Zero when the seam had
+    /// no identity to read it from.
+    pub occurrence: u32,
+    /// The correlation the call fired under, when there was one.
+    ///
+    /// Part of the synthesis digest, and safe to be: the orchestrator replays the
+    /// SAME correlation ids to every candidate, so including it separates two
+    /// requests from each other without separating two candidates from each other
+    /// — which is the property that keeps them comparable past the edge of the
+    /// tape.
+    pub correlation_id: Option<String>,
 }
 
 impl SubstituteMiss {
@@ -3393,7 +3885,17 @@ impl SubstituteMiss {
             component,
             method,
             args,
+            occurrence: 0,
+            correlation_id: None,
         }
+    }
+
+    /// Attach the call context synthesis needs. Kept off [`Self::new`] so a
+    /// hand-written seam that only wants attribution is unaffected.
+    pub fn with_call_context(mut self, occurrence: u32, correlation_id: Option<String>) -> Self {
+        self.occurrence = occurrence;
+        self.correlation_id = correlation_id;
+        self
     }
 }
 
@@ -3673,64 +4175,208 @@ fn shadow_observe_loud<F: FnOnce()>(boundary: &str, method: &str, observe: F) {
     }
 }
 
-pub fn dispatch<T, A, F, C, R, O>(
-    obs: CrossingObservation,
-    args: A,
-    run: F,
+/// The ONE Substitute-lookup arm, shared by [`dispatch`] and [`dispatch_async`].
+///
+/// Sequenced as resolve → decide → EMIT → (maybe) stop. The emit must precede
+/// the stop: both `Stopped` arms below diverge, and an observation that never
+/// reached the sink would make a request the miss killed indistinguishable from
+/// one that never made the call at all.
+///
+/// That ordering is what removed the declared `MissPolicy`. The lookup used to
+/// emit its own observation, so the seam's decision arrived too late to be
+/// recorded and the boundary's DECLARATION had to stand in for it. Holding the
+/// observation across the decision — which the execute-shadow path has always
+/// done — makes the outcome an observed fact. The seam owns both fail-stops and
+/// consumes the token before it panics; a future dropped before the seam
+/// decides leaves the token to write the call as cancelled.
+fn substitute_lookup<T, C>(
+    caller: &'static Location<'static>,
+    spec: &BoundarySpec,
+    identity: &CallsiteIdentity,
+    correlation: Option<&str>,
+    boundary_args: serde_json::Value,
     reconstruct: C,
-    extract: R,
 ) -> T
 where
-    A: FnOnce() -> serde_json::Value,
-    F: FnOnce() -> T,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
-    R: Fn(&T) -> O,
-    O: Into<RecordedOutput>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
 {
-    // Default: a Substitute-miss has no honest value and re-running is unsafe,
-    // so STOP (see `fail_stop_substitute_miss`). A boundary whose caller has a
-    // deterministic degraded path declares `on_miss` and routes through
-    // `dispatch_or_miss` instead. Mirrors `dispatch` / `dispatch_async_or_miss`.
-    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_or_miss(
-        obs,
-        args,
-        run,
+    let peek = substitute_peek_boundary(caller, spec, &boundary_args, Some(identity));
+    substitute_decide(
+        spec,
+        identity,
+        correlation,
+        peek,
+        boundary_args,
         reconstruct,
-        extract,
-        MissPolicy::FailStop,
-        move || fail_stop_substitute_miss(boundary, method),
+        substitute_observe_boundary,
     )
 }
 
-/// [`dispatch`] with a caller-supplied `on_miss` value for the Substitute-miss
-/// branch — the sync twin of [`dispatch_async_or_miss`]. See it for the full
-/// contract: the blocking NovelCall divergence is still emitted before `on_miss`
-/// runs, and a HIT whose recorded value cannot be reconstructed still fail-stops.
-pub fn dispatch_or_miss<T, A, F, C, R, O, M>(
+/// The decision half of a `Substitute` lookup, parameterized on how to emit.
+///
+/// The delegate seams replay through a hook INJECTED into the wrapper rather
+/// than the process-global one, so they cannot share
+/// [`substitute_observe_boundary`]. They share this instead — which is the
+/// point: the emit-before-stop ordering lives in exactly ONE place, and a seam
+/// that forgot it would have to be written by hand to do so.
+fn substitute_decide<T, C, E>(
+    spec: &BoundarySpec,
+    identity: &CallsiteIdentity,
+    correlation: Option<&str>,
+    peek: SubstitutePeek,
+    boundary_args: serde_json::Value,
+    reconstruct: C,
+    observe: E,
+) -> T
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    E: FnOnce(SubstituteToken, SubstituteOutcome),
+{
+    let SubstitutePeek { recorded, token } = peek;
+
+    // Built ONLY on the miss branch. `SubstituteMiss` owns its args image, so
+    // constructing it eagerly costs a clone on every active call at every
+    // boundary with a miss arm — which is what the previous shape paid, because
+    // the macro had to hand the marker to a thunk before the outcome was known.
+    // The seam can build it from the spec alone (`trait_name` IS the declared
+    // component), so the cold path pays and the hot path does not.
+    let miss;
+    let rebuilt = match recorded {
+        Some(value) => reconstruct(ReconstructInput::Hit(value)),
+        None => {
+            miss = SubstituteMiss::new(
+                spec.boundary,
+                spec.trait_name,
+                spec.method_name,
+                boundary_args,
+            )
+            .with_call_context(
+                identity.occurrence,
+                // Same fallback the record seam uses: explicit if the site set
+                // one, else ambient. Read HERE and not earlier, so an active call
+                // that hits pays nothing for it.
+                correlation
+                    .map(ToOwned::to_owned)
+                    .or_else(deja_context::current_correlation_id),
+            );
+            reconstruct(ReconstructInput::Miss(&miss))
+        }
+    };
+
+    let outcome = match &rebuilt {
+        Reconstructed::Value(_) => SubstituteOutcome::Substituted,
+        Reconstructed::Synthesized(_) => SubstituteOutcome::Synthesized,
+        Reconstructed::Failed(_) | Reconstructed::NoValue => SubstituteOutcome::Stopped,
+    };
+    if let Some(token) = token {
+        observe(token, outcome);
+    }
+
+    match rebuilt {
+        Reconstructed::Value(replayed) | Reconstructed::Synthesized(replayed) => replayed,
+        // A hit whose payload will not rebuild is a capture/codec incompatibility,
+        // not graceful degradation: running the live boundary here would convert
+        // it into production I/O. Stop. Unlike before, the observation this
+        // request leaves behind now says it stopped, rather than reporting a
+        // cleanly-served call for a request that died.
+        Reconstructed::Failed(reason) => {
+            fail_stop_substitute_unreconstructable(spec.boundary, spec.method_name, &reason)
+        }
+        Reconstructed::NoValue => fail_stop_substitute_miss(spec.boundary, spec.method_name),
+    }
+}
+
+/// The ONE replay-facing seam the boundary macro calls.
+///
+/// Recording captures raw observations; replay performs all interpretation
+/// (design §1). This function owns ALL of the run/skip/shadow/record control
+/// flow internally, so the macro emits a single mode-agnostic shape and names
+/// ZERO replay-only operations. Removing every replay hook would leave this a
+/// plain "run + (maybe) record" function and change the macro's emitted tokens
+/// by zero.
+///
+/// The four closures the macro supplies:
+/// - `args` — LAZY structured-args serialization. NOT evaluated when the hook
+///   is inactive, preserving the zero-overhead fast path
+///   (`start_boundary_event_lazy`'s laziness, design §3 / major #5).
+/// - `run` — the real boundary block.
+/// - `reconstruct` — answers BOTH halves of a Substitute lookup, taking a
+///   [`ReconstructInput`]. On a HIT it rebuilds `T` from the recorded JSON,
+///   returning [`Reconstructed::Value`] or [`Reconstructed::Failed`]. On a MISS
+///   it either derives a value from the query ([`Reconstructed::Synthesized`])
+///   or declines ([`Reconstructed::NoValue`]). Both `Failed` and `NoValue`
+///   fail-stop, AFTER the observation is emitted.
+/// - `extract` — the lossless result image AND the `is_error` flag, as the
+///   existing record/shadow seams expect. Fidelity is fixed by the macro, not
+///   chosen by a replay flag.
+///
+/// There is no separate `on_miss` parameter and no `_or_miss` twin. The miss
+/// continuation is something the site RETURNS rather than a policy it declares
+/// alongside, which is what lets the emitted observation record what actually
+/// happened — see [`SubstituteOutcome`].
+///
+/// Internally this is implemented in terms of the recording event seam, the
+/// two-phase substitute lifecycle, and the deprecated `execute_shadow_*` seams.
+/// The outer branch is always the explicit [`RuntimeMode`], so record/no-op never
+/// ask replay helpers for a verdict.
+///
+/// Control flow (all owned here, never named by the macro):
+/// - **NoOp** → call the lazy record-only path, which runs `run()` and evaluates
+///   `args` only if a standalone recorder is actually active.
+/// - **Record** → call the same lazy record-only path; no replay lookup and no
+///   execute-shadow lookup run in record mode.
+/// - **Replay + Execute** → run `run()` only after an execute-shadow token is
+///   returned, shadow-observe `extract(&out)`, and suppress the normal record.
+/// - **Replay + Substitute** → resolve the baseline WITHOUT emitting, ask
+///   `reconstruct`, emit the observation stamped with what it said, and only
+///   then return the value or stop. `run()` is never called: live replay
+///   execution is reserved for declared `Execute`.
+///
+/// This doc block used to sit two items away from the function it describes — a
+/// plain `//` note between it and the code left it attached to
+/// [`Reconstructed`], so `dispatch` rendered undocumented and the enum rendered
+/// with the seam's control flow on top of its own.
+/// The ONE replay-facing seam for sync boundaries.
+///
+/// `reconstruct` answers BOTH halves of a Substitute lookup — see
+/// [`ReconstructInput`]. There is no separate `on_miss` parameter and no
+/// `dispatch_or_miss` twin: a boundary that declares a miss value returns
+/// [`Reconstructed::Synthesized`] from the miss arm, one that does not returns
+/// [`Reconstructed::NoValue`], and the seam stops on the latter exactly as the
+/// old default did.
+///
+/// `neutral` is the site's declaration that an error it recorded changed no
+/// state, as a predicate over the rebuilt value. When it is `Some` and this
+/// call's own recorded result is such an error, an `Execute` site returns that
+/// error instead of re-running (see [`serves_recorded_error`]). The recorded
+/// run's statement failed and wrote nothing; re-running it here could succeed
+/// and write a row the recording never had, so serving the error is what keeps
+/// the replay's state the recording's. `Substitute` sites ignore it.
+pub fn dispatch_serving<T, A, F, C, R, O, S, P>(
     obs: CrossingObservation,
     args: A,
     run: F,
     reconstruct: C,
     extract: R,
-    miss_policy: MissPolicy,
-    on_miss: M,
+    check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
     F: FnOnce() -> T,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
-    M: FnOnce() -> T,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match runtime_mode() {
-        RuntimeMode::Disabled => record_only_path(obs, args, run, extract),
-        RuntimeMode::Record => record_only_path(obs, args, run, extract),
+        RuntimeMode::Disabled | RuntimeMode::Record => {
+            record_only_path(obs, args, run, reconstruct, extract, check)
+        }
         RuntimeMode::Replay => {
             // Bind the structured args ONCE in replay mode. The same value feeds
-            // the execute peek, the substitute lookup, and the deferred live
-            // record path used only for explicit recorded-skip fall-throughs.
+            // the execute peek and the substitute lookup.
             let boundary_args: serde_json::Value = args();
 
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
@@ -3742,11 +4388,26 @@ where
                         &boundary_args,
                         Some(&obs.identity),
                     ) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        #[allow(deprecated)]
+                                        execute_shadow_observe_boundary(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run();
                         // Serialization of the live output runs UNGUARDED: a
                         // panicking `extract` is a code bug and must propagate —
                         // returning live output without an observation would
-                        // silently under-report divergence.
+                        // silently under-report divergence. The unwind drops
+                        // the token, which writes the call as cancelled.
                         let result_json = extract(&out).into().result;
                         shadow_observe_loud(obs.spec.boundary, obs.spec.method_name, || {
                             #[allow(deprecated)]
@@ -3756,30 +4417,242 @@ where
                     }
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
-                ExecuteMode::Lookup => {
-                    #[allow(deprecated)]
-                    match replay_boundary(
-                        obs.caller,
-                        &obs.spec,
-                        &boundary_args,
-                        Some(&obs.identity),
-                        miss_policy,
-                    ) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => on_miss(),
-                    }
-                }
+                ExecuteMode::Lookup => substitute_lookup(
+                    obs.caller,
+                    &obs.spec,
+                    &obs.identity,
+                    obs.correlation_id.as_deref(),
+                    boundary_args,
+                    reconstruct,
+                ),
             }
         }
+    }
+}
+
+/// [`dispatch_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub fn dispatch<T, A, F, C, R, O, S>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
+}
+
+/// What the round-trip check needs to know about a site, taken before the
+/// record path consumes its spec.
+#[derive(Clone, Copy)]
+struct RoundTripSite {
+    substitutes: bool,
+    boundary: &'static str,
+    method_name: &'static str,
+}
+
+impl RoundTripSite {
+    fn of(spec: &BoundarySpec) -> Self {
+        Self {
+            substitutes: crate::replay::replay_strategy_to_execute_mode(spec.replay_strategy)
+                == ExecuteMode::Lookup,
+            boundary: spec.boundary,
+            method_name: spec.method_name,
+        }
+    }
+}
+
+/// Rebuild the value this call just recorded, through the site's own
+/// `reconstruct`, and compare it with the original — the property replay
+/// depends on and nothing else checks.
+///
+/// The rebuild reads the capture back from its JSON TEXT, as replay reads it
+/// from the tape: rebuilding from the in-memory value would hold, for example,
+/// an `f64` that the text form does not reproduce. A capture whose text runs
+/// past [`round_trip::MAX_CHECKED_BYTES`] is not checked: the serialisation
+/// stops there, so the check's cost on the recording path is bounded.
+fn round_trip_fidelity<T, C, S>(
+    site: RoundTripSite,
+    out: &T,
+    output: &RecordedOutput,
+    reconstruct: C,
+    check: round_trip::RoundTrip<S>,
+) -> Fidelity
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    if !site.substitutes || output.is_error {
+        return Fidelity::Unverified;
+    }
+    let compare = match check {
+        round_trip::RoundTrip::RecordOnly => return Fidelity::Opaque,
+        round_trip::RoundTrip::Unverifiable => return Fidelity::Unverified,
+        round_trip::RoundTrip::Check(compare) => compare,
+    };
+    let mut text = round_trip::BoundedText::new(round_trip::MAX_CHECKED_BYTES);
+    if serde_json::to_writer(&mut text, &output.result).is_err() {
+        return if text.overflowed() {
+            Fidelity::Unverified
+        } else {
+            Fidelity::Opaque
+        };
+    }
+    let Ok(as_read) = serde_json::from_slice::<serde_json::Value>(text.bytes()) else {
+        return Fidelity::Opaque;
+    };
+    match reconstruct(ReconstructInput::Hit(as_read)) {
+        Reconstructed::Value(rebuilt) => match compare(out, &rebuilt) {
+            round_trip::Comparison::Same => Fidelity::Lossless,
+            round_trip::Comparison::Different => Fidelity::Lossy,
+            round_trip::Comparison::Incomparable => Fidelity::Unverified,
+        },
+        Reconstructed::Synthesized(_) | Reconstructed::Failed(_) | Reconstructed::NoValue => {
+            Fidelity::Opaque
+        }
+    }
+}
+
+/// Capture `out`, measure its round trip, and hand both to `emit`, inside the
+/// recorder's panic firewall.
+///
+/// The measurement has a firewall of its own: a `reconstruct` or comparison
+/// that panics is a site that does not rebuild, so it reads as opaque and the
+/// event is still written, rather than taking the event with it.
+///
+/// A site that declares a codec and does not round-trip through it is a codec
+/// bug. A debug build panics on it, outside the firewall, so every test that
+/// records through it fails; that includes a debug-built service with
+/// recording on. A release recorder only stamps it on the event: recording
+/// never fails the service.
+fn finish_round_tripped<T, R, O, C, S>(
+    site: RoundTripSite,
+    out: &T,
+    extract: R,
+    reconstruct: C,
+    check: round_trip::RoundTrip<S>,
+    emit: impl FnOnce(RecordedOutput, Fidelity),
+) where
+    R: FnOnce(&T) -> O,
+    O: Into<RecordedOutput>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    let checks = matches!(check, round_trip::RoundTrip::Check(_));
+    let fidelity = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let output = extract(out).into();
+        let fidelity = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            round_trip_fidelity(site, out, &output, reconstruct, check)
+        }))
+        .unwrap_or(Fidelity::Opaque);
+        emit(output, fidelity);
+        fidelity
+    }))
+    .ok();
+    if cfg!(debug_assertions)
+        && checks
+        && matches!(fidelity, Some(Fidelity::Lossy | Fidelity::Opaque))
+    {
+        panic!(
+            "deja: `{}::{}` does not round-trip through its own codec ({:?}): replay would \
+             return a different value from the one this recording saw",
+            site.boundary, site.method_name, fidelity
+        );
+    }
+}
+
+/// Whether an execute-shadow boundary should SERVE a recorded result instead of
+/// re-running its statement.
+///
+/// An execute boundary re-runs so the replay's state evolves as the recording's
+/// did. A recorded `Err` that changed no state has nothing to evolve, so
+/// re-running it is not "evolving like the recording" — it is evolving
+/// DIFFERENTLY from it. Measured on one self-replay: 40 origins where an INSERT
+/// recorded as a unique-constraint violation replayed `Ok`, because the
+/// per-correlation schema was seeded without the row that made it collide. The
+/// reported divergence is the visible half; the damaging half is that the
+/// replay then WROTE a row the recording never wrote, so every later statement
+/// in that correlation ran against a different database.
+///
+/// Two conditions, and deja owns only the first.
+///
+/// The recorded envelope must say `Err`. That is `ResultCodec`'s own
+/// discriminator, a shape deja defined, so reading it is not deja learning an
+/// error taxonomy. A boundary whose codec writes no discriminator has no
+/// opinion here and is left alone.
+///
+/// And the SITE must have declared that error class state-neutral. A unique
+/// violation wrote nothing; a partially-applied statement did; a timeout or a
+/// deadlock says nothing about state at all and re-running it is how a candidate
+/// that no longer fails that way gets to show it. Only the site can tell these
+/// apart — `UniqueViolation` is a driver concept — so the predicate is the
+/// vendor's over its own error type and deja never inspects the error itself.
+pub fn serves_recorded_error(recorded: &serde_json::Value, site_declares_neutral: bool) -> bool {
+    site_declares_neutral
+        && recorded.get("result").and_then(serde_json::Value::as_str) == Some("Err")
+}
+
+/// The resolution ranks a recorded error may be served from: a site the author
+/// declared (1) or the call's span path (2). Both find this call by where it
+/// is. An unlocated match (3) can hand one call another call's recorded value,
+/// and a served error is never compared afterwards, so a wrong one would go
+/// unseen. Anything else, no resolution included, runs the boundary.
+const SERVING_RANKS: [u8; 2] = [1, 2];
+
+/// Serve this call's own recorded error instead of running the boundary, when
+/// the site declared it state-neutral; otherwise hand the token back to run.
+///
+/// Reads only the row the execute peek already resolved for THIS call through
+/// its correlation, so nothing is borrowed from another request, and only when
+/// the peek found it by the call's site ([`SERVING_RANKS`]). A recorded value
+/// that does not rebuild, or that the site's predicate does not accept, falls
+/// through to running the boundary, never to a fail-stop.
+// The token already moved by value into the observer; handing it back moves it
+// once more, where boxing it would allocate on every executed call.
+#[allow(clippy::result_large_err)]
+fn serve_or_run<T, C, P>(
+    token: ExecuteShadowToken,
+    neutral: Option<P>,
+    reconstruct: C,
+    emit: impl FnOnce(ExecuteShadowToken, serde_json::Value),
+) -> Result<T, ExecuteShadowToken>
+where
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    P: FnOnce(&T) -> bool,
+{
+    if !matches!(token.resolved_rank(), Some(rank) if SERVING_RANKS.contains(&rank)) {
+        return Err(token);
+    }
+    let recorded = match token.recorded_result() {
+        Some(recorded) if serves_recorded_error(recorded, neutral.is_some()) => recorded.clone(),
+        _ => return Err(token),
+    };
+    let Some(neutral) = neutral else {
+        return Err(token);
+    };
+    match reconstruct(ReconstructInput::Hit(recorded.clone())) {
+        Reconstructed::Value(value) if neutral(&value) => {
+            emit(token.served(), recorded);
+            Ok(value)
+        }
+        _ => Err(token),
     }
 }
 
@@ -3790,13 +4663,23 @@ where
 /// `start_boundary_event_lazy`, which evaluates it ONLY when the recording hook
 /// is active. When nothing is recording, the hook short-circuits before `args`
 /// runs, so the inactive path serializes no arguments.
-fn record_only_path<T, A, F, R, O>(obs: CrossingObservation, args: A, run: F, extract: R) -> T
+fn record_only_path<T, A, F, C, R, O, S>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
 where
     A: FnOnce() -> serde_json::Value,
     F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let event = start_boundary_event_lazy_with_state(
         obs.caller,
         obs.spec,
@@ -3806,23 +4689,41 @@ where
         obs.state_capture,
     );
     let out = run();
-    finish_boundary_event(event, &out, &extract);
+    if let Some((hook, event)) = event {
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            check,
+            |output, fidelity| {
+                event
+                    .with_fidelity(fidelity)
+                    .finish_recorded(&*hook, output);
+            },
+        );
+    }
     out
 }
 
-async fn record_only_path_async<T, A, Fut, F, R, O>(
+async fn record_only_path_async<T, A, Fut, F, C, R, O, S>(
     obs: CrossingObservation,
     args: A,
     run: F,
+    reconstruct: C,
     extract: R,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
     Fut: std::future::Future<Output = T>,
     F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let event = start_boundary_event_lazy_with_state(
         obs.caller,
         obs.spec,
@@ -3832,7 +4733,20 @@ where
         obs.state_capture,
     );
     let out = run().await;
-    finish_boundary_event(event, &out, &extract);
+    if let Some((hook, event)) = event {
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            check,
+            |output, fidelity| {
+                event
+                    .with_fidelity(fidelity)
+                    .finish_recorded(&*hook, output);
+            },
+        );
+    }
     out
 }
 
@@ -3843,68 +4757,34 @@ where
 /// observation happens AFTER the real future resolves. The boundary macro emits
 /// this for `async fn` bodies and for `future = "boxed"` bodies (wrapping the
 /// returned `T` in `Box::pin`). See [`dispatch`] for the full rationale.
-pub async fn dispatch_async<T, A, Fut, F, C, R, O>(
-    obs: CrossingObservation,
-    args: A,
-    run: F,
-    reconstruct: C,
-    extract: R,
-) -> T
-where
-    A: FnOnce() -> serde_json::Value,
-    Fut: Future<Output = T>,
-    F: FnOnce() -> Fut,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
-    R: Fn(&T) -> O,
-    O: Into<RecordedOutput>,
-{
-    // Egress default: a Substitute-miss has no honest value and re-running is
-    // unsafe, so STOP (see `fail_stop_substitute_miss`). A boundary whose caller
-    // has a deterministic degraded path uses `dispatch_async_or_miss` instead.
-    let (boundary, method) = (obs.spec.boundary, obs.spec.method_name);
-    dispatch_async_or_miss(
-        obs,
-        args,
-        run,
-        reconstruct,
-        extract,
-        MissPolicy::FailStop,
-        move || fail_stop_substitute_miss(boundary, method),
-    )
-    .await
-}
-
-/// [`dispatch_async`] with a caller-supplied `on_miss` closure for the
-/// Substitute-miss branch. The blocking NovelCall divergence is STILL emitted by
-/// `replay_boundary` before this point — the miss is always surfaced on the
-/// scorecard; `on_miss` only decides the continuation. Use this for a read whose
-/// caller has a deterministic degraded path: a Superposition config read returns
-/// `Err(SuperpositionError)` so the app's DB→default fallback runs and replay
-/// progresses, instead of the egress fail-stop. `on_miss` fires ONLY on a genuine
-/// lookup miss — a HIT whose recorded value cannot be reconstructed still
-/// fail-stops (a codec incompatibility is a bug, not graceful degradation).
+///
+/// The Substitute arm is shared verbatim with the sync seam
+/// (`substitute_lookup`): it never awaits, so there is exactly ONE copy of the
+/// emit-before-stop ordering the observation's honesty depends on.
 #[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
-pub async fn dispatch_async_or_miss<T, A, Fut, F, C, R, O, M>(
+pub async fn dispatch_async_serving<T, A, Fut, F, C, R, O, S, P>(
     obs: CrossingObservation,
     args: A,
     run: F,
     reconstruct: C,
     extract: R,
-    miss_policy: MissPolicy,
-    on_miss: M,
+    check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     A: FnOnce() -> serde_json::Value,
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
-    M: FnOnce() -> T,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match runtime_mode() {
-        RuntimeMode::Disabled => record_only_path_async(obs, args, run, extract).await,
-        RuntimeMode::Record => record_only_path_async(obs, args, run, extract).await,
+        RuntimeMode::Disabled | RuntimeMode::Record => {
+            record_only_path_async(obs, args, run, reconstruct, extract, check).await
+        }
         RuntimeMode::Replay => {
             let boundary_args: serde_json::Value = args();
 
@@ -3916,11 +4796,26 @@ where
                         &boundary_args,
                         Some(&obs.identity),
                     ) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        #[allow(deprecated)]
+                                        execute_shadow_observe_boundary(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run().await;
                         // Serialization of the live output runs UNGUARDED: a
                         // panicking `extract` is a code bug and must propagate —
                         // returning live output without an observation would
-                        // silently under-report divergence.
+                        // silently under-report divergence. The unwind drops
+                        // the token, which writes the call as cancelled.
                         let result_json = extract(&out).into().result;
                         shadow_observe_loud(obs.spec.boundary, obs.spec.method_name, || {
                             #[allow(deprecated)]
@@ -3930,31 +4825,48 @@ where
                     }
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
-                ExecuteMode::Lookup => {
-                    #[allow(deprecated)]
-                    match replay_boundary(
-                        obs.caller,
-                        &obs.spec,
-                        &boundary_args,
-                        Some(&obs.identity),
-                        miss_policy,
-                    ) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => on_miss(),
-                    }
-                }
+                ExecuteMode::Lookup => substitute_lookup(
+                    obs.caller,
+                    &obs.spec,
+                    &obs.identity,
+                    obs.correlation_id.as_deref(),
+                    boundary_args,
+                    reconstruct,
+                ),
             }
         }
     }
+}
+
+/// [`dispatch_async_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub async fn dispatch_async<T, A, Fut, F, C, R, O, S>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_async_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -4001,18 +4913,22 @@ pub struct DelegateObservation<'a> {
 /// to be moved, which forbids a borrowing args thunk; the macro therefore
 /// computes args eagerly only on the active path, exactly as before). Once called,
 /// this seam branches solely on the injected hook's [`RuntimeMode`].
-pub fn dispatch_with_hook<T, F, C, R, O>(
+pub fn dispatch_with_hook_serving<T, F, C, R, O, S, P>(
     obs: DelegateObservation<'_>,
     args: serde_json::Value,
     run: F,
     reconstruct: C,
     extract: R,
+    check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     F: FnOnce() -> T,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match obs.hook.process_mode() {
         RuntimeMode::Disabled => run(),
@@ -4021,7 +4937,7 @@ where
         // — the per-request gate lives here, never in process_mode.
         RuntimeMode::Record => {
             if obs.hook.capture_verdict().should_capture() {
-                delegate_record_path(obs, args, run, extract)
+                delegate_record_path(obs, args, run, reconstruct, extract, check)
             } else {
                 run()
             }
@@ -4031,7 +4947,6 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -4039,6 +4954,19 @@ where
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
                     }) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        obs.hook.execute_shadow_observe(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run();
                         // Serialization runs UNGUARDED (a panicking `extract` is a
                         // code bug and must propagate); only the delegate observer
@@ -4053,33 +4981,60 @@ where
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
                 ExecuteMode::Lookup => {
-                    match obs.hook.try_replay_with_context(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
+                    // Two-phase against the INJECTED hook, then the shared
+                    // decision: the delegate path gets the same observed outcome
+                    // and the same emit-before-stop ordering as the global seam.
+                    let peek = obs.hook.substitute_peek(ReplayLookup {
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
                         args: &boundary_args,
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
-                    }) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
-                    }
+                    });
+                    substitute_decide(
+                        &obs.spec,
+                        &obs.identity,
+                        // The delegate observation carries no explicit
+                        // correlation; the ambient fallback inside applies.
+                        None,
+                        peek,
+                        boundary_args,
+                        reconstruct,
+                        |token, outcome| obs.hook.substitute_observe(token, outcome),
+                    )
                 }
             }
         }
     }
+}
+
+/// [`dispatch_with_hook_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub fn dispatch_with_hook<T, F, C, R, O, S>(
+    obs: DelegateObservation<'_>,
+    args: serde_json::Value,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_with_hook_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
 }
 
 /// Async twin of [`dispatch_with_hook`] for `async` delegate methods (which the
@@ -4087,26 +5042,30 @@ where
 /// future; the macro wraps the whole call in `Box::pin`. `args` is the
 /// already-serialized image (see [`dispatch_with_hook`] for why the delegate
 /// computes it eagerly on the active path).
-pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O>(
+pub async fn dispatch_async_with_hook_serving<T, Fut, F, C, R, O, S, P>(
     obs: DelegateObservation<'_>,
     args: serde_json::Value,
     run: F,
     reconstruct: C,
     extract: R,
+    check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
 ) -> T
 where
     Fut: Future<Output = T>,
     F: FnOnce() -> Fut,
-    C: FnOnce(serde_json::Value) -> Reconstructed<T>,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
 {
     match obs.hook.process_mode() {
         RuntimeMode::Disabled => run().await,
         // process_mode ROUTES; capture_verdict GATES the emit (see the sync path).
         RuntimeMode::Record => {
             if obs.hook.capture_verdict().should_capture() {
-                delegate_record_path_async(obs, args, run, extract).await
+                delegate_record_path_async(obs, args, run, reconstruct, extract, check).await
             } else {
                 run().await
             }
@@ -4116,7 +5075,6 @@ where
             match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
                 ExecuteMode::Execute => {
                     if let Some(token) = obs.hook.execute_shadow_peek(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
@@ -4124,6 +5082,19 @@ where
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
                     }) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        obs.hook.execute_shadow_observe(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
                         let out = run().await;
                         // Serialization runs UNGUARDED (a panicking `extract` is a
                         // code bug and must propagate); only the delegate observer
@@ -4138,46 +5109,80 @@ where
                     fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
                 }
                 ExecuteMode::Lookup => {
-                    match obs.hook.try_replay_with_context(ReplayLookup {
-                        miss_policy: crate::MissPolicy::FailStop,
+                    // Two-phase against the INJECTED hook, then the shared
+                    // decision: the delegate path gets the same observed outcome
+                    // and the same emit-before-stop ordering as the global seam.
+                    let peek = obs.hook.substitute_peek(ReplayLookup {
                         boundary: obs.spec.boundary,
                         trait_name: obs.spec.trait_name,
                         method_name: obs.spec.method_name,
                         args: &boundary_args,
                         callsite_identity: Some(&obs.identity),
                         caller_location: Some(obs.caller),
-                    }) {
-                        Some(recorded) => match reconstruct(recorded) {
-                            Reconstructed::Value(replayed) => replayed,
-                            Reconstructed::Failed(reason) => {
-                                fail_stop_substitute_unreconstructable(
-                                    obs.spec.boundary,
-                                    obs.spec.method_name,
-                                    &reason,
-                                )
-                            }
-                        },
-                        None => {
-                            fail_stop_substitute_miss(obs.spec.boundary, obs.spec.method_name);
-                        }
-                    }
+                    });
+                    substitute_decide(
+                        &obs.spec,
+                        &obs.identity,
+                        // The delegate observation carries no explicit
+                        // correlation; the ambient fallback inside applies.
+                        None,
+                        peek,
+                        boundary_args,
+                        reconstruct,
+                        |token, outcome| obs.hook.substitute_observe(token, outcome),
+                    )
                 }
             }
         }
     }
 }
 
-fn delegate_record_path<T, F, R, O>(
+/// [`dispatch_async_with_hook_serving`] for a site that declares no state-neutral error: it
+/// always runs the boundary in execute mode.
+pub async fn dispatch_async_with_hook<T, Fut, F, C, R, O, S>(
+    obs: DelegateObservation<'_>,
+    args: serde_json::Value,
+    run: F,
+    reconstruct: C,
+    extract: R,
+    check: round_trip::RoundTrip<S>,
+) -> T
+where
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    R: Fn(&T) -> O,
+    O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+{
+    dispatch_async_with_hook_serving(
+        obs,
+        args,
+        run,
+        reconstruct,
+        extract,
+        check,
+        None::<fn(&T) -> bool>,
+    )
+    .await
+}
+
+fn delegate_record_path<T, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     boundary_args: serde_json::Value,
     run: F,
+    reconstruct: C,
     extract: R,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     F: FnOnce() -> T,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let builder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         EventBuilder::start_with_receiver(
             obs.hook,
@@ -4194,26 +5199,39 @@ where
     .ok();
     let out = run();
     if let Some(builder) = builder {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let output = extract(&out).into();
-            builder.finish_recorded(obs.hook, output);
-        }));
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            check,
+            |output, fidelity| {
+                builder
+                    .with_fidelity(fidelity)
+                    .finish_recorded(obs.hook, output);
+            },
+        );
     }
     out
 }
 
-async fn delegate_record_path_async<T, Fut, F, R, O>(
+async fn delegate_record_path_async<T, Fut, F, C, R, O, S>(
     obs: DelegateObservation<'_>,
     boundary_args: serde_json::Value,
     run: F,
+    reconstruct: C,
     extract: R,
+    check: round_trip::RoundTrip<S>,
 ) -> T
 where
     Fut: std::future::Future<Output = T>,
     F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
     R: Fn(&T) -> O,
     O: Into<RecordedOutput>,
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
 {
+    let site = RoundTripSite::of(&obs.spec);
     let builder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         EventBuilder::start_with_receiver(
             obs.hook,
@@ -4230,10 +5248,18 @@ where
     .ok();
     let out = run().await;
     if let Some(builder) = builder {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let output = extract(&out).into();
-            builder.finish_recorded(obs.hook, output);
-        }));
+        finish_round_tripped(
+            site,
+            &out,
+            &extract,
+            reconstruct,
+            check,
+            |output, fidelity| {
+                builder
+                    .with_fidelity(fidelity)
+                    .finish_recorded(obs.hook, output);
+            },
+        );
     }
     out
 }
@@ -4513,10 +5539,10 @@ fn correlation_matches(event: &BoundaryEvent, correlation_id: Option<&str>) -> b
     }
 }
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -4524,7 +5550,7 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-fn fnv1a_str(hash: u64, value: &str) -> u64 {
+pub(crate) fn fnv1a_str(hash: u64, value: &str) -> u64 {
     let hash = fnv1a_bytes(hash, value.as_bytes());
     fnv1a_bytes(hash, &[0xff])
 }
@@ -4614,6 +5640,11 @@ mod tests {
 
     use super::*;
     use std::panic::Location;
+
+    /// The round-trip comparator for a test about routing, not codecs.
+    fn unchecked<T>() -> crate::round_trip::RoundTrip<fn(&T, &T) -> crate::round_trip::Comparison> {
+        crate::round_trip::RoundTrip::Unverifiable
+    }
 
     // -----------------------------------------------------------------------
     // DejaRecord — the one-stream wire shape (tag routes, fields stay flat).
@@ -4983,11 +6014,14 @@ mod tests {
             vec![explicit_write],
             "DB-shaped args/result must not add inferred row keys"
         );
-        assert_eq!(event.result_image, Some(result_image));
-        assert_eq!(event.pre_image, Some(pre_image));
+        assert_eq!(event.result_image, Some(Payload::from(result_image)));
+        assert_eq!(event.pre_image, Some(Payload::from(pre_image)));
         assert_eq!(
             event.value_digest,
-            Some(value_digest_of(&event.args, &event.result))
+            Some(value_digest_of(
+                &event.args.to_value(),
+                &event.result.to_value(),
+            ))
         );
     }
 
@@ -5195,10 +6229,10 @@ mod tests {
             call_line: 1,
             call_column: 1,
             receiver: None,
-            request: serde_json::json!({"key": "settlement_rate_default"}),
-            args: serde_json::json!(["settlement_rate_default"]),
-            response: serde_json::json!("0.10"),
-            result: serde_json::json!("0.10"),
+            request: serde_json::json!({"key": "settlement_rate_default"}).into(),
+            args: serde_json::json!(["settlement_rate_default"]).into(),
+            response: serde_json::json!("0.10").into(),
+            result: serde_json::json!("0.10").into(),
             is_error: false,
             duration_us: 1,
             event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5249,6 +6283,20 @@ mod tests {
         assert!(
             round_wire.get("fidelity").is_none(),
             "the Rust field name is not a wire alias"
+        );
+    }
+
+    /// A verdict from a newer build reads as `Unknown` rather than failing the
+    /// event, so the next verdict added never drops a tape's events on a
+    /// reader that predates it.
+    #[test]
+    fn a_fidelity_this_build_does_not_know_still_reads() {
+        let unknown: Fidelity =
+            serde_json::from_value(serde_json::json!("a_verdict_from_the_future")).expect("reads");
+        assert_eq!(unknown, Fidelity::Unknown);
+        assert_eq!(
+            serde_json::from_value::<Fidelity>(serde_json::json!("lossy")).expect("reads"),
+            Fidelity::Lossy
         );
     }
 
@@ -5315,10 +6363,10 @@ mod tests {
                 call_line: 42,
                 call_column: 9,
                 receiver: None,
-                request: serde_json::json!({}),
-                args: serde_json::json!({}),
-                response: serde_json::json!({}),
-                result: serde_json::json!({}),
+                request: serde_json::json!({}).into(),
+                args: serde_json::json!({}).into(),
+                response: serde_json::json!({}).into(),
+                result: serde_json::json!({}).into(),
                 is_error: false,
                 duration_us: 100,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5358,10 +6406,10 @@ mod tests {
                 call_line: 10,
                 call_column: 5,
                 receiver: None,
-                request: serde_json::json!({}),
-                args: serde_json::json!({}),
-                response: serde_json::json!({"error": "not found"}),
-                result: serde_json::json!({"error": "not found"}),
+                request: serde_json::json!({}).into(),
+                args: serde_json::json!({}).into(),
+                response: serde_json::json!({"error": "not found"}).into(),
+                result: serde_json::json!({"error": "not found"}).into(),
                 is_error: true,
                 duration_us: 50,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5417,10 +6465,10 @@ mod tests {
                 call_line: 42,
                 call_column: 9,
                 receiver: None,
-                request: serde_json::json!({"address_id": "addr_1"}),
-                args: serde_json::json!({"address_id": "addr_1"}),
-                response: serde_json::json!({"ok": true}),
-                result: serde_json::json!({"ok": true}),
+                request: serde_json::json!({"address_id": "addr_1"}).into(),
+                args: serde_json::json!({"address_id": "addr_1"}).into(),
+                response: serde_json::json!({"ok": true}).into(),
+                result: serde_json::json!({"ok": true}).into(),
                 is_error: false,
                 duration_us: 100,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5460,10 +6508,10 @@ mod tests {
                 call_line: 50,
                 call_column: 9,
                 receiver: None,
-                request: serde_json::json!({"address_id": "addr_2"}),
-                args: serde_json::json!({"address_id": "addr_2"}),
-                response: serde_json::json!({"ok": true}),
-                result: serde_json::json!({"ok": true}),
+                request: serde_json::json!({"address_id": "addr_2"}).into(),
+                args: serde_json::json!({"address_id": "addr_2"}).into(),
+                response: serde_json::json!({"ok": true}).into(),
+                result: serde_json::json!({"ok": true}).into(),
                 is_error: false,
                 duration_us: 100,
                 event_schema_version: CURRENT_EVENT_SCHEMA_VERSION,
@@ -5545,6 +6593,330 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// In-memory fake hook with knobs to drive each `dispatch` case.
+    /// Adapt a HIT-only reconstruct closure to the two-armed seam signature.
+    ///
+    /// `NoValue` on a miss reproduces the pre-synthesis default exactly (the
+    /// seam fail-stops), so a fixture written before the miss arm existed keeps
+    /// asserting what it always asserted.
+    fn hit_only<T>(
+        f: impl FnOnce(serde_json::Value) -> Reconstructed<T>,
+    ) -> impl FnOnce(ReconstructInput<'_>) -> Reconstructed<T> {
+        move |input| match input {
+            ReconstructInput::Hit(recorded) => f(recorded),
+            ReconstructInput::Miss(_) => Reconstructed::NoValue,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The Substitute outcome is OBSERVED, not declared
+    //
+    // These are the assertions the pre-synthesis tests structurally could not
+    // make. While a declared `on_miss` always produced a value, declaration and
+    // outcome could not disagree, so "the miss was stamped absorbed" passed
+    // whichever of the two the seam read. `Reconstructed::NoValue` makes them
+    // disagree, and every test below turns on that difference.
+    // -----------------------------------------------------------------------
+
+    /// A minimal pending observation, so a test can drive the decision half
+    /// without a lookup table behind it.
+    fn pending_observation(resolved: bool) -> crate::replay::ObservedCall {
+        crate::replay::ObservedCall {
+            correlation_id: None,
+            boundary: "imc".to_string(),
+            role: None,
+            trait_name: "Comp".to_string(),
+            method_name: "op".to_string(),
+            args: serde_json::json!({"k": 1}),
+            resolved,
+            resolved_rank: None,
+            source_event_global_sequence: None,
+            timestamp_ns: now_ns(),
+            end_timestamp_ns: None,
+            task_id: None,
+            parent_task_id: None,
+            task_bucket: None,
+            bucket_id: None,
+            fork_seq: 0,
+            call_file: None,
+            call_line: None,
+            call_column: None,
+            span_path: None,
+            graph_node_id: None,
+            synthesized: false,
+            real_impl_will_fail: false,
+            recorded_result: None,
+            observed_result: None,
+            provenance: Provenance::Recorded,
+            seed_gap: false,
+            absorbed: false,
+            outcome: SubstituteOutcome::default(),
+            arg_divergent: false,
+            served_event_global_sequence: None,
+            lookup_ordinal: None,
+            cancelled: false,
+        }
+    }
+
+    /// Run one Substitute decision and report what was emitted and what the
+    /// seam returned. `None` for the value means the seam fail-stopped.
+    fn drive(
+        recorded: Option<serde_json::Value>,
+        produce: impl FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>,
+    ) -> (Option<crate::replay::ObservedCall>, Option<u64>) {
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&emitted);
+        let spec = BoundarySpec::new("imc", "Comp", "op");
+        let identity = CallsiteIdentity {
+            version: 1,
+            source: CallsiteSource::SyntacticHash,
+            id: None,
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: None,
+        };
+        let peek = SubstitutePeek {
+            token: Some(SubstituteToken::new(pending_observation(
+                recorded.is_some(),
+            ))),
+            recorded,
+        };
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            substitute_decide(
+                &spec,
+                &identity,
+                None,
+                peek,
+                serde_json::json!({"k": 1}),
+                produce,
+                move |token, outcome| {
+                    *sink.lock().expect("emit lock") = Some(token.into_observed(outcome));
+                },
+            )
+        }))
+        .ok();
+        std::panic::set_hook(previous);
+
+        let observed = emitted.lock().expect("emit lock").clone();
+        (observed, returned)
+    }
+
+    /// The stamped outcome is whatever the site's closure RETURNED.
+    #[test]
+    fn the_stamped_outcome_follows_the_reconstruct_return() {
+        let hit = Some(serde_json::json!(7u64));
+
+        let (observed, value) = drive(hit.clone(), |_| Reconstructed::Value(7));
+        assert_eq!(value, Some(7), "a clean hit must return its rebuilt value");
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Substituted
+        );
+
+        let (observed, value) = drive(None, |_| Reconstructed::Synthesized(42));
+        assert_eq!(value, Some(42), "a synthesized miss must return its value");
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Synthesized
+        );
+
+        let (observed, value) = drive(None, |_| Reconstructed::NoValue);
+        assert_eq!(value, None, "a declined miss must stop the request");
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Stopped
+        );
+
+        let (observed, value) = drive(hit, |_| Reconstructed::Failed("bad codec".into()));
+        assert_eq!(
+            value, None,
+            "an unreconstructable hit must stop the request"
+        );
+        assert_eq!(
+            observed.expect("emitted").outcome,
+            SubstituteOutcome::Stopped
+        );
+    }
+
+    /// THE ORDERING. A lookup that stops the request still emits its
+    /// observation.
+    ///
+    /// This is the property that made it safe to defer the emission at all. The
+    /// old seam emitted inside the lookup precisely because the two stopping
+    /// arms below diverge, and an observation lost to the unwind would leave a
+    /// killed request looking like one that never made the call — under-reporting
+    /// divergence, which fail-stop replay must never do. Deferral is safe only
+    /// because the SEAM owns both fail-stops and can emit before it panics; if
+    /// anyone reorders those two statements, this test is what catches it.
+    #[test]
+    fn a_stopped_lookup_still_emits_its_observation() {
+        for (label, recorded, produce) in [
+            (
+                "declined miss",
+                None,
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::<u64>::NoValue)
+                    as Box<dyn FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>>,
+            ),
+            (
+                "unreconstructable hit",
+                Some(serde_json::json!(7u64)),
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::Failed("bad codec".into())),
+            ),
+        ] {
+            let (observed, value) = drive(recorded, produce);
+            assert_eq!(value, None, "{label}: precondition — this must fail-stop");
+            let observed = observed.unwrap_or_else(|| {
+                panic!(
+                    "{label}: the observation must reach the sink BEFORE the seam \
+                     panics, or a request the miss killed is indistinguishable from \
+                     one that never made the call"
+                )
+            });
+            assert_eq!(observed.outcome, SubstituteOutcome::Stopped, "{label}");
+        }
+    }
+
+    /// A hit that stopped the request is now distinguishable from one that
+    /// served it — which the two booleans structurally cannot say.
+    ///
+    /// Before this change the seam emitted `resolved: true, Provenance::Recorded`
+    /// and only THEN panicked on `Failed`, so the ledger showed a cleanly-served
+    /// call for a request that died. Both bools are false here (nothing was
+    /// absorbed, nothing was synthesized) and both are RIGHT; only `outcome`
+    /// carries the fact.
+    #[test]
+    fn an_unreconstructable_hit_is_recorded_as_resolved_and_stopped() {
+        let (observed, value) = drive(Some(serde_json::json!(7u64)), |_| {
+            Reconstructed::<u64>::Failed("bad codec".into())
+        });
+        assert_eq!(value, None, "precondition: this must fail-stop");
+
+        let observed = observed.expect("emitted");
+        assert!(
+            observed.resolved,
+            "precondition: the lookup HIT — this is not a novel call"
+        );
+        assert_eq!(
+            observed.outcome,
+            SubstituteOutcome::Stopped,
+            "a hit whose payload would not rebuild must be recorded as having \
+             stopped the request, not as a call that was served"
+        );
+        assert!(!observed.absorbed && !observed.synthesized);
+    }
+
+    /// The three representations of one fact must never disagree.
+    ///
+    /// `absorbed` (what the scorer reads), `synthesized` (the V2 scaffold field)
+    /// and `outcome` are all stamped in one place for exactly this reason. Two
+    /// of them are derived views kept for the wire; a record where they drifted
+    /// apart would tell two different stories about the same call.
+    #[test]
+    fn the_derived_flags_never_disagree_with_the_outcome() {
+        for (label, recorded, produce) in [
+            (
+                "substituted",
+                Some(serde_json::json!(7u64)),
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::Value(7u64))
+                    as Box<dyn FnOnce(ReconstructInput<'_>) -> Reconstructed<u64>>,
+            ),
+            (
+                "synthesized",
+                None,
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::Synthesized(42u64)),
+            ),
+            (
+                "stopped",
+                None,
+                Box::new(|_: ReconstructInput<'_>| Reconstructed::NoValue),
+            ),
+        ] {
+            let (observed, _) = drive(recorded, produce);
+            let observed = observed.expect("emitted");
+            let synthesized = observed.outcome == SubstituteOutcome::Synthesized;
+            assert_eq!(observed.absorbed, synthesized, "{label}: absorbed drifted");
+            assert_eq!(
+                observed.synthesized, synthesized,
+                "{label}: synthesized drifted"
+            );
+        }
+    }
+
+    /// The miss marker is built ONLY on the miss branch, and carries the call.
+    ///
+    /// Two facts in one: a hit never constructs it (the args clone stays off the
+    /// hot path, which is what moving construction into the seam bought), and a
+    /// miss gets one describing the call that actually missed.
+    #[test]
+    fn the_miss_marker_is_built_only_on_the_miss_branch() {
+        let (_, value) = drive(Some(serde_json::json!(7u64)), |input| match input {
+            ReconstructInput::Hit(v) => Reconstructed::Value(v.as_u64().unwrap_or(0)),
+            ReconstructInput::Miss(_) => panic!("a HIT must never reach the miss arm"),
+        });
+        assert_eq!(value, Some(7));
+
+        let (_, value) = drive(None, |input| match input {
+            ReconstructInput::Hit(_) => panic!("a MISS must never reach the hit arm"),
+            ReconstructInput::Miss(miss) => {
+                assert_eq!(miss.boundary, "imc");
+                assert_eq!(miss.component, "Comp");
+                assert_eq!(miss.method, "op");
+                assert_eq!(
+                    miss.args,
+                    serde_json::json!({"k": 1}),
+                    "the marker must carry the args the lookup was keyed on, so a \
+                     miss can be matched back against the tape"
+                );
+                Reconstructed::Synthesized(1)
+            }
+        });
+        assert_eq!(value, Some(1));
+    }
+
+    /// The security argument for synthesized values, asserted structurally.
+    ///
+    /// A seed (or any other value) synthesized on a miss is derived from the
+    /// query, so anyone holding the query can predict it. That is safe only
+    /// because the miss arm is UNREACHABLE outside replay: record and disabled
+    /// modes never perform a lookup, so they never miss. The claim is worth a
+    /// test rather than a doc sentence, because it is the whole reason
+    /// predictable values are acceptable at all — if a future mode change let
+    /// record-mode traffic reach this arm, predictable hash seeds would be
+    /// serving real requests.
+    #[test]
+    fn record_and_disabled_modes_never_reach_the_miss_arm() {
+        for (label, active) in [("record", true), ("disabled", false)] {
+            let hook = FakeHook::new(active);
+            assert_ne!(
+                hook.process_mode(),
+                RuntimeMode::Replay,
+                "{label}: precondition — this hook must not be in replay mode"
+            );
+            let out = dispatch_with_hook(
+                delegate_obs(&hook),
+                serde_json::json!({"k": "v"}),
+                || 5u64,
+                |input| match input {
+                    ReconstructInput::Hit(_) => {
+                        panic!("{label}: a non-replay mode must not reconstruct a hit")
+                    }
+                    ReconstructInput::Miss(_) => panic!(
+                        "{label}: a non-replay mode reached the MISS arm — synthesized \
+                         values are only safe because this cannot happen"
+                    ),
+                },
+                |v: &u64| (serde_json::json!(v), false),
+                unchecked(),
+            );
+            assert_eq!(out, 5, "{label}: the real block must have run");
+        }
+    }
+
     struct FakeHook {
         active: bool,
         /// When `Some`, `try_replay_with_context` returns it (a lookup hit).
@@ -5555,6 +6927,12 @@ mod tests {
         // Observations the test asserts on.
         recorded: Mutex<Vec<BoundaryEvent>>,
         shadow_observed: Mutex<Vec<serde_json::Value>>,
+        /// What the execute peek resolves as this call's recorded result.
+        shadow_recorded: Option<serde_json::Value>,
+        /// The rank that resolution was found at.
+        shadow_rank: Option<u8>,
+        /// The provenance of each observation the seam emitted.
+        shadow_provenance: Mutex<Vec<crate::Provenance>>,
     }
 
     impl FakeHook {
@@ -5565,6 +6943,9 @@ mod tests {
                 execute: false,
                 recorded: Mutex::new(Vec::new()),
                 shadow_observed: Mutex::new(Vec::new()),
+                shadow_recorded: None,
+                shadow_rank: None,
+                shadow_provenance: Mutex::new(Vec::new()),
             }
         }
     }
@@ -5606,6 +6987,11 @@ mod tests {
             }
             // Minimal observation; `execute_shadow_observe` fills the result.
             Some(ExecuteShadowToken::new(crate::replay::ObservedCall {
+                outcome: crate::SubstituteOutcome::default(),
+                arg_divergent: false,
+                served_event_global_sequence: None,
+                lookup_ordinal: None,
+                cancelled: false,
                 correlation_id: None,
                 boundary: query.boundary.to_string(),
                 role: None,
@@ -5613,7 +6999,7 @@ mod tests {
                 method_name: query.method_name.to_string(),
                 args: query.args.clone(),
                 resolved: false,
-                resolved_rank: None,
+                resolved_rank: self.shadow_rank,
                 source_event_global_sequence: None,
                 timestamp_ns: now_ns(),
                 end_timestamp_ns: None,
@@ -5629,7 +7015,7 @@ mod tests {
                 graph_node_id: None,
                 synthesized: false,
                 real_impl_will_fail: false,
-                recorded_result: None,
+                recorded_result: self.shadow_recorded.clone(),
                 observed_result: None,
                 provenance: crate::Provenance::Shadow,
                 seed_gap: false,
@@ -5641,7 +7027,8 @@ mod tests {
             token: ExecuteShadowToken,
             observed_result: serde_json::Value,
         ) {
-            let _ = token;
+            let call = token.into_observed(observed_result.clone());
+            self.shadow_provenance.lock().unwrap().push(call.provenance);
             self.shadow_observed.lock().unwrap().push(observed_result);
         }
     }
@@ -5677,6 +7064,123 @@ mod tests {
         }
     }
 
+    /// An execute-mode hook whose peek resolves `recorded` for the call.
+    fn executing_with(recorded: serde_json::Value) -> FakeHook {
+        let mut hook = FakeHook::new(true);
+        hook.execute = true;
+        hook.shadow_recorded = Some(recorded);
+        hook.shadow_rank = Some(2);
+        hook
+    }
+
+    fn execute_spec() -> BoundarySpec {
+        let mut spec = BoundarySpec::new("db", "T", "m");
+        spec.replay_strategy = ReplayStrategy::Execute;
+        spec
+    }
+
+    fn unique_violation() -> serde_json::Value {
+        serde_json::json!({ "kind": "UniqueViolation", "result": "Err", "version": 1 })
+    }
+
+    fn rebuild_kind(input: ReconstructInput<'_>) -> Reconstructed<Result<u64, String>> {
+        match input {
+            ReconstructInput::Hit(v) if v["result"] == "Err" => {
+                Reconstructed::Value(Err(v["kind"].as_str().unwrap().to_owned()))
+            }
+            _ => Reconstructed::NoValue,
+        }
+    }
+
+    fn is_unique(out: &Result<u64, String>) -> bool {
+        matches!(out, Err(kind) if kind == "UniqueViolation")
+    }
+
+    /// The delegate seam serves a declared-neutral recorded error without
+    /// running the boundary, and says so in what it emits.
+    #[test]
+    fn the_delegate_seam_serves_a_declared_neutral_recorded_error() {
+        let hook = executing_with(unique_violation());
+        let ran = std::cell::Cell::new(false);
+        let out = dispatch_with_hook_serving(
+            delegate_obs_with_spec(&hook, execute_spec()),
+            serde_json::json!({}),
+            || {
+                ran.set(true);
+                Ok(1u64)
+            },
+            rebuild_kind,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            unchecked(),
+            Some(is_unique),
+        );
+        assert_eq!(out, Err("UniqueViolation".to_owned()));
+        assert!(!ran.get(), "the boundary did not run");
+        assert_eq!(
+            *hook.shadow_provenance.lock().unwrap(),
+            vec![crate::Provenance::ServedRecordedError]
+        );
+        assert_eq!(
+            *hook.shadow_observed.lock().unwrap(),
+            vec![unique_violation()]
+        );
+    }
+
+    /// The async delegate seam does the same.
+    #[test]
+    fn the_async_delegate_seam_serves_a_declared_neutral_recorded_error() {
+        let hook = executing_with(unique_violation());
+        let ran = std::cell::Cell::new(false);
+        let out = block_on_ready(dispatch_async_with_hook_serving(
+            delegate_obs_with_spec(&hook, execute_spec()),
+            serde_json::json!({}),
+            || {
+                ran.set(true);
+                async { Ok(1u64) }
+            },
+            rebuild_kind,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            unchecked(),
+            Some(is_unique),
+        ));
+        assert_eq!(out, Err("UniqueViolation".to_owned()));
+        assert!(!ran.get(), "the boundary did not run");
+        assert_eq!(
+            *hook.shadow_provenance.lock().unwrap(),
+            vec![crate::Provenance::ServedRecordedError]
+        );
+    }
+
+    /// Without a declaration the same recorded error is re-run, as today.
+    #[test]
+    fn the_delegate_seam_without_a_declaration_runs_the_boundary() {
+        let hook = executing_with(unique_violation());
+        let out = dispatch_with_hook(
+            delegate_obs_with_spec(&hook, execute_spec()),
+            serde_json::json!({}),
+            || Ok::<u64, String>(1),
+            rebuild_kind,
+            |r: &Result<u64, String>| (serde_json::json!(format!("{r:?}")), r.is_err()),
+            unchecked(),
+        );
+        assert_eq!(out, Ok(1));
+        assert_eq!(
+            *hook.shadow_provenance.lock().unwrap(),
+            vec![crate::Provenance::Shadow]
+        );
+    }
+
+    /// Poll a future that never waits to completion.
+    fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut fut = std::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("the seam awaited something in a test"),
+        }
+    }
+
     /// Case 1 — INACTIVE hook is handled by the GLOBAL `dispatch` fast path and by
     /// the delegate MACRO's `if !is_active` gate (the seam itself assumes the
     /// caller has gated activity). The authoritative inactive-laziness proof for
@@ -5693,6 +7197,7 @@ mod tests {
             || 7u64,
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 7);
     }
@@ -5708,6 +7213,7 @@ mod tests {
             || 42u64,
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 42);
         let recorded = hook
@@ -5773,6 +7279,7 @@ mod tests {
                     .with_result_image(result_image.clone())
                     .with_pre_image(pre_image.clone())
             },
+            unchecked(),
         );
         assert_eq!(out, live_result);
 
@@ -5793,8 +7300,8 @@ mod tests {
             vec![explicit_write],
             "DB-shaped args/result must not infer any write key beyond the extractor payload"
         );
-        assert_eq!(event.pre_image, Some(pre_image));
-        assert_eq!(event.result_image, Some(result_image));
+        assert_eq!(event.pre_image, Some(Payload::from(pre_image)));
+        assert_eq!(event.result_image, Some(Payload::from(result_image)));
     }
 
     /// Case 3a — LOOKUP HIT that reconstructs: `run` is NEVER called, the recorded
@@ -5811,13 +7318,14 @@ mod tests {
                 ran.set(true);
                 7u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 99, "returned the reconstructed recorded value");
         assert!(!ran.get(), "the real block must NOT run on a lookup hit");
@@ -5840,7 +7348,7 @@ mod tests {
                     ran.set(true);
                     5u64
                 },
-                |v| {
+                hit_only(|v| {
                     if v.as_object()
                         .is_some_and(|map| map.contains_key("deja_err"))
                     {
@@ -5854,8 +7362,9 @@ mod tests {
                             "test fixture: no replay representation",
                         )),
                     }
-                },
+                }),
                 |r: &u64| (serde_json::json!(*r), false),
+                unchecked(),
             )
         }));
 
@@ -5889,6 +7398,7 @@ mod tests {
                 },
                 |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
                 |r: &u64| (serde_json::json!(*r), false),
+                unchecked(),
             )
         }));
 
@@ -5931,13 +7441,14 @@ mod tests {
                 ran.set(true);
                 7u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
 
         assert_eq!(out, 7);
@@ -5979,6 +7490,7 @@ mod tests {
             || Ok(RedisLikeValue::Null),
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             capture_redis_like,
+            unchecked(),
         );
         assert_eq!(recorded_out, Ok(RedisLikeValue::Null));
         let recorded_result = {
@@ -6012,6 +7524,7 @@ mod tests {
             || Ok(RedisLikeValue::Null),
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             capture_redis_like,
+            unchecked(),
         );
         assert_eq!(shadow_out, Ok(RedisLikeValue::Null));
         assert_eq!(
@@ -6034,13 +7547,14 @@ mod tests {
                 ran.set(true);
                 7u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
 
         assert_eq!(
@@ -6070,6 +7584,7 @@ mod tests {
             || async { 21u64 },
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         )
         .await;
         assert_eq!(out, 21);
@@ -6082,13 +7597,14 @@ mod tests {
             delegate_obs(&hook),
             serde_json::json!({"k": "v"}),
             || async { 0u64 },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         )
         .await;
         assert_eq!(out, 100);
@@ -6121,13 +7637,14 @@ mod tests {
                 ran.set(true);
                 11u64
             },
-            |v| match serde_json::from_value::<u64>(v) {
+            hit_only(|v| match serde_json::from_value::<u64>(v) {
                 Ok(value) => Reconstructed::Value(value),
                 Err(_) => {
                     Reconstructed::Failed(String::from("test fixture: no replay representation"))
                 }
-            },
+            }),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         )
         .await;
 
@@ -6173,6 +7690,7 @@ mod tests {
             || 55u64,
             |_v| Reconstructed::Failed(String::from("test fixture: no replay representation")),
             |r: &u64| (serde_json::json!(*r), false),
+            unchecked(),
         );
         assert_eq!(out, 55);
         assert!(
@@ -6410,5 +7928,481 @@ mod reply_canon_merge_tests {
         );
         // Marked, never sorted.
         assert_eq!(events[0].result, serde_json::json!({ "value": [2, 1] }));
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::Payload;
+
+    fn payload(text: &str) -> Payload {
+        serde_json::from_str::<Payload>(text).expect("test payload is valid JSON")
+    }
+
+    /// The property the type exists to preserve: it must compare the way the
+    /// `serde_json::Value` it replaced compared, or swapping the representation
+    /// silently changes what this harness calls a divergence.
+    #[test]
+    fn payload_equality_matches_value_equality() {
+        let cases = [
+            (r#"{"a":1,"b":2}"#, r#"{"b":2,"a":1}"#, true, "key order"),
+            (
+                r#"{"a": 1}"#,
+                r#"{"a":1}"#,
+                true,
+                "insignificant whitespace",
+            ),
+            ("1.0", "1.00", true, "float spelling"),
+            ("1", "1.0", false, "integer is not a float"),
+            ("1", "1e0", false, "integer is not an exponent"),
+            (r#"{"a":1}"#, r#"{"a":2}"#, false, "different values"),
+            (r#"{"a":1}"#, r#"{"a":1,"b":2}"#, false, "different shape"),
+        ];
+        for (left, right, expected, what) in cases {
+            assert_eq!(
+                payload(left) == payload(right),
+                expected,
+                "Payload disagreed with expectation on {what}: {left} vs {right}"
+            );
+            // And it agrees with the comparison it replaced, so the two can
+            // never drift apart without this failing.
+            let (lv, rv) = (payload(left).to_value(), payload(right).to_value());
+            assert_eq!(
+                lv == rv,
+                expected,
+                "serde_json::Value disagreed on {what}: {left} vs {right}"
+            );
+        }
+    }
+
+    /// The wire content must not move: the recorder writes these payloads and a
+    /// reader parses them, and a representation change that altered what they
+    /// SAY would strand every tape already on disk.
+    ///
+    /// The assertion is structural rather than textual, and the difference is
+    /// worth stating. This type serializes by rendering its text back through a
+    /// `Value`, so the bytes it emits are whatever `serde_json` renders — which
+    /// is exactly what the `Value` field it replaced emitted, since that field
+    /// was rendered from a `Value` by the same build. Key order therefore
+    /// follows the build's `Map`, as it always has.
+    /// The duplicated pairs must end up on ONE allocation after a bulk read.
+    ///
+    /// `request` is recorded as a clone of `args` and `response` as a clone of
+    /// `result`, so an event read back off a tape holds each of those payloads
+    /// twice — the two fields are captured independently from the JSON. The
+    /// saving is invisible to any assertion about what the event SAYS, which is
+    /// why this reaches for the pointer: content equality would pass just as
+    /// happily with the duplication still there.
+    /// An event parsed from a tape line, which is the only way to get one whose
+    /// duplicated fields sit in separate allocations — constructing one in
+    /// memory shares them already.
+    fn event_from_tape(
+        request: serde_json::Value,
+        args: serde_json::Value,
+        response: serde_json::Value,
+        result: serde_json::Value,
+    ) -> crate::BoundaryEvent {
+        let line = serde_json::to_string(&serde_json::json!({
+            "record_kind": "boundary_event",
+            "global_sequence": 1, "request_sequence": 1, "correlation_id": "c1",
+            "timestamp_ns": 0, "boundary": "redis", "trait_name": "T",
+            "method_name": "m", "call_file": "f.rs", "call_line": 1, "call_column": 1,
+            "request": request, "args": args, "response": response, "result": result,
+            "is_error": false, "duration_us": 1, "event_schema_version": 3,
+            "provenance": "recorded", "recon": "lossless", "replay_strategy": "substitute",
+        }))
+        .expect("fixture serializes");
+        match serde_json::from_str::<crate::DejaRecord>(&line).expect("fixture parses") {
+            crate::DejaRecord::BoundaryEvent(event) => *event,
+            other => panic!("fixture is a boundary event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sharing_collapses_the_duplicated_pairs_onto_one_allocation() {
+        let mut event = event_from_tape(
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"b": 2}),
+            serde_json::json!({"b": 2}),
+        );
+
+        assert!(
+            !std::sync::Arc::ptr_eq(&event.request.text, &event.args.text),
+            "a freshly parsed event holds the duplicate separately — otherwise \
+             this test cannot show that sharing did anything"
+        );
+
+        event.share_duplicate_payloads();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&event.request.text, &event.args.text),
+            "request must share the allocation it duplicates"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&event.response.text, &event.result.text),
+            "response must share the allocation it duplicates"
+        );
+        assert_eq!(event.request, event.args, "and still say the same thing");
+        assert_eq!(event.response, event.result);
+    }
+
+    /// Sharing is by exact bytes, so a tape whose fields genuinely differ keeps
+    /// both — the optimization must never be able to change what an event says.
+    #[test]
+    fn sharing_leaves_genuinely_different_payloads_alone() {
+        let mut event = event_from_tape(
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"a": 2}),
+            serde_json::json!({"b": 1}),
+            serde_json::json!({"b": 2}),
+        );
+        event.share_duplicate_payloads();
+        assert_ne!(
+            event.request, event.args,
+            "different payloads must survive sharing unchanged"
+        );
+        assert_eq!(event.request, payload(r#"{"a":1}"#));
+        assert_eq!(event.args, payload(r#"{"a":2}"#));
+    }
+
+    #[test]
+    fn payload_round_trips_its_content() {
+        let text = r#"{"b":2,"a":[1,{"c":null}],"d":"x"}"#;
+        let carried = serde_json::to_string(&payload(text)).expect("payload serializes");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&carried).expect("carried is JSON"),
+            serde_json::from_str::<serde_json::Value>(text).expect("source is JSON"),
+            "a payload must come back saying the same thing it was given"
+        );
+        assert_eq!(
+            payload(&carried),
+            payload(text),
+            "and must compare equal to what it was built from"
+        );
+    }
+
+    /// A payload has to survive the envelope it actually travels in.
+    ///
+    /// Every event is written inside `DejaRecord`, which is internally tagged,
+    /// and serde replays an internally-tagged body through a buffer a
+    /// `serde_json` `RawValue` cannot be read back out of. An earlier version
+    /// of this type deserialized as a `RawValue`: it passed every direct test
+    /// here while making every recorded event unparseable, because testing the
+    /// type alone never puts it inside the tag. This does.
+    #[test]
+    fn payload_survives_the_internally_tagged_envelope() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        #[serde(tag = "record_kind", rename_all = "snake_case")]
+        enum Envelope {
+            Carrying { payload: Payload },
+        }
+        let original = Envelope::Carrying {
+            payload: payload(r#"{"a":[1,2],"b":{"c":"d"}}"#),
+        };
+        let line = serde_json::to_string(&original).expect("envelope serializes");
+        let back: Envelope = serde_json::from_str(&line).expect("envelope round-trips");
+        assert_eq!(back, original, "the payload came back unchanged");
+    }
+
+    #[test]
+    fn null_is_the_default_and_reads_as_null() {
+        assert!(Payload::default().is_null());
+        assert_eq!(Payload::default().to_value(), serde_json::Value::Null);
+        assert!(!payload(r#"{"a":1}"#).is_null());
+    }
+}
+
+#[cfg(test)]
+mod serves_recorded_error_tests {
+    use super::serves_recorded_error;
+
+    /// `ResultCodec`'s own envelope shape, which is the only thing deja reads
+    /// here — not the error inside it.
+    fn envelope(result: &str) -> serde_json::Value {
+        serde_json::json!({ "result": result, "value": [] })
+    }
+
+    /// The case this exists for: a recorded constraint violation the site has
+    /// declared state-neutral is served, not re-run.
+    #[test]
+    fn a_declared_neutral_recorded_error_is_served() {
+        assert!(serves_recorded_error(&envelope("Err"), true));
+    }
+
+    /// Undeclared is today's behaviour, unchanged. The whole design rests on the
+    /// site opting in, so a site that says nothing must execute exactly as it
+    /// does now.
+    #[test]
+    fn an_undeclared_recorded_error_still_executes() {
+        assert!(!serves_recorded_error(&envelope("Err"), false));
+    }
+
+    /// A recorded `Ok` executes even where the site declared neutrality.
+    ///
+    /// Neutrality is a claim about an ERROR — that it wrote nothing. A recorded
+    /// success wrote something, and serving it instead of re-running it would
+    /// skip exactly the state change the execute boundary exists to reproduce.
+    #[test]
+    fn a_recorded_ok_executes_even_when_the_site_declares_neutrality() {
+        assert!(!serves_recorded_error(&envelope("Ok"), true));
+    }
+
+    /// A boundary whose codec writes no discriminator is left alone.
+    ///
+    /// Only `ResultCodec` stamps `result`. Without it deja cannot tell a failure
+    /// from a value, and guessing would serve a recorded SUCCESS as though it
+    /// were an error — the inverse of the bug, at a boundary that never asked.
+    #[test]
+    fn an_envelope_without_a_discriminator_is_not_served() {
+        assert!(!serves_recorded_error(
+            &serde_json::json!({ "value": [1, 2] }),
+            true
+        ));
+        assert!(!serves_recorded_error(&serde_json::json!("Err"), true));
+        assert!(!serves_recorded_error(&serde_json::Value::Null, true));
+    }
+
+    /// The discriminator is matched exactly, not by prefix or case. `ResultCodec`
+    /// writes `Ok` and `Err` and nothing else, so anything adjacent is a codec
+    /// deja does not own.
+    #[test]
+    fn the_discriminator_is_matched_exactly() {
+        for other in ["err", "ERR", "Error", "Err2", ""] {
+            assert!(
+                !serves_recorded_error(&envelope(other), true),
+                "{other:?} must not be read as Err"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
+mod serve_or_run_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::{serve_or_run, ExecuteShadowToken, Provenance, ReconstructInput, Reconstructed};
+
+    /// The envelope a `process_tracker` insert recorded on 2026-09-23 when the
+    /// row already existed: `ResultCodec`'s discriminator plus the error kind.
+    fn unique_violation() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "UniqueViolation",
+            "message": "duplicate key value violates unique constraint \"process_tracker_pkey\"",
+            "result": "Err",
+            "version": 1
+        })
+    }
+
+    fn recorded_ok() -> serde_json::Value {
+        serde_json::json!({ "result": "Ok", "value": 7, "version": 1 })
+    }
+
+    /// A token as the execute peek hands it over, carrying `recorded`, found
+    /// at the call's span path.
+    fn token(recorded: Option<serde_json::Value>) -> ExecuteShadowToken {
+        let rank = recorded.as_ref().map(|_| 2);
+        token_at(recorded, rank)
+    }
+
+    fn token_at(recorded: Option<serde_json::Value>, rank: Option<u8>) -> ExecuteShadowToken {
+        ExecuteShadowToken::new(crate::replay::ObservedCall {
+            outcome: crate::SubstituteOutcome::default(),
+            arg_divergent: false,
+            served_event_global_sequence: None,
+            lookup_ordinal: None,
+            cancelled: false,
+            correlation_id: Some("c-1".to_owned()),
+            boundary: "db".to_owned(),
+            role: None,
+            trait_name: "diesel_models::query::generics".to_owned(),
+            method_name: "generic_insert".to_owned(),
+            args: serde_json::json!({}),
+            resolved: recorded.is_some(),
+            resolved_rank: rank,
+            source_event_global_sequence: Some(2972),
+            timestamp_ns: 0,
+            end_timestamp_ns: None,
+            task_id: None,
+            parent_task_id: None,
+            task_bucket: None,
+            bucket_id: None,
+            fork_seq: 0,
+            call_file: None,
+            call_line: None,
+            call_column: None,
+            span_path: None,
+            graph_node_id: None,
+            synthesized: false,
+            real_impl_will_fail: false,
+            seed_gap: recorded.is_none(),
+            recorded_result: recorded,
+            observed_result: None,
+            provenance: Provenance::Shadow,
+            absorbed: false,
+        })
+    }
+
+    /// How the site's codec rebuilds an envelope: the error arm keeps the kind.
+    fn rebuild(input: ReconstructInput<'_>) -> Reconstructed<Result<u64, String>> {
+        match input {
+            ReconstructInput::Hit(v) if v["result"] == "Err" => {
+                Reconstructed::Value(Err(v["kind"].as_str().unwrap().to_owned()))
+            }
+            ReconstructInput::Hit(v) => Reconstructed::Value(Ok(v["value"].as_u64().unwrap())),
+            ReconstructInput::Miss(_) => Reconstructed::NoValue,
+        }
+    }
+
+    fn unique(out: &Result<u64, String>) -> bool {
+        matches!(out, Err(kind) if kind == "UniqueViolation")
+    }
+
+    /// What was emitted, and with which provenance.
+    type Emitted = RefCell<Vec<(Provenance, serde_json::Value)>>;
+
+    fn emit_into(emitted: &Emitted) -> impl FnOnce(ExecuteShadowToken, serde_json::Value) + '_ {
+        move |token, value| {
+            let call = token.into_observed(value.clone());
+            emitted.borrow_mut().push((call.provenance, value));
+        }
+    }
+
+    /// The case this exists for: a recorded unique violation the site declares
+    /// state-neutral is served, and the observation says it was served, with
+    /// the recorded value as what the candidate returned.
+    #[test]
+    fn a_declared_neutral_recorded_error_is_served_and_named() {
+        let emitted = Emitted::default();
+        let served = serve_or_run(
+            token(Some(unique_violation())),
+            Some(unique),
+            rebuild,
+            emit_into(&emitted),
+        );
+        assert_eq!(served.ok(), Some(Err("UniqueViolation".to_owned())));
+        assert_eq!(
+            emitted.into_inner(),
+            vec![(Provenance::ServedRecordedError, unique_violation())]
+        );
+    }
+
+    /// An error the site's predicate does not accept runs: re-running it is
+    /// how a candidate that no longer fails that way shows it.
+    #[test]
+    fn an_error_the_site_does_not_declare_neutral_runs() {
+        let emitted = Emitted::default();
+        let mut other = unique_violation();
+        other["kind"] = serde_json::json!("SerializationFailure");
+        let ran = serve_or_run(
+            token(Some(other)),
+            Some(unique),
+            rebuild,
+            emit_into(&emitted),
+        );
+        assert!(ran.is_err(), "handed back to run");
+        assert!(
+            emitted.into_inner().is_empty(),
+            "nothing emitted before running"
+        );
+    }
+
+    /// A site that declares nothing runs, and does no extra work: the recorded
+    /// value is not even rebuilt.
+    #[test]
+    fn an_undeclared_site_runs_without_rebuilding() {
+        let rebuilt = Cell::new(0);
+        let ran = serve_or_run(
+            token(Some(unique_violation())),
+            None::<fn(&Result<u64, String>) -> bool>,
+            |input| {
+                rebuilt.set(rebuilt.get() + 1);
+                rebuild(input)
+            },
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+        assert_eq!(rebuilt.get(), 0);
+    }
+
+    /// A recorded success runs, even at a site that declared an error neutral,
+    /// and its predicate is never asked.
+    #[test]
+    fn a_recorded_success_runs() {
+        let asked = Cell::new(0);
+        let ran = serve_or_run(
+            token(Some(recorded_ok())),
+            Some(|out: &Result<u64, String>| {
+                asked.set(asked.get() + 1);
+                unique(out)
+            }),
+            rebuild,
+            |_, _| panic!("a recorded success is not served"),
+        );
+        assert!(ran.is_err());
+        assert_eq!(asked.get(), 0);
+    }
+
+    /// A recorded error that does not rebuild runs rather than stopping.
+    #[test]
+    fn a_recorded_error_that_does_not_rebuild_runs() {
+        let ran = serve_or_run(
+            token(Some(unique_violation())),
+            Some(unique),
+            |_| Reconstructed::Failed("codec refused".to_owned()),
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+    }
+
+    /// A recorded error found only by the unlocated rank runs: that rank can
+    /// hand this call another call's recorded value.
+    #[test]
+    fn an_error_found_only_unlocated_runs() {
+        let ran = serve_or_run(
+            token_at(Some(unique_violation()), Some(3)),
+            Some(unique),
+            rebuild,
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+    }
+
+    /// A recorded error with no resolution rank at all runs: nothing says
+    /// whose row it is.
+    #[test]
+    fn an_error_with_no_resolution_rank_runs() {
+        let ran = serve_or_run(
+            token_at(Some(unique_violation()), None),
+            Some(unique),
+            rebuild,
+            |_, _| panic!("nothing is emitted for a call that runs"),
+        );
+        assert!(ran.is_err());
+    }
+
+    /// A declared site's own recorded error is served.
+    #[test]
+    fn an_error_found_at_a_declared_site_is_served() {
+        let emitted = Emitted::default();
+        let served = serve_or_run(
+            token_at(Some(unique_violation()), Some(1)),
+            Some(unique),
+            rebuild,
+            emit_into(&emitted),
+        );
+        assert!(served.is_ok());
+        assert_eq!(emitted.into_inner().len(), 1);
+    }
+
+    /// With no recorded row for this call there is nothing of its own to
+    /// serve, so it runs.
+    #[test]
+    fn a_call_with_no_recorded_row_runs() {
+        let ran = serve_or_run(token(None), Some(unique), rebuild, |_, _| {
+            panic!("nothing is emitted for a call that runs")
+        });
+        assert!(ran.is_err());
     }
 }

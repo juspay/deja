@@ -34,8 +34,10 @@ fn substitute_miss_fail_stops_in_replay() {
     // Empty lookup table → every lookup misses.
     let table = deja::LookupTable {
         recording_id: "fail-stop-test".to_string(),
-        policy_version: 1,
+        policy_version: deja::POLICY_VERSION,
+        event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
         entries: vec![],
+        identity_entries: Vec::new(),
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("lookup.json");

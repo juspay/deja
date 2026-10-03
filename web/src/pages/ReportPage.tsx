@@ -1,14 +1,17 @@
 import React from "react";
+import { diffArgs, summarizeLeaves } from "../lib/argdiff";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams } from "../lib/api";
+import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams, ChangeReach } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { VerdictBanner } from "../components/Result";
 import { ConfidenceBadge, ConfidenceLadder, overallConfidence } from "../components/Confidence";
 import { KillRun } from "../components/KillRun";
 import UnifiedView from "../components/UnifiedView";
+import { BaselineNote, DeltaPanel } from "../components/DeltaSummary";
 import { Side, transportFailure } from "../lib/spine";
+import { emptyFindingsText, evidenceOf } from "../lib/evidence";
 
 /* ---------------------------------------------------------------- header --- */
 
@@ -124,6 +127,13 @@ type Finding = {
    */
   nodeId: number | null;
   side: Side;
+  /**
+   * What changed, for a value divergence: the first changed leaves of the
+   * recorded-vs-attempted arguments, so the list says `headers.prefer:
+   * return=representation → return=minimal` and nobody has to open thirty
+   * header lines to find it.
+   */
+  what?: ReturnType<typeof summarizeLeaves>;
 };
 
 // The order a reader should meet them: what changed, what that changed, what the
@@ -183,16 +193,24 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
       c.blocking
     )
       // Agreement is an allow-list here too. Skipping every unrecognised kind
-      // kept blocking rows — pruned_subtree, novel_subtree, identity_skew — out
-      // of the findings list entirely, so a reader who trusted the list saw a
-      // clean run.
+      // kept rows the scorer emitted as blocking — pruned_subtree,
+      // novel_subtree, and at the time identity_skew — out of the findings
+      // list entirely, so a reader who trusted the list saw a clean run.
       //
-      // The findings list is for what counts against the verdict, so an
-      // unrecognised kind earns a place here by the scorer's own `blocking`
-      // flag rather than by a list of benign kinds kept in the viewer. Such a
-      // list would drift from the scorer the way the four-kind dispatch did.
-      // A non-blocking unrecognised kind is still marked and still navigable in
-      // the tree, and its panel names it — it is simply not called a finding.
+      // The named ranks above are placed by KIND, and two of them are not
+      // verdict items at all: `environmental` and `identity-skew` are the tail
+      // of RANKS, "what was never the candidate's fault" — non-blocking on the
+      // ledger since #124 made a skew order rather than a difference, and
+      // shown here on purpose, so a tolerated skew is visible where a reader
+      // judges the run instead of hidden by its own tolerance. Their labels and
+      // panels say they do not count.
+      //
+      // Only an UNRECOGNISED kind earns a place here by the scorer's own
+      // `blocking` flag rather than by a list of benign kinds kept in the
+      // viewer. Such a list would drift from the scorer the way the four-kind
+      // dispatch did. A non-blocking unrecognised kind is still marked and
+      // still navigable in the tree, and its panel names it — it is simply not
+      // called a finding.
       rank = "unknown";
     if (!rank) continue; // matched / recovered / deterministic are not findings
     // Anchor on the side that owns the evidence: the recording for a call the
@@ -206,6 +224,10 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
         ? [[rep, "rep"], [rec, "rec"]]
         : [[rec, "rec"], [rep, "rep"]];
     const [nodeId, side] = order.find(([id]) => id != null) ?? [null, "rec" as Side];
+    const what =
+      c.kind === "value_diverged" && c.recorded?.args !== undefined && c.observed?.args !== undefined
+        ? summarizeLeaves(diffArgs(c.recorded.args, c.observed.args))
+        : undefined;
     out.push({
       rank,
       correlation: c.correlation_id ?? null,
@@ -214,6 +236,12 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
       span: spanOf(c),
       nodeId,
       side,
+      // Kept when it is EMPTY as well. An empty leaf-diff on a flagged finding
+      // means the two sides hold the same values in a different order, and
+      // dropping it here rendered nothing at all — the silent case `UnifiedView`
+      // was taught to name as "order only", still live in this view because the
+      // fix landed in one of the two places that needed it.
+      what,
     });
   }
   for (const d of https) {
@@ -250,11 +278,48 @@ function FindingRow({ f, onOpen }: { f: Finding; onOpen: (f: Finding) => void })
         <span className="fwhere mono">{f.where}</span>
         {f.correlation && <span className="fcorr mono">{f.correlation.slice(0, 8)}</span>}
       </button>
+      {f.what && <ChangedLeaves what={f.what} />}
     </li>
   );
 }
 
-function FindingList({ findings, onOpen }: { findings: Finding[]; onOpen: (f: Finding) => void }) {
+/** The changed leaves of a finding, inline under its row. */
+function ChangedLeaves({ what }: { what: NonNullable<Finding["what"]> }) {
+  // No leaf differs, yet the finding was flagged: same values, different order.
+  // Saying so is not a guess — it is what an empty leaf-diff here means.
+  if (what.shown.length === 0) {
+    return (
+      <div
+        className="fwhat mono"
+        title="the two sides hold the same values in a different order — no leaf differs"
+      >
+        <span className="jpath">order only</span>
+      </div>
+    );
+  }
+  return (
+    <div className="fwhat mono">
+      {what.shown.map((l) => (
+        <span key={l.path} className="fleaf">
+          <span className="jpath">{l.path}</span>
+          <del>{l.recorded}</del>
+          <ins>{l.candidate}</ins>
+        </span>
+      ))}
+      {what.more > 0 && <span className="fmore">+{what.more} more</span>}
+    </div>
+  );
+}
+
+function FindingList({
+  findings,
+  onOpen,
+  emptyText,
+}: {
+  findings: Finding[];
+  onOpen: (f: Finding) => void;
+  emptyText: string;
+}) {
   const [show, setShow] = React.useState<FindingRank | "all">("all");
   const counts = React.useMemo(() => {
     const m = new Map<FindingRank, number>();
@@ -263,8 +328,7 @@ function FindingList({ findings, onOpen }: { findings: Finding[]; onOpen: (f: Fi
   }, [findings]);
   const rows = show === "all" ? findings : findings.filter((f) => f.rank === show);
 
-  if (findings.length === 0)
-    return <p className="hint">no divergence rows were published for this run.</p>;
+  if (findings.length === 0) return <p className="hint">{emptyText}</p>;
 
   return (
     <>
@@ -349,6 +413,92 @@ function TrustStrip({ run }: { run: RunRow }) {
           <span className="tval">{w}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------- reach ------ */
+
+const REACH_LABEL: Record<ChangeReach, string> = {
+  not_exercised: "not exercised",
+  exercised: "exercised",
+  flow_ran: "flow ran",
+  flow_ran_weak: "flow ran (weak)",
+  module_ran: "module ran",
+  unknown: "unknown",
+};
+
+/**
+ * Did the replay reach what this candidate changed? A verdict says whether
+ * behaviour changed on the recorded traffic; this says how much of the change
+ * that traffic reached. A caveat here never changes the verdict above it.
+ */
+function ChangeReachPanel({ run }: { run: RunRow }) {
+  const q = useQuery({
+    queryKey: ["change-coverage", run.run_id],
+    queryFn: () => api.changeCoverage(run.run_id),
+    staleTime: Infinity,
+  });
+  if (q.isLoading) return <p className="hint">assessing what this candidate changed…</p>;
+  const d = q.data;
+  if (!d) return null;
+  if ("unavailable" in d) {
+    return (
+      <div className="trust">
+        <div className="trustrow">
+          <span className="tkey">change</span>
+          <span className="tval">not assessed — {d.unavailable}</span>
+        </div>
+      </div>
+    );
+  }
+  const worst = d.never_ran > 0 ? "warn" : d.unproven > 0 ? "warn" : "";
+  return (
+    <div className="trust">
+      <div className={`trustrow ${worst}`}>
+        <span className="tkey">change</span>
+        <span className="tval">
+          <b>{d.items.length}</b> changed item{d.items.length === 1 ? "" : "s"} between{" "}
+          <code>{d.base_ref}</code> (<code>{d.merge_base.slice(0, 10)}</code>) and{" "}
+          <code>{d.head.slice(0, 10)}</code> · {d.driven_requests} requests driven
+          {d.caveats.length === 0 && d.items.length > 0 && (
+            <> — every changed item was exercised, so the verdict speaks to this change</>
+          )}
+        </span>
+      </div>
+      {d.caveats.map((c, i) => (
+        <div className="trustrow warn" key={i}>
+          <span className="tkey">caveat</span>
+          <span className="tval">{c}</span>
+        </div>
+      ))}
+      {d.items.length > 0 && (
+        <details className="evraw">
+          <summary>changed items</summary>
+          <table className="fieldtbl">
+            <thead>
+              <tr>
+                <th>reach</th>
+                <th>item</th>
+                <th>where</th>
+                <th>why</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.items.map((it, i) => (
+                <tr key={i} className={it.reach === "exercised" ? undefined : "fdiff"}>
+                  <td className="mono">{REACH_LABEL[it.reach] ?? it.reach}</td>
+                  <td className="mono">{it.item}</td>
+                  <td className="mono">
+                    {it.path}:{it.lines}
+                  </td>
+                  <td>{it.why}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
     </div>
   );
 }
@@ -559,9 +709,14 @@ export default function ReportPage() {
     enabled: isReplay && scored,
   });
 
+  const evidence = React.useMemo(
+    () =>
+      evidenceOf({ data: calls.data, error: calls.error }, { data: https.data, error: https.error }),
+    [calls.data, calls.error, https.data, https.error],
+  );
   const findings = React.useMemo(
-    () => buildFindings(calls.data ?? [], https.data ?? []),
-    [calls.data, https.data],
+    () => buildFindings(evidence.calls, evidence.https),
+    [evidence],
   );
 
   // A finding is an anchor into the one execution view — the same
@@ -600,19 +755,45 @@ export default function ReportPage() {
       </div>
 
       <RunHeader run={r} />
+      {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} label={runParams(r)?.label} />}
       <VerdictBanner result={result} />
+      {isReplay && scored && runParams(r)?.delta_against && (
+        <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} />
+      )}
+      {isReplay && scored && !runParams(r)?.delta_against && (
+        <p className="hint delta-link">
+          This verdict is against the tape.{" "}
+          <Link to={withDebug(`/r/${r.run_id}/delta`, debug)}>
+            Compare against another run of the same tape →
+          </Link>
+        </p>
+      )}
 
       {isReplay && scored && (
         <>
           <section>
             <h2>Summary</h2>
             <TrustStrip run={r} />
+            <ChangeReachPanel run={r} />
             <Counters run={r} />
           </section>
 
           <section>
             <h2>What diverged</h2>
-            <FindingList findings={findings} onOpen={openFinding} />
+            {evidence.notes.map((note) => (
+              <p className="err" key={note}>
+                {note}
+              </p>
+            ))}
+            {evidence.blocking ? (
+              <p className="err">{evidence.blocking}</p>
+            ) : (
+              <FindingList
+                findings={findings}
+                onOpen={openFinding}
+                emptyText={emptyFindingsText(evidence)}
+              />
+            )}
           </section>
 
           <section>
@@ -639,7 +820,13 @@ export default function ReportPage() {
               tree with one detail panel now. */}
           <section id="execution">
             <h2>Execution — recorded against replayed</h2>
-            <UnifiedView runId={runId} scorecard={r.scorecard} />
+            <UnifiedView
+              runId={runId}
+              scorecard={r.scorecard}
+              systemName={
+                typeof r.params.system_under_test === "string" ? r.params.system_under_test : null
+              }
+            />
           </section>
         </>
       )}

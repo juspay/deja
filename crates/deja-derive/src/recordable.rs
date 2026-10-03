@@ -362,6 +362,7 @@ fn generate_async_method(
         build_args_json(&sig.inputs)
     };
     let result_json_expr = result_json_expr(opaque);
+    let compare_closure = compare_closure(enable_replay, &return_type);
     let replay_bound = if enable_replay {
         quote!(#return_type: ::serde::de::DeserializeOwned,)
     } else {
@@ -377,7 +378,7 @@ fn generate_async_method(
     let reconstruct_closure = if enable_replay {
         quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja_runtime::Reconstructed<#return_type> {
-                match ::serde_json::from_value::<#return_type>(__deja_recorded) {
+                match ::deja_runtime::canonical::from_value::<#return_type>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja_runtime::Reconstructed::Value(__deja_replayed),
                     ::std::result::Result::Err(__deja_err) => ::deja_runtime::Reconstructed::Failed(
@@ -399,6 +400,27 @@ fn generate_async_method(
                         ::std::stringify!(#return_type)
                     )
                 )
+            }
+        }
+    };
+
+    // ONE closure answers both halves of the lookup. The delegate path declares
+    // no miss value, so its miss arm is `NoValue` — the same fail-stop the seam
+    // performed before, now expressed as the value the site returns rather than
+    // as the seam's fallback.
+    let reconstruct_closure = {
+        let __deja_hit = reconstruct_closure;
+        quote! {
+            |__deja_input: ::deja_runtime::ReconstructInput<'_>|
+                -> ::deja_runtime::Reconstructed<#return_type>
+            {
+                match __deja_input {
+                    ::deja_runtime::ReconstructInput::Hit(__deja_recorded) => {
+                        (#__deja_hit)(__deja_recorded)
+                    }
+                    ::deja_runtime::ReconstructInput::Miss(_) =>
+                        ::deja_runtime::Reconstructed::NoValue,
+                }
             }
         }
     };
@@ -495,6 +517,7 @@ fn generate_async_method(
                 },
                 #reconstruct_closure,
                 move |__deja_result| { #result_json_expr },
+                #compare_closure,
             ))
         }
     }
@@ -540,6 +563,7 @@ fn generate_sync_method(
         build_args_json(&sig.inputs)
     };
     let result_json_expr = result_json_expr(opaque);
+    let compare_closure = compare_closure(enable_replay, &output_type_tokens(return_type));
     let where_clause = sync_where_clause(generics, enable_replay.then_some(return_type_for_bound));
     let where_clause = if enable_replay {
         where_clause
@@ -554,7 +578,7 @@ fn generate_sync_method(
         let return_type_for_replay = output_type_tokens(return_type);
         quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja_runtime::Reconstructed<#return_type_for_replay> {
-                match ::serde_json::from_value::<#return_type_for_replay>(__deja_recorded) {
+                match ::deja_runtime::canonical::from_value::<#return_type_for_replay>(__deja_recorded) {
                     ::std::result::Result::Ok(__deja_replayed) =>
                         ::deja_runtime::Reconstructed::Value(__deja_replayed),
                     ::std::result::Result::Err(__deja_err) => ::deja_runtime::Reconstructed::Failed(
@@ -577,6 +601,25 @@ fn generate_sync_method(
                         ::std::stringify!(#return_type_for_replay)
                     )
                 )
+            }
+        }
+    };
+
+    // See the async arm: one closure, `NoValue` on a miss.
+    let reconstruct_closure = {
+        let __deja_hit = reconstruct_closure;
+        let return_type_for_replay = output_type_tokens(return_type);
+        quote! {
+            |__deja_input: ::deja_runtime::ReconstructInput<'_>|
+                -> ::deja_runtime::Reconstructed<#return_type_for_replay>
+            {
+                match __deja_input {
+                    ::deja_runtime::ReconstructInput::Hit(__deja_recorded) => {
+                        (#__deja_hit)(__deja_recorded)
+                    }
+                    ::deja_runtime::ReconstructInput::Miss(_) =>
+                        ::deja_runtime::Reconstructed::NoValue,
+                }
             }
         }
     };
@@ -654,7 +697,23 @@ fn generate_sync_method(
                 || self.$inner.#method_ident(#(#delegation_args),*),
                 #reconstruct_closure,
                 |__deja_result| { #result_json_expr },
+                #compare_closure,
             )
+        }
+    }
+}
+
+/// The round-trip check handed to the dispatch seam, which compares each
+/// recorded value with its rebuilt copy when the type offers a way to. A
+/// record-only delegate declares no replay codec.
+fn compare_closure(enable_replay: bool, value_type: &TokenStream) -> TokenStream {
+    if enable_replay {
+        quote! { ::deja_runtime::round_trip!(#value_type) }
+    } else {
+        quote! {
+            ::deja_runtime::round_trip::RoundTrip::<
+                fn(&#value_type, &#value_type) -> ::deja_runtime::round_trip::Comparison
+            >::RecordOnly
         }
     }
 }

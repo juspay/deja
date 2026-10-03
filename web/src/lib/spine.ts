@@ -117,6 +117,10 @@ export type SpineNode = {
   repMs: number | null;
   hiddenRec: HiddenGroup[];
   hiddenRep: HiddenGroup[];
+  /** True on a row promoted from the execution graph alone (an internal span
+   *  that made no instrumented call) — a waypoint with fields and durations,
+   *  never a verdict. */
+  promoted?: boolean;
   presence: Presence;
   /** The span-shape outcome when this row is (or carries) a SCORED span —
    *  the run's declared instrumentation contract (`scored_span_namespaces`). */
@@ -260,6 +264,14 @@ export function buildSpine(
   graph: { record: GraphNode[]; replay: GraphNode[] } | undefined,
   https: HttpDiff[],
   spanShapes?: Map<string, SpanShapeOutcome[]>,
+  opts?: {
+    /** Promote internal application spans (non-transport graph spans that made
+     *  no instrumented call) to real rows under their nearest spine ancestor,
+     *  instead of the countable hidden groups. The instrumented lattice —
+     *  `ucs::flow_data_transform` and kin — becomes visible per side even when
+     *  the run declared no scored-span contract. */
+    promoteInternal?: boolean;
+  },
 ): SpineModel {
   const idx = {
     rec: new Map<number, GraphNode>((graph?.record ?? []).map((n) => [n.node_id, n])),
@@ -474,8 +486,14 @@ export function buildSpine(
   let hidTransport = 0;
   let hidInternal = 0;
 
+  const promoted: SpineNode[] = [];
   for (const side of ["rec", "rep"] as const) {
-    const all = side === "rec" ? (graph?.record ?? []) : (graph?.replay ?? []);
+    // Ascending start time puts parents before children, so a promoted parent
+    // is already owned when its child walks up looking for a host — nesting
+    // among internal spans survives the promotion.
+    const all = [...(side === "rec" ? (graph?.record ?? []) : (graph?.replay ?? []))].sort(
+      (a, b) => a.started_ns - b.started_ns,
+    );
     const loose = new Map<string, HiddenGroup>();
     let looseTotal = 0;
     for (const n of all) {
@@ -492,6 +510,31 @@ export function buildSpine(
         if (!up) break;
         cur = parentOf(up);
       }
+
+      // The instrumented lattice, shown as rows. A row is a SITE: instances of
+      // the same span under the same host merge, exactly like ledger rows.
+      if (opts?.promoteInternal && !isTransport(n) && host) {
+        const path = `${host.path}>${n.span_name}`;
+        const key = `${host.caseId}|${path}`;
+        let row = nodes.get(key);
+        if (!row) {
+          row = fresh(host.caseId, path, host.depth + 1);
+          row.promoted = true;
+          nodes.set(key, row);
+          host.children.push(row);
+          promoted.push(row);
+        }
+        const bucket = side === "rec" ? row.recNodes : row.repNodes;
+        if (!bucket.includes(n.node_id)) bucket.push(n.node_id);
+        const v = msOf(n);
+        if (v != null) {
+          if (side === "rec") row.recMs = (row.recMs ?? 0) + v;
+          else row.repMs = (row.repMs ?? 0) + v;
+        }
+        owner[side].set(n.node_id, row);
+        continue;
+      }
+
       const ms = msOf(n) ?? 0;
       if (isTransport(n)) hidTransport += 1;
       else hidInternal += 1;
@@ -521,6 +564,17 @@ export function buildSpine(
         groups: [...loose.values()].sort((a, b) => b.count - a.count),
       });
     }
+  }
+
+  // Promoted rows joined after the enrichment pass, so their presence is set
+  // here, from the node ids each side actually contributed.
+  for (const row of promoted) {
+    row.presence =
+      row.recNodes.length > 0 && row.repNodes.length > 0
+        ? "both"
+        : row.recNodes.length > 0
+          ? "record-only"
+          : "replay-only";
   }
 
   const byCount = (a: HiddenGroup, b: HiddenGroup) => b.count - a.count;

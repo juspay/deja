@@ -723,8 +723,8 @@ pub fn semantic_event_text(event: &BoundaryEvent) -> String {
             .graph_node_id
             .map(|id| id.to_string())
             .unwrap_or_default(),
-        event.args,
-        event.result
+        event.args.text(),
+        event.result.text()
     )
 }
 
@@ -1161,8 +1161,8 @@ pub fn build_diff_rows(
     for e in &rec {
         let (label, _) = logical_key(&e.boundary, &e.method_name, &e.args);
         let left = Some(SideCell {
-            args: e.args.clone(),
-            result: Some(e.result.clone()),
+            args: e.args.to_value(),
+            result: Some(e.result.to_value()),
         });
         if consumed.contains(&e.global_sequence) {
             rows.push(DiffRow {
@@ -1171,7 +1171,7 @@ pub fn build_diff_rows(
                 left: left.clone(),
                 // Right echoes the substituted (recorded) value the candidate received.
                 right: Some(SideCell {
-                    args: e.args.clone(),
+                    args: e.args.to_value(),
                     result: None,
                 }),
                 gseq: Some(e.global_sequence),

@@ -39,7 +39,9 @@ use axum::{
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
-use deja_orchestrator::{api::runs, divergence, HarnessRoot, Run, RunStatus};
+use deja_orchestrator::{
+    api::runs, artifact_kinds, divergence, HarnessRoot, Run, RunId, RunStatus,
+};
 use deja_store::Store;
 use sha2::{Digest, Sha256};
 
@@ -70,6 +72,11 @@ enum ExecutorSelection {
 struct K8sExecutor {
     incluster: InClusterConfig,
     cfg: K8sExecutorConfig,
+    /// How many runs may RUN at once; `0` = no scheduling, which is the create
+    /// endpoint launching Jobs that start immediately, as it always did.
+    /// Resolved once at startup so the queue the endpoint creates into and the
+    /// queue the scheduler drains are the same one.
+    scheduler_capacity: usize,
 }
 
 impl ExecutorSelection {
@@ -85,6 +92,7 @@ impl ExecutorSelection {
                 Ok(ExecutorSelection::K8s(Box::new(K8sExecutor {
                     incluster,
                     cfg,
+                    scheduler_capacity: deja_orchestrator::executor::scheduler_capacity_from_env(),
                 })))
             }
         }
@@ -127,6 +135,30 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let executor = match ExecutorSelection::from_env() {
+        Ok(e) => {
+            match &e {
+                ExecutorSelection::Compose => eprintln!("deja-orchestrator: executor = compose"),
+                ExecutorSelection::K8s(k) => eprintln!(
+                    "deja-orchestrator: executor = k8s (jobs ns {}, template {}/{})",
+                    k.cfg.jobs_namespace, k.cfg.template_namespace, k.cfg.template_configmap
+                ),
+            }
+            Arc::new(e)
+        }
+        Err(err) => {
+            eprintln!("deja-orchestrator: executor config failed: {err}");
+            std::process::exit(1);
+        }
+    };
+    // Sweep the hydrated-artifact cache at boot, not only on the next view.
+    // The cache is the reason this volume fills, so a deployment that fixes it
+    // should reclaim on restart rather than waiting for someone to open a run —
+    // which on a full volume is the one thing nobody can do. After the
+    // executor, because only it says whether these files are a cache at all, and
+    // before the store, whose migration lock has no timeout.
+    evict_cached_artifacts(&root, "", LocalArtifacts::of(&executor));
+
     // Optional Postgres store: dashboard state, stage history, audit. Runs
     // still execute without it (file-backed worker state); store-backed
     // surfaces return 503 until it is up (demo/lib.sh boots the orchestrator
@@ -146,22 +178,6 @@ async fn main() {
             None
         }
     };
-    let executor = match ExecutorSelection::from_env() {
-        Ok(e) => {
-            match &e {
-                ExecutorSelection::Compose => eprintln!("deja-orchestrator: executor = compose"),
-                ExecutorSelection::K8s(k) => eprintln!(
-                    "deja-orchestrator: executor = k8s (jobs ns {}, template {}/{})",
-                    k.cfg.jobs_namespace, k.cfg.template_namespace, k.cfg.template_configmap
-                ),
-            }
-            Arc::new(e)
-        }
-        Err(err) => {
-            eprintln!("deja-orchestrator: executor config failed: {err}");
-            std::process::exit(1);
-        }
-    };
     let state = AppState {
         root: root.clone(),
         store,
@@ -177,11 +193,22 @@ async fn main() {
     // registry — without one there is nothing to reconcile, so log and skip.
     if let ExecutorSelection::K8s(k) = &*state.executor {
         match &state.store {
-            Some(store) => deja_orchestrator::executor::reconcile::spawn(
-                store.clone(),
-                k.incluster.clone(),
-                k.cfg.clone(),
-            ),
+            Some(store) => {
+                deja_orchestrator::executor::reconcile::spawn(
+                    store.clone(),
+                    k.incluster.clone(),
+                    k.cfg.clone(),
+                );
+                // The run scheduler. Off unless the environment declares a
+                // capacity, in which case `v1_create_run` creates each Job
+                // SUSPENDED and this loop resumes it when the pool has room.
+                deja_orchestrator::executor::scheduler::spawn(
+                    store.clone(),
+                    k.incluster.clone(),
+                    k.cfg.clone(),
+                    k.scheduler_capacity,
+                );
+            }
             None => eprintln!(
                 "deja-orchestrator: k8s reconciler disabled — no store (the reconciler needs \
                  the run registry to know which runs to settle)"
@@ -246,6 +273,9 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/calls", get(v1_calls))
         .route("/runs/{run_id}/http-diffs", get(v1_http_diffs))
         .route("/runs/{run_id}/graph", get(v1_graph))
+        .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
+        .route("/runs/{run_id}/tree", get(v1_tree))
+        .route("/runs/{run_id}/delta", get(v1_delta))
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit));
@@ -414,6 +444,13 @@ async fn v1_create_run(
     {
         return error_resp(400, &e);
     }
+    // A baseline is named by run id; a value that is not one would only be
+    // discovered when the report asks for the delta.
+    if let Some(against) = spec.delta_against.as_deref() {
+        if let Err(e) = against.parse::<RunId>() {
+            return error_resp(400, &format!("delta_against: {e}"));
+        }
+    }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
         Err(e) => return error_resp(500, &format!("create run: {e}")),
@@ -458,6 +495,17 @@ async fn v1_create_run(
     };
     match &*st.executor {
         ExecutorSelection::Compose => runs::spawn_worker(&st.root, &run.run_id, ctx),
+        // Scheduling on: the run is ACCEPTED and its Job created SUSPENDED —
+        // the scheduler resumes it when the pool has room. Starting it here
+        // would be the burst the queue exists to prevent, and a running Job
+        // spends its `activeDeadlineSeconds` waiting for a node.
+        ExecutorSelection::K8s(k) if k.scheduler_capacity > 0 => runs::spawn_k8s_run_queued(
+            &st.root,
+            run.clone(),
+            ctx,
+            k.incluster.clone(),
+            k.cfg.clone(),
+        ),
         ExecutorSelection::K8s(k) => runs::spawn_k8s_run(
             &st.root,
             run.clone(),
@@ -487,7 +535,7 @@ async fn v1_create_run(
 async fn v1_kill_run(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
 ) -> Response {
     let ExecutorSelection::K8s(k) = &*st.executor else {
         return error_resp(400, "kill is only supported for the k8s executor");
@@ -542,7 +590,7 @@ async fn v1_kill_run(
     }
 
     json_ok(serde_json::json!({
-        "run_id": run_id,
+        "run_id": run_id.as_str(),
         "job_deleted": report.job_deleted,
         "pods_deleted": report.pods_deleted,
         "problems": report.problems,
@@ -557,7 +605,7 @@ async fn v1_kill_run(
 /// 202 regardless) — matching the in-process transport's semantics.
 async fn v1_ingest_run_event(
     State(st): State<AppState>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
     body: axum::body::Bytes,
 ) -> Response {
     use deja_orchestrator::lifecycle::store_ctx::{apply_run_event, RunEvent};
@@ -655,6 +703,11 @@ async fn v1_ingest_run_event(
         if let Err(e) = apply_run_event(store, &run_id, &ev).await {
             eprintln!("deja-orchestrator: run-event store write failed for {run_id}: {e}");
         }
+        // This run's own delta, and those measured against it. Off the
+        // ingest path.
+        if settles_deltas(&ev) {
+            tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
+        }
     }
     StatusCode::ACCEPTED.into_response()
 }
@@ -689,7 +742,9 @@ async fn v1_list_recordings(State(st): State<AppState>) -> Response {
 /// wearing a confident label, which is worse than a refusal that says what to
 /// set. Its root override is optional and only consulted once its bucket
 /// resolves.
-fn scan_scope(system: Option<&str>) -> Result<(String, String), String> {
+fn scan_scope(
+    system: Option<&str>,
+) -> Result<(deja_orchestrator::system::RecordingBucket, String), String> {
     // Naming nothing means the default system, and the default system resolves
     // through the same registry as every other — declared, not special.
     // Delegates so that this endpoint, the correlation endpoint and the replay
@@ -741,6 +796,7 @@ async fn v1_systems() -> Response {
                 "is_default": s.is_default,
                 "configured": configured,
                 "s3_bucket": s.s3_bucket,
+                "s3_prefix": s.s3_prefix,
                 "recording_root": s.recording_root,
                 "manages_stores": s.manages_stores,
                 "manages_stores_declared": s.manages_stores_declared,
@@ -748,6 +804,7 @@ async fn v1_systems() -> Response {
                 "job_template_key": s.job_template_key,
                 "candidate_image_repo": s.candidate_image_repo,
                 "instance_pattern": s.instance_pattern,
+                "main_instance_prefix": s.main_instance_prefix,
                 "scored_span_namespaces": s.scored_span_namespaces,
                 // Reported so a deployment can see the canon the scorer will
                 // apply, rather than inferring it from a verdict that stopped
@@ -782,14 +839,17 @@ async fn v1_available_recordings(
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
     let root = match scan_scope(system_scope) {
-        Ok((bucket, root)) => {
-            cfg.bucket = bucket;
+        Ok((location, root)) => {
+            location.apply(&mut cfg);
             root
         }
         Err(message) => return error_resp(400, &message),
     };
     let scan_bucket = cfg.bucket.clone();
-    let found = match tokio::task::spawn_blocking(move || {
+    // The SCANNED config, bucket and prefix together, for the manifest
+    // enrichment below and for spelling each row's prefix in full.
+    let scanned = cfg.clone();
+    let mut found = match tokio::task::spawn_blocking(move || {
         deja_compactor::list_landed_recordings(&cfg, &root)
     })
     .await
@@ -810,6 +870,59 @@ async fn v1_available_recordings(
             .unwrap_or_default(),
         Err(_) => Default::default(),
     };
+
+    // Selection filters. Both default OFF, so every existing caller sees exactly
+    // what it saw before. A caller that wants a recording it can actually drive
+    // asks for it, and is refused BY NAME when the deployment has not declared
+    // enough to answer — never served the unfiltered list as if the question had
+    // been honoured.
+    if q.require_revision.unwrap_or(false) {
+        found.retain(|r| {
+            matches!(
+                deja_orchestrator::parse_recording_id(&r.session_id),
+                deja_orchestrator::RecordingIdentity::Described { .. }
+            )
+        });
+    }
+    if let Some(wanted) = q.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        found.retain(|r| {
+            group_of(&deja_orchestrator::parse_recording_id(&r.session_id)).as_deref()
+                == Some(wanted)
+        });
+    }
+    if q.main_instances.unwrap_or(false) {
+        // Matched rather than `unwrap_or_else`: that unifies this borrow of
+        // `q.system` with the `&'static str` the default returns, which asks the
+        // query string to live forever. A match lets the static coerce down
+        // instead.
+        let scoped: &str = match system_scope {
+            Some(s) => s,
+            None => deja_orchestrator::default_system(),
+        };
+        let Some(prefix) = deja_orchestrator::system::system_config(scoped).main_instance_prefix
+        else {
+            return error_resp(
+                400,
+                &format!(
+                    "system `{scoped}` declares no `main_instance_prefix`, so which pods are its \
+                     primary deployment is not knowable here: declare \
+                     `systems.{scoped}.main_instance_prefix` or drop `main_instances`"
+                ),
+            );
+        };
+        // Non-emptiness is asserted separately and first. `all` over an empty
+        // list is TRUE, so a recording whose `inst=` partitions the scan could
+        // not read would otherwise pass a test it was never measured against —
+        // and pass it precisely when we know least about it.
+        found.retain(|r| from_main_deployment(r, &prefix));
+    }
+
+    // Re-order now that ids can be parsed here. This must happen BEFORE the page
+    // is cut: a page taken from the wrong order does not merely mis-sort, it can
+    // drop the newest recording off the end of the page entirely, which is what
+    // it did in sandbox.
+    found.sort_by_cached_key(selection_order_key);
+    found.reverse();
 
     let total = found.len();
     let offset = q.offset.unwrap_or(0);
@@ -846,15 +959,21 @@ async fn v1_available_recordings(
     // in hyperswitch-art — finding nothing, and reporting every prism row as
     // unsealed with null counts. That failure is silent: "not sealed" is a valid
     // answer, so nothing downstream could tell it from the truth.
-    let mut cfg_for_manifests = deja_orchestrator::s3::S3Config::from_env();
-    cfg_for_manifests.bucket = scan_bucket.clone();
-    let manifests = tokio::task::spawn_blocking(move || {
-        deja_compactor::read_manifests(&cfg_for_manifests, &ids)
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_default();
+    let cfg_for_manifests = scanned.clone();
+    // This listing does not distinguish "not sealed" from "could not tell" —
+    // read_manifests preserves that per-recording, a replay's membership check
+    // needs it, this enrichment does not.
+    let manifests: Vec<Option<deja_compactor::SessionManifest>> =
+        tokio::task::spawn_blocking(move || {
+            deja_compactor::read_manifests(&cfg_for_manifests, &ids)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.ok().flatten())
+        .collect();
 
     let page: Vec<serde_json::Value> = page_rows
         .into_iter()
@@ -913,8 +1032,36 @@ async fn v1_available_recordings(
                 }
                 deja_orchestrator::RecordingIdentity::Opaque => serde_json::Value::Null,
             };
+            // An id that names no revision is not the same as a recording whose
+            // revision is unknown. The envelopes carry `code.sha`, the seal
+            // already collected it, and this endpoint already holds the
+            // manifest for the row — so report it rather than making every
+            // reader open the tape to find out. Purely additive: it fills a
+            // field that was null, and never overrides what an id did say,
+            // because the two spell a sha at different lengths and reconciling
+            // them is a separate question from filling a gap.
+            let described = match (described, manifest.and_then(manifest_revision)) {
+                (serde_json::Value::Null, Some(revision)) => serde_json::json!({
+                    "revision": revision,
+                    "revision_source": "manifest",
+                }),
+                (serde_json::Value::Object(mut o), Some(revision))
+                    if !o.contains_key("revision") =>
+                {
+                    o.insert("revision".into(), revision.into());
+                    o.insert("revision_source".into(), "manifest".into());
+                    serde_json::Value::Object(o)
+                }
+                (other, _) => other,
+            };
             serde_json::json!({
                 "recording_id": r.session_id,
+                // The deployment-and-day this belongs to, from the ID. Null
+                // when the id does not carry both a revision and a start date —
+                // which is NOT the same condition as `identity.revision` being
+                // null, because that field can be answered from the manifest
+                // and the manifest does not supply a day. See `group_of`.
+                "group": group_of(&identity),
                 "dates": r.dates,
                 "latest_date": r.latest_date(),
                 "objects": r.objects,
@@ -935,7 +1082,8 @@ async fn v1_available_recordings(
                 "instances": r.instances,
                 // The prefix the orchestrator would ingest from. Reported so a
                 // run can be reproduced by hand, not so a caller has to supply it.
-                "prefix": r.prefix,
+                // In full, since it is read beside `bucket` as an `s3://` path.
+                "prefix": scanned.bucket_key(&r.prefix),
                 // Seal facts. Null, never zero, when the recording is unsealed.
                 "sealed": manifest.is_some(),
                 "correlations": manifest.map(|m| m.counts.correlations),
@@ -969,10 +1117,148 @@ async fn v1_available_recordings(
     }))
 }
 
+/// The order a caller means by "newest first".
+///
+/// The compactor's listing sorts by write DATE and then by session id, and it
+/// cannot do better: it carries no deja dependency, so it cannot parse an id.
+/// That tiebreak sorts `rec-<revision>-<time>-<instance>` on the REVISION hex,
+/// so the moment two revisions are live the order stops tracking time — sandbox
+/// had `rec-72b65cb-…0800` sorted above `rec-4157177-…1400`, six hours newer,
+/// and the pipeline replayed the older tape without anything reporting a fault.
+///
+/// A total key rather than a hand-written comparator. The shapes here
+/// (`Described`, `BootDerived`, `Opaque`) make a pairwise rule easy to write
+/// non-transitively, and an inconsistent comparator does not fail loudly: it
+/// yields a wrong order at some list lengths and not others.
+///
+/// `None` sorts below `Some`, so within one date a recording that names its
+/// time comes before one that does not. For a system whose ids are ALL
+/// boot-derived — prism mints `run-<nanos>` for every recording — every middle
+/// element is `None` and the session id decides, and a fixed-width nanosecond
+/// epoch sorts lexically exactly as it sorts numerically. That case was already
+/// correct and stays correct.
+/// Whether every instance that wrote this recording belongs to the system's
+/// primary deployment.
+///
+/// Non-emptiness is asserted separately and FIRST, because `all` over an empty
+/// list is true: a recording whose `inst=` partitions the scan could not read
+/// would otherwise pass a test it was never measured against, and pass it
+/// exactly when we know least about it.
+///
+/// The match is anchored with `starts_with` rather than `contains` for a reason
+/// that is not stylistic: the custom deployments are named
+/// `sbx-custom-cug-hyperswitch-server-…`, which CONTAINS the main deployment's
+/// name `sbx-hyperswitch-server`. A substring test — which is what the
+/// neighbouring `instance_pattern` does, for a different question — admits
+/// precisely the pods this one exists to exclude.
+/// The revision a sealed recording's ENVELOPES claim, when they claim exactly
+/// one.
+///
+/// The manifest's `code` is the distinct code identities seen across the
+/// session's envelopes, which is where the revision authoritatively lives —
+/// `parse_recording_id`'s own documentation says so: "An id is a convenience,
+/// and the recording's envelopes carry the same facts authoritatively."
+///
+/// Zero or several read as UNKNOWN rather than as a pick. A recording whose
+/// envelopes disagree about which code produced them has no single revision,
+/// and naming one of them would be a confident lie in exactly the case where a
+/// caller most needs to know it cannot compare a candidate to this tape.
+fn manifest_revision(manifest: &deja_compactor::SessionManifest) -> Option<String> {
+    let distinct: std::collections::BTreeSet<&str> = manifest
+        .code
+        .iter()
+        .filter_map(|c| c.sha.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    match distinct.len() {
+        1 => distinct.into_iter().next().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// The deployment-and-day a recording belongs to, or `None` when its id does not
+/// name BOTH a revision and a start date.
+///
+/// Both, and the distinction is live rather than theoretical. A row's
+/// `identity.revision` can come from the MANIFEST when the id does not carry
+/// one (`revision_source: "manifest"`), so a boot-derived recording can report
+/// a revision and still have no group — `run-1789076520165195354` does exactly
+/// that today, with revision `28d8299` and 59 correlations. The manifest
+/// supplies the revision; nothing supplies the day, because the id has no start
+/// date and the recording's own `latest_date` is the day it last WROTE, which
+/// for a session straddling midnight is not the day it belongs to.
+///
+/// Grouping it by the wrong day would put a recording in a selection whose
+/// scope nobody named, which is worse than leaving it ungroupable: the pipeline
+/// already excludes these on the main-deployment test, so nothing is lost by
+/// declining to guess.
+///
+/// `<revision>-<MMDD>`, derived rather than stored. The id ALREADY carries the
+/// minute a recording started, so the day is a prefix of something every
+/// recording has had all along — no new id shape, nothing to mint, and every
+/// recording ever sealed is groupable the moment this ships.
+///
+/// This is the unit a replay actually wants. A pod's recording is an arbitrary
+/// slice: pods are replaced every thirty minutes, so "the traffic this
+/// deployment served that day" is spread across dozens of them — 82 on the day
+/// this was measured — and picking one is picking a fraction for no reason a
+/// caller could state.
+fn group_of(identity: &deja_orchestrator::RecordingIdentity) -> Option<String> {
+    match identity {
+        deja_orchestrator::RecordingIdentity::Described {
+            revision,
+            recorded_at,
+            ..
+        } => Some(format!(
+            "{revision}-{}",
+            &recorded_at[..4.min(recorded_at.len())]
+        )),
+        _ => None,
+    }
+}
+
+fn from_main_deployment(r: &deja_compactor::LandedRecording, prefix: &str) -> bool {
+    !r.instances.is_empty() && r.instances.iter().all(|i| i.starts_with(prefix))
+}
+
+fn selection_order_key(
+    r: &deja_compactor::LandedRecording,
+) -> (Option<String>, Option<String>, String) {
+    let recorded_at = match deja_orchestrator::parse_recording_id(&r.session_id) {
+        deja_orchestrator::RecordingIdentity::Described { recorded_at, .. } => Some(recorded_at),
+        _ => None,
+    };
+    (
+        r.latest_date().map(str::to_owned),
+        recorded_at,
+        r.session_id.clone(),
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct AvailableQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Keep only recordings whose id names the revision that produced them.
+    ///
+    /// `run-<nanos>` is NOT merely a legacy spelling — it is what the prism
+    /// recorder mints for every recording it makes — so this is a per-caller
+    /// question rather than something the endpoint may decide. A router replay
+    /// needs the revision (it is what makes a candidate comparable and what the
+    /// candidate-migrations fetch resolves against) and asks for it; a prism
+    /// caller must not, or it would filter away everything prism records.
+    require_revision: Option<bool>,
+    /// Keep only recordings written entirely by the system's primary
+    /// deployment, per its declared `main_instance_prefix`.
+    main_instances: Option<bool>,
+    /// Keep only the members of one deployment-and-day, `<revision>-<MMDD>`.
+    ///
+    /// The members ARE the recording: replaying a deployment's day means
+    /// driving all of them as one run rather than picking one pod's slice. So
+    /// this is how a caller turns a group it has chosen into the list it needs,
+    /// having chosen it from the `group` field on the rows.
+    group: Option<String>,
     /// Which system's recordings to list. Absent = the default bucket
     /// (`DEJA_S3_BUCKET`). A named system scans ITS bucket
     /// (`DEJA_<SYSTEM>_S3_BUCKET`, root `DEJA_<SYSTEM>_RECORDING_ROOT`
@@ -1045,13 +1331,14 @@ async fn v1_recording_correlations(
     // s3://<default>/landing/v1" about a recording that exists.
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let root = match scan_scope(q.system.as_deref().filter(|s| !s.trim().is_empty())) {
-        Ok((bucket, root)) => {
-            cfg.bucket = bucket;
+        Ok((location, root)) => {
+            location.apply(&mut cfg);
             root
         }
         Err(message) => return error_resp(400, &format!("{message} (reading correlations)")),
     };
-    let bucket = cfg.bucket.clone();
+    let searched = cfg.uri(&root);
+    let spelled = cfg.clone();
     let scanned = root.clone();
     let wanted = id.clone();
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
@@ -1158,7 +1445,7 @@ async fn v1_recording_correlations(
                 "offset": offset,
                 "limit": limit,
                 "correlations": serde_json::Value::Null,
-                "prefix": prefix,
+                "prefix": spelled.bucket_key(&prefix),
                 "detail": "recording has landed but is not sealed yet — its correlations are not \
                            knowable without ingesting it, which the first replay run of it does",
             }))
@@ -1180,21 +1467,38 @@ async fn v1_recording_correlations(
             "note": "sealed before the correlation index existed: the manifest knows how many \
                      correlations the seal covered but not which",
         })),
-        RecordingCorrelations::Unknown => error_resp(
-            404,
-            &format!("recording {id} is not in s3://{bucket}/{root}"),
-        ),
+        RecordingCorrelations::Unknown => {
+            error_resp(404, &format!("recording {id} is not in {searched}"))
+        }
     }
 }
 
+/// How many runs `GET /api/v1/runs` returns.
+///
+/// Unchanged at 200. The 2026-09-17 outage was NOT this number — it was the
+/// bytes PER row: 200 rows weighed 46.5 MB, of which 173,866 bytes were the
+/// rows and the other 97.5% was `scorecard`. Without that column the same 200
+/// rows are ~174 KB, so cutting the count would have bought 10x against the
+/// 267x that dropping the column buys, and would have cost something real —
+/// `RunsPage` derives attempt ordinals ("attempt 3 of 4") over the WHOLE list,
+/// and a page-sized list makes that number silently wrong.
+///
+/// Paginating is still worth doing. It is worth doing with the ordinals moved
+/// server-side first, which is a separate change and not one to make while the
+/// pod is in CrashLoopBackOff.
+const RUN_LIST_LIMIT: i64 = 200;
+
 /// `GET /api/v1/runs` — run list (Postgres-backed; newest first).
+///
+/// Rows are [`RunSummaryRow`], which carries no `scorecard`. A caller that
+/// needs one asks for a single run.
 async fn v1_list_runs(State(st): State<AppState>) -> Response {
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    match store.list_runs(200).await {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
+    match store.list_run_summaries(RUN_LIST_LIMIT).await {
+        Ok(rows) => json_ok_ser(&rows),
         Err(e) => error_resp(500, &format!("list runs: {e}")),
     }
 }
@@ -1217,7 +1521,7 @@ fn live_json(live: &Run) -> serde_json::Value {
 /// the snapshot carries the worker's live stage/step (file store is the
 /// worker's source of truth mid-run). Degrades to the snapshot alone when the
 /// store is down, so script polling works file-only too.
-async fn v1_get_run(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
     let row = match &st.store {
         Some(store) => match store.get_run(&id).await {
             Ok(row) => row,
@@ -1248,32 +1552,212 @@ fn local_path_for_artifact_kind(
     run_id: &str,
     kind: &str,
 ) -> Option<std::path::PathBuf> {
-    Some(match kind {
-        "observed" => root.observed_path(run_id),
-        "http_diffs" => root.http_diff_path(run_id),
-        "lookup_table" => root.lookup_table_path(run_id),
-        "scorecard" => root.scorecard_path(run_id),
-        "call_ledger" => root.call_ledger_path(run_id),
-        "record_graph" => root.record_graph_path(run_id),
-        _ => return None,
+    artifact_kinds::served()
+        .find(|served| served.name == kind)
+        .map(|served| served.path(root, run_id))
+}
+
+/// Default ceiling on the hydrated-artifact cache. `DEJA_ARTIFACT_CACHE_MAX_BYTES`
+/// overrides it; `0` disables the sweep entirely.
+///
+/// Sized well under the state volume so tapes under `recordings/`, run records
+/// and the seed work still have room: the cache is the part that grows without
+/// anyone deciding to grow it.
+const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn artifact_cache_max_bytes() -> u64 {
+    std::env::var("DEJA_ARTIFACT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_BYTES)
+}
+
+/// Caches the orchestrator derives from hydrated files and rebuilds on a miss.
+const DERIVED_CACHES: [&str; 3] = ["behaviour_tree", "delta", "change_coverage"];
+
+/// Where the cache sweep may find a file of `kind` for `run_id`: a hydrated
+/// copy, or a cache derived from one. Nothing else is cache.
+fn cache_path_for_kind(root: &HarnessRoot, run_id: &str, kind: &str) -> Option<std::path::PathBuf> {
+    match kind {
+        "behaviour_tree" => Some(root.behaviour_tree_path(run_id)),
+        "delta" => Some(root.delta_cache_path(run_id)),
+        "change_coverage" => Some(root.change_coverage_path(run_id)),
+        "lookup_table" => Some(root.lookup_table_path(run_id)),
+        _ => local_path_for_artifact_kind(root, run_id, kind),
+    }
+}
+
+/// What counts as cache here. Derived caches always do: they are rebuilt on a
+/// miss. Hydrated kinds do only where they are copies of stored objects.
+fn cache_kinds(local: LocalArtifacts) -> impl Iterator<Item = &'static str> {
+    artifact_kinds::served()
+        .map(|kind| kind.name)
+        .chain(NO_LONGER_HYDRATED)
+        .filter(move |_| local == LocalArtifacts::CopiesOfStore)
+        .chain(DERIVED_CACHES)
+}
+
+/// Kinds that were hydrated once and no longer are. Copies pulled before the
+/// change are still on the volume, and nothing will pull them again, so the
+/// sweep keeps evicting them.
+const NO_LONGER_HYDRATED: [&str; 1] = ["lookup_table"];
+
+/// The directories the cache sweep looks in, asked of `cache_path_for_kind`
+/// rather than named here.
+fn artifact_cache_dirs(root: &HarnessRoot, local: LocalArtifacts) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = cache_kinds(local)
+        .filter_map(|kind| cache_path_for_kind(root, "_probe", kind))
+        .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// The run whose cache file `path` is, or `None` when it is not one.
+///
+/// A path is cache only if `cache_path_for_kind` would produce exactly it for
+/// some run and kind. Those directories also hold run records, seed
+/// certificates, notes and manifests, which are not copies of anything; a
+/// directory is not a category.
+fn cached_file_run(
+    root: &HarnessRoot,
+    path: &std::path::Path,
+    local: LocalArtifacts,
+) -> Option<String> {
+    const MARK: &str = "\u{1}";
+    let name = path.file_name()?.to_str()?;
+    cache_kinds(local).find_map(|kind| {
+        let template = cache_path_for_kind(root, MARK, kind)?;
+        let (prefix, suffix) = template.file_name()?.to_str()?.split_once(MARK)?;
+        let run_id = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+        (cache_path_for_kind(root, run_id, kind).as_deref() == Some(path))
+            .then(|| run_id.to_owned())
     })
+}
+
+/// What the files in this deployment's artifact directories are. The paths
+/// are the same either way; which one applies is decided by the executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalArtifacts {
+    /// k8s: runs publish from the pod to S3, and the orchestrator hydrates
+    /// copies of those objects. Evicting one costs a re-download.
+    CopiesOfStore,
+    /// compose: the lifecycle runs in-process and registers local paths, and
+    /// nothing is hydrated. Evicting a hydrated-kind file deletes the artifact.
+    OnlyCopies,
+}
+
+impl LocalArtifacts {
+    fn of(executor: &ExecutorSelection) -> Self {
+        match executor {
+            ExecutorSelection::K8s(_) => Self::CopiesOfStore,
+            ExecutorSelection::Compose => Self::OnlyCopies,
+        }
+    }
+}
+
+/// Delete least-recently-modified hydrated artifacts until the cache is under
+/// budget.
+///
+/// Only files `cached_file_run` recognises for this deployment are counted or
+/// deleted. Each is a copy of an `s3://` object that the run's artifact row
+/// still points at, or a cache derived from one, so eviction costs a
+/// re-download or a rebuild on the next view and loses nothing. Without it the
+/// cache only ever grows: `hydrate_run_artifacts` skips a path that already
+/// exists and has no counterpart that removes one, so the volume fills in
+/// proportion to runs LOOKED AT rather than runs executed.
+///
+/// `keep` is the run being served right now — evicting its files between the
+/// write and the read would turn a view into an empty one.
+///
+/// Modification time is the ordering key, not access time: `relatime` makes
+/// atime unreliable and a hydrated file is written once and then only read.
+/// So this is least-recently-HYDRATED, which for a write-once cache is the same
+/// order.
+fn evict_cached_artifacts(root: &HarnessRoot, keep: &str, local: LocalArtifacts) {
+    let budget = artifact_cache_max_bytes();
+    if budget == 0 {
+        return;
+    }
+    let mut entries: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for dir in artifact_cache_dirs(root, local) {
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in listing.flatten() {
+            let path = entry.path();
+            let Some(run_id) = cached_file_run(root, &path, local) else {
+                continue;
+            };
+            // `keep` empty means keep nothing: the boot sweep protects no run.
+            if !keep.is_empty() && run_id == keep {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            total = total.saturating_add(meta.len());
+            entries.push((modified, meta.len(), path));
+        }
+    }
+    if total <= budget {
+        return;
+    }
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    let mut freed: u64 = 0;
+    let mut removed = 0_usize;
+    for (_, size, path) in entries {
+        if total.saturating_sub(freed) <= budget {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            freed = freed.saturating_add(size);
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        eprintln!(
+            "artifact cache: evicted {removed} file(s), {freed} byte(s); \
+             {} of {budget} byte(s) remain",
+            total.saturating_sub(freed)
+        );
+    }
 }
 
 /// Pull a run's `s3://` artifacts down to the local paths the detail endpoints
 /// read (idempotent — a path already present is left alone). k8s runs publish
 /// artifacts to S3 (the pod is ephemeral); this makes them readable on the
-/// orchestrator. Best-effort: a missing/failed artifact just leaves that view
-/// empty, never errors the request. No-op for compose runs — their artifacts are
-/// already local and their URIs are filesystem paths, not `s3://`.
-async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
-    let Some(store) = st.store.clone() else {
-        return;
-    };
-    let Ok(arts) = store.list_artifacts(run_id).await else {
-        return;
-    };
+/// orchestrator. A failed pull leaves the path absent; the scorecard, calls and
+/// http-diffs endpoints then answer through `absent_artifact`, which says the
+/// artifact is registered but is not on this host, while `/graph` still reads
+/// an absent side as empty. No-op for compose runs — their artifacts are already
+/// local and their URIs are filesystem paths, not `s3://`.
+///
+/// Returns what the run registered, so a reader can tell an artifact that was
+/// never published from one that has not arrived, and which of those can be
+/// pulled again; `None` without a store.
+async fn hydrate_run_artifacts(st: &AppState, run_id: &str) -> Option<Hydrated> {
+    let store = st.store.clone()?;
+    let arts = store.list_artifacts(run_id).await.ok()?;
+    let registered: std::collections::BTreeSet<String> =
+        arts.iter().map(|art| art.kind.clone()).collect();
+    // Only an artifact that lives in S3 can be fetched a second time. A
+    // compose run's artifacts are registered under their local paths: the
+    // file on disk IS the artifact, and removing it would remove the only copy.
+    let pullable: std::collections::BTreeSet<String> = arts
+        .iter()
+        .filter(|art| deja_orchestrator::codebundle::parse_s3_uri(&art.uri).is_ok())
+        .map(|art| art.kind.clone())
+        .collect();
     let root = st.root.clone();
     let run_id = run_id.to_owned();
+    let local_files = LocalArtifacts::of(&st.executor);
     // object_store's sync API blocks on its own runtime — run it off the async
     // worker so we never nest block_on inside tokio.
     let _ = tokio::task::spawn_blocking(move || {
@@ -1294,41 +1778,68 @@ async fn hydrate_run_artifacts(st: &AppState, run_id: &str) {
                     if let Some(parent) = local.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Err(e) = std::fs::write(&local, bytes) {
+                    // renamed into place: a concurrent view that finds the
+                    // path takes it as whole, so it must never see a prefix
+                    if let Err(e) = divergence::behaviour_tree::write_atomic(&local, &bytes) {
                         eprintln!("hydrate: write {}: {e}", local.display());
                     }
                 }
                 Err(e) => eprintln!("hydrate: {} <- {}: {e}", local.display(), art.uri),
             }
         }
+        // Sweep AFTER writing, and never the run just written: a view that
+        // hydrated its own files and then evicted them would render empty.
+        evict_cached_artifacts(&root, &run_id, local_files);
     })
     .await;
+    Some(Hydrated {
+        registered,
+        pullable,
+    })
 }
 
-/// `GET /api/v1/runs/{id}/scorecard` — serve the divergence scorecard. Prefers
-/// the runner's PRECOMPUTED scorecard (a k8s recompute would need the recording,
-/// which isn't on the orchestrator); falls back to recomputing for compose.
-async fn v1_scorecard(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+/// What a run's artifact registration says: every kind it published, and the
+/// subset held in S3 that the orchestrator can pull again.
+struct Hydrated {
+    registered: std::collections::BTreeSet<String>,
+    pullable: std::collections::BTreeSet<String>,
+}
+
+/// `GET /api/v1/runs/{id}/scorecard` — serve the scorecard the run published.
+///
+/// The API does not score. A run whose scorecard is not here gets a refusal
+/// naming why; a card built on this host from whatever inputs happened to be
+/// lying around would look like a judgement the run never made.
+async fn v1_scorecard(State(st): State<AppState>, id: RunId) -> Response {
     hydrate_run_artifacts(&st, &id).await;
-    if let Ok(content) = std::fs::read_to_string(st.root.scorecard_path(&id)) {
-        if let Ok(card) = serde_json::from_str::<serde_json::Value>(&content) {
-            return json_ok(card);
+    let content = match std::fs::read_to_string(artifact_kinds::SCORECARD.path(&st.root, &id)) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return absent_artifact(&st, &id, artifact_kinds::SCORECARD.name).await;
+        }
+        Err(e) => return error_resp(500, &format!("scorecard: {e}")),
+    };
+    let mut card = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(card) => card,
+        Err(e) => {
+            return error_resp(
+                500,
+                &format!("scorecard: the published artifact does not parse: {e}"),
+            )
+        }
+    };
+    // A scorer that ingested nothing can only say so; which of the run's
+    // dispositions explains it is known here and not there.
+    if let Some(reason) = card.pointer_mut("/verdict/reason") {
+        if reason.as_str() == Some(divergence::NO_ARTIFACTS_REASON) {
+            let (state, failure) = run_disposition(&st, &id).await;
+            *reason = serde_json::Value::String(empty_scorecard_reason(
+                state.as_deref(),
+                failure.as_deref(),
+            ));
         }
     }
-    match divergence::scorecard(&st.root, &id) {
-        Ok(mut card) => {
-            // An empty scorecard has three possible causes and they are not the
-            // same news. The scorer can only report that nothing arrived; which
-            // cause applies is a fact about the RUN, and this is the one place
-            // that holds both.
-            if card.verdict.reason == divergence::NO_ARTIFACTS_REASON {
-                let (state, failure) = run_disposition(&st, &id).await;
-                card.verdict.reason = empty_scorecard_reason(state.as_deref(), failure.as_deref());
-            }
-            json_ok(serde_json::to_value(&card).unwrap_or_default())
-        }
-        Err(e) => error_resp(500, &format!("scorecard: {e}")),
-    }
+    json_ok(card)
 }
 
 /// The run's state and failure message, preferring the STORE row.
@@ -1353,93 +1864,205 @@ async fn run_disposition(st: &AppState, id: &str) -> (Option<String>, Option<Str
             return (Some(row.state), failure);
         }
     }
-    match runs::get(&st.root, id) {
-        Ok(run) => (
+    // The live record, read through the same containment check as every
+    // other file the delta handlers open.
+    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    match live {
+        Some(run) => (
             serde_json::to_value(run.status)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned)),
             run.failure_reason,
         ),
-        Err(_) => (None, None),
+        None => (None, None),
+    }
+}
+
+/// Where a run stands, as the one thing both "empty" and "absent" answers name.
+enum Disposition<'a> {
+    Failed(Option<&'a str>),
+    Completed,
+    InProgress(&'a str),
+    Unknown,
+}
+
+impl<'a> Disposition<'a> {
+    fn of(state: Option<&'a str>, failure: Option<&'a str>) -> Self {
+        match state {
+            Some("failed") => Self::Failed(failure),
+            Some("completed") => Self::Completed,
+            Some(other) => Self::InProgress(other),
+            None => Self::Unknown,
+        }
+    }
+
+    fn named(&self) -> String {
+        match self {
+            Self::Failed(failure) => format!(
+                "the run FAILED — {}",
+                failure.unwrap_or("no failure message was recorded against the run")
+            ),
+            Self::Completed => "the run reports COMPLETED".to_owned(),
+            Self::InProgress(state) => format!("the run is still {state}"),
+            Self::Unknown => "the run itself could not be read".to_owned(),
+        }
     }
 }
 
 /// Why a scorecard that judged nothing is empty, said in the run's own terms.
 ///
-/// [`divergence::detect`] is handed the artifacts and nothing else, so the most
-/// it can say is that none arrived. WHY none arrived is a property of the run,
-/// and the three answers are different news that must not arrive as one
-/// sentence:
-///
-///  - the run is still going, so artifacts may genuinely still appear;
-///  - the run is over and FAILED, so they never will — and the failure says why;
-///  - the run is over and COMPLETED yet ingested nothing, which is an anomaly in
-///    its own right and the loudest of the three, because a run that succeeded
-///    without comparing anything is a hole in the pipeline rather than a result.
-///
-/// The standing rule this serves: an empty result names which of its possible
-/// causes applies. This one previously named none of them, and said "yet" —
-/// which told a reader the artifacts were on their way for runs that had died
-/// an hour before.
+/// The scorer is handed the artifacts and nothing else, so the most it can say
+/// is that none arrived. Why none arrived is a property of the run: still
+/// going, so they may appear; FAILED, so they never will; or COMPLETED having
+/// ingested nothing, the loudest, because a run that succeeded without
+/// comparing anything is a hole in the pipeline rather than a result.
 fn empty_scorecard_reason(state: Option<&str>, failure: Option<&str>) -> String {
     let base = divergence::NO_ARTIFACTS_REASON;
-    match state {
-        Some("failed") => format!(
-            "{base}: the run FAILED before producing any — {}. Nothing was compared, so \
-             nothing here is evidence about the candidate",
-            failure.unwrap_or("no failure message was recorded against the run")
+    let disposition = Disposition::of(state, failure);
+    let consequence = match disposition {
+        Disposition::Failed(_) => {
+            "Nothing was compared, so nothing here is evidence about the candidate"
+        }
+        Disposition::Completed => {
+            "A run that finished without ingesting anything has not scored the candidate, \
+             and this scorecard must not be read as though it had"
+        }
+        Disposition::InProgress(_) => {
+            "This is a snapshot of a run in progress rather than a verdict on it"
+        }
+        Disposition::Unknown => "Whether more are coming is therefore unknown, not \"not yet\"",
+    };
+    format!("{base}: {}. {consequence}", disposition.named())
+}
+
+/// How the artifact index accounts for a `kind` this host does not have.
+async fn artifact_registration(st: &AppState, id: &str, kind: &str) -> String {
+    let listing = match &st.store {
+        None => None,
+        Some(store) => Some(
+            store
+                .list_artifacts(id)
+                .await
+                .map(|arts| arts.into_iter().map(|a| (a.kind, a.uri)).collect())
+                .map_err(|e| e.to_string()),
         ),
-        Some("completed") => format!(
-            "{base}, yet the run reports COMPLETED — a run that finished without ingesting \
-             anything has not scored the candidate, and this scorecard must not be read as \
-             though it had"
+    };
+    describe_registration(listing, kind)
+}
+
+/// The index's account of `kind`, from its listing of the run as
+/// `(kind, uri)` rows; `None` when the deployment has no store.
+fn describe_registration(
+    listing: Option<Result<Vec<(String, String)>, String>>,
+    kind: &str,
+) -> String {
+    match listing {
+        None => "this deployment has no artifact store, so the run's own files are the only \
+                 copy and this one was never written"
+            .to_owned(),
+        Some(Ok(rows)) => match rows.into_iter().find(|(k, _)| k == kind) {
+            Some((_, uri)) => format!(
+                "it is registered at {uri} but is not on this host — the pull failed or the \
+                 cached copy was evicted; a fault in serving it, not a fact about the run"
+            ),
+            // The index records uploads, not attempts: a run that never produced
+            // this artifact and one whose upload failed look the same from here.
+            None => "the run never registered one — whether it was not produced or its \
+                     upload failed is not recorded here"
+                .to_owned(),
+        },
+        Some(Err(e)) => format!("the artifact index could not be read ({e})"),
+    }
+}
+
+/// The one answer every detail endpoint gives for an artifact that is not
+/// here: which artifact, what the index says about it, and where the run
+/// stands. 404 because the thing asked for does not exist on this host; the
+/// body says whether it ever will.
+async fn absent_artifact(st: &AppState, id: &str, kind: &str) -> Response {
+    let registration = artifact_registration(st, id, kind).await;
+    let (state, failure) = run_disposition(st, id).await;
+    let disposition = Disposition::of(state.as_deref(), failure.as_deref());
+    let consequence = match disposition {
+        Disposition::Failed(_) => "It will not arrive; the failure is the answer",
+        Disposition::Completed => {
+            "A completed run is expected to have published it, so this is a hole in the \
+             pipeline, not an empty result"
+        }
+        Disposition::InProgress(_) => "It may still arrive",
+        Disposition::Unknown => "Whether it will arrive is unknown",
+    };
+    error_resp(
+        404,
+        &format!(
+            "no {kind} artifact for {id}: {registration}; {}. {consequence}",
+            disposition.named()
         ),
-        Some(other) => format!(
-            "{base}: the run is still {other}, so this is a snapshot of a run in progress \
-             rather than a verdict on it"
-        ),
-        None => format!(
-            "{base}, and the run itself could not be read — whether more are coming is \
-             therefore unknown, not \"not yet\""
-        ),
+    )
+}
+
+/// A JSON-lines artifact, read so every non-blank line becomes a row or a
+/// counted drop. `Ok(None)` is absence; a line that will not parse refuses the
+/// whole artifact, because a truncated stream served as a whole one is
+/// indistinguishable from a complete answer.
+fn read_jsonl_artifact(
+    path: &std::path::Path,
+    kind: &str,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    use std::io::BufRead as _;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{kind}: {e}")),
+    };
+    let mut rows = Vec::new();
+    let mut unparseable = 0usize;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("{kind}: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(&line) {
+            Ok(row) => rows.push(row),
+            Err(_) => unparseable += 1,
+        }
+    }
+    if unparseable > 0 {
+        return Err(format!(
+            "{kind}: {unparseable} of {} lines could not be parsed; refusing to serve a \
+             partial artifact as a whole one",
+            rows.len() + unparseable
+        ));
+    }
+    Ok(Some(rows))
+}
+
+/// Serve a JSON-lines artifact the run published, or name why it is not here.
+async fn serve_jsonl_artifact(
+    st: &AppState,
+    id: &str,
+    kind: &artifact_kinds::RunArtifactKind,
+) -> Response {
+    hydrate_run_artifacts(st, id).await;
+    match read_jsonl_artifact(&kind.path(&st.root, id), kind.name) {
+        Ok(Some(rows)) => json_ok(serde_json::Value::Array(rows)),
+        Ok(None) => absent_artifact(st, id, kind.name).await,
+        Err(e) => error_resp(500, &e),
     }
 }
 
 /// `GET /api/v1/runs/{id}/calls` — the per-call divergence ledger (recorded vs
-/// observed, classified + located) that backs the interactive diff view. Prefers
-/// the runner's PRECOMPUTED ledger (a recompute needs the recording, absent on
-/// the orchestrator for k8s runs); falls back to recomputing for compose.
-async fn v1_calls(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    hydrate_run_artifacts(&st, &id).await;
-    if let Ok(content) = std::fs::read_to_string(st.root.call_ledger_path(&id)) {
-        let rows: Vec<serde_json::Value> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        if !rows.is_empty() {
-            return json_ok(serde_json::Value::Array(rows));
-        }
-    }
-    match divergence::call_ledger(&st.root, &id) {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
-        Err(e) => error_resp(500, &format!("call ledger: {e}")),
-    }
+/// observed, classified + located) that backs the interactive diff view, as the
+/// run published it. A published empty ledger is a run that made no calls.
+async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
+    serve_jsonl_artifact(&st, &id, &artifact_kinds::CALL_LEDGER).await
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
-/// (status + field-level body diff), parsed from the run's http-diff stream.
-async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    hydrate_run_artifacts(&st, &id).await;
-    let rows: Vec<serde_json::Value> = std::fs::read_to_string(st.root.http_diff_path(&id))
-        .map(|c| {
-            c.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    json_ok(serde_json::Value::Array(rows))
+/// (status + field-level body diff), from the run's published http-diff stream.
+async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
+    serve_jsonl_artifact(&st, &id, &artifact_kinds::HTTP_DIFFS).await
 }
 
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
@@ -1448,7 +2071,7 @@ async fn v1_http_diffs(State(st): State<AppState>, Path(id): Path<String>) -> Re
 /// (recorded events + the call ledger's observed side). Graph nodes ride the
 /// shared `DejaRecord` stream: record-side in the recording tape, replay-side
 /// in the run's observed stream.
-async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_graph(State(st): State<AppState>, id: RunId) -> Response {
     // k8s: the replay-side observed stream AND the record-side graph nodes both
     // ride S3 artifacts — hydrate pulls them to their local paths. The record
     // side comes from the `record_graph` artifact (span STRUCTURE only, extracted
@@ -1529,8 +2152,643 @@ async fn v1_graph(State(st): State<AppState>, Path(id): Path<String>) -> Respons
     }))
 }
 
+/// `GET /api/v1/runs/{id}/change-coverage` — did the replay reach what the
+/// candidate changed? Computed on first request from the git host's compare of
+/// the candidate against its base branch and the run's own replay graph and
+/// call ledger, then cached beside the run. Never an error for a run that
+/// cannot be assessed: the body says why, so the report can say "not assessed"
+/// instead of a reader receiving a 500 from a successful run.
+async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
+    use deja_orchestrator::change_coverage::{self, Assessment};
+
+    let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
+
+    // The run's own parameters — the live record on compose, the stored row's
+    // params on k8s — name the system and the candidate. The live record is
+    // read through the same containment check as every other file this
+    // handler opens: resolved, and confirmed to lie under the runs directory.
+    let live: Option<Run> = confined(st.root.run_path(&id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    let params: Option<deja_orchestrator::RunParams> = match live {
+        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        None => match &st.store {
+            Some(store) => match store.get_run(&id).await {
+                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+                _ => None,
+            },
+            None => None,
+        },
+    };
+    let Some(params) = params else {
+        return error_resp(404, "run not found");
+    };
+
+    // The evidence files, and the cache beside them. Each path is resolved and
+    // then checked to lie under its own directory before it is opened — the
+    // same containment check whatever the id looked like — and the cache is
+    // named off the resolved replay-graph path rather than off the id, so no
+    // file is ever written to a path the id alone chose.
+    hydrate_run_artifacts(&st, &id).await;
+    let observed_dir = st.root.root.join("observed");
+    let runs_dir = st.root.root.join("runs");
+    let Some(observed_path) = confined(st.root.observed_path(&id), &observed_dir) else {
+        return unavailable(
+            "the run published no replay execution graph, so there is no evidence of what ran"
+                .to_owned(),
+        );
+    };
+    let ledger_path = confined(st.root.call_ledger_path(&id), &runs_dir);
+    let cache = deja_orchestrator::change_coverage_cache_of(&observed_path);
+    if let Ok(cached) = std::fs::read_to_string(&cache) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_ok(value);
+        }
+    }
+
+    let system = params
+        .system_under_test
+        .clone()
+        .unwrap_or_else(|| deja_orchestrator::default_system().to_owned());
+    let config = deja_orchestrator::system::system_config(&system);
+    let nonempty = |s: String| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+    let deployment_default = std::env::var("DEJA_CANDIDATE_REPO").ok();
+    let Some(repo) = change_coverage::source_repo_for(
+        params.candidate_repo.as_deref(),
+        config.source_repo.as_deref(),
+        config.is_default,
+        deployment_default.as_deref(),
+    ) else {
+        return unavailable(format!(
+            "no source repository is declared for system '{system}': set systems.{system}.source_repo (owner/name) in the deja configuration, or send candidate_repo on the run"
+        ));
+    };
+    let Some(template) = std::env::var("DEJA_CANDIDATE_TARBALL_URL")
+        .ok()
+        .and_then(nonempty)
+    else {
+        return unavailable(
+            "DEJA_CANDIDATE_TARBALL_URL is not set, so the candidate's source cannot be fetched"
+                .to_owned(),
+        );
+    };
+    let sha = match deja_orchestrator::executor::resolve_candidate_image_for(
+        &params.candidate_spec,
+        &system,
+    ) {
+        Ok((_, sha)) => sha,
+        Err(e) => return unavailable(format!("the candidate does not name a build sha: {e}")),
+    };
+    let base_ref = config.change_base_ref.clone();
+
+    let computed = tokio::task::spawn_blocking(
+        move || -> Result<change_coverage::ChangeCoverage, String> {
+            let replay: Vec<deja_core::ExecutionGraphNode> = std::fs::File::open(&observed_path)
+                .map(|file| {
+                    std::io::BufRead::lines(std::io::BufReader::new(file))
+                        .map_while(Result::ok)
+                        .filter_map(
+                            |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
+                                Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
+                                _ => None,
+                            },
+                        )
+                        .collect()
+                })
+                .map_err(|e| format!("the run's replay graph could not be read: {e}"))?;
+            if replay.is_empty() {
+                return Err("the run published no replay execution graph, so there is no evidence of what ran".to_owned());
+            }
+            let calls: Vec<serde_json::Value> = ledger_path
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|content| {
+                    content
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let evidence = change_coverage::Evidence::from_graph_and_calls(&replay, &calls);
+            let change = change_coverage::fetch_change_set(&repo, &base_ref, &sha, &template)?;
+            Ok(change_coverage::assess(&system, &repo, &base_ref, change, &evidence))
+        },
+    )
+    .await;
+    let assessment = match computed {
+        Ok(Ok(coverage)) => Assessment::Assessed(coverage),
+        Ok(Err(why)) => Assessment::Unavailable { unavailable: why },
+        Err(e) => Assessment::Unavailable {
+            unavailable: format!("assessment task failed: {e}"),
+        },
+    };
+    // Cache only an assessment: a transient failure must not be remembered as
+    // the answer.
+    if let Assessment::Assessed(_) = &assessment {
+        if let Ok(text) = serde_json::to_string(&assessment) {
+            let _ = std::fs::write(&cache, text);
+        }
+    }
+    json_ok_ser(&assessment)
+}
+
+/// Why a run has no behaviour tree, or a pair of runs no delta. The two kinds
+/// are different news: a pending answer clears on its own, so a reader may ask
+/// again; a refusal never will, and asking again only hides it.
+#[derive(Debug)]
+enum Unavailable {
+    Pending(String),
+    Refused(String),
+    /// The two runs read different tapes. A refusal like any other for the
+    /// run row, but a data-integrity warning to a reader, so it has its own
+    /// kind rather than looking like "not applicable".
+    TapeMismatch(String),
+}
+
+impl Unavailable {
+    fn kind(&self) -> &'static str {
+        match self {
+            Unavailable::Pending(_) => "pending",
+            Unavailable::Refused(_) => "refused",
+            Unavailable::TapeMismatch(_) => "tape_mismatch",
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let (Unavailable::Pending(why)
+        | Unavailable::Refused(why)
+        | Unavailable::TapeMismatch(why)) = self;
+        serde_json::json!({ "unavailable": why, "unavailable_kind": self.kind() })
+    }
+}
+
+/// A file a tree is built from that could not be read whole.
+enum ReadFailure {
+    Missing(std::path::PathBuf),
+    Unparsable {
+        path: std::path::PathBuf,
+        line: usize,
+    },
+}
+
+/// Every line of `path` as a `T`, or the first line that is not one. A
+/// dropped line would build a short tree that reads as a whole one.
+fn read_jsonl_strict<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<Vec<T>, ReadFailure> {
+    let text =
+        std::fs::read_to_string(path).map_err(|_| ReadFailure::Missing(path.to_path_buf()))?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| {
+            serde_json::from_str(line).map_err(|_| ReadFailure::Unparsable {
+                path: path.to_path_buf(),
+                line: i + 1,
+            })
+        })
+        .collect()
+}
+
+/// The files a run's tree is read from, each resolved under its own directory.
+struct TreeSources {
+    ledger: std::path::PathBuf,
+    diffs: Option<std::path::PathBuf>,
+    observed: Option<std::path::PathBuf>,
+    cache: std::path::PathBuf,
+}
+
+/// Resolve a run's tree sources, or say why they are not all there. A source
+/// the run registered but that is not on disk has not arrived yet; one it
+/// never registered after it finished will never exist.
+fn tree_sources(
+    st: &AppState,
+    id: &str,
+    registered: Option<&std::collections::BTreeSet<String>>,
+    state: Option<&str>,
+) -> Result<TreeSources, Unavailable> {
+    let absent = |kind: &str, what: &str| {
+        match state {
+        _ if registered.is_some_and(|r| r.contains(kind)) => Unavailable::Pending(format!(
+            "run {id}'s {what} is published but has not reached the orchestrator yet"
+        )),
+        Some("completed" | "failed") => Unavailable::Refused(format!(
+            "run {id} finished without publishing its {what}, so it was never scored and has no behaviour to compare"
+        )),
+        Some(state) => Unavailable::Pending(format!(
+            "run {id} is still {state}; its {what} is published when it finishes"
+        )),
+        None => Unavailable::Refused(format!("run {id} could not be read")),
+    }
+    };
+    let root = &st.root;
+    let ledger = confined(root.call_ledger_path(id), &root.root.join("runs"))
+        .ok_or_else(|| absent(artifact_kinds::CALL_LEDGER.name, "call ledger"))?;
+    let diffs = confined(root.http_diff_path(id), &root.root.join("http-diffs"));
+    if diffs.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::HTTP_DIFFS.name)) {
+        return Err(absent(artifact_kinds::HTTP_DIFFS.name, "http diffs"));
+    }
+    let observed = confined(root.observed_path(id), &root.root.join("observed"));
+    if observed.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::OBSERVED.name)) {
+        return Err(absent(artifact_kinds::OBSERVED.name, "observed stream"));
+    }
+    // beside the ledger it is built from, named off the confined ledger path:
+    // `<run>.call-ledger.jsonl` → `<run>.call-ledger.behaviour-tree.jsonl`
+    let cache = deja_orchestrator::behaviour_tree_cache_of(&ledger);
+    Ok(TreeSources {
+        ledger,
+        diffs,
+        observed,
+        cache,
+    })
+}
+
+/// The cached tree when it is current, else one built strictly from its
+/// sources and cached. Nothing short is ever built, so nothing short is
+/// ever cached.
+fn read_or_build_tree(
+    id: &str,
+    sources: &TreeSources,
+) -> Result<divergence::behaviour_tree::BehaviourTree, ReadFailure> {
+    use divergence::behaviour_tree::{self, BehaviourTree};
+
+    if let Some(tree) = std::fs::read_to_string(&sources.cache)
+        .ok()
+        .and_then(|t| BehaviourTree::from_jsonl(&t))
+        .filter(|t| t.canon_version == behaviour_tree::CANON_VERSION)
+    {
+        return Ok(tree);
+    }
+    let rows: Vec<divergence::ledger::CallRecord> = read_jsonl_strict(&sources.ledger)?;
+    let diffs: Vec<deja_kernel::HttpDiff> = match &sources.diffs {
+        Some(path) => read_jsonl_strict(path)?,
+        None => Vec::new(),
+    };
+    let event_schema_versions = match &sources.observed {
+        Some(path) => behaviour_tree::event_schema_versions(
+            &std::fs::read_to_string(path).map_err(|_| ReadFailure::Missing(path.clone()))?,
+        ),
+        None => Default::default(),
+    };
+    let mut tree = behaviour_tree::build(id, &rows, &diffs);
+    tree.event_schema_versions = event_schema_versions;
+    // renamed into place, so a concurrent reader never sees a prefix
+    let _ = tree.write_atomic(&sources.cache);
+    Ok(tree)
+}
+
+/// A run's behaviour tree: read from the cache beside its ledger when one is
+/// there, else built from the ledger, the http diffs and the observed stream,
+/// and cached. `Err` says whether one can still appear.
+///
+/// Every file is opened through a path that was resolved and confirmed to lie
+/// under its own directory, and the cache is named off the resolved ledger
+/// path rather than off the id, so no file is read or written at a path the
+/// id alone chose.
+///
+/// A hydrated file that cannot be read whole (evicted by the cache sweep
+/// between hydration and read, or left torn by an older writer) is removed
+/// and fetched once more before the answer is given — only when the run
+/// holds that artifact in S3. A file that is the artifact's only copy is
+/// never removed.
+async fn behaviour_tree_for(
+    st: &AppState,
+    id: &str,
+) -> Result<divergence::behaviour_tree::BehaviourTree, Unavailable> {
+    let (state, _) = run_disposition(st, id).await;
+    let mut refetched = false;
+    loop {
+        let hydrated = hydrate_run_artifacts(st, id).await;
+        let sources = tree_sources(
+            st,
+            id,
+            hydrated.as_ref().map(|h| &h.registered),
+            state.as_deref(),
+        )?;
+        let kind_of = {
+            let (ledger, diffs, observed) = (
+                sources.ledger.clone(),
+                sources.diffs.clone(),
+                sources.observed.clone(),
+            );
+            move |path: &std::path::Path| -> &'static str {
+                if path == ledger {
+                    artifact_kinds::CALL_LEDGER.name
+                } else if diffs.as_deref() == Some(path) {
+                    artifact_kinds::HTTP_DIFFS.name
+                } else if observed.as_deref() == Some(path) {
+                    artifact_kinds::OBSERVED.name
+                } else {
+                    ""
+                }
+            }
+        };
+        let run = id.to_owned();
+        let read = tokio::task::spawn_blocking(move || read_or_build_tree(&run, &sources))
+            .await
+            .map_err(|e| Unavailable::Pending(format!("build behaviour tree of run {id}: {e}")))?;
+        let failure = match read {
+            Ok(tree) => return Ok(tree),
+            Err(failure) => failure,
+        };
+        let path = match &failure {
+            ReadFailure::Missing(path) | ReadFailure::Unparsable { path, .. } => path.clone(),
+        };
+        let pullable = hydrated
+            .as_ref()
+            .is_some_and(|h| h.pullable.contains(kind_of(&path)));
+        if pullable && !refetched {
+            let _ = std::fs::remove_file(&path);
+            refetched = true;
+            continue;
+        }
+        return Err(match failure {
+            ReadFailure::Missing(path) if pullable => Unavailable::Pending(format!(
+                "{} went missing while run {id}'s tree was read; it is fetched again on the next request",
+                path.display()
+            )),
+            ReadFailure::Missing(path) => Unavailable::Refused(format!(
+                "{} is not on this orchestrator and the run holds no copy to fetch, so run {id} has no behaviour to compare",
+                path.display()
+            )),
+            ReadFailure::Unparsable { path, line } => Unavailable::Refused(format!(
+                "line {line} of {} does not parse, so run {id}'s published artifact is not whole",
+                path.display()
+            )),
+        });
+    }
+}
+
+/// `GET /api/v1/runs/{id}/tree` — the run as a behaviour tree: every address
+/// the tape holds, with whether the run reproduced it and, when not, a hash of
+/// what it produced. `{unavailable, unavailable_kind}` when there is none.
+async fn v1_tree(State(st): State<AppState>, id: RunId) -> Response {
+    match behaviour_tree_for(&st, &id).await {
+        Ok(tree) => json_ok_ser(&tree),
+        Err(why) => json_ok(why.to_json()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeltaQuery {
+    /// The run to measure against: the baseline `M`. The path's run is `Y`.
+    against: Option<String>,
+}
+
+/// `GET /api/v1/runs/{id}/delta?against={run}` — what this run changed
+/// relative to another run of the same tape, three-way against the tape.
+/// Both runs' tape-relative verdicts ride along so a reader sees the two
+/// verdicts side by side. `{unavailable, unavailable_kind}` names why no
+/// delta can be computed, and whether one still can be: `pending` while a
+/// side is still being scored, `refused` for a pairing that never will.
+async fn v1_delta(
+    State(st): State<AppState>,
+    id: RunId,
+    axum::extract::Query(q): axum::extract::Query<DeltaQuery>,
+) -> Response {
+    let refused = |why: String| json_ok(Unavailable::Refused(why).to_json());
+    let y_params = run_params_for(&st, &id).await;
+    let declared = y_params.as_ref().and_then(|p| p.delta_against.clone());
+    // The query names the baseline; without one, the run's own record does,
+    // when the pipeline that created it said what to measure it against.
+    let named = q
+        .against
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_owned)
+        .or_else(|| declared.clone());
+    let against = match named {
+        None => {
+            return refused(
+                "no baseline run named: pass ?against=<run id> of a run on the same tape, or create the run with delta_against"
+                    .to_owned(),
+            )
+        }
+        Some(raw) => match raw.parse::<RunId>() {
+            Ok(id) => id,
+            Err(e) => return refused(format!("against is not a run id: {e}")),
+        },
+    };
+    if *against == *id {
+        return refused("a run measured against itself has no delta".to_owned());
+    }
+    // The run's OWN delta — against the baseline it was created with — is
+    // cached beside its ledger and its verdict is written to the run row.
+    // Any other pairing is computed on the spot and kept nowhere.
+    let result = if declared.as_deref() == Some(&*against) {
+        delta_for_run(&st, &id, &against).await
+    } else {
+        delta_between(&st, &id, &against).await
+    };
+    match result {
+        Ok(body) => json_ok(body),
+        Err(why) => json_ok(why.to_json()),
+    }
+}
+
+/// The delta of `y` against `m`: both trees, the three-way, and both sides'
+/// tape verdicts. `Err` says why there is none, and whether there can be.
+async fn delta_between(
+    st: &AppState,
+    y_id: &str,
+    m_id: &str,
+) -> Result<serde_json::Value, Unavailable> {
+    let y_params = run_params_for(st, y_id).await;
+    let m_params = run_params_for(st, m_id).await;
+    let tape = |p: &Option<deja_orchestrator::RunParams>| {
+        p.as_ref()
+            .and_then(|p| p.recording_group.clone().or_else(|| p.recording_id.clone()))
+    };
+    if let (Some(y_tape), Some(m_tape)) = (tape(&y_params), tape(&m_params)) {
+        if y_tape != m_tape {
+            return Err(Unavailable::TapeMismatch(format!(
+                "the runs drove different tapes ({y_tape} and {m_tape}); a delta only holds between runs of one tape"
+            )));
+        }
+    }
+    // One name is not one tape: a recording re-seals as it grows, so two runs
+    // of one group can have read different content. What each run actually
+    // read decides, and a run whose tape cannot be read refuses rather than
+    // passing unchecked.
+    if st.store.is_none() {
+        return Err(Unavailable::Refused(
+            "a delta needs the run store to read what each run's ingest report says it scored"
+                .to_owned(),
+        ));
+    }
+    let y_report = tape_report(st, y_id).await?;
+    let m_report = tape_report(st, m_id).await?;
+    let refuse = |why: String| {
+        Unavailable::TapeMismatch(format!(
+            "{why}; a delta only holds between runs of one tape"
+        ))
+    };
+    divergence::tape::same_tape(y_id, Some(&y_report), m_id, Some(&m_report)).map_err(refuse)?;
+    let y = behaviour_tree_for(st, y_id).await?;
+    let m = behaviour_tree_for(st, m_id).await?;
+    let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
+    let verdict_of = |run: &str| -> serde_json::Value {
+        confined(st.root.scorecard_path(run), &st.root.root.join("runs"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("verdict").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let candidate_of = |p: &Option<deja_orchestrator::RunParams>| {
+        p.as_ref()
+            .map(|p| serde_json::to_value(&p.candidate_spec).unwrap_or_default())
+    };
+    let mut body = serde_json::to_value(&delta).unwrap_or_default();
+    // Recorded in the body so a cached copy shows it passed the check.
+    divergence::tape::record_tape_check(&mut body, y_id, Some(&y_report), m_id, Some(&m_report))
+        .map_err(refuse)?;
+    body["tape"] = serde_json::json!(tape(&y_params).or_else(|| tape(&m_params)));
+    body["sides"] = serde_json::json!({
+        "m": { "run": m_id, "tape_verdict": verdict_of(m_id), "candidate": candidate_of(&m_params) },
+        "y": { "run": y_id, "tape_verdict": verdict_of(y_id), "candidate": candidate_of(&y_params) },
+    });
+    Ok(body)
+}
+
+/// The run row's word for a delta result: `pass` or `fail` once computed,
+/// else the kind of unavailability, so a reader of the row can tell a delta
+/// still coming from one that never will.
+fn delta_verdict_word(result: &Result<serde_json::Value, Unavailable>) -> &'static str {
+    match result {
+        Ok(body) => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "refused",
+        },
+        // The run row keeps its four words; a tape mismatch is a refusal there.
+        Err(Unavailable::TapeMismatch(_)) => "refused",
+        Err(why) => why.kind(),
+    }
+}
+
+/// The run's own delta, against the baseline named in its params: served
+/// from the cache beside its ledger when that holds the current answer,
+/// else computed, cached, and its verdict written to the run row. The cache
+/// is named off the confined ledger path, and read and written off the async
+/// worker, as the tree cache is. Only a computed delta is cached.
+async fn delta_for_run(
+    st: &AppState,
+    y_id: &str,
+    m_id: &str,
+) -> Result<serde_json::Value, Unavailable> {
+    use divergence::behaviour_tree::CANON_VERSION;
+
+    let runs_dir = st.root.root.join("runs");
+    let cache = confined(st.root.call_ledger_path(y_id), &runs_dir)
+        .map(|ledger| deja_orchestrator::delta_cache_of(&ledger));
+    if let Some(cache) = cache.clone() {
+        let (y, m) = (y_id.to_owned(), m_id.to_owned());
+        let cached = tokio::task::spawn_blocking(move || -> Option<serde_json::Value> {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&cache).ok()?).ok()?;
+            divergence::delta::cached_is_current(&doc, &y, &m, CANON_VERSION).then_some(doc)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(doc) = cached {
+            // The row is settled from the cache too: a column that was reset,
+            // or never written because the store was away, catches up on the
+            // next view rather than waiting for a recomputation.
+            record_delta_verdict(st, y_id, &Ok(doc.clone())).await;
+            return Ok(doc);
+        }
+    }
+    let computed = delta_between(st, y_id, m_id).await;
+    record_delta_verdict(st, y_id, &computed).await;
+    if let (Ok(body), Some(cache)) = (&computed, cache) {
+        let text = body.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            divergence::behaviour_tree::write_atomic(&cache, text.as_bytes())
+        })
+        .await;
+    }
+    computed
+}
+
+/// The run row's delta verdict, from a computed delta or the reason there is
+/// none. Idempotent; the newest answer wins.
+async fn record_delta_verdict(
+    st: &AppState,
+    y_id: &str,
+    computed: &Result<serde_json::Value, Unavailable>,
+) {
+    if let Some(store) = &st.store {
+        if let Err(e) = store
+            .set_delta_verdict(y_id, delta_verdict_word(computed))
+            .await
+        {
+            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
+        }
+    }
+}
+
+/// Whether ingesting `ev` settles deltas. A run's finish, not its result: the
+/// runner reports the result BEFORE it publishes the ledger and diffs a tree
+/// is read from, and finishes after.
+fn settles_deltas(ev: &deja_orchestrator::lifecycle::store_ctx::RunEvent) -> bool {
+    use deja_orchestrator::lifecycle::store_ctx::RunEvent;
+    matches!(ev, RunEvent::Finish { .. })
+}
+
+/// Settle deltas when a run finishes, which is after it has published
+/// everything a tree is read from: the run's own delta, if it names a
+/// baseline, and the delta of every run that names THIS run as its
+/// baseline. Best-effort and off the ingest path; a delta whose other side
+/// is still running is left pending and settled when that side finishes.
+async fn settle_deltas_for(st: AppState, run_id: String) {
+    if let Some(against) = run_params_for(&st, &run_id)
+        .await
+        .and_then(|p| p.delta_against)
+    {
+        let _ = delta_for_run(&st, &run_id, &against).await;
+    }
+    let Some(store) = st.store.clone() else {
+        return;
+    };
+    let Ok(dependents) = store.runs_measured_against(&run_id).await else {
+        return;
+    };
+    for dependent in dependents {
+        let _ = delta_for_run(&st, &dependent, &run_id).await;
+    }
+}
+
+/// The run's parameters: the live record on compose, the stored row on k8s.
+async fn run_params_for(st: &AppState, id: &str) -> Option<deja_orchestrator::RunParams> {
+    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
+        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
+    match live {
+        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
+        None => match &st.store {
+            Some(store) => match store.get_run(id).await {
+                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+                _ => None,
+            },
+            None => None,
+        },
+    }
+}
+
+/// `candidate` resolved, if it exists and lies under `base`; `None` otherwise.
+/// The resolution follows symlinks and folds `..`, so what is checked is the
+/// file that would actually be opened.
+fn confined(candidate: std::path::PathBuf, base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base = base.canonicalize().ok()?;
+    let candidate = candidate.canonicalize().ok()?;
+    if !candidate.starts_with(&base) {
+        return None;
+    }
+    Some(candidate)
+}
+
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.
-async fn v1_run_stages(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_run_stages(State(st): State<AppState>, id: RunId) -> Response {
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -1551,7 +2809,7 @@ struct LogsQuery {
 /// `GET /api/v1/runs/{id}/logs?stage=&after_seq=` — persisted worker logs.
 async fn v1_run_logs(
     State(st): State<AppState>,
-    Path(id): Path<String>,
+    id: RunId,
     axum::extract::Query(q): axum::extract::Query<LogsQuery>,
 ) -> Response {
     let store = match require_store(&st) {
@@ -1573,7 +2831,7 @@ async fn v1_run_logs(
 }
 
 /// `GET /api/v1/runs/{id}/artifacts` — registered artifacts for a run.
-async fn v1_run_artifacts(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+async fn v1_run_artifacts(State(st): State<AppState>, id: RunId) -> Response {
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -1581,6 +2839,118 @@ async fn v1_run_artifacts(State(st): State<AppState>, Path(id): Path<String>) ->
     match store.list_artifacts(&id).await {
         Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
         Err(e) => error_resp(500, &format!("list artifacts: {e}")),
+    }
+}
+
+/// A registered artifact's bytes: an `s3://` uri (k8s run) is fetched from S3,
+/// anything else (compose run) is read as a local path. The error carries the
+/// HTTP status the raw endpoint answers with.
+async fn artifact_bytes(uri: &str) -> Result<Vec<u8>, (u16, String)> {
+    if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(uri) {
+        let fetch = tokio::task::spawn_blocking(move || {
+            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+            cfg.bucket = bucket;
+            deja_compactor::get_object_decoded(&cfg, &key)
+        })
+        .await;
+        match fetch {
+            Ok(Ok(b)) => Ok(b),
+            Ok(Err(e)) => Err((502, format!("artifact fetch from s3: {e}"))),
+            Err(e) => Err((500, format!("artifact fetch task: {e}"))),
+        }
+    } else {
+        std::fs::read(uri).map_err(|e| (404, format!("artifact file unreadable: {e}")))
+    }
+}
+
+/// A run's ingest report, or what its absence means for a delta.
+async fn tape_report(st: &AppState, run_id: &str) -> Result<serde_json::Value, Unavailable> {
+    match ingest_report_for(st, run_id).await {
+        Ok(report) => Ok(report),
+        Err(gap) => {
+            let (state, _) = run_disposition(st, run_id).await;
+            Err(report_gap(run_id, state.as_deref(), gap))
+        }
+    }
+}
+
+/// Why a run's ingest report could not be read.
+#[derive(Debug)]
+enum ReportGap {
+    /// The run registered no report.
+    NotRegistered,
+    /// A report was registered but its object is no longer there: the
+    /// artifact bucket expires objects, and a compose run's file can be removed.
+    Gone,
+    /// The object is there but is not a report.
+    Corrupt(String),
+    /// It could not be read this time, which may pass.
+    Unreadable(String),
+}
+
+/// What a missing report means for a delta: refused when it cannot appear,
+/// pending when it still can. A run that has not ingested yet has no report,
+/// which is a wait, not a mismatch.
+fn report_gap(run_id: &str, state: Option<&str>, gap: ReportGap) -> Unavailable {
+    match gap {
+        ReportGap::NotRegistered => match state {
+            Some("completed" | "failed") | None => Unavailable::Refused(format!(
+                "run {run_id} has no ingest report, so the tape it scored is unknown"
+            )),
+            Some(state) => Unavailable::Pending(format!(
+                "run {run_id} is still {state}; its ingest report is published when it ingests"
+            )),
+        },
+        ReportGap::Gone => Unavailable::Refused(format!(
+            "run {run_id}'s ingest report is registered but no longer stored \
+             (the artifact bucket expires objects), so the tape it scored is unknown"
+        )),
+        ReportGap::Corrupt(e) => {
+            Unavailable::Refused(format!("run {run_id}'s ingest report is not JSON: {e}"))
+        }
+        ReportGap::Unreadable(e) => Unavailable::Pending(format!(
+            "run {run_id}'s ingest report could not be read: {e}"
+        )),
+    }
+}
+
+/// The `ingest_report` a run published, parsed.
+async fn ingest_report_for(st: &AppState, run_id: &str) -> Result<serde_json::Value, ReportGap> {
+    let Some(store) = &st.store else {
+        return Err(ReportGap::NotRegistered);
+    };
+    let artifacts = store
+        .list_artifacts(run_id)
+        .await
+        .map_err(|e| ReportGap::Unreadable(format!("list artifacts: {e}")))?;
+    // `list_artifacts` also matches on recording id, so the run is checked here.
+    let Some(report) = artifacts
+        .into_iter()
+        .filter(|a| a.kind == "ingest_report" && a.run_id.as_deref() == Some(run_id))
+        .max_by_key(|a| a.id)
+    else {
+        return Err(ReportGap::NotRegistered);
+    };
+    let bytes = match artifact_bytes(&report.uri).await {
+        Ok(bytes) => bytes,
+        Err(_) if artifact_is_gone(&report.uri).await => return Err(ReportGap::Gone),
+        Err((_, e)) => return Err(ReportGap::Unreadable(e)),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| ReportGap::Corrupt(e.to_string()))
+}
+
+/// Whether a registered artifact's object is definitely absent — a not-found
+/// from the store, or a missing local file — as opposed to unreachable.
+async fn artifact_is_gone(uri: &str) -> bool {
+    match deja_orchestrator::codebundle::parse_s3_uri(uri) {
+        Ok((bucket, key)) => tokio::task::spawn_blocking(move || {
+            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+            cfg.bucket = bucket;
+            deja_compactor::object_exists(&cfg, &key)
+        })
+        .await
+        .is_ok_and(|exists| matches!(exists, Ok(false))),
+        Err(_) => !std::path::Path::new(uri).exists(),
     }
 }
 
@@ -1596,31 +2966,10 @@ async fn v1_artifact_raw(State(st): State<AppState>, Path(id): Path<i64>) -> Res
         Ok(None) => return error_resp(404, "artifact not found"),
         Err(e) => return error_resp(500, &format!("get artifact: {e}")),
     };
-    let content_type = if art.kind == "visualization_html" {
-        "text/html; charset=utf-8"
-    } else if art.uri.ends_with(".json") {
-        "application/json"
-    } else {
-        "application/x-ndjson"
-    };
-    // s3:// artifact (k8s run) → fetch from S3; else a local path (compose run).
-    let bytes = if let Ok((bucket, key)) = deja_orchestrator::codebundle::parse_s3_uri(&art.uri) {
-        let fetch = tokio::task::spawn_blocking(move || {
-            let mut cfg = deja_orchestrator::s3::S3Config::from_env();
-            cfg.bucket = bucket;
-            deja_compactor::get_object_decoded(&cfg, &key)
-        })
-        .await;
-        match fetch {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return error_resp(502, &format!("artifact fetch from s3: {e}")),
-            Err(e) => return error_resp(500, &format!("artifact fetch task: {e}")),
-        }
-    } else {
-        match std::fs::read(&art.uri) {
-            Ok(b) => b,
-            Err(e) => return error_resp(404, &format!("artifact file unreadable: {e}")),
-        }
+    let content_type = artifact_kinds::served_content_type(&art.kind, &art.uri);
+    let bytes = match artifact_bytes(&art.uri).await {
+        Ok(b) => b,
+        Err((status, msg)) => return error_resp(status, &msg),
     };
     (
         StatusCode::OK,
@@ -1637,7 +2986,7 @@ async fn v1_audit(State(st): State<AppState>) -> Response {
         Err(resp) => return resp,
     };
     match store.audit_list(500).await {
-        Ok(rows) => json_ok(serde_json::to_value(&rows).unwrap_or_default()),
+        Ok(rows) => json_ok_ser(&rows),
         Err(e) => error_resp(500, &format!("audit list: {e}")),
     }
 }
@@ -1651,7 +3000,7 @@ async fn v1_audit(State(st): State<AppState>) -> Response {
 /// LISTEN/NOTIFY wake-ups without changing the wire contract).
 async fn run_stream(
     State(st): State<AppState>,
-    Path(run_id): Path<String>,
+    run_id: RunId,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         let mut last: Option<String> = None;
@@ -1690,6 +3039,30 @@ async fn run_stream(
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
+
+/// 200 with a JSON body serialised STRAIGHT from the value, with no
+/// `serde_json::Value` in between.
+///
+/// [`json_ok`] takes an already-built `Value`, so a caller holding typed rows
+/// has to clone them into a second tree first. For small bodies that is
+/// invisible; for a list it is a full deep copy of everything being sent, and
+/// on 2026-09-17 that copy was one of the three materialisations that OOMKilled
+/// the orchestrator ten times. Handlers that hold typed rows should use this
+/// one; handlers that genuinely assemble a `Value` keep [`json_ok`].
+fn json_ok_ser<T: serde::Serialize>(value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        // Serialising our own row types cannot fail on shape; this is here so
+        // the failure is NAMED rather than served as an empty body that reads
+        // to a client as "no runs".
+        Err(e) => error_resp(500, &format!("serialize response: {e}")),
+    }
+}
 
 fn json_ok(value: serde_json::Value) -> Response {
     (
@@ -1813,12 +3186,12 @@ mod tests {
         std::env::remove_var("DEJA_CONFIG_TOML");
 
         assert_eq!(
-            prism.as_ref().map(|(b, _)| b.as_str()),
+            prism.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("ucs-deja"),
             "a prism recording is in prism's bucket, whichever endpoint asks"
         );
         assert_eq!(
-            hyperswitch.as_ref().map(|(b, _)| b.as_str()),
+            hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
             Ok("hyperswitch-art")
         );
         assert_eq!(hyperswitch, omitted, "naming the default is omitting it");
@@ -1836,7 +3209,7 @@ mod tests {
         std::env::set_var(
             "DEJA_CONFIG_TOML",
             format!(
-                "[systems.{default}]\ns3_bucket = \"declared-art\"\nrecording_root = \"landing/v7\"\n[systems.other]\ns3_bucket = \"other-art\"\n"
+                "[systems.{default}]\ns3_bucket = \"declared-art\"\nrecording_root = \"landing/v7\"\n[systems.other]\ns3_bucket = \"other-art\"\ns3_prefix = \"other/\"\n"
             ),
         );
         let named = scan_scope(Some(default));
@@ -1849,12 +3222,20 @@ mod tests {
             named, omitted,
             "the same scope, whichever way it is asked for"
         );
+        let at = |bucket: &str, prefix: &str| deja_orchestrator::system::RecordingBucket {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+        };
         assert_eq!(
             named,
-            Ok(("declared-art".to_owned(), "landing/v7".to_owned())),
+            Ok((at("declared-art", ""), "landing/v7".to_owned())),
             "the DECLARED bucket, not the orchestrator's own"
         );
-        assert_eq!(other, Ok(("other-art".to_owned(), "landing/v1".to_owned())));
+        assert_eq!(
+            other,
+            Ok((at("other-art", "other"), "landing/v1".to_owned())),
+            "a declared prefix travels with its bucket, normalised"
+        );
         let err = unknown.expect_err("an undeclared system is refused by name");
         assert!(
             err.contains("zzz") && err.contains("systems.zzz.s3_bucket"),
@@ -1872,6 +3253,61 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
+
+    /// The guard the type exists to enforce, on the endpoints that had skipped it.
+    ///
+    /// `RunId` refuses anything carrying a path separator or a parent reference,
+    /// and its own doc says the check happens during extraction so "there is
+    /// nothing for a new handler to remember to call and nothing for an existing
+    /// one to have skipped". Five handlers had skipped it, by taking
+    /// `Path<String>` instead — which is how a check documented as unskippable
+    /// gets skipped: the seam is opt-in by TYPE, and the comment asserts the
+    /// property rather than enforcing it.
+    ///
+    /// `run_stream` is the one that mattered. It carries no auth layer and its id
+    /// reached `runs::get`, which resolves to a filesystem path.
+    ///
+    /// The body is asserted, not just the status, so a refusal is attributable
+    /// to the run-id check rather than to a later failure that happens to share
+    /// a status. On these four the statuses differ anyway when the guard is
+    /// removed — the stream yields 200 with an SSE error event, the store-backed
+    /// three yield the store's own refusal — but `v1_kill_run` answers a wrong
+    /// executor with the same 400 this asserts, so status alone is not a safe
+    /// thing to rely on for the family.
+    #[tokio::test]
+    async fn a_run_id_carrying_a_traversal_is_refused_before_the_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = Router::new()
+            .route("/runs/{run_id}/stages", get(v1_run_stages))
+            .route("/runs/{run_id}/logs", get(v1_run_logs))
+            .route("/runs/{run_id}/artifacts", get(v1_run_artifacts))
+            .route("/runs/{run_id}/stream", get(run_stream))
+            .with_state(test_state(dir.path()));
+
+        for suffix in ["stages", "logs", "artifacts", "stream"] {
+            let uri = format!("/runs/..%2F..%2Fetc%2Fpasswd/{suffix}");
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "/{suffix} must refuse a traversal id: {text}"
+            );
+            assert!(
+                text.contains("run id must be plain"),
+                "/{suffix} must refuse it AS a malformed run id, not as some \
+                 later failure that happens to share a status: {text}"
+            );
+        }
+    }
 
     async fn ok(Extension(actor): Extension<AuthenticatedActor>) -> String {
         actor.0
@@ -1999,6 +3435,149 @@ mod tests {
         );
     }
 
+    const LEDGER_ROW: &str = r#"{"correlation_id":"c1","boundary":"redis","trait_name":"Cache","method_name":"get","kind":"matched","blocking":false}"#;
+
+    /// A compose run in `status`, with `ledger` as its call ledger if given.
+    fn run_with_ledger(
+        dir: &std::path::Path,
+        id: &str,
+        status: RunStatus,
+        ledger: Option<&str>,
+    ) -> AppState {
+        let st = test_state(dir);
+        let mut run = pending_run(id);
+        run.status = status;
+        deja_orchestrator::write_json(&st.root.run_path(id), &run).unwrap();
+        if let Some(ledger) = ledger {
+            std::fs::write(st.root.call_ledger_path(id), ledger).unwrap();
+        }
+        st
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A missing ledger is pending while the run can still publish one, and
+    /// refused once it has finished without one: only the first is worth
+    /// asking again about.
+    #[test]
+    fn a_missing_ledger_is_pending_until_the_run_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = run_with_ledger(dir.path(), "run-a", RunStatus::Running, None);
+        let finished = run_with_ledger(dir.path(), "run-b", RunStatus::Completed, None);
+        let rt = rt();
+        match rt.block_on(behaviour_tree_for(&running, "run-a")) {
+            Err(why @ Unavailable::Pending(_)) => assert_eq!(why.kind(), "pending"),
+            other => panic!("expected pending, got {other:?}"),
+        }
+        match rt.block_on(behaviour_tree_for(&finished, "run-b")) {
+            Err(why @ Unavailable::Refused(_)) => assert_eq!(why.kind(), "refused"),
+            other => panic!("expected refused, got {other:?}"),
+        }
+    }
+
+    /// A published artifact that has not been hydrated yet will arrive, so it
+    /// is pending even for a finished run.
+    #[test]
+    fn a_registered_but_absent_artifact_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = run_with_ledger(dir.path(), "run-c", RunStatus::Completed, Some(LEDGER_ROW));
+        let registered: std::collections::BTreeSet<String> = ["call_ledger", "http_diffs"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        match tree_sources(&st, "run-c", Some(&registered), Some("completed")) {
+            Err(Unavailable::Pending(why)) => assert!(why.contains("http diffs"), "{why}"),
+            Err(other) => panic!("expected pending, got {other:?}"),
+            Ok(_) => panic!("expected pending, got sources"),
+        }
+        assert!(
+            tree_sources(&st, "run-c", None, Some("completed")).is_ok(),
+            "unregistered diffs are simply none"
+        );
+    }
+
+    /// A ledger that does not parse whole builds nothing and caches nothing: a
+    /// short tree would read the addresses past the cut as reproduced.
+    #[test]
+    fn a_torn_ledger_builds_no_tree_and_caches_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let torn = format!("{LEDGER_ROW}\n{{\"correlation_id\":\"c2\",\"bound");
+        let st = run_with_ledger(dir.path(), "run-d", RunStatus::Completed, Some(&torn));
+        let cache = st
+            .root
+            .call_ledger_path("run-d")
+            .with_extension("behaviour-tree.jsonl");
+        match rt().block_on(behaviour_tree_for(&st, "run-d")) {
+            Err(Unavailable::Refused(why)) => assert!(why.contains("line 2"), "{why}"),
+            other => panic!("expected refused, got {other:?}"),
+        }
+        assert!(!cache.exists(), "nothing short is cached");
+
+        let whole = run_with_ledger(dir.path(), "run-e", RunStatus::Completed, Some(LEDGER_ROW));
+        let tree = rt().block_on(behaviour_tree_for(&whole, "run-e")).unwrap();
+        assert_eq!(tree.correlations.len(), 1);
+        assert!(whole
+            .root
+            .call_ledger_path("run-e")
+            .with_extension("behaviour-tree.jsonl")
+            .exists());
+    }
+
+    /// The tree records the event schema its candidate captured under, read
+    /// off the observed stream.
+    #[test]
+    fn the_tree_carries_the_candidates_event_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = run_with_ledger(dir.path(), "run-f", RunStatus::Completed, Some(LEDGER_ROW));
+        std::fs::write(
+            st.root.observed_path("run-f"),
+            r#"{"record_kind":"boundary_event","event_schema_version":10}"#,
+        )
+        .unwrap();
+        let tree = rt().block_on(behaviour_tree_for(&st, "run-f")).unwrap();
+        assert_eq!(tree.event_schema_versions, [10].into_iter().collect());
+    }
+
+    #[test]
+    fn the_row_says_which_kind_of_unavailable() {
+        let computed = |pass| Ok(serde_json::json!({ "verdict": { "pass": pass } }));
+        assert_eq!(delta_verdict_word(&computed(true)), "pass");
+        assert_eq!(delta_verdict_word(&computed(false)), "fail");
+        assert_eq!(
+            delta_verdict_word(&Err(Unavailable::Pending(String::new()))),
+            "pending"
+        );
+        assert_eq!(
+            delta_verdict_word(&Err(Unavailable::Refused(String::new()))),
+            "refused"
+        );
+        // A reader sees a tape mismatch as its own kind; the run row keeps
+        // its four words and records a refusal.
+        let mismatch = Unavailable::TapeMismatch("different seals".to_owned());
+        assert_eq!(mismatch.to_json()["unavailable_kind"], "tape_mismatch");
+        assert_eq!(delta_verdict_word(&Err(mismatch)), "refused");
+    }
+
+    /// The runner reports its result before it publishes the ledger and diffs,
+    /// so settling on the result would always find nothing to compare.
+    #[test]
+    fn deltas_settle_on_finish_not_on_result() {
+        use deja_orchestrator::lifecycle::store_ctx::RunEvent;
+        assert!(settles_deltas(&RunEvent::Finish {
+            ok: true,
+            failure: None
+        }));
+        assert!(!settles_deltas(&RunEvent::Result {
+            verdict: Some("pass".to_owned()),
+            scorecard: None
+        }));
+    }
+
     fn test_state(dir: &std::path::Path) -> AppState {
         AppState {
             root: Arc::new(HarnessRoot::new(dir).unwrap()),
@@ -2014,6 +3593,9 @@ mod tests {
         Run {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
+                label: None,
+                delta_against: None,
+                purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
                 system_under_test: None,
@@ -2022,6 +3604,7 @@ mod tests {
                 },
                 candidate_repo: None,
                 recording_id: Some("rec-1".to_owned()),
+                recording_group: None,
                 s3_source: None,
                 correlation_filter: None,
                 workload: serde_json::Value::Null,
@@ -2223,18 +3806,18 @@ mod tests {
     // artifacts, silent about the run, and the "yet" told the reader more were
     // coming when the run had been dead for an hour.
 
-    /// THE SEAM. `detect` writes this reason and the scorecard endpoint matches
-    /// on it to decide whether to name the run's disposition. If the scorer's
-    /// wording drifts, the endpoint stops matching and the naming silently stops
-    /// happening — the exact producer/consumer split that keeps costing this
-    /// repo. Nothing else in the suite would notice, so this is the thing that
-    /// notices.
+    /// THE SEAM. The lifecycle's scorer writes this reason into the card it
+    /// publishes, and the scorecard endpoint matches on it to decide whether to
+    /// name the run's disposition. If the scorer's wording drifts, the endpoint
+    /// stops matching and the naming silently stops happening — the exact
+    /// producer/consumer split that keeps costing this repo.
     #[test]
     fn the_scorer_emits_exactly_the_reason_the_endpoint_matches_on() {
         let dir = tempfile::tempdir().unwrap();
         let root = HarnessRoot::new(dir.path()).unwrap();
         // No artifacts of any kind: the `nothing` arm of `detect`.
-        let card = deja_orchestrator::divergence::scorecard(&root, "run-with-nothing").unwrap();
+        let card =
+            deja_orchestrator::divergence::detect_and_score(&root, "run-with-nothing").unwrap();
         assert!(
             card.verdict.inconclusive,
             "an artifact-less run is not judgeable"
@@ -2312,5 +3895,990 @@ mod tests {
             );
             assert!(reason.starts_with(base), "state {state:?}: {reason}");
         }
+    }
+
+    // -- the API serves what the run published, and names what it did not ----
+    //
+    // Each detail endpoint has exactly three answers: the artifact parses and is
+    // served; it is absent and the response says why; it is present and will not
+    // parse, and the response refuses with a count. No endpoint computes an
+    // artifact the run did not publish.
+
+    fn run_in(state: &AppState, run_id: &str, status: RunStatus, failure: Option<&str>) {
+        let mut run = pending_run(run_id);
+        run.status = status;
+        run.failure_reason = failure.map(str::to_owned);
+        deja_orchestrator::write_json(&state.root.run_path(run_id), &run).unwrap();
+    }
+
+    async fn get_json(state: AppState, uri: String) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_router(state).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn error_of(body: &serde_json::Value) -> &str {
+        body.get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("expected an error body, got {body}"))
+    }
+
+    /// A failed run with no scorecard gets a refusal carrying the failure, not a
+    /// card synthesised to look like a judgement.
+    #[tokio::test]
+    async fn an_absent_scorecard_is_refused_with_the_runs_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(
+            &state,
+            "run-a",
+            RunStatus::Failed,
+            Some("session not found"),
+        );
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-a/scorecard".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("scorecard"), "names the artifact: {err}");
+        assert!(err.contains("FAILED"), "names the run's state: {err}");
+        assert!(
+            err.contains("session not found"),
+            "carries the failure: {err}"
+        );
+    }
+
+    /// Inputs on disk but no published ledger: the ledger is absent, not
+    /// rebuilt from those inputs inside the API process.
+    #[tokio::test]
+    async fn an_absent_ledger_is_not_rebuilt_from_inputs_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-b", RunStatus::Completed, None);
+        for path in [
+            state.root.lookup_table_path("run-b"),
+            state.root.observed_path("run-b"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-b/calls".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("call_ledger"), "names the artifact: {err}");
+        assert!(err.contains("COMPLETED"), "names the run's state: {err}");
+    }
+
+    /// A ledger the run published empty is a run that made no calls — a fact
+    /// about the run, served as one.
+    #[tokio::test]
+    async fn a_published_empty_ledger_is_a_run_that_made_no_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-c", RunStatus::Completed, None);
+        let path = state.root.call_ledger_path("run-c");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-c/calls".into()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// A missing http-diff stream used to answer `[]`, which reads as "this run
+    /// had no HTTP diffs".
+    #[tokio::test]
+    async fn an_absent_http_diff_stream_is_not_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-d", RunStatus::Running, None);
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-d/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("http_diffs"), "names the artifact: {err}");
+        assert!(
+            err.contains("still running"),
+            "names the run's state: {err}"
+        );
+    }
+
+    /// An unparseable line is counted and refused, not dropped from a stream
+    /// that is then served as whole.
+    #[tokio::test]
+    async fn an_unparseable_http_diff_line_is_refused_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-e", RunStatus::Completed, None);
+        let path = state.root.http_diff_path("run-e");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"correlation_id\":\"c1\"}\n{truncated\n").unwrap();
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-e/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let err = error_of(&body);
+        assert!(err.contains("1 of 2"), "counts the drop: {err}");
+    }
+
+    /// The other polarity: a stream the run published empty is served empty.
+    #[tokio::test]
+    async fn a_published_empty_http_diff_stream_is_served_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-f", RunStatus::Completed, None);
+        let path = state.root.http_diff_path("run-f");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-f/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// A card the scorer PUBLISHED with nothing ingested still names the run's
+    /// disposition. Produced by `detect_and_score`, the lifecycle's own writer,
+    /// so this is the producer's wording meeting the endpoint's match.
+    #[tokio::test]
+    async fn a_published_empty_scorecard_names_the_runs_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-g", RunStatus::Completed, None);
+        deja_orchestrator::divergence::detect_and_score(&state.root, "run-g").unwrap();
+        assert!(
+            state.root.scorecard_path("run-g").exists(),
+            "precondition: the producer wrote the path the endpoint reads"
+        );
+
+        let (status, body) = get_json(state, "/api/v1/runs/run-g/scorecard".into()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reason = body["verdict"]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("COMPLETED"), "{reason}");
+    }
+
+    /// Registered-but-absent is a serving fault and says where the object is;
+    /// a DIFFERENT kind registered for the run is not this one.
+    #[test]
+    fn a_registered_artifact_that_is_absent_is_a_serving_fault() {
+        let rows = vec![
+            (
+                "scorecard".to_owned(),
+                "s3://b/runs/r/scorecard.json".to_owned(),
+            ),
+            (
+                "call_ledger".to_owned(),
+                "s3://b/runs/r/call_ledger.jsonl".to_owned(),
+            ),
+        ];
+        let said = describe_registration(Some(Ok(rows.clone())), "call_ledger");
+        assert!(said.contains("s3://b/runs/r/call_ledger.jsonl"), "{said}");
+        assert!(said.contains("not on this host"), "{said}");
+
+        let said = describe_registration(Some(Ok(rows)), "http_diffs");
+        assert!(said.contains("never registered"), "{said}");
+        assert!(
+            said.contains("upload failed"),
+            "names the case it cannot rule out: {said}"
+        );
+    }
+
+    /// No store and an unreadable index are each their own answer.
+    #[test]
+    fn no_store_and_an_unreadable_index_are_named_apart() {
+        let said = describe_registration(None, "http_diffs");
+        assert!(said.contains("no artifact store"), "{said}");
+        let said = describe_registration(Some(Err("pool timed out".to_owned())), "http_diffs");
+        assert!(
+            said.contains("could not be read (pool timed out)"),
+            "{said}"
+        );
+    }
+
+    // ---- grouping: a deployment and a day ----
+
+    /// The group is derived from an id that already exists. Every recording ever
+    /// sealed is groupable the moment this ships — nothing to mint, no new id
+    /// shape, no migration.
+    #[test]
+    fn a_group_is_the_revision_and_the_day_of_an_existing_id() {
+        let id = deja_orchestrator::parse_recording_id("rec-4157177-09101430-xc");
+        assert_eq!(super::group_of(&id).as_deref(), Some("4157177-0910"));
+    }
+
+    /// Two pods, two half-hour windows, ONE group. This is the whole point: the
+    /// recordings of a deployment's day are spread across dozens of pods because
+    /// pods are replaced every thirty minutes, and picking one is picking a
+    /// fraction for no reason a caller could state.
+    #[test]
+    fn every_pod_of_a_deployments_day_lands_in_one_group() {
+        let a = deja_orchestrator::parse_recording_id("rec-4157177-09100030-aa");
+        let b = deja_orchestrator::parse_recording_id("rec-4157177-09102330-zz");
+        assert_eq!(super::group_of(&a), super::group_of(&b));
+
+        // The precondition that makes this a test of grouping rather than of
+        // two identical inputs: they really are different recordings.
+        assert_ne!(
+            "rec-4157177-09100030-aa", "rec-4157177-09102330-zz",
+            "precondition: distinct recordings"
+        );
+    }
+
+    /// A different day and a different revision are both different groups. A
+    /// grouping that collapsed either would replay one deployment's traffic
+    /// against another's candidate, or mix two days into a run whose scope
+    /// nobody named.
+    #[test]
+    fn the_day_and_the_revision_both_separate_groups() {
+        let base = deja_orchestrator::parse_recording_id("rec-4157177-09101430-xc");
+        let other_day = deja_orchestrator::parse_recording_id("rec-4157177-09111430-xc");
+        let other_rev = deja_orchestrator::parse_recording_id("rec-72b65cb-09101430-xc");
+        assert_ne!(super::group_of(&base), super::group_of(&other_day));
+        assert_ne!(super::group_of(&base), super::group_of(&other_rev));
+    }
+
+    /// A recording whose id names no revision has no group. Null rather than a
+    /// bucket for the unidentifiable, which would be a group a replay could
+    /// select and then have no candidate to compare against.
+    #[test]
+    fn a_recording_without_a_revision_has_no_group() {
+        for id in ["run-1788907613122648573", "rec-nonsense", "whatever"] {
+            assert_eq!(
+                super::group_of(&deja_orchestrator::parse_recording_id(id)),
+                None,
+                "{id} must not be grouped"
+            );
+        }
+    }
+
+    /// A REVISION IS NOT ENOUGH — the day has to come from the id too.
+    ///
+    /// This is the case live data produced rather than one I imagined:
+    /// `run-1789076520165195354` reports revision `28d8299` on its row, because
+    /// the manifest answered when the id could not, and it holds 59
+    /// correlations. The manifest supplies no DAY, so grouping it would mean
+    /// guessing one — and a recording placed in the wrong day is a member of a
+    /// selection whose scope nobody named.
+    ///
+    /// So a row can have `identity.revision` set and `group` null, and that is
+    /// the intended answer rather than an oversight.
+    #[test]
+    fn a_manifest_supplied_revision_does_not_make_a_group() {
+        let boot = deja_orchestrator::parse_recording_id("run-1789076520165195354");
+        // The precondition: this really is the boot-derived shape, so the test
+        // is about a revision arriving from elsewhere and not about a bad id.
+        assert!(
+            matches!(
+                boot,
+                deja_orchestrator::RecordingIdentity::BootDerived { .. }
+            ),
+            "precondition: boot-derived"
+        );
+        assert_eq!(super::group_of(&boot), None);
+    }
+
+    // ---- identity: the revision the envelopes claim ----
+
+    fn refused(u: &super::Unavailable) -> Option<&str> {
+        match u {
+            super::Unavailable::Refused(why) | super::Unavailable::TapeMismatch(why) => Some(why),
+            super::Unavailable::Pending(_) => None,
+        }
+    }
+
+    /// A run's own delta cached before the tape check existed must not be
+    /// served: the view goes to the computation. Without a store that refuses
+    /// before reading a report, which is what is asserted. A checked copy is
+    /// served, so the refusal is not the cache failing to be read.
+    #[tokio::test]
+    async fn a_cached_delta_is_served_only_once_its_tape_was_checked() {
+        use divergence::behaviour_tree::CANON_VERSION;
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
+        let ledger = st.root.call_ledger_path("run-Y");
+        std::fs::write(&ledger, "").unwrap();
+        let cache = deja_orchestrator::delta_cache_of(&ledger);
+        let mut doc = serde_json::json!({
+            "y_run": "run-Y", "m_run": "run-M", "canon_version": CANON_VERSION,
+            "verdict": {"pass": true}, "requests": {},
+        });
+
+        std::fs::write(&cache, doc.to_string()).unwrap();
+        let served = super::delta_for_run(&st, "run-Y", "run-M").await;
+        let why = served.as_ref().err().and_then(refused);
+        assert!(
+            why.is_some_and(|w| w.contains("ingest report")),
+            "an unchecked cached delta was served: {served:?}"
+        );
+
+        let report = serde_json::json!({"members": ["rec-a"], "correlations": 3});
+        divergence::tape::record_tape_check(
+            &mut doc,
+            "run-Y",
+            Some(&report),
+            "run-M",
+            Some(&report),
+        )
+        .unwrap();
+        std::fs::write(&cache, doc.to_string()).unwrap();
+        let served = super::delta_for_run(&st, "run-Y", "run-M").await;
+        assert_eq!(served.ok(), Some(doc));
+    }
+
+    /// A baseline that has not ingested yet has no report: that is a wait,
+    /// not a mismatch, and must not read as "never".
+    #[test]
+    fn a_missing_report_on_an_unfinished_run_is_pending() {
+        for state in ["queued", "seeding", "running", "resolving"] {
+            let gap = super::report_gap("run-M", Some(state), super::ReportGap::NotRegistered);
+            assert!(
+                refused(&gap).is_none(),
+                "{state} must be pending, got {gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_report_on_a_finished_or_unknown_run_is_refused() {
+        for state in [Some("completed"), Some("failed"), None] {
+            let gap = super::report_gap("run-M", state, super::ReportGap::NotRegistered);
+            let why = refused(&gap).unwrap_or_default();
+            assert!(
+                why.contains("run run-M has no ingest report"),
+                "{state:?}: {gap:?}"
+            );
+        }
+    }
+
+    /// An expired object never comes back, so it refuses whatever the run's
+    /// state; a transient read failure does not.
+    #[test]
+    fn a_gone_report_refuses_and_an_unreadable_one_waits() {
+        let gone = super::report_gap("run-M", Some("completed"), super::ReportGap::Gone);
+        assert!(
+            refused(&gone)
+                .unwrap_or_default()
+                .contains("no longer stored"),
+            "{gone:?}"
+        );
+        let corrupt = super::report_gap(
+            "run-M",
+            Some("completed"),
+            super::ReportGap::Corrupt("eof".into()),
+        );
+        assert!(
+            refused(&corrupt).unwrap_or_default().contains("not JSON"),
+            "{corrupt:?}"
+        );
+        let flaky = super::report_gap(
+            "run-M",
+            Some("completed"),
+            super::ReportGap::Unreadable("503".into()),
+        );
+        assert!(refused(&flaky).is_none(), "{flaky:?}");
+    }
+
+    fn manifest_with_codes(shas: &[Option<&str>]) -> deja_compactor::SessionManifest {
+        let code: Vec<serde_json::Value> = shas
+            .iter()
+            .map(|s| serde_json::json!({ "sha": s, "deja_version": null }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "session_id": "s",
+            "status": "sealed",
+            "capture_mode": "session",
+            "envelope_schema_versions": [1],
+            "event_schema_versions": [1],
+            "code": code,
+            "instances": [],
+            "counts": {
+                "landing_objects": 1, "lines_in": 1, "events": 1,
+                "duplicates_dropped": 0, "correlations": 1
+            },
+            "data_parts": [],
+            "created_unix_ms": 0
+        }))
+        .unwrap()
+    }
+
+    /// The gap this closes: a recording whose ID names no revision still has one
+    /// in its envelopes, and the seal already collected it.
+    #[test]
+    fn a_single_envelope_sha_is_the_recordings_revision() {
+        let m = manifest_with_codes(&[Some("4157177")]);
+        assert_eq!(super::manifest_revision(&m).as_deref(), Some("4157177"));
+    }
+
+    /// Several entries naming the SAME sha is one revision, not an ambiguity —
+    /// the manifest holds one entry per distinct code identity, but nothing
+    /// stops a repeat, and collapsing to a set is what makes that harmless.
+    #[test]
+    fn repeated_entries_naming_one_sha_are_not_ambiguous() {
+        let m = manifest_with_codes(&[Some("4157177"), Some("4157177")]);
+        assert_eq!(super::manifest_revision(&m).as_deref(), Some("4157177"));
+    }
+
+    /// Two different shas means the recording spans revisions, so it has no
+    /// single one. Picking either would be a confident lie in exactly the case
+    /// where a caller most needs to know it cannot compare a candidate to this
+    /// tape.
+    #[test]
+    fn two_envelope_shas_read_as_unknown_not_as_a_pick() {
+        let m = manifest_with_codes(&[Some("4157177"), Some("72b65cb")]);
+
+        // The precondition: both really are present, so this is testing the
+        // ambiguity rule and not an empty collection.
+        assert_eq!(m.code.len(), 2, "precondition: two code identities");
+
+        assert_eq!(super::manifest_revision(&m), None);
+    }
+
+    /// Absent and blank both mean "not stated". A blank would otherwise become
+    /// a revision that renders as an empty string and compares equal to
+    /// nothing, which is worse than reporting none.
+    #[test]
+    fn absent_or_blank_shas_are_not_a_revision() {
+        assert_eq!(super::manifest_revision(&manifest_with_codes(&[])), None);
+        assert_eq!(
+            super::manifest_revision(&manifest_with_codes(&[None])),
+            None
+        );
+        assert_eq!(
+            super::manifest_revision(&manifest_with_codes(&[Some("   ")])),
+            None
+        );
+        // ...and a blank alongside a real one does not make the real one
+        // ambiguous.
+        assert_eq!(
+            super::manifest_revision(&manifest_with_codes(&[Some("  "), Some("4157177")]))
+                .as_deref(),
+            Some("4157177")
+        );
+    }
+
+    // ---- recording selection: order, and which pods count ----
+
+    fn landed(session_id: &str, date: &str, instances: &[&str]) -> deja_compactor::LandedRecording {
+        deja_compactor::LandedRecording {
+            session_id: session_id.to_owned(),
+            dates: vec![date.to_owned()],
+            prefix: format!("landing/v1/dt={date}/session={session_id}"),
+            objects: 1,
+            instances: instances.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn newest_first(mut rows: Vec<deja_compactor::LandedRecording>) -> Vec<String> {
+        rows.sort_by_cached_key(super::selection_order_key);
+        rows.reverse();
+        rows.into_iter().map(|r| r.session_id).collect()
+    }
+
+    /// The sandbox failure written as a test. Two revisions recorded on the same
+    /// day, and the raw session-id tiebreak preferred the OLDER tape because it
+    /// compares the revision hex before the timestamp.
+    #[test]
+    fn ordering_tracks_time_not_the_revision_hex() {
+        let older = landed("rec-72b65cb-09070800-y1", "2026-09-07", &["pod"]);
+        let newer = landed("rec-4157177-09071400-xc", "2026-09-07", &["pod"]);
+
+        // The precondition that makes this test about the fix rather than about
+        // nothing: the order being replaced really does prefer the older tape.
+        assert!(
+            older.session_id > newer.session_id,
+            "precondition: raw id order puts the 08:00 tape above the 14:00 one"
+        );
+
+        assert_eq!(
+            newest_first(vec![older, newer])[0],
+            "rec-4157177-09071400-xc",
+            "the 14:00 recording is newer than the 08:00 one whatever its revision"
+        );
+    }
+
+    /// A session that straddles midnight is ordered by the date it last wrote
+    /// into, so yesterday's 23:50 tape does not outrank this morning's.
+    #[test]
+    fn a_later_write_date_outranks_an_earlier_one() {
+        let yesterday = landed("rec-4157177-09062350-aa", "2026-09-06", &["pod"]);
+        let today = landed("rec-4157177-09070100-bb", "2026-09-07", &["pod"]);
+        assert_eq!(
+            newest_first(vec![yesterday, today])[0],
+            "rec-4157177-09070100-bb"
+        );
+    }
+
+    /// prism mints `run-<nanos>` for every recording it makes, so its ids carry
+    /// no parsed time and fall through to the session id — where a fixed-width
+    /// nanosecond epoch sorts lexically exactly as it sorts numerically. That
+    /// order was already correct; this change must leave it alone.
+    #[test]
+    fn boot_derived_ids_keep_their_nanosecond_order() {
+        let older = landed("run-1788539093442862902", "2026-09-07", &["pod"]);
+        let newer = landed("run-1788680145151199733", "2026-09-07", &["pod"]);
+        assert_eq!(
+            newest_first(vec![older, newer])[0],
+            "run-1788680145151199733"
+        );
+    }
+
+    /// Seed one hydrated artifact with a chosen size and modification time.
+    fn hydrated(root: &HarnessRoot, run_id: &str, kind: &str, bytes: usize, age_secs: u64) {
+        let path = super::cache_path_for_kind(root, run_id, kind).expect("known kind");
+        std::fs::create_dir_all(path.parent().expect("kind dir")).expect("mkdir");
+        std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age_secs);
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    fn present(root: &HarnessRoot, run_id: &str, kind: &str) -> bool {
+        super::cache_path_for_kind(root, run_id, kind).is_some_and(|path| path.exists())
+    }
+
+    /// Seed a file that is NOT a hydrated artifact, with a chosen age.
+    fn resident(path: &std::path::Path, bytes: usize, age_secs: u64) {
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(path, vec![b'x'; bytes]).expect("write");
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    /// The files that share a directory with hydrated artifacts and are not
+    /// copies of anything: the run record is the only copy of a run's progress,
+    /// and the ingest endpoint refuses every event for a run without one.
+    fn residents(root: &HarnessRoot, run_id: &str) -> Vec<std::path::PathBuf> {
+        vec![
+            root.run_path(run_id),
+            root.seed_certificate_path(run_id),
+            root.record_graph_note_path(run_id),
+            root.root
+                .join("runs")
+                .join(format!("{run_id}.manifest.json")),
+        ]
+    }
+
+    /// THE bug: at boot nothing is protected, the budget forces eviction, and
+    /// the oldest files in `runs/` are run records. Only the hydrated copy may go.
+    #[test]
+    fn the_boot_sweep_deletes_only_hydrated_copies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        for path in residents(&root, "run-old") {
+            resident(&path, 1_000, 10);
+        }
+        hydrated(&root, "run-cached", "scorecard", 1_000, 100);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        // Vacuity guard: the sweep really did evict.
+        assert!(
+            !present(&root, "run-cached", "scorecard"),
+            "precondition: the budget forced eviction"
+        );
+        for path in residents(&root, "run-old") {
+            assert!(path.exists(), "the sweep deleted {}", path.display());
+        }
+    }
+
+    /// A name is not enough: `runs/<id>.jsonl` has the file name an observed
+    /// stream would have, in a directory observed streams never live in.
+    #[test]
+    fn a_hydrated_name_in_the_wrong_directory_is_not_cache() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let stray = root.root.join("runs").join("run-x.jsonl");
+        resident(&stray, 1_000, 10);
+        hydrated(&root, "run-cached", "scorecard", 1_000, 100);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(!present(&root, "run-cached", "scorecard"), "precondition");
+        assert!(stray.exists(), "only the seam's exact path is cache");
+    }
+
+    /// Files that are not cache do not count toward the cache's budget. The
+    /// run record is the NEWEST file here, so a sweep that counted it would
+    /// evict both cached files to make room for it, and delete nothing it
+    /// should not; only the count tells the two apart.
+    #[test]
+    fn only_cache_counts_toward_the_budget() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "call_ledger", 1_000, 50);
+        hydrated(&root, "run-b", "call_ledger", 1_000, 100);
+        resident(&root.run_path("run-big"), 10_000, 200);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1500");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(
+            !present(&root, "run-a", "call_ledger"),
+            "precondition: 2,000 cached bytes over a 1,500 budget evicts the oldest"
+        );
+        assert!(
+            present(&root, "run-b", "call_ledger"),
+            "1,000 cached bytes remain, under budget: the record's bytes are not cache"
+        );
+        assert!(
+            root.run_path("run-big").exists(),
+            "a run record is not cache"
+        );
+    }
+
+    /// The caches the orchestrator derives beside hydrated files are cache too:
+    /// the behaviour tree is written when a run finishes, so leaving it out
+    /// would grow the volume with every run executed.
+    #[test]
+    fn derived_caches_are_swept_and_the_record_beside_them_is_not() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let derived = [
+            root.behaviour_tree_path("run-old"),
+            root.delta_cache_path("run-old"),
+            root.change_coverage_path("run-old"),
+        ];
+        for path in &derived {
+            resident(path, 1_000, 10);
+        }
+        resident(&root.run_path("run-old"), 1_000, 5);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        for path in &derived {
+            assert!(
+                !path.exists(),
+                "a derived cache was left: {}",
+                path.display()
+            );
+        }
+        assert!(root.run_path("run-old").exists(), "the run record survives");
+    }
+
+    /// On compose the hydrated-kind files are the ONLY copy: the lifecycle ran
+    /// in-process and registered local paths, and nothing was hydrated.
+    /// Evicting those is deletion, whatever the budget says. A derived cache
+    /// beside them is rebuilt on a miss, so it still goes.
+    #[test]
+    fn compose_evicts_derived_caches_and_never_its_only_copies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-compose", "scorecard", 1_000, 10);
+        hydrated(&root, "run-compose", "lookup_table", 1_000, 10);
+        let tree = root.behaviour_tree_path("run-compose");
+        resident(&tree, 1_000, 5);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(
+            &root,
+            "",
+            super::LocalArtifacts::of(&ExecutorSelection::Compose),
+        );
+        assert!(!tree.exists(), "a derived cache is evicted on compose too");
+        for kind in ["scorecard", "lookup_table"] {
+            assert!(
+                present(&root, "run-compose", kind),
+                "compose's only copy of {kind} survives"
+            );
+        }
+    }
+
+    /// The k8s executor says the local files are copies of stored objects.
+    #[test]
+    fn a_k8s_executor_holds_copies_of_stored_objects() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sa = tempfile::tempdir().unwrap();
+        std::fs::write(sa.path().join("ca.crt"), "ca").unwrap();
+        std::fs::write(sa.path().join("namespace"), "ns\n").unwrap();
+        std::fs::write(sa.path().join("token"), "tok").unwrap();
+        std::env::set_var("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+        std::env::set_var("KUBERNETES_SERVICE_PORT", "443");
+        let incluster = InClusterConfig::from_env_at(sa.path());
+        std::env::remove_var("KUBERNETES_SERVICE_HOST");
+        std::env::remove_var("KUBERNETES_SERVICE_PORT");
+        let k8s = ExecutorSelection::K8s(Box::new(K8sExecutor {
+            incluster: incluster.expect("in-cluster config from a fixture SA root"),
+            cfg: K8sExecutorConfig::from_env(),
+            scheduler_capacity: 0,
+        }));
+        assert_eq!(
+            super::LocalArtifacts::of(&k8s),
+            super::LocalArtifacts::CopiesOfStore
+        );
+    }
+
+    /// The other polarity: where local files are copies of stored objects, the
+    /// same fixture is evicted.
+    #[test]
+    fn copies_of_stored_objects_are_evicted_over_budget() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-k8s", "scorecard", 1_000, 10);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(!present(&root, "run-k8s", "scorecard"), "a copy is evicted");
+    }
+
+    /// `keep` protects one run, not every run whose id it prefixes.
+    #[test]
+    fn keep_protects_exactly_the_run_it_names() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "scorecard", 1_000, 10);
+        hydrated(&root, "run-ab", "scorecard", 1_000, 20);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "run-a", super::LocalArtifacts::CopiesOfStore);
+        assert!(
+            present(&root, "run-a", "scorecard"),
+            "the served run is kept"
+        );
+        assert!(
+            !present(&root, "run-ab", "scorecard"),
+            "a run whose id merely starts with it is not"
+        );
+    }
+
+    /// A cache under budget is left entirely alone — the sweep is a ceiling, not
+    /// a scheduled deletion.
+    #[test]
+    fn a_cache_under_budget_loses_nothing() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "observed", 1_000, 100);
+        hydrated(&root, "run-b", "observed", 1_000, 200);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1000000");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(
+            present(&root, "run-a", "observed"),
+            "under budget, nothing goes"
+        );
+        assert!(present(&root, "run-b", "observed"));
+    }
+
+    /// Over budget, the OLDEST goes first and the sweep stops as soon as it is
+    /// under — not "delete everything old", which would throw away a cache that
+    /// is merely full.
+    #[test]
+    fn eviction_takes_the_oldest_first_and_stops_at_the_budget() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "oldest", "observed", 1_000, 100);
+        hydrated(&root, "middle", "observed", 1_000, 200);
+        hydrated(&root, "newest", "observed", 1_000, 300);
+        // 3000 bytes present, budget 2500: exactly one file must go.
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "2500");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(
+            !present(&root, "oldest", "observed"),
+            "the oldest is evicted"
+        );
+        assert!(
+            present(&root, "middle", "observed"),
+            "and the sweep then stops"
+        );
+        assert!(present(&root, "newest", "observed"));
+    }
+
+    /// The run being served survives even when it is the oldest thing there.
+    ///
+    /// `hydrate_run_artifacts` writes then sweeps, so without this the very
+    /// files a view just downloaded could be deleted before it reads them, and
+    /// the view would render empty on a cache that was merely full.
+    #[test]
+    fn the_run_being_served_is_never_evicted() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "serving", "observed", 4_000, 1);
+        hydrated(&root, "other", "observed", 1_000, 999);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "500");
+        super::evict_cached_artifacts(&root, "serving", super::LocalArtifacts::CopiesOfStore);
+        assert!(
+            present(&root, "serving", "observed"),
+            "the served run is kept"
+        );
+        assert!(
+            !present(&root, "other", "observed"),
+            "others go to make room"
+        );
+    }
+
+    /// The raw endpoint takes its content type from the kind table, so a
+    /// compose run's local path and an old object name are served by what the
+    /// artifact is. No store-backed test reaches the endpoint, so the seam is
+    /// held against the source. The needle is assembled so this test does not
+    /// count itself.
+    #[test]
+    fn the_raw_endpoint_serves_by_kind() {
+        let source = include_str!("main.rs");
+        let needle = format!("artifact_kinds::{}(&art.kind", "served_content_type");
+        assert_eq!(
+            source.matches(&needle).count(),
+            1,
+            "v1_artifact_raw decides its content type through the kind table"
+        );
+    }
+
+    /// Viewing a run does not pull its lookup table. Only scoring reads it,
+    /// and scoring runs in the replay pod; `/raw` fetches the published object
+    /// by its URI. Hydration skips a kind with no local path here.
+    #[test]
+    fn viewing_a_run_does_not_pull_its_lookup_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        assert!(
+            local_path_for_artifact_kind(&root, "run-1", "lookup_table").is_none(),
+            "no API path reads the orchestrator's copy of the lookup table"
+        );
+        assert!(
+            local_path_for_artifact_kind(&root, "run-1", "call_ledger").is_some(),
+            "a kind the API reads is still hydrated"
+        );
+        // Old copies are swept where hydration used to put them.
+        assert_eq!(
+            cache_path_for_kind(&root, "run-1", "lookup_table"),
+            Some(artifact_kinds::LOOKUP_TABLE.path(&root, "run-1")),
+            "the sweep looks for old copies where they are"
+        );
+        // Hydration asks the served-only seam, not the sweep's, which also
+        // answers for the lookup table.
+        let needle = format!(
+            "let Some(local) = {}(&root, &run_id, &art.kind)",
+            "local_path_for_artifact_kind"
+        );
+        assert_eq!(include_str!("main.rs").matches(&needle).count(), 1);
+    }
+
+    /// Every hydrated kind is swept, not only the big one. A kind added to the
+    /// artifact-kind table as served joins the sweep by existing.
+    #[test]
+    fn every_hydrated_kind_is_swept() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        for kind in [
+            "observed",
+            "http_diffs",
+            "lookup_table",
+            "scorecard",
+            "call_ledger",
+            "record_graph",
+        ] {
+            hydrated(&root, "run-x", kind, 1_000, 100);
+        }
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "1");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        for kind in [
+            "observed",
+            "http_diffs",
+            "lookup_table",
+            "scorecard",
+            "call_ledger",
+            "record_graph",
+        ] {
+            assert!(!present(&root, "run-x", kind), "{kind} was not swept");
+        }
+    }
+
+    /// Zero disables the sweep, so a deployment can turn it off without editing
+    /// the image.
+    #[test]
+    fn a_zero_budget_disables_the_sweep() {
+        // The budget is read from the process environment, which every test in
+        // this binary shares — without the lock these race each other.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        hydrated(&root, "run-a", "observed", 10_000, 100);
+        std::env::set_var("DEJA_ARTIFACT_CACHE_MAX_BYTES", "0");
+        super::evict_cached_artifacts(&root, "", super::LocalArtifacts::CopiesOfStore);
+        assert!(present(&root, "run-a", "observed"), "zero means no ceiling");
+    }
+
+    /// The substring trap, and why the predicate anchors. The custom
+    /// deployment's pod name CONTAINS the main deployment's name, so the
+    /// `contains` rule its neighbour `instance_pattern` uses would admit exactly
+    /// what this filter exists to exclude.
+    #[test]
+    fn main_deployment_match_is_anchored_not_a_substring() {
+        const MAIN: &str = "sbx-hyperswitch-server-";
+        let custom = landed(
+            "run-1788680145151199733",
+            "2026-09-07",
+            &["sbx-custom-cug-hyperswitch-server-54d4746479-d2qr7"],
+        );
+        let main = landed(
+            "rec-4157177-09071400-xc",
+            "2026-09-07",
+            &["sbx-hyperswitch-server-66d5b699fc-xx5tg"],
+        );
+
+        // The trap, stated exactly. A custom pod is NOT named
+        // `sbx-hyperswitch-server-…` — so the anchored prefix rejects it on the
+        // `sbx-` boundary. What it does contain is the bare service name
+        // `hyperswitch-server`, and a bare service name is precisely the shape
+        // `instance_pattern` takes elsewhere in this document (prism declares
+        // `"ucs"`). So the substring rule that answers "which system minted
+        // this" would answer "yes, main" here, and the anchor is what keeps the
+        // two questions apart.
+        assert!(
+            custom.instances[0].contains("hyperswitch-server"),
+            "precondition: a bare service-name pattern really does match a custom pod"
+        );
+        assert!(
+            !custom.instances[0].starts_with(MAIN),
+            "precondition: and the anchored prefix really does not"
+        );
+
+        assert!(super::from_main_deployment(&main, MAIN));
+        assert!(
+            !super::from_main_deployment(&custom, MAIN),
+            "a custom deployment is not the main one however its name reads"
+        );
+    }
+
+    /// `all` over an empty list is TRUE, so emptiness has to be its own
+    /// assertion and has to come first. Without it, a recording whose `inst=`
+    /// partitions the scan could not read passes the main-deployment filter —
+    /// admitted precisely because nothing is known about it.
+    #[test]
+    fn a_recording_with_no_instances_is_not_from_the_main_deployment() {
+        const MAIN: &str = "sbx-hyperswitch-server-";
+        let unknown = landed("rec-4157177-09071400-xc", "2026-09-07", &[]);
+
+        assert!(
+            unknown.instances.iter().all(|i| i.starts_with(MAIN)),
+            "precondition: the vacuous `all` really does pass on an empty list"
+        );
+
+        assert!(!super::from_main_deployment(&unknown, MAIN));
     }
 }

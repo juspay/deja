@@ -6,6 +6,7 @@ license.workspace = true
 description = "Compacts deja landing objects into sealed, manifested session layouts in S3"
 
 [dependencies]
+bytes = "1"
 flate2 = "1"
 futures = "0.3"
 object_store = { version = "0.11", features = ["aws"] }
