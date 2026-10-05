@@ -555,6 +555,41 @@ export type RecordingIdentity = {
   booted_at_nanos?: string;
 };
 
+/**
+ * Why a listed recording has no seal covering everything it has landed.
+ *
+ * Tagged on `reason`, mirroring the server's `SealPending`. A recording still
+ * being written is fine and self-correcting; one that stopped being written and
+ * still has no seal is a question for the sealer's ledger. The two used to
+ * arrive as the same `sealed: false`.
+ *
+ * Two of the four reasons are absences of a measurement rather than states of
+ * the recording, and they are reasons precisely so that nothing downstream has
+ * to invent the missing number.
+ */
+export type SealPending =
+  | {
+      reason: "still_writing";
+      quiet_for_secs: number;
+      quiet_after_secs: number;
+      objects: number;
+    }
+  | {
+      reason: "quiet_but_not_sealed";
+      quiet_for_secs: number;
+      quiet_after_secs: number;
+      objects: number;
+    }
+  /** The listing carried no write time, so which of the two above applies is
+   *  not knowable from it. Named rather than guessed. */
+  | { reason: "age_unknown"; objects: number }
+  /** The age is known and the window is not: the orchestrator is not told what
+   *  silence the sealer waits for (`DEJA_SEAL_QUIET_SECS` is set on the sealing
+   *  job), so it reports the age and declines to judge it. THE ORDINARY CASE
+   *  today — render it as "age known, threshold not published here", never by
+   *  supplying a threshold of your own. */
+  | { reason: "threshold_unknown"; quiet_for_secs: number; objects: number };
+
 /** One session found in the bucket. */
 export type AvailableRecording = {
   /** The session id, minted ONCE PER ROUTER PROCESS — so this names a pod's
@@ -600,6 +635,38 @@ export type AvailableRecording = {
   /** Capture gaps the seal found — `global_sequence` ranges the recorder
    *  allocated and the tape never received. Null when unsealed. */
   gaps?: number | null;
+  /** Seconds since this session's newest landing object, from the listing.
+   *  Null when the listing carried no write time — not zero, which would read
+   *  as "written this second". */
+  quiet_for_secs: number | null;
+  /** The silence the sealer waits for before it treats a recording as
+   *  finished, AS DECLARED TO THE ORCHESTRATOR.
+   *
+   *  NULL IS THE NORMAL ANSWER, and it is not a gap in the data.
+   *  `DEJA_SEAL_QUIET_SECS` is set where the sealer runs, and a deployment has
+   *  no reason to set it on the service that lists — so this process usually
+   *  does not know the window and says so. Do not substitute a default: the
+   *  library's is 900s and sandbox's sealer applies 120s, so a rendered default
+   *  would be wrong by more than seven times and wrong confidently. Render null
+   *  as "not published here". */
+  quiet_after_secs: number | null;
+  /** WHY no seal covers everything this session has landed, or null when one
+   *  does.
+   *
+   *  `sealed: false` was the whole answer, and it says the same thing about
+   *  two states a reader has to act on differently. `still_writing` is the
+   *  steady state of a live recorder and corrects itself. `quiet_but_not_sealed`
+   *  means the recording stopped growing and still has no seal — either the
+   *  next pass will write one or a pass has already refused it, which the
+   *  sealer's ledger says and a listing cannot. Do not render either as
+   *  "skipped".
+   *
+   *  `quiet_for_secs` says how close to sealing a recording is and NOT how long
+   *  it has been accruing: on `still_writing` it is below `quiet_after_secs` by
+   *  construction, so a session that began an hour ago and one that began a
+   *  week ago report the same small number at the same flush rate. `objects` is
+   *  the field that separates those. */
+  seal_pending: SealPending | null;
   /**
    * The deployment-day this session belongs to: `<revision>-<MMDD>`.
    *
