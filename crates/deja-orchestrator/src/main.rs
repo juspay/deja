@@ -953,6 +953,11 @@ async fn v1_available_recordings(
     // correlations and "not counted yet" are different answers, and a picker that
     // rendered the second as the first would hide good recordings as empty ones.
     let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
+    // The window the SEALER applies, read from the sealer's own definition, and
+    // the clock the ages below are measured against — taken once so every row
+    // in a page is explained against the same instant.
+    let quiet_after_secs = deja_compactor::configured_quiet_secs();
+    let now_unix_secs = deja_compactor::now_unix_secs();
     // The SCANNED bucket, not the deployment's default. The rows above came from
     // whichever bucket `scan_scope` resolved for the named system, so reading
     // their manifests from `from_env()` would look for a prism recording's seal
@@ -985,6 +990,12 @@ async fn v1_available_recordings(
             // that difference should be one field rather than every reader
             // reimplementing the same two shapes.
             let identity = deja_orchestrator::parse_recording_id(&r.session_id);
+            let r_quiet_for_secs = r.quiet_for_secs(now_unix_secs);
+            let r_seal_pending = r.seal_pending(
+                manifest.map(|m| m.counts.landing_objects),
+                quiet_after_secs,
+                now_unix_secs,
+            );
             // Which system minted the session. The `inst=` pod names are the
             // authoritative signal when the scan captured any (the UCS pods
             // carry the pattern below; router pods do not). The id SHAPE alone
@@ -1099,6 +1110,27 @@ async fn v1_available_recordings(
                 // vanish silently and readers would get a list or a number
                 // depending on which line came last.
                 "sealed_instances": manifest.map(|m| m.instances.len()),
+                // Why there is no seal covering everything this recording has
+                // landed, or null when there is one.
+                //
+                // `sealed: false` with three null counts was the whole answer,
+                // and it is the same answer for two states that have to be acted
+                // on differently: a recording that is simply still being written
+                // (the steady state of a live recorder, and self-correcting), and
+                // one that stopped being written and was not sealed anyway —
+                // which means a pass considered it and dropped it, and the
+                // sealer's ledger row names which drop. It also carries how long
+                // the recording has been in that state, so one that has been
+                // growing for days is distinguishable from one that will seal on
+                // the next tick. Both numbers come off the listing this endpoint
+                // already did; nothing extra is read.
+                "seal_pending": r_seal_pending,
+                // Seconds since this recording's newest landing object, and the
+                // window the sealer measures it against. Reported beside the
+                // verdict above rather than only inside it, so a sealed-and-
+                // current row still says how old it is.
+                "quiet_for_secs": r_quiet_for_secs,
+                "quiet_after_secs": quiet_after_secs,
                 // Capture gaps: `global_sequence` ranges the recorder allocated
                 // whose events never reached the tape. Already computed at seal
                 // time and, until now, surfaced nowhere — it is the evidence the
@@ -4372,6 +4404,12 @@ mod tests {
             prefix: format!("landing/v1/dt={date}/session={session_id}"),
             objects: 1,
             instances: instances.iter().map(|s| (*s).to_owned()).collect(),
+            // These fixtures exercise ORDER and pod selection, neither of which
+            // reads a write time. Left absent rather than filled with a
+            // plausible one, so a rule that started depending on it would show
+            // up here as an unexplained `age_unknown` rather than pass on a
+            // number this test never meant to state.
+            newest_object_unix_secs: None,
         }
     }
 

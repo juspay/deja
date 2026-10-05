@@ -556,6 +556,31 @@ export type RecordingIdentity = {
 };
 
 /** One session found in the bucket. */
+/**
+ * Why a listed recording has no seal covering everything it has landed.
+ *
+ * Tagged on `reason`, mirroring the server's `SealPending`. A recording still
+ * being written is fine and self-correcting; one that stopped being written and
+ * still has no seal is a question for the sealer's ledger. The two used to
+ * arrive as the same `sealed: false`.
+ */
+export type SealPending =
+  | {
+      reason: "still_writing";
+      quiet_for_secs: number;
+      quiet_after_secs: number;
+      objects: number;
+    }
+  | {
+      reason: "quiet_but_not_sealed";
+      quiet_for_secs: number;
+      quiet_after_secs: number;
+      objects: number;
+    }
+  /** The listing carried no write time, so which of the two above applies is
+   *  not knowable from it. Named rather than guessed. */
+  | { reason: "age_unknown"; objects: number };
+
 export type AvailableRecording = {
   /** The session id, minted ONCE PER ROUTER PROCESS — so this names a pod's
    *  entire lifetime, not a bounded window of traffic. */
@@ -600,6 +625,25 @@ export type AvailableRecording = {
   /** Capture gaps the seal found — `global_sequence` ranges the recorder
    *  allocated and the tape never received. Null when unsealed. */
   gaps?: number | null;
+  /** Seconds since this session's newest landing object, from the listing.
+   *  Null when the listing carried no write time — not zero, which would read
+   *  as "written this second". */
+  quiet_for_secs?: number | null;
+  /** The silence the sealer waits for before it treats a recording as
+   *  finished. Reported so `quiet_for_secs` is legible without also knowing
+   *  the deployment's configuration. */
+  quiet_after_secs?: number;
+  /** WHY no seal covers everything this session has landed, or null when one
+   *  does.
+   *
+   *  `sealed: false` was the whole answer, and it says the same thing about
+   *  two states a reader has to act on differently. `still_writing` is the
+   *  steady state of a live recorder and corrects itself. `quiet_but_not_sealed`
+   *  means the recording stopped growing and still has no seal — either the
+   *  next pass will write one or a pass has already refused it, which the
+   *  sealer's ledger says and a listing cannot. Do not render either as
+   *  "skipped". */
+  seal_pending?: SealPending | null;
   /**
    * The deployment-day this session belongs to: `<revision>-<MMDD>`.
    *

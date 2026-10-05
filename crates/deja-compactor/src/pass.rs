@@ -89,7 +89,28 @@ pub enum Outcome {
     AlreadyCurrent { sealed_objects: usize },
     /// Still being written. Not a drop: the recording is fine and the next
     /// pass will find it finished.
-    NotReady { state: String, objects: usize },
+    ///
+    /// `active` is the one outcome a pass can report for ever, so the row says
+    /// how far from sealing the recording is rather than only that it is not
+    /// there yet. A landing written to more often than the quiet window is wide
+    /// never produces a gap that wide, so it is never sealed and keeps growing
+    /// — and `active, N object(s)` reads identically on the pass that will seal
+    /// it on the next tick and on every pass over a recording that has been
+    /// growing for days and will be refused as `too_large` once it stops.
+    /// Readiness computes both numbers; the row used to drop them.
+    NotReady {
+        state: String,
+        objects: usize,
+        /// Seconds since the newest landing object. `None` for a state that has
+        /// no age: `absent` has nothing in the landing to have been written at
+        /// a time, and reporting that as zero would read as "written this
+        /// second", which is the opposite of what it means.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quiet_for_secs: Option<u64>,
+        /// The window the age above is being measured against, so a row is
+        /// legible without also knowing the deployment's configuration.
+        threshold_secs: u64,
+    },
     /// The landing passed the pass's memory budget while it was being read, so
     /// no seal was attempted. A DROP: this recording will not seal until
     /// either the budget rises or compaction stops holding the whole landing.
@@ -212,8 +233,25 @@ impl std::fmt::Display for Row {
             Outcome::AlreadyCurrent { sealed_objects } => {
                 write!(f, "already current ({sealed_objects} object(s) covered)")
             }
-            Outcome::NotReady { state, objects } => {
-                write!(f, "not ready ({state}, {objects} object(s))")
+            Outcome::NotReady {
+                state,
+                objects,
+                quiet_for_secs,
+                threshold_secs,
+            } => {
+                write!(f, "not ready ({state}")?;
+                if let Some(quiet) = quiet_for_secs {
+                    write!(
+                        f,
+                        ", last written {quiet}s ago, inside a {threshold_secs}s quiet window"
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        ", no landing object to age against a {threshold_secs}s quiet window"
+                    )?;
+                }
+                write!(f, ", {objects} object(s))")
             }
             Outcome::TooLarge {
                 budget_bytes,
@@ -538,6 +576,8 @@ async fn seal_outcome_in(
             return Ok(Outcome::NotReady {
                 state: readiness_state(&readiness).to_owned(),
                 objects: readiness.objects(),
+                quiet_for_secs: readiness.quiet_for_secs(),
+                threshold_secs: quiet_after_secs,
             });
         }
         SealDecision::Seal { resealing } => resealing,
@@ -1102,6 +1142,8 @@ mod tests {
                     Outcome::NotReady {
                         state: "active".to_owned(),
                         objects: 3,
+                        quiet_for_secs: Some(9),
+                        threshold_secs: 120,
                     },
                 )],
                 unreachable: None,
@@ -1442,7 +1484,7 @@ mod tests {
         // An hour of required quiet against a landing written a moment ago.
         let row = block(seal_one_in(&store, "sys", "r1", ROOT, 3600, None));
         match &row.outcome {
-            Outcome::NotReady { state, objects } => {
+            Outcome::NotReady { state, objects, .. } => {
                 assert_eq!(state, "active");
                 assert_eq!(*objects, 1);
             }
@@ -1450,5 +1492,74 @@ mod tests {
         }
         assert!(!row.outcome.is_drop());
         assert!(block(crate::manifest_of(&store, "r1")).unwrap().is_none());
+    }
+
+    /// A `not_ready` row says how far the recording is from sealing, not merely
+    /// that it is not there yet.
+    ///
+    /// `active` is the one outcome a pass can report for ever. A recording whose
+    /// landing is written to more often than the quiet window is wide never
+    /// goes quiet, so it is never sealed, so it keeps growing — and a row that
+    /// says only `active, N object(s)` reads the same on the pass that will seal
+    /// it on the next tick as on every pass over a recording that has been
+    /// growing for days and will be refused as `too_large` the moment it does
+    /// stop. The two numbers that separate those are the ones readiness already
+    /// computed and the row threw away.
+    ///
+    /// Asserted on the serialised row, because the ledger line IS JSON: an
+    /// operator and the ETL read these keys, not the Rust enum.
+    #[test]
+    fn a_not_ready_row_names_the_window_it_is_waiting_on() {
+        let store = store();
+        land(&store, "r1", 0, &[envelope("r1", 1, 0)]);
+        let row = block(seal_one_in(&store, "sys", "r1", ROOT, 3600, None));
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["outcome"], "not_ready");
+        assert_eq!(json["state"], "active");
+        assert_eq!(
+            json["threshold_secs"], 3600,
+            "the row names the window it is being measured against: {json}"
+        );
+        // Landed a moment ago, so the age is small but it must be PRESENT — the
+        // claim is that the number is reported, not that a test clock is exact.
+        let quiet = json["quiet_for_secs"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the row names how long it has been quiet: {json}"));
+        assert!(quiet < 3600, "a landing just written is not quiet: {json}");
+
+        // And the human line carries the same two numbers, so a log and a row
+        // cannot describe one recording differently.
+        let line = row.to_string();
+        assert!(line.contains("3600"), "{line}");
+    }
+
+    /// `absent` reaches `not_ready` too, and it has no age: there is nothing in
+    /// the landing to have been written at a time. It must report that as
+    /// absent rather than as zero, which would read as "written this second".
+    ///
+    /// Both rows are asserted against ONE fixture because the absence on its own
+    /// has no opportunity to fail: a row carrying no age at all satisfies it,
+    /// which is what it did before `quiet_for_secs` existed. The active row
+    /// beside it is what makes the omission a measurement.
+    #[test]
+    fn an_absent_recording_reports_no_age_rather_than_a_zero_one() {
+        let store = store();
+        let absent = block(seal_one_in(&store, "sys", "nothing-here", ROOT, 3600, None));
+        land(&store, "r1", 0, &[envelope("r1", 1, 0)]);
+        let active = block(seal_one_in(&store, "sys", "r1", ROOT, 3600, None));
+
+        let absent = serde_json::to_value(&absent).unwrap();
+        let active = serde_json::to_value(&active).unwrap();
+        assert_eq!(absent["state"], "absent");
+        assert_eq!(active["state"], "active");
+        assert!(
+            active.get("quiet_for_secs").is_some(),
+            "a landing that exists has an age, so the omission below is a fact \
+             about `absent` and not about the field: {active}"
+        );
+        assert!(
+            absent.get("quiet_for_secs").is_none(),
+            "an absent landing has no age at all: {absent}"
+        );
     }
 }

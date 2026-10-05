@@ -1037,6 +1037,78 @@ pub fn list_objects(cfg: &S3Config, prefix: &str) -> Result<Vec<String>, String>
     })
 }
 
+/// One landed object as a listing sees it: its key and when the store wrote it.
+///
+/// The write time is the only fact anything knows about a landing's AGE, and a
+/// listing is the one place it is free — it comes back on every `ObjectMeta`.
+/// A reader that keeps only the key has to list the prefix a second time to
+/// recover it, which is why "how long has this been growing?" used to be a
+/// question only the sealer could answer and only about one recording at a
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedObject {
+    pub key: String,
+    /// `last_modified` in unix seconds.
+    pub modified_unix_secs: i64,
+}
+
+async fn list_landed(store: &DynStore, prefix: &str) -> Result<Vec<LandedObject>, String> {
+    let prefix_path = object_store::path::Path::from(prefix);
+    let mut objects: Vec<LandedObject> = store
+        .list(Some(&prefix_path))
+        .map_ok(|meta| LandedObject {
+            key: meta.location.as_ref().to_owned(),
+            modified_unix_secs: meta.last_modified.timestamp(),
+        })
+        .try_collect()
+        .await
+        .map_err(|e| format!("s3 list {prefix}: {e}"))?;
+    objects.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(objects)
+}
+
+/// Now, in unix seconds. Zero if the clock is before the epoch, which is the
+/// same direction [`readiness_of`] errs in: an impossible clock reads as "just
+/// written" and so leaves a recording alone.
+pub fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long a session must go unwritten before silence is taken for an ending.
+///
+/// Must exceed the aggregator's flush interval, or the gap between two flushes
+/// of a live workload reads as a finished recording. The converse is the
+/// standing cost of the other direction: a workload whose flushes are closer
+/// together than this never produces a gap this wide, so its recording is
+/// never sealed and grows for as long as the pod lives.
+pub const DEFAULT_QUIET_SECS: u64 = 900;
+
+/// The quiet window this deployment waits for, from `DEJA_SEAL_QUIET_SECS`.
+///
+/// Read HERE rather than in the sealer binary so that everything which reports
+/// against the window reports against the same number. The sealer applies it
+/// and the orchestrator's listing explains itself in terms of it; two readings
+/// would let the API name a threshold the sealer is not using, and the
+/// disagreement would show up as a recording the API says is about to seal
+/// that the sealer then leaves alone.
+pub fn configured_quiet_secs() -> u64 {
+    quiet_secs_from(std::env::var("DEJA_SEAL_QUIET_SECS").ok().as_deref())
+}
+
+/// [`configured_quiet_secs`] over a supplied value, so the parse is assertable
+/// without the process environment.
+///
+/// Anything unparseable is the default rather than zero: zero would seal every
+/// live recording as a prefix of itself, which is the one mistake that cannot
+/// be undone by a later pass.
+fn quiet_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_QUIET_SECS)
+}
+
 /// One recording as it exists in the landing area, discovered by listing.
 ///
 /// Held so a caller can name a recording instead of constructing a path to it.
@@ -1061,6 +1133,15 @@ pub struct LandedRecording {
     /// in the keys the scan lists.
     #[serde(default)]
     pub instances: Vec<String>,
+    /// When the newest object under this session was written, in unix seconds.
+    ///
+    /// `None` when the listing that built this row carried keys only. That is a
+    /// different fact from "written at the epoch" and from "quiet for zero
+    /// seconds", and it is kept apart from both: a reader deciding whether a
+    /// recording is still growing must not be handed a zero it cannot tell from
+    /// a measurement.
+    #[serde(default)]
+    pub newest_object_unix_secs: Option<i64>,
 }
 
 impl LandedRecording {
@@ -1069,6 +1150,100 @@ impl LandedRecording {
     pub fn latest_date(&self) -> Option<&str> {
         self.dates.last().map(String::as_str)
     }
+
+    /// Seconds since the newest object landed, against a clock the caller
+    /// supplies. `None` when the listing carried no write time.
+    ///
+    /// A clock behind the newest object reads as zero rather than as a negative
+    /// or a huge number, which is the same direction [`readiness_of`] errs in:
+    /// "still being written" leaves the recording alone, and that is the
+    /// recoverable mistake.
+    #[must_use]
+    pub fn quiet_for_secs(&self, now_unix_secs: i64) -> Option<u64> {
+        self.newest_object_unix_secs
+            .map(|at| now_unix_secs.saturating_sub(at).max(0) as u64)
+    }
+
+    /// Why no seal covers everything this recording has landed, or `None` when
+    /// one does.
+    ///
+    /// `sealed_objects` is the object count the existing manifest was built
+    /// from, or `None` for a recording with no manifest at all. The two cases
+    /// collapse here on purpose: a recording that grew past its seal has no
+    /// current seal either, which is exactly the condition
+    /// [`seal_decision`] re-seals on.
+    ///
+    /// This exists because "unsealed" was the whole answer a listing could
+    /// give, and it is the same word for two states an operator has to act on
+    /// differently. One is the steady state of a live recorder, which corrects
+    /// itself. The other is a recording that stopped being written and still
+    /// has no seal, which is either about to get one or has already been
+    /// refused one — a question for the sealer's ledger, and worth asking.
+    #[must_use]
+    pub fn seal_pending(
+        &self,
+        sealed_objects: Option<usize>,
+        quiet_after_secs: u64,
+        now_unix_secs: i64,
+    ) -> Option<SealPending> {
+        if sealed_objects.is_some_and(|sealed| seal_covers(sealed, self.objects)) {
+            return None;
+        }
+        let objects = self.objects;
+        let Some(quiet_for_secs) = self.quiet_for_secs(now_unix_secs) else {
+            return Some(SealPending::AgeUnknown { objects });
+        };
+        Some(if quiet_for_secs < quiet_after_secs {
+            SealPending::StillWriting {
+                quiet_for_secs,
+                quiet_after_secs,
+                objects,
+            }
+        } else {
+            SealPending::QuietButNotSealed {
+                quiet_for_secs,
+                quiet_after_secs,
+                objects,
+            }
+        })
+    }
+}
+
+/// Why a listed recording has no seal covering everything it has landed.
+///
+/// Tagged and flat for the same reason [`crate::pass::Outcome`] is: a reader
+/// switches on `reason` and every number it needs sits beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum SealPending {
+    /// Written to inside the quiet window. The sealer is correct to leave a
+    /// recording that is still growing — and will go on leaving it alone for as
+    /// long as it keeps being written to, however large it becomes. `objects`
+    /// is how far it has got, so a recording that has been in this state for
+    /// days is distinguishable from one that will seal on the next tick.
+    StillWriting {
+        quiet_for_secs: u64,
+        quiet_after_secs: u64,
+        objects: usize,
+    },
+    /// Quiet past the window and still not covered.
+    ///
+    /// Either the next pass will seal it or a pass has already refused it, and
+    /// which of those applies is NOT knowable from a listing: the sealer runs
+    /// on a schedule, so a recording that went quiet a moment ago may simply
+    /// not have been visited yet. The sealer's ledger row for it is what says
+    /// which — and that is the point of naming this state separately rather
+    /// than reporting it as merely unsealed, since it is the one that has a
+    /// ledger row worth reading behind it.
+    QuietButNotSealed {
+        quiet_for_secs: u64,
+        quiet_after_secs: u64,
+        objects: usize,
+    },
+    /// The listing carried no write time, so which of the two above applies is
+    /// not knowable from it. Named rather than guessed at, because guessing
+    /// either way states something that was never measured.
+    AgeUnknown { objects: usize },
 }
 
 /// Enumerate the recordings present under `root` (default `landing/v1`), by
@@ -1088,18 +1263,48 @@ impl LandedRecording {
 /// something a caller should have to know. Keys that match neither are ignored
 /// rather than guessed at.
 pub fn list_landed_recordings(cfg: &S3Config, root: &str) -> Result<Vec<LandedRecording>, String> {
-    Ok(index_landed_keys(root, &list_objects(cfg, root)?))
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    let objects = rt.block_on(list_landed(&store, root))?;
+    Ok(index_landed_objects(root, &objects))
 }
 
 /// The listing's parsing half, separated from its IO so the key shapes it must
 /// understand can be stated as examples rather than discovered in production.
 pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
+    let objects: Vec<LandedObject> = keys
+        .iter()
+        .map(|key| LandedObject {
+            key: key.clone(),
+            // No write time, not a zero one. `index_landed_objects` takes the
+            // maximum over a session's objects from this floor, so a listing
+            // built entirely from keys reports `None` rather than a date it
+            // invented.
+            modified_unix_secs: i64::MIN,
+        })
+        .collect();
+    index_landed_objects(root, &objects)
+}
+
+/// [`index_landed_keys`] over objects that carry their write times, so each
+/// recording also reports when it was last written to.
+///
+/// The two are one function because the key parsing is the part that has to
+/// understand both bucket layouts, and two copies of it would drift the first
+/// time a layout changed — which is the shape this crate's listing already got
+/// wrong once.
+pub fn index_landed_objects(root: &str, objects: &[LandedObject]) -> Vec<LandedRecording> {
     let root = root.trim_end_matches('/');
-    // (session, (dates, objects, instances)) — BTreeMaps/Sets so everything
-    // comes out sorted without a pass.
+    // (session, (dates, objects, instances, newest write)) — BTreeMaps/Sets so
+    // everything comes out sorted without a pass.
     #[allow(clippy::type_complexity)]
-    let mut found: BTreeMap<String, (BTreeSet<String>, usize, BTreeSet<String>)> = BTreeMap::new();
-    for key in keys {
+    let mut found: BTreeMap<String, (BTreeSet<String>, usize, BTreeSet<String>, i64)> =
+        BTreeMap::new();
+    for LandedObject {
+        key,
+        modified_unix_secs,
+    } in objects
+    {
         let Some(rest) = key.strip_prefix(root).map(|r| r.trim_start_matches('/')) else {
             continue;
         };
@@ -1120,7 +1325,9 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
             }
         }
         let Some(session) = session else { continue };
-        let entry = found.entry(session.to_owned()).or_default();
+        let entry = found
+            .entry(session.to_owned())
+            .or_insert_with(|| (BTreeSet::new(), 0, BTreeSet::new(), i64::MIN));
         if let Some(d) = date {
             entry.0.insert(d.to_owned());
         }
@@ -1128,11 +1335,12 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
         if let Some(inst) = instance {
             entry.2.insert(inst.to_owned());
         }
+        entry.3 = entry.3.max(*modified_unix_secs);
     }
 
     let mut out: Vec<LandedRecording> = found
         .into_iter()
-        .map(|(session_id, (dates, objects, instances))| {
+        .map(|(session_id, (dates, objects, instances, newest))| {
             let dates: Vec<String> = dates.into_iter().collect();
             // One partition: address it directly. Several (or none): address the
             // root, so a straddling session is ingested whole.
@@ -1147,6 +1355,11 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
                 prefix,
                 objects,
                 instances: instances.into_iter().collect(),
+                // `i64::MIN` is the sentinel a key-only listing leaves behind,
+                // and it is deliberately not a plausible timestamp: a reader
+                // that mistook it for one would compute an absurd age rather
+                // than quietly look recent.
+                newest_object_unix_secs: (newest != i64::MIN).then_some(newest),
             }
         })
         .collect();
@@ -1303,6 +1516,24 @@ impl SealReadiness {
             | SealReadiness::Quiesced { objects, .. } => *objects,
         }
     }
+
+    /// Seconds since the newest landing object, where that is known.
+    ///
+    /// `None` for `Absent`, which has nothing in the landing to have been
+    /// written at a time, and for `Complete`, which is terminal on the
+    /// producer's own end-of-stream marker rather than on the clock — a
+    /// finished recording is finished however long ago it finished. Both are
+    /// absences of a measurement and neither is a zero: a caller that rendered
+    /// them as zero would say "written this second" about a landing that holds
+    /// nothing.
+    #[must_use]
+    pub fn quiet_for_secs(&self) -> Option<u64> {
+        match self {
+            SealReadiness::Active { quiet_for_secs, .. }
+            | SealReadiness::Quiesced { quiet_for_secs, .. } => Some(*quiet_for_secs),
+            SealReadiness::Absent | SealReadiness::Complete { .. } => None,
+        }
+    }
 }
 
 /// What a sealing pass should do about one session.
@@ -1339,12 +1570,28 @@ pub enum SealDecision {
 /// Fewer or equal means nothing new, INCLUDING the case where the landing has
 /// been swept behind an existing seal (zero objects), which must not read as a
 /// reason to re-seal from nothing.
+/// Whether a seal built from `sealed_objects` already covers a landing of
+/// `landing_objects`.
+///
+/// One spelling of the rule, because two callers now answer the same question:
+/// the pass deciding whether to re-seal, and the listing explaining why a
+/// recording has no current seal. A second copy would let the API call a
+/// recording covered that the next pass re-seals, or the reverse.
+///
+/// Fewer or equal means nothing new, INCLUDING a landing swept behind an
+/// existing seal (zero objects), which must not read as a reason to re-seal
+/// from nothing.
+#[must_use]
+pub fn seal_covers(sealed_objects: usize, landing_objects: usize) -> bool {
+    landing_objects <= sealed_objects
+}
+
 pub fn seal_decision(
     existing: Option<&SessionManifest>,
     readiness: &SealReadiness,
 ) -> SealDecision {
     match existing {
-        Some(manifest) if readiness.objects() <= manifest.counts.landing_objects => {
+        Some(manifest) if seal_covers(manifest.counts.landing_objects, readiness.objects()) => {
             SealDecision::AlreadyCurrent {
                 sealed_objects: manifest.counts.landing_objects,
             }
@@ -1469,10 +1716,7 @@ async fn readiness_of(
         .map(|m| m.last_modified.timestamp())
         .max()
         .unwrap_or(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = now_unix_secs();
     // A clock skewed so the newest object is in the future reads as zero quiet
     // time, not as a huge one — erring towards "still active" leaves the
     // recording alone, which is the recoverable mistake.
@@ -2867,6 +3111,137 @@ mod tests {
 
     fn keys(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn landed(list: &[(&str, i64)]) -> Vec<LandedObject> {
+        list.iter()
+            .map(|(key, at)| LandedObject {
+                key: (*key).to_owned(),
+                modified_unix_secs: *at,
+            })
+            .collect()
+    }
+
+    /// The listing already holds every landing object's write time — it lists
+    /// `ObjectMeta` and then keeps only the key. Carrying the newest one is the
+    /// difference between a reader that can say how long a recording has been
+    /// growing and one that has to list the bucket again to find out.
+    ///
+    /// Asserted through serde, because this field's consumer is a JSON row.
+    #[test]
+    fn the_listing_carries_each_sessions_newest_write_time() {
+        let found = index_landed_objects(
+            "landing/v1",
+            &landed(&[
+                ("landing/v1/dt=2026-10-05/session=run-a/inst=r1/0.gz", 1_000),
+                ("landing/v1/dt=2026-10-05/session=run-a/inst=r1/1.gz", 1_700),
+                ("landing/v1/dt=2026-10-05/session=run-b/inst=r1/0.gz", 400),
+            ]),
+        );
+        let a = found.iter().find(|r| r.session_id == "run-a").unwrap();
+        assert_eq!(a.newest_object_unix_secs, Some(1_700));
+        assert_eq!(
+            serde_json::to_value(a).unwrap()["newest_object_unix_secs"],
+            1_700
+        );
+        // Age is derived from it against a clock the caller supplies, so the
+        // rule is assertable without waiting.
+        assert_eq!(a.quiet_for_secs(1_760), Some(60));
+        // A clock behind the newest object reads as zero quiet time rather than
+        // as an enormous one — the same direction `readiness_of` errs in.
+        assert_eq!(a.quiet_for_secs(1_000), Some(0));
+
+        let b = found.iter().find(|r| r.session_id == "run-b").unwrap();
+        assert_eq!(b.newest_object_unix_secs, Some(400));
+
+        // A caller that has only keys still gets a listing, and says so rather
+        // than claiming an age of zero.
+        let keyed = index_landed_keys(
+            "landing/v1",
+            &keys(&["landing/v1/dt=2026-10-05/session=run-a/inst=r1/0.gz"]),
+        );
+        assert_eq!(keyed[0].newest_object_unix_secs, None);
+        assert_eq!(keyed[0].quiet_for_secs(1_760), None);
+    }
+
+    /// An unsealed recording names WHICH of the reasons it can have applies.
+    ///
+    /// `sealed: false` with three null counts was the whole answer, and it
+    /// conflated the two states an operator has to tell apart: a recording that
+    /// is simply still being written, and one that stopped being written and
+    /// was not sealed anyway — which is a drop with a ledger row behind it.
+    #[test]
+    fn an_unsealed_recording_names_which_reason_applies() {
+        let found = index_landed_objects(
+            "landing/v1",
+            &landed(&[
+                ("landing/v1/dt=2026-10-05/session=live/inst=r1/0.gz", 9_000),
+                ("landing/v1/dt=2026-10-05/session=live/inst=r1/1.gz", 9_940),
+                ("landing/v1/dt=2026-10-05/session=stale/inst=r1/0.gz", 1_000),
+            ]),
+        );
+        let now = 10_000;
+        let live = found.iter().find(|r| r.session_id == "live").unwrap();
+        let stale = found.iter().find(|r| r.session_id == "stale").unwrap();
+
+        // Still inside the window: the sealer is right to leave it, and the
+        // row says for how long it has been left.
+        assert_eq!(
+            live.seal_pending(None, 120, now),
+            Some(SealPending::StillWriting {
+                quiet_for_secs: 60,
+                quiet_after_secs: 120,
+                objects: 2,
+            })
+        );
+        // Past the window and still uncovered: the sealer has had a pass at it
+        // and wrote nothing. A different fact, and the actionable one.
+        assert_eq!(
+            stale.seal_pending(None, 120, now),
+            Some(SealPending::QuietButNotSealed {
+                quiet_for_secs: 9_000,
+                quiet_after_secs: 120,
+                objects: 1,
+            })
+        );
+        // A seal that covers everything landed is not pending at all.
+        assert_eq!(stale.seal_pending(Some(1), 120, now), None);
+        // A seal shorter than the landing is: the recording grew past it, which
+        // is exactly the case `seal_decision` re-seals.
+        assert!(live.seal_pending(Some(1), 120, now).is_some());
+        // No write time: say so rather than imply an age.
+        assert_eq!(
+            index_landed_keys(
+                "landing/v1",
+                &keys(&["landing/v1/dt=2026-10-05/session=live/inst=r1/0.gz"])
+            )[0]
+            .seal_pending(None, 120, now),
+            Some(SealPending::AgeUnknown { objects: 1 })
+        );
+
+        // The reason is the row's discriminant, since a reader switches on it.
+        assert_eq!(
+            serde_json::to_value(live.seal_pending(None, 120, now).unwrap()).unwrap()["reason"],
+            "still_writing"
+        );
+    }
+
+    /// The window the sealer waits for is read in ONE place. The sealer binary
+    /// and the orchestrator both report against it, and two readings of
+    /// `DEJA_SEAL_QUIET_SECS` would let the API describe a threshold the sealer
+    /// is not applying.
+    #[test]
+    fn the_quiet_window_has_one_reading() {
+        assert_eq!(quiet_secs_from(None), DEFAULT_QUIET_SECS);
+        assert_eq!(quiet_secs_from(Some("120")), 120);
+        assert_eq!(quiet_secs_from(Some("  120  ")), 120);
+        assert_eq!(
+            quiet_secs_from(Some("banana")),
+            DEFAULT_QUIET_SECS,
+            "an unparseable window is the default, not zero — zero seals every \
+             live recording as a prefix of itself"
+        );
+        assert_eq!(quiet_secs_from(Some("")), DEFAULT_QUIET_SECS);
     }
 
     #[test]
