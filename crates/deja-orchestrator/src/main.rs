@@ -832,6 +832,54 @@ async fn v1_systems() -> Response {
     json_ok(serde_json::json!({ "systems": systems }))
 }
 
+/// The window and the clock one page of recordings is explained against.
+///
+/// Extracted from the handler for one reason: the CHOICE below is the whole
+/// point of reporting a readiness at all, and inside a handler that builds its
+/// JSON inline it was unreachable from a test. The library distinction between
+/// "declared" and "applied" is asserted in `deja-compactor`; that guarantee
+/// being covered says nothing about whether this caller selects the right half
+/// of it, and selecting the wrong half is the mistake that has already been
+/// made once.
+struct SealExplainer {
+    /// The window as declared to THIS process, which is usually not at all.
+    ///
+    /// `declared_quiet_secs`, never `configured_quiet_secs`.
+    /// `DEJA_SEAL_QUIET_SECS` is set on the sealing job, and a deployment has
+    /// no reason to set it on the orchestrator — in sandbox it is on the
+    /// CronJob's container and absent from the ConfigMap the orchestrator
+    /// reads. So `None` is the ordinary answer and is reported as null. The
+    /// applied reading would answer 900 here against a sealer running 120,
+    /// publishing a threshold nothing applies and letting a reader draw a
+    /// verdict from a number this process invented.
+    ///
+    /// Sharing one reading of the variable with the sealer makes the two agree
+    /// about what it SAYS. It cannot make a deployment set it in two places.
+    quiet_after_secs: Option<u64>,
+    now_unix_secs: i64,
+}
+
+impl SealExplainer {
+    fn from_env() -> Self {
+        Self {
+            quiet_after_secs: deja_compactor::declared_quiet_secs(),
+            now_unix_secs: deja_compactor::now_unix_secs(),
+        }
+    }
+
+    /// One recording's age and its reason for having no current seal.
+    fn explain(
+        &self,
+        r: &deja_compactor::LandedRecording,
+        sealed_objects: Option<usize>,
+    ) -> (Option<u64>, Option<deja_compactor::SealPending>) {
+        (
+            r.quiet_for_secs(self.now_unix_secs),
+            r.seal_pending(sealed_objects, self.quiet_after_secs, self.now_unix_secs),
+        )
+    }
+}
+
 async fn v1_available_recordings(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<AvailableQuery>,
@@ -953,6 +1001,9 @@ async fn v1_available_recordings(
     // correlations and "not counted yet" are different answers, and a picker that
     // rendered the second as the first would hide good recordings as empty ones.
     let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
+    // Resolved once per page, so every row is explained against one window and
+    // one instant.
+    let seal_explainer = SealExplainer::from_env();
     // The SCANNED bucket, not the deployment's default. The rows above came from
     // whichever bucket `scan_scope` resolved for the named system, so reading
     // their manifests from `from_env()` would look for a prism recording's seal
@@ -985,6 +1036,8 @@ async fn v1_available_recordings(
             // that difference should be one field rather than every reader
             // reimplementing the same two shapes.
             let identity = deja_orchestrator::parse_recording_id(&r.session_id);
+            let (r_quiet_for_secs, r_seal_pending) =
+                seal_explainer.explain(&r, manifest.map(|m| m.counts.landing_objects));
             // Which system minted the session. The `inst=` pod names are the
             // authoritative signal when the scan captured any (the UCS pods
             // carry the pattern below; router pods do not). The id SHAPE alone
@@ -1099,6 +1152,29 @@ async fn v1_available_recordings(
                 // vanish silently and readers would get a list or a number
                 // depending on which line came last.
                 "sealed_instances": manifest.map(|m| m.instances.len()),
+                // Why there is no seal covering everything this recording has
+                // landed, or null when there is one.
+                //
+                // `sealed: false` with three null counts was the whole answer,
+                // and it is the same answer for two states that have to be acted
+                // on differently: a recording that is simply still being written
+                // (the steady state of a live recorder, and self-correcting), and
+                // one that stopped being written and still has no seal, which is
+                // either about to get one or has already been refused one — a
+                // question for the sealer's ledger that a listing cannot settle
+                // but should at least raise. That verdict is what is new here;
+                // how far a growing recording has got is still `objects`, since
+                // an active row's age is bounded by the window by construction.
+                // Both numbers come off the listing this endpoint already did;
+                // nothing extra is read.
+                "seal_pending": r_seal_pending,
+                // Seconds since this recording's newest landing object, and the
+                // window a sealer would measure it against — null when this
+                // process was not told the window. Reported beside the verdict
+                // above rather than only inside it, so a sealed-and-current row
+                // still says how old it is.
+                "quiet_for_secs": r_quiet_for_secs,
+                "quiet_after_secs": seal_explainer.quiet_after_secs,
                 // Capture gaps: `global_sequence` ranges the recorder allocated
                 // whose events never reached the tape. Already computed at seal
                 // time and, until now, surfaced nowhere — it is the evidence the
@@ -4372,6 +4448,93 @@ mod tests {
             prefix: format!("landing/v1/dt={date}/session={session_id}"),
             objects: 1,
             instances: instances.iter().map(|s| (*s).to_owned()).collect(),
+            // These fixtures exercise ORDER and pod selection, neither of which
+            // reads a write time. Left absent rather than filled with a
+            // plausible one, so a rule that started depending on it would show
+            // up here as an unexplained `age_unknown` rather than pass on a
+            // number this test never meant to state.
+            newest_object_unix_secs: None,
+        }
+    }
+
+    // ---- why a listed recording has no seal ----
+
+    /// The endpoint reads the window the DEPLOYMENT DECLARED, not the one a
+    /// sealer would apply in its absence.
+    ///
+    /// The distinction itself is asserted in `deja-compactor`. This asserts the
+    /// SELECTION: which of the two readings this caller picks. They differ only
+    /// when the variable is unset, which is the deployed case — it is set on the
+    /// sealing job's container and absent from the ConfigMap the orchestrator
+    /// reads — so the applied reading answers 900 here while the sealer runs
+    /// 120, and every row would carry a threshold nothing is applying.
+    ///
+    /// Holds the bin's environment lock, because it both writes and reads the
+    /// one process environment and cargo runs these on parallel threads.
+    #[test]
+    fn the_listing_explains_a_recording_against_the_declared_window_only() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = std::env::var("DEJA_SEAL_QUIET_SECS").ok();
+
+        // A recording written a moment ago: inside any window a sealer applies,
+        // so the two readings give visibly different verdicts.
+        let fresh = |now: i64| deja_compactor::LandedRecording {
+            session_id: "rec-1".to_owned(),
+            dates: vec!["2026-10-05".to_owned()],
+            prefix: "landing/v1/dt=2026-10-05/session=rec-1".to_owned(),
+            objects: 7,
+            instances: vec!["i1".to_owned()],
+            newest_object_unix_secs: Some(now - 30),
+        };
+
+        std::env::remove_var("DEJA_SEAL_QUIET_SECS");
+        let unset = super::SealExplainer::from_env();
+        let (age, pending) = unset.explain(&fresh(unset.now_unix_secs), None);
+        assert_eq!(age, Some(30));
+        assert_eq!(
+            unset.quiet_after_secs, None,
+            "an undeclared window is reported as absent, never as the library default"
+        );
+        assert_eq!(
+            pending,
+            Some(deja_compactor::SealPending::ThresholdUnknown {
+                quiet_for_secs: 30,
+                objects: 7,
+            }),
+            "the applied reading would have judged this against 900 and called it \
+             still_writing — a verdict built from a number this process invented"
+        );
+
+        // Declared: the same recording is judged, and against the declared
+        // number rather than the default.
+        std::env::set_var("DEJA_SEAL_QUIET_SECS", "120");
+        let declared = super::SealExplainer::from_env();
+        assert_eq!(declared.quiet_after_secs, Some(120));
+        assert_eq!(
+            declared.explain(&fresh(declared.now_unix_secs), None).1,
+            Some(deja_compactor::SealPending::StillWriting {
+                quiet_for_secs: 30,
+                quiet_after_secs: 120,
+                objects: 7,
+            })
+        );
+        // And a window the recording is PAST, so the pinned number is the
+        // declared one and not merely any number that happens to be reported.
+        std::env::set_var("DEJA_SEAL_QUIET_SECS", "10");
+        let narrow = super::SealExplainer::from_env();
+        assert_eq!(
+            narrow.explain(&fresh(narrow.now_unix_secs), None).1,
+            Some(deja_compactor::SealPending::QuietButNotSealed {
+                quiet_for_secs: 30,
+                quiet_after_secs: 10,
+                objects: 7,
+            }),
+            "the declared window decides the verdict, not the default"
+        );
+
+        match restore {
+            Some(v) => std::env::set_var("DEJA_SEAL_QUIET_SECS", v),
+            None => std::env::remove_var("DEJA_SEAL_QUIET_SECS"),
         }
     }
 

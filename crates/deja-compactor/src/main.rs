@@ -22,16 +22,12 @@
 
 use deja_compactor::{S3Config, SealReadiness};
 
-/// How long a session must go unwritten before silence is taken for an ending.
-/// Must exceed the aggregator's flush interval, or the gap between two flushes
-/// of a live workload reads as a finished recording.
-const DEFAULT_QUIET_SECS: u64 = 900;
-
+/// The quiet window, read from the one place that reads it. It used to be read
+/// here, which left the orchestrator — which now explains an unsealed recording
+/// in terms of this window — with no way to name the number the sealer is
+/// actually applying.
 fn quiet_secs() -> u64 {
-    std::env::var("DEJA_SEAL_QUIET_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_QUIET_SECS)
+    deja_compactor::configured_quiet_secs()
 }
 
 /// The most DECOMPRESSED landing a single compaction may hold before it refuses
