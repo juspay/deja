@@ -495,6 +495,41 @@ export const api = {
     ),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
 
+  /** The pull request's acknowledgements, withdrawn ones included; 404 when
+   *  the run names no pull request. */
+  acknowledgements: (id: string) =>
+    request<{ github: GithubRef; acknowledgements: Acknowledgement[] }>(
+      `/api/v1/runs/${id}/acknowledgements`,
+    ),
+  /** Propose rows of this run's delta as intended. The server keys them by
+   *  shape, so the same shape in many requests is one acknowledgement. */
+  proposeAcknowledgements: (id: string, rows: DeltaAddress[], note: string) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<{ ids: number[] }>(`/api/v1/runs/${id}/acknowledgements`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Deja-Actor": who },
+      body: JSON.stringify({ rows, note }),
+    });
+  },
+  /** A second person confirms; the proposer's own confirmation is refused. */
+  confirmAcknowledgement: (ackId: number) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<{ ok: true }>(`/api/v1/acknowledgements/${ackId}/confirm`, {
+      method: "POST",
+      headers: { "X-Deja-Actor": who },
+    });
+  },
+  withdrawAcknowledgement: (ackId: number) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<{ ok: true }>(`/api/v1/acknowledgements/${ackId}`, {
+      method: "DELETE",
+      headers: { "X-Deja-Actor": who },
+    });
+  },
+
   createRun: (spec: Record<string, unknown>) => {
     const who = actor();
     if (!who) throw new Error("set your actor name first (top right)");
@@ -779,6 +814,48 @@ export type DeltaRow = {
   y: DeltaSide;
   blocking: boolean;
   lane?: { connector: string; flow: string } | null;
+  /** Laid over a charged row when the pull request has an acknowledgement
+   *  for its shape. Absent from an older server and on uncharged rows. */
+  acknowledgement?: RowAcknowledgement | null;
+};
+
+export type AcknowledgementState = "proposed" | "acknowledged" | "stale";
+
+export type RowAcknowledgement = {
+  id: number;
+  state: AcknowledgementState;
+  /** The confirmer when confirmed, else the proposer. */
+  by: string;
+  note: string;
+  /** The value differs from the one acknowledged; shown, not held against the row. */
+  value_changed: boolean;
+};
+
+/** The verdict once acknowledgements are counted. */
+export type EffectiveVerdict = "pass" | "acknowledged" | "fail";
+
+export type GithubRef = { repo: string; pr_number: number; head_sha: string; change_id?: string };
+
+/** One acknowledgement as stored: a shape of divergence on one pull request. */
+export type Acknowledgement = {
+  id: number;
+  repo: string;
+  pr_number: number;
+  change_id: string;
+  lane: { connector: string; flow: string } | null;
+  pattern:
+    | { kind: "call"; span_path: string; boundary: string; operation: string }
+    | { kind: "status" }
+    | { kind: "body"; json_path: string };
+  value_hash: string | null;
+  note: string;
+  origin_run_id: string;
+  proposed_by: string;
+  proposed_at: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  withdrawn_by: string | null;
+  withdrawn_at: string | null;
 };
 
 export type DeltaLane = {
@@ -814,6 +891,15 @@ export type Delta = {
     inherited_requests?: number;
     resolved_requests?: number;
     reason: string;
+    /** Blocking charged rows covered by a confirmed acknowledgement, by a
+     *  proposal only, or by one given on an earlier version of the change.
+     *  Absent from an older server. */
+    acknowledged?: number;
+    proposed?: number;
+    stale?: number;
+    /** What consumers gate on once acknowledgements count; absent when the
+     *  run names no pull request. */
+    effective?: EffectiveVerdict;
   };
   buckets: Partial<Record<DeltaBucket, number>>;
   lanes: DeltaLane[];
