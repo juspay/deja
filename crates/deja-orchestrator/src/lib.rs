@@ -368,6 +368,40 @@ pub fn system_env_var(system: &str, suffix: &str) -> String {
     format!("DEJA_{}_{suffix}", system.to_uppercase().replace('-', "_"))
 }
 
+/// The pull request a run was created for, as the pipeline knows it. `repo`
+/// is `owner/name`; `change_id` is the patch id of the pull request's own
+/// diff (merge-base to head), which a merge of main into the branch leaves
+/// alone and an author's push changes. Acknowledgements are keyed by the
+/// first two and go stale on the third.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubRef {
+    pub repo: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
+}
+
+impl GithubRef {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut parts = self.repo.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(o), Some(n), None) if !o.is_empty() && !n.is_empty() => {}
+            _ => return Err(format!("repo must be owner/name, got {:?}", self.repo)),
+        }
+        if self.pr_number == 0 {
+            return Err("pr_number must be positive".into());
+        }
+        if self.head_sha.len() < 7 || !self.head_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "head_sha must be a hex commit id, got {:?}",
+                self.head_sha
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     pub mode: RunMode,
@@ -443,6 +477,9 @@ pub struct RunSpec {
     /// the image tag; never parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The pull request this run was created for, when the pipeline says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRef>,
 }
 
 impl RunSpec {
@@ -559,6 +596,9 @@ pub struct RunParams {
     pub purpose: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The pull request this run was created for, when the pipeline says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRef>,
 }
 
 impl RunParams {
@@ -589,6 +629,7 @@ impl RunParams {
             delta_against: spec.delta_against.clone(),
             purpose: spec.purpose.clone(),
             label: spec.label.clone(),
+            github: spec.github.clone(),
         }
     }
 
@@ -1460,6 +1501,7 @@ mod run_params_tests {
     fn replay_spec() -> RunSpec {
         RunSpec {
             label: None,
+            github: None,
             delta_against: None,
             purpose: None,
             scored_span_namespaces: Vec::new(),

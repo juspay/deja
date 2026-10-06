@@ -35,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
@@ -246,6 +246,14 @@ fn app_router(state: AppState) -> Router {
     let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
     // Killing a run is a human action like creating one: same auth, and audited.
     let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
+    // Acknowledging a divergence is a human action, twice over: one person
+    // proposes, another confirms. Same auth as creating a run, and audited.
+    let propose_acknowledgements =
+        post(v1_propose_acknowledgements).route_layer(middleware::from_fn(require_human_auth));
+    let confirm_acknowledgement =
+        post(v1_confirm_acknowledgement).route_layer(middleware::from_fn(require_human_auth));
+    let withdraw_acknowledgement =
+        delete(v1_withdraw_acknowledgement).route_layer(middleware::from_fn(require_human_auth));
     // Push-back ingest: an out-of-process lifecycle runner (the k8s Job) reports
     // RunEvents here and authenticates with the service token (require_service_auth).
     let ingest_run_event = post(v1_ingest_run_event).route_layer(middleware::from_fn_with_state(
@@ -276,6 +284,12 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
         .route("/runs/{run_id}/tree", get(v1_tree))
         .route("/runs/{run_id}/delta", get(v1_delta))
+        .route(
+            "/runs/{run_id}/acknowledgements",
+            propose_acknowledgements.get(v1_list_acknowledgements),
+        )
+        .route("/acknowledgements/{id}/confirm", confirm_acknowledgement)
+        .route("/acknowledgements/{id}", withdraw_acknowledgement)
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit));
@@ -449,6 +463,11 @@ async fn v1_create_run(
     if let Some(against) = spec.delta_against.as_deref() {
         if let Err(e) = against.parse::<RunId>() {
             return error_resp(400, &format!("delta_against: {e}"));
+        }
+    }
+    if let Some(gh) = spec.github.as_ref() {
+        if let Err(e) = gh.validate() {
+            return error_resp(400, &format!("github: {e}"));
         }
     }
     let run = match runs::persist_new(&st.root, spec) {
@@ -2581,7 +2600,14 @@ async fn v1_delta(
         delta_between(&st, &id, &against).await
     };
     match result {
-        Ok(body) => json_ok(body),
+        Ok(mut body) => {
+            // The run's own delta is overlaid in delta_for_run; a pairing named
+            // by the query is overlaid here, as it is kept nowhere.
+            if declared.as_deref() != Some(&*against) {
+                overlay_acknowledgements(&st, &id, &mut body).await;
+            }
+            json_ok(body)
+        }
         Err(why) => json_ok(why.to_json()),
     }
 }
@@ -2655,10 +2681,18 @@ async fn delta_between(
 /// still coming from one that never will.
 fn delta_verdict_word(result: &Result<serde_json::Value, Unavailable>) -> &'static str {
     match result {
-        Ok(body) => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
-            Some(true) => "pass",
-            Some(false) => "fail",
-            None => "refused",
+        // The effective verdict, once acknowledgements are counted, is what
+        // the row says; a body the overlay has not seen falls back to the
+        // pure three-way.
+        Ok(body) => match body.pointer("/verdict/effective").and_then(|v| v.as_str()) {
+            Some("pass") => "pass",
+            Some("acknowledged") => "acknowledged",
+            Some("fail") => "fail",
+            _ => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
+                Some(true) => "pass",
+                Some(false) => "fail",
+                None => "refused",
+            },
         },
         // The run row keeps its four words; a tape mismatch is a refusal there.
         Err(Unavailable::TapeMismatch(_)) => "refused",
@@ -2691,7 +2725,10 @@ async fn delta_for_run(
         .await
         .ok()
         .flatten();
-        if let Some(doc) = cached {
+        if let Some(mut doc) = cached {
+            // The cache holds the pure three-way; the acknowledgements are laid
+            // over it on every read, so a confirmation shows at once.
+            overlay_acknowledgements(st, y_id, &mut doc).await;
             // The row is settled from the cache too: a column that was reset,
             // or never written because the store was away, catches up on the
             // next view rather than waiting for a recomputation.
@@ -2700,7 +2737,8 @@ async fn delta_for_run(
         }
     }
     let computed = delta_between(st, y_id, m_id).await;
-    record_delta_verdict(st, y_id, &computed).await;
+    // Cached before the overlay: the cache is a function of the two trees
+    // alone, and never of who has acknowledged what since.
     if let (Ok(body), Some(cache)) = (&computed, cache) {
         let text = body.to_string();
         let _ = tokio::task::spawn_blocking(move || {
@@ -2708,6 +2746,14 @@ async fn delta_for_run(
         })
         .await;
     }
+    let computed = match computed {
+        Ok(mut body) => {
+            overlay_acknowledgements(st, y_id, &mut body).await;
+            Ok(body)
+        }
+        Err(why) => Err(why),
+    };
+    record_delta_verdict(st, y_id, &computed).await;
     computed
 }
 
@@ -2757,6 +2803,303 @@ async fn settle_deltas_for(st: AppState, run_id: String) {
     for dependent in dependents {
         let _ = delta_for_run(&st, &dependent, &run_id).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Acknowledgements: a divergence a pull request introduces, accepted as
+// intended. The model and the overlay live in divergence::acknowledgement;
+// this is their store and their HTTP.
+// ---------------------------------------------------------------------------
+
+fn acknowledgement_from_row(
+    r: &deja_store::AcknowledgementRow,
+) -> Option<divergence::acknowledgement::Acknowledgement> {
+    use divergence::acknowledgement::{Acknowledgement, Key};
+    let lane = match &r.lane {
+        Some(v) if !v.is_null() => Some(serde_json::from_value(v.clone()).ok()?),
+        _ => None,
+    };
+    let pattern = serde_json::from_value(r.pattern.clone()).ok()?;
+    Some(Acknowledgement {
+        id: r.id,
+        key: Key { lane, pattern },
+        change_id: r.change_id.clone(),
+        value_hash: r.value_hash.clone(),
+        note: r.note.clone(),
+        proposed_by: r.proposed_by.clone(),
+        acknowledged_by: r.acknowledged_by.clone(),
+        withdrawn: r.withdrawn_at.is_some(),
+    })
+}
+
+/// The pull request a run was created for, as its params say.
+async fn github_of(st: &AppState, id: &str) -> Option<deja_orchestrator::GithubRef> {
+    run_params_for(st, id).await.and_then(|p| p.github)
+}
+
+fn pr_number_i64(gh: &deja_orchestrator::GithubRef) -> Option<i64> {
+    i64::try_from(gh.pr_number).ok()
+}
+
+/// Lay the pull request's acknowledgements over `body`, a delta of `y_id`,
+/// and settle its effective verdict. A run that names no pull request, or a
+/// store that is away, leaves the body as the pure three-way, whose verdict
+/// then has no `effective` and reads as pass or fail.
+async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_json::Value) {
+    let Some(gh) = github_of(st, y_id).await else {
+        return;
+    };
+    let (Some(store), Some(pr)) = (&st.store, pr_number_i64(&gh)) else {
+        return;
+    };
+    let rows = match store.acknowledgements_for_pull_request(&gh.repo, pr).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("deja-orchestrator: acknowledgements read failed for {y_id}: {e}");
+            return;
+        }
+    };
+    let acks: Vec<_> = rows.iter().filter_map(acknowledgement_from_row).collect();
+    let Ok(mut delta) = serde_json::from_value::<divergence::delta::Delta>(body.clone()) else {
+        return;
+    };
+    divergence::acknowledgement::apply(&mut delta, &acks, gh.change_id.as_deref());
+    body["rows"] = serde_json::to_value(&delta.rows).unwrap_or_default();
+    body["verdict"] = serde_json::to_value(&delta.verdict).unwrap_or_default();
+}
+
+/// Whether `actor` may confirm a proposal by `proposer`: a second person,
+/// and only that until sign-in gives deja a maintainers list to check
+/// against. Names are compared trimmed and case-insensitively, since they
+/// are typed.
+fn may_confirm(proposer: &str, actor: &str) -> bool {
+    !proposer.trim().eq_ignore_ascii_case(actor.trim())
+}
+
+/// After a confirmation or a withdrawal, every run of the pull request has
+/// its delta verdict re-stated, so the row's word and the delta agree.
+async fn restate_pull_request_verdicts(st: &AppState, repo: &str, pr: i64) {
+    let Some(store) = &st.store else {
+        return;
+    };
+    let Ok(runs) = store.runs_for_pull_request(repo, pr).await else {
+        return;
+    };
+    for run in runs {
+        if let Some(against) = run_params_for(st, &run).await.and_then(|p| p.delta_against) {
+            let _ = delta_for_run(st, &run, &against).await;
+        }
+    }
+}
+
+/// `GET /api/v1/runs/{id}/acknowledgements`: the pull request's
+/// acknowledgements, withdrawn ones included, with the pull request they
+/// belong to.
+async fn v1_list_acknowledgements(State(st): State<AppState>, id: RunId) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(gh) = github_of(&st, &id).await else {
+        return error_resp(
+            404,
+            "this run names no pull request; acknowledgements belong to one",
+        );
+    };
+    let Some(pr) = pr_number_i64(&gh) else {
+        return error_resp(400, "pr_number is out of range");
+    };
+    match store.acknowledgements_for_pull_request(&gh.repo, pr).await {
+        Ok(rows) => json_ok(serde_json::json!({ "github": gh, "acknowledgements": rows })),
+        Err(e) => error_resp(500, &format!("acknowledgements: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ProposeAcknowledgements {
+    /// Addresses of rows in this run's delta, as the delta lists them.
+    rows: Vec<divergence::behaviour_tree::Address>,
+    note: String,
+}
+
+/// `POST /api/v1/runs/{id}/acknowledgements`: propose rows of this run's
+/// delta as intended. Only rows the delta charges to this run can be
+/// proposed; the key stored is the row's pattern, not its address, so the
+/// proposal outlives this run and its recording.
+async fn v1_propose_acknowledgements(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    id: RunId,
+    body: axum::body::Bytes,
+) -> Response {
+    use divergence::acknowledgement::{Key, Pattern};
+    use divergence::delta::Side;
+
+    let req: ProposeAcknowledgements = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    let note = req.note.trim();
+    if note.is_empty() {
+        return error_resp(400, "note is required: say why the divergence is intended");
+    }
+    if req.rows.is_empty() {
+        return error_resp(400, "rows is empty: name at least one divergence");
+    }
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(gh) = github_of(&st, &id).await else {
+        return error_resp(
+            404,
+            "this run names no pull request; acknowledgements belong to one",
+        );
+    };
+    let Some(pr) = pr_number_i64(&gh) else {
+        return error_resp(400, "pr_number is out of range");
+    };
+    let Some(against) = run_params_for(&st, &id).await.and_then(|p| p.delta_against) else {
+        return error_resp(
+            400,
+            "this run names no baseline, so it has no delta to acknowledge",
+        );
+    };
+    let delta = match delta_for_run(&st, &id, &against).await {
+        Ok(body) => match serde_json::from_value::<divergence::delta::Delta>(body) {
+            Ok(d) => d,
+            Err(e) => return error_resp(500, &format!("delta: {e}")),
+        },
+        Err(why) => return error_resp(409, &format!("no delta to acknowledge: {}", why.to_json())),
+    };
+    let mut items: Vec<deja_store::NewAcknowledgement> = Vec::new();
+    let mut keys: Vec<Key> = Vec::new();
+    for address in &req.rows {
+        let Some(row) = delta
+            .rows
+            .iter()
+            .find(|r| r.address == *address && r.bucket.charges_y())
+        else {
+            return error_resp(
+                400,
+                &format!(
+                    "not a divergence this run is charged with: {}",
+                    serde_json::json!(address)
+                ),
+            );
+        };
+        let key = Key::of_row(row);
+        if keys.contains(&key) {
+            continue;
+        }
+        items.push(deja_store::NewAcknowledgement {
+            lane: row
+                .lane
+                .as_ref()
+                .map(|l| serde_json::to_value(l).unwrap_or_default()),
+            pattern: serde_json::to_value(Pattern::of(&row.address)).unwrap_or_default(),
+            value_hash: match &row.y {
+                Side::Hash(h) => Some(h.clone()),
+                _ => None,
+            },
+        });
+        keys.push(key);
+    }
+    let change_id = gh.change_id.clone().unwrap_or_default();
+    let ids = match store
+        .acknowledgements_propose(&gh.repo, pr, &change_id, &id, &actor.0, note, &items)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(e) => return error_resp(500, &format!("propose: {e}")),
+    };
+    let _ = store
+        .audit(
+            &actor.0,
+            "acknowledgement.propose",
+            "pull_request",
+            &format!("{}#{}", gh.repo, gh.pr_number),
+            &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
+        )
+        .await;
+    json_ok(serde_json::json!({ "ids": ids }))
+}
+
+/// `POST /api/v1/acknowledgements/{id}/confirm`: a second person accepts a
+/// proposal. The proposer cannot confirm their own.
+async fn v1_confirm_acknowledgement(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(ack_id): Path<i64>,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let row = match store.acknowledgement_get(ack_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(404, "no such acknowledgement"),
+        Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
+    };
+    if !may_confirm(&row.proposed_by, &actor.0) {
+        return error_resp(
+            403,
+            "a proposal is confirmed by someone other than its proposer",
+        );
+    }
+    if row.withdrawn_at.is_some() {
+        return error_resp(409, "this acknowledgement was withdrawn");
+    }
+    match store.acknowledgement_confirm(ack_id, &actor.0).await {
+        Ok(true) => {}
+        Ok(false) => return error_resp(409, "already confirmed"),
+        Err(e) => return error_resp(500, &format!("confirm: {e}")),
+    }
+    let _ = store
+        .audit(
+            &actor.0,
+            "acknowledgement.confirm",
+            "pull_request",
+            &format!("{}#{}", row.repo, row.pr_number),
+            &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
+        )
+        .await;
+    restate_pull_request_verdicts(&st, &row.repo, row.pr_number).await;
+    json_ok(serde_json::json!({ "ok": true }))
+}
+
+/// `DELETE /api/v1/acknowledgements/{id}`: withdraw a proposal or a
+/// confirmed acknowledgement. The row stays, marked, so the trail does.
+async fn v1_withdraw_acknowledgement(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(ack_id): Path<i64>,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let row = match store.acknowledgement_get(ack_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(404, "no such acknowledgement"),
+        Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
+    };
+    match store.acknowledgement_withdraw(ack_id, &actor.0).await {
+        Ok(true) => {}
+        Ok(false) => return error_resp(409, "already withdrawn"),
+        Err(e) => return error_resp(500, &format!("withdraw: {e}")),
+    }
+    let _ = store
+        .audit(
+            &actor.0,
+            "acknowledgement.withdraw",
+            "pull_request",
+            &format!("{}#{}", row.repo, row.pr_number),
+            &serde_json::json!({ "id": ack_id }),
+        )
+        .await;
+    restate_pull_request_verdicts(&st, &row.repo, row.pr_number).await;
+    json_ok(serde_json::json!({ "ok": true }))
 }
 
 /// The run's parameters: the live record on compose, the stored row on k8s.
@@ -3548,6 +3891,10 @@ mod tests {
         let computed = |pass| Ok(serde_json::json!({ "verdict": { "pass": pass } }));
         assert_eq!(delta_verdict_word(&computed(true)), "pass");
         assert_eq!(delta_verdict_word(&computed(false)), "fail");
+        // Once acknowledgements are counted, the effective word is the row's.
+        let overlaid =
+            Ok(serde_json::json!({ "verdict": { "pass": false, "effective": "acknowledged" } }));
+        assert_eq!(delta_verdict_word(&overlaid), "acknowledged");
         assert_eq!(
             delta_verdict_word(&Err(Unavailable::Pending(String::new()))),
             "pending"
@@ -3594,6 +3941,7 @@ mod tests {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -4880,5 +5228,17 @@ mod tests {
         );
 
         assert!(!super::from_main_deployment(&unknown, MAIN));
+    }
+}
+
+#[cfg(test)]
+mod acknowledgement_rules {
+    use super::may_confirm;
+
+    #[test]
+    fn a_proposer_does_not_confirm_their_own_proposal() {
+        assert!(!may_confirm("asha", "asha"));
+        assert!(!may_confirm(" Asha ", "asha"));
+        assert!(may_confirm("asha", "ravi"));
     }
 }

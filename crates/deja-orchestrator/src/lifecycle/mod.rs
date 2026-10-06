@@ -9395,6 +9395,7 @@ mod tests {
             run_id: "r1".into(),
             spec: RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -9471,6 +9472,7 @@ mod tests {
             run_id: "run-backstop".into(),
             spec: RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -10207,6 +10209,7 @@ mod tests {
             run_id: run_id.to_owned(),
             spec: RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -12198,6 +12201,7 @@ mod stage_timing {
             run_id: "run-timing".into(),
             spec: RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
