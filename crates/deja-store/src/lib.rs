@@ -170,6 +170,33 @@ pub struct AuditRow {
     pub params: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcknowledgementRow {
+    pub id: i64,
+    pub repo: String,
+    pub pr_number: i64,
+    pub change_id: String,
+    pub lane: Option<serde_json::Value>,
+    pub pattern: serde_json::Value,
+    pub value_hash: Option<String>,
+    pub note: String,
+    pub origin_run_id: String,
+    pub proposed_by: String,
+    pub proposed_at: DateTime<Utc>,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    pub withdrawn_by: Option<String>,
+    pub withdrawn_at: Option<DateTime<Utc>>,
+}
+
+/// One divergence to acknowledge: the row's key, and its value for display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewAcknowledgement {
+    pub lane: Option<serde_json::Value>,
+    pub pattern: serde_json::Value,
+    pub value_hash: Option<String>,
+}
+
 impl Store {
     /// Connect and run migrations. Errors are returned (the caller decides
     /// whether the store is mandatory).
@@ -227,6 +254,128 @@ impl Store {
                 params: r.get(6),
             })
             .collect())
+    }
+
+    // -- acknowledgements ----------------------------------------------------
+
+    /// Propose `items` as intended divergences of one pull request, in one
+    /// transaction, all with the same note and proposer. Returns the new ids
+    /// in the order given.
+    #[allow(clippy::too_many_arguments)] // one call per proposal, every column named
+    pub async fn acknowledgements_propose(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        change_id: &str,
+        origin_run_id: &str,
+        proposed_by: &str,
+        note: &str,
+        items: &[NewAcknowledgement],
+    ) -> Result<Vec<i64>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO acknowledgements
+                   (repo, pr_number, change_id, lane, pattern, value_hash, note,
+                    origin_run_id, proposed_by)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 RETURNING id",
+            )
+            .bind(repo)
+            .bind(pr_number)
+            .bind(change_id)
+            .bind(&item.lane)
+            .bind(&item.pattern)
+            .bind(&item.value_hash)
+            .bind(note)
+            .bind(origin_run_id)
+            .bind(proposed_by)
+            .fetch_one(&mut *tx)
+            .await?;
+            ids.push(id);
+        }
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    pub async fn acknowledgement_get(
+        &self,
+        id: i64,
+    ) -> Result<Option<AcknowledgementRow>, sqlx::Error> {
+        let row = sqlx::query(&format!("{ACK_SELECT} WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(ack_row))
+    }
+
+    /// Confirm a proposal. False when it was already confirmed or withdrawn:
+    /// the first decision stands, a second press changes nothing.
+    pub async fn acknowledgement_confirm(&self, id: i64, by: &str) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "UPDATE acknowledgements SET acknowledged_by = $2, acknowledged_at = now()
+             WHERE id = $1 AND acknowledged_at IS NULL AND withdrawn_at IS NULL",
+        )
+        .bind(id)
+        .bind(by)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// Withdraw a proposal or a confirmed acknowledgement. False when already
+    /// withdrawn. The row stays: who proposed, who confirmed and who withdrew
+    /// remain readable.
+    pub async fn acknowledgement_withdraw(&self, id: i64, by: &str) -> Result<bool, sqlx::Error> {
+        let n = sqlx::query(
+            "UPDATE acknowledgements SET withdrawn_by = $2, withdrawn_at = now()
+             WHERE id = $1 AND withdrawn_at IS NULL",
+        )
+        .bind(id)
+        .bind(by)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// Every acknowledgement of one pull request, withdrawn ones included,
+    /// oldest first. The caller decides what a withdrawn one means.
+    pub async fn acknowledgements_for_pull_request(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<AcknowledgementRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{ACK_SELECT} WHERE repo = $1 AND pr_number = $2 ORDER BY id"
+        ))
+        .bind(repo)
+        .bind(pr_number)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(ack_row).collect())
+    }
+
+    /// Every run created for one pull request (`params.github`), newest
+    /// first, whatever its state.
+    pub async fn runs_for_pull_request(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT run_id FROM replay_runs
+             WHERE params -> 'github' ->> 'repo' = $1
+               AND params -> 'github' ->> 'pr_number' = $2
+             ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .bind(pr_number.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
     // -- recordings ----------------------------------------------------------
@@ -692,6 +841,30 @@ impl Store {
             sha256: r.get(6),
             created_at: r.get(7),
         }))
+    }
+}
+
+const ACK_SELECT: &str = "SELECT id, repo, pr_number, change_id, lane, pattern, value_hash, note, \
+     origin_run_id, proposed_by, proposed_at, acknowledged_by, acknowledged_at, \
+     withdrawn_by, withdrawn_at FROM acknowledgements";
+
+fn ack_row(r: sqlx::postgres::PgRow) -> AcknowledgementRow {
+    AcknowledgementRow {
+        id: r.get(0),
+        repo: r.get(1),
+        pr_number: r.get(2),
+        change_id: r.get(3),
+        lane: r.get(4),
+        pattern: r.get(5),
+        value_hash: r.get(6),
+        note: r.get(7),
+        origin_run_id: r.get(8),
+        proposed_by: r.get(9),
+        proposed_at: r.get(10),
+        acknowledged_by: r.get(11),
+        acknowledged_at: r.get(12),
+        withdrawn_by: r.get(13),
+        withdrawn_at: r.get(14),
     }
 }
 
