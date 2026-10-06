@@ -118,7 +118,7 @@ pub fn bytes<const N: usize>(miss: &SubstituteMiss) -> [u8; N] {
     out
 }
 
-/// A deterministic UUID, formatted, in the **version 8** space.
+/// A deterministic UUID's sixteen bytes, in the **version 8** space.
 ///
 /// Version 8 is RFC 9562's "custom" space: real code produces v4 (random) or v7
 /// (time-ordered), so a synthesized uuid is STRUCTURALLY disjoint from anything
@@ -126,7 +126,7 @@ pub fn bytes<const N: usize>(miss: &SubstituteMiss) -> [u8; N] {
 /// rather than assumed — a synthesized id can never satisfy a downstream lookup
 /// keyed on a recorded one, so a false resync on fabricated data is impossible
 /// rather than unlikely.
-pub fn uuid_v8(miss: &SubstituteMiss) -> String {
+pub fn uuid_v8_bytes(miss: &SubstituteMiss) -> [u8; 16] {
     let hi = digest(miss, "uuid/hi").to_be_bytes();
     let lo = digest(miss, "uuid/lo").to_be_bytes();
     let mut b = [0u8; 16];
@@ -137,6 +137,17 @@ pub fn uuid_v8(miss: &SubstituteMiss) -> String {
     // space and buys the disjointness above.
     b[6] = (b[6] & 0x0f) | 0x80;
     b[8] = (b[8] & 0x3f) | 0x80;
+    b
+}
+
+/// The same UUID, formatted.
+///
+/// A host that wants its own `Uuid` builds it from [`uuid_v8_bytes`] rather than
+/// parsing this back: no parse to fail, no fallback to a nil value, and the
+/// hyphen-free rendering is then `as_simple()` instead of stripping characters
+/// out of a string.
+pub fn uuid_v8(miss: &SubstituteMiss) -> String {
+    let b = uuid_v8_bytes(miss);
     let hex = |r: &[u8]| {
         r.iter()
             .map(|byte| format!("{byte:02x}"))
@@ -251,24 +262,59 @@ impl SubstituteMiss {
     /// alphabet answers rather than panicking because this runs on the miss path,
     /// where a panic ends the correlation the arm exists to keep alive.
     pub fn over(&self, alphabet: &[char], length: usize) -> String {
-        // No symbols, no draw.
-        let Some(&first) = alphabet.first() else {
-            return String::new();
-        };
-        let Ok(span) = u64::try_from(alphabet.len()) else {
-            return String::new();
-        };
         // The alphabet goes in by its SYMBOLS, not its size. `length` carries no
         // `/`, so the two fields cannot run together whatever the symbols are.
         let alphabet_image: String = alphabet.iter().collect();
         let seed = digest(self, &format!("over/{length}/{alphabet_image}"));
-        positions(seed, length)
-            .map(|word| {
-                // `word % span` is below `alphabet.len()`, so neither fallback is
-                // reachable; they are here so no position can be dropped.
-                let pick = usize::try_from(word % span).unwrap_or(0);
-                alphabet.get(pick).copied().unwrap_or(first)
-            })
+        draw_over(alphabet, seed, length)
+    }
+
+    /// `length` characters over [`ALPHANUMERIC`].
+    ///
+    /// The shape most opaque-identifier generators promise. Folds the alphabet in
+    /// so no call site has to name it, and so no call site can name a different
+    /// one by accident; it is [`Self::over`] with that alphabet and shares its
+    /// domain, which is why it is independent of [`Self::digits`] at one miss —
+    /// the symbols differ, so the domains differ.
+    pub fn alphanumeric(&self, length: usize) -> String {
+        self.over(&ALPHANUMERIC, length)
+    }
+
+    /// `length` decimal digits, for a generator that promises only these.
+    pub fn digits(&self, length: usize) -> String {
+        self.over(&DIGITS, length)
+    }
+
+    /// `count` mutually distinct alphanumeric words of `length` characters.
+    ///
+    /// For a body that draws `count` INDEPENDENT values and returns them together
+    /// — recovery codes are the standing case. Calling a one-value shape `count`
+    /// times would answer with `count` copies, because a shape is a function of
+    /// the miss and the miss does not change between the draws. So this makes ONE
+    /// draw of `count * length` characters and carves it: positions within a draw
+    /// are independent, which is exactly the property wanted, and it keeps the
+    /// words from being prefixes of one another the way two draws of different
+    /// lengths would be.
+    ///
+    /// Its own domain, NOT a carve of [`Self::alphanumeric`] of the same total
+    /// width. Carving that would make `alphanumeric_words(1, n)` equal
+    /// `alphanumeric(n)`, and an arm using both would be handing back one value
+    /// twice while appearing to draw two.
+    ///
+    /// `length` of zero answers `count` empty words rather than an empty list:
+    /// the caller asked for that many words.
+    pub fn alphanumeric_words(&self, count: usize, length: usize) -> Vec<String> {
+        if length == 0 {
+            return vec![String::new(); count];
+        }
+        let seed = digest(self, &format!("words/{count}/{length}"));
+        let drawn: Vec<char> = draw_over(&ALPHANUMERIC, seed, count.saturating_mul(length))
+            .chars()
+            .collect();
+        drawn
+            .chunks(length)
+            .take(count)
+            .map(|chunk| chunk.iter().collect())
             .collect()
     }
 
@@ -300,6 +346,81 @@ impl SubstituteMiss {
             .collect()
     }
 
+    /// A deterministic `f64` in `[0, 1)`.
+    ///
+    /// The half-open range matters wherever this stands in for a roll against a
+    /// rollout percentage: a value of exactly `1.0` would fire a 100%-exclusive
+    /// branch the live generator can never reach.
+    pub fn unit_f64(&self) -> f64 {
+        // Via `u32` so the conversion is `f64::from`, lossless and total, rather
+        // than an `as` cast.
+        let span = f64::from(u32::MAX) + 1.0;
+        let draw = u32::try_from(digest(self, "unit_f64") >> 32).unwrap_or(0);
+        f64::from(draw) / span
+    }
+
+    /// A deterministic value in `min..=max`, inclusive, the way `gen_range` reads.
+    ///
+    /// The bounds are in the domain, not just the arithmetic. Without them a draw
+    /// in `0..=9` and a draw in `0..=99` at one miss would be one word reduced
+    /// twice, and the first would be the second's last digit.
+    ///
+    /// Computed in `i128` so a range spanning the whole of `i64` cannot overflow
+    /// on the way to being reduced. An empty or inverted range answers `min`,
+    /// which is the only value in it.
+    pub fn in_range(&self, min: i64, max: i64) -> i64 {
+        if min >= max {
+            return min;
+        }
+        let span = i128::from(max) - i128::from(min) + 1;
+        let draw = i128::from(digest(self, &format!("in_range/{min}/{max}"))) % span;
+        i64::try_from(i128::from(min) + draw).unwrap_or(min)
+    }
+
+    /// A deterministic index into `0..length`; `None` for an empty range, which
+    /// is what a live generator answers when there is nothing to pick.
+    ///
+    /// Its own domain, and that is the whole point of it being here: reduced from
+    /// a shared word, this and [`Self::in_range`] over `0..=length - 1` are the
+    /// SAME value at every miss, since both are that word modulo `length`. Two
+    /// shapes, one stream, and no reader of either could tell.
+    pub fn index(&self, length: usize) -> Option<usize> {
+        let span = u64::try_from(length).ok().filter(|n| *n > 0)?;
+        usize::try_from(digest(self, &format!("index/{length}")) % span).ok()
+    }
+
+    /// A deterministic permutation of `0..length`.
+    ///
+    /// Fisher-Yates driven by the miss, so the result is a genuine permutation —
+    /// every index present exactly once — rather than a sequence of independent
+    /// draws, which is what a caller's `shuffle` promises.
+    pub fn permutation(&self, length: usize) -> Vec<usize> {
+        let seed = digest(self, &format!("permutation/{length}"));
+        let words: Vec<u64> = positions(seed, length).collect();
+        let mut out: Vec<usize> = (0..length).collect();
+        for position in (1..length).rev() {
+            let (Some(word), Ok(span)) = (words.get(position), u64::try_from(position + 1)) else {
+                continue;
+            };
+            if let Ok(pick) = usize::try_from(word % span) {
+                out.swap(position, pick);
+            }
+        }
+        out
+    }
+
+    /// A deterministic `u32` for a seam standing in for an ambient numeric
+    /// identifier rather than for a value with a shape — a process id is the
+    /// standing case.
+    ///
+    /// Unlike the identifier shapes this carries no marker at all, because the
+    /// thing it replaces has no room for one. That is a reason to keep it to
+    /// seams nothing is keyed on.
+    pub fn opaque_u32(&self) -> u32 {
+        let word = digest(self, "opaque_u32").to_le_bytes();
+        u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+    }
+
     /// Nanoseconds since the Unix epoch for this miss, advancing with the
     /// occurrence at this call site.
     ///
@@ -316,6 +437,46 @@ impl SubstituteMiss {
     pub fn epoch_nanos(&self) -> i64 {
         monotonic(self, 0, CLOCK_STEP_NS)
     }
+}
+
+/// The 62 ASCII alphanumerics, lowercase before uppercase.
+///
+/// The common shape for an opaque identifier a service puts on the wire, and
+/// generic: it encodes no host's format, only "letters and digits, no
+/// punctuation". A caller whose alphabet differs — one that admits `-` and `_`,
+/// or excludes a confusable — passes its own to
+/// [`SubstituteMiss::over`](SubstituteMiss::over) instead.
+pub const ALPHANUMERIC: [char; 62] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+    'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B',
+    'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z',
+];
+
+/// Decimal digits, for the generators that promise only these.
+pub const DIGITS: [char; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+
+/// `length` symbols from `alphabet`, expanded from a seed that already carries
+/// the draw's domain.
+///
+/// Shared by the shapes that produce characters so the expansion exists once; the
+/// DOMAIN is each caller's own, which is what keeps two of them independent.
+fn draw_over(alphabet: &[char], seed: u64, length: usize) -> String {
+    // No symbols, no draw.
+    let Some(&first) = alphabet.first() else {
+        return String::new();
+    };
+    let Ok(span) = u64::try_from(alphabet.len()) else {
+        return String::new();
+    };
+    positions(seed, length)
+        .map(|word| {
+            // `word % span` is below `alphabet.len()`, so neither fallback is
+            // reachable; they are here so no position can be dropped.
+            let pick = usize::try_from(word % span).unwrap_or(0);
+            alphabet.get(pick).copied().unwrap_or(first)
+        })
+        .collect()
 }
 
 /// One word per position, from a seed that already carries the draw's domain.
@@ -383,6 +544,15 @@ mod tests {
         assert_eq!(a.over(&HEX, 12), b.over(&HEX, 12));
         assert_eq!(a.bytes_vec(12), b.bytes_vec(12));
         assert_eq!(a.epoch_nanos(), b.epoch_nanos());
+        assert_eq!(a.alphanumeric(12), b.alphanumeric(12));
+        assert_eq!(a.digits(12), b.digits(12));
+        assert_eq!(a.alphanumeric_words(3, 6), b.alphanumeric_words(3, 6));
+        assert_eq!(a.unit_f64(), b.unit_f64());
+        assert_eq!(a.in_range(-5, 5), b.in_range(-5, 5));
+        assert_eq!(a.index(10), b.index(10));
+        assert_eq!(a.permutation(8), b.permutation(8));
+        assert_eq!(a.opaque_u32(), b.opaque_u32());
+        assert_eq!(uuid_v8_bytes(&a), uuid_v8_bytes(&b));
     }
 
     /// Property 2, and the test that makes property 1 non-vacuous: a helper that
@@ -412,6 +582,14 @@ mod tests {
             assert_ne!(id(&base), id(other), "{label}");
             assert_ne!(base.over(&HEX, 12), other.over(&HEX, 12), "{label}");
             assert_ne!(base.bytes_vec(12), other.bytes_vec(12), "{label}");
+            assert_ne!(base.alphanumeric(12), other.alphanumeric(12), "{label}");
+            assert_ne!(
+                base.alphanumeric_words(3, 6),
+                other.alphanumeric_words(3, 6),
+                "{label}"
+            );
+            assert_ne!(base.opaque_u32(), other.opaque_u32(), "{label}");
+            assert_ne!(uuid_v8_bytes(&base), uuid_v8_bytes(other), "{label}");
         }
     }
 
@@ -566,6 +744,20 @@ mod tests {
         assert!(
             !long.starts_with(&short),
             "an 8-character draw is the head of a 40-character draw: {short} / {long}"
+        );
+
+        assert!(!m.alphanumeric(40).starts_with(&m.alphanumeric(8)));
+        assert!(!m.digits(40).starts_with(&m.digits(8)));
+        assert!(
+            !m.alphanumeric_words(4, 8)
+                .concat()
+                .starts_with(&m.alphanumeric_words(4, 4).concat()),
+            "widening a word draw rewrote the earlier words"
+        );
+        assert_ne!(
+            m.permutation(16)[..8],
+            m.permutation(8)[..],
+            "a shorter permutation is the head of a longer one"
         );
     }
 
@@ -771,6 +963,206 @@ mod tests {
         assert!(monotonic(&m, 0, i64::MAX) > 0, "must not wrap negative");
     }
 
+    /// THE pair this change exists for: a position in `0..10` and a draw in
+    /// `0..=9` must not be the same number.
+    ///
+    /// Reduced from a shared word they are byte-identical at EVERY miss, because
+    /// both are that word modulo ten — two shapes, one stream, and nothing in
+    /// either value shows it. So the assertion is over a set of misses and says
+    /// they do not agree everywhere: at one miss they agree about a tenth of the
+    /// time by chance, which is a coincidence and not the defect, and a
+    /// single-point test would be deciding this on the luck of one digest.
+    #[test]
+    fn an_index_and_a_range_draw_are_not_the_same_number() {
+        let agreements = (0..12)
+            .filter(|n| {
+                let m = miss(json!({"n": n}));
+                m.index(10).and_then(|at| i64::try_from(at).ok()) == Some(m.in_range(0, 9))
+            })
+            .count();
+        assert!(
+            agreements < 12,
+            "`index(10)` and `in_range(0, 9)` agreed at all 12 misses: they are \
+             one word reduced twice, not two shapes"
+        );
+    }
+
+    /// No two shapes at one miss may share a stream, pairwise, across every shape
+    /// this module offers.
+    ///
+    /// One test rather than a pair of assertions per shape: a per-shape test only
+    /// refutes the collisions its author thought of, and the defect this module
+    /// keeps meeting is two shapes that nobody thought to compare. Each output is
+    /// rendered to bytes and no rendering may be a prefix of another — equality
+    /// for the equal-length pairs, and the prefix relation for the rest, which is
+    /// the form a shared position-indexed stream actually takes.
+    ///
+    /// The ranges here are deliberately wide. A narrow one would collide by
+    /// chance often enough to make this flaky, which is why the narrow pair has
+    /// its own test above.
+    #[test]
+    fn no_two_shapes_at_one_miss_share_a_stream() {
+        let m = miss(json!({"key": "k1"}));
+        // One wide span shared by the index and the range draw, so a shared-word
+        // design makes them EQUAL here and this test fires on that pair too. A
+        // span of ten million leaves a chance collision at one in ten million,
+        // which is not a flake worth trading the coverage for.
+        let span = 10_000_000usize;
+        let rendered: Vec<(&str, Vec<u8>)> = vec![
+            ("u64", u64(&m).to_le_bytes().to_vec()),
+            ("bytes::<16>", bytes::<16>(&m).to_vec()),
+            ("uuid_v8_bytes", uuid_v8_bytes(&m).to_vec()),
+            ("id", id(&m).into_bytes()),
+            ("over(HEX, 16)", m.over(&HEX, 16).into_bytes()),
+            ("bytes_vec(16)", m.bytes_vec(16)),
+            ("alphanumeric(16)", m.alphanumeric(16).into_bytes()),
+            ("digits(16)", m.digits(16).into_bytes()),
+            (
+                "words(2, 8)",
+                m.alphanumeric_words(2, 8).concat().into_bytes(),
+            ),
+            ("unit_f64", m.unit_f64().to_le_bytes().to_vec()),
+            (
+                "in_range(0, span - 1)",
+                i64::try_from(span - 1)
+                    .map(|max| m.in_range(0, max))
+                    .unwrap_or(0)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                "index(span)",
+                m.index(span).unwrap_or(0).to_le_bytes().to_vec(),
+            ),
+            (
+                "permutation(16)",
+                m.permutation(16)
+                    .into_iter()
+                    .map(|at| u8::try_from(at).unwrap_or(u8::MAX))
+                    .collect(),
+            ),
+            ("opaque_u32", m.opaque_u32().to_le_bytes().to_vec()),
+        ];
+
+        for (i, (left_name, left)) in rendered.iter().enumerate() {
+            assert!(
+                !left.is_empty(),
+                "{left_name} rendered empty, which is a prefix of everything and \
+                 would make this test vacuous"
+            );
+            for (right_name, right) in rendered.iter().skip(i + 1) {
+                assert!(
+                    !left.starts_with(right) && !right.starts_with(left),
+                    "{left_name} and {right_name} share a stream at one miss: \
+                     {left:?} / {right:?}"
+                );
+            }
+        }
+    }
+
+    /// A word draw must not be a carve of the plain alphanumeric draw of the same
+    /// total width.
+    ///
+    /// The shortcut this refutes is real and tempting: carve
+    /// `alphanumeric(count * length)` instead of giving the words their own
+    /// domain. Then `alphanumeric_words(1, n)` IS `alphanumeric(n)`, and an arm
+    /// drawing a recovery code and an identifier from one miss hands back the
+    /// same characters twice while appearing to draw two values.
+    #[test]
+    fn a_word_draw_is_not_a_carve_of_the_plain_draw() {
+        let m = miss(json!({"key": "k1"}));
+        assert_ne!(
+            m.alphanumeric_words(1, 12).first().map(String::as_str),
+            Some(m.alphanumeric(12).as_str()),
+            "the single word is the plain draw"
+        );
+        assert_ne!(
+            m.alphanumeric_words(2, 8).concat(),
+            m.alphanumeric(16),
+            "the carve is the plain draw of the combined width"
+        );
+    }
+
+    /// The words of one draw must differ from each other, which is the whole
+    /// reason a caller asks for several.
+    #[test]
+    fn the_words_of_one_draw_differ_from_one_another() {
+        let words = miss(json!({"key": "k1"})).alphanumeric_words(8, 6);
+        let distinct: std::collections::BTreeSet<&String> = words.iter().collect();
+        assert_eq!(distinct.len(), words.len(), "repeated words: {words:?}");
+        assert!(words.iter().all(|w| w.chars().count() == 6), "{words:?}");
+    }
+
+    /// Each shape keeps the contract its caller reads off the live generator.
+    #[test]
+    fn the_numeric_shapes_stay_inside_their_promised_ranges() {
+        for n in 0..32 {
+            let m = miss(json!({"n": n}));
+
+            let unit = m.unit_f64();
+            assert!((0.0..1.0).contains(&unit), "{unit} outside [0, 1)");
+
+            let drawn = m.in_range(-5, 5);
+            assert!((-5..=5).contains(&drawn), "{drawn} outside -5..=5");
+            assert_eq!(m.in_range(7, 7), 7, "an empty range is its own only value");
+            assert_eq!(m.in_range(9, 2), 9, "an inverted range answers its min");
+            assert_eq!(
+                m.in_range(i64::MIN, i64::MAX).clamp(i64::MIN, i64::MAX),
+                m.in_range(i64::MIN, i64::MAX),
+                "a whole-i64 range must not overflow on the way to being reduced"
+            );
+
+            assert_eq!(m.index(0), None, "an empty range has no index");
+            assert!(m.index(10).is_some_and(|at| at < 10), "{:?}", m.index(10));
+
+            let permuted = m.permutation(16);
+            let seen: std::collections::BTreeSet<usize> = permuted.iter().copied().collect();
+            assert_eq!(seen.len(), 16, "not a permutation: {permuted:?}");
+            assert_eq!(seen.into_iter().next_back(), Some(15), "{permuted:?}");
+
+            assert!(m.digits(8).chars().all(|c| c.is_ascii_digit()), "{n}");
+            assert!(
+                m.alphanumeric(8).chars().all(|c| c.is_ascii_alphanumeric()),
+                "{n}"
+            );
+        }
+    }
+
+    /// A permutation of a non-trivial length must actually move something.
+    ///
+    /// Without this, a `permutation` that ignored its words would return
+    /// `0..length` in order and satisfy every assertion above: it is a genuine
+    /// permutation, every index present exactly once.
+    #[test]
+    fn a_permutation_is_not_the_identity() {
+        let permuted = miss(json!({"key": "k1"})).permutation(16);
+        assert_ne!(
+            permuted,
+            (0..16).collect::<Vec<usize>>(),
+            "the identity is a permutation and tells a caller nothing"
+        );
+    }
+
+    /// The bytes and the rendering are one value, so a host can build its own
+    /// `Uuid` from the bytes instead of parsing the string back.
+    ///
+    /// This is also the proof that extracting the byte construction out of
+    /// [`uuid_v8`] did not move what [`uuid_v8`] returns.
+    #[test]
+    fn the_uuid_bytes_and_the_uuid_rendering_are_one_value() {
+        let m = miss(json!({"key": "k1"}));
+        let hex: String = uuid_v8_bytes(&m)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(uuid_v8(&m).replace('-', ""), hex);
+        assert_eq!(
+            uuid_v8_bytes(&m)[6] >> 4,
+            8,
+            "the version nibble lives in the bytes, not only in the rendering"
+        );
+    }
+
     /// Every synthesized value, pinned to the byte for one fully specified miss.
     ///
     /// Determinism within one build is not the property that matters here. Two
@@ -817,5 +1209,30 @@ mod tests {
         assert_eq!(m.bytes_vec(5), [84, 173, 42, 128, 211]);
 
         assert_eq!(m.epoch_nanos(), 2_000_000);
+
+        assert_eq!(m.alphanumeric(12), "Pmcr7e3kMC4T");
+        assert_eq!(m.digits(10), "7777742863");
+        assert_eq!(m.alphanumeric_words(3, 6), ["x1z6lY", "EXuhpl", "qfSuG5"]);
+        // The bits rather than a decimal literal: the value is exact (an integer
+        // over a power of two), and pinning the bits cannot be defeated by how
+        // the literal is spelled.
+        assert_eq!(m.unit_f64().to_bits(), 0x3fd8_3573_8440_0000);
+        assert_eq!(m.permutation(8), [2, 1, 0, 4, 6, 7, 3, 5]);
+        assert_eq!(m.opaque_u32(), 501_387_581);
+        assert_eq!(
+            uuid_v8_bytes(&m),
+            [42, 64, 187, 138, 119, 27, 131, 158, 163, 217, 96, 229, 1, 38, 14, 96]
+        );
+
+        // The pair this change exists for, pinned at two widths. At the narrow
+        // one they happen to agree, which is what a tenth of all misses look like
+        // and is why `an_index_and_a_range_draw_are_not_the_same_number` asks
+        // across misses rather than at one. At the wide one the independence is
+        // visible in the literals.
+        assert_eq!(m.in_range(0, 9), 1);
+        assert_eq!(m.index(10), Some(1));
+        assert_eq!(m.in_range(0, 9_999), 2_606);
+        assert_eq!(m.index(10_000), Some(5_441));
+        assert_eq!(m.in_range(-5, 5), -1);
     }
 }
