@@ -282,7 +282,7 @@ impl Store {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  RETURNING id",
             )
-            .bind(repo)
+            .bind(repo.to_ascii_lowercase())
             .bind(pr_number)
             .bind(change_id)
             .bind(&item.lane)
@@ -342,7 +342,9 @@ impl Store {
     }
 
     /// Every acknowledgement of one pull request, withdrawn ones included,
-    /// oldest first. The caller decides what a withdrawn one means.
+    /// oldest first. The caller decides what a withdrawn one means. The
+    /// repository is matched in lower case, as it is written: GitHub names
+    /// are case-insensitive.
     pub async fn acknowledgements_for_pull_request(
         &self,
         repo: &str,
@@ -351,28 +353,33 @@ impl Store {
         let rows = sqlx::query(&format!(
             "{ACK_SELECT} WHERE repo = $1 AND pr_number = $2 ORDER BY id"
         ))
-        .bind(repo)
+        .bind(repo.to_ascii_lowercase())
         .bind(pr_number)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(ack_row).collect())
     }
 
-    /// Every run created for one pull request (`params.github`), newest
-    /// first, whatever its state.
+    /// The newest `limit` runs created for one pull request
+    /// (`params.github`), whatever their state. The repository is matched as
+    /// run creation stores it, in lower case, so the expression index on the
+    /// raw value is still the one used.
     pub async fn runs_for_pull_request(
         &self,
         repo: &str,
         pr_number: i64,
+        limit: i64,
     ) -> Result<Vec<String>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT run_id FROM replay_runs
              WHERE params -> 'github' ->> 'repo' = $1
                AND params -> 'github' ->> 'pr_number' = $2
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC
+             LIMIT $3",
         )
-        .bind(repo)
+        .bind(repo.to_ascii_lowercase())
         .bind(pr_number.to_string())
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.get(0)).collect())
