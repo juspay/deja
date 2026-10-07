@@ -108,7 +108,11 @@ pub fn exchange_code(
         q(client_secret),
         q(redirect_uri)
     );
-    let resp = ureq::post(&e.token)
+    // Through the forward proxy when one is configured: the orchestrator's
+    // only other outbound call goes the same way, and a sealed cluster has no
+    // direct route to Google.
+    let resp = crate::codebundle::tarball_agent()
+        .post(&e.token)
         .set("content-type", "application/x-www-form-urlencoded")
         .timeout(Duration::from_secs(10))
         .send_string(&body);
@@ -160,7 +164,8 @@ impl Verifier {
     }
 
     fn fetch(&self) -> Result<JwkSet, String> {
-        let text = ureq::get(&self.jwks_url)
+        let text = crate::codebundle::tarball_agent()
+            .get(&self.jwks_url)
             .timeout(Duration::from_secs(10))
             .call()
             .map_err(|e| format!("fetching Google's signing keys: {e}"))?
