@@ -37,7 +37,11 @@ pub struct AuthConfig {
     pub enabled: bool,
     pub client_id: String,
     pub client_secret: String,
+    /// Signs the cookies. Required when enabled.
+    pub session_secret: String,
     pub session_duration: Duration,
+    /// Whether the cookies carry `Secure`. Default true.
+    pub cookie_secure: bool,
     /// Lowercased suffixes.
     pub domains: Vec<String>,
     pub default_role: String,
@@ -51,7 +55,9 @@ impl Default for AuthConfig {
             enabled: false,
             client_id: String::new(),
             client_secret: String::new(),
+            session_secret: String::new(),
             session_duration: DEFAULT_SESSION,
+            cookie_secure: true,
             domains: vec![DEFAULT_DOMAIN.to_owned()],
             default_role: DEFAULT_ROLE.to_owned(),
             roles: BTreeMap::new(),
@@ -73,6 +79,13 @@ impl AuthConfig {
             .map(|d| d.trim().to_ascii_lowercase())
             .filter(|d| !d.is_empty())
             .collect();
+        // A suffix without its `@` is a different rule from the one the key
+        // names: `juspay.in` would admit `x@notjuspay.in`.
+        if let Some(bad) = domains.iter().find(|d| !d.starts_with('@')) {
+            return Err(format!(
+                "auth.domain_allowlist entries are email suffixes starting with '@', got {bad:?}"
+            ));
+        }
         let roles = s
             .roles
             .iter()
@@ -95,7 +108,14 @@ impl AuthConfig {
                 .unwrap_or_default()
                 .trim()
                 .to_owned(),
+            session_secret: s
+                .session_secret
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
             session_duration,
+            cookie_secure: s.cookie_secure.unwrap_or(true),
             domains: if domains.is_empty() {
                 vec![DEFAULT_DOMAIN.to_owned()]
             } else {
@@ -108,8 +128,15 @@ impl AuthConfig {
                 .unwrap_or_else(|| DEFAULT_ROLE.to_owned()),
             roles,
         };
-        if cfg.enabled && (cfg.client_id.is_empty() || cfg.client_secret.is_empty()) {
-            return Err("auth.enabled needs auth.client_id and auth.client_secret".to_owned());
+        if cfg.enabled
+            && (cfg.client_id.is_empty()
+                || cfg.client_secret.is_empty()
+                || cfg.session_secret.is_empty())
+        {
+            return Err(
+                "auth.enabled needs auth.client_id, auth.client_secret and auth.session_secret"
+                    .to_owned(),
+            );
         }
         Ok(cfg)
     }
@@ -170,31 +197,29 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    /// From the declared settings. A configuration that does not parse keeps
-    /// sign-in off and says why, rather than taking the server down.
-    pub fn from_settings() -> (Arc<Self>, Option<String>) {
-        let (cfg, warn) = match settings::load() {
-            Ok(s) => match s.auth.as_ref().map(AuthConfig::from_settings) {
-                None => (AuthConfig::default(), None),
-                Some(Ok(cfg)) => (cfg, None),
-                Some(Err(e)) => (AuthConfig::default(), Some(e)),
-            },
-            Err(e) => (AuthConfig::default(), Some(e)),
+    /// From the declared settings. No `[auth]` block is sign-in off. A block
+    /// that is declared and does not resolve — a secret that failed to mount,
+    /// a duration that does not parse — is an error the caller must refuse
+    /// to start on: silently running without the gate the deployment asked
+    /// for would reopen every route to a typed name.
+    pub fn from_settings() -> Result<Arc<Self>, String> {
+        let s = settings::load().map_err(|e| format!("settings: {e}"))?;
+        let cfg = match s.auth.as_ref() {
+            None => AuthConfig::default(),
+            Some(a) => AuthConfig::from_settings(a).map_err(|e| format!("[auth]: {e}"))?,
         };
-        let secret = settings::load()
-            .ok()
-            .and_then(|s| s.auth)
-            .and_then(|a| a.session_secret)
-            .unwrap_or_default();
-        let signer = session::Signer::new(secret.trim().as_bytes());
+        let signer = if cfg.enabled {
+            session::Signer::new(cfg.session_secret.as_bytes())
+        } else {
+            session::Signer::quiet_random()
+        };
         let verifier = google::Verifier::new(cfg.client_id.clone(), google::Endpoints::default());
-        let state = Arc::new(Self {
+        Ok(Arc::new(Self {
             config: RwLock::new(cfg),
             signer,
             verifier,
             endpoints: google::Endpoints::default(),
-        });
-        (state, warn)
+        }))
     }
 
     /// Sign-in off, with nothing configured: what a deployment without an
@@ -232,11 +257,18 @@ impl AuthState {
 
     /// Re-read the lists and the switch. The client id is not swapped, since
     /// the verifier was built for it; a changed client id needs a restart,
-    /// which a changed secret does anyway.
+    /// which a changed secret does anyway. A document that no longer carries
+    /// the block while sign-in is on is refused, the last good configuration
+    /// kept: a gate is never lowered by a half-written file or a remount.
     pub fn reload(&self) -> Result<(), String> {
         let s = settings::load()?;
         let next = match s.auth.as_ref() {
             Some(a) => AuthConfig::from_settings(a)?,
+            None if self.enabled() => {
+                return Err(
+                    "the [auth] block is gone from the settings while sign-in is on".to_owned(),
+                )
+            }
             None => AuthConfig::default(),
         };
         if let Ok(mut cur) = self.config.write() {
@@ -245,6 +277,7 @@ impl AuthState {
             cur.default_role = next.default_role;
             cur.roles = next.roles;
             cur.session_duration = next.session_duration;
+            cur.cookie_secure = next.cookie_secure;
         }
         Ok(())
     }
@@ -278,6 +311,7 @@ mod tests {
             client_secret: Some("sec".into()),
             session_secret: Some("k".into()),
             session_duration: Some("12h".into()),
+            cookie_secure: None,
             domain_allowlist: Some(vec!["@juspay.in".into()]),
             default_role: None,
             roles: roles
@@ -313,6 +347,29 @@ mod tests {
         assert_eq!(cfg.roles_for("asha@juspay.in"), vec!["viewer"]);
         assert!(cfg.has_role("RAVI@juspay.in", ROLE_MAINTAINER));
         assert!(!cfg.has_role("asha@juspay.in", ROLE_MAINTAINER));
+    }
+
+    #[test]
+    fn an_allowlist_entry_is_a_suffix_with_its_at_sign() {
+        let mut s = settings(&[]);
+        s.domain_allowlist = Some(vec!["juspay.in".into()]);
+        let err = AuthConfig::from_settings(&s).err().unwrap_or_default();
+        assert!(err.contains("'@'"), "{err}");
+        s.domain_allowlist = Some(vec!["@juspay.in".into(), " @Example.com ".into()]);
+        let cfg = AuthConfig::from_settings(&s).unwrap();
+        assert!(cfg.domain_allowed("x@example.com"));
+        assert!(!cfg.domain_allowed("x@notjuspay.in"));
+    }
+
+    #[test]
+    fn enabling_needs_a_session_secret_and_the_cookie_is_secure_unless_said() {
+        let mut s = settings(&[]);
+        assert!(AuthConfig::from_settings(&s).unwrap().cookie_secure);
+        s.cookie_secure = Some(false);
+        assert!(!AuthConfig::from_settings(&s).unwrap().cookie_secure);
+        s.session_secret = Some("  ".into());
+        let err = AuthConfig::from_settings(&s).err().unwrap_or_default();
+        assert!(err.contains("session_secret"), "{err}");
     }
 
     #[test]

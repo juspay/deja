@@ -36,6 +36,10 @@ impl Default for Endpoints {
 /// What the ID token says about the person.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Claims {
+    /// Google's stable id for the account. The email can be renamed or
+    /// reassigned; this cannot, so it is what a decision is recorded under.
+    #[serde(default)]
+    pub sub: String,
     pub email: Option<String>,
     #[serde(default)]
     pub email_verified: bool,

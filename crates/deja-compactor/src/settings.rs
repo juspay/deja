@@ -57,13 +57,19 @@ pub struct AuthSettings {
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
-    /// Signs the session cookie. Empty: a random key per process, so sessions
-    /// do not survive a restart.
+    /// Signs the session cookie. Required when sign-in is on: a random key
+    /// per process would sign people out on every restart and, with two
+    /// replicas, on every other request.
     #[serde(default)]
     pub session_secret: Option<String>,
     /// `24h`, `30m`, `7d`. Default a day.
     #[serde(default)]
     pub session_duration: Option<String>,
+    /// Whether the cookies carry `Secure`, so a browser sends them over https
+    /// only. Default true; false is for a development server on plain http.
+    /// Not derived from the request: that would be a header the proxy sets.
+    #[serde(default)]
+    pub cookie_secure: Option<bool>,
     /// Email suffixes allowed to sign in. Default `@juspay.in`.
     #[serde(default, deserialize_with = "list_or_csv")]
     pub domain_allowlist: Option<Vec<String>>,

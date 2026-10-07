@@ -121,6 +121,13 @@ impl MutationAuth {
 #[derive(Clone, Debug)]
 struct AuthenticatedActor(String);
 
+/// The sign-in issuer's stable id for the actor, beside the name: set by
+/// `require_session` from the session cookie, `None` for a typed name or the
+/// pipeline's token. What a decision is recorded under, since an email can
+/// be renamed or handed to someone else.
+#[derive(Clone, Debug)]
+struct ActorSubject(Option<String>);
+
 #[tokio::main]
 async fn main() {
     // rustls 0.23 refuses to auto-select a CryptoProvider when both aws-lc-rs
@@ -181,10 +188,19 @@ async fn main() {
             None
         }
     };
-    let (auth, auth_warning) = deja_orchestrator::auth::AuthState::from_settings();
-    if let Some(w) = auth_warning {
-        eprintln!("deja-orchestrator: sign-in is off, the [auth] block could not be used: {w}");
-    }
+    // A declared [auth] block that does not resolve is a refusal to start,
+    // not a warning: running without the gate the deployment asked for would
+    // reopen the acknowledgement routes to a typed name, and the only trace
+    // would be one line here that nobody reads.
+    let auth = match deja_orchestrator::auth::AuthState::from_settings() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "deja-orchestrator: refusing to start, sign-in is declared but unusable: {e}"
+            );
+            std::process::exit(2);
+        }
+    };
     if auth.enabled() {
         let cfg = auth.config();
         eprintln!(
@@ -453,20 +469,30 @@ async fn require_session(
             Some(expected) if service_token_matches(expected, supplied) => {
                 req.extensions_mut()
                     .insert(AuthenticatedActor("svc:pipeline".to_owned()));
+                req.extensions_mut().insert(ActorSubject(None));
                 next.run(req).await
             }
             _ => error_resp(401, "invalid bearer token"),
         };
     }
     if let Some(session) = session_from_headers(&st, req.headers()) {
+        // The domain gate again, not only at login: an account moved out of
+        // the allowed domains is out as soon as the list changes, not when
+        // its cookie expires.
+        if !st.auth.config().domain_allowed(&session.email) {
+            return error_resp(401, "this account is no longer allowed to sign in");
+        }
         req.extensions_mut()
             .insert(AuthenticatedActor(session.email));
+        req.extensions_mut()
+            .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
         return next.run(req).await;
     }
     if !st.auth.enabled() {
         return match actor_from_headers(req.headers()) {
             Some(actor) => {
                 req.extensions_mut().insert(AuthenticatedActor(actor));
+                req.extensions_mut().insert(ActorSubject(None));
                 next.run(req).await
             }
             None => error_resp(401, "X-Deja-Actor header required for mutating requests"),
@@ -558,7 +584,7 @@ async fn auth_login_start(
             auth::STATE_COOKIE,
             &cookie,
             Some(session::STATE_MAX_AGE.as_secs()),
-            scheme == "https",
+            cfg.cookie_secure,
         )],
     )
 }
@@ -577,7 +603,7 @@ async fn auth_callback(
         return error_resp(404, "sign-in is not configured on this deployment");
     }
     let (scheme, host) = request_origin(&headers);
-    let secure = scheme == "https";
+    let secure = cfg.cookie_secure;
     let clear_state = set_cookie(auth::STATE_COOKIE, "", Some(0), secure);
     let fail = |code: &str| {
         redirect_with_cookies(
@@ -634,10 +660,13 @@ async fn auth_callback(
         eprintln!("deja-orchestrator: sign-in refused: account not in the allowed domains");
         return fail("domain");
     }
-    let session =
-        st.auth
-            .signer
-            .new_session(&email, &claims.name, &claims.picture, cfg.session_duration);
+    let session = st.auth.signer.new_session(
+        &claims.sub,
+        &email,
+        &claims.name,
+        &claims.picture,
+        cfg.session_duration,
+    );
     let cookie = st.auth.signer.sign_session(&session);
     if let Some(store) = &st.store {
         let _ = store
@@ -665,14 +694,13 @@ async fn auth_callback(
 }
 
 /// `POST /auth/logout`: forget the session.
-async fn auth_logout(headers: HeaderMap) -> Response {
-    let (scheme, _) = request_origin(&headers);
+async fn auth_logout(State(st): State<AppState>) -> Response {
     let mut r = json_ok(serde_json::json!({ "ok": true }));
     let cleared = set_cookie(
         deja_orchestrator::auth::SESSION_COOKIE,
         "",
         Some(0),
-        scheme == "https",
+        st.auth.config().cookie_secure,
     );
     if let Ok(v) = cleared.parse() {
         r.headers_mut().insert(header::SET_COOKIE, v);
@@ -3206,15 +3234,49 @@ fn may_confirm(proposer: &str, actor: &str) -> bool {
     !proposer.trim().eq_ignore_ascii_case(actor.trim())
 }
 
-/// The rule once sign-in is on: a maintainer, and not the proposer. Off, the
-/// second-person rule alone, as before.
+/// Why a confirmation is refused, in the words the person sees.
+fn confirm_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer: &str,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return (!may_confirm(proposer, actor))
+            .then_some("a proposal is confirmed by someone other than its proposer");
+    }
+    // The epoch: a proposal from before sign-in carries no subject, and a
+    // typed name cannot be told from the signed-in person who typed it. It
+    // has to be proposed again by someone who is signed in.
+    let Some(proposer_sub) = proposer_sub.filter(|s| !s.is_empty()) else {
+        return Some("this was proposed before sign-in; propose it again, signed in");
+    };
+    if !cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return Some("only a maintainer may acknowledge");
+    }
+    // Same person under two emails is still one person: compare the subject
+    // when both sides have one, the email otherwise.
+    let same = match actor_sub.filter(|s| !s.is_empty()) {
+        Some(a) => a == proposer_sub,
+        None => !may_confirm(proposer, actor),
+    };
+    same.then_some("a proposal is confirmed by someone other than its proposer")
+}
+
+/// The rule once sign-in is on: a maintainer, not the proposer, and a
+/// proposal made while signed in. Off, the second-person rule alone. The
+/// handler asks `confirm_refusal` for the reason; this is the yes/no form
+/// the tests read.
+#[cfg(test)]
 fn may_confirm_under(
     cfg: &deja_orchestrator::auth::AuthConfig,
     proposer: &str,
+    proposer_sub: Option<&str>,
     actor: &str,
+    actor_sub: Option<&str>,
 ) -> bool {
-    may_confirm(proposer, actor)
-        && (!cfg.enabled || cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER))
+    confirm_refusal(cfg, proposer, proposer_sub, actor, actor_sub).is_none()
 }
 
 /// Withdrawing: a maintainer or the proposer once sign-in is on; anyone
@@ -3319,6 +3381,7 @@ struct ProposeAcknowledgements {
 async fn v1_propose_acknowledgements(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
     id: RunId,
     body: axum::body::Bytes,
 ) -> Response {
@@ -3405,7 +3468,16 @@ async fn v1_propose_acknowledgements(
         );
     };
     let ids = match store
-        .acknowledgements_propose(&gh.repo, pr, change_id, &id, &actor.0, note, &items)
+        .acknowledgements_propose(
+            &gh.repo,
+            pr,
+            change_id,
+            &id,
+            &actor.0,
+            subject.0.as_deref(),
+            note,
+            &items,
+        )
         .await
     {
         Ok(ids) => ids,
@@ -3427,6 +3499,7 @@ async fn v1_propose_acknowledgements(
 async fn v1_confirm_acknowledgement(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
     Path(ack_id): Path<i64>,
 ) -> Response {
     let store = match require_store(&st) {
@@ -3439,20 +3512,22 @@ async fn v1_confirm_acknowledgement(
         Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
     };
     let cfg = st.auth.config();
-    if !may_confirm_under(&cfg, &row.proposed_by, &actor.0) {
-        return error_resp(
-            403,
-            if cfg.enabled {
-                "only a maintainer other than the proposer may confirm"
-            } else {
-                "a proposal is confirmed by someone other than its proposer"
-            },
-        );
+    if let Some(why) = confirm_refusal(
+        &cfg,
+        &row.proposed_by,
+        row.proposed_by_sub.as_deref(),
+        &actor.0,
+        subject.0.as_deref(),
+    ) {
+        return error_resp(403, why);
     }
     if row.withdrawn_at.is_some() {
         return error_resp(409, "this acknowledgement was withdrawn");
     }
-    match store.acknowledgement_confirm(ack_id, &actor.0).await {
+    match store
+        .acknowledgement_confirm(ack_id, &actor.0, subject.0.as_deref())
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return error_resp(409, "already confirmed"),
         Err(e) => return error_resp(500, &format!("confirm: {e}")),
@@ -3474,6 +3549,7 @@ async fn v1_confirm_acknowledgement(
 async fn v1_withdraw_acknowledgement(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
     Path(ack_id): Path<i64>,
 ) -> Response {
     let store = match require_store(&st) {
@@ -3489,7 +3565,10 @@ async fn v1_withdraw_acknowledgement(
     if !may_withdraw_under(&cfg, &row.proposed_by, &actor.0) {
         return error_resp(403, "only a maintainer or the proposer may withdraw");
     }
-    match store.acknowledgement_withdraw(ack_id, &actor.0).await {
+    match store
+        .acknowledgement_withdraw(ack_id, &actor.0, subject.0.as_deref())
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return error_resp(409, "already withdrawn"),
         Err(e) => return error_resp(500, &format!("withdraw: {e}")),
@@ -5705,7 +5784,13 @@ mod sign_in {
     }
 
     fn session_cookie(signer: &session::Signer, email: &str) -> String {
-        let s = signer.new_session(email, "", "", std::time::Duration::from_secs(60));
+        let s = signer.new_session(
+            &format!("sub-of-{email}"),
+            email,
+            "",
+            "",
+            std::time::Duration::from_secs(60),
+        );
         format!("{}={}", auth::SESSION_COOKIE, signer.sign_session(&s))
     }
 
@@ -5810,6 +5895,21 @@ mod sign_in {
     }
 
     #[tokio::test]
+    async fn an_account_outside_the_allowed_domains_is_out_even_with_a_live_cookie() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&signer, "asha@example.com"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn who_am_i_tells_the_viewer_what_to_draw() {
         let r = router(state(AuthState::disabled(), None));
         let me = || Request::builder().uri("/api/v1/auth/me");
@@ -5903,15 +6003,53 @@ mod sign_in {
     fn the_confirm_and_withdraw_rules_follow_the_lists_once_sign_in_is_on() {
         let (a, _) = enabled(&["ravi@juspay.in"]);
         let cfg = a.config();
-        assert!(may_confirm_under(&cfg, "asha@juspay.in", "ravi@juspay.in"));
+        assert!(may_confirm_under(
+            &cfg,
+            "asha@juspay.in",
+            Some("s-asha"),
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
         assert!(
-            !may_confirm_under(&cfg, "asha@juspay.in", "dev@juspay.in"),
+            !may_confirm_under(
+                &cfg,
+                "asha@juspay.in",
+                Some("s-asha"),
+                "dev@juspay.in",
+                Some("s-dev")
+            ),
             "not a maintainer"
         );
         assert!(
-            !may_confirm_under(&cfg, "ravi@juspay.in", "ravi@juspay.in"),
+            !may_confirm_under(
+                &cfg,
+                "ravi@juspay.in",
+                Some("s-ravi"),
+                "ravi@juspay.in",
+                Some("s-ravi")
+            ),
             "own proposal"
         );
+        // The epoch: a proposal without a subject was made before sign-in.
+        assert_eq!(
+            confirm_refusal(&cfg, "asha", None, "ravi@juspay.in", Some("s-ravi")),
+            Some("this was proposed before sign-in; propose it again, signed in")
+        );
+        // One person under two emails is still the proposer.
+        assert!(!may_confirm_under(
+            &cfg,
+            "old@juspay.in",
+            Some("s-ravi"),
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        assert!(may_confirm_under(
+            &cfg,
+            "asha@juspay.in",
+            Some("s-asha"),
+            "ravi@juspay.in",
+            None
+        ));
         assert!(
             may_withdraw_under(&cfg, "asha@juspay.in", "asha@juspay.in"),
             "the proposer"
@@ -5922,7 +6060,7 @@ mod sign_in {
         );
         assert!(!may_withdraw_under(&cfg, "asha@juspay.in", "dev@juspay.in"));
         let off = AuthConfig::default();
-        assert!(may_confirm_under(&off, "asha", "dev"));
+        assert!(may_confirm_under(&off, "asha", None, "dev", None));
         assert!(may_withdraw_under(&off, "asha", "dev"));
     }
 }

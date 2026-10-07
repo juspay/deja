@@ -20,6 +20,10 @@ pub const STATE_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
+    /// The issuer's stable id for the account (Google's `sub`). Empty on a
+    /// cookie minted before it was carried.
+    #[serde(default)]
+    pub sub: String,
     pub email: String,
     #[serde(default)]
     pub name: String,
@@ -112,8 +116,16 @@ impl Signer {
         Ok(s)
     }
 
-    pub fn new_session(&self, email: &str, name: &str, picture: &str, ttl: Duration) -> Session {
+    pub fn new_session(
+        &self,
+        sub: &str,
+        email: &str,
+        name: &str,
+        picture: &str,
+        ttl: Duration,
+    ) -> Session {
         Session {
+            sub: sub.to_owned(),
             email: email.to_owned(),
             name: name.to_owned(),
             picture: picture.to_owned(),
@@ -162,7 +174,13 @@ mod tests {
     #[test]
     fn a_session_round_trips_and_a_tampered_one_does_not() {
         let s = Signer::new(b"k");
-        let ses = s.new_session("asha@juspay.in", "Asha", "", Duration::from_secs(60));
+        let ses = s.new_session(
+            "sub-1",
+            "asha@juspay.in",
+            "Asha",
+            "",
+            Duration::from_secs(60),
+        );
         let tok = s.sign_session(&ses);
         assert_eq!(s.verify_session(&tok).unwrap(), ses);
         let mut bad = tok.clone();
@@ -175,6 +193,7 @@ mod tests {
     fn an_expired_session_is_refused() {
         let s = Signer::new(b"k");
         let ses = Session {
+            sub: String::new(),
             email: "a@juspay.in".into(),
             name: String::new(),
             picture: String::new(),
