@@ -39,6 +39,54 @@ pub struct Settings {
     /// Every system, keyed by the name a caller sends. The keys are the roster.
     #[serde(default)]
     pub systems: BTreeMap<String, SystemDeclaration>,
+    /// Sign-in for the people who acknowledge and promote. Absent or
+    /// `enabled = false`: the typed actor name, as before.
+    #[serde(default)]
+    pub auth: Option<AuthSettings>,
+}
+
+/// `[auth]`: Google sign-in in front of the actions that need a person behind
+/// them, and the lists of who may do what. Secrets arrive as every other value
+/// does, `DEJA__AUTH__CLIENT_SECRET` and so on, so the chart's environment
+/// delivers them and nothing is committed.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct AuthSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Signs the session cookie. Empty: a random key per process, so sessions
+    /// do not survive a restart.
+    #[serde(default)]
+    pub session_secret: Option<String>,
+    /// `24h`, `30m`, `7d`. Default a day.
+    #[serde(default)]
+    pub session_duration: Option<String>,
+    /// Email suffixes allowed to sign in. Default `@juspay.in`.
+    #[serde(default, deserialize_with = "list_or_csv")]
+    pub domain_allowlist: Option<Vec<String>>,
+    /// The role every signed-in account holds. Default `viewer`.
+    #[serde(default)]
+    pub default_role: Option<String>,
+    /// Role name to the emails that hold it: `maintainer`, `integ_upgrader`,
+    /// `sandbox_upgrader`. Compared case-insensitively. A list in the file;
+    /// comma-separated in the environment (`DEJA__AUTH__ROLES__MAINTAINER`).
+    #[serde(default)]
+    pub roles: BTreeMap<String, Emails>,
+}
+
+/// A list of emails, as a list or as one comma-separated string.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(transparent)]
+pub struct Emails(#[serde(deserialize_with = "list_or_csv_plain")] pub Vec<String>);
+
+fn list_or_csv_plain<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(list_or_csv(d)?.unwrap_or_default())
 }
 
 /// What a deployment declares for one system. Every field is optional, and the
