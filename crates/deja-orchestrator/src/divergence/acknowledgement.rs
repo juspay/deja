@@ -148,8 +148,10 @@ impl Effective {
 }
 
 /// Lay `acks` over `delta`'s charged rows and settle the effective verdict.
-/// `change_id` is the run's; `None` means the run does not know its change,
-/// and nothing is marked stale.
+/// `change_id` is the run's; `None` means the run does not know which
+/// version of the change it ran, so every acknowledgement is stale: a
+/// decision cannot be carried to a version nobody can name. Run creation
+/// refuses a pull request without one, so this is only runs from before.
 ///
 /// For a row, the newest live acknowledgement with its key wins, a confirmed
 /// one over a proposal. Withdrawn acknowledgements are ignored. Rows the
@@ -175,6 +177,7 @@ pub fn apply(delta: &mut Delta, acks: &[Acknowledgement], change_id: Option<&str
             continue;
         };
         let state = match (change_id, ack.acknowledged_by.as_deref()) {
+            (None, _) => State::Stale,
             (Some(c), _) if c != ack.change_id => State::Stale,
             (_, Some(_)) => State::Acknowledged,
             (_, None) => State::Proposed,
@@ -201,6 +204,13 @@ pub fn apply(delta: &mut Delta, acks: &[Acknowledgement], change_id: Option<&str
             }
         }
     }
+    // Every blocking charged row is counted exactly once above, and
+    // `introduced` + `changed` is the same set counted when the delta was
+    // built — a new state or a new bucket must keep the two in step.
+    debug_assert_eq!(
+        acknowledged + proposed + stale + uncovered,
+        delta.verdict.introduced + delta.verdict.changed
+    );
     let effective = if delta.verdict.pass {
         Effective::Pass
     } else if uncovered == 0 && proposed == 0 && stale == 0 && acknowledged > 0 {
@@ -285,6 +295,8 @@ mod tests {
                 proposed: 0,
                 stale: 0,
                 effective: None,
+                overlay_failure: None,
+                unread_acknowledgements: 0,
             },
             buckets: BTreeMap::new(),
             lanes: Vec::new(),
@@ -429,13 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn a_run_without_a_change_id_marks_nothing_stale() {
+    fn a_run_without_a_change_id_marks_everything_stale() {
         let r = row(call("c", 1, Some(3)), Bucket::Introduced, "v1");
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
+        assert_eq!(apply(&mut d, &[ack(1, key, true)], None), Effective::Fail);
         assert_eq!(
-            apply(&mut d, &[ack(1, key, true)], None),
-            Effective::Acknowledged
+            d.rows[0].acknowledgement.as_ref().unwrap().state,
+            State::Stale
         );
+        assert_eq!(d.verdict.stale, 1);
     }
 }

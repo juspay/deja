@@ -770,10 +770,12 @@ async fn v1_create_run(
             return error_resp(400, &format!("delta_against: {e}"));
         }
     }
-    if let Some(gh) = spec.github.as_ref() {
+    let mut spec = spec;
+    if let Some(gh) = spec.github.as_mut() {
         if let Err(e) = gh.validate() {
             return error_resp(400, &format!("github: {e}"));
         }
+        gh.normalize();
     }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
@@ -2984,7 +2986,7 @@ async fn delta_between(
 /// The run row's word for a delta result: `pass` or `fail` once computed,
 /// else the kind of unavailability, so a reader of the row can tell a delta
 /// still coming from one that never will.
-fn delta_verdict_word(result: &Result<serde_json::Value, Unavailable>) -> &'static str {
+fn delta_verdict_word(result: Result<&serde_json::Value, &Unavailable>) -> &'static str {
     match result {
         // The effective verdict, once acknowledgements are counted, is what
         // the row says; a body the overlay has not seen falls back to the
@@ -3037,7 +3039,7 @@ async fn delta_for_run(
             // The row is settled from the cache too: a column that was reset,
             // or never written because the store was away, catches up on the
             // next view rather than waiting for a recomputation.
-            record_delta_verdict(st, y_id, &Ok(doc.clone())).await;
+            record_delta_verdict(st, y_id, Ok(&doc)).await;
             return Ok(doc);
         }
     }
@@ -3058,7 +3060,7 @@ async fn delta_for_run(
         }
         Err(why) => Err(why),
     };
-    record_delta_verdict(st, y_id, &computed).await;
+    record_delta_verdict(st, y_id, computed.as_ref()).await;
     computed
 }
 
@@ -3067,7 +3069,7 @@ async fn delta_for_run(
 async fn record_delta_verdict(
     st: &AppState,
     y_id: &str,
-    computed: &Result<serde_json::Value, Unavailable>,
+    computed: Result<&serde_json::Value, &Unavailable>,
 ) {
     if let Some(store) = &st.store {
         if let Err(e) = store
@@ -3147,28 +3149,51 @@ fn pr_number_i64(gh: &deja_orchestrator::GithubRef) -> Option<i64> {
 }
 
 /// Lay the pull request's acknowledgements over `body`, a delta of `y_id`,
-/// and settle its effective verdict. A run that names no pull request, or a
-/// store that is away, leaves the body as the pure three-way, whose verdict
-/// then has no `effective` and reads as pass or fail.
+/// and settle its effective verdict. A run that names no pull request leaves
+/// the body as the pure three-way, whose verdict then has no `effective` and
+/// reads as pass or fail: the normal case, which the acknowledge page
+/// explains. When the run does name one and the overlay still cannot
+/// happen — the store is away, its rows would not read, the delta would not
+/// decode — the verdict says so in `overlay_failure`, so the bare comparison
+/// is never mistaken for a decision.
 async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_json::Value) {
+    use serde::Deserialize as _;
+
     let Some(gh) = github_of(st, y_id).await else {
         return;
     };
-    let (Some(store), Some(pr)) = (&st.store, pr_number_i64(&gh)) else {
-        return;
+    let failed = |body: &mut serde_json::Value, why: String| {
+        eprintln!("deja-orchestrator: acknowledgements not applied to {y_id}: {why}");
+        body["verdict"]["overlay_failure"] = serde_json::Value::String(why);
+    };
+    let Some(pr) = pr_number_i64(&gh) else {
+        return failed(body, "pr_number is out of range".to_owned());
+    };
+    let Some(store) = &st.store else {
+        return failed(body, "the store is away".to_owned());
     };
     let rows = match store.acknowledgements_for_pull_request(&gh.repo, pr).await {
         Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("deja-orchestrator: acknowledgements read failed for {y_id}: {e}");
-            return;
-        }
+        Err(e) => return failed(body, format!("the acknowledgements could not be read: {e}")),
     };
     let acks: Vec<_> = rows.iter().filter_map(acknowledgement_from_row).collect();
-    let Ok(mut delta) = serde_json::from_value::<divergence::delta::Delta>(body.clone()) else {
-        return;
+    let unread = rows.len() - acks.len();
+    if unread > 0 {
+        eprintln!(
+            "deja-orchestrator: {unread} of {} acknowledgements of {}#{} could not be decoded and were not applied to {y_id}",
+            rows.len(),
+            gh.repo,
+            gh.pr_number
+        );
+    }
+    // Decoded from a borrow: the body is several megabytes on a large delta,
+    // and a copy per read is what this process has been killed for before.
+    let mut delta = match divergence::delta::Delta::deserialize(&*body) {
+        Ok(d) => d,
+        Err(e) => return failed(body, format!("the cached delta would not decode: {e}")),
     };
     divergence::acknowledgement::apply(&mut delta, &acks, gh.change_id.as_deref());
+    delta.verdict.unread_acknowledgements = unread;
     body["rows"] = serde_json::to_value(&delta.rows).unwrap_or_default();
     body["verdict"] = serde_json::to_value(&delta.verdict).unwrap_or_default();
 }
@@ -3204,19 +3229,56 @@ fn may_withdraw_under(
         || proposer.trim().eq_ignore_ascii_case(actor.trim())
 }
 
-/// After a confirmation or a withdrawal, every run of the pull request has
-/// its delta verdict re-stated, so the row's word and the delta agree.
-async fn restate_pull_request_verdicts(st: &AppState, repo: &str, pr: i64) {
-    let Some(store) = &st.store else {
-        return;
-    };
-    let Ok(runs) = store.runs_for_pull_request(repo, pr).await else {
-        return;
-    };
-    for run in runs {
-        if let Some(against) = run_params_for(st, &run).await.and_then(|p| p.delta_against) {
-            let _ = delta_for_run(st, &run, &against).await;
+/// How many of a pull request's runs have their verdict re-stated after a
+/// decision. The newest ones are the ones a check reads; older runs catch up
+/// on their next view, since the overlay runs on every read anyway.
+const RESTATE_RUNS: i64 = 20;
+
+/// After a confirmation or a withdrawal, the newest runs of the pull request
+/// have their delta verdict re-stated, so the row's word and the delta
+/// agree. Spawned off the request: the decision is already written, and a
+/// delta per run is work the person who pressed the button must not wait
+/// behind.
+fn restate_pull_request_verdicts(st: AppState, repo: String, pr: i64) {
+    tokio::spawn(async move {
+        let Some(store) = &st.store else {
+            return;
+        };
+        let runs = match store.runs_for_pull_request(&repo, pr, RESTATE_RUNS).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                eprintln!("deja-orchestrator: runs of {repo}#{pr} could not be listed to re-state their verdicts: {e}");
+                return;
+            }
+        };
+        for run in runs {
+            if let Some(against) = run_params_for(&st, &run)
+                .await
+                .and_then(|p| p.delta_against)
+            {
+                let _ = delta_for_run(&st, &run, &against).await;
+            }
         }
+    });
+}
+
+/// Write an audit line, and say so when it could not be written: the
+/// decision it records has already been taken, and a trail with a hole in
+/// it should at least be a known hole.
+async fn audit_or_say(
+    store: &deja_store::Store,
+    actor: &str,
+    action: &str,
+    target: &str,
+    details: &serde_json::Value,
+) {
+    if let Err(e) = store
+        .audit(actor, action, "pull_request", target, details)
+        .await
+    {
+        eprintln!(
+            "deja-orchestrator: audit of {action} on {target} by {actor} was not written: {e}"
+        );
     }
 }
 
@@ -3333,23 +3395,30 @@ async fn v1_propose_acknowledgements(
         });
         keys.push(key);
     }
-    let change_id = gh.change_id.clone().unwrap_or_default();
+    // A proposal is bound to the version of the change it was made on. A run
+    // from before change ids were required cannot carry one, so it cannot
+    // propose: the acknowledgement would never go stale.
+    let Some(change_id) = gh.change_id.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return error_resp(
+            409,
+            "this run names no change_id for its pull request, so an acknowledgement given on it could not be bound to a version of the change; run the replay again",
+        );
+    };
     let ids = match store
-        .acknowledgements_propose(&gh.repo, pr, &change_id, &id, &actor.0, note, &items)
+        .acknowledgements_propose(&gh.repo, pr, change_id, &id, &actor.0, note, &items)
         .await
     {
         Ok(ids) => ids,
         Err(e) => return error_resp(500, &format!("propose: {e}")),
     };
-    let _ = store
-        .audit(
-            &actor.0,
-            "acknowledgement.propose",
-            "pull_request",
-            &format!("{}#{}", gh.repo, gh.pr_number),
-            &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
-        )
-        .await;
+    audit_or_say(
+        &store,
+        &actor.0,
+        "acknowledgement.propose",
+        &format!("{}#{}", gh.repo, gh.pr_number),
+        &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
+    )
+    .await;
     json_ok(serde_json::json!({ "ids": ids }))
 }
 
@@ -3388,16 +3457,15 @@ async fn v1_confirm_acknowledgement(
         Ok(false) => return error_resp(409, "already confirmed"),
         Err(e) => return error_resp(500, &format!("confirm: {e}")),
     }
-    let _ = store
-        .audit(
-            &actor.0,
-            "acknowledgement.confirm",
-            "pull_request",
-            &format!("{}#{}", row.repo, row.pr_number),
-            &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
-        )
-        .await;
-    restate_pull_request_verdicts(&st, &row.repo, row.pr_number).await;
+    audit_or_say(
+        &store,
+        &actor.0,
+        "acknowledgement.confirm",
+        &format!("{}#{}", row.repo, row.pr_number),
+        &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
+    )
+    .await;
+    restate_pull_request_verdicts(st.clone(), row.repo.clone(), row.pr_number);
     json_ok(serde_json::json!({ "ok": true }))
 }
 
@@ -3426,16 +3494,15 @@ async fn v1_withdraw_acknowledgement(
         Ok(false) => return error_resp(409, "already withdrawn"),
         Err(e) => return error_resp(500, &format!("withdraw: {e}")),
     }
-    let _ = store
-        .audit(
-            &actor.0,
-            "acknowledgement.withdraw",
-            "pull_request",
-            &format!("{}#{}", row.repo, row.pr_number),
-            &serde_json::json!({ "id": ack_id }),
-        )
-        .await;
-    restate_pull_request_verdicts(&st, &row.repo, row.pr_number).await;
+    audit_or_say(
+        &store,
+        &actor.0,
+        "acknowledgement.withdraw",
+        &format!("{}#{}", row.repo, row.pr_number),
+        &serde_json::json!({ "id": ack_id }),
+    )
+    .await;
+    restate_pull_request_verdicts(st.clone(), row.repo.clone(), row.pr_number);
     json_ok(serde_json::json!({ "ok": true }))
 }
 
@@ -4226,25 +4293,25 @@ mod tests {
     #[test]
     fn the_row_says_which_kind_of_unavailable() {
         let computed = |pass| Ok(serde_json::json!({ "verdict": { "pass": pass } }));
-        assert_eq!(delta_verdict_word(&computed(true)), "pass");
-        assert_eq!(delta_verdict_word(&computed(false)), "fail");
+        assert_eq!(delta_verdict_word(computed(true).as_ref()), "pass");
+        assert_eq!(delta_verdict_word(computed(false).as_ref()), "fail");
         // Once acknowledgements are counted, the effective word is the row's.
         let overlaid =
             Ok(serde_json::json!({ "verdict": { "pass": false, "effective": "acknowledged" } }));
-        assert_eq!(delta_verdict_word(&overlaid), "acknowledged");
+        assert_eq!(delta_verdict_word(overlaid.as_ref()), "acknowledged");
         assert_eq!(
-            delta_verdict_word(&Err(Unavailable::Pending(String::new()))),
+            delta_verdict_word(Err(&Unavailable::Pending(String::new()))),
             "pending"
         );
         assert_eq!(
-            delta_verdict_word(&Err(Unavailable::Refused(String::new()))),
+            delta_verdict_word(Err(&Unavailable::Refused(String::new()))),
             "refused"
         );
         // A reader sees a tape mismatch as its own kind; the run row keeps
         // its four words and records a refusal.
         let mismatch = Unavailable::TapeMismatch("different seals".to_owned());
         assert_eq!(mismatch.to_json()["unavailable_kind"], "tape_mismatch");
-        assert_eq!(delta_verdict_word(&Err(mismatch)), "refused");
+        assert_eq!(delta_verdict_word(Err(&mismatch)), "refused");
     }
 
     /// The runner reports its result before it publishes the ledger and diffs,

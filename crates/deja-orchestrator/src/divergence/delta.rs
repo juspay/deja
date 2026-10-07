@@ -148,6 +148,21 @@ pub struct DeltaVerdict {
     /// `None` on a delta the overlay has not seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective: Option<Effective>,
+    /// Why the acknowledgements could not be laid over this delta, when they
+    /// could not: the store was away, its rows would not read, or the delta
+    /// itself would not decode. `effective` is `None` then and the verdict is
+    /// the pure three-way, which a consumer must not mistake for a decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_failure: Option<String>,
+    /// Acknowledgements of this pull request the overlay could not decode and
+    /// so did not apply. Non-zero means a row may show as acknowledged in the
+    /// history and as uncovered here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread_acknowledgements: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// What the comparison could not cover: requests only one run drove. Their
@@ -487,6 +502,8 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             proposed: 0,
             stale: 0,
             effective: None,
+            overlay_failure: None,
+            unread_acknowledgements: 0,
         },
         buckets,
         lanes: lane_summaries,

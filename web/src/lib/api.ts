@@ -67,7 +67,7 @@ export type RunRow = {
   /** What the run changed relative to the baseline it was created against
    *  (params.delta_against): pass, fail, or pending while the baseline is
    *  still being scored. Absent for a run that names no baseline. */
-  delta_verdict?: "pass" | "fail" | "pending" | "refused" | null;
+  delta_verdict?: "pass" | "fail" | "acknowledged" | "pending" | "refused" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;
@@ -932,8 +932,13 @@ export type Delta = {
     proposed?: number;
     stale?: number;
     /** What consumers gate on once acknowledgements count; absent when the
-     *  run names no pull request. */
+     *  run names no pull request, or when the overlay failed. */
     effective?: EffectiveVerdict;
+    /** Why the acknowledgements could not be laid over this delta; the
+     *  verdict above is then the pure three-way, not a decision. */
+    overlay_failure?: string;
+    /** Acknowledgements the server could not decode and did not apply. */
+    unread_acknowledgements?: number;
   };
   buckets: Partial<Record<DeltaBucket, number>>;
   lanes: DeltaLane[];

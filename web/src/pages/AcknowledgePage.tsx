@@ -63,6 +63,15 @@ export default function AcknowledgePage() {
   if (!against) return <>{crumbs}<div className="delta-unavailable">This run was not measured against main, so there is nothing to acknowledge.</div></>;
   if (!acks.data) return <>{crumbs}<div className="delta-unavailable">This run names no pull request; acknowledgements belong to one.</div></>;
   if (!d) return <>{crumbs}<div className="delta-unavailable">The delta is not available yet.</div></>;
+  if (d.verdict.overlay_failure)
+    return (
+      <>
+        {crumbs}
+        <div className="delta-unavailable">
+          The acknowledgements could not be laid over this delta: {d.verdict.overlay_failure}. Nothing here is a decision until that is fixed.
+        </div>
+      </>
+    );
 
   const gh = acks.data.github;
   const history = acks.data.acknowledgements;
