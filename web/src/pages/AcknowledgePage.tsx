@@ -4,6 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { Acknowledgement, DeltaRow, DeltaSide, api, runParams } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import { Group, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
+import { useHasRole, useMe } from "../lib/me";
 
 /**
  * `/r/:runId/acknowledge`: the divergences a pull request is charged with,
@@ -46,6 +47,9 @@ export default function AcknowledgePage() {
     setSelected(new Set());
     setErr(null);
   });
+  const whoami = useMe();
+  const maintainer = useHasRole("maintainer");
+  const signedInRequired = !!whoami.data?.configured && !whoami.data.authenticated;
 
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
   const crumbs = (
@@ -69,7 +73,9 @@ export default function AcknowledgePage() {
   const todo = groups.filter((g) => !g.ack || g.ack.state !== "acknowledged");
   const done = groups.filter((g) => g.ack?.state === "acknowledged");
   const markable = todo.filter((g) => !g.ack || g.ack.state === "stale");
-  const confirmable = todo.filter((g) => g.ack?.state === "proposed" && !isMine(g));
+  const confirmable = todo.filter((g) => g.ack?.state === "proposed" && !isMine(g) && maintainer);
+  // The server's rule: a maintainer, or the proposer, may withdraw.
+  const withdrawable = (g: Group) => maintainer || isMine(g);
   const uncoveredRows = markable.reduce((n, g) => n + g.rows.length, 0);
   const label = runParams(run.data!)?.label ?? "";
   const step = effective === "pass" ? 4 : effective === "acknowledged" ? 4 : markable.length > 0 ? 2 : 3;
@@ -101,7 +107,11 @@ export default function AcknowledgePage() {
         <span className={step > 3 ? "done" : step === 3 ? "now" : ""}>3 · a second person acknowledges</span>
         <span className={step === 4 ? "done" : ""}>4 · the check turns green</span>
       </div>
-      {!me && <p className="hint">Set your name in the top right to mark or acknowledge.</p>}
+      {!me && !signedInRequired && <p className="hint">Set your name in the top right to mark or acknowledge.</p>}
+      {signedInRequired && <p className="hint">Sign in (top right) to mark or acknowledge.</p>}
+      {whoami.data?.authenticated && !maintainer && todo.some((g) => g.ack?.state === "proposed") && (
+        <p className="hint">Only a maintainer may acknowledge; you can mark shapes as intended and withdraw your own.</p>
+      )}
       {err && <p className="err">{err}</p>}
       <div className="ack-grid">
         <div className="ack-main">
@@ -128,7 +138,7 @@ export default function AcknowledgePage() {
               <tbody>
                 {list.map((g) => {
                   const a = g.ack;
-                  const selectable = (!a || a.state === "stale" || (a.state === "proposed" && !isMine(g))) && tab === "todo";
+                  const selectable = (!a || a.state === "stale" || (a.state === "proposed" && !isMine(g) && maintainer)) && tab === "todo";
                   return (
                     <tr key={g.key} className={a ? `st-${a.state}` : "st-none"}>
                       <td className="sel">
@@ -158,7 +168,7 @@ export default function AcknowledgePage() {
                       </td>
                       <td className="act">
                         <button className="btn quiet" onClick={() => setShown(shown?.key === g.key ? null : g)}>{shown?.key === g.key ? "hide" : "show"}</button>
-                        {a && <button className="btn quiet" disabled={!me || withdraw.isPending} onClick={() => withdraw.mutate(a.id)}>Withdraw</button>}
+                        {a && withdrawable(g) && <button className="btn quiet" disabled={!me || withdraw.isPending} onClick={() => withdraw.mutate(a.id)}>Withdraw</button>}
                       </td>
                     </tr>
                   );

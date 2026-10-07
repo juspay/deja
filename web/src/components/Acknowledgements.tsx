@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { Delta, RunRow, api, actor, runParams } from "../lib/api";
+import { Delta, RunRow, api, runParams } from "../lib/api";
+import { useActor } from "../lib/me";
 import { useDebug, withDebug } from "../lib/debug";
 import { badgeOf, effectiveOf, groupCharged, requestsOf, useAcknowledgements } from "../lib/acknowledge";
 
@@ -22,9 +23,10 @@ export function AcknowledgeButton({ run }: { run: RunRow }) {
     enabled: !!against,
   });
   const acks = useAcknowledgements(run.run_id);
+  const me = useActor();
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
   if (!d || !acks.data) return null;
-  const badge = badgeOf(groupCharged(d), d, actor());
+  const badge = badgeOf(groupCharged(d), d, me);
   if (!badge) return null;
   return (
     <Link className={`btn ack-btn ${badge.tone}`} to={withDebug(`/r/${run.run_id}/acknowledge`, debug)}>

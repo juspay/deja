@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import {
   createBrowserRouter,
   Link,
@@ -16,7 +16,8 @@ import "@fontsource/inter/latin-500.css";
 import "@fontsource/inter/latin-600.css";
 import "json-diff-kit/dist/viewer.css";
 import "./styles.css";
-import { actor, setActor } from "./lib/api";
+import { actor, api, setActor } from "./lib/api";
+import { loginUrl, useMe } from "./lib/me";
 import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
 import RunsPage from "./pages/RunsPage";
@@ -24,10 +25,48 @@ import ReportPage from "./pages/ReportPage";
 import DeltaPage from "./pages/DeltaPage";
 import AcknowledgePage from "./pages/AcknowledgePage";
 import AuditPage from "./pages/AuditPage";
+import LoginPage from "./pages/LoginPage";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
+
+/** The identity in the header: the signed-in account when sign-in is on,
+ *  a sign-in link when it is on and there is no session, the typed name
+ *  when it is off. */
+function Identity() {
+  const me = useMe();
+  const qc = useQueryClient();
+  if (me.isLoading) return null;
+  if (me.data?.configured) {
+    if (!me.data.authenticated) {
+      return (
+        <a className="btn signin" href={loginUrl()}>
+          Sign in
+        </a>
+      );
+    }
+    const roles = (me.data.roles ?? []).filter((r) => r !== "viewer");
+    return (
+      <span className="whoami" title={me.data.name || me.data.email}>
+        {me.data.picture && <img src={me.data.picture} alt="" />}
+        <span className="email">{me.data.email}</span>
+        {roles.length > 0 && <span className="roles">{roles.join(" · ")}</span>}
+        <button
+          className="btn quiet"
+          onClick={async () => {
+            await api.logout();
+            await qc.invalidateQueries({ queryKey: ["me"] });
+            window.location.href = "/";
+          }}
+        >
+          Sign out
+        </button>
+      </span>
+    );
+  }
+  return <ActorBox />;
+}
 
 function ActorBox() {
   const [name, setName] = React.useState(actor());
@@ -65,7 +104,7 @@ function Shell() {
           {tab("/recordings", "Recordings")}
           {tab("/audit", "Audit")}
         </nav>
-        <ActorBox />
+        <Identity />
       </header>
       <main>
         <Outlet />
@@ -92,6 +131,7 @@ const router = createBrowserRouter([
       // HOME is the form. The list is a destination you go to, not the thing you
       // land on when you want to start a run.
       { path: "/", element: <NewRunPage /> },
+      { path: "/login", element: <LoginPage /> },
       { path: "/replays/new", element: <Navigate to="/" replace /> },
       { path: "/runs", element: <RunsPage /> },
       { path: "/r/:runId", element: <ReportPage /> },
