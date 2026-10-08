@@ -197,9 +197,7 @@ async fn main() {
     let auth = match deja_orchestrator::auth::AuthState::from_settings() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!(
-                "deja-orchestrator: refusing to start, sign-in is declared but unusable: {e}"
-            );
+            eprintln!("deja-orchestrator: refusing to start: {e}");
             std::process::exit(2);
         }
     };
@@ -209,6 +207,13 @@ async fn main() {
             "deja-orchestrator: sign-in on (Google), accounts ending in {}, {} role list(s)",
             cfg.domains.join(", "),
             cfg.roles.len()
+        );
+    } else if auth.declared() {
+        // A block with the client, the secrets and the lists, and no
+        // `enabled = true`: said out loud, since everything else about the
+        // deployment says sign-in was meant.
+        eprintln!(
+            "deja-orchestrator: an [auth] block is declared but auth.enabled is not true; running with sign-in OFF (typed names)"
         );
     }
     {
@@ -471,7 +476,7 @@ async fn require_session(
         return match st.mutation_auth.service_token.as_deref() {
             Some(expected) if service_token_matches(expected, supplied) => {
                 req.extensions_mut()
-                    .insert(AuthenticatedActor("svc:pipeline".to_owned()));
+                    .insert(AuthenticatedActor(SERVICE_ACTOR.to_owned()));
                 req.extensions_mut().insert(ActorSubject(None));
                 next.run(req).await
             }
@@ -719,6 +724,13 @@ async fn v1_auth_me(State(st): State<AppState>, headers: HeaderMap) -> Response 
         return json_ok(serde_json::json!({ "configured": false, "authenticated": false }));
     }
     match session_from_headers(&st, &headers) {
+        // The same gate the actions apply: an account that left the allowed
+        // domains is told so here, not at the first press of a button.
+        Some(s) if !cfg.domain_allowed(&s.email) => json_ok(serde_json::json!({
+            "configured": true,
+            "authenticated": false,
+            "reason": "this account is no longer allowed to sign in",
+        })),
         Some(s) => json_ok(serde_json::json!({
             "configured": true,
             "authenticated": true,
@@ -3173,6 +3185,8 @@ fn acknowledgement_from_row(
         proposed_by: r.proposed_by.clone(),
         acknowledged_by: r.acknowledged_by.clone(),
         withdrawn: r.withdrawn_at.is_some(),
+        proposed_by_sub: r.proposed_by_sub.clone(),
+        acknowledged_by_sub: r.acknowledged_by_sub.clone(),
     })
 }
 
@@ -3251,7 +3265,15 @@ async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_js
         Ok(d) => d,
         Err(e) => return failed(body, format!("the cached delta would not decode: {e}")),
     };
-    divergence::acknowledgement::apply(&mut delta, &acks, gh.change_id.as_deref());
+    // With sign-in on, only a signed-in confirmation counts: a decision from
+    // before it would otherwise pass the gate for as long as the change id
+    // held, however it had been given.
+    divergence::acknowledgement::apply(
+        &mut delta,
+        &acks,
+        gh.change_id.as_deref(),
+        st.auth.enabled(),
+    );
     delta.verdict.unread_acknowledgements = unread;
     body["rows"] = serde_json::to_value(&delta.rows).unwrap_or_default();
     body["verdict"] = serde_json::to_value(&delta.verdict).unwrap_or_default();
@@ -3277,23 +3299,32 @@ fn confirm_refusal(
         return (!may_confirm(proposer, actor))
             .then_some("a proposal is confirmed by someone other than its proposer");
     }
-    // The epoch: a proposal from before sign-in carries no subject, and a
-    // typed name cannot be told from the signed-in person who typed it. It
-    // has to be proposed again by someone who is signed in.
+    // The epoch: a proposal carries the subject of the person who made it,
+    // or none when it was made before sign-in or by the pipeline's token. A
+    // typed name cannot be told from the signed-in person who typed it, so
+    // it has to be proposed again by someone who is signed in.
     let Some(proposer_sub) = proposer_sub.filter(|s| !s.is_empty()) else {
-        return Some("this was proposed before sign-in; propose it again, signed in");
+        return Some(if proposer == SERVICE_ACTOR {
+            "this was proposed by the pipeline's token; propose it signed in"
+        } else {
+            "this was proposed before sign-in; propose it again, signed in"
+        });
+    };
+    // Confirming is a person's act: the token never confirms, and a cookie
+    // from before subjects were carried signs in again first.
+    let Some(actor_sub) = actor_sub.filter(|s| !s.is_empty()) else {
+        return Some("acknowledging needs a signed-in person");
     };
     if !cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
         return Some("only a maintainer may acknowledge");
     }
-    // Same person under two emails is still one person: compare the subject
-    // when both sides have one, the email otherwise.
-    let same = match actor_sub.filter(|s| !s.is_empty()) {
-        Some(a) => a == proposer_sub,
-        None => !may_confirm(proposer, actor),
-    };
-    same.then_some("a proposal is confirmed by someone other than its proposer")
+    // Same person under two emails is still one person.
+    (actor_sub == proposer_sub)
+        .then_some("a proposal is confirmed by someone other than its proposer")
 }
+
+/// The name the pipeline's bearer token acts under.
+const SERVICE_ACTOR: &str = "svc:pipeline";
 
 /// The rule once sign-in is on: a maintainer, not the proposer, and a
 /// proposal made while signed in. Off, the second-person rule alone. The
@@ -3314,12 +3345,25 @@ fn may_confirm_under(
 /// before, as before.
 fn may_withdraw_under(
     cfg: &deja_orchestrator::auth::AuthConfig,
-    proposer: &str,
+    proposer_sub: Option<&str>,
     actor: &str,
+    actor_sub: Option<&str>,
 ) -> bool {
-    !cfg.enabled
-        || cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER)
-        || proposer.trim().eq_ignore_ascii_case(actor.trim())
+    if !cfg.enabled {
+        return true;
+    }
+    if cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return true;
+    }
+    // The proposer, by subject: a typed name from before sign-in is nobody
+    // in particular, so such a row is a maintainer's to withdraw.
+    match (
+        proposer_sub.filter(|s| !s.is_empty()),
+        actor_sub.filter(|s| !s.is_empty()),
+    ) {
+        (Some(p), Some(a)) => p == a,
+        _ => false,
+    }
 }
 
 /// How many of a pull request's runs have their verdict re-stated after a
@@ -3658,8 +3702,20 @@ async fn v1_withdraw_acknowledgement(
         Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
     };
     let cfg = st.auth.config();
-    if !may_withdraw_under(&cfg, &row.proposed_by, &actor.0) {
-        return error_resp(403, "only a maintainer or the proposer may withdraw");
+    if !may_withdraw_under(
+        &cfg,
+        row.proposed_by_sub.as_deref(),
+        &actor.0,
+        subject.0.as_deref(),
+    ) {
+        return error_resp(
+            403,
+            if row.proposed_by_sub.is_none() {
+                "this was proposed before sign-in; only a maintainer may withdraw it"
+            } else {
+                "only a maintainer or the signed-in proposer may withdraw"
+            },
+        );
     }
     match store
         .acknowledgement_withdraw(ack_id, &actor.0, subject.0.as_deref())
@@ -5981,13 +6037,19 @@ mod sign_in {
             },
             executor: Arc::new(ExecutorSelection::Compose),
             auth,
+            restates: Arc::default(),
         }
+    }
+
+    async fn whose(Extension(subject): Extension<ActorSubject>) -> String {
+        subject.0.unwrap_or_else(|| "none".to_owned())
     }
 
     fn router(st: AppState) -> Router {
         let gated = middleware::from_fn_with_state(st.clone(), require_session);
         Router::new()
-            .route("/gated", post(whoami).route_layer(gated))
+            .route("/gated", post(whoami).route_layer(gated.clone()))
+            .route("/gated-subject", post(whose).route_layer(gated))
             .route("/api/v1/auth/me", get(v1_auth_me))
             .route("/auth/login/start", get(auth_login_start))
             .route("/auth/callback", get(auth_callback))
@@ -6233,16 +6295,17 @@ mod sign_in {
     fn the_confirm_and_withdraw_rules_follow_the_lists_once_sign_in_is_on() {
         let (a, _) = enabled(&["ravi@juspay.in"]);
         let cfg = a.config();
-        assert!(may_confirm_under(
-            &cfg,
+        let ok = |p: &str, ps: Option<&str>, a: &str, as_: Option<&str>| {
+            may_confirm_under(&cfg, p, ps, a, as_)
+        };
+        assert!(ok(
             "asha@juspay.in",
             Some("s-asha"),
             "ravi@juspay.in",
             Some("s-ravi")
         ));
         assert!(
-            !may_confirm_under(
-                &cfg,
+            !ok(
                 "asha@juspay.in",
                 Some("s-asha"),
                 "dev@juspay.in",
@@ -6251,8 +6314,7 @@ mod sign_in {
             "not a maintainer"
         );
         assert!(
-            !may_confirm_under(
-                &cfg,
+            !ok(
                 "ravi@juspay.in",
                 Some("s-ravi"),
                 "ravi@juspay.in",
@@ -6260,37 +6322,124 @@ mod sign_in {
             ),
             "own proposal"
         );
-        // The epoch: a proposal without a subject was made before sign-in.
+        // The epoch: a proposal without a subject was made before sign-in,
+        // or by the pipeline's token, and each says which.
         assert_eq!(
             confirm_refusal(&cfg, "asha", None, "ravi@juspay.in", Some("s-ravi")),
             Some("this was proposed before sign-in; propose it again, signed in")
         );
+        assert_eq!(
+            confirm_refusal(&cfg, SERVICE_ACTOR, None, "ravi@juspay.in", Some("s-ravi")),
+            Some("this was proposed by the pipeline's token; propose it signed in")
+        );
         // One person under two emails is still the proposer.
-        assert!(!may_confirm_under(
-            &cfg,
+        assert!(!ok(
             "old@juspay.in",
             Some("s-ravi"),
             "ravi@juspay.in",
             Some("s-ravi")
         ));
-        assert!(may_confirm_under(
+        // Confirming without a subject of one's own is refused, whoever asks.
+        assert_eq!(
+            confirm_refusal(
+                &cfg,
+                "asha@juspay.in",
+                Some("s-asha"),
+                "ravi@juspay.in",
+                None
+            ),
+            Some("acknowledging needs a signed-in person")
+        );
+        // Withdrawing: a maintainer, or the proposer by subject; a row from
+        // before sign-in is a maintainer's to withdraw.
+        assert!(may_withdraw_under(
             &cfg,
-            "asha@juspay.in",
             Some("s-asha"),
-            "ravi@juspay.in",
-            None
+            "asha@juspay.in",
+            Some("s-asha")
         ));
         assert!(
-            may_withdraw_under(&cfg, "asha@juspay.in", "asha@juspay.in"),
-            "the proposer"
-        );
-        assert!(
-            may_withdraw_under(&cfg, "asha@juspay.in", "ravi@juspay.in"),
+            may_withdraw_under(&cfg, Some("s-asha"), "ravi@juspay.in", Some("s-ravi")),
             "a maintainer"
         );
-        assert!(!may_withdraw_under(&cfg, "asha@juspay.in", "dev@juspay.in"));
-        let off = AuthConfig::default();
+        assert!(!may_withdraw_under(
+            &cfg,
+            Some("s-asha"),
+            "dev@juspay.in",
+            Some("s-dev")
+        ));
+        assert!(
+            !may_withdraw_under(&cfg, None, "asha@juspay.in", Some("s-asha")),
+            "typed before sign-in"
+        );
+        assert!(may_withdraw_under(
+            &cfg,
+            None,
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        // Off, the old rules: a second person confirms, anyone withdraws.
+        let off = AuthState::disabled().config();
         assert!(may_confirm_under(&off, "asha", None, "dev", None));
-        assert!(may_withdraw_under(&off, "asha", "dev"));
+        assert!(!may_confirm_under(&off, "asha", None, "asha", None));
+        assert!(may_withdraw_under(&off, None, "dev", None));
+    }
+
+    /// The cookies carry `Secure` by the setting, not by a header the proxy
+    /// may or may not send.
+    #[tokio::test]
+    async fn the_secure_flag_is_the_setting_not_the_forwarded_scheme() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login/start")
+                    .header("host", "deja.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("Secure"), "{cookie}");
+    }
+
+    /// The subject travels from the cookie to the handler beside the name;
+    /// the token and a typed name carry none.
+    #[tokio::test]
+    async fn the_subject_reaches_the_handler_beside_the_name() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, Some("right")));
+        let (st, body) = call(
+            r.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gated-subject")
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (st, body.as_str()),
+            (StatusCode::OK, "sub-of-asha@juspay.in")
+        );
+        let (_, body) = call(
+            r,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gated-subject")
+                .header(header::AUTHORIZATION, "Bearer right")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body, "none");
     }
 }

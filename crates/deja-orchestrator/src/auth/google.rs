@@ -223,6 +223,11 @@ impl Verifier {
         let data =
             decode::<Claims>(id_token, &key, &validation).map_err(|e| format!("id_token: {e}"))?;
         let claims = data.claims;
+        // The subject is what decisions are recorded under; a token
+        // without one is not an identity.
+        if claims.sub.trim().is_empty() {
+            return Err("id_token carries no subject".to_owned());
+        }
         if !claims.email_verified {
             return Err("Google has not verified this email".to_owned());
         }

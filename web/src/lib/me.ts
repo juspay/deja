@@ -1,5 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
-import { actor, api, rememberMe } from "./api";
+import { Me, actor, api, askToSignIn, rememberMe } from "./api";
+
+/** Before a gated action: when sign-in is configured and the person is not
+ *  signed in, open the sign-in dialog and report that the action must wait.
+ *  With sign-in off, or signed in, nothing happens and the action proceeds. */
+export function needsSignIn(me: Me | undefined): boolean {
+  if (!me?.configured || me.authenticated) return false;
+  askToSignIn();
+  return true;
+}
 
 /** The who-am-I probe, once per page load, remembered for `actor()`. */
 export function useMe() {

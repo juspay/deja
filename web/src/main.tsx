@@ -16,7 +16,7 @@ import "@fontsource/inter/latin-500.css";
 import "@fontsource/inter/latin-600.css";
 import "json-diff-kit/dist/viewer.css";
 import "./styles.css";
-import { actor, api, setActor } from "./lib/api";
+import { SIGN_IN_EVENT, actor, api, setActor } from "./lib/api";
 import { loginUrl, useMe } from "./lib/me";
 import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
@@ -34,6 +34,38 @@ const queryClient = new QueryClient({
 /** The identity in the header: the signed-in account when sign-in is on,
  *  a sign-in link when it is on and there is no session, the typed name
  *  when it is off. */
+/**
+ * The one dialog for "sign in to do this": opened by any gated action tried
+ * without a session, from wherever the person is, and closed by signing in
+ * (a navigation) or by Not now. Native <dialog>, like the launch modal.
+ */
+function SignInDialog() {
+  const ref = React.useRef<HTMLDialogElement>(null);
+  React.useEffect(() => {
+    const open = () => {
+      const d = ref.current;
+      if (d && !d.open) d.showModal();
+    };
+    window.addEventListener(SIGN_IN_EVENT, open);
+    return () => window.removeEventListener(SIGN_IN_EVENT, open);
+  }, []);
+  return (
+    <dialog ref={ref} className="signin" aria-labelledby="signin-title">
+      <h2 id="signin-title">Sign in to do this</h2>
+      <p className="hint">Marking a divergence as intended, acknowledging one and withdrawing one are recorded against a person. Reading never needs an account.</p>
+      <div className="signin-actions">
+        <a className="btn primary" href={loginUrl()}>
+          Continue with Google
+        </a>
+        <button className="btn quiet" onClick={() => ref.current?.close()}>
+          Not now
+        </button>
+      </div>
+      <p className="hint">You will come back to this page afterwards.</p>
+    </dialog>
+  );
+}
+
 function Identity() {
   const me = useMe();
   const qc = useQueryClient();
@@ -108,6 +140,7 @@ function Shell() {
       </header>
       <main>
         <Outlet />
+        <SignInDialog />
       </main>
     </>
   );

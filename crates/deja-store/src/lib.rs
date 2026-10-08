@@ -188,12 +188,14 @@ pub struct AcknowledgementRow {
     pub withdrawn_by: Option<String>,
     pub withdrawn_at: Option<DateTime<Utc>>,
     /// The sign-in issuer's stable id beside each name; null when the
-    /// action was taken with sign-in off or by the service token.
-    #[serde(default)]
+    /// action was taken with sign-in off or by the service token. Never
+    /// serialised: a Google subject is a stable account id across
+    /// services, and no reader of the API needs it.
+    #[serde(default, skip_serializing)]
     pub proposed_by_sub: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub acknowledged_by_sub: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub withdrawn_by_sub: Option<String>,
 }
 

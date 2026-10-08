@@ -456,6 +456,15 @@ dialog.launch {
   box-shadow: 0 24px 64px rgba(0,0,0,0.55);
 }
 dialog.launch::backdrop { background: rgba(6, 9, 13, 0.66); }
+dialog.signin {
+  width: min(440px, calc(100vw - 2rem)); padding: var(--s5); border: 1px solid var(--border);
+  border-radius: var(--r-lg); background: var(--surface-raised); color: var(--text);
+  box-shadow: 0 24px 64px rgba(0,0,0,0.55); text-align: center;
+}
+dialog.signin::backdrop { background: rgba(6, 9, 13, 0.66); }
+dialog.signin h2 { margin: 0 0 var(--s2); font-size: var(--fs-18); }
+dialog.signin .hint { max-width: 36ch; margin: 0 auto var(--s4); }
+.signin-actions { display: flex; justify-content: center; gap: var(--s3); margin-bottom: var(--s3); }
 .launchhead { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s3); margin-bottom: var(--s4); }
 .launchlabel { color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
 .launchid { font-family: var(--font-mono); font-size: var(--fs-15); color: var(--text); user-select: all; }

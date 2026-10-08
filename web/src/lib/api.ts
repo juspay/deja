@@ -402,6 +402,14 @@ export type Me = {
 let signedIn: Me | null = null;
 
 /** Remember the probe's answer, so `actor()` can prefer the verified email. */
+/** The event the sign-in dialog listens for: fired by a gated action tried
+ *  without a session, and by the pages before they even send one. */
+export const SIGN_IN_EVENT = "deja:sign-in-required";
+
+export function askToSignIn() {
+  window.dispatchEvent(new CustomEvent(SIGN_IN_EVENT));
+}
+
 export function rememberMe(m: Me) {
   signedIn = m;
 }
@@ -437,10 +445,10 @@ export type ApiError = Error & { status?: number };
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
-    // A gated action without a session: go and sign in, and come back here.
+    // A gated action without a session: ask the person to sign in, in
+    // place, rather than navigating them away from what they were doing.
     if (resp.status === 401 && signedIn?.configured && !signedIn.authenticated && window.location.pathname !== "/login") {
-      const back = window.location.pathname + window.location.search;
-      window.location.href = "/login?return_url=" + encodeURIComponent(back);
+      askToSignIn();
     }
     let detail = `${resp.status}`;
     try {

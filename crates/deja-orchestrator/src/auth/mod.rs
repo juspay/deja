@@ -191,6 +191,8 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 /// for Google's ID tokens.
 pub struct AuthState {
     config: RwLock<AuthConfig>,
+    /// Whether an `[auth]` block was declared at all.
+    declared: bool,
     pub signer: session::Signer,
     pub verifier: google::Verifier,
     pub endpoints: google::Endpoints,
@@ -203,10 +205,22 @@ impl AuthState {
     /// to start on: silently running without the gate the deployment asked
     /// for would reopen every route to a typed name.
     pub fn from_settings() -> Result<Arc<Self>, String> {
-        let s = settings::load().map_err(|e| format!("settings: {e}"))?;
-        let cfg = match s.auth.as_ref() {
-            None => AuthConfig::default(),
-            Some(a) => AuthConfig::from_settings(a).map_err(|e| format!("[auth]: {e}"))?,
+        Self::from_loaded(settings::load())
+    }
+
+    /// The same, from a settings document already loaded (or not): the
+    /// three answers are a document that could not be read at all, a block
+    /// that does not resolve, and a usable configuration — and the first
+    /// two say which they are, since on-call reads the one line.
+    pub fn from_loaded(loaded: Result<settings::Settings, String>) -> Result<Arc<Self>, String> {
+        let s = loaded.map_err(|e| format!("the settings document could not be read: {e}"))?;
+        let (cfg, declared) = match s.auth.as_ref() {
+            None => (AuthConfig::default(), false),
+            Some(a) => (
+                AuthConfig::from_settings(a)
+                    .map_err(|e| format!("sign-in is declared but unusable: [auth]: {e}"))?,
+                true,
+            ),
         };
         let signer = if cfg.enabled {
             session::Signer::new(cfg.session_secret.as_bytes())
@@ -216,10 +230,17 @@ impl AuthState {
         let verifier = google::Verifier::new(cfg.client_id.clone(), google::Endpoints::default());
         Ok(Arc::new(Self {
             config: RwLock::new(cfg),
+            declared,
             signer,
             verifier,
             endpoints: google::Endpoints::default(),
         }))
+    }
+
+    /// Whether the settings carried an `[auth]` block at all, whatever it
+    /// said: a declared block with sign-in off is worth a line at boot.
+    pub fn declared(&self) -> bool {
+        self.declared
     }
 
     /// Sign-in off, with nothing configured: what a deployment without an
@@ -227,6 +248,7 @@ impl AuthState {
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
             config: RwLock::new(AuthConfig::default()),
+            declared: false,
             signer: session::Signer::quiet_random(),
             verifier: google::Verifier::new(String::new(), google::Endpoints::default()),
             endpoints: google::Endpoints::default(),
@@ -241,6 +263,7 @@ impl AuthState {
     ) -> Arc<Self> {
         Arc::new(Self {
             config: RwLock::new(cfg),
+            declared: true,
             signer,
             verifier,
             endpoints: google::Endpoints::default(),
@@ -261,7 +284,16 @@ impl AuthState {
     /// the block while sign-in is on is refused, the last good configuration
     /// kept: a gate is never lowered by a half-written file or a remount.
     pub fn reload(&self) -> Result<(), String> {
-        let s = settings::load()?;
+        self.reload_from(settings::load())
+    }
+
+    /// The reload, from a document already loaded. The switch itself never
+    /// moves here: off to on would run with this process's random signing
+    /// key and a verifier built for no client, on to off would drop the
+    /// gate on a half-written file. Either is a restart, and the reload
+    /// says so and keeps the last good configuration.
+    pub fn reload_from(&self, loaded: Result<settings::Settings, String>) -> Result<(), String> {
+        let s = loaded?;
         let next = match s.auth.as_ref() {
             Some(a) => AuthConfig::from_settings(a)?,
             None if self.enabled() => {
@@ -271,14 +303,23 @@ impl AuthState {
             }
             None => AuthConfig::default(),
         };
-        if let Ok(mut cur) = self.config.write() {
-            cur.enabled = next.enabled;
-            cur.domains = next.domains;
-            cur.default_role = next.default_role;
-            cur.roles = next.roles;
-            cur.session_duration = next.session_duration;
-            cur.cookie_secure = next.cookie_secure;
+        let mut cur = self
+            .config
+            .write()
+            .map_err(|_| "the configuration lock is poisoned".to_owned())?;
+        if next.enabled != cur.enabled {
+            return Err(format!(
+                "auth.enabled changed from {} to {} in the settings; that takes a restart, keeping sign-in {}",
+                cur.enabled,
+                next.enabled,
+                if cur.enabled { "on" } else { "off" }
+            ));
         }
+        cur.domains = next.domains;
+        cur.default_role = next.default_role;
+        cur.roles = next.roles;
+        cur.session_duration = next.session_duration;
+        cur.cookie_secure = next.cookie_secure;
         Ok(())
     }
 }
@@ -347,6 +388,60 @@ mod tests {
         assert_eq!(cfg.roles_for("asha@juspay.in"), vec!["viewer"]);
         assert!(cfg.has_role("RAVI@juspay.in", ROLE_MAINTAINER));
         assert!(!cfg.has_role("asha@juspay.in", ROLE_MAINTAINER));
+    }
+
+    fn doc(toml_text: &str) -> Result<deja_compactor::settings::Settings, String> {
+        toml::from_str(toml_text).map_err(|e| e.to_string())
+    }
+
+    /// Starting: no block is sign-in off; a block that does not resolve is
+    /// a refusal that names the block; a document that will not read is a
+    /// refusal that names the document, not sign-in.
+    #[test]
+    fn starting_tells_a_missing_block_from_a_broken_one_from_a_broken_document() {
+        let none = AuthState::from_loaded(doc("")).unwrap();
+        assert!(!none.enabled() && !none.declared());
+        let off = AuthState::from_loaded(doc("[auth]\nclient_id = \"cid\"")).unwrap();
+        assert!(!off.enabled() && off.declared());
+        let broken = AuthState::from_loaded(doc("[auth]\nenabled = true\nclient_id = \"cid\""))
+            .err()
+            .unwrap_or_default();
+        assert!(
+            broken.starts_with("sign-in is declared but unusable"),
+            "{broken}"
+        );
+        let unread = AuthState::from_loaded(Err("boom".to_owned()))
+            .err()
+            .unwrap_or_default();
+        assert!(
+            unread.starts_with("the settings document could not be read"),
+            "{unread}"
+        );
+    }
+
+    /// The reload moves the lists and never the switch.
+    #[test]
+    fn reloading_moves_the_lists_and_refuses_to_move_the_switch() {
+        let on = "[auth]\nenabled = true\nclient_id = \"cid\"\nclient_secret = \"sec\"\nsession_secret = \"k\"\n";
+        let st = AuthState::from_loaded(doc(on)).unwrap();
+        assert!(st.enabled());
+        st.reload_from(doc(&format!(
+            "{on}[auth.roles]\nmaintainer = [\"ravi@juspay.in\"]\n"
+        )))
+        .unwrap();
+        assert!(st.config().has_role("ravi@juspay.in", ROLE_MAINTAINER));
+        let off = on.replace("enabled = true", "enabled = false");
+        let err = st.reload_from(doc(&off)).err().unwrap_or_default();
+        assert!(err.contains("takes a restart"), "{err}");
+        assert!(st.enabled(), "the gate stayed up");
+        assert!(
+            st.reload_from(doc("")).is_err(),
+            "a vanished block is refused too"
+        );
+        // And a process that started off stays off.
+        let cold = AuthState::from_loaded(doc("")).unwrap();
+        assert!(cold.reload_from(doc(on)).is_err());
+        assert!(!cold.enabled());
     }
 
     #[test]

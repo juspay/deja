@@ -4,7 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { Acknowledgement, DeltaRow, DeltaSide, api, deltaUnavailable, runParams } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import { Group, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
-import { useHasRole, useMe } from "../lib/me";
+import { needsSignIn, useHasRole, useMe } from "../lib/me";
 
 /**
  * `/r/:runId/acknowledge`: the divergences a pull request is charged with,
@@ -50,6 +50,11 @@ export default function AcknowledgePage() {
   const whoami = useMe();
   const maintainer = useHasRole("maintainer");
   const signedInRequired = !!whoami.data?.configured && !whoami.data.authenticated;
+  // Signed out with sign-in configured, the controls stay live: pressing one
+  // opens the sign-in dialog instead of doing nothing, so the way in is
+  // where the person is looking. The server refuses the call regardless.
+  const canAct = !!me || signedInRequired;
+  const maintainerOrAsk = maintainer || signedInRequired;
 
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
   const crumbs = (
@@ -101,9 +106,9 @@ export default function AcknowledgePage() {
   const todo = groups.filter((g) => !g.ack || g.ack.state !== "acknowledged");
   const done = groups.filter((g) => g.ack?.state === "acknowledged");
   const markable = todo.filter((g) => !g.ack || g.ack.state === "stale");
-  const confirmable = todo.filter((g) => g.ack?.state === "proposed" && !isMine(g) && maintainer);
+  const confirmable = todo.filter((g) => g.ack?.state === "proposed" && !isMine(g) && maintainerOrAsk);
   // The server's rule: a maintainer, or the proposer, may withdraw.
-  const withdrawable = (g: Group) => maintainer || isMine(g);
+  const withdrawable = (g: Group) => maintainerOrAsk || isMine(g);
   const uncoveredRows = markable.reduce((n, g) => n + g.rows.length, 0);
   const label = runParams(run.data!)?.label ?? "";
   const step = effective === "pass" ? 4 : effective === "acknowledged" ? 4 : markable.length > 0 ? 2 : 3;
@@ -136,7 +141,7 @@ export default function AcknowledgePage() {
         <span className={step === 4 ? "done" : ""}>4 · the check turns green</span>
       </div>
       {!me && !signedInRequired && <p className="hint">Set your name in the top right to mark or acknowledge.</p>}
-      {signedInRequired && <p className="hint">Sign in (top right) to mark or acknowledge.</p>}
+      {signedInRequired && <p className="hint">Sign in to mark or acknowledge; reading needs no account.</p>}
       {whoami.data?.authenticated && !maintainer && todo.some((g) => g.ack?.state === "proposed") && (
         <p className="hint">Only a maintainer may acknowledge; you can mark shapes as intended and withdraw your own.</p>
       )}
@@ -171,12 +176,12 @@ export default function AcknowledgePage() {
               <tbody>
                 {list.map((g) => {
                   const a = g.ack;
-                  const selectable = (!a || a.state === "stale" || (a.state === "proposed" && !isMine(g) && maintainer)) && tab === "todo";
+                  const selectable = (!a || a.state === "stale" || (a.state === "proposed" && !isMine(g) && maintainerOrAsk)) && tab === "todo";
                   return (
                     <tr key={g.key} className={a ? `st-${a.state}` : "st-none"}>
                       <td className="sel">
                         {selectable && (
-                          <input type="checkbox" id={`ack-${g.key}`} checked={selected.has(g.key)} onChange={() => toggle(g.key)} disabled={!me} aria-label={`select ${g.what} ${g.where}`} />
+                          <input type="checkbox" id={`ack-${g.key}`} checked={selected.has(g.key)} onChange={() => toggle(g.key)} disabled={!canAct} aria-label={`select ${g.what} ${g.where}`} />
                         )}
                       </td>
                       <td className="lane">{g.lane}</td>
@@ -201,7 +206,7 @@ export default function AcknowledgePage() {
                       </td>
                       <td className="act">
                         <button className="btn quiet" onClick={() => setShown(shown?.key === g.key ? null : g)}>{shown?.key === g.key ? "hide" : "show"}</button>
-                        {a && withdrawable(g) && <button className="btn quiet" disabled={!me || withdraw.isPending} onClick={() => withdraw.mutate(a.id)}>Withdraw</button>}
+                        {a && withdrawable(g) && <button className="btn quiet" disabled={!canAct || withdraw.isPending} onClick={() => { if (needsSignIn(whoami.data)) return; withdraw.mutate(a.id); }}>Withdraw</button>}
                       </td>
                     </tr>
                   );
@@ -213,14 +218,14 @@ export default function AcknowledgePage() {
           {tab === "todo" && (confirmable.length > 0 || markable.length > 0) && (
             <div className="ack-actions">
               {selectedProposed.length > 0 && (
-                <button className="btn primary" disabled={!me || confirm.isPending} onClick={() => selectedProposed.forEach((g) => g.ack && confirm.mutate(g.ack.id))}>
+                <button className="btn primary" disabled={!canAct || confirm.isPending} onClick={() => { if (needsSignIn(whoami.data)) return; selectedProposed.forEach((g) => g.ack && confirm.mutate(g.ack.id)); }}>
                   Acknowledge {selectedProposed.length} shape{selectedProposed.length === 1 ? "" : "s"} · {requestsOf(selectedProposed)} requests
                 </button>
               )}
               {selectedGroups.length > 0 && (
                 <>
-                  <input id="ack-note" type="text" placeholder="why this divergence is intended" value={note} onChange={(e) => setNote(e.target.value)} disabled={!me || propose.isPending} />
-                  <button className="btn primary" disabled={!me || note.trim().length === 0 || propose.isPending} onClick={() => propose.mutate({ rows: selectedRows, note: note.trim() })}>
+                  <input id="ack-note" type="text" placeholder="why this divergence is intended" value={note} onChange={(e) => setNote(e.target.value)} disabled={!canAct || propose.isPending} />
+                  <button className="btn primary" disabled={!canAct || note.trim().length === 0 || propose.isPending} onClick={() => { if (needsSignIn(whoami.data)) return; propose.mutate({ rows: selectedRows, note: note.trim() }); }}>
                     Mark {selectedGroups.length} shape{selectedGroups.length === 1 ? "" : "s"} as intended
                   </button>
                 </>
