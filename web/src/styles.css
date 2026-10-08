@@ -1145,6 +1145,7 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 
 /* ---- acknowledgements: the rows a PR is charged with, and who accepted them ---- */
 .chip.acknowledged, .chip.delta.acknowledged { background: rgba(63,185,80,0.14); color: var(--green-fg); }
+.chip.delta.unknown { background: var(--surface-overlay); color: var(--text-faint); border: 1px dashed var(--border-strong); }
 .chip.proposed { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
 .chip.stale { background: rgba(248,81,73,0.14); color: var(--red-fg); }
 .delta-ack { display: grid; gap: var(--s3); }

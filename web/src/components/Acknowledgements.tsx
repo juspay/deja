@@ -25,7 +25,17 @@ export function AcknowledgeButton({ run }: { run: RunRow }) {
   const acks = useAcknowledgements(run.run_id);
   const me = useActor();
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
-  if (!d || !acks.data) return null;
+  if (!d) return null;
+  // An overlay that could not happen, or acknowledgements that could not be
+  // read, still get the button: the page says what went wrong.
+  if (d.verdict.overlay_failure || acks.error) {
+    return (
+      <Link className="btn ack-btn todo" to={withDebug(`/r/${run.run_id}/acknowledge`, debug)}>
+        Acknowledge <span className="count todo">unknown</span>
+      </Link>
+    );
+  }
+  if (!acks.data) return null;
   const badge = badgeOf(groupCharged(d), d, me);
   if (!badge) return null;
   return (
@@ -40,27 +50,44 @@ export function AcknowledgeButton({ run }: { run: RunRow }) {
 export function AcknowledgeLine({ runId, d }: { runId: string; d: Delta }) {
   const debug = useDebug();
   const acks = useAcknowledgements(runId);
-  if (!acks.data) return null;
-  const groups = groupCharged(d);
-  if (groups.length === 0) return null;
   const v = d.verdict;
-  const effective = effectiveOf(d);
-  const gh = acks.data.github;
-  const uncovered = groups.filter((g) => !g.ack).reduce((n, g) => n + g.rows.length, 0);
+  const page = (
+    <span className="sub">
+      <Link to={withDebug(`/r/${runId}/acknowledge`, debug)}>open the acknowledge page →</Link>
+    </span>
+  );
+  // The failures come first, before any read of the acknowledgements: the
+  // conditions that stop the overlay (the store away, rows unreadable) are
+  // the same ones that fail the acknowledgements request, and a line that
+  // waited for that request would never show them.
   if (v.overlay_failure) {
     return (
       <div className="delta-ack-verdict tone-bad">
         <span className="chip solid fail">unknown</span>
         <div className="txt">
           <span className="h">The acknowledgements could not be laid over this delta: {v.overlay_failure}. What is shown is the bare comparison, not a decision.</span>
-          <span className="sub">
-            PR {gh.repo}#{gh.pr_number} ·{" "}
-            <Link to={withDebug(`/r/${runId}/acknowledge`, debug)}>open the acknowledge page →</Link>
-          </span>
+          {page}
         </div>
       </div>
     );
   }
+  if (acks.error) {
+    return (
+      <div className="delta-ack-verdict tone-bad">
+        <span className="chip solid fail">unknown</span>
+        <div className="txt">
+          <span className="h">The pull request's acknowledgements could not be read: {String((acks.error as Error).message)}.</span>
+          {page}
+        </div>
+      </div>
+    );
+  }
+  if (!acks.data) return null;
+  const groups = groupCharged(d);
+  if (groups.length === 0) return null;
+  const effective = effectiveOf(d);
+  const gh = acks.data.github;
+  const uncovered = groups.filter((g) => !g.ack).reduce((n, g) => n + g.rows.length, 0);
   const unread = v.unread_acknowledgements ?? 0;
   const text =
     effective === "acknowledged"

@@ -67,7 +67,9 @@ export type RunRow = {
   /** What the run changed relative to the baseline it was created against
    *  (params.delta_against): pass, fail, or pending while the baseline is
    *  still being scored. Absent for a run that names no baseline. */
-  delta_verdict?: "pass" | "fail" | "acknowledged" | "pending" | "refused" | null;
+  /** `unknown`: the acknowledgements could not be laid over the delta, so
+   *  the bare comparison was not written as a decision. */
+  delta_verdict?: "pass" | "fail" | "acknowledged" | "unknown" | "pending" | "refused" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;

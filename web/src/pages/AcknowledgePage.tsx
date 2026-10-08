@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { Acknowledgement, DeltaRow, DeltaSide, api, runParams } from "../lib/api";
+import { Acknowledgement, DeltaRow, DeltaSide, api, deltaUnavailable, runParams } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import { Group, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
 import { useHasRole, useMe } from "../lib/me";
@@ -58,11 +58,28 @@ export default function AcknowledgePage() {
       <Link to={withDebug(`/r/${runId}`, debug)}>report</Link> <span>/</span> <span className="hint">acknowledge</span>
     </div>
   );
+  const unavailable = deltaUnavailable(delta.data);
   if (run.isLoading || acks.isLoading || (against && delta.isLoading)) return <>{crumbs}<p className="hint">loading…</p></>;
   if (run.error) return <>{crumbs}<p className="err">{String(run.error)}</p></>;
   if (!against) return <>{crumbs}<div className="delta-unavailable">This run was not measured against main, so there is nothing to acknowledge.</div></>;
-  if (!acks.data) return <>{crumbs}<div className="delta-unavailable">This run names no pull request; acknowledgements belong to one.</div></>;
+  if (delta.error) return <>{crumbs}<p className="err">The delta could not be read: {String((delta.error as Error).message)}</p></>;
+  if (unavailable)
+    return (
+      <>
+        {crumbs}
+        <div className="delta-unavailable">
+          {unavailable.pending
+            ? `The delta is not available yet: ${unavailable.why}`
+            : unavailable.tapeMismatch
+              ? `There is no delta to acknowledge: the two runs read different recordings (${unavailable.why}).`
+              : `There is no delta to acknowledge, and there will not be one: ${unavailable.why}`}
+        </div>
+      </>
+    );
   if (!d) return <>{crumbs}<div className="delta-unavailable">The delta is not available yet.</div></>;
+  // The overlay's failures come before any read of the acknowledgements:
+  // the store being away fails both, and the page must name that, not
+  // "names no pull request".
   if (d.verdict.overlay_failure)
     return (
       <>
@@ -72,6 +89,8 @@ export default function AcknowledgePage() {
         </div>
       </>
     );
+  if (acks.error) return <>{crumbs}<p className="err">The pull request's acknowledgements could not be read: {String((acks.error as Error).message)}</p></>;
+  if (!acks.data) return <>{crumbs}<div className="delta-unavailable">This run names no pull request; acknowledgements belong to one.</div></>;
 
   const gh = acks.data.github;
   const history = acks.data.acknowledgements;
@@ -120,6 +139,11 @@ export default function AcknowledgePage() {
       {signedInRequired && <p className="hint">Sign in (top right) to mark or acknowledge.</p>}
       {whoami.data?.authenticated && !maintainer && todo.some((g) => g.ack?.state === "proposed") && (
         <p className="hint">Only a maintainer may acknowledge; you can mark shapes as intended and withdraw your own.</p>
+      )}
+      {(v.unread_acknowledgements ?? 0) > 0 && (
+        <p className="err">
+          {v.unread_acknowledgements} acknowledgement{v.unread_acknowledgements === 1 ? "" : "s"} of this pull request could not be read and did not count: the history may show a shape as acknowledged that the delta lists as unmarked.
+        </p>
       )}
       {err && <p className="err">{err}</p>}
       <div className="ack-grid">

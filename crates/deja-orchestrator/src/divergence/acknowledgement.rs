@@ -206,22 +206,34 @@ pub fn apply(delta: &mut Delta, acks: &[Acknowledgement], change_id: Option<&str
     }
     // Every blocking charged row is counted exactly once above, and
     // `introduced` + `changed` is the same set counted when the delta was
-    // built — a new state or a new bucket must keep the two in step.
-    debug_assert_eq!(
-        acknowledged + proposed + stale + uncovered,
-        delta.verdict.introduced + delta.verdict.changed
-    );
-    let effective = if delta.verdict.pass {
+    // built — a new state or a new bucket must keep the two in step. Checked
+    // in the shipped binary too: a mismatch is a bug, and a bug in the
+    // accounting is not allowed to pass as a decision.
+    let counted = acknowledged + proposed + stale + uncovered;
+    let charged = delta.verdict.introduced + delta.verdict.changed;
+    debug_assert_eq!(counted, charged);
+    let v = &mut delta.verdict;
+    v.acknowledged = acknowledged;
+    v.proposed = proposed;
+    v.stale = stale;
+    if counted != charged {
+        eprintln!(
+            "deja-orchestrator: acknowledgement accounting does not balance for {}: {counted} rows counted, {charged} charged",
+            delta.y_run
+        );
+        v.overlay_failure = Some(format!(
+            "the acknowledgement accounting does not balance: {counted} rows counted, {charged} charged"
+        ));
+        v.effective = None;
+        return Effective::Fail;
+    }
+    let effective = if v.pass {
         Effective::Pass
     } else if uncovered == 0 && proposed == 0 && stale == 0 && acknowledged > 0 {
         Effective::Acknowledged
     } else {
         Effective::Fail
     };
-    let v = &mut delta.verdict;
-    v.acknowledged = acknowledged;
-    v.proposed = proposed;
-    v.stale = stale;
     v.effective = Some(effective);
     effective
 }
