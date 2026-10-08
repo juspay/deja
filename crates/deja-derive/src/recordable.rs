@@ -496,6 +496,7 @@ fn generate_async_method(
                 lexical_path: ::core::option::Option::Some(::std::module_path!().to_string()),
                 syntax_hash: ::core::option::Option::Some(#syntax_hash_lit),
                 span_path: ::deja_runtime::current_span_path(),
+                span_instance: ::deja_runtime::current_span_instance(),
             };
 
             // ONE seam: collapses the former execute / replay / record arms into a
@@ -681,6 +682,7 @@ fn generate_sync_method(
                 lexical_path: ::core::option::Option::Some(::std::module_path!().to_string()),
                 syntax_hash: ::core::option::Option::Some(#syntax_hash_lit),
                 span_path: ::deja_runtime::current_span_path(),
+                span_instance: ::deja_runtime::current_span_instance(),
             };
 
             // ONE seam: the former execute / replay / record arms collapse into a

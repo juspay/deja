@@ -53,6 +53,13 @@ struct SpanContext {
     /// Logical span-path root→leaf (`"payments_core>update_trackers"`), built once
     /// from the parent's path plus this span's name.
     path: Arc<str>,
+    /// `path` with each span instance told apart from its same-name siblings: the
+    /// k-th sibling (k >= 1) named `x` under one parent instance is `x#k`, so the
+    /// first is byte-identical to `path`. See [`current_span_instance`].
+    instance: Arc<str>,
+    /// How many children of each name this span instance has created so far —
+    /// the counter `instance` ordinals are drawn from.
+    children: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, u32>>>,
     /// Correlation id from this span's own `request_id` field, else inherited from
     /// the parent. `None` when no ancestor carried one.
     correlation: Option<Arc<str>>,
@@ -111,6 +118,8 @@ struct SpanCursor {
     span_id: u64,
     /// Full logical span-path root→leaf, from the owning span's `SpanContext`.
     path: Arc<str>,
+    /// The owning span's instance path, from its `SpanContext`.
+    instance: Arc<str>,
     /// Task lineage of the owning span.
     lineage: Arc<crate::TaskLineage>,
 }
@@ -167,6 +176,7 @@ fn push_span_cursor(span_id: u64, cx: &SpanContext) {
         stack.borrow_mut().push(SpanCursor {
             span_id,
             path: Arc::clone(&cx.path),
+            instance: Arc::clone(&cx.instance),
             lineage: Arc::clone(&cx.lineage),
         });
     });
@@ -321,6 +331,30 @@ pub fn current_span_path() -> Option<String> {
     with_current_cursor(|cursor| cursor.path.to_string())
 }
 
+/// The span-path of the innermost entered span with each span INSTANCE told apart:
+/// the k-th child named `x` that one parent instance created is `x#k`, the first
+/// carrying no suffix. `None` exactly when [`current_span_path`] is.
+///
+/// Present even where it equals the path: its presence is how a tape says its
+/// calls were numbered by instance. An instance key rendered for a tape that
+/// predates it would be numbered by arrival, and a twin falling through to the
+/// plain path could then be served the same row as its sibling.
+///
+/// This is what separates twins: two concurrent branches entering same-named
+/// spans and making identical calls share a span path, and today's tiebreak is
+/// arrival order, which under `join!` is a scheduler race. Creation order is not:
+/// `join!`/`try_join!` first-poll their branches in declaration order, and an
+/// `#[instrument]` async fn creates its span on that first poll.
+///
+/// The limit is where creation itself races — a span created after an `.await`
+/// in concurrent branches, or inside spawned tasks. There the ordinal is as racy
+/// as arrival order was; the lookup tries this first and falls back to the plain
+/// path, and args still keep distinct calls apart.
+#[must_use]
+pub fn current_span_instance() -> Option<String> {
+    with_current_cursor(|cursor| cursor.instance.to_string())
+}
+
 /// The task lineage of the innermost span entered on this thread, derived from the
 /// entered span tree — the span-based replacement for the `CURRENT_TASK_LINEAGE`
 /// task-local.
@@ -417,6 +451,35 @@ where
             None => Arc::from(name),
         };
 
+        // Instance: the parent's instance plus this span's name, ordinal-suffixed
+        // when a same-name sibling came first. Counted only under a parent that
+        // belongs to a request and only for a span that does not open its own:
+        // a long-lived span above the request root would otherwise number every
+        // request's root differently on record and on replay.
+        let instance: Arc<str> = match parent.as_ref() {
+            Some(parent) => {
+                let counted = parent.correlation.is_some() && own_correlation.is_none();
+                let ordinal = if counted {
+                    let mut children = parent
+                        .children
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let next = children.entry(name).or_insert(0);
+                    let ordinal = *next;
+                    *next += 1;
+                    ordinal
+                } else {
+                    0
+                };
+                if ordinal == 0 {
+                    Arc::from(format!("{}>{name}", parent.instance).as_str())
+                } else {
+                    Arc::from(format!("{}>{name}#{ordinal}", parent.instance).as_str())
+                }
+            }
+            None => Arc::clone(&path),
+        };
+
         // A `deja.fork` span opens a fresh, unordered lineage bucket; every other
         // span inherits its parent's, so synchronous nesting stays in one bucket.
         let mut fork_visitor = ForkVisitor(false);
@@ -457,6 +520,8 @@ where
 
         span.extensions_mut().insert(SpanContext {
             path,
+            instance,
+            children: Arc::default(),
             correlation,
             lineage,
             observe,
@@ -1186,6 +1251,64 @@ mod tests {
                 current_span_path().as_deref(),
                 Some("deja::http_incoming"),
                 "and the root, still entered, is what remains"
+            );
+        });
+    }
+
+    #[test]
+    fn same_name_siblings_are_numbered_by_creation_not_by_entry() {
+        // Twins: two branches each creating a same-named span under one parent,
+        // as `try_join!` over two `#[instrument]` calls does. The second CREATED
+        // is `#1` however the two are later entered, and the first carries no
+        // suffix, so a call there reads exactly as it does without a twin.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-twins");
+            let _root = root.enter();
+            let billing = tracing::info_span!("create_address");
+            let shipping = tracing::info_span!("create_address");
+            {
+                let _shipping = shipping.enter();
+                assert_eq!(
+                    current_span_path().as_deref(),
+                    Some("deja::http_incoming>create_address")
+                );
+                assert_eq!(
+                    current_span_instance().as_deref(),
+                    Some("deja::http_incoming>create_address#1"),
+                    "entered first, created second"
+                );
+                let _child = tracing::info_span!("insert").entered();
+                assert_eq!(
+                    current_span_instance().as_deref(),
+                    Some("deja::http_incoming>create_address#1>insert"),
+                    "a child is numbered under its own parent instance"
+                );
+            }
+            let _billing = billing.enter();
+            assert_eq!(
+                current_span_instance(),
+                current_span_path(),
+                "the first instance is the plain path"
+            );
+        });
+    }
+
+    #[test]
+    fn spans_outside_a_request_are_never_numbered() {
+        // A long-lived span above the request root would number every request's
+        // root differently on record and on replay; only spans under a request
+        // are counted.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let server = tracing::info_span!("server");
+            let _server = server.enter();
+            let _earlier = tracing::info_span!("deja::http_incoming", request_id = "req-1");
+            let later = tracing::info_span!("deja::http_incoming", request_id = "req-2");
+            let _later = later.enter();
+            assert_eq!(
+                current_span_instance().as_deref(),
+                Some("server>deja::http_incoming")
             );
         });
     }

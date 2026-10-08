@@ -1932,6 +1932,13 @@ pub enum Locus {
     /// occurrence counter. That was identity wearing a locus's clothes; the
     /// identity now lives on [`LookupKey`] and this is a path again.
     SpanPath { path: String },
+    /// Rank 2, tried before [`Locus::SpanPath`] — the same path with each span
+    /// INSTANCE told apart from its same-name siblings by creation ordinal
+    /// (`CallsiteIdentity::span_instance`). Separates twins: concurrent branches
+    /// in same-named spans making identical calls, which `SpanPath` can only
+    /// tell apart by arrival order. A miss here falls through to `SpanPath`, so
+    /// where creation order itself races nothing is worse than before.
+    SpanInstance { path: String },
     /// Rank 3 — NO location claimed: match on identity, args and occurrence
     /// alone, wherever the call is made from.
     ///
@@ -1989,9 +1996,21 @@ impl Locus {
     pub fn rank(&self) -> u8 {
         match self {
             Locus::DeclaredSite(_) => 1,
-            Locus::SpanPath { .. } => 2,
+            Locus::SpanInstance { .. } | Locus::SpanPath { .. } => 2,
             Locus::Unlocated => 3,
             Locus::SourceLocation { .. } => 5,
+        }
+    }
+
+    /// Which locus this is, by name — the tier a resolved call reports, since
+    /// two loci share rank 2.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Locus::DeclaredSite(_) => "declared_site",
+            Locus::SpanInstance { .. } => "span_instance",
+            Locus::SpanPath { .. } => "span_path",
+            Locus::Unlocated => "unlocated",
+            Locus::SourceLocation { .. } => "source_location",
         }
     }
 }
@@ -2072,6 +2091,10 @@ pub struct ObservedCall {
     pub resolved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_rank: Option<u8>,
+    /// The [`Locus::kind`] that resolved this call. Names the tier where a rank
+    /// cannot: `span_instance` and `span_path` are both rank 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_locus: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_event_global_sequence: Option<u64>,
     /// Replay-side wall-clock start timestamp for this observed call. This is
@@ -2230,6 +2253,8 @@ struct ObservedCallWire {
     #[serde(default)]
     resolved_rank: Option<u8>,
     #[serde(default)]
+    resolved_locus: Option<String>,
+    #[serde(default)]
     source_event_global_sequence: Option<u64>,
     #[serde(default)]
     timestamp_ns: u64,
@@ -2294,6 +2319,7 @@ impl From<ObservedCallWire> for ObservedCall {
             args: wire.args,
             resolved: wire.resolved,
             resolved_rank: wire.resolved_rank,
+            resolved_locus: wire.resolved_locus,
             source_event_global_sequence: wire.source_event_global_sequence,
             timestamp_ns: wire.timestamp_ns,
             end_timestamp_ns: wire.end_timestamp_ns,
@@ -2516,6 +2542,11 @@ pub fn loci_for(
         // Rank 2 — logical span-path. Strongest non-explicit locus: stable
         // across line/signature edits AND distinct per concurrent span, so the
         // occurrence tiebreak is span-scoped (no positional swap).
+        if let Some(instance) = &id.span_instance {
+            out.push(Locus::SpanInstance {
+                path: instance.clone(),
+            });
+        }
         if let Some(path) = &id.span_path {
             out.push(Locus::SpanPath { path: path.clone() });
         }
@@ -3476,9 +3507,11 @@ impl LookupTableHook {
             &self.table
         };
         let mut hit: Option<(&HookEntry, u8)> = None;
+        let mut hit_locus: Option<&'static str> = None;
         for key in &keys {
             if let Some(entry) = table.get(key) {
                 hit = Some((entry, key.locus.rank()));
+                hit_locus = Some(key.locus.kind());
                 break;
             }
         }
@@ -3516,6 +3549,7 @@ impl LookupTableHook {
             for key in &arg_free_keys {
                 if let Some(entry) = self.arg_free_table.get(key) {
                     hit = Some((entry, key.locus.rank()));
+                    hit_locus = Some(key.locus.kind());
                     arg_divergent = true;
                     break;
                 }
@@ -3546,6 +3580,7 @@ impl LookupTableHook {
             location: location.map(|(f, l, c)| (f.to_owned(), l, c)),
             graph_node_id,
             resolved_rank: hit.map(|(_, rank)| rank),
+            resolved_locus: hit_locus,
             // Left absent on an args-free serve. The sequence is a claim that
             // THIS call is the recorded event at it, and an args-free serve is
             // not that claim: the arguments differ. Which event the value came
@@ -3577,6 +3612,7 @@ struct Resolution {
     location: Option<(String, u32, u32)>,
     graph_node_id: Option<u64>,
     resolved_rank: Option<u8>,
+    resolved_locus: Option<&'static str>,
     source_event_global_sequence: Option<u64>,
     recorded_result: Option<serde_json::Value>,
     /// `recorded_result` came from the same address with different arguments.
@@ -3616,6 +3652,7 @@ impl Resolution {
             // continued anyway.
             resolved: self.recorded_result.is_some() && !self.arg_divergent,
             resolved_rank: self.resolved_rank,
+            resolved_locus: self.resolved_locus.map(str::to_owned),
             source_event_global_sequence: self.source_event_global_sequence,
             timestamp_ns: crate::now_ns(),
             end_timestamp_ns: None,
@@ -3830,6 +3867,7 @@ impl DejaHook for LookupTableHook {
             args: event.args.to_value(),
             resolved: false,
             resolved_rank: None,
+            resolved_locus: None,
             source_event_global_sequence: None,
             timestamp_ns: event.timestamp_ns,
             end_timestamp_ns: event.end_timestamp_ns,
@@ -5512,6 +5550,7 @@ mod tests {
             lexical_path: Some(path.to_owned()),
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -5526,6 +5565,7 @@ mod tests {
             lexical_path: None,
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -5741,6 +5781,7 @@ mod tests {
             lexical_path: Some("router::routing".to_owned()),
             syntax_hash: Some(99),
             span_path: Some("http>pay".to_owned()),
+            span_instance: None,
         };
         let loci = loci_for(Some(&declared), Some(("routing.rs", 10, 3)));
 
@@ -5892,6 +5933,7 @@ mod tests {
             lexical_path: None,
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         };
         assert!(
             !loci_for(Some(&bare_identity), None).is_empty(),
@@ -5917,15 +5959,25 @@ mod tests {
             lexical_path: Some("router::core".to_owned()),
             syntax_hash: Some(7),
             span_path: Some("http>pay".to_owned()),
+            span_instance: Some("http>pay".to_owned()),
         };
-        let ranks: Vec<u8> = loci_for(Some(&full), Some(("f.rs", 1, 2)))
-            .iter()
-            .map(Locus::rank)
-            .collect();
+        let loci = loci_for(Some(&full), Some(("f.rs", 1, 2)));
+        let ranks: Vec<u8> = loci.iter().map(Locus::rank).collect();
         assert_eq!(
             ranks,
-            vec![1, 2, 5, 3],
-            "declared site, span path, source location, then the floor"
+            vec![1, 2, 2, 5, 3],
+            "declared site, span instance, span path, source location, then the floor"
+        );
+        assert_eq!(
+            loci.iter().map(Locus::kind).collect::<Vec<_>>(),
+            vec![
+                "declared_site",
+                "span_instance",
+                "span_path",
+                "source_location",
+                "unlocated"
+            ],
+            "the instance is tried before the plain path it falls back to"
         );
         assert!(
             !ranks.contains(&4) && !ranks.contains(&6),
@@ -5962,6 +6014,7 @@ mod tests {
             lexical_path: Some("router::core".to_owned()),
             syntax_hash: Some(0xAAAA),
             span_path: Some("http>pay".to_owned()),
+            span_instance: None,
         };
         let disguised_identity = CallsiteIdentity {
             scope: Some("time::common_utils::date_time::now".to_owned()),
@@ -7464,6 +7517,7 @@ mod tests {
             lexical_path: Some("crate::module".to_owned()),
             syntax_hash: Some(crate::stable_callsite_hash(scope)),
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -7761,6 +7815,7 @@ mod tests {
             lexical_path: Some("crate::module".to_owned()),
             syntax_hash: Some(crate::stable_callsite_hash(scope)),
             span_path: Some(logical.to_owned()),
+            span_instance: None,
         };
         let id_attempt = make("payments_core>update_payment_attempt");
         let id_intent = make("payments_core>update_payment_intent");
@@ -7995,6 +8050,7 @@ mod tests {
             lexical_path: Some(lexical_path.to_owned()),
             syntax_hash: Some(crate::stable_callsite_hash(scope)),
             span_path: None,
+            span_instance: None,
         }
     }
 

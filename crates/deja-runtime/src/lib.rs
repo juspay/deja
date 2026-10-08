@@ -49,7 +49,7 @@ pub mod round_trip;
 pub mod synth;
 pub mod wire_capture;
 pub mod writer;
-pub use correlation_layer::{current_span_path, DejaCorrelationLayer};
+pub use correlation_layer::{current_span_instance, current_span_path, DejaCorrelationLayer};
 pub use graph::{
     current_execution_graph_context, read_execution_graph_records, ExecutionGraphLayer,
     GraphNodeSink,
@@ -1154,6 +1154,13 @@ pub struct CallsiteIdentity {
     #[serde(default)]
     #[serde(rename = "logical_context")]
     pub span_path: Option<String>,
+    /// `span_path` with same-name sibling span instances told apart by creation
+    /// ordinal (`x#1` for the second `x` under one parent). The source for
+    /// [`crate::replay::Locus::SpanInstance`], which is rendered only where this
+    /// is present: a tape that predates it was numbered by arrival and keeps
+    /// exactly that addressing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_instance: Option<String>,
 }
 
 /// Deserialize an `Option<u64>` from either a JSON number or a JSON string,
@@ -6768,6 +6775,7 @@ mod tests {
             args: serde_json::json!({"k": 1}),
             resolved,
             resolved_rank: None,
+            resolved_locus: None,
             source_event_global_sequence: None,
             timestamp_ns: now_ns(),
             end_timestamp_ns: None,
@@ -6815,6 +6823,7 @@ mod tests {
             lexical_path: None,
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         };
         let peek = SubstitutePeek {
             token: Some(SubstituteToken::new(pending_observation(
@@ -7139,6 +7148,7 @@ mod tests {
                 args: query.args.clone(),
                 resolved: false,
                 resolved_rank: self.shadow_rank,
+                resolved_locus: None,
                 source_event_global_sequence: None,
                 timestamp_ns: now_ns(),
                 end_timestamp_ns: None,
@@ -7183,6 +7193,7 @@ mod tests {
             lexical_path: Some("crate::m".to_string()),
             syntax_hash: Some(123),
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -8360,6 +8371,7 @@ mod serve_or_run_tests {
             args: serde_json::json!({}),
             resolved: recorded.is_some(),
             resolved_rank: rank,
+            resolved_locus: None,
             source_event_global_sequence: Some(2972),
             timestamp_ns: 0,
             end_timestamp_ns: None,
