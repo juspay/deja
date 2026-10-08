@@ -58,6 +58,9 @@ struct AppState {
     store: Option<Arc<Store>>,
     mutation_auth: MutationAuth,
     executor: Arc<ExecutorSelection>,
+    /// Sign-in for the gated actions (acknowledging, later promoting). Off
+    /// unless the configuration's `[auth]` block says otherwise.
+    auth: Arc<deja_orchestrator::auth::AuthState>,
     /// Verdict restates in flight, one per pull request.
     restates: Arc<Restates>,
 }
@@ -120,6 +123,13 @@ impl MutationAuth {
 #[derive(Clone, Debug)]
 struct AuthenticatedActor(String);
 
+/// The sign-in issuer's stable id for the actor, beside the name: set by
+/// `require_session` from the session cookie, `None` for a typed name or the
+/// pipeline's token. What a decision is recorded under, since an email can
+/// be renamed or handed to someone else.
+#[derive(Clone, Debug)]
+struct ActorSubject(Option<String>);
+
 #[tokio::main]
 async fn main() {
     // rustls 0.23 refuses to auto-select a CryptoProvider when both aws-lc-rs
@@ -180,11 +190,53 @@ async fn main() {
             None
         }
     };
+    // A declared [auth] block that does not resolve is a refusal to start,
+    // not a warning: running without the gate the deployment asked for would
+    // reopen the acknowledgement routes to a typed name, and the only trace
+    // would be one line here that nobody reads.
+    let auth = match deja_orchestrator::auth::AuthState::from_settings() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("deja-orchestrator: refusing to start: {e}");
+            std::process::exit(2);
+        }
+    };
+    if auth.enabled() {
+        let cfg = auth.config();
+        eprintln!(
+            "deja-orchestrator: sign-in on (Google), accounts ending in {}, {} role list(s)",
+            cfg.domains.join(", "),
+            cfg.roles.len()
+        );
+    } else if auth.declared() {
+        // A block with the client, the secrets and the lists, and no
+        // `enabled = true`: said out loud, since everything else about the
+        // deployment says sign-in was meant.
+        eprintln!(
+            "deja-orchestrator: an [auth] block is declared but auth.enabled is not true; running with sign-in OFF (typed names)"
+        );
+    }
+    {
+        // The lists and the switch are re-read on a timer, so a changed
+        // configuration applies on the next request without a restart.
+        let auth = auth.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(deja_orchestrator::auth::RELOAD_EVERY).await;
+                if let Err(e) = auth.reload() {
+                    eprintln!(
+                        "deja-orchestrator: [auth] reload failed, keeping the last good lists: {e}"
+                    );
+                }
+            }
+        });
+    }
     let state = AppState {
         root: root.clone(),
         store,
         mutation_auth: MutationAuth::from_env(),
         executor,
+        auth,
         restates: Arc::default(),
     };
 
@@ -251,12 +303,13 @@ fn app_router(state: AppState) -> Router {
     let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
     // Acknowledging a divergence is a human action, twice over: one person
     // proposes, another confirms. Same auth as creating a run, and audited.
-    let propose_acknowledgements =
-        post(v1_propose_acknowledgements).route_layer(middleware::from_fn(require_human_auth));
-    let confirm_acknowledgement =
-        post(v1_confirm_acknowledgement).route_layer(middleware::from_fn(require_human_auth));
-    let withdraw_acknowledgement =
-        delete(v1_withdraw_acknowledgement).route_layer(middleware::from_fn(require_human_auth));
+    // ...and the one place a person has to be signed in once sign-in is on:
+    // a bearer token if presented, else the session cookie, else (sign-in
+    // off) the typed name. See require_session.
+    let gated = middleware::from_fn_with_state(state.clone(), require_session);
+    let propose_acknowledgements = post(v1_propose_acknowledgements).route_layer(gated.clone());
+    let confirm_acknowledgement = post(v1_confirm_acknowledgement).route_layer(gated.clone());
+    let withdraw_acknowledgement = delete(v1_withdraw_acknowledgement).route_layer(gated);
     // Push-back ingest: an out-of-process lifecycle runner (the k8s Job) reports
     // RunEvents here and authenticates with the service token (require_service_auth).
     let ingest_run_event = post(v1_ingest_run_event).route_layer(middleware::from_fn_with_state(
@@ -295,10 +348,16 @@ fn app_router(state: AppState) -> Router {
         .route("/acknowledgements/{id}", withdraw_acknowledgement)
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
-        .route("/audit", get(v1_audit));
+        .route("/audit", get(v1_audit))
+        .route("/auth/me", get(v1_auth_me));
 
     Router::new()
         .nest("/api/v1", api_v1)
+        // The sign-in flow lives at the root, as the redirect URI registered
+        // with Google names it: /auth/callback on this host.
+        .route("/auth/login/start", get(auth_login_start))
+        .route("/auth/callback", get(auth_callback))
+        .route("/auth/logout", post(auth_logout))
         // SPA: real assets by path; any other GET falls back to index.html
         // (client-side routing). The API is entirely under /api/v1, so the
         // page URL space (/runs/..., /recordings, ...) is the SPA's alone.
@@ -396,6 +455,292 @@ async fn require_service_auth(
 
     req.extensions_mut().insert(AuthenticatedActor(actor));
     next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in: the gate on the actions that need a person, and the Google flow.
+// The model is deja_orchestrator::auth; this is its HTTP.
+// ---------------------------------------------------------------------------
+
+/// The gate on acknowledging (and later promoting). Precedence: a bearer
+/// token, if presented, is authoritative and never falls through, so a CI
+/// job with a revoked token gets a clear 401; else the session cookie, whose
+/// verified email is the actor; else, only with sign-in off, the typed name
+/// header that every other human action still uses.
+async fn require_session(
+    State(st): State<AppState>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(supplied) = bearer_token(req.headers()) {
+        return match st.mutation_auth.service_token.as_deref() {
+            Some(expected) if service_token_matches(expected, supplied) => {
+                req.extensions_mut()
+                    .insert(AuthenticatedActor(SERVICE_ACTOR.to_owned()));
+                req.extensions_mut().insert(ActorSubject(None));
+                next.run(req).await
+            }
+            _ => error_resp(401, "invalid bearer token"),
+        };
+    }
+    if let Some(session) = session_from_headers(&st, req.headers()) {
+        // The domain gate again, not only at login: an account moved out of
+        // the allowed domains is out as soon as the list changes, not when
+        // its cookie expires.
+        if !st.auth.config().domain_allowed(&session.email) {
+            return error_resp(401, "this account is no longer allowed to sign in");
+        }
+        req.extensions_mut()
+            .insert(AuthenticatedActor(session.email));
+        req.extensions_mut()
+            .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
+        return next.run(req).await;
+    }
+    if !st.auth.enabled() {
+        return match actor_from_headers(req.headers()) {
+            Some(actor) => {
+                req.extensions_mut().insert(AuthenticatedActor(actor));
+                req.extensions_mut().insert(ActorSubject(None));
+                next.run(req).await
+            }
+            None => error_resp(401, "X-Deja-Actor header required for mutating requests"),
+        };
+    }
+    error_resp(401, "sign in to do this")
+}
+
+fn session_from_headers(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Option<deja_orchestrator::auth::session::Session> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    let value = deja_orchestrator::auth::session::cookie_value(
+        raw,
+        deja_orchestrator::auth::SESSION_COOKIE,
+    )?;
+    st.auth.signer.verify_session(value).ok()
+}
+
+/// The scheme and host the browser used, as the ingress reports them.
+fn request_origin(headers: &HeaderMap) -> (String, String) {
+    let h = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or("").trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let scheme = h("x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
+    let host = h("x-forwarded-host")
+        .or_else(|| h("host"))
+        .unwrap_or_else(|| "localhost".to_owned());
+    (scheme, host)
+}
+
+fn set_cookie(name: &str, value: &str, max_age: Option<u64>, secure: bool) -> String {
+    let mut c = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax");
+    if let Some(a) = max_age {
+        c.push_str(&format!("; Max-Age={a}"));
+    }
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+fn redirect_with_cookies(location: &str, cookies: &[String]) -> Response {
+    let mut b = Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, location);
+    for c in cookies {
+        b = b.header(header::SET_COOKIE, c);
+    }
+    b.body(axum::body::Body::empty())
+        .unwrap_or_else(|_| error_resp(500, "redirect"))
+}
+
+type Query = axum::extract::Query<std::collections::HashMap<String, String>>;
+
+/// `GET /auth/login/start?return_url=/r/…`: sign the state cookie and send
+/// the browser to Google.
+async fn auth_login_start(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): Query,
+) -> Response {
+    use deja_orchestrator::auth::{self, google, session};
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(404, "sign-in is not configured on this deployment");
+    }
+    let return_url = auth::safe_return_url(q.get("return_url").map(String::as_str));
+    let state = session::random_nonce();
+    let id_nonce = session::random_nonce();
+    let cookie = st.auth.signer.sign_state(&state, &id_nonce, &return_url);
+    let (scheme, host) = request_origin(&headers);
+    let redirect_uri = format!("{scheme}://{host}/auth/callback");
+    let url = google::authorization_url(
+        &st.auth.endpoints,
+        &cfg.client_id,
+        &redirect_uri,
+        &state,
+        &id_nonce,
+    );
+    redirect_with_cookies(
+        &url,
+        &[set_cookie(
+            auth::STATE_COOKIE,
+            &cookie,
+            Some(session::STATE_MAX_AGE.as_secs()),
+            cfg.cookie_secure,
+        )],
+    )
+}
+
+/// `GET /auth/callback?code=&state=`: the state check, the code exchange,
+/// the ID-token verification (signature, audience, issuer, expiry, nonce),
+/// the domain gate, then the session cookie and the way back.
+async fn auth_callback(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): Query,
+) -> Response {
+    use deja_orchestrator::auth::{self, google, session};
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(404, "sign-in is not configured on this deployment");
+    }
+    let (scheme, host) = request_origin(&headers);
+    let secure = cfg.cookie_secure;
+    let clear_state = set_cookie(auth::STATE_COOKIE, "", Some(0), secure);
+    let fail = |code: &str| {
+        redirect_with_cookies(
+            &format!("/login?error={code}"),
+            std::slice::from_ref(&clear_state),
+        )
+    };
+    let state_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| session::cookie_value(raw, auth::STATE_COOKIE).map(str::to_owned));
+    let Some(state_cookie) = state_cookie else {
+        return fail("state_mismatch");
+    };
+    let sent_state = q.get("state").map(String::as_str).unwrap_or("");
+    let Ok((return_url, id_nonce)) = st.auth.signer.verify_state(&state_cookie, sent_state) else {
+        return fail("state_mismatch");
+    };
+    let Some(code) = q.get("code").cloned().filter(|c| !c.is_empty()) else {
+        return fail("exchange");
+    };
+    let redirect_uri = format!("{scheme}://{host}/auth/callback");
+    let auth_state = st.auth.clone();
+    let (client_id, client_secret) = (cfg.client_id.clone(), cfg.client_secret.clone());
+    // Both the exchange and a key fetch are blocking HTTP; off the runtime.
+    let verified = tokio::task::spawn_blocking(move || {
+        let id_token = google::exchange_code(
+            &auth_state.endpoints,
+            &client_id,
+            &client_secret,
+            &code,
+            &redirect_uri,
+        )
+        .map_err(|e| ("exchange", e))?;
+        auth_state
+            .verifier
+            .verify(&id_token, Some(&id_nonce))
+            .map_err(|e| ("verify", e))
+    })
+    .await;
+    let claims = match verified {
+        Ok(Ok(c)) => c,
+        Ok(Err((code, why))) => {
+            eprintln!("deja-orchestrator: sign-in failed at {code}: {why}");
+            return fail(code);
+        }
+        Err(e) => {
+            eprintln!("deja-orchestrator: sign-in task failed: {e}");
+            return fail("verify");
+        }
+    };
+    let email = claims.email.unwrap_or_default();
+    if !cfg.domain_allowed(&email) {
+        eprintln!("deja-orchestrator: sign-in refused: account not in the allowed domains");
+        return fail("domain");
+    }
+    let session = st.auth.signer.new_session(
+        &claims.sub,
+        &email,
+        &claims.name,
+        &claims.picture,
+        cfg.session_duration,
+    );
+    let cookie = st.auth.signer.sign_session(&session);
+    if let Some(store) = &st.store {
+        let _ = store
+            .audit(
+                &email,
+                "auth.login",
+                "session",
+                &email,
+                &serde_json::json!({}),
+            )
+            .await;
+    }
+    redirect_with_cookies(
+        &return_url,
+        &[
+            set_cookie(
+                auth::SESSION_COOKIE,
+                &cookie,
+                Some(cfg.session_duration.as_secs()),
+                secure,
+            ),
+            clear_state,
+        ],
+    )
+}
+
+/// `POST /auth/logout`: forget the session.
+async fn auth_logout(State(st): State<AppState>) -> Response {
+    let mut r = json_ok(serde_json::json!({ "ok": true }));
+    let cleared = set_cookie(
+        deja_orchestrator::auth::SESSION_COOKIE,
+        "",
+        Some(0),
+        st.auth.config().cookie_secure,
+    );
+    if let Ok(v) = cleared.parse() {
+        r.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    r
+}
+
+/// `GET /api/v1/auth/me`: what the viewer draws its header from. Never 401:
+/// an anonymous visitor gets `authenticated: false` and decides what to show.
+async fn v1_auth_me(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return json_ok(serde_json::json!({ "configured": false, "authenticated": false }));
+    }
+    match session_from_headers(&st, &headers) {
+        // The same gate the actions apply: an account that left the allowed
+        // domains is told so here, not at the first press of a button.
+        Some(s) if !cfg.domain_allowed(&s.email) => json_ok(serde_json::json!({
+            "configured": true,
+            "authenticated": false,
+            "reason": "this account is no longer allowed to sign in",
+        })),
+        Some(s) => json_ok(serde_json::json!({
+            "configured": true,
+            "authenticated": true,
+            "email": s.email,
+            "name": s.name,
+            "picture": s.picture,
+            "roles": cfg.roles_for(&s.email),
+        })),
+        None => json_ok(serde_json::json!({ "configured": true, "authenticated": false })),
+    }
 }
 
 fn actor_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -2840,6 +3185,8 @@ fn acknowledgement_from_row(
         proposed_by: r.proposed_by.clone(),
         acknowledged_by: r.acknowledged_by.clone(),
         withdrawn: r.withdrawn_at.is_some(),
+        proposed_by_sub: r.proposed_by_sub.clone(),
+        acknowledged_by_sub: r.acknowledged_by_sub.clone(),
     })
 }
 
@@ -2918,7 +3265,15 @@ async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_js
         Ok(d) => d,
         Err(e) => return failed(body, format!("the cached delta would not decode: {e}")),
     };
-    divergence::acknowledgement::apply(&mut delta, &acks, gh.change_id.as_deref());
+    // With sign-in on, only a signed-in confirmation counts: a decision from
+    // before it would otherwise pass the gate for as long as the change id
+    // held, however it had been given.
+    divergence::acknowledgement::apply(
+        &mut delta,
+        &acks,
+        gh.change_id.as_deref(),
+        st.auth.enabled(),
+    );
     delta.verdict.unread_acknowledgements = unread;
     body["rows"] = serde_json::to_value(&delta.rows).unwrap_or_default();
     body["verdict"] = serde_json::to_value(&delta.verdict).unwrap_or_default();
@@ -2930,6 +3285,85 @@ async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_js
 /// are typed.
 fn may_confirm(proposer: &str, actor: &str) -> bool {
     !proposer.trim().eq_ignore_ascii_case(actor.trim())
+}
+
+/// Why a confirmation is refused, in the words the person sees.
+fn confirm_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer: &str,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return (!may_confirm(proposer, actor))
+            .then_some("a proposal is confirmed by someone other than its proposer");
+    }
+    // The epoch: a proposal carries the subject of the person who made it,
+    // or none when it was made before sign-in or by the pipeline's token. A
+    // typed name cannot be told from the signed-in person who typed it, so
+    // it has to be proposed again by someone who is signed in.
+    let Some(proposer_sub) = proposer_sub.filter(|s| !s.is_empty()) else {
+        return Some(if proposer == SERVICE_ACTOR {
+            "this was proposed by the pipeline's token; propose it signed in"
+        } else {
+            "this was proposed before sign-in; propose it again, signed in"
+        });
+    };
+    // Confirming is a person's act: the token never confirms, and a cookie
+    // from before subjects were carried signs in again first.
+    let Some(actor_sub) = actor_sub.filter(|s| !s.is_empty()) else {
+        return Some("acknowledging needs a signed-in person");
+    };
+    if !cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return Some("only a maintainer may acknowledge");
+    }
+    // Same person under two emails is still one person.
+    (actor_sub == proposer_sub)
+        .then_some("a proposal is confirmed by someone other than its proposer")
+}
+
+/// The name the pipeline's bearer token acts under.
+const SERVICE_ACTOR: &str = "svc:pipeline";
+
+/// The rule once sign-in is on: a maintainer, not the proposer, and a
+/// proposal made while signed in. Off, the second-person rule alone. The
+/// handler asks `confirm_refusal` for the reason; this is the yes/no form
+/// the tests read.
+#[cfg(test)]
+fn may_confirm_under(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer: &str,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> bool {
+    confirm_refusal(cfg, proposer, proposer_sub, actor, actor_sub).is_none()
+}
+
+/// Withdrawing: a maintainer or the proposer once sign-in is on; anyone
+/// before, as before.
+fn may_withdraw_under(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> bool {
+    if !cfg.enabled {
+        return true;
+    }
+    if cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return true;
+    }
+    // The proposer, by subject: a typed name from before sign-in is nobody
+    // in particular, so such a row is a maintainer's to withdraw.
+    match (
+        proposer_sub.filter(|s| !s.is_empty()),
+        actor_sub.filter(|s| !s.is_empty()),
+    ) {
+        (Some(p), Some(a)) => p == a,
+        _ => false,
+    }
 }
 
 /// How many of a pull request's runs have their verdict re-stated after a
@@ -3083,6 +3517,7 @@ struct ProposeAcknowledgements {
 async fn v1_propose_acknowledgements(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
     id: RunId,
     body: axum::body::Bytes,
 ) -> Response {
@@ -3173,7 +3608,16 @@ async fn v1_propose_acknowledgements(
         );
     };
     let ids = match store
-        .acknowledgements_propose(&gh.repo, pr, change_id, &id, &actor.0, note, &items)
+        .acknowledgements_propose(
+            &gh.repo,
+            pr,
+            change_id,
+            &id,
+            &actor.0,
+            subject.0.as_deref(),
+            note,
+            &items,
+        )
         .await
     {
         Ok(ids) => ids,
@@ -3195,6 +3639,7 @@ async fn v1_propose_acknowledgements(
 async fn v1_confirm_acknowledgement(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
     Path(ack_id): Path<i64>,
 ) -> Response {
     let store = match require_store(&st) {
@@ -3206,16 +3651,23 @@ async fn v1_confirm_acknowledgement(
         Ok(None) => return error_resp(404, "no such acknowledgement"),
         Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
     };
-    if !may_confirm(&row.proposed_by, &actor.0) {
-        return error_resp(
-            403,
-            "a proposal is confirmed by someone other than its proposer",
-        );
+    let cfg = st.auth.config();
+    if let Some(why) = confirm_refusal(
+        &cfg,
+        &row.proposed_by,
+        row.proposed_by_sub.as_deref(),
+        &actor.0,
+        subject.0.as_deref(),
+    ) {
+        return error_resp(403, why);
     }
     if row.withdrawn_at.is_some() {
         return error_resp(409, "this acknowledgement was withdrawn");
     }
-    match store.acknowledgement_confirm(ack_id, &actor.0).await {
+    match store
+        .acknowledgement_confirm(ack_id, &actor.0, subject.0.as_deref())
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return error_resp(409, "already confirmed"),
         Err(e) => return error_resp(500, &format!("confirm: {e}")),
@@ -3237,6 +3689,7 @@ async fn v1_confirm_acknowledgement(
 async fn v1_withdraw_acknowledgement(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
     Path(ack_id): Path<i64>,
 ) -> Response {
     let store = match require_store(&st) {
@@ -3248,7 +3701,26 @@ async fn v1_withdraw_acknowledgement(
         Ok(None) => return error_resp(404, "no such acknowledgement"),
         Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
     };
-    match store.acknowledgement_withdraw(ack_id, &actor.0).await {
+    let cfg = st.auth.config();
+    if !may_withdraw_under(
+        &cfg,
+        row.proposed_by_sub.as_deref(),
+        &actor.0,
+        subject.0.as_deref(),
+    ) {
+        return error_resp(
+            403,
+            if row.proposed_by_sub.is_none() {
+                "this was proposed before sign-in; only a maintainer may withdraw it"
+            } else {
+                "only a maintainer or the signed-in proposer may withdraw"
+            },
+        );
+    }
+    match store
+        .acknowledgement_withdraw(ack_id, &actor.0, subject.0.as_deref())
+        .await
+    {
         Ok(true) => {}
         Ok(false) => return error_resp(409, "already withdrawn"),
         Err(e) => return error_resp(500, &format!("withdraw: {e}")),
@@ -4229,6 +4701,7 @@ mod tests {
                 service_token: None,
             },
             executor: Arc::new(ExecutorSelection::Compose),
+            auth: deja_orchestrator::auth::AuthState::disabled(),
             restates: Arc::default(),
         }
     }
@@ -5537,5 +6010,436 @@ mod acknowledgement_rules {
         assert!(!may_confirm("asha", "asha"));
         assert!(!may_confirm(" Asha ", "asha"));
         assert!(may_confirm("asha", "ravi"));
+    }
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sign_in {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use deja_orchestrator::auth::{self, google, session, AuthConfig, AuthState};
+    use tower::ServiceExt;
+
+    async fn whoami(Extension(actor): Extension<AuthenticatedActor>) -> String {
+        actor.0
+    }
+
+    fn state(auth: Arc<AuthState>, service_token: Option<&str>) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(HarnessRoot::new(dir.path()).unwrap());
+        std::mem::forget(dir);
+        AppState {
+            root,
+            store: None,
+            mutation_auth: MutationAuth {
+                service_token: service_token.map(Arc::<str>::from),
+            },
+            executor: Arc::new(ExecutorSelection::Compose),
+            auth,
+            restates: Arc::default(),
+        }
+    }
+
+    async fn whose(Extension(subject): Extension<ActorSubject>) -> String {
+        subject.0.unwrap_or_else(|| "none".to_owned())
+    }
+
+    fn router(st: AppState) -> Router {
+        let gated = middleware::from_fn_with_state(st.clone(), require_session);
+        Router::new()
+            .route("/gated", post(whoami).route_layer(gated.clone()))
+            .route("/gated-subject", post(whose).route_layer(gated))
+            .route("/api/v1/auth/me", get(v1_auth_me))
+            .route("/auth/login/start", get(auth_login_start))
+            .route("/auth/callback", get(auth_callback))
+            .with_state(st)
+    }
+
+    fn enabled(maintainers: &[&str]) -> (Arc<AuthState>, session::Signer) {
+        let mut cfg = AuthConfig {
+            enabled: true,
+            client_id: "cid".into(),
+            client_secret: "sec".into(),
+            ..AuthConfig::default()
+        };
+        cfg.roles.insert(
+            auth::ROLE_MAINTAINER.to_owned(),
+            maintainers.iter().map(|m| m.to_string()).collect(),
+        );
+        let state = AuthState::with_parts(
+            cfg,
+            session::Signer::new(b"test-key"),
+            google::Verifier::with_keys("cid".into(), jsonwebtoken::jwk::JwkSet { keys: vec![] }),
+        );
+        (state, session::Signer::new(b"test-key"))
+    }
+
+    fn session_cookie(signer: &session::Signer, email: &str) -> String {
+        let s = signer.new_session(
+            &format!("sub-of-{email}"),
+            email,
+            "",
+            "",
+            std::time::Duration::from_secs(60),
+        );
+        format!("{}={}", auth::SESSION_COOKIE, signer.sign_session(&s))
+    }
+
+    async fn call(router: Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn post_gated() -> axum::http::request::Builder {
+        Request::builder().method(Method::POST).uri("/gated")
+    }
+
+    #[tokio::test]
+    async fn with_sign_in_off_the_typed_name_still_works_and_nothing_else_is_needed() {
+        let r = router(state(AuthState::disabled(), None));
+        let (st, body) = call(
+            r.clone(),
+            post_gated()
+                .header("X-Deja-Actor", "asha")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "asha"));
+        let (st, _) = call(r, post_gated().body(Body::empty()).unwrap()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn with_sign_in_on_a_typed_name_is_not_enough() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header("X-Deja-Actor", "asha")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_makes_the_email_the_actor() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, body) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "asha@juspay.in"));
+    }
+
+    #[tokio::test]
+    async fn a_bad_bearer_token_never_falls_back_to_the_cookie() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, Some("right")));
+        let (st, _) = call(
+            r.clone(),
+            post_gated()
+                .header(header::AUTHORIZATION, "Bearer wrong")
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, body) = call(
+            r,
+            post_gated()
+                .header(header::AUTHORIZATION, "Bearer right")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "svc:pipeline"));
+    }
+
+    #[tokio::test]
+    async fn a_tampered_or_foreign_cookie_is_anonymous() {
+        let (a, _) = enabled(&[]);
+        let other = session::Signer::new(b"someone-elses-key");
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&other, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_account_outside_the_allowed_domains_is_out_even_with_a_live_cookie() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&signer, "asha@example.com"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn who_am_i_tells_the_viewer_what_to_draw() {
+        let r = router(state(AuthState::disabled(), None));
+        let me = || Request::builder().uri("/api/v1/auth/me");
+        let (_, body) = call(r, me().body(Body::empty()).unwrap()).await;
+        assert!(body.contains("\"configured\":false"));
+        let (a, signer) = enabled(&["ravi@juspay.in"]);
+        let r = router(state(a, None));
+        let (_, body) = call(r.clone(), me().body(Body::empty()).unwrap()).await;
+        assert!(body.contains("\"configured\":true") && body.contains("\"authenticated\":false"));
+        let (_, body) = call(
+            r,
+            me().header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("\"email\":\"ravi@juspay.in\"") && body.contains("maintainer"));
+    }
+
+    #[tokio::test]
+    async fn login_start_sends_the_browser_to_google_with_a_state_cookie() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login/start?return_url=/r/x")
+                    .header("host", "deja.example")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.starts_with("https://accounts.google.com/o/oauth2/v2/auth?client_id=cid"));
+        assert!(loc.contains("redirect_uri=https%3A%2F%2Fdeja.example%2Fauth%2Fcallback"));
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with(&format!("{}=", auth::STATE_COOKIE)));
+        assert!(cookie.contains("Secure") && cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn login_start_is_absent_when_sign_in_is_off_and_the_callback_checks_state() {
+        let r = router(state(AuthState::disabled(), None));
+        let (st, _) = call(
+            r,
+            Request::builder()
+                .uri("/auth/login/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let cookie = format!(
+            "{}={}",
+            auth::STATE_COOKIE,
+            signer.sign_state("abc", "n", "/r/x")
+        );
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/callback?code=c&state=not-abc")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/login?error=state_mismatch"
+        );
+    }
+
+    #[test]
+    fn the_confirm_and_withdraw_rules_follow_the_lists_once_sign_in_is_on() {
+        let (a, _) = enabled(&["ravi@juspay.in"]);
+        let cfg = a.config();
+        let ok = |p: &str, ps: Option<&str>, a: &str, as_: Option<&str>| {
+            may_confirm_under(&cfg, p, ps, a, as_)
+        };
+        assert!(ok(
+            "asha@juspay.in",
+            Some("s-asha"),
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        assert!(
+            !ok(
+                "asha@juspay.in",
+                Some("s-asha"),
+                "dev@juspay.in",
+                Some("s-dev")
+            ),
+            "not a maintainer"
+        );
+        assert!(
+            !ok(
+                "ravi@juspay.in",
+                Some("s-ravi"),
+                "ravi@juspay.in",
+                Some("s-ravi")
+            ),
+            "own proposal"
+        );
+        // The epoch: a proposal without a subject was made before sign-in,
+        // or by the pipeline's token, and each says which.
+        assert_eq!(
+            confirm_refusal(&cfg, "asha", None, "ravi@juspay.in", Some("s-ravi")),
+            Some("this was proposed before sign-in; propose it again, signed in")
+        );
+        assert_eq!(
+            confirm_refusal(&cfg, SERVICE_ACTOR, None, "ravi@juspay.in", Some("s-ravi")),
+            Some("this was proposed by the pipeline's token; propose it signed in")
+        );
+        // One person under two emails is still the proposer.
+        assert!(!ok(
+            "old@juspay.in",
+            Some("s-ravi"),
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        // Confirming without a subject of one's own is refused, whoever asks.
+        assert_eq!(
+            confirm_refusal(
+                &cfg,
+                "asha@juspay.in",
+                Some("s-asha"),
+                "ravi@juspay.in",
+                None
+            ),
+            Some("acknowledging needs a signed-in person")
+        );
+        // Withdrawing: a maintainer, or the proposer by subject; a row from
+        // before sign-in is a maintainer's to withdraw.
+        assert!(may_withdraw_under(
+            &cfg,
+            Some("s-asha"),
+            "asha@juspay.in",
+            Some("s-asha")
+        ));
+        assert!(
+            may_withdraw_under(&cfg, Some("s-asha"), "ravi@juspay.in", Some("s-ravi")),
+            "a maintainer"
+        );
+        assert!(!may_withdraw_under(
+            &cfg,
+            Some("s-asha"),
+            "dev@juspay.in",
+            Some("s-dev")
+        ));
+        assert!(
+            !may_withdraw_under(&cfg, None, "asha@juspay.in", Some("s-asha")),
+            "typed before sign-in"
+        );
+        assert!(may_withdraw_under(
+            &cfg,
+            None,
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        // Off, the old rules: a second person confirms, anyone withdraws.
+        let off = AuthState::disabled().config();
+        assert!(may_confirm_under(&off, "asha", None, "dev", None));
+        assert!(!may_confirm_under(&off, "asha", None, "asha", None));
+        assert!(may_withdraw_under(&off, None, "dev", None));
+    }
+
+    /// The cookies carry `Secure` by the setting, not by a header the proxy
+    /// may or may not send.
+    #[tokio::test]
+    async fn the_secure_flag_is_the_setting_not_the_forwarded_scheme() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login/start")
+                    .header("host", "deja.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("Secure"), "{cookie}");
+    }
+
+    /// The subject travels from the cookie to the handler beside the name;
+    /// the token and a typed name carry none.
+    #[tokio::test]
+    async fn the_subject_reaches_the_handler_beside_the_name() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, Some("right")));
+        let (st, body) = call(
+            r.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gated-subject")
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (st, body.as_str()),
+            (StatusCode::OK, "sub-of-asha@juspay.in")
+        );
+        let (_, body) = call(
+            r,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gated-subject")
+                .header(header::AUTHORIZATION, "Bearer right")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body, "none");
     }
 }

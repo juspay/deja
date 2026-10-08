@@ -389,7 +389,42 @@ export type RunGraph = {
   record_note?: string | null;
 };
 
+/** Who the server says is signed in. `null` until the probe has answered. */
+export type Me = {
+  configured: boolean;
+  authenticated: boolean;
+  email?: string;
+  name?: string;
+  picture?: string;
+  roles?: string[];
+};
+
+let signedIn: Me | null = null;
+
+/** Remember the probe's answer, so `actor()` can prefer the verified email. */
+/** The event the sign-in dialog listens for: fired by a gated action tried
+ *  without a session, and by the pages before they even send one. */
+export const SIGN_IN_EVENT = "deja:sign-in-required";
+
+export function askToSignIn() {
+  window.dispatchEvent(new CustomEvent(SIGN_IN_EVENT));
+}
+
+export function rememberMe(m: Me) {
+  signedIn = m;
+}
+
+export function currentMe(): Me | null {
+  return signedIn;
+}
+
+/**
+ * The actor for this browser: the signed-in email when sign-in is on and a
+ * session exists, else the typed name. The gated routes ignore the header
+ * once sign-in is on; the ungated ones (creating a run) still record it.
+ */
 export function actor(): string {
+  if (signedIn?.authenticated && signedIn.email) return signedIn.email;
   return localStorage.getItem("deja-actor") || "";
 }
 
@@ -410,6 +445,11 @@ export type ApiError = Error & { status?: number };
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
+    // A gated action without a session: ask the person to sign in, in
+    // place, rather than navigating them away from what they were doing.
+    if (resp.status === 401 && signedIn?.configured && !signedIn.authenticated && window.location.pathname !== "/login") {
+      askToSignIn();
+    }
     let detail = `${resp.status}`;
     try {
       const body = (await resp.json()) as { error?: string };
@@ -496,6 +536,8 @@ export const api = {
       `/api/v1/runs/${id}/delta?against=${encodeURIComponent(against)}`,
     ),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
+  me: () => request<Me>("/api/v1/auth/me"),
+  logout: () => fetch("/auth/logout", { method: "POST", credentials: "same-origin" }),
 
   /** The pull request's acknowledgements, withdrawn ones included; 404 when
    *  the run names no pull request. */

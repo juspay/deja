@@ -51,6 +51,10 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
+jsonwebtoken = "9"
+hmac = "0.12"
+rand = "0.8"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
@@ -58,6 +62,7 @@ deja-context = { path = "../deja-context" }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
+rsa = "0.9"
 
 [[bin]]
 name = "deja-orchestrator"
