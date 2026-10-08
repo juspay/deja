@@ -588,6 +588,27 @@ impl Store {
         Ok(())
     }
 
+    /// Re-point a run at another baseline. The delta verdict goes back to
+    /// pending with it: whatever was settled was settled against the old
+    /// baseline, and the row must not keep saying so.
+    pub async fn set_run_delta_against(
+        &self,
+        run_id: &str,
+        baseline_run_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE replay_runs
+             SET params = jsonb_set(params, '{delta_against}', to_jsonb($2::text), true),
+                 delta_verdict = 'pending'
+             WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .bind(baseline_run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Every completed run created to be measured against `baseline_run_id`
     /// (`params.delta_against`), so their deltas can be settled when the
     /// baseline finishes.

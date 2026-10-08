@@ -35,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
@@ -249,6 +249,8 @@ fn app_router(state: AppState) -> Router {
     let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
     // Killing a run is a human action like creating one: same auth, and audited.
     let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
+    let repoint_baseline =
+        put(v1_repoint_baseline).route_layer(middleware::from_fn(require_human_auth));
     // Acknowledging a divergence is a human action, twice over: one person
     // proposes, another confirms. Same auth as creating a run, and audited.
     let propose_acknowledgements =
@@ -276,6 +278,7 @@ fn app_router(state: AppState) -> Router {
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
         .route("/runs/{run_id}/kill", kill_run_route)
+        .route("/runs/{run_id}/baseline", repoint_baseline)
         .route("/runs/{run_id}", get(v1_get_run))
         .route("/runs/{run_id}/stages", get(v1_run_stages))
         .route("/runs/{run_id}/logs", get(v1_run_logs))
@@ -1542,6 +1545,89 @@ fn live_json(live: &Run) -> serde_json::Value {
 /// the snapshot carries the worker's live stage/step (file store is the
 /// worker's source of truth mid-run). Degrades to the snapshot alone when the
 /// store is down, so script polling works file-only too.
+/// `PUT /api/v1/runs/{run_id}/baseline` — re-point a run at another baseline.
+///
+/// A run names the baseline it is measured against when it is created
+/// (`delta_against`). The pipeline that created it may replay the baseline
+/// again afterwards — the tape was resealed between the two runs and the
+/// delta refused the pair — and nothing could tell deja. The run kept naming
+/// the first baseline, so its row stayed refused and the report opened the
+/// refused comparison, while the pipeline had already measured it against the
+/// second. The re-point says so. The delta is settled again against the new
+/// baseline, off this request, exactly as it would be on either run's finish.
+async fn v1_repoint_baseline(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    run_id: RunId,
+    body: axum::body::Bytes,
+) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Repoint {
+        delta_against: String,
+    }
+    let Repoint { delta_against } = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_resp(400, &format!("parse body: {e}")),
+    };
+    let against = match delta_against.parse::<RunId>() {
+        Ok(id) => id,
+        Err(e) => return error_resp(400, &format!("delta_against: {e}")),
+    };
+    if against == run_id {
+        return error_resp(400, "delta_against: a run is not its own baseline");
+    }
+
+    // The live record first, as the ingest path writes it: a run the store has
+    // not seen (or no store at all) is still re-pointed where its delta is read.
+    let mut found = false;
+    let mut previous: Option<String> = None;
+    if let Some(path) = confined(st.root.run_path(&run_id), &st.root.root.join("runs")) {
+        let mut run: Run = match deja_orchestrator::read_json(&path) {
+            Ok(run) => run,
+            Err(e) => return error_resp(500, &format!("read run: {e}")),
+        };
+        previous = run.spec.delta_against.clone();
+        run.spec.delta_against = Some(against.to_string());
+        if let Err(e) = deja_orchestrator::write_json(&path, &run) {
+            return error_resp(500, &format!("persist run: {e}"));
+        }
+        found = true;
+    }
+    if let Some(store) = &st.store {
+        if previous.is_none() {
+            previous = run_params_for(&st, &run_id)
+                .await
+                .and_then(|p| p.delta_against);
+        }
+        match store.set_run_delta_against(&run_id, &against).await {
+            Ok(updated) => found |= updated,
+            Err(e) => return error_resp(500, &format!("re-point run: {e}")),
+        }
+    }
+    if !found {
+        return error_resp(404, "run not found");
+    }
+
+    if let Some(store) = &st.store {
+        let _ = store
+            .audit(
+                &actor.0,
+                "run.repoint_baseline",
+                "run",
+                &run_id,
+                &serde_json::json!({ "from": previous, "to": against.as_str() }),
+            )
+            .await;
+    }
+    // Settled against the new baseline, or left pending until it finishes.
+    tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
+    json_ok(serde_json::json!({
+        "run_id": run_id.as_str(),
+        "delta_against": against.as_str(),
+        "previous": previous,
+    }))
+}
+
 async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
     let row = match &st.store {
         Some(store) => match store.get_run(&id).await {
@@ -4320,6 +4406,75 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         app_router(state).oneshot(req).await.unwrap().status()
+    }
+
+    async fn put_baseline(
+        state: AppState,
+        run_id: &str,
+        body: serde_json::Value,
+        actor: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/runs/{run_id}/baseline"))
+            .header("content-type", "application/json");
+        if let Some(actor) = actor {
+            req = req.header("X-Deja-Actor", actor);
+        }
+        let req = req.body(Body::from(body.to_string())).unwrap();
+        app_router(state).oneshot(req).await.unwrap().status()
+    }
+
+    /// A run re-pointed at another baseline names that baseline from then on,
+    /// where its delta is read from. Each refusal is the kind the pipeline
+    /// would otherwise discover later: no actor, no such run, a baseline that
+    /// is not a run id, a run named as its own baseline.
+    #[tokio::test]
+    async fn a_run_can_be_repointed_at_another_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let mut run = pending_run("run-y");
+        run.spec.delta_against = Some("run-m1".to_owned());
+        deja_orchestrator::write_json(&state.root.run_path("run-y"), &run).unwrap();
+        let against = |id: &str| serde_json::json!({ "delta_against": id });
+
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-m2"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-missing", against("run-m2"), Some("ci")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("../run-m2"), Some("ci")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-y"), Some("ci")).await,
+            StatusCode::BAD_REQUEST
+        );
+        let untouched: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(
+            untouched.spec.delta_against.as_deref(),
+            Some("run-m1"),
+            "a refused re-point changes nothing"
+        );
+
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-m2"), Some("ci")).await,
+            StatusCode::OK
+        );
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(run.spec.delta_against.as_deref(), Some("run-m2"));
+        assert_eq!(
+            run_params_for(&state, "run-y")
+                .await
+                .and_then(|p| p.delta_against)
+                .as_deref(),
+            Some("run-m2"),
+            "the delta reads the baseline from the same record"
+        );
     }
 
     #[tokio::test]
