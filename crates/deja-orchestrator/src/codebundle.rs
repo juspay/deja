@@ -523,14 +523,16 @@ pub fn bundle_migrations_from_targz<R: Read>(
     Ok((out, fp))
 }
 
-/// A `ureq` agent that honors an outbound HTTP proxy for the codeload fetch.
+/// A `ureq` agent that honors an outbound HTTP proxy for the orchestrator's
+/// calls to the internet: the codeload fetch here, and the Google token and
+/// signing-key calls in `auth::google`.
 ///
 /// The orchestrator's hosting environment may have no direct internet egress —
 /// all outbound traffic goes through a forward proxy (e.g. squid) — and `ureq`
 /// does NOT read proxy environment variables on its own, so a bare `ureq::get`
 /// ignores the proxy and the connection times out. The proxy is read from
-/// `DEJA_HTTP_PROXY` first — a DEDICATED var so it scopes to this one outbound
-/// call and never redirects the in-cluster k8s API / S3 clients — then falls
+/// `DEJA_HTTP_PROXY` first — a DEDICATED var so it scopes to these internet
+/// calls and never redirects the in-cluster k8s API / S3 clients — then falls
 /// back to the conventional `HTTPS_PROXY`/`HTTP_PROXY`. Unset → a direct agent,
 /// so local/demo/CI keep working unchanged.
 pub(crate) fn tarball_agent() -> ureq::Agent {

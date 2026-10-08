@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import {
   createBrowserRouter,
   Link,
@@ -16,7 +16,8 @@ import "@fontsource/inter/latin-500.css";
 import "@fontsource/inter/latin-600.css";
 import "json-diff-kit/dist/viewer.css";
 import "./styles.css";
-import { actor, setActor } from "./lib/api";
+import { SIGN_IN_EVENT, actor, api, setActor } from "./lib/api";
+import { loginUrl, useMe } from "./lib/me";
 import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
 import RunsPage from "./pages/RunsPage";
@@ -24,10 +25,80 @@ import ReportPage from "./pages/ReportPage";
 import DeltaPage from "./pages/DeltaPage";
 import AcknowledgePage from "./pages/AcknowledgePage";
 import AuditPage from "./pages/AuditPage";
+import LoginPage from "./pages/LoginPage";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
+
+/** The identity in the header: the signed-in account when sign-in is on,
+ *  a sign-in link when it is on and there is no session, the typed name
+ *  when it is off. */
+/**
+ * The one dialog for "sign in to do this": opened by any gated action tried
+ * without a session, from wherever the person is, and closed by signing in
+ * (a navigation) or by Not now. Native <dialog>, like the launch modal.
+ */
+function SignInDialog() {
+  const ref = React.useRef<HTMLDialogElement>(null);
+  React.useEffect(() => {
+    const open = () => {
+      const d = ref.current;
+      if (d && !d.open) d.showModal();
+    };
+    window.addEventListener(SIGN_IN_EVENT, open);
+    return () => window.removeEventListener(SIGN_IN_EVENT, open);
+  }, []);
+  return (
+    <dialog ref={ref} className="signin" aria-labelledby="signin-title">
+      <h2 id="signin-title">Sign in to do this</h2>
+      <p className="hint">Marking a divergence as intended, acknowledging one and withdrawing one are recorded against a person. Reading never needs an account.</p>
+      <div className="signin-actions">
+        <a className="btn primary" href={loginUrl()}>
+          Continue with Google
+        </a>
+        <button className="btn quiet" onClick={() => ref.current?.close()}>
+          Not now
+        </button>
+      </div>
+      <p className="hint">You will come back to this page afterwards.</p>
+    </dialog>
+  );
+}
+
+function Identity() {
+  const me = useMe();
+  const qc = useQueryClient();
+  if (me.isLoading) return null;
+  if (me.data?.configured) {
+    if (!me.data.authenticated) {
+      return (
+        <a className="btn signin" href={loginUrl()}>
+          Sign in
+        </a>
+      );
+    }
+    const roles = (me.data.roles ?? []).filter((r) => r !== "viewer");
+    return (
+      <span className="whoami" title={me.data.name || me.data.email}>
+        {me.data.picture && <img src={me.data.picture} alt="" />}
+        <span className="email">{me.data.email}</span>
+        {roles.length > 0 && <span className="roles">{roles.join(" · ")}</span>}
+        <button
+          className="btn quiet"
+          onClick={async () => {
+            await api.logout();
+            await qc.invalidateQueries({ queryKey: ["me"] });
+            window.location.href = "/";
+          }}
+        >
+          Sign out
+        </button>
+      </span>
+    );
+  }
+  return <ActorBox />;
+}
 
 function ActorBox() {
   const [name, setName] = React.useState(actor());
@@ -65,10 +136,11 @@ function Shell() {
           {tab("/recordings", "Recordings")}
           {tab("/audit", "Audit")}
         </nav>
-        <ActorBox />
+        <Identity />
       </header>
       <main>
         <Outlet />
+        <SignInDialog />
       </main>
     </>
   );
@@ -92,6 +164,7 @@ const router = createBrowserRouter([
       // HOME is the form. The list is a destination you go to, not the thing you
       // land on when you want to start a run.
       { path: "/", element: <NewRunPage /> },
+      { path: "/login", element: <LoginPage /> },
       { path: "/replays/new", element: <Navigate to="/" replace /> },
       { path: "/runs", element: <RunsPage /> },
       { path: "/r/:runId", element: <ReportPage /> },
