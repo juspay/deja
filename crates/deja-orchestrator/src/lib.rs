@@ -368,6 +368,93 @@ pub fn system_env_var(system: &str, suffix: &str) -> String {
     format!("DEJA_{}_{suffix}", system.to_uppercase().replace('-', "_"))
 }
 
+/// The pull request a run was created for, as the pipeline knows it. `repo`
+/// is `owner/name`; `change_id` is the patch id of the pull request's own
+/// diff (merge-base to head), which a merge of main into the branch leaves
+/// alone and an author's push changes. Acknowledgements are keyed by the
+/// first two and go stale on the third.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubRef {
+    pub repo: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
+}
+
+impl GithubRef {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut parts = self.repo.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(o), Some(n), None) if !o.is_empty() && !n.is_empty() => {}
+            _ => return Err(format!("repo must be owner/name, got {:?}", self.repo)),
+        }
+        if self.pr_number == 0 {
+            return Err("pr_number must be positive".into());
+        }
+        if self.head_sha.len() < 7 || !self.head_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "head_sha must be a hex commit id, got {:?}",
+                self.head_sha
+            ));
+        }
+        // The change id is what binds an acknowledgement to a version of the
+        // change. Without it a run could not tell that the diff moved, and
+        // every acknowledgement given on an earlier version would still
+        // cover it.
+        if self
+            .change_id
+            .as_deref()
+            .is_none_or(|c| c.trim().is_empty())
+        {
+            return Err(
+                "change_id is required: the patch id of the pull request's own diff".into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The repository name as it is stored and matched: GitHub names are
+    /// case-insensitive, so one spelling is kept.
+    pub fn normalize(&mut self) {
+        self.repo = self.repo.trim().to_ascii_lowercase();
+        if let Some(c) = self.change_id.as_mut() {
+            *c = c.trim().to_owned();
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod github_ref_tests {
+    use super::GithubRef;
+
+    fn gh(repo: &str, change_id: Option<&str>) -> GithubRef {
+        GithubRef {
+            repo: repo.into(),
+            pr_number: 4000,
+            head_sha: "436fc2a31c".into(),
+            change_id: change_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_pull_request_without_a_change_id_is_refused() {
+        assert!(gh("juspay/deja", Some("8d1f3")).validate().is_ok());
+        let err = gh("juspay/deja", None).validate().unwrap_err();
+        assert!(err.contains("change_id"), "{err}");
+        assert!(gh("juspay/deja", Some("  ")).validate().is_err());
+    }
+
+    #[test]
+    fn the_repository_is_kept_in_one_spelling() {
+        let mut g = gh(" Juspay/Hyperswitch ", Some(" c1 "));
+        g.normalize();
+        assert_eq!(g.repo, "juspay/hyperswitch");
+        assert_eq!(g.change_id.as_deref(), Some("c1"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     pub mode: RunMode,
@@ -443,6 +530,9 @@ pub struct RunSpec {
     /// the image tag; never parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The pull request this run was created for, when the pipeline says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRef>,
 }
 
 impl RunSpec {
@@ -559,6 +649,9 @@ pub struct RunParams {
     pub purpose: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The pull request this run was created for, when the pipeline says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRef>,
 }
 
 impl RunParams {
@@ -589,6 +682,7 @@ impl RunParams {
             delta_against: spec.delta_against.clone(),
             purpose: spec.purpose.clone(),
             label: spec.label.clone(),
+            github: spec.github.clone(),
         }
     }
 
@@ -1460,6 +1554,7 @@ mod run_params_tests {
     fn replay_spec() -> RunSpec {
         RunSpec {
             label: None,
+            github: None,
             delta_against: None,
             purpose: None,
             scored_span_namespaces: Vec::new(),

@@ -729,6 +729,7 @@ mod tests {
             run_id: run_id.into(),
             spec: crate::RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -808,6 +809,7 @@ mod tests {
             run_id: "run-43".into(),
             spec: crate::RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),

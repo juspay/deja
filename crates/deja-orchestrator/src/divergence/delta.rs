@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::acknowledgement::{Effective, RowAcknowledgement};
 use super::behaviour_tree::{Address, BehaviourTree, Lane, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -90,6 +91,9 @@ pub struct Row {
     pub blocking: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
+    /// Set by the acknowledgement overlay on a charged row; never cached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledgement: Option<RowAcknowledgement>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -129,6 +133,36 @@ pub struct DeltaVerdict {
     #[serde(default)]
     pub resolved_requests: usize,
     pub reason: String,
+    /// Blocking charged rows covered by a confirmed acknowledgement; set by
+    /// the overlay, never cached.
+    #[serde(default)]
+    pub acknowledged: usize,
+    /// Blocking charged rows covered only by a proposal, not yet confirmed.
+    #[serde(default)]
+    pub proposed: usize,
+    /// Blocking charged rows whose acknowledgement was given on an earlier
+    /// version of the change.
+    #[serde(default)]
+    pub stale: usize,
+    /// The verdict once acknowledgements are counted: what consumers gate on.
+    /// `None` on a delta the overlay has not seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<Effective>,
+    /// Why the acknowledgements could not be laid over this delta, when they
+    /// could not: the store was away, its rows would not read, or the delta
+    /// itself would not decode. `effective` is `None` then and the verdict is
+    /// the pure three-way, which a consumer must not mistake for a decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_failure: Option<String>,
+    /// Acknowledgements of this pull request the overlay could not decode and
+    /// so did not apply. Non-zero means a row may show as acknowledged in the
+    /// history and as uncovered here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread_acknowledgements: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// What the comparison could not cover: requests only one run drove. Their
@@ -331,6 +365,7 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             y: y_side,
             blocking,
             lane,
+            acknowledgement: None,
         });
     }
     // every address lands in exactly one place: a bucket row, clean, or
@@ -463,6 +498,12 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             inherited_requests,
             resolved_requests,
             reason,
+            acknowledged: 0,
+            proposed: 0,
+            stale: 0,
+            effective: None,
+            overlay_failure: None,
+            unread_acknowledgements: 0,
         },
         buckets,
         lanes: lane_summaries,

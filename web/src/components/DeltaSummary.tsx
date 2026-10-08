@@ -16,6 +16,7 @@ import {
 import { candidateRef } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { comparedDiffs, pollPending, readState, sealLine } from "../lib/deltaPanel";
+import { AcknowledgeLine } from "./Acknowledgements";
 
 /**
  * "Compared with main": what a pull request's run changed relative to main
@@ -735,6 +736,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
           ) : (
             <Headline d={d} reqs={reqs} />
           )}
+          <AcknowledgeLine runId={runId} d={d} />
           {mainRead.state === "failed" && (
             <p className="err">
               Main's response diffs could not be read, so its field and status columns are unknown (—): {mainRead.reason}

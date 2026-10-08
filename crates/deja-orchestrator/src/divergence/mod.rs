@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::HarnessRoot;
 
+pub mod acknowledgement;
 pub mod behaviour_tree;
 pub mod delta;
 pub mod ledger;
@@ -8459,6 +8460,7 @@ mod tests {
     ) -> crate::RunSpec {
         let spec = crate::RunSpec {
             label: None,
+            github: None,
             delta_against: None,
             purpose: None,
             scored_span_namespaces: namespaces,
@@ -8550,6 +8552,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
                     label: None,
+                    github: None,
                     delta_against: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
@@ -8675,6 +8678,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
                     label: None,
+                    github: None,
                     delta_against: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
@@ -8875,6 +8879,7 @@ mod tests {
                 run_id: run_id.to_owned(),
                 spec: crate::RunSpec {
                     label: None,
+                    github: None,
                     delta_against: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),

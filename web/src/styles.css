@@ -1142,3 +1142,79 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .delta-vals td.val.rec { color: var(--green-fg); }
 .delta-vals td.val.faint { color: var(--text-faint); }
 .delta-vals td.val.samev { color: var(--text-subtle); }
+
+/* ---- acknowledgements: the rows a PR is charged with, and who accepted them ---- */
+.chip.acknowledged, .chip.delta.acknowledged { background: rgba(63,185,80,0.14); color: var(--green-fg); }
+.chip.delta.unknown { background: var(--surface-overlay); color: var(--text-faint); border: 1px dashed var(--border-strong); }
+.chip.proposed { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
+.chip.stale { background: rgba(248,81,73,0.14); color: var(--red-fg); }
+.delta-ack { display: grid; gap: var(--s3); }
+.delta-ack-verdict { border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); padding: var(--s3) var(--s4); display: flex; gap: var(--s4); align-items: flex-start; }
+.delta-ack-verdict.tone-good { border-left-color: var(--green); }
+.delta-ack-verdict.tone-bad { border-left-color: var(--red); }
+.delta-ack-verdict .txt { display: grid; gap: 2px; }
+.delta-ack-verdict .h { font-weight: 600; }
+.delta-ack-verdict .sub { color: var(--text-subtle); font-size: var(--fs-12); }
+.delta-ack-table, .delta-ack-history { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: var(--fs-12); }
+.delta-ack-table th, .delta-ack-table td, .delta-ack-history th, .delta-ack-history td { padding: var(--s2) var(--s3); border-bottom: 1px solid var(--border-muted); text-align: left; vertical-align: top; }
+.delta-ack-table th, .delta-ack-history th { color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+.delta-ack-table td.num, .delta-ack-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.delta-ack-table td.sel { width: 24px; }
+.delta-ack-table td.lane { white-space: nowrap; }
+.delta-ack-table .where, .delta-ack-history .where { color: var(--text-muted); font-size: var(--fs-11); }
+.delta-ack-table .fam { color: var(--text-faint); font-size: var(--fs-11); }
+.delta-ack-table .fam.changed { color: var(--red-fg); }
+.delta-ack-table .ackstate { display: inline-flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.delta-ack-table .note { color: var(--text-muted); font-style: italic; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+.delta-ack-table td.act { white-space: nowrap; text-align: right; }
+.delta-ack-table td.act .btn + .btn { margin-left: var(--s2); }
+.delta-ack-table tr.st-acknowledged td.lane { border-left: 3px solid var(--green); }
+.delta-ack-table tr.st-proposed td.lane { border-left: 3px solid var(--amber); }
+.delta-ack-table tr.st-stale td.lane { border-left: 3px solid var(--red); }
+.delta-ack-propose { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.delta-ack-propose input { flex: 1 1 320px; min-width: 0; }
+.delta-ack-history tr.gone td { color: var(--text-faint); }
+.btn.quiet { background: transparent; }
+
+/* ---- the acknowledge button and page ---- */
+.ack-btn { margin-left: auto; display: inline-flex; gap: var(--s2); align-items: center; }
+.ack-btn .count { border-radius: 999px; font-size: var(--fs-11); font-weight: 700; padding: 0 8px; }
+.ack-btn .count.todo { background: var(--amber); color: var(--on-accent); }
+.ack-btn .count.ok { background: var(--green); color: var(--on-accent); }
+.ack-btn .count.wait { background: var(--surface-overlay); color: var(--text-muted); }
+.ack-head { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; margin-bottom: var(--s3); }
+.ack-head h1 { margin: 0; }
+.ack-head .right { margin-left: auto; display: flex; gap: var(--s2); }
+.ack-steps { display: flex; gap: var(--s2); flex-wrap: wrap; font-size: var(--fs-12); color: var(--text-subtle); margin-bottom: var(--s4); }
+.ack-steps span { border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px; }
+.ack-steps .done { color: var(--green-fg); border-color: var(--green); }
+.ack-steps .now { color: var(--amber-fg); border-color: var(--amber); }
+.ack-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--s4); align-items: start; }
+@media (max-width: 1400px) { .ack-grid { grid-template-columns: 1fr; } .ack-rail { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); } }
+.ack-main { display: grid; gap: var(--s3); min-width: 0; }
+.ack-tabs { display: flex; gap: var(--s4); border-bottom: 1px solid var(--border); }
+.ack-tabs button { background: none; border: 0; color: var(--text-subtle); padding: var(--s2) 0; border-bottom: 2px solid transparent; border-radius: 0; font-size: var(--fs-13); }
+.ack-tabs button:hover { background: none; color: var(--text); }
+.ack-tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+.ack-actions { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.ack-actions input { flex: 1 1 320px; min-width: 0; }
+.ack-rail { display: grid; gap: var(--s3); }
+.ack-card { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-raised); padding: var(--s3) var(--s4); display: grid; gap: var(--s2); }
+.ack-card h3 { margin: 0; font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); font-weight: 600; }
+.ack-card dl { display: grid; grid-template-columns: auto 1fr; gap: 4px var(--s3); margin: 0; font-size: var(--fs-12); }
+.ack-card dt { color: var(--text-faint); } .ack-card dd { margin: 0; }
+.ack-card p { margin: 0; }
+.ack-example { background: var(--surface-inset); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2) var(--s3); display: grid; gap: 3px; font-size: var(--fs-12); }
+.ack-example .t { color: var(--text-subtle); }
+.ack-example .r { display: grid; grid-template-columns: 90px 1fr; gap: var(--s3); }
+.ack-example .r b { color: var(--text-faint); font-weight: 500; }
+.ack-example .old { color: var(--red-fg); } .ack-example .new { color: var(--green-fg); }
+.chip.grey { background: var(--surface-overlay); color: var(--text-muted); }
+.delta-ack-table td .sub { display: block; }
+.ack-main { overflow-x: auto; }
+.ack-grid > .ack-main .delta-ack-table { table-layout: auto; }
+.delta-ack-table td .sub, .delta-ack-history td .where { overflow-wrap: anywhere; }
+.delta-ack-table td.act { white-space: nowrap; }
+.delta-ack-table th:nth-child(3) { min-width: 260px; }
+.delta-ack-table .what { display: block; }
+@media (min-width: 1401px) { .ack-grid { grid-template-columns: minmax(0, 1fr) 280px; } }
