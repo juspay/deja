@@ -4869,6 +4869,145 @@ where
     .await
 }
 
+/// [`dispatch_async_serving`] for a site whose return value can only be read by
+/// consuming it (an HTTP response body).
+///
+/// `read` consumes the value and hands it back rebuilt, with what it read or
+/// why reading failed; it is the one step outside the recorder's panic
+/// firewall, because a panic there has already consumed the value. `record`
+/// turns what was read into tape JSON inside the firewall, so a panic there
+/// drops the event, not the request. Both run only when this call is recorded
+/// or shadow-observed in replay; an inactive or sampled-out call returns the
+/// value untouched.
+#[allow(deprecated)] // implemented in terms of the deprecated seams it subsumes
+#[allow(clippy::too_many_arguments)]
+pub async fn owned_dispatch_async<T, A, Fut, F, C, K, KF, Rd, W, S, P>(
+    obs: CrossingObservation,
+    args: A,
+    run: F,
+    reconstruct: C,
+    read: K,
+    record: W,
+    check: round_trip::RoundTrip<S>,
+    neutral: Option<P>,
+) -> T
+where
+    A: FnOnce() -> serde_json::Value,
+    Fut: Future<Output = T>,
+    F: FnOnce() -> Fut,
+    C: FnOnce(ReconstructInput<'_>) -> Reconstructed<T>,
+    K: FnOnce(T) -> KF,
+    KF: Future<Output = (T, Result<Rd, String>)>,
+    W: FnOnce(Rd, &T) -> (serde_json::Value, bool),
+    S: FnOnce(&T, &T) -> round_trip::Comparison,
+    P: FnOnce(&T) -> bool,
+{
+    match runtime_mode() {
+        RuntimeMode::Disabled | RuntimeMode::Record => {
+            let site = RoundTripSite::of(&obs.spec);
+            let event = start_boundary_event_lazy_with_state(
+                obs.caller,
+                obs.spec,
+                obs.correlation_id,
+                args,
+                Some(obs.identity),
+                obs.state_capture,
+            );
+            let out = run().await;
+            let Some((hook, event)) = event else {
+                return out;
+            };
+            let (value, read) = read(out).await;
+            match read {
+                Ok(read) => finish_round_tripped(
+                    site,
+                    &value,
+                    move |value: &T| record(read, value),
+                    reconstruct,
+                    check,
+                    |output, fidelity| {
+                        event
+                            .with_fidelity(fidelity)
+                            .finish_recorded(&*hook, output);
+                    },
+                ),
+                Err(reason) => {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        event.with_fidelity(Fidelity::Opaque).finish_recorded(
+                            &*hook,
+                            RecordedOutput::from((unreadable_capture(&reason), false)),
+                        );
+                    }));
+                }
+            }
+            value
+        }
+        RuntimeMode::Replay => {
+            let boundary_args: serde_json::Value = args();
+
+            match crate::replay::replay_strategy_to_execute_mode(obs.spec.replay_strategy) {
+                ExecuteMode::Execute => {
+                    if let Some(token) = execute_shadow_peek_boundary(
+                        obs.caller,
+                        &obs.spec,
+                        &boundary_args,
+                        Some(&obs.identity),
+                    ) {
+                        let token =
+                            match serve_or_run(token, neutral, reconstruct, |token, served| {
+                                shadow_observe_loud(
+                                    obs.spec.boundary,
+                                    obs.spec.method_name,
+                                    || {
+                                        #[allow(deprecated)]
+                                        execute_shadow_observe_boundary(token, served);
+                                    },
+                                );
+                            }) {
+                                Ok(served) => return served,
+                                Err(token) => token,
+                            };
+                        let out = run().await;
+                        // Unguarded, as in `dispatch_async_serving`.
+                        let (out, read) = read(out).await;
+                        let result_json = match read {
+                            Ok(read) => record(read, &out).0,
+                            Err(reason) => unreadable_capture(&reason),
+                        };
+                        shadow_observe_loud(obs.spec.boundary, obs.spec.method_name, || {
+                            #[allow(deprecated)]
+                            execute_shadow_observe_boundary(token, result_json);
+                        });
+                        return out;
+                    }
+                    fail_stop_execute_shadow_unavailable(obs.spec.boundary, obs.spec.method_name);
+                }
+                ExecuteMode::Lookup => substitute_lookup(
+                    obs.caller,
+                    &obs.spec,
+                    &obs.identity,
+                    obs.correlation_id.as_deref(),
+                    boundary_args,
+                    reconstruct,
+                ),
+            }
+        }
+    }
+}
+
+fn unreadable_capture(reason: &str) -> serde_json::Value {
+    serde_json::json!({ "captured": false, "reason": reason })
+}
+
+/// The reason a row whose value could not be read carries, so a replay hit on
+/// it names that cause instead of reading as a codec bug.
+pub fn unreadable_capture_reason(recorded: &serde_json::Value) -> Option<&str> {
+    if recorded.get("captured") != Some(&serde_json::Value::Bool(false)) {
+        return None;
+    }
+    recorded.get("reason").and_then(serde_json::Value::as_str)
+}
+
 // ---------------------------------------------------------------------------
 // Hook-parameterized seam (`dispatch_with_hook` / `_async`) for the delegate path
 // ---------------------------------------------------------------------------
