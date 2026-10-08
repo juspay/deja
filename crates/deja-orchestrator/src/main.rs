@@ -58,6 +58,8 @@ struct AppState {
     store: Option<Arc<Store>>,
     mutation_auth: MutationAuth,
     executor: Arc<ExecutorSelection>,
+    /// Verdict restates in flight, one per pull request.
+    restates: Arc<Restates>,
 }
 
 /// Which executor drives runs, resolved ONCE at startup. K8s carries the
@@ -183,6 +185,7 @@ async fn main() {
         store,
         mutation_auth: MutationAuth::from_env(),
         executor,
+        restates: Arc::default(),
     };
 
     // Restart-durable reconciler (#34 V3/V7). The per-launch watcher in
@@ -466,11 +469,8 @@ async fn v1_create_run(
         }
     }
     let mut spec = spec;
-    if let Some(gh) = spec.github.as_mut() {
-        if let Err(e) = gh.validate() {
-            return error_resp(400, &format!("github: {e}"));
-        }
-        gh.normalize();
+    if let Err(e) = admit_github(&mut spec) {
+        return error_resp(400, &format!("github: {e}"));
     }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
@@ -2690,6 +2690,15 @@ fn delta_verdict_word(result: Result<&serde_json::Value, &Unavailable>) -> &'sta
             Some("pass") => "pass",
             Some("acknowledged") => "acknowledged",
             Some("fail") => "fail",
+            // The acknowledgements could not be laid over the delta: the
+            // row must not say pass or fail on a bare comparison that was
+            // never a decision, so it says it does not know.
+            _ if body
+                .pointer("/verdict/overlay_failure")
+                .is_some_and(|v| v.is_string()) =>
+            {
+                "unknown"
+            }
             _ => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
                 Some(true) => "pass",
                 Some(false) => "fail",
@@ -2834,9 +2843,28 @@ fn acknowledgement_from_row(
     })
 }
 
-/// The pull request a run was created for, as its params say.
-async fn github_of(st: &AppState, id: &str) -> Option<deja_orchestrator::GithubRef> {
-    run_params_for(st, id).await.and_then(|p| p.github)
+/// The pull request a run was created for, as its params say: `Ok(None)`
+/// when it names none, `Err` when that could not be told.
+async fn github_of(
+    st: &AppState,
+    id: &str,
+) -> Result<Option<deja_orchestrator::GithubRef>, String> {
+    run_params_read(st, id)
+        .await
+        .map(|p| p.and_then(|p| p.github))
+}
+
+/// The pull request's acknowledgements as the overlay reads them, and how
+/// many rows would not decode: a row written under an older shape of the
+/// pattern or the lane. Those are not applied; the count is shown, so a
+/// history that says "confirmed" beside a delta that says "uncovered" has
+/// a number explaining the gap.
+fn decode_acknowledgements(
+    rows: &[deja_store::AcknowledgementRow],
+) -> (Vec<divergence::acknowledgement::Acknowledgement>, usize) {
+    let acks: Vec<_> = rows.iter().filter_map(acknowledgement_from_row).collect();
+    let unread = rows.len() - acks.len();
+    (acks, unread)
 }
 
 fn pr_number_i64(gh: &deja_orchestrator::GithubRef) -> Option<i64> {
@@ -2854,12 +2882,16 @@ fn pr_number_i64(gh: &deja_orchestrator::GithubRef) -> Option<i64> {
 async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_json::Value) {
     use serde::Deserialize as _;
 
-    let Some(gh) = github_of(st, y_id).await else {
-        return;
-    };
     let failed = |body: &mut serde_json::Value, why: String| {
         eprintln!("deja-orchestrator: acknowledgements not applied to {y_id}: {why}");
         body["verdict"]["overlay_failure"] = serde_json::Value::String(why);
+    };
+    // "Names no pull request" and "could not tell" are two answers: the
+    // first is the normal case, the second a failure the verdict carries.
+    let gh = match github_of(st, y_id).await {
+        Ok(Some(gh)) => gh,
+        Ok(None) => return,
+        Err(e) => return failed(body, e),
     };
     let Some(pr) = pr_number_i64(&gh) else {
         return failed(body, "pr_number is out of range".to_owned());
@@ -2871,8 +2903,7 @@ async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_js
         Ok(rows) => rows,
         Err(e) => return failed(body, format!("the acknowledgements could not be read: {e}")),
     };
-    let acks: Vec<_> = rows.iter().filter_map(acknowledgement_from_row).collect();
-    let unread = rows.len() - acks.len();
+    let (acks, unread) = decode_acknowledgements(&rows);
     if unread > 0 {
         eprintln!(
             "deja-orchestrator: {unread} of {} acknowledgements of {}#{} could not be decoded and were not applied to {y_id}",
@@ -2906,32 +2937,89 @@ fn may_confirm(proposer: &str, actor: &str) -> bool {
 /// on their next view, since the overlay runs on every read anyway.
 const RESTATE_RUNS: i64 = 20;
 
+/// The restates in flight, one per pull request. "Acknowledge N shapes" is
+/// N confirmations at once; without this each would walk the runs on its
+/// own, computing the same deltas side by side and racing to write the
+/// row, so a pass that read the acknowledgements early could land last.
+/// A decision that arrives while a pass is running asks for one more pass
+/// after it, which reads the acknowledgements fresh.
+#[derive(Default)]
+struct Restates(std::sync::Mutex<std::collections::HashMap<(String, i64), bool>>);
+
+impl Restates {
+    /// Whether the caller runs the pass. False means one is running and has
+    /// been asked to go once more when it is done.
+    fn begin(&self, key: &(String, i64)) -> bool {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match m.get_mut(key) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                m.insert(key.clone(), false);
+                true
+            }
+        }
+    }
+
+    /// After a pass: whether another is owed. When not, the key is released.
+    fn finish(&self, key: &(String, i64)) -> bool {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match m.get_mut(key) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                m.remove(key);
+                false
+            }
+        }
+    }
+}
+
 /// After a confirmation or a withdrawal, the newest runs of the pull request
 /// have their delta verdict re-stated, so the row's word and the delta
 /// agree. Spawned off the request: the decision is already written, and a
 /// delta per run is work the person who pressed the button must not wait
-/// behind.
+/// behind. One pass per pull request at a time (see [`Restates`]).
 fn restate_pull_request_verdicts(st: AppState, repo: String, pr: i64) {
+    let key = (repo, pr);
+    if !st.restates.begin(&key) {
+        return;
+    }
     tokio::spawn(async move {
-        let Some(store) = &st.store else {
-            return;
-        };
-        let runs = match store.runs_for_pull_request(&repo, pr, RESTATE_RUNS).await {
-            Ok(runs) => runs,
-            Err(e) => {
-                eprintln!("deja-orchestrator: runs of {repo}#{pr} could not be listed to re-state their verdicts: {e}");
-                return;
-            }
-        };
-        for run in runs {
-            if let Some(against) = run_params_for(&st, &run)
-                .await
-                .and_then(|p| p.delta_against)
-            {
-                let _ = delta_for_run(&st, &run, &against).await;
+        loop {
+            restate_once(&st, &key.0, key.1).await;
+            if !st.restates.finish(&key) {
+                break;
             }
         }
     });
+}
+
+async fn restate_once(st: &AppState, repo: &str, pr: i64) {
+    let Some(store) = &st.store else {
+        return;
+    };
+    let runs = match store.runs_for_pull_request(repo, pr, RESTATE_RUNS).await {
+        Ok(runs) => runs,
+        Err(e) => {
+            eprintln!("deja-orchestrator: runs of {repo}#{pr} could not be listed to re-state their verdicts: {e}");
+            return;
+        }
+    };
+    if runs.len() as i64 == RESTATE_RUNS {
+        eprintln!(
+            "deja-orchestrator: {repo}#{pr} has more than {RESTATE_RUNS} runs; only the newest {RESTATE_RUNS} are re-stated now, the rest on their next view"
+        );
+    }
+    for run in runs {
+        if let Some(against) = run_params_for(st, &run).await.and_then(|p| p.delta_against) {
+            let _ = delta_for_run(st, &run, &against).await;
+        }
+    }
 }
 
 /// Write an audit line, and say so when it could not be written: the
@@ -2962,11 +3050,15 @@ async fn v1_list_acknowledgements(State(st): State<AppState>, id: RunId) -> Resp
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let Some(gh) = github_of(&st, &id).await else {
-        return error_resp(
-            404,
-            "this run names no pull request; acknowledgements belong to one",
-        );
+    let gh = match github_of(&st, &id).await {
+        Ok(Some(gh)) => gh,
+        Ok(None) => {
+            return error_resp(
+                404,
+                "this run names no pull request; acknowledgements belong to one",
+            )
+        }
+        Err(e) => return error_resp(500, &e),
     };
     let Some(pr) = pr_number_i64(&gh) else {
         return error_resp(400, "pr_number is out of range");
@@ -3012,11 +3104,15 @@ async fn v1_propose_acknowledgements(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let Some(gh) = github_of(&st, &id).await else {
-        return error_resp(
-            404,
-            "this run names no pull request; acknowledgements belong to one",
-        );
+    let gh = match github_of(&st, &id).await {
+        Ok(Some(gh)) => gh,
+        Ok(None) => {
+            return error_resp(
+                404,
+                "this run names no pull request; acknowledgements belong to one",
+            )
+        }
+        Err(e) => return error_resp(500, &e),
     };
     let Some(pr) = pr_number_i64(&gh) else {
         return error_resp(400, "pr_number is out of range");
@@ -3169,19 +3265,49 @@ async fn v1_withdraw_acknowledgement(
     json_ok(serde_json::json!({ "ok": true }))
 }
 
+/// A pull request on a new run is checked and kept in one spelling before
+/// anything is persisted: the store's lookups by repository name depend on
+/// it, and a change id is what every later acknowledgement is bound to.
+fn admit_github(spec: &mut deja_orchestrator::RunSpec) -> Result<(), String> {
+    if let Some(gh) = spec.github.as_mut() {
+        gh.validate()?;
+        gh.normalize();
+    }
+    Ok(())
+}
+
 /// The run's parameters: the live record on compose, the stored row on k8s.
 async fn run_params_for(st: &AppState, id: &str) -> Option<deja_orchestrator::RunParams> {
-    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
-        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
-    match live {
-        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
-        None => match &st.store {
-            Some(store) => match store.get_run(id).await {
-                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
-                _ => None,
-            },
-            None => None,
-        },
+    run_params_read(st, id).await.ok().flatten()
+}
+
+/// The run's parameters, telling "there is no such run" (`Ok(None)`) apart
+/// from "there is one and it could not be read" (`Err`): a live record that
+/// will not decode, a store that is away, a row whose params will not
+/// decode. The overlay needs the difference, since the first is the normal
+/// case for a run that names no pull request and the second is a failure
+/// it must say out loud.
+async fn run_params_read(
+    st: &AppState,
+    id: &str,
+) -> Result<Option<deja_orchestrator::RunParams>, String> {
+    if let Some(path) = confined(st.root.run_path(id), &st.root.root.join("runs")) {
+        return match deja_orchestrator::read_json::<Run>(&path) {
+            Ok(run) => Ok(Some(deja_orchestrator::RunParams::resolved(
+                &run.spec, None,
+            ))),
+            Err(e) => Err(format!("the run's record would not read: {e}")),
+        };
+    }
+    let Some(store) = &st.store else {
+        return Ok(None);
+    };
+    match store.get_run(id).await {
+        Ok(Some(row)) => serde_json::from_value(row.params)
+            .map(Some)
+            .map_err(|e| format!("the run's parameters would not decode: {e}")),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!("the run's row could not be read: {e}")),
     }
 }
 
@@ -3975,6 +4101,109 @@ mod tests {
         let mismatch = Unavailable::TapeMismatch("different seals".to_owned());
         assert_eq!(mismatch.to_json()["unavailable_kind"], "tape_mismatch");
         assert_eq!(delta_verdict_word(Err(&mismatch)), "refused");
+        // An overlay that could not happen is neither word: the bare
+        // three-way is not a decision, and the row says so.
+        let unknown = Ok(serde_json::json!({
+            "verdict": { "pass": false, "overlay_failure": "the store is away" }
+        }));
+        assert_eq!(delta_verdict_word(unknown.as_ref()), "unknown");
+    }
+
+    /// The overlay tells "names no pull request" from "could not read the
+    /// run", and says the second on the verdict rather than leaving the
+    /// bare three-way to be read as a decision.
+    #[tokio::test]
+    async fn the_overlay_says_why_it_could_not_happen_and_stays_quiet_when_there_is_nothing_to_do()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
+        let three_way = || serde_json::json!({ "verdict": { "pass": false }, "rows": [] });
+
+        // No pull request on the run: the normal case, nothing is touched.
+        let mut run = pending_run("run-plain");
+        deja_orchestrator::write_json(&st.root.run_path("run-plain"), &run).unwrap();
+        let mut body = three_way();
+        overlay_acknowledgements(&st, "run-plain", &mut body).await;
+        assert_eq!(body, three_way());
+
+        // A pull request, and no store to read its acknowledgements from.
+        run.run_id = "run-pr".to_owned();
+        run.spec.github = Some(deja_orchestrator::GithubRef {
+            repo: "juspay/deja".into(),
+            pr_number: 7,
+            head_sha: "abcdef1".into(),
+            change_id: Some("c1".into()),
+        });
+        deja_orchestrator::write_json(&st.root.run_path("run-pr"), &run).unwrap();
+        let mut body = three_way();
+        overlay_acknowledgements(&st, "run-pr", &mut body).await;
+        assert_eq!(body["verdict"]["overlay_failure"], "the store is away");
+        assert!(body["verdict"].get("effective").is_none());
+        assert_eq!(delta_verdict_word(Ok(&body)), "unknown");
+
+        // A run whose record will not read is a failure, not "no pull request".
+        std::fs::write(st.root.run_path("run-torn"), b"{not json").unwrap();
+        let mut body = three_way();
+        overlay_acknowledgements(&st, "run-torn", &mut body).await;
+        let why = body["verdict"]["overlay_failure"].as_str().unwrap();
+        assert!(why.contains("would not read"), "{why}");
+    }
+
+    /// Creation keeps the repository in one spelling, so the store's
+    /// lookups by `params.github.repo` find the run however it was typed.
+    #[test]
+    fn creation_admits_a_pull_request_in_one_spelling() {
+        let mut spec = pending_run("run-x").spec;
+        spec.github = Some(deja_orchestrator::GithubRef {
+            repo: " Juspay/Hyperswitch-Prism ".into(),
+            pr_number: 9,
+            head_sha: "abcdef1".into(),
+            change_id: Some(" c1 ".into()),
+        });
+        admit_github(&mut spec).unwrap();
+        let gh = spec.github.as_ref().unwrap();
+        assert_eq!(gh.repo, "juspay/hyperswitch-prism");
+        assert_eq!(gh.change_id.as_deref(), Some("c1"));
+        spec.github.as_mut().unwrap().change_id = None;
+        assert!(admit_github(&mut spec).is_err());
+    }
+
+    /// Rows the overlay cannot decode are counted, not dropped on the quiet.
+    #[test]
+    fn undecodable_acknowledgement_rows_are_counted() {
+        // Built through serde, as the store would hand it over, so the test
+        // needs no clock of its own.
+        let row = |pattern: serde_json::Value| -> deja_store::AcknowledgementRow {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "repo": "juspay/deja", "pr_number": 7, "change_id": "c1",
+                "lane": null, "pattern": pattern, "value_hash": null, "note": "n",
+                "origin_run_id": "run-pr", "proposed_by": "asha",
+                "proposed_at": "2026-10-08T10:00:00Z",
+                "acknowledged_by": null, "acknowledged_at": null,
+                "withdrawn_by": null, "withdrawn_at": null
+            }))
+            .unwrap()
+        };
+        let rows = vec![
+            row(serde_json::json!({ "kind": "status" })),
+            row(serde_json::json!({ "kind": "something_from_the_future" })),
+        ];
+        let (acks, unread) = decode_acknowledgements(&rows);
+        assert_eq!((acks.len(), unread), (1, 1));
+    }
+
+    /// One restate per pull request at a time; a decision that lands while
+    /// one is running asks for exactly one more pass, not one per press.
+    #[test]
+    fn restates_run_single_file_per_pull_request() {
+        let r = Restates::default();
+        let key = ("juspay/deja".to_owned(), 7);
+        assert!(r.begin(&key), "the first caller runs");
+        assert!(!r.begin(&key), "a second caller only marks a rerun");
+        assert!(!r.begin(&key));
+        assert!(r.finish(&key), "one more pass is owed");
+        assert!(!r.finish(&key), "and then the key is released");
+        assert!(r.begin(&key));
     }
 
     /// The runner reports its result before it publishes the ledger and diffs,
@@ -4000,6 +4229,7 @@ mod tests {
                 service_token: None,
             },
             executor: Arc::new(ExecutorSelection::Compose),
+            restates: Arc::default(),
         }
     }
 
