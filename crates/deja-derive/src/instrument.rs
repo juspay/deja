@@ -291,11 +291,43 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     // reconstruction selector. With no selector, the site is Debug/record-only;
     // the bare built-in names map to the serde / Ok-only codegen, and any other
     // path is a custom `::deja::codec::ReplayCodec` impl.
-    let capture_mode = args
-        .codec
-        .as_ref()
-        .map(classify_codec)
+    let owned_codec = args.owned_codec;
+    if let Some(path) = &owned_codec {
+        let refusal = if args.codec.is_some() || args.result.is_some() {
+            Some("`owned_codec` is the site's codec; drop `codec` / `result`")
+        } else if sig.asyncness.is_none() && args.future.is_none() {
+            Some("`owned_codec` captures asynchronously; it needs an `async fn` or `future = \"boxed\"`")
+        } else if matches!(preset, Preset::Redis) {
+            Some("`owned_codec` does not apply to the redis kit")
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            return syn::Error::new_spanned(path, message).to_compile_error();
+        }
+    }
+    let capture_mode = owned_codec
+        .clone()
+        .map(CaptureMode::Custom)
+        .or_else(|| args.codec.as_ref().map(classify_codec))
         .unwrap_or(CaptureMode::Debug);
+    let (codec_trait, unreadable_guard) = if owned_codec.is_some() {
+        (
+            quote!(::deja::codec::OwnedReplayCodec),
+            quote! {
+                if let ::std::option::Option::Some(__deja_reason) =
+                    ::deja::__private::unreadable_capture_reason(&__deja_recorded)
+                {
+                    return ::deja::__private::Reconstructed::Failed(::std::format!(
+                        "the recorded call could not read its value: {}",
+                        __deja_reason
+                    ));
+                }
+            },
+        )
+    } else {
+        (quote!(::deja::codec::ReplayCodec), TokenStream::new())
+    };
 
     // The lossless capture expr handed to the dispatch seam as `extract`. An
     // explicit `result =` always wins (escape hatch); otherwise the explicit
@@ -375,7 +407,8 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
     let reconstruct_closure: TokenStream = match &capture_mode {
         CaptureMode::Custom(path) => quote! {
             |__deja_recorded: ::serde_json::Value| -> ::deja::__private::Reconstructed<#recon_ty> {
-                match <#path as ::deja::codec::ReplayCodec>::reconstruct(__deja_recorded) {
+                #unreadable_guard
+                match <#path as #codec_trait>::reconstruct(__deja_recorded) {
                     ::std::option::Option::Some(__deja_replayed) =>
                         ::deja::__private::Reconstructed::Value(__deja_replayed),
                     ::std::option::Option::None => ::deja::__private::Reconstructed::Failed(
@@ -531,6 +564,27 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
         }
     };
 
+    // An owned codec consumes the value and hands it back, so it reaches the
+    // seam as a capture future instead of a by-reference extractor.
+    let (dispatch_async_fn, extract_arg, neutral_arg) = match &owned_codec {
+        Some(path) => (
+            quote!(owned_dispatch_async),
+            quote! {
+                move |__deja_result| <#path as ::deja::codec::OwnedReplayCodec>::read(__deja_result),
+                <#path as ::deja::codec::OwnedReplayCodec>::record
+            },
+            match &neutral_error_expr {
+                Some(expr) => quote!(::std::option::Option::Some(#expr),),
+                None => quote!(::std::option::Option::None::<fn(&#recon_ty) -> bool>,),
+            },
+        ),
+        None => (
+            dispatch_async_fn,
+            quote!(move |__deja_result| { #result_expr }),
+            neutral_arg,
+        ),
+    };
+
     if sig.asyncness.is_some() {
         if args.future.is_some() {
             return syn::Error::new_spanned(
@@ -569,7 +623,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                                 move || __deja_boundary_args,
                                 move || async move #block,
                                 #reconstruct_closure,
-                                move |__deja_result| { #result_expr },
+                                #extract_arg,
                                 #compare_closure,
                                 #neutral_arg
                             ).await
@@ -605,7 +659,7 @@ fn generate_inner(args: InstrumentArgs, mut func: ItemFn, preset: Preset) -> Tok
                                 move || __deja_boundary_args,
                                 move || async move { #block.await },
                                 #reconstruct_closure,
-                                move |__deja_result| { #result_expr },
+                                #extract_arg,
                                 #compare_closure,
                                 #neutral_arg
                             ))
@@ -1237,6 +1291,9 @@ pub struct InstrumentArgs {
     /// custom `::deja::codec::ReplayCodec` impl whose `Value` must equal the
     /// return type.
     pub codec: Option<Path>,
+    /// `owned_codec = <Path>`: a `::deja::codec::OwnedReplayCodec` impl, for a
+    /// return value that can only be read by consuming it. Async sites only.
+    pub owned_codec: Option<Path>,
     /// DECLARATIVE BOUNDARY MODEL (#28+). The per-site replay routing knob:
     /// `replay = Execute | Substitute` (bare enum-variant identifier; the macro
     /// maps it to a `deja::__private::ReplayStrategy` value — the wire field on
@@ -1335,6 +1392,7 @@ impl Parse for InstrumentArgs {
                         "args" => args.args = Some(input.parse()?),
                         "result" => args.result = Some(input.parse()?),
                         "codec" => args.codec = Some(input.parse()?),
+                        "owned_codec" => args.owned_codec = Some(input.parse()?),
                         "on_miss" => args.on_miss = Some(input.parse()?),
                         "neutral_error" => args.neutral_error = Some(input.parse()?),
                         "state_read" => args.state_read = Some(input.parse()?),
@@ -1741,6 +1799,63 @@ mod tests {
             !undeclared.contains("dispatch_async_serving"),
             "{undeclared}"
         );
+    }
+
+    /// `owned_codec` is the site's whole codec, and captures by awaiting.
+    #[test]
+    fn owned_codec_refuses_what_it_cannot_honour() {
+        let expand = |args, func, preset| {
+            generate_with_preset(parse_args(args), parse_fn(func), None, preset).to_string()
+        };
+        let async_fn = || {
+            quote!(
+                async fn fetch(path: String) -> Body {
+                    todo!()
+                }
+            )
+        };
+        for (args, func, preset, refusal) in [
+            (
+                quote!(owned_codec = BodyCodec, codec = SerdeCodec),
+                async_fn(),
+                Preset::None,
+                "drop `codec`",
+            ),
+            (
+                quote!(owned_codec = BodyCodec, result = { (json!(null), false) }),
+                async_fn(),
+                Preset::None,
+                "drop `codec`",
+            ),
+            (
+                quote!(owned_codec = BodyCodec),
+                quote!(
+                    fn fetch(path: String) -> Body {
+                        todo!()
+                    }
+                ),
+                Preset::None,
+                "captures asynchronously",
+            ),
+            (
+                quote!(owned_codec = BodyCodec),
+                async_fn(),
+                Preset::Redis,
+                "redis kit",
+            ),
+        ] {
+            let refused = expand(args, func, preset);
+            assert!(
+                refused.contains("compile_error") && refused.contains(refusal),
+                "{refused}"
+            );
+        }
+
+        let owned = expand(quote!(owned_codec = BodyCodec), async_fn(), Preset::None);
+        assert!(!owned.contains("compile_error"), "{owned}");
+        assert!(owned.contains("owned_dispatch_async"), "{owned}");
+        assert!(owned.contains("OwnedReplayCodec"), "{owned}");
+        assert!(!owned.contains("codec :: ReplayCodec"), "{owned}");
     }
 
     #[test]
