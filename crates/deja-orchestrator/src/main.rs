@@ -1540,11 +1540,6 @@ fn live_json(live: &Run) -> serde_json::Value {
     })
 }
 
-/// `GET /api/v1/runs/{id}` — store row + live file-store snapshot merged: the
-/// row carries dashboard fields (verdict, expectation, candidate sha, actor),
-/// the snapshot carries the worker's live stage/step (file store is the
-/// worker's source of truth mid-run). Degrades to the snapshot alone when the
-/// store is down, so script polling works file-only too.
 /// `PUT /api/v1/runs/{run_id}/baseline` — re-point a run at another baseline.
 ///
 /// A run names the baseline it is measured against when it is created
@@ -1555,6 +1550,12 @@ fn live_json(live: &Run) -> serde_json::Value {
 /// refused comparison, while the pipeline had already measured it against the
 /// second. The re-point says so. The delta is settled again against the new
 /// baseline, off this request, exactly as it would be on either run's finish.
+///
+/// Only a finished run can be re-pointed. The lifecycle holds the record in
+/// memory while the run drives and writes it back at every transition, so a
+/// re-point mid-run would be written over by the next one and the file and
+/// the row would name different baselines. The pipeline re-points after the
+/// candidate's finish, which is the one time it is safe.
 async fn v1_repoint_baseline(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
@@ -1577,47 +1578,87 @@ async fn v1_repoint_baseline(
         return error_resp(400, "delta_against: a run is not its own baseline");
     }
 
-    // The live record first, as the ingest path writes it: a run the store has
-    // not seen (or no store at all) is still re-pointed where its delta is read.
-    let mut found = false;
-    let mut previous: Option<String> = None;
-    if let Some(path) = confined(st.root.run_path(&run_id), &st.root.root.join("runs")) {
-        let mut run: Run = match deja_orchestrator::read_json(&path) {
-            Ok(run) => run,
+    // The live record, as the ingest path writes it: a run the store has not
+    // seen (or no store at all) is still re-pointed where its delta is read.
+    let live = match confined(st.root.run_path(&run_id), &st.root.root.join("runs")) {
+        Some(path) => match deja_orchestrator::read_json::<Run>(&path) {
+            Ok(run) => Some((path, run)),
             Err(e) => return error_resp(500, &format!("read run: {e}")),
+        },
+        None => None,
+    };
+    let row = match &st.store {
+        Some(store) => match store.get_run(&run_id).await {
+            Ok(row) => row,
+            Err(e) => return error_resp(500, &format!("get run: {e}")),
+        },
+        None => None,
+    };
+    // The record is authoritative for the state, as it is for the baseline.
+    let state = match (&live, &row) {
+        (Some((_, run)), _) => format!("{:?}", run.status).to_lowercase(),
+        (None, Some(row)) => row.state.clone(),
+        (None, None) => return error_resp(404, "run not found"),
+    };
+    if !matches!(state.as_str(), "completed" | "failed") {
+        return error_resp(
+            409,
+            &format!("run is {state}; a baseline can be re-pointed once the run has finished"),
+        );
+    }
+    let baseline_known = confined(st.root.run_path(&against), &st.root.root.join("runs")).is_some()
+        || match &st.store {
+            Some(store) => match store.get_run(&against).await {
+                Ok(row) => row.is_some(),
+                Err(e) => return error_resp(500, &format!("get baseline run: {e}")),
+            },
+            None => false,
         };
-        previous = run.spec.delta_against.clone();
-        run.spec.delta_against = Some(against.to_string());
-        if let Err(e) = deja_orchestrator::write_json(&path, &run) {
-            return error_resp(500, &format!("persist run: {e}"));
-        }
-        found = true;
-    }
-    if let Some(store) = &st.store {
-        if previous.is_none() {
-            previous = run_params_for(&st, &run_id)
-                .await
-                .and_then(|p| p.delta_against);
-        }
-        match store.set_run_delta_against(&run_id, &against).await {
-            Ok(updated) => found |= updated,
-            Err(e) => return error_resp(500, &format!("re-point run: {e}")),
-        }
-    }
-    if !found {
-        return error_resp(404, "run not found");
+    if !baseline_known {
+        return error_resp(404, "baseline run not found");
     }
 
+    let previous = live
+        .as_ref()
+        .and_then(|(_, run)| run.spec.delta_against.clone())
+        .or_else(|| {
+            row.as_ref()
+                .and_then(|row| row.params.get("delta_against"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    // The file first, then the row; a row that will not take the change puts
+    // the file back, so a refused re-point changes nothing.
+    if let Some((path, run)) = &live {
+        let mut repointed = run.clone();
+        repointed.spec.delta_against = Some(against.to_string());
+        if let Err(e) = deja_orchestrator::write_json(path, &repointed) {
+            return error_resp(500, &format!("persist run: {e}"));
+        }
+    }
     if let Some(store) = &st.store {
-        let _ = store
-            .audit(
-                &actor.0,
-                "run.repoint_baseline",
-                "run",
-                &run_id,
-                &serde_json::json!({ "from": previous, "to": against.as_str() }),
-            )
-            .await;
+        if let Err(e) = store.set_run_delta_against(&run_id, &against).await {
+            if let Some((path, run)) = &live {
+                if let Err(restore) = deja_orchestrator::write_json(path, run) {
+                    return error_resp(
+                        500,
+                        &format!(
+                            "re-point run: {e}; and the record could not be put back: {restore}"
+                        ),
+                    );
+                }
+            }
+            return error_resp(500, &format!("re-point run: {e}"));
+        }
+        audit_or_say(
+            store,
+            &actor.0,
+            "run.repoint_baseline",
+            "run",
+            &run_id,
+            &serde_json::json!({ "from": previous, "to": against.as_str() }),
+        )
+        .await;
     }
     // Settled against the new baseline, or left pending until it finishes.
     tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
@@ -1628,6 +1669,11 @@ async fn v1_repoint_baseline(
     }))
 }
 
+/// `GET /api/v1/runs/{id}` — store row + live file-store snapshot merged: the
+/// row carries dashboard fields (verdict, expectation, candidate sha, actor),
+/// the snapshot carries the worker's live stage/step (file store is the
+/// worker's source of truth mid-run). Degrades to the snapshot alone when the
+/// store is down, so script polling works file-only too.
 async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
     let row = match &st.store {
         Some(store) => match store.get_run(&id).await {
@@ -3115,11 +3161,12 @@ async fn audit_or_say(
     store: &deja_store::Store,
     actor: &str,
     action: &str,
+    object_type: &str,
     target: &str,
     details: &serde_json::Value,
 ) {
     if let Err(e) = store
-        .audit(actor, action, "pull_request", target, details)
+        .audit(actor, action, object_type, target, details)
         .await
     {
         eprintln!(
@@ -3269,6 +3316,7 @@ async fn v1_propose_acknowledgements(
         &store,
         &actor.0,
         "acknowledgement.propose",
+        "pull_request",
         &format!("{}#{}", gh.repo, gh.pr_number),
         &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
     )
@@ -3310,6 +3358,7 @@ async fn v1_confirm_acknowledgement(
         &store,
         &actor.0,
         "acknowledgement.confirm",
+        "pull_request",
         &format!("{}#{}", row.repo, row.pr_number),
         &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
     )
@@ -3343,6 +3392,7 @@ async fn v1_withdraw_acknowledgement(
         &store,
         &actor.0,
         "acknowledgement.withdraw",
+        "pull_request",
         &format!("{}#{}", row.repo, row.pr_number),
         &serde_json::json!({ "id": ack_id }),
     )
@@ -4434,8 +4484,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path());
         let mut run = pending_run("run-y");
+        run.status = deja_orchestrator::RunStatus::Completed;
         run.spec.delta_against = Some("run-m1".to_owned());
         deja_orchestrator::write_json(&state.root.run_path("run-y"), &run).unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-m2"), &pending_run("run-m2"))
+            .unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-live"), &pending_run("run-live"))
+            .unwrap();
         let against = |id: &str| serde_json::json!({ "delta_against": id });
 
         assert_eq!(
@@ -4453,6 +4508,16 @@ mod tests {
         assert_eq!(
             put_baseline(state.clone(), "run-y", against("run-y"), Some("ci")).await,
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-nowhere"), Some("ci")).await,
+            StatusCode::NOT_FOUND,
+            "a baseline that does not exist is refused here, not at the settle"
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-live", against("run-m2"), Some("ci")).await,
+            StatusCode::CONFLICT,
+            "a run still driving would write the old baseline back over a re-point"
         );
         let untouched: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
         assert_eq!(
