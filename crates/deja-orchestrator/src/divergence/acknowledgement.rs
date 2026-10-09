@@ -195,10 +195,20 @@ pub fn apply(
             continue;
         }
         let key = Key::of_row(row);
-        let best = live
-            .iter()
-            .filter(|a| a.key == key)
-            .max_by_key(|a| (a.confirmed(require_subjects), a.id));
+        // One acknowledgement speaks for the row: one given on THIS version
+        // of the change before any from an earlier one, then a confirmed one
+        // before a proposal, then the newest. A confirmation from an earlier
+        // version must not stand in front of a proposal on this one: the row
+        // would read stale, offer "propose again" to the very maintainer who
+        // should be confirming, and hide the proposal that is waiting for
+        // them (PR #2471, 2026-10-09: proposals 3/4 hidden behind 1/2).
+        let best = live.iter().filter(|a| a.key == key).max_by_key(|a| {
+            (
+                change_id == Some(a.change_id.as_str()),
+                a.confirmed(require_subjects),
+                a.id,
+            )
+        });
         let Some(ack) = best else {
             row.acknowledgement = None;
             if row.blocking {
@@ -539,5 +549,42 @@ mod tests {
             State::Stale
         );
         assert_eq!(d.verdict.stale, 1);
+    }
+
+    /// PR #2471, 2026-10-09: a shape confirmed on an earlier version of the
+    /// change, then proposed again on this one. The row must show the
+    /// proposal waiting for confirmation, not the old confirmation as stale,
+    /// or a maintainer is offered "propose again" instead of "approve".
+    #[test]
+    fn a_proposal_on_this_change_outranks_a_confirmation_on_an_earlier_one() {
+        let r = row(body("c", "$.probe"), Bucket::Introduced, "v1");
+        let key = Key::of_row(&r);
+        let mut earlier = ack(1, key.clone(), true);
+        earlier.change_id = "c0".into();
+        let current = ack(3, key.clone(), false);
+        let mut d = delta(vec![r.clone()]);
+        assert_eq!(
+            apply(
+                &mut d,
+                &[earlier.clone(), current.clone()],
+                Some("c1"),
+                true
+            ),
+            Effective::Fail
+        );
+        let shown = d.rows[0].acknowledgement.as_ref().unwrap();
+        assert_eq!((shown.id, shown.state), (3, State::Proposed));
+        assert_eq!((d.verdict.proposed, d.verdict.stale), (1, 0));
+
+        // Once this version's proposal is confirmed, it is what counts.
+        let mut confirmed = current;
+        confirmed.acknowledged_by = Some("maintainer".into());
+        confirmed.acknowledged_by_sub = Some("sub-maintainer".into());
+        let mut d = delta(vec![r]);
+        assert_eq!(
+            apply(&mut d, &[earlier, confirmed], Some("c1"), true),
+            Effective::Acknowledged
+        );
+        assert_eq!(d.rows[0].acknowledgement.as_ref().unwrap().id, 3);
     }
 }

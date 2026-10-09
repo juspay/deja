@@ -269,8 +269,17 @@ impl Store {
     // -- acknowledgements ----------------------------------------------------
 
     /// Propose `items` as intended divergences of one pull request, in one
-    /// transaction, all with the same note and proposer. Returns the new ids
-    /// in the order given.
+    /// transaction, all with the same note and proposer. Returns the ids in
+    /// the order given.
+    ///
+    /// A shape that already has a live (not withdrawn) acknowledgement on
+    /// this version of the change -- proposed or confirmed, by anyone -- is
+    /// not proposed again: its existing id is returned instead. A second
+    /// proposal of the same shape only splits the decision across two rows
+    /// (one person confirms one, the other stays open forever); and the same
+    /// request sent twice, a double click, must not leave two. Proposals on
+    /// one pull request are serialized by an advisory lock so two requests
+    /// at once cannot both see "none yet".
     #[allow(clippy::too_many_arguments)] // one call per proposal, every column named
     pub async fn acknowledgements_propose(
         &self,
@@ -283,9 +292,33 @@ impl Store {
         note: &str,
         items: &[NewAcknowledgement],
     ) -> Result<Vec<i64>, sqlx::Error> {
+        let repo = repo.to_ascii_lowercase();
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("acknowledgements:{repo}#{pr_number}"))
+            .execute(&mut *tx)
+            .await?;
         let mut ids = Vec::with_capacity(items.len());
         for item in items {
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM acknowledgements
+                  WHERE repo = $1 AND pr_number = $2 AND change_id = $3
+                    AND lane IS NOT DISTINCT FROM $4 AND pattern = $5
+                    AND withdrawn_at IS NULL
+                  ORDER BY (acknowledged_at IS NOT NULL) DESC, id DESC
+                  LIMIT 1",
+            )
+            .bind(&repo)
+            .bind(pr_number)
+            .bind(change_id)
+            .bind(&item.lane)
+            .bind(&item.pattern)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(id) = existing {
+                ids.push(id);
+                continue;
+            }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO acknowledgements
                    (repo, pr_number, change_id, lane, pattern, value_hash, note,
@@ -293,7 +326,7 @@ impl Store {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  RETURNING id",
             )
-            .bind(repo.to_ascii_lowercase())
+            .bind(&repo)
             .bind(pr_number)
             .bind(change_id)
             .bind(&item.lane)
