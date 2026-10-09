@@ -124,6 +124,7 @@ fn the_owned_seam_does_not_capture_a_call_it_does_not_record() {
         lexical_path: None,
         syntax_hash: None,
         span_path: None,
+        span_instance: None,
     };
     let obs = deja::__private::CrossingObservation::with_correlation(
         deja::__private::BoundarySpec::new("inactive_probe", "BoundaryInactiveTest", "seam"),
