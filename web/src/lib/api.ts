@@ -67,7 +67,9 @@ export type RunRow = {
   /** What the run changed relative to the baseline it was created against
    *  (params.delta_against): pass, fail, or pending while the baseline is
    *  still being scored. Absent for a run that names no baseline. */
-  delta_verdict?: "pass" | "fail" | "pending" | "refused" | null;
+  /** `unknown`: the acknowledgements could not be laid over the delta, so
+   *  the bare comparison was not written as a decision. */
+  delta_verdict?: "pass" | "fail" | "acknowledged" | "unknown" | "pending" | "refused" | null;
   scorecard: Scorecard | null;
   failure: { message?: string } | null;
   expectation: string | null;
@@ -387,7 +389,42 @@ export type RunGraph = {
   record_note?: string | null;
 };
 
+/** Who the server says is signed in. `null` until the probe has answered. */
+export type Me = {
+  configured: boolean;
+  authenticated: boolean;
+  email?: string;
+  name?: string;
+  picture?: string;
+  roles?: string[];
+};
+
+let signedIn: Me | null = null;
+
+/** Remember the probe's answer, so `actor()` can prefer the verified email. */
+/** The event the sign-in dialog listens for: fired by a gated action tried
+ *  without a session, and by the pages before they even send one. */
+export const SIGN_IN_EVENT = "deja:sign-in-required";
+
+export function askToSignIn() {
+  window.dispatchEvent(new CustomEvent(SIGN_IN_EVENT));
+}
+
+export function rememberMe(m: Me) {
+  signedIn = m;
+}
+
+export function currentMe(): Me | null {
+  return signedIn;
+}
+
+/**
+ * The actor for this browser: the signed-in email when sign-in is on and a
+ * session exists, else the typed name. The gated routes ignore the header
+ * once sign-in is on; the ungated ones (creating a run) still record it.
+ */
 export function actor(): string {
+  if (signedIn?.authenticated && signedIn.email) return signedIn.email;
   return localStorage.getItem("deja-actor") || "";
 }
 
@@ -408,6 +445,11 @@ export type ApiError = Error & { status?: number };
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
+    // A gated action without a session: ask the person to sign in, in
+    // place, rather than navigating them away from what they were doing.
+    if (resp.status === 401 && signedIn?.configured && !signedIn.authenticated && window.location.pathname !== "/login") {
+      askToSignIn();
+    }
     let detail = `${resp.status}`;
     try {
       const body = (await resp.json()) as { error?: string };
@@ -494,6 +536,43 @@ export const api = {
       `/api/v1/runs/${id}/delta?against=${encodeURIComponent(against)}`,
     ),
   audit: () => request<AuditRow[]>("/api/v1/audit"),
+  me: () => request<Me>("/api/v1/auth/me"),
+  logout: () => fetch("/auth/logout", { method: "POST", credentials: "same-origin" }),
+
+  /** The pull request's acknowledgements, withdrawn ones included; 404 when
+   *  the run names no pull request. */
+  acknowledgements: (id: string) =>
+    request<{ github: GithubRef; acknowledgements: Acknowledgement[] }>(
+      `/api/v1/runs/${id}/acknowledgements`,
+    ),
+  /** Propose rows of this run's delta as intended. The server keys them by
+   *  shape, so the same shape in many requests is one acknowledgement. */
+  proposeAcknowledgements: (id: string, rows: DeltaAddress[], note: string) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<{ ids: number[] }>(`/api/v1/runs/${id}/acknowledgements`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Deja-Actor": who },
+      body: JSON.stringify({ rows, note }),
+    });
+  },
+  /** A second person confirms; the proposer's own confirmation is refused. */
+  confirmAcknowledgement: (ackId: number) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<{ ok: true }>(`/api/v1/acknowledgements/${ackId}/confirm`, {
+      method: "POST",
+      headers: { "X-Deja-Actor": who },
+    });
+  },
+  withdrawAcknowledgement: (ackId: number) => {
+    const who = actor();
+    if (!who) throw new Error("set your actor name first (top right)");
+    return request<{ ok: true }>(`/api/v1/acknowledgements/${ackId}`, {
+      method: "DELETE",
+      headers: { "X-Deja-Actor": who },
+    });
+  },
 
   createRun: (spec: Record<string, unknown>) => {
     const who = actor();
@@ -779,6 +858,48 @@ export type DeltaRow = {
   y: DeltaSide;
   blocking: boolean;
   lane?: { connector: string; flow: string } | null;
+  /** Laid over a charged row when the pull request has an acknowledgement
+   *  for its shape. Absent from an older server and on uncharged rows. */
+  acknowledgement?: RowAcknowledgement | null;
+};
+
+export type AcknowledgementState = "proposed" | "acknowledged" | "stale";
+
+export type RowAcknowledgement = {
+  id: number;
+  state: AcknowledgementState;
+  /** The confirmer when confirmed, else the proposer. */
+  by: string;
+  note: string;
+  /** The value differs from the one acknowledged; shown, not held against the row. */
+  value_changed: boolean;
+};
+
+/** The verdict once acknowledgements are counted. */
+export type EffectiveVerdict = "pass" | "acknowledged" | "fail";
+
+export type GithubRef = { repo: string; pr_number: number; head_sha: string; change_id?: string };
+
+/** One acknowledgement as stored: a shape of divergence on one pull request. */
+export type Acknowledgement = {
+  id: number;
+  repo: string;
+  pr_number: number;
+  change_id: string;
+  lane: { connector: string; flow: string } | null;
+  pattern:
+    | { kind: "call"; span_path: string; boundary: string; operation: string }
+    | { kind: "status" }
+    | { kind: "body"; json_path: string };
+  value_hash: string | null;
+  note: string;
+  origin_run_id: string;
+  proposed_by: string;
+  proposed_at: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  withdrawn_by: string | null;
+  withdrawn_at: string | null;
 };
 
 export type DeltaLane = {
@@ -814,6 +935,20 @@ export type Delta = {
     inherited_requests?: number;
     resolved_requests?: number;
     reason: string;
+    /** Blocking charged rows covered by a confirmed acknowledgement, by a
+     *  proposal only, or by one given on an earlier version of the change.
+     *  Absent from an older server. */
+    acknowledged?: number;
+    proposed?: number;
+    stale?: number;
+    /** What consumers gate on once acknowledgements count; absent when the
+     *  run names no pull request, or when the overlay failed. */
+    effective?: EffectiveVerdict;
+    /** Why the acknowledgements could not be laid over this delta; the
+     *  verdict above is then the pure three-way, not a decision. */
+    overlay_failure?: string;
+    /** Acknowledgements the server could not decode and did not apply. */
+    unread_acknowledgements?: number;
   };
   buckets: Partial<Record<DeltaBucket, number>>;
   lanes: DeltaLane[];

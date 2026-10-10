@@ -237,6 +237,7 @@ pub fn hash_seed(name: &'static str) -> DejaBuildHasher {
         lexical_path: Some(scope.clone()),
         syntax_hash: Some(crate::stable_callsite_hash(&scope)),
         span_path: crate::current_span_path(),
+        span_instance: crate::current_span_instance(),
     };
     let spec = BoundarySpec::with_semantics(
         BOUNDARY,

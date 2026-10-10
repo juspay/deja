@@ -41,6 +41,32 @@ use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
+/// Each reserved ASCII byte expands from one byte to a three-byte escape.
+fn encoded_instance_name_len(name: &str) -> usize {
+    name.len()
+        + 2 * name
+            .bytes()
+            .filter(|byte| matches!(byte, b'%' | b'>' | b'#'))
+            .count()
+}
+
+/// Write an exceptional name directly into its instance path; ordinary names
+/// are appended with one copy by the caller.
+fn push_encoded_instance_name(out: &mut String, name: &str) {
+    let mut start = 0;
+    for (index, byte) in name.bytes().enumerate() {
+        let escape = match byte {
+            b'%' => "%25",
+            b'>' => "%3E",
+            b'#' => "%23",
+            _ => continue,
+        };
+        out.push_str(&name[start..index]);
+        out.push_str(escape);
+        start = index + 1;
+    }
+    out.push_str(&name[start..]);
+}
 /// The span field carrying the request correlation id (set by the ingress root
 /// span — see `router_env::root_span`).
 pub(crate) const CORRELATION_FIELD: &str = "request_id";
@@ -53,6 +79,13 @@ struct SpanContext {
     /// Logical span-path root→leaf (`"payments_core>update_trackers"`), built once
     /// from the parent's path plus this span's name.
     path: Arc<str>,
+    /// `path` with each span instance told apart from its same-name siblings.
+    /// Literal reserved bytes are escaped before appending any generated `#n`
+    /// ordinal, so names cannot impersonate instance syntax.
+    instance: Arc<str>,
+    /// How many children of each name this span instance has created so far —
+    /// the counter `instance` ordinals are drawn from.
+    children: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, u32>>>,
     /// Correlation id from this span's own `request_id` field, else inherited from
     /// the parent. `None` when no ancestor carried one.
     correlation: Option<Arc<str>>,
@@ -111,6 +144,8 @@ struct SpanCursor {
     span_id: u64,
     /// Full logical span-path root→leaf, from the owning span's `SpanContext`.
     path: Arc<str>,
+    /// The owning span's instance path, from its `SpanContext`.
+    instance: Arc<str>,
     /// Task lineage of the owning span.
     lineage: Arc<crate::TaskLineage>,
 }
@@ -167,6 +202,7 @@ fn push_span_cursor(span_id: u64, cx: &SpanContext) {
         stack.borrow_mut().push(SpanCursor {
             span_id,
             path: Arc::clone(&cx.path),
+            instance: Arc::clone(&cx.instance),
             lineage: Arc::clone(&cx.lineage),
         });
     });
@@ -301,24 +337,42 @@ fn restore_correlation(span_id: u64) {
 /// The layer is installed unfiltered, so the path captures EVERY ambient `tracing`
 /// span (framework, library, and `#[instrument]` spans), root→leaf. Two consequences:
 ///
-///  * **Not robust to span-structure edits.** Adding, removing, or renaming ANY
-///    enclosing instrumented span on V2 (e.g. a function rename — which renames its
-///    default span — or an extracted helper) changes the path string, so the rank-2
-///    `SpanPath` key misses on V2 and the call demotes to rank-3 `SyntacticHash`
-///    (still line/signature-independent) or weaker. That is no WORSE than pre-P3
-///    behavior; `args_hash` still guards distinct-arg correctness. So a benign edit
-///    that leaves the span structure intact (a pure line shift) keeps rank-2; one that
-///    reshapes spans falls back gracefully.
-///  * **Disambiguates by span NAME, not instance.** Two concurrently-entered DISTINCT
-///    span instances that share a name (e.g. two parallel tasks each entering an
-///    identically-named span within one correlation) collapse to the SAME path and
-///    SAME bucket — the residual "case C" that needs a finer, distinctly-named
-///    `#[instrument]` span to resolve (a follow-up, not handled here). The headline
-///    case (`update_payment_attempt` vs `update_payment_intent`) has distinct names
-///    and IS disambiguated.
+///  * **Not robust to span-structure edits.** Adding, removing, or renaming an
+///    enclosing span changes both rank-2 paths; the lookup can then try source
+///    location or unlocated matching. Args remain part of every key.
+///  * **The plain path disambiguates by span NAME, not instance.** Same-name
+///    concurrent siblings share it and may exchange occurrence numbers. New
+///    recordings also carry `current_span_instance()`, which numbers such
+///    siblings by creation order; if creation order itself races, replay can
+///    still fall back to the plain path.
 #[must_use]
 pub fn current_span_path() -> Option<String> {
     with_current_cursor(|cursor| cursor.path.to_string())
+}
+
+/// The span-instance address of the innermost entered span. A same-name sibling
+/// gets a generated `#n` suffix; reserved name bytes are escaped so a literal
+/// name cannot impersonate that suffix or the path delimiters. `None` exactly
+/// when [`current_span_path`] is.
+///
+/// Present even where it equals the path: its presence is how a tape says its
+/// calls were numbered by instance. An instance key rendered for a tape that
+/// predates it would be numbered by arrival, and a twin falling through to the
+/// plain path could then be served the same row as its sibling.
+///
+/// This is what separates twins: two concurrent branches entering same-named
+/// spans and making identical calls share a span path, and today's tiebreak is
+/// arrival order, which under `join!` is a scheduler race. Creation order is not:
+/// `join!`/`try_join!` first-poll their branches in declaration order, and an
+/// `#[instrument]` async fn creates its span on that first poll.
+///
+/// The limit is where creation itself races — a span created after an `.await`
+/// in concurrent branches, or inside spawned tasks. There the ordinal is as racy
+/// as arrival order was; the lookup tries this first and falls back to the plain
+/// path, and args still keep distinct calls apart.
+#[must_use]
+pub fn current_span_instance() -> Option<String> {
+    with_current_cursor(|cursor| cursor.instance.to_string())
 }
 
 /// The task lineage of the innermost span entered on this thread, derived from the
@@ -417,6 +471,56 @@ where
             None => Arc::from(name),
         };
 
+        // Instance: the parent's instance plus this span's name, ordinal-suffixed
+        // when a same-name sibling came first. Counted only under a parent that
+        // belongs to a request and only for a span that does not open its own:
+        // a long-lived span above the request root would otherwise number every
+        // request's root differently on record and on replay.
+        let instance: Arc<str> = match parent.as_ref() {
+            Some(parent) => {
+                let counted = parent.correlation.is_some() && own_correlation.is_none();
+                let ordinal = if counted {
+                    let mut children = parent
+                        .children
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let next = children.entry(name).or_insert(0);
+                    let ordinal = *next;
+                    *next += 1;
+                    ordinal
+                } else {
+                    0
+                };
+                let encoded_len = encoded_instance_name_len(name);
+                let mut instance = String::with_capacity(
+                    parent.instance.len() + 1 + encoded_len + usize::from(ordinal != 0) * 11,
+                );
+                instance.push_str(&parent.instance);
+                instance.push('>');
+                if encoded_len == name.len() {
+                    instance.push_str(name);
+                } else {
+                    push_encoded_instance_name(&mut instance, name);
+                }
+                if ordinal != 0 {
+                    use std::fmt::Write as _;
+                    instance.push('#');
+                    write!(&mut instance, "{ordinal}").expect("writing to String cannot fail");
+                }
+                Arc::from(instance)
+            }
+            None => {
+                let encoded_len = encoded_instance_name_len(name);
+                if encoded_len == name.len() {
+                    Arc::clone(&path)
+                } else {
+                    let mut instance = String::with_capacity(encoded_len);
+                    push_encoded_instance_name(&mut instance, name);
+                    Arc::from(instance)
+                }
+            }
+        };
+
         // A `deja.fork` span opens a fresh, unordered lineage bucket; every other
         // span inherits its parent's, so synchronous nesting stays in one bucket.
         let mut fork_visitor = ForkVisitor(false);
@@ -457,6 +561,8 @@ where
 
         span.extensions_mut().insert(SpanContext {
             path,
+            instance,
+            children: Arc::default(),
             correlation,
             lineage,
             observe,
@@ -565,6 +671,84 @@ mod tests {
                 assert_eq!(current_correlation_id().as_deref(), Some("outer"));
             }
             assert_eq!(current_correlation_id().as_deref(), Some("outer"));
+        });
+    }
+    #[test]
+    fn reserved_span_names_do_not_alias_generated_instance_ordinals() {
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-encoding");
+            let _root = root.enter();
+
+            let literal = tracing::info_span!("x#1");
+            let literal_instance = {
+                let _literal = literal.enter();
+                assert_eq!(
+                    current_span_path().as_deref(),
+                    Some("deja::http_incoming>x#1")
+                );
+                current_span_instance()
+            };
+            let first_x = tracing::info_span!("x");
+            let first_instance = {
+                let _first = first_x.enter();
+                current_span_instance()
+            };
+            let second_x = tracing::info_span!("x");
+            let second_instance = {
+                let _second = second_x.enter();
+                current_span_instance()
+            };
+            assert_eq!(
+                literal_instance.as_deref(),
+                Some("deja::http_incoming>x%231")
+            );
+            assert_eq!(first_instance.as_deref(), Some("deja::http_incoming>x"));
+            assert_eq!(second_instance.as_deref(), Some("deja::http_incoming>x#1"));
+            assert_ne!(literal_instance, second_instance);
+
+            {
+                let unicode = tracing::info_span!("é#1");
+                let _unicode = unicode.enter();
+                assert_eq!(
+                    current_span_instance().as_deref(),
+                    Some("deja::http_incoming>é%231")
+                );
+            }
+
+            let literal_parent = tracing::info_span!("parent>part");
+            let child_instance = {
+                let _parent = literal_parent.enter();
+                let child = tracing::info_span!("child%part");
+                let _child = child.enter();
+                assert_eq!(
+                    current_span_path().as_deref(),
+                    Some("deja::http_incoming>parent>part>child%part")
+                );
+                current_span_instance()
+            };
+            assert_eq!(
+                child_instance.as_deref(),
+                Some("deja::http_incoming>parent%3Epart>child%25part")
+            );
+        });
+    }
+    #[test]
+    fn reserved_root_and_correlated_child_names_are_encoded_for_instances() {
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("root#1", request_id = "req-root-encoding");
+            let _root = root.enter();
+            assert_eq!(current_span_path().as_deref(), Some("root#1"));
+            assert_eq!(current_span_instance().as_deref(), Some("root%231"));
+
+            let child_root = tracing::info_span!("child%>root", request_id = "req-child-encoding");
+            let _child_root = child_root.enter();
+            assert_eq!(current_span_path().as_deref(), Some("root#1>child%>root"));
+            assert_eq!(
+                current_span_instance().as_deref(),
+                Some("root%231>child%25%3Eroot")
+            );
         });
     }
 
@@ -1186,6 +1370,64 @@ mod tests {
                 current_span_path().as_deref(),
                 Some("deja::http_incoming"),
                 "and the root, still entered, is what remains"
+            );
+        });
+    }
+
+    #[test]
+    fn same_name_siblings_are_numbered_by_creation_not_by_entry() {
+        // Twins: two branches each creating a same-named span under one parent,
+        // as `try_join!` over two `#[instrument]` calls does. The second CREATED
+        // is `#1` however the two are later entered, and the first carries no
+        // suffix, so a call there reads exactly as it does without a twin.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let root = tracing::info_span!("deja::http_incoming", request_id = "req-twins");
+            let _root = root.enter();
+            let billing = tracing::info_span!("create_address");
+            let shipping = tracing::info_span!("create_address");
+            {
+                let _shipping = shipping.enter();
+                assert_eq!(
+                    current_span_path().as_deref(),
+                    Some("deja::http_incoming>create_address")
+                );
+                assert_eq!(
+                    current_span_instance().as_deref(),
+                    Some("deja::http_incoming>create_address#1"),
+                    "entered first, created second"
+                );
+                let _child = tracing::info_span!("insert").entered();
+                assert_eq!(
+                    current_span_instance().as_deref(),
+                    Some("deja::http_incoming>create_address#1>insert"),
+                    "a child is numbered under its own parent instance"
+                );
+            }
+            let _billing = billing.enter();
+            assert_eq!(
+                current_span_instance(),
+                current_span_path(),
+                "the first instance is the plain path"
+            );
+        });
+    }
+
+    #[test]
+    fn spans_outside_a_request_are_never_numbered() {
+        // A long-lived span above the request root would number every request's
+        // root differently on record and on replay; only spans under a request
+        // are counted.
+        let subscriber = tracing_subscriber::registry().with(DejaCorrelationLayer::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let server = tracing::info_span!("server");
+            let _server = server.enter();
+            let _earlier = tracing::info_span!("deja::http_incoming", request_id = "req-1");
+            let later = tracing::info_span!("deja::http_incoming", request_id = "req-2");
+            let _later = later.enter();
+            assert_eq!(
+                current_span_instance().as_deref(),
+                Some("server>deja::http_incoming")
             );
         });
     }

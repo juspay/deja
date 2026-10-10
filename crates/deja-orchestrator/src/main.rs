@@ -35,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
@@ -58,6 +58,11 @@ struct AppState {
     store: Option<Arc<Store>>,
     mutation_auth: MutationAuth,
     executor: Arc<ExecutorSelection>,
+    /// Sign-in for the gated actions (acknowledging, later promoting). Off
+    /// unless the configuration's `[auth]` block says otherwise.
+    auth: Arc<deja_orchestrator::auth::AuthState>,
+    /// Verdict restates in flight, one per pull request.
+    restates: Arc<Restates>,
 }
 
 /// Which executor drives runs, resolved ONCE at startup. K8s carries the
@@ -117,6 +122,13 @@ impl MutationAuth {
 
 #[derive(Clone, Debug)]
 struct AuthenticatedActor(String);
+
+/// The sign-in issuer's stable id for the actor, beside the name: set by
+/// `require_session` from the session cookie, `None` for a typed name or the
+/// pipeline's token. What a decision is recorded under, since an email can
+/// be renamed or handed to someone else.
+#[derive(Clone, Debug)]
+struct ActorSubject(Option<String>);
 
 #[tokio::main]
 async fn main() {
@@ -178,11 +190,54 @@ async fn main() {
             None
         }
     };
+    // A declared [auth] block that does not resolve is a refusal to start,
+    // not a warning: running without the gate the deployment asked for would
+    // reopen the acknowledgement routes to a typed name, and the only trace
+    // would be one line here that nobody reads.
+    let auth = match deja_orchestrator::auth::AuthState::from_settings() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("deja-orchestrator: refusing to start: {e}");
+            std::process::exit(2);
+        }
+    };
+    if auth.enabled() {
+        let cfg = auth.config();
+        eprintln!(
+            "deja-orchestrator: sign-in on (Google), accounts ending in {}, {} role list(s)",
+            cfg.domains.join(", "),
+            cfg.roles.len()
+        );
+    } else if auth.declared() {
+        // A block with the client, the secrets and the lists, and no
+        // `enabled = true`: said out loud, since everything else about the
+        // deployment says sign-in was meant.
+        eprintln!(
+            "deja-orchestrator: an [auth] block is declared but auth.enabled is not true; running with sign-in OFF (typed names)"
+        );
+    }
+    {
+        // The lists and the switch are re-read on a timer, so a changed
+        // configuration applies on the next request without a restart.
+        let auth = auth.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(deja_orchestrator::auth::RELOAD_EVERY).await;
+                if let Err(e) = auth.reload() {
+                    eprintln!(
+                        "deja-orchestrator: [auth] reload failed, keeping the last good lists: {e}"
+                    );
+                }
+            }
+        });
+    }
     let state = AppState {
         root: root.clone(),
         store,
         mutation_auth: MutationAuth::from_env(),
         executor,
+        auth,
+        restates: Arc::default(),
     };
 
     // Restart-durable reconciler (#34 V3/V7). The per-launch watcher in
@@ -246,6 +301,15 @@ fn app_router(state: AppState) -> Router {
     let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
     // Killing a run is a human action like creating one: same auth, and audited.
     let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
+    // Acknowledging a divergence is a human action, twice over: one person
+    // proposes, another confirms. Same auth as creating a run, and audited.
+    // ...and the one place a person has to be signed in once sign-in is on:
+    // a bearer token if presented, else the session cookie, else (sign-in
+    // off) the typed name. See require_session.
+    let gated = middleware::from_fn_with_state(state.clone(), require_session);
+    let propose_acknowledgements = post(v1_propose_acknowledgements).route_layer(gated.clone());
+    let confirm_acknowledgement = post(v1_confirm_acknowledgement).route_layer(gated.clone());
+    let withdraw_acknowledgement = delete(v1_withdraw_acknowledgement).route_layer(gated);
     // Push-back ingest: an out-of-process lifecycle runner (the k8s Job) reports
     // RunEvents here and authenticates with the service token (require_service_auth).
     let ingest_run_event = post(v1_ingest_run_event).route_layer(middleware::from_fn_with_state(
@@ -276,12 +340,24 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
         .route("/runs/{run_id}/tree", get(v1_tree))
         .route("/runs/{run_id}/delta", get(v1_delta))
+        .route(
+            "/runs/{run_id}/acknowledgements",
+            propose_acknowledgements.get(v1_list_acknowledgements),
+        )
+        .route("/acknowledgements/{id}/confirm", confirm_acknowledgement)
+        .route("/acknowledgements/{id}", withdraw_acknowledgement)
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
-        .route("/audit", get(v1_audit));
+        .route("/audit", get(v1_audit))
+        .route("/auth/me", get(v1_auth_me));
 
     Router::new()
         .nest("/api/v1", api_v1)
+        // The sign-in flow lives at the root, as the redirect URI registered
+        // with Google names it: /auth/callback on this host.
+        .route("/auth/login/start", get(auth_login_start))
+        .route("/auth/callback", get(auth_callback))
+        .route("/auth/logout", post(auth_logout))
         // SPA: real assets by path; any other GET falls back to index.html
         // (client-side routing). The API is entirely under /api/v1, so the
         // page URL space (/runs/..., /recordings, ...) is the SPA's alone.
@@ -381,6 +457,292 @@ async fn require_service_auth(
     next.run(req).await
 }
 
+// ---------------------------------------------------------------------------
+// Sign-in: the gate on the actions that need a person, and the Google flow.
+// The model is deja_orchestrator::auth; this is its HTTP.
+// ---------------------------------------------------------------------------
+
+/// The gate on acknowledging (and later promoting). Precedence: a bearer
+/// token, if presented, is authoritative and never falls through, so a CI
+/// job with a revoked token gets a clear 401; else the session cookie, whose
+/// verified email is the actor; else, only with sign-in off, the typed name
+/// header that every other human action still uses.
+async fn require_session(
+    State(st): State<AppState>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(supplied) = bearer_token(req.headers()) {
+        return match st.mutation_auth.service_token.as_deref() {
+            Some(expected) if service_token_matches(expected, supplied) => {
+                req.extensions_mut()
+                    .insert(AuthenticatedActor(SERVICE_ACTOR.to_owned()));
+                req.extensions_mut().insert(ActorSubject(None));
+                next.run(req).await
+            }
+            _ => error_resp(401, "invalid bearer token"),
+        };
+    }
+    if let Some(session) = session_from_headers(&st, req.headers()) {
+        // The domain gate again, not only at login: an account moved out of
+        // the allowed domains is out as soon as the list changes, not when
+        // its cookie expires.
+        if !st.auth.config().domain_allowed(&session.email) {
+            return error_resp(401, "this account is no longer allowed to sign in");
+        }
+        req.extensions_mut()
+            .insert(AuthenticatedActor(session.email));
+        req.extensions_mut()
+            .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
+        return next.run(req).await;
+    }
+    if !st.auth.enabled() {
+        return match actor_from_headers(req.headers()) {
+            Some(actor) => {
+                req.extensions_mut().insert(AuthenticatedActor(actor));
+                req.extensions_mut().insert(ActorSubject(None));
+                next.run(req).await
+            }
+            None => error_resp(401, "X-Deja-Actor header required for mutating requests"),
+        };
+    }
+    error_resp(401, "sign in to do this")
+}
+
+fn session_from_headers(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Option<deja_orchestrator::auth::session::Session> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    let value = deja_orchestrator::auth::session::cookie_value(
+        raw,
+        deja_orchestrator::auth::SESSION_COOKIE,
+    )?;
+    st.auth.signer.verify_session(value).ok()
+}
+
+/// The scheme and host the browser used, as the ingress reports them.
+fn request_origin(headers: &HeaderMap) -> (String, String) {
+    let h = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or("").trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let scheme = h("x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
+    let host = h("x-forwarded-host")
+        .or_else(|| h("host"))
+        .unwrap_or_else(|| "localhost".to_owned());
+    (scheme, host)
+}
+
+fn set_cookie(name: &str, value: &str, max_age: Option<u64>, secure: bool) -> String {
+    let mut c = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax");
+    if let Some(a) = max_age {
+        c.push_str(&format!("; Max-Age={a}"));
+    }
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+fn redirect_with_cookies(location: &str, cookies: &[String]) -> Response {
+    let mut b = Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, location);
+    for c in cookies {
+        b = b.header(header::SET_COOKIE, c);
+    }
+    b.body(axum::body::Body::empty())
+        .unwrap_or_else(|_| error_resp(500, "redirect"))
+}
+
+type Query = axum::extract::Query<std::collections::HashMap<String, String>>;
+
+/// `GET /auth/login/start?return_url=/r/…`: sign the state cookie and send
+/// the browser to Google.
+async fn auth_login_start(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): Query,
+) -> Response {
+    use deja_orchestrator::auth::{self, google, session};
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(404, "sign-in is not configured on this deployment");
+    }
+    let return_url = auth::safe_return_url(q.get("return_url").map(String::as_str));
+    let state = session::random_nonce();
+    let id_nonce = session::random_nonce();
+    let cookie = st.auth.signer.sign_state(&state, &id_nonce, &return_url);
+    let (scheme, host) = request_origin(&headers);
+    let redirect_uri = format!("{scheme}://{host}/auth/callback");
+    let url = google::authorization_url(
+        &st.auth.endpoints,
+        &cfg.client_id,
+        &redirect_uri,
+        &state,
+        &id_nonce,
+    );
+    redirect_with_cookies(
+        &url,
+        &[set_cookie(
+            auth::STATE_COOKIE,
+            &cookie,
+            Some(session::STATE_MAX_AGE.as_secs()),
+            cfg.cookie_secure,
+        )],
+    )
+}
+
+/// `GET /auth/callback?code=&state=`: the state check, the code exchange,
+/// the ID-token verification (signature, audience, issuer, expiry, nonce),
+/// the domain gate, then the session cookie and the way back.
+async fn auth_callback(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): Query,
+) -> Response {
+    use deja_orchestrator::auth::{self, google, session};
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(404, "sign-in is not configured on this deployment");
+    }
+    let (scheme, host) = request_origin(&headers);
+    let secure = cfg.cookie_secure;
+    let clear_state = set_cookie(auth::STATE_COOKIE, "", Some(0), secure);
+    let fail = |code: &str| {
+        redirect_with_cookies(
+            &format!("/login?error={code}"),
+            std::slice::from_ref(&clear_state),
+        )
+    };
+    let state_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| session::cookie_value(raw, auth::STATE_COOKIE).map(str::to_owned));
+    let Some(state_cookie) = state_cookie else {
+        return fail("state_mismatch");
+    };
+    let sent_state = q.get("state").map(String::as_str).unwrap_or("");
+    let Ok((return_url, id_nonce)) = st.auth.signer.verify_state(&state_cookie, sent_state) else {
+        return fail("state_mismatch");
+    };
+    let Some(code) = q.get("code").cloned().filter(|c| !c.is_empty()) else {
+        return fail("exchange");
+    };
+    let redirect_uri = format!("{scheme}://{host}/auth/callback");
+    let auth_state = st.auth.clone();
+    let (client_id, client_secret) = (cfg.client_id.clone(), cfg.client_secret.clone());
+    // Both the exchange and a key fetch are blocking HTTP; off the runtime.
+    let verified = tokio::task::spawn_blocking(move || {
+        let id_token = google::exchange_code(
+            &auth_state.endpoints,
+            &client_id,
+            &client_secret,
+            &code,
+            &redirect_uri,
+        )
+        .map_err(|e| ("exchange", e))?;
+        auth_state
+            .verifier
+            .verify(&id_token, Some(&id_nonce))
+            .map_err(|e| ("verify", e))
+    })
+    .await;
+    let claims = match verified {
+        Ok(Ok(c)) => c,
+        Ok(Err((code, why))) => {
+            eprintln!("deja-orchestrator: sign-in failed at {code}: {why}");
+            return fail(code);
+        }
+        Err(e) => {
+            eprintln!("deja-orchestrator: sign-in task failed: {e}");
+            return fail("verify");
+        }
+    };
+    let email = claims.email.unwrap_or_default();
+    if !cfg.domain_allowed(&email) {
+        eprintln!("deja-orchestrator: sign-in refused: account not in the allowed domains");
+        return fail("domain");
+    }
+    let session = st.auth.signer.new_session(
+        &claims.sub,
+        &email,
+        &claims.name,
+        &claims.picture,
+        cfg.session_duration,
+    );
+    let cookie = st.auth.signer.sign_session(&session);
+    if let Some(store) = &st.store {
+        let _ = store
+            .audit(
+                &email,
+                "auth.login",
+                "session",
+                &email,
+                &serde_json::json!({}),
+            )
+            .await;
+    }
+    redirect_with_cookies(
+        &return_url,
+        &[
+            set_cookie(
+                auth::SESSION_COOKIE,
+                &cookie,
+                Some(cfg.session_duration.as_secs()),
+                secure,
+            ),
+            clear_state,
+        ],
+    )
+}
+
+/// `POST /auth/logout`: forget the session.
+async fn auth_logout(State(st): State<AppState>) -> Response {
+    let mut r = json_ok(serde_json::json!({ "ok": true }));
+    let cleared = set_cookie(
+        deja_orchestrator::auth::SESSION_COOKIE,
+        "",
+        Some(0),
+        st.auth.config().cookie_secure,
+    );
+    if let Ok(v) = cleared.parse() {
+        r.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    r
+}
+
+/// `GET /api/v1/auth/me`: what the viewer draws its header from. Never 401:
+/// an anonymous visitor gets `authenticated: false` and decides what to show.
+async fn v1_auth_me(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return json_ok(serde_json::json!({ "configured": false, "authenticated": false }));
+    }
+    match session_from_headers(&st, &headers) {
+        // The same gate the actions apply: an account that left the allowed
+        // domains is told so here, not at the first press of a button.
+        Some(s) if !cfg.domain_allowed(&s.email) => json_ok(serde_json::json!({
+            "configured": true,
+            "authenticated": false,
+            "reason": "this account is no longer allowed to sign in",
+        })),
+        Some(s) => json_ok(serde_json::json!({
+            "configured": true,
+            "authenticated": true,
+            "email": s.email,
+            "name": s.name,
+            "picture": s.picture,
+            "roles": cfg.roles_for(&s.email),
+        })),
+        None => json_ok(serde_json::json!({ "configured": true, "authenticated": false })),
+    }
+}
+
 fn actor_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-deja-actor")
@@ -450,6 +812,10 @@ async fn v1_create_run(
         if let Err(e) = against.parse::<RunId>() {
             return error_resp(400, &format!("delta_against: {e}"));
         }
+    }
+    let mut spec = spec;
+    if let Err(e) = admit_github(&mut spec) {
+        return error_resp(400, &format!("github: {e}"));
     }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
@@ -2581,7 +2947,14 @@ async fn v1_delta(
         delta_between(&st, &id, &against).await
     };
     match result {
-        Ok(body) => json_ok(body),
+        Ok(mut body) => {
+            // The run's own delta is overlaid in delta_for_run; a pairing named
+            // by the query is overlaid here, as it is kept nowhere.
+            if declared.as_deref() != Some(&*against) {
+                overlay_acknowledgements(&st, &id, &mut body).await;
+            }
+            json_ok(body)
+        }
         Err(why) => json_ok(why.to_json()),
     }
 }
@@ -2653,12 +3026,29 @@ async fn delta_between(
 /// The run row's word for a delta result: `pass` or `fail` once computed,
 /// else the kind of unavailability, so a reader of the row can tell a delta
 /// still coming from one that never will.
-fn delta_verdict_word(result: &Result<serde_json::Value, Unavailable>) -> &'static str {
+fn delta_verdict_word(result: Result<&serde_json::Value, &Unavailable>) -> &'static str {
     match result {
-        Ok(body) => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
-            Some(true) => "pass",
-            Some(false) => "fail",
-            None => "refused",
+        // The effective verdict, once acknowledgements are counted, is what
+        // the row says; a body the overlay has not seen falls back to the
+        // pure three-way.
+        Ok(body) => match body.pointer("/verdict/effective").and_then(|v| v.as_str()) {
+            Some("pass") => "pass",
+            Some("acknowledged") => "acknowledged",
+            Some("fail") => "fail",
+            // The acknowledgements could not be laid over the delta: the
+            // row must not say pass or fail on a bare comparison that was
+            // never a decision, so it says it does not know.
+            _ if body
+                .pointer("/verdict/overlay_failure")
+                .is_some_and(|v| v.is_string()) =>
+            {
+                "unknown"
+            }
+            _ => match body.pointer("/verdict/pass").and_then(|v| v.as_bool()) {
+                Some(true) => "pass",
+                Some(false) => "fail",
+                None => "refused",
+            },
         },
         // The run row keeps its four words; a tape mismatch is a refusal there.
         Err(Unavailable::TapeMismatch(_)) => "refused",
@@ -2691,16 +3081,20 @@ async fn delta_for_run(
         .await
         .ok()
         .flatten();
-        if let Some(doc) = cached {
+        if let Some(mut doc) = cached {
+            // The cache holds the pure three-way; the acknowledgements are laid
+            // over it on every read, so a confirmation shows at once.
+            overlay_acknowledgements(st, y_id, &mut doc).await;
             // The row is settled from the cache too: a column that was reset,
             // or never written because the store was away, catches up on the
             // next view rather than waiting for a recomputation.
-            record_delta_verdict(st, y_id, &Ok(doc.clone())).await;
+            record_delta_verdict(st, y_id, Ok(&doc)).await;
             return Ok(doc);
         }
     }
     let computed = delta_between(st, y_id, m_id).await;
-    record_delta_verdict(st, y_id, &computed).await;
+    // Cached before the overlay: the cache is a function of the two trees
+    // alone, and never of who has acknowledged what since.
     if let (Ok(body), Some(cache)) = (&computed, cache) {
         let text = body.to_string();
         let _ = tokio::task::spawn_blocking(move || {
@@ -2708,6 +3102,14 @@ async fn delta_for_run(
         })
         .await;
     }
+    let computed = match computed {
+        Ok(mut body) => {
+            overlay_acknowledgements(st, y_id, &mut body).await;
+            Ok(body)
+        }
+        Err(why) => Err(why),
+    };
+    record_delta_verdict(st, y_id, computed.as_ref()).await;
     computed
 }
 
@@ -2716,7 +3118,7 @@ async fn delta_for_run(
 async fn record_delta_verdict(
     st: &AppState,
     y_id: &str,
-    computed: &Result<serde_json::Value, Unavailable>,
+    computed: Result<&serde_json::Value, &Unavailable>,
 ) {
     if let Some(store) = &st.store {
         if let Err(e) = store
@@ -2759,19 +3161,625 @@ async fn settle_deltas_for(st: AppState, run_id: String) {
     }
 }
 
-/// The run's parameters: the live record on compose, the stored row on k8s.
-async fn run_params_for(st: &AppState, id: &str) -> Option<deja_orchestrator::RunParams> {
-    let live: Option<Run> = confined(st.root.run_path(id), &st.root.root.join("runs"))
-        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
-    match live {
-        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
-        None => match &st.store {
-            Some(store) => match store.get_run(id).await {
-                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
+// ---------------------------------------------------------------------------
+// Acknowledgements: a divergence a pull request introduces, accepted as
+// intended. The model and the overlay live in divergence::acknowledgement;
+// this is their store and their HTTP.
+// ---------------------------------------------------------------------------
+
+fn acknowledgement_from_row(
+    r: &deja_store::AcknowledgementRow,
+) -> Option<divergence::acknowledgement::Acknowledgement> {
+    use divergence::acknowledgement::{Acknowledgement, Key};
+    let lane = match &r.lane {
+        Some(v) if !v.is_null() => Some(serde_json::from_value(v.clone()).ok()?),
+        _ => None,
+    };
+    let pattern = serde_json::from_value(r.pattern.clone()).ok()?;
+    Some(Acknowledgement {
+        id: r.id,
+        key: Key { lane, pattern },
+        change_id: r.change_id.clone(),
+        value_hash: r.value_hash.clone(),
+        note: r.note.clone(),
+        proposed_by: r.proposed_by.clone(),
+        acknowledged_by: r.acknowledged_by.clone(),
+        withdrawn: r.withdrawn_at.is_some(),
+        proposed_by_sub: r.proposed_by_sub.clone(),
+        acknowledged_by_sub: r.acknowledged_by_sub.clone(),
+    })
+}
+
+/// The pull request a run was created for, as its params say: `Ok(None)`
+/// when it names none, `Err` when that could not be told.
+async fn github_of(
+    st: &AppState,
+    id: &str,
+) -> Result<Option<deja_orchestrator::GithubRef>, String> {
+    run_params_read(st, id)
+        .await
+        .map(|p| p.and_then(|p| p.github))
+}
+
+/// The pull request's acknowledgements as the overlay reads them, and how
+/// many rows would not decode: a row written under an older shape of the
+/// pattern or the lane. Those are not applied; the count is shown, so a
+/// history that says "confirmed" beside a delta that says "uncovered" has
+/// a number explaining the gap.
+fn decode_acknowledgements(
+    rows: &[deja_store::AcknowledgementRow],
+) -> (Vec<divergence::acknowledgement::Acknowledgement>, usize) {
+    let acks: Vec<_> = rows.iter().filter_map(acknowledgement_from_row).collect();
+    let unread = rows.len() - acks.len();
+    (acks, unread)
+}
+
+fn pr_number_i64(gh: &deja_orchestrator::GithubRef) -> Option<i64> {
+    i64::try_from(gh.pr_number).ok()
+}
+
+/// Lay the pull request's acknowledgements over `body`, a delta of `y_id`,
+/// and settle its effective verdict. A run that names no pull request leaves
+/// the body as the pure three-way, whose verdict then has no `effective` and
+/// reads as pass or fail: the normal case, which the acknowledge page
+/// explains. When the run does name one and the overlay still cannot
+/// happen — the store is away, its rows would not read, the delta would not
+/// decode — the verdict says so in `overlay_failure`, so the bare comparison
+/// is never mistaken for a decision.
+async fn overlay_acknowledgements(st: &AppState, y_id: &str, body: &mut serde_json::Value) {
+    use serde::Deserialize as _;
+
+    let failed = |body: &mut serde_json::Value, why: String| {
+        eprintln!("deja-orchestrator: acknowledgements not applied to {y_id}: {why}");
+        body["verdict"]["overlay_failure"] = serde_json::Value::String(why);
+    };
+    // "Names no pull request" and "could not tell" are two answers: the
+    // first is the normal case, the second a failure the verdict carries.
+    let gh = match github_of(st, y_id).await {
+        Ok(Some(gh)) => gh,
+        Ok(None) => return,
+        Err(e) => return failed(body, e),
+    };
+    let Some(pr) = pr_number_i64(&gh) else {
+        return failed(body, "pr_number is out of range".to_owned());
+    };
+    let Some(store) = &st.store else {
+        return failed(body, "the store is away".to_owned());
+    };
+    let rows = match store.acknowledgements_for_pull_request(&gh.repo, pr).await {
+        Ok(rows) => rows,
+        Err(e) => return failed(body, format!("the acknowledgements could not be read: {e}")),
+    };
+    let (acks, unread) = decode_acknowledgements(&rows);
+    if unread > 0 {
+        eprintln!(
+            "deja-orchestrator: {unread} of {} acknowledgements of {}#{} could not be decoded and were not applied to {y_id}",
+            rows.len(),
+            gh.repo,
+            gh.pr_number
+        );
+    }
+    // Decoded from a borrow: the body is several megabytes on a large delta,
+    // and a copy per read is what this process has been killed for before.
+    let mut delta = match divergence::delta::Delta::deserialize(&*body) {
+        Ok(d) => d,
+        Err(e) => return failed(body, format!("the cached delta would not decode: {e}")),
+    };
+    // With sign-in on, only a signed-in confirmation counts: a decision from
+    // before it would otherwise pass the gate for as long as the change id
+    // held, however it had been given.
+    divergence::acknowledgement::apply(
+        &mut delta,
+        &acks,
+        gh.change_id.as_deref(),
+        st.auth.enabled(),
+    );
+    delta.verdict.unread_acknowledgements = unread;
+    body["rows"] = serde_json::to_value(&delta.rows).unwrap_or_default();
+    body["verdict"] = serde_json::to_value(&delta.verdict).unwrap_or_default();
+}
+
+/// Whether `actor` may confirm a proposal by `proposer`: a second person,
+/// and only that until sign-in gives deja a maintainers list to check
+/// against. Names are compared trimmed and case-insensitively, since they
+/// are typed.
+fn may_confirm(proposer: &str, actor: &str) -> bool {
+    !proposer.trim().eq_ignore_ascii_case(actor.trim())
+}
+
+/// Why a confirmation is refused, in the words the person sees.
+fn confirm_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer: &str,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return (!may_confirm(proposer, actor))
+            .then_some("a proposal is confirmed by someone other than its proposer");
+    }
+    // The epoch: a proposal carries the subject of the person who made it,
+    // or none when it was made before sign-in or by the pipeline's token. A
+    // typed name cannot be told from the signed-in person who typed it, so
+    // it has to be proposed again by someone who is signed in.
+    let Some(proposer_sub) = proposer_sub.filter(|s| !s.is_empty()) else {
+        return Some(if proposer == SERVICE_ACTOR {
+            "this was proposed by the pipeline's token; propose it signed in"
+        } else {
+            "this was proposed before sign-in; propose it again, signed in"
+        });
+    };
+    // Confirming is a person's act: the token never confirms, and a cookie
+    // from before subjects were carried signs in again first.
+    let Some(actor_sub) = actor_sub.filter(|s| !s.is_empty()) else {
+        return Some("acknowledging needs a signed-in person");
+    };
+    if !cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return Some("only a maintainer may acknowledge");
+    }
+    // Same person under two emails is still one person.
+    (actor_sub == proposer_sub)
+        .then_some("a proposal is confirmed by someone other than its proposer")
+}
+
+/// The name the pipeline's bearer token acts under.
+const SERVICE_ACTOR: &str = "svc:pipeline";
+
+/// The rule once sign-in is on: a maintainer, not the proposer, and a
+/// proposal made while signed in. Off, the second-person rule alone. The
+/// handler asks `confirm_refusal` for the reason; this is the yes/no form
+/// the tests read.
+#[cfg(test)]
+fn may_confirm_under(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer: &str,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> bool {
+    confirm_refusal(cfg, proposer, proposer_sub, actor, actor_sub).is_none()
+}
+
+/// Withdrawing: a maintainer or the proposer once sign-in is on; anyone
+/// before, as before.
+fn may_withdraw_under(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    proposer_sub: Option<&str>,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> bool {
+    if !cfg.enabled {
+        return true;
+    }
+    if cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return true;
+    }
+    // The proposer, by subject: a typed name from before sign-in is nobody
+    // in particular, so such a row is a maintainer's to withdraw.
+    match (
+        proposer_sub.filter(|s| !s.is_empty()),
+        actor_sub.filter(|s| !s.is_empty()),
+    ) {
+        (Some(p), Some(a)) => p == a,
+        _ => false,
+    }
+}
+
+/// How many of a pull request's runs have their verdict re-stated after a
+/// decision. The newest ones are the ones a check reads; older runs catch up
+/// on their next view, since the overlay runs on every read anyway.
+const RESTATE_RUNS: i64 = 20;
+
+/// The restates in flight, one per pull request. "Acknowledge N shapes" is
+/// N confirmations at once; without this each would walk the runs on its
+/// own, computing the same deltas side by side and racing to write the
+/// row, so a pass that read the acknowledgements early could land last.
+/// A decision that arrives while a pass is running asks for one more pass
+/// after it, which reads the acknowledgements fresh.
+#[derive(Default)]
+struct Restates(std::sync::Mutex<std::collections::HashMap<(String, i64), bool>>);
+
+impl Restates {
+    /// Whether the caller runs the pass. False means one is running and has
+    /// been asked to go once more when it is done.
+    fn begin(&self, key: &(String, i64)) -> bool {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match m.get_mut(key) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                m.insert(key.clone(), false);
+                true
+            }
+        }
+    }
+
+    /// After a pass: whether another is owed. When not, the key is released.
+    fn finish(&self, key: &(String, i64)) -> bool {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match m.get_mut(key) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                m.remove(key);
+                false
+            }
+        }
+    }
+}
+
+/// After a confirmation or a withdrawal, the newest runs of the pull request
+/// have their delta verdict re-stated, so the row's word and the delta
+/// agree. Spawned off the request: the decision is already written, and a
+/// delta per run is work the person who pressed the button must not wait
+/// behind. One pass per pull request at a time (see [`Restates`]).
+fn restate_pull_request_verdicts(st: AppState, repo: String, pr: i64) {
+    let key = (repo, pr);
+    if !st.restates.begin(&key) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            restate_once(&st, &key.0, key.1).await;
+            if !st.restates.finish(&key) {
+                break;
+            }
+        }
+    });
+}
+
+async fn restate_once(st: &AppState, repo: &str, pr: i64) {
+    let Some(store) = &st.store else {
+        return;
+    };
+    let runs = match store.runs_for_pull_request(repo, pr, RESTATE_RUNS).await {
+        Ok(runs) => runs,
+        Err(e) => {
+            eprintln!("deja-orchestrator: runs of {repo}#{pr} could not be listed to re-state their verdicts: {e}");
+            return;
+        }
+    };
+    if runs.len() as i64 == RESTATE_RUNS {
+        eprintln!(
+            "deja-orchestrator: {repo}#{pr} has more than {RESTATE_RUNS} runs; only the newest {RESTATE_RUNS} are re-stated now, the rest on their next view"
+        );
+    }
+    for run in runs {
+        if let Some(against) = run_params_for(st, &run).await.and_then(|p| p.delta_against) {
+            let _ = delta_for_run(st, &run, &against).await;
+        }
+    }
+}
+
+/// Write an audit line, and say so when it could not be written: the
+/// decision it records has already been taken, and a trail with a hole in
+/// it should at least be a known hole.
+async fn audit_or_say(
+    store: &deja_store::Store,
+    actor: &str,
+    action: &str,
+    target: &str,
+    details: &serde_json::Value,
+) {
+    if let Err(e) = store
+        .audit(actor, action, "pull_request", target, details)
+        .await
+    {
+        eprintln!(
+            "deja-orchestrator: audit of {action} on {target} by {actor} was not written: {e}"
+        );
+    }
+}
+
+/// `GET /api/v1/runs/{id}/acknowledgements`: the pull request's
+/// acknowledgements, withdrawn ones included, with the pull request they
+/// belong to.
+async fn v1_list_acknowledgements(State(st): State<AppState>, id: RunId) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let gh = match github_of(&st, &id).await {
+        Ok(Some(gh)) => gh,
+        Ok(None) => {
+            return error_resp(
+                404,
+                "this run names no pull request; acknowledgements belong to one",
+            )
+        }
+        Err(e) => return error_resp(500, &e),
+    };
+    let Some(pr) = pr_number_i64(&gh) else {
+        return error_resp(400, "pr_number is out of range");
+    };
+    match store.acknowledgements_for_pull_request(&gh.repo, pr).await {
+        Ok(rows) => json_ok(serde_json::json!({ "github": gh, "acknowledgements": rows })),
+        Err(e) => error_resp(500, &format!("acknowledgements: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ProposeAcknowledgements {
+    /// Addresses of rows in this run's delta, as the delta lists them.
+    rows: Vec<divergence::behaviour_tree::Address>,
+    note: String,
+}
+
+/// `POST /api/v1/runs/{id}/acknowledgements`: propose rows of this run's
+/// delta as intended. Only rows the delta charges to this run can be
+/// proposed; the key stored is the row's pattern, not its address, so the
+/// proposal outlives this run and its recording.
+async fn v1_propose_acknowledgements(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    id: RunId,
+    body: axum::body::Bytes,
+) -> Response {
+    use divergence::acknowledgement::{Key, Pattern};
+    use divergence::delta::Side;
+
+    let req: ProposeAcknowledgements = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    let note = req.note.trim();
+    if note.is_empty() {
+        return error_resp(400, "note is required: say why the divergence is intended");
+    }
+    if req.rows.is_empty() {
+        return error_resp(400, "rows is empty: name at least one divergence");
+    }
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let gh = match github_of(&st, &id).await {
+        Ok(Some(gh)) => gh,
+        Ok(None) => {
+            return error_resp(
+                404,
+                "this run names no pull request; acknowledgements belong to one",
+            )
+        }
+        Err(e) => return error_resp(500, &e),
+    };
+    let Some(pr) = pr_number_i64(&gh) else {
+        return error_resp(400, "pr_number is out of range");
+    };
+    let Some(against) = run_params_for(&st, &id).await.and_then(|p| p.delta_against) else {
+        return error_resp(
+            400,
+            "this run names no baseline, so it has no delta to acknowledge",
+        );
+    };
+    let delta = match delta_for_run(&st, &id, &against).await {
+        Ok(body) => match serde_json::from_value::<divergence::delta::Delta>(body) {
+            Ok(d) => d,
+            Err(e) => return error_resp(500, &format!("delta: {e}")),
+        },
+        Err(why) => return error_resp(409, &format!("no delta to acknowledge: {}", why.to_json())),
+    };
+    let mut items: Vec<deja_store::NewAcknowledgement> = Vec::new();
+    let mut keys: Vec<Key> = Vec::new();
+    for address in &req.rows {
+        let Some(row) = delta
+            .rows
+            .iter()
+            .find(|r| r.address == *address && r.bucket.charges_y())
+        else {
+            return error_resp(
+                400,
+                &format!(
+                    "not a divergence this run is charged with: {}",
+                    serde_json::json!(address)
+                ),
+            );
+        };
+        let key = Key::of_row(row);
+        if keys.contains(&key) {
+            continue;
+        }
+        items.push(deja_store::NewAcknowledgement {
+            lane: row
+                .lane
+                .as_ref()
+                .map(|l| serde_json::to_value(l).unwrap_or_default()),
+            pattern: serde_json::to_value(Pattern::of(&row.address)).unwrap_or_default(),
+            value_hash: match &row.y {
+                Side::Hash(h) => Some(h.clone()),
                 _ => None,
             },
-            None => None,
-        },
+        });
+        keys.push(key);
+    }
+    // A proposal is bound to the version of the change it was made on. A run
+    // from before change ids were required cannot carry one, so it cannot
+    // propose: the acknowledgement would never go stale.
+    let Some(change_id) = gh.change_id.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return error_resp(
+            409,
+            "this run names no change_id for its pull request, so an acknowledgement given on it could not be bound to a version of the change; run the replay again",
+        );
+    };
+    let ids = match store
+        .acknowledgements_propose(
+            &gh.repo,
+            pr,
+            change_id,
+            &id,
+            &actor.0,
+            subject.0.as_deref(),
+            note,
+            &items,
+        )
+        .await
+    {
+        Ok(ids) => ids,
+        Err(e) => return error_resp(500, &format!("propose: {e}")),
+    };
+    audit_or_say(
+        &store,
+        &actor.0,
+        "acknowledgement.propose",
+        &format!("{}#{}", gh.repo, gh.pr_number),
+        &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
+    )
+    .await;
+    json_ok(serde_json::json!({ "ids": ids }))
+}
+
+/// `POST /api/v1/acknowledgements/{id}/confirm`: a second person accepts a
+/// proposal. The proposer cannot confirm their own.
+async fn v1_confirm_acknowledgement(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    Path(ack_id): Path<i64>,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let row = match store.acknowledgement_get(ack_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(404, "no such acknowledgement"),
+        Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
+    };
+    let cfg = st.auth.config();
+    if let Some(why) = confirm_refusal(
+        &cfg,
+        &row.proposed_by,
+        row.proposed_by_sub.as_deref(),
+        &actor.0,
+        subject.0.as_deref(),
+    ) {
+        return error_resp(403, why);
+    }
+    if row.withdrawn_at.is_some() {
+        return error_resp(409, "this acknowledgement was withdrawn");
+    }
+    match store
+        .acknowledgement_confirm(ack_id, &actor.0, subject.0.as_deref())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return error_resp(409, "already confirmed"),
+        Err(e) => return error_resp(500, &format!("confirm: {e}")),
+    }
+    audit_or_say(
+        &store,
+        &actor.0,
+        "acknowledgement.confirm",
+        &format!("{}#{}", row.repo, row.pr_number),
+        &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
+    )
+    .await;
+    restate_pull_request_verdicts(st.clone(), row.repo.clone(), row.pr_number);
+    json_ok(serde_json::json!({ "ok": true }))
+}
+
+/// `DELETE /api/v1/acknowledgements/{id}`: withdraw a proposal or a
+/// confirmed acknowledgement. The row stays, marked, so the trail does.
+async fn v1_withdraw_acknowledgement(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    Path(ack_id): Path<i64>,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let row = match store.acknowledgement_get(ack_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(404, "no such acknowledgement"),
+        Err(e) => return error_resp(500, &format!("acknowledgement: {e}")),
+    };
+    let cfg = st.auth.config();
+    if !may_withdraw_under(
+        &cfg,
+        row.proposed_by_sub.as_deref(),
+        &actor.0,
+        subject.0.as_deref(),
+    ) {
+        return error_resp(
+            403,
+            if row.proposed_by_sub.is_none() {
+                "this was proposed before sign-in; only a maintainer may withdraw it"
+            } else {
+                "only a maintainer or the signed-in proposer may withdraw"
+            },
+        );
+    }
+    match store
+        .acknowledgement_withdraw(ack_id, &actor.0, subject.0.as_deref())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return error_resp(409, "already withdrawn"),
+        Err(e) => return error_resp(500, &format!("withdraw: {e}")),
+    }
+    audit_or_say(
+        &store,
+        &actor.0,
+        "acknowledgement.withdraw",
+        &format!("{}#{}", row.repo, row.pr_number),
+        &serde_json::json!({ "id": ack_id }),
+    )
+    .await;
+    restate_pull_request_verdicts(st.clone(), row.repo.clone(), row.pr_number);
+    json_ok(serde_json::json!({ "ok": true }))
+}
+
+/// A pull request on a new run is checked and kept in one spelling before
+/// anything is persisted: the store's lookups by repository name depend on
+/// it, and a change id is what every later acknowledgement is bound to.
+fn admit_github(spec: &mut deja_orchestrator::RunSpec) -> Result<(), String> {
+    if let Some(gh) = spec.github.as_mut() {
+        gh.validate()?;
+        gh.normalize();
+    }
+    Ok(())
+}
+
+/// The run's parameters: the live record on compose, the stored row on k8s.
+async fn run_params_for(st: &AppState, id: &str) -> Option<deja_orchestrator::RunParams> {
+    run_params_read(st, id).await.ok().flatten()
+}
+
+/// The run's parameters, telling "there is no such run" (`Ok(None)`) apart
+/// from "there is one and it could not be read" (`Err`): a live record that
+/// will not decode, a store that is away, a row whose params will not
+/// decode. The overlay needs the difference, since the first is the normal
+/// case for a run that names no pull request and the second is a failure
+/// it must say out loud.
+async fn run_params_read(
+    st: &AppState,
+    id: &str,
+) -> Result<Option<deja_orchestrator::RunParams>, String> {
+    if let Some(path) = confined(st.root.run_path(id), &st.root.root.join("runs")) {
+        return match deja_orchestrator::read_json::<Run>(&path) {
+            Ok(run) => Ok(Some(deja_orchestrator::RunParams::resolved(
+                &run.spec, None,
+            ))),
+            Err(e) => Err(format!("the run's record would not read: {e}")),
+        };
+    }
+    let Some(store) = &st.store else {
+        return Ok(None);
+    };
+    match store.get_run(id).await {
+        Ok(Some(row)) => serde_json::from_value(row.params)
+            .map(Some)
+            .map_err(|e| format!("the run's parameters would not decode: {e}")),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!("the run's row could not be read: {e}")),
     }
 }
 
@@ -3546,21 +4554,128 @@ mod tests {
     #[test]
     fn the_row_says_which_kind_of_unavailable() {
         let computed = |pass| Ok(serde_json::json!({ "verdict": { "pass": pass } }));
-        assert_eq!(delta_verdict_word(&computed(true)), "pass");
-        assert_eq!(delta_verdict_word(&computed(false)), "fail");
+        assert_eq!(delta_verdict_word(computed(true).as_ref()), "pass");
+        assert_eq!(delta_verdict_word(computed(false).as_ref()), "fail");
+        // Once acknowledgements are counted, the effective word is the row's.
+        let overlaid =
+            Ok(serde_json::json!({ "verdict": { "pass": false, "effective": "acknowledged" } }));
+        assert_eq!(delta_verdict_word(overlaid.as_ref()), "acknowledged");
         assert_eq!(
-            delta_verdict_word(&Err(Unavailable::Pending(String::new()))),
+            delta_verdict_word(Err(&Unavailable::Pending(String::new()))),
             "pending"
         );
         assert_eq!(
-            delta_verdict_word(&Err(Unavailable::Refused(String::new()))),
+            delta_verdict_word(Err(&Unavailable::Refused(String::new()))),
             "refused"
         );
         // A reader sees a tape mismatch as its own kind; the run row keeps
         // its four words and records a refusal.
         let mismatch = Unavailable::TapeMismatch("different seals".to_owned());
         assert_eq!(mismatch.to_json()["unavailable_kind"], "tape_mismatch");
-        assert_eq!(delta_verdict_word(&Err(mismatch)), "refused");
+        assert_eq!(delta_verdict_word(Err(&mismatch)), "refused");
+        // An overlay that could not happen is neither word: the bare
+        // three-way is not a decision, and the row says so.
+        let unknown = Ok(serde_json::json!({
+            "verdict": { "pass": false, "overlay_failure": "the store is away" }
+        }));
+        assert_eq!(delta_verdict_word(unknown.as_ref()), "unknown");
+    }
+
+    /// The overlay tells "names no pull request" from "could not read the
+    /// run", and says the second on the verdict rather than leaving the
+    /// bare three-way to be read as a decision.
+    #[tokio::test]
+    async fn the_overlay_says_why_it_could_not_happen_and_stays_quiet_when_there_is_nothing_to_do()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
+        let three_way = || serde_json::json!({ "verdict": { "pass": false }, "rows": [] });
+
+        // No pull request on the run: the normal case, nothing is touched.
+        let mut run = pending_run("run-plain");
+        deja_orchestrator::write_json(&st.root.run_path("run-plain"), &run).unwrap();
+        let mut body = three_way();
+        overlay_acknowledgements(&st, "run-plain", &mut body).await;
+        assert_eq!(body, three_way());
+
+        // A pull request, and no store to read its acknowledgements from.
+        run.run_id = "run-pr".to_owned();
+        run.spec.github = Some(deja_orchestrator::GithubRef {
+            repo: "juspay/deja".into(),
+            pr_number: 7,
+            head_sha: "abcdef1".into(),
+            change_id: Some("c1".into()),
+        });
+        deja_orchestrator::write_json(&st.root.run_path("run-pr"), &run).unwrap();
+        let mut body = three_way();
+        overlay_acknowledgements(&st, "run-pr", &mut body).await;
+        assert_eq!(body["verdict"]["overlay_failure"], "the store is away");
+        assert!(body["verdict"].get("effective").is_none());
+        assert_eq!(delta_verdict_word(Ok(&body)), "unknown");
+
+        // A run whose record will not read is a failure, not "no pull request".
+        std::fs::write(st.root.run_path("run-torn"), b"{not json").unwrap();
+        let mut body = three_way();
+        overlay_acknowledgements(&st, "run-torn", &mut body).await;
+        let why = body["verdict"]["overlay_failure"].as_str().unwrap();
+        assert!(why.contains("would not read"), "{why}");
+    }
+
+    /// Creation keeps the repository in one spelling, so the store's
+    /// lookups by `params.github.repo` find the run however it was typed.
+    #[test]
+    fn creation_admits_a_pull_request_in_one_spelling() {
+        let mut spec = pending_run("run-x").spec;
+        spec.github = Some(deja_orchestrator::GithubRef {
+            repo: " Juspay/Hyperswitch-Prism ".into(),
+            pr_number: 9,
+            head_sha: "abcdef1".into(),
+            change_id: Some(" c1 ".into()),
+        });
+        admit_github(&mut spec).unwrap();
+        let gh = spec.github.as_ref().unwrap();
+        assert_eq!(gh.repo, "juspay/hyperswitch-prism");
+        assert_eq!(gh.change_id.as_deref(), Some("c1"));
+        spec.github.as_mut().unwrap().change_id = None;
+        assert!(admit_github(&mut spec).is_err());
+    }
+
+    /// Rows the overlay cannot decode are counted, not dropped on the quiet.
+    #[test]
+    fn undecodable_acknowledgement_rows_are_counted() {
+        // Built through serde, as the store would hand it over, so the test
+        // needs no clock of its own.
+        let row = |pattern: serde_json::Value| -> deja_store::AcknowledgementRow {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "repo": "juspay/deja", "pr_number": 7, "change_id": "c1",
+                "lane": null, "pattern": pattern, "value_hash": null, "note": "n",
+                "origin_run_id": "run-pr", "proposed_by": "asha",
+                "proposed_at": "2026-10-08T10:00:00Z",
+                "acknowledged_by": null, "acknowledged_at": null,
+                "withdrawn_by": null, "withdrawn_at": null
+            }))
+            .unwrap()
+        };
+        let rows = vec![
+            row(serde_json::json!({ "kind": "status" })),
+            row(serde_json::json!({ "kind": "something_from_the_future" })),
+        ];
+        let (acks, unread) = decode_acknowledgements(&rows);
+        assert_eq!((acks.len(), unread), (1, 1));
+    }
+
+    /// One restate per pull request at a time; a decision that lands while
+    /// one is running asks for exactly one more pass, not one per press.
+    #[test]
+    fn restates_run_single_file_per_pull_request() {
+        let r = Restates::default();
+        let key = ("juspay/deja".to_owned(), 7);
+        assert!(r.begin(&key), "the first caller runs");
+        assert!(!r.begin(&key), "a second caller only marks a rerun");
+        assert!(!r.begin(&key));
+        assert!(r.finish(&key), "one more pass is owed");
+        assert!(!r.finish(&key), "and then the key is released");
+        assert!(r.begin(&key));
     }
 
     /// The runner reports its result before it publishes the ledger and diffs,
@@ -3586,6 +4701,8 @@ mod tests {
                 service_token: None,
             },
             executor: Arc::new(ExecutorSelection::Compose),
+            auth: deja_orchestrator::auth::AuthState::disabled(),
+            restates: Arc::default(),
         }
     }
 
@@ -3594,6 +4711,7 @@ mod tests {
             run_id: run_id.to_owned(),
             spec: deja_orchestrator::RunSpec {
                 label: None,
+                github: None,
                 delta_against: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
@@ -4880,5 +5998,448 @@ mod tests {
         );
 
         assert!(!super::from_main_deployment(&unknown, MAIN));
+    }
+}
+
+#[cfg(test)]
+mod acknowledgement_rules {
+    use super::may_confirm;
+
+    #[test]
+    fn a_proposer_does_not_confirm_their_own_proposal() {
+        assert!(!may_confirm("asha", "asha"));
+        assert!(!may_confirm(" Asha ", "asha"));
+        assert!(may_confirm("asha", "ravi"));
+    }
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sign_in {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use deja_orchestrator::auth::{self, google, session, AuthConfig, AuthState};
+    use tower::ServiceExt;
+
+    async fn whoami(Extension(actor): Extension<AuthenticatedActor>) -> String {
+        actor.0
+    }
+
+    fn state(auth: Arc<AuthState>, service_token: Option<&str>) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Arc::new(HarnessRoot::new(dir.path()).unwrap());
+        std::mem::forget(dir);
+        AppState {
+            root,
+            store: None,
+            mutation_auth: MutationAuth {
+                service_token: service_token.map(Arc::<str>::from),
+            },
+            executor: Arc::new(ExecutorSelection::Compose),
+            auth,
+            restates: Arc::default(),
+        }
+    }
+
+    async fn whose(Extension(subject): Extension<ActorSubject>) -> String {
+        subject.0.unwrap_or_else(|| "none".to_owned())
+    }
+
+    fn router(st: AppState) -> Router {
+        let gated = middleware::from_fn_with_state(st.clone(), require_session);
+        Router::new()
+            .route("/gated", post(whoami).route_layer(gated.clone()))
+            .route("/gated-subject", post(whose).route_layer(gated))
+            .route("/api/v1/auth/me", get(v1_auth_me))
+            .route("/auth/login/start", get(auth_login_start))
+            .route("/auth/callback", get(auth_callback))
+            .with_state(st)
+    }
+
+    fn enabled(maintainers: &[&str]) -> (Arc<AuthState>, session::Signer) {
+        let mut cfg = AuthConfig {
+            enabled: true,
+            client_id: "cid".into(),
+            client_secret: "sec".into(),
+            ..AuthConfig::default()
+        };
+        cfg.roles.insert(
+            auth::ROLE_MAINTAINER.to_owned(),
+            maintainers.iter().map(|m| m.to_string()).collect(),
+        );
+        let state = AuthState::with_parts(
+            cfg,
+            session::Signer::new(b"test-key"),
+            google::Verifier::with_keys("cid".into(), jsonwebtoken::jwk::JwkSet { keys: vec![] }),
+        );
+        (state, session::Signer::new(b"test-key"))
+    }
+
+    fn session_cookie(signer: &session::Signer, email: &str) -> String {
+        let s = signer.new_session(
+            &format!("sub-of-{email}"),
+            email,
+            "",
+            "",
+            std::time::Duration::from_secs(60),
+        );
+        format!("{}={}", auth::SESSION_COOKIE, signer.sign_session(&s))
+    }
+
+    async fn call(router: Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn post_gated() -> axum::http::request::Builder {
+        Request::builder().method(Method::POST).uri("/gated")
+    }
+
+    #[tokio::test]
+    async fn with_sign_in_off_the_typed_name_still_works_and_nothing_else_is_needed() {
+        let r = router(state(AuthState::disabled(), None));
+        let (st, body) = call(
+            r.clone(),
+            post_gated()
+                .header("X-Deja-Actor", "asha")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "asha"));
+        let (st, _) = call(r, post_gated().body(Body::empty()).unwrap()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn with_sign_in_on_a_typed_name_is_not_enough() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header("X-Deja-Actor", "asha")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_makes_the_email_the_actor() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, body) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "asha@juspay.in"));
+    }
+
+    #[tokio::test]
+    async fn a_bad_bearer_token_never_falls_back_to_the_cookie() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, Some("right")));
+        let (st, _) = call(
+            r.clone(),
+            post_gated()
+                .header(header::AUTHORIZATION, "Bearer wrong")
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, body) = call(
+            r,
+            post_gated()
+                .header(header::AUTHORIZATION, "Bearer right")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "svc:pipeline"));
+    }
+
+    #[tokio::test]
+    async fn a_tampered_or_foreign_cookie_is_anonymous() {
+        let (a, _) = enabled(&[]);
+        let other = session::Signer::new(b"someone-elses-key");
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&other, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_account_outside_the_allowed_domains_is_out_even_with_a_live_cookie() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let (st, _) = call(
+            r,
+            post_gated()
+                .header(header::COOKIE, session_cookie(&signer, "asha@example.com"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn who_am_i_tells_the_viewer_what_to_draw() {
+        let r = router(state(AuthState::disabled(), None));
+        let me = || Request::builder().uri("/api/v1/auth/me");
+        let (_, body) = call(r, me().body(Body::empty()).unwrap()).await;
+        assert!(body.contains("\"configured\":false"));
+        let (a, signer) = enabled(&["ravi@juspay.in"]);
+        let r = router(state(a, None));
+        let (_, body) = call(r.clone(), me().body(Body::empty()).unwrap()).await;
+        assert!(body.contains("\"configured\":true") && body.contains("\"authenticated\":false"));
+        let (_, body) = call(
+            r,
+            me().header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(body.contains("\"email\":\"ravi@juspay.in\"") && body.contains("maintainer"));
+    }
+
+    #[tokio::test]
+    async fn login_start_sends_the_browser_to_google_with_a_state_cookie() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login/start?return_url=/r/x")
+                    .header("host", "deja.example")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.starts_with("https://accounts.google.com/o/oauth2/v2/auth?client_id=cid"));
+        assert!(loc.contains("redirect_uri=https%3A%2F%2Fdeja.example%2Fauth%2Fcallback"));
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with(&format!("{}=", auth::STATE_COOKIE)));
+        assert!(cookie.contains("Secure") && cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn login_start_is_absent_when_sign_in_is_off_and_the_callback_checks_state() {
+        let r = router(state(AuthState::disabled(), None));
+        let (st, _) = call(
+            r,
+            Request::builder()
+                .uri("/auth/login/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, None));
+        let cookie = format!(
+            "{}={}",
+            auth::STATE_COOKIE,
+            signer.sign_state("abc", "n", "/r/x")
+        );
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/callback?code=c&state=not-abc")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/login?error=state_mismatch"
+        );
+    }
+
+    #[test]
+    fn the_confirm_and_withdraw_rules_follow_the_lists_once_sign_in_is_on() {
+        let (a, _) = enabled(&["ravi@juspay.in"]);
+        let cfg = a.config();
+        let ok = |p: &str, ps: Option<&str>, a: &str, as_: Option<&str>| {
+            may_confirm_under(&cfg, p, ps, a, as_)
+        };
+        assert!(ok(
+            "asha@juspay.in",
+            Some("s-asha"),
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        assert!(
+            !ok(
+                "asha@juspay.in",
+                Some("s-asha"),
+                "dev@juspay.in",
+                Some("s-dev")
+            ),
+            "not a maintainer"
+        );
+        assert!(
+            !ok(
+                "ravi@juspay.in",
+                Some("s-ravi"),
+                "ravi@juspay.in",
+                Some("s-ravi")
+            ),
+            "own proposal"
+        );
+        // The epoch: a proposal without a subject was made before sign-in,
+        // or by the pipeline's token, and each says which.
+        assert_eq!(
+            confirm_refusal(&cfg, "asha", None, "ravi@juspay.in", Some("s-ravi")),
+            Some("this was proposed before sign-in; propose it again, signed in")
+        );
+        assert_eq!(
+            confirm_refusal(&cfg, SERVICE_ACTOR, None, "ravi@juspay.in", Some("s-ravi")),
+            Some("this was proposed by the pipeline's token; propose it signed in")
+        );
+        // One person under two emails is still the proposer.
+        assert!(!ok(
+            "old@juspay.in",
+            Some("s-ravi"),
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        // Confirming without a subject of one's own is refused, whoever asks.
+        assert_eq!(
+            confirm_refusal(
+                &cfg,
+                "asha@juspay.in",
+                Some("s-asha"),
+                "ravi@juspay.in",
+                None
+            ),
+            Some("acknowledging needs a signed-in person")
+        );
+        // Withdrawing: a maintainer, or the proposer by subject; a row from
+        // before sign-in is a maintainer's to withdraw.
+        assert!(may_withdraw_under(
+            &cfg,
+            Some("s-asha"),
+            "asha@juspay.in",
+            Some("s-asha")
+        ));
+        assert!(
+            may_withdraw_under(&cfg, Some("s-asha"), "ravi@juspay.in", Some("s-ravi")),
+            "a maintainer"
+        );
+        assert!(!may_withdraw_under(
+            &cfg,
+            Some("s-asha"),
+            "dev@juspay.in",
+            Some("s-dev")
+        ));
+        assert!(
+            !may_withdraw_under(&cfg, None, "asha@juspay.in", Some("s-asha")),
+            "typed before sign-in"
+        );
+        assert!(may_withdraw_under(
+            &cfg,
+            None,
+            "ravi@juspay.in",
+            Some("s-ravi")
+        ));
+        // Off, the old rules: a second person confirms, anyone withdraws.
+        let off = AuthState::disabled().config();
+        assert!(may_confirm_under(&off, "asha", None, "dev", None));
+        assert!(!may_confirm_under(&off, "asha", None, "asha", None));
+        assert!(may_withdraw_under(&off, None, "dev", None));
+    }
+
+    /// The cookies carry `Secure` by the setting, not by a header the proxy
+    /// may or may not send.
+    #[tokio::test]
+    async fn the_secure_flag_is_the_setting_not_the_forwarded_scheme() {
+        let (a, _) = enabled(&[]);
+        let r = router(state(a, None));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/login/start")
+                    .header("host", "deja.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("Secure"), "{cookie}");
+    }
+
+    /// The subject travels from the cookie to the handler beside the name;
+    /// the token and a typed name carry none.
+    #[tokio::test]
+    async fn the_subject_reaches_the_handler_beside_the_name() {
+        let (a, signer) = enabled(&[]);
+        let r = router(state(a, Some("right")));
+        let (st, body) = call(
+            r.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gated-subject")
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (st, body.as_str()),
+            (StatusCode::OK, "sub-of-asha@juspay.in")
+        );
+        let (_, body) = call(
+            r,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gated-subject")
+                .header(header::AUTHORIZATION, "Bearer right")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body, "none");
     }
 }

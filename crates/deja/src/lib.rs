@@ -1036,6 +1036,37 @@ pub mod codec {
     pub struct ResultCodec<T, E>(PhantomData<fn() -> (T, E)>);
 
     #[cfg(feature = "error-stack")]
+    impl<T, E> ResultCodec<T, E>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        E: serde::Serialize + serde::de::DeserializeOwned + error_stack::Context,
+    {
+        /// The `Ok` arm's envelope, for a codec that holds the arm by reference.
+        pub fn ok_envelope(inner: &T) -> serde_json::Value {
+            serde_json::json!({
+                "version": crate::value::DejaDatabaseResult::VERSION,
+                "result": "Ok",
+                "value": crate::canonical::to_value_or_null(inner),
+                "type_name": std::any::type_name::<T>(),
+            })
+        }
+
+        /// The `Err` arm's envelope, for a codec that holds the report by
+        /// reference.
+        pub fn err_envelope(report: &error_stack::Report<E>) -> serde_json::Value {
+            serde_json::json!({
+                "version": crate::value::DejaDatabaseResult::VERSION,
+                "result": "Err",
+                // For a fieldless enum this serializes to the bare
+                // variant-name string ("NotFound"), keeping the wire
+                // `kind` identical to the legacy hand-rolled mapping.
+                "kind": crate::canonical::to_value_or_null(report.current_context()),
+                "message": format!("{report:?}"),
+            })
+        }
+    }
+
+    #[cfg(feature = "error-stack")]
     impl<T, E> ReplayCodec for ResultCodec<T, E>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
@@ -1045,27 +1076,8 @@ pub mod codec {
 
         fn capture(value: &Self::Value) -> (serde_json::Value, bool) {
             match value {
-                Ok(inner) => (
-                    serde_json::json!({
-                        "version": crate::value::DejaDatabaseResult::VERSION,
-                        "result": "Ok",
-                        "value": crate::canonical::to_value_or_null(inner),
-                        "type_name": std::any::type_name::<T>(),
-                    }),
-                    false,
-                ),
-                Err(report) => (
-                    serde_json::json!({
-                        "version": crate::value::DejaDatabaseResult::VERSION,
-                        "result": "Err",
-                        // For a fieldless enum this serializes to the bare
-                        // variant-name string ("NotFound"), keeping the wire
-                        // `kind` identical to the legacy hand-rolled mapping.
-                        "kind": crate::canonical::to_value_or_null(report.current_context()),
-                        "message": format!("{report:?}"),
-                    }),
-                    true,
-                ),
+                Ok(inner) => (Self::ok_envelope(inner), false),
+                Err(report) => (Self::err_envelope(report), true),
             }
         }
 
@@ -1114,6 +1126,36 @@ pub mod codec {
         fn reconstruct(recorded: serde_json::Value) -> Option<Self::Value> {
             C::reconstruct(recorded).map(|value| (value, None))
         }
+    }
+
+    /// The [`ReplayCodec`] contract for a return value that can only be read by
+    /// consuming it (opensearch's `Response`, `reqwest::Response`). Selected
+    /// with `owned_codec = <Codec>` on an `async fn` or a `future = "boxed"`
+    /// boundary, and used only while the call is recorded (or shadow-observed
+    /// in replay); an inactive build never touches the value.
+    ///
+    /// Recording must not change what the caller sees, so the work splits in
+    /// two. [`Self::read`] consumes the value and returns it rebuilt; its
+    /// signature hands the value back whether or not the read worked, and it
+    /// runs outside the recorder's panic firewall, so it should do nothing but
+    /// read and rebuild. [`Self::record`] turns what was read into tape JSON
+    /// inside the firewall, where a panic drops the event and not the request.
+    pub trait OwnedReplayCodec {
+        /// The boundary's return type.
+        type Value;
+        /// What [`Self::read`] read, before it becomes tape JSON.
+        type Read;
+        /// Consume the value and rebuild it for the caller as it was. `Err`
+        /// is why it could not be read; the rebuilt value then carries that
+        /// failure, and the tape records `{"captured": false, "reason"}`.
+        fn read(
+            value: Self::Value,
+        ) -> impl std::future::Future<Output = (Self::Value, Result<Self::Read, String>)> + Send;
+        /// Tape JSON for what was read, and whether it is an error arm. Also
+        /// handed the rebuilt value, for what `read` left in it (an error arm).
+        fn record(read: Self::Read, value: &Self::Value) -> (serde_json::Value, bool);
+        /// Replay side, as [`ReplayCodec::reconstruct`].
+        fn reconstruct(recorded: serde_json::Value) -> Option<Self::Value>;
     }
 }
 
@@ -1969,16 +2011,17 @@ pub mod __private {
     // subsumed by `dispatch`).
     #[allow(deprecated)]
     pub use deja_runtime::{
-        boundary_execute_mode, current_span_path, dispatch, dispatch_async, dispatch_async_serving,
-        dispatch_serving, execute_shadow_observe_boundary, execute_shadow_peek_boundary,
-        fail_stop_absent_executor, fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss,
-        finish_boundary_event, next_boundary_occurrence, observation_is_active,
+        boundary_execute_mode, current_span_instance, current_span_path, dispatch, dispatch_async,
+        dispatch_async_serving, dispatch_serving, execute_shadow_observe_boundary,
+        execute_shadow_peek_boundary, fail_stop_absent_executor,
+        fail_stop_execute_shadow_unavailable, fail_stop_substitute_miss, finish_boundary_event,
+        next_boundary_occurrence, observation_is_active, owned_dispatch_async,
         record_boundary_async, record_boundary_async_lazy, record_boundary_sync,
         record_boundary_sync_lazy, replay_boundary, replay_is_active, runtime_mode,
-        stable_callsite_hash, substitute_observe_boundary, substitute_peek_boundary, BoundarySpec,
-        CallsiteIdentity, CallsiteSource, CrossingObservation, ExecuteMode, ExecuteShadowToken,
-        ReconstructInput, Reconstructed, RecordedOutput, RuntimeMode, SubstituteOutcome,
-        SubstitutePeek, SubstituteToken,
+        stable_callsite_hash, substitute_observe_boundary, substitute_peek_boundary,
+        unreadable_capture_reason, BoundarySpec, CallsiteIdentity, CallsiteSource,
+        CrossingObservation, ExecuteMode, ExecuteShadowToken, ReconstructInput, Reconstructed,
+        RecordedOutput, RuntimeMode, SubstituteOutcome, SubstitutePeek, SubstituteToken,
     };
     // The round-trip comparator every dispatch call passes: the recorder
     // compares each recorded value with its rebuilt copy.
