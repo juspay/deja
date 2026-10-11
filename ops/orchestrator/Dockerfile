@@ -74,12 +74,12 @@ COPY --from=build /src/target/release/deja-orchestrator /usr/local/bin/deja-orch
 # (orchestrator API); a replay Job's runner container overrides the command to
 # deja-runner (one run, exit code = Job result).
 COPY --from=build /src/target/release/deja-runner /usr/local/bin/deja-runner
-# The sealing tool, run by the scheduled sealer CronJob (`deja-compactor seal`)
+# The sealing tool, run by the scheduled sealer CronJob (`deja-compactor pass`)
 # rather than by anything in a replay. It ships in the same image because the
-# sealer IS this build — a seal must be written by the code that understands the
-# layout it writes — but it is deliberately NOT reachable from a replay Job's
-# role: the Job may not write sessions/v1/*, and a replay must not be able to
-# alter the recordings it is judged against.
+# sealer is built alongside the code that understands the layout it writes, but
+# it is deliberately NOT reachable from a replay Job's role: the Job may not
+# write sessions/v1/*, and a replay must not alter the recordings it is judged
+# against.
 COPY --from=build /src/target/release/deja-compactor /usr/local/bin/deja-compactor
 # The migration tool the runner's migrate stage shells out to — on PATH.
 COPY --from=diesel-build /diesel/bin/diesel /usr/local/bin/diesel

@@ -839,6 +839,9 @@ pub enum RecordingIdentity {
         /// Discriminator for the instance, so two pods starting in the same
         /// minute stay distinct.
         instance: String,
+        /// `YYYY-MM-DD` when the id names one day of a session — see
+        /// `deja_compactor::day`. `None` for a whole session.
+        day: Option<String>,
     },
     /// A boot-derived default: `run-<nanos-since-epoch>`, minted at process
     /// boot. Both recorders once minted these — prism until it moved to the
@@ -881,6 +884,10 @@ pub fn recording_id_body(recording_id: &str) -> &str {
 ///
 /// [`Opaque`]: RecordingIdentity::Opaque
 pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
+    let deja_compactor::day::RecordingDay {
+        session_id: recording_id,
+        day,
+    } = deja_compactor::day::split_recording_id(recording_id);
     // The UCS recorder's boot-derived default: `run-` + a nanosecond epoch.
     // Digit count pins the era (18-19 digits ≈ 1971-2262), so `run-1` or a
     // hand-named `run-foo` stays Opaque instead of masquerading as a boot id.
@@ -910,6 +917,7 @@ pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
         revision: revision.to_owned(),
         recorded_at: recorded_at.to_owned(),
         instance: instance.to_owned(),
+        day: day.map(str::to_owned),
     }
 }
 
@@ -942,6 +950,13 @@ pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
 /// caller could state.
 pub fn group_of(identity: &RecordingIdentity) -> Option<String> {
     match identity {
+        // One day of a session belongs to that day. A whole session belongs
+        // to the day it began, which its id carries.
+        RecordingIdentity::Described {
+            revision,
+            day: Some(day),
+            ..
+        } => Some(format!("{revision}-{}{}", &day[5..7], &day[8..10])),
         RecordingIdentity::Described {
             revision,
             recorded_at,
@@ -1741,6 +1756,35 @@ mod run_identity_tests {
     }
 
     #[test]
+    fn a_day_of_a_long_lived_session_is_grouped_under_that_day() {
+        // A pod that booted on 09-29 and is still recording on 10-08. Its
+        // whole-session id belongs to the day it began; each day of it, to
+        // that day — otherwise every later day's traffic joins 09-29.
+        let whole = parse_recording_id("rec-2091a49-09291507-xx");
+        assert_eq!(group_of(&whole).as_deref(), Some("2091a49-0929"));
+
+        let one_day = parse_recording_id("rec-2091a49-09291507-xx.2026-10-08");
+        assert_eq!(
+            one_day,
+            RecordingIdentity::Described {
+                revision: "2091a49".into(),
+                recorded_at: "09291507".into(),
+                instance: "xx".into(),
+                day: Some("2026-10-08".into()),
+            }
+        );
+        assert_eq!(group_of(&one_day).as_deref(), Some("2091a49-1008"));
+
+        // A day suffix does not make an id described that is not.
+        assert_eq!(
+            parse_recording_id("run-1785331134782268537.2026-10-08"),
+            RecordingIdentity::BootDerived {
+                booted_at_nanos: "1785331134782268537".into()
+            }
+        );
+    }
+
+    #[test]
     fn a_recording_id_is_read_in_both_shapes_and_neither_is_guessed_at() {
         // A recorder that knows its revision names it.
         assert_eq!(
@@ -1749,6 +1793,7 @@ mod run_identity_tests {
                 revision: "dcb9f9e".into(),
                 recorded_at: "07291352".into(),
                 instance: "a3".into(),
+                day: None,
             }
         );
 

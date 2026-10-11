@@ -40,7 +40,7 @@ use axum::{
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
 use deja_orchestrator::{
-    api::runs, artifact_kinds, divergence, HarnessRoot, Run, RunId, RunStatus,
+    api::runs, artifact_kinds, divergence, group_of, HarnessRoot, Run, RunId, RunStatus,
 };
 use deja_store::Store;
 use sha2::{Digest, Sha256};
@@ -1255,6 +1255,33 @@ async fn v1_available_recordings(
             group_of(&deja_orchestrator::parse_recording_id(&r.session_id)).as_deref()
                 == Some(wanted)
         });
+        // Resolve marker state before pagination so empty terminal markers do
+        // not appear as selectable members or inflate the group total.
+        let ids: Vec<String> = found.iter().map(|r| r.session_id.clone()).collect();
+        let cfg_for_manifests = scanned.clone();
+        let results = match tokio::task::spawn_blocking(move || {
+            deja_compactor::read_manifests(&cfg_for_manifests, &ids)
+        })
+        .await
+        {
+            Ok(Ok(results)) => results,
+            Ok(Err(error)) => {
+                return error_resp(502, &format!("recording manifests unavailable: {error}"))
+            }
+            Err(error) => {
+                return error_resp(502, &format!("recording manifest reader failed: {error}"))
+            }
+        };
+        if let Some(error) = results.iter().find_map(|result| result.as_ref().err()) {
+            return error_resp(502, &format!("recording manifest unavailable: {error}"));
+        }
+        found = without_empty_terminal_markers(
+            found,
+            results
+                .into_iter()
+                .map(|result| result.expect("manifest errors returned above"))
+                .collect(),
+        );
     }
     if q.main_instances.unwrap_or(false) {
         // Matched rather than `unwrap_or_else`: that unifies this borrow of
@@ -1319,26 +1346,30 @@ async fn v1_available_recordings(
     // correlations and "not counted yet" are different answers, and a picker that
     // rendered the second as the first would hide good recordings as empty ones.
     let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
-    // The SCANNED bucket, not the deployment's default. The rows above came from
-    // whichever bucket `scan_scope` resolved for the named system, so reading
-    // their manifests from `from_env()` would look for a prism recording's seal
-    // in hyperswitch-art — finding nothing, and reporting every prism row as
-    // unsealed with null counts. That failure is silent: "not sealed" is a valid
-    // answer, so nothing downstream could tell it from the truth.
     let cfg_for_manifests = scanned.clone();
-    // This listing does not distinguish "not sealed" from "could not tell" —
-    // read_manifests preserves that per-recording, a replay's membership check
-    // needs it, this enrichment does not.
-    let manifests: Vec<Option<deja_compactor::SessionManifest>> =
-        tokio::task::spawn_blocking(move || {
-            deja_compactor::read_manifests(&cfg_for_manifests, &ids)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
+    // A missing manifest means unsealed; a failed read prevents a truthful catalog.
+    let manifest_results = match tokio::task::spawn_blocking(move || {
+        deja_compactor::read_manifests(&cfg_for_manifests, &ids)
+    })
+    .await
+    {
+        Ok(Ok(manifests)) => manifests,
+        Ok(Err(error)) => {
+            return error_resp(502, &format!("recording manifests unavailable: {error}"));
+        }
+        Err(error) => {
+            return error_resp(502, &format!("recording manifest reader failed: {error}"));
+        }
+    };
+    if let Some(error) = manifest_results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+    {
+        return error_resp(502, &format!("recording manifest unavailable: {error}"));
+    }
+    let manifests: Vec<Option<deja_compactor::SessionManifest>> = manifest_results
         .into_iter()
-        .map(|r| r.ok().flatten())
+        .map(|result| result.expect("manifest errors returned above"))
         .collect();
 
     let page: Vec<serde_json::Value> = page_rows
@@ -1346,6 +1377,7 @@ async fn v1_available_recordings(
         .enumerate()
         .map(|(i, r)| {
             let manifest = manifests.get(i).and_then(Option::as_ref);
+
             // The id's provenance is parsed HERE, not by the client: a
             // recording made before ids carried a revision reports none, and
             // that difference should be one field rather than every reader
@@ -1388,10 +1420,12 @@ async fn v1_available_recordings(
                     revision,
                     recorded_at,
                     instance,
+                    day,
                 } => serde_json::json!({
                     "revision": revision,
                     "recorded_at": recorded_at,
                     "instance": instance,
+                    "day": day,
                 }),
                 deja_orchestrator::RecordingIdentity::BootDerived { booted_at_nanos } => {
                     serde_json::json!({ "booted_at_nanos": booted_at_nanos })
@@ -1420,57 +1454,39 @@ async fn v1_available_recordings(
                 }
                 (other, _) => other,
             };
+            let empty = manifest.is_some_and(empty_terminal_manifest);
+            let source_snapshot_counts = manifest.map(|m| serde_json::json!({
+                "landing_objects": m.counts.landing_objects,
+                "lines_in": m.counts.lines_in,
+                "lines_without_ingress": m.counts.lines_without_ingress,
+                "other_day_lines": m.counts.other_day_lines,
+                "day_dependency_objects": m.counts.day_dependency_objects,
+                "events": m.counts.events,
+                "correlations": m.counts.correlations,
+                "graph_nodes": m.counts.graph_nodes,
+                "data_parts": m.data_parts.len(),
+            }));
             serde_json::json!({
                 "recording_id": r.session_id,
-                // The deployment-and-day this belongs to, from the ID. Null
-                // when the id does not carry both a revision and a start date —
-                // which is NOT the same condition as `identity.revision` being
-                // null, because that field can be answered from the manifest
-                // and the manifest does not supply a day. See `group_of`.
                 "group": group_of(&identity),
                 "dates": r.dates,
                 "latest_date": r.latest_date(),
                 "objects": r.objects,
                 "pulled": pulled.contains(&r.session_id),
-                // Null for a recording whose id names no revision; its envelopes
-                // still carry `code.sha` and `instance_id`.
                 "identity": described,
-                // Which recorded system minted the session, from the id shape;
-                // null when the shape names neither.
                 "system": system,
-                // The bucket the session was FOUND in — with the scoped scan
-                // this differs from the default, and a replay of the session
-                // needs it to build `s3_source` (`s3://{bucket}/{prefix}`).
                 "bucket": scan_bucket,
-                // The `inst=` discriminators under the session — for a UCS
-                // session this is the recorder's pod name, the only identity
-                // its id does not carry.
                 "instances": r.instances,
-                // The prefix the orchestrator would ingest from. Reported so a
-                // run can be reproduced by hand, not so a caller has to supply it.
-                // In full, since it is read beside `bucket` as an `s3://` path.
                 "prefix": scanned.bucket_key(&r.prefix),
-                // Seal facts. Null, never zero, when the recording is unsealed.
-                "sealed": manifest.is_some(),
+                "sealed": manifest.is_some_and(is_sealed_replayable),
+                "seal_state": if empty { "empty" } else if manifest.is_some() { "sealed" } else { "unsealed" },
+                "seal_error": serde_json::Value::Null,
+                "replayable": manifest.is_some_and(is_sealed_replayable),
                 "correlations": manifest.map(|m| m.counts.correlations),
                 "events": manifest.map(|m| m.counts.events),
-                // `sealed_instances`, not `instances`, and the prefix is load
-                // bearing: the LISTING also reports instances — the `inst=` pod
-                // names it can read straight off the keys — and that is a
-                // different fact from this one, which is how many producers the
-                // SEAL recorded per-instance coverage for. Both are worth having
-                // and they can disagree (a pod that wrote objects the seal has
-                // not covered yet). Sharing the key would not fail: `json!` keeps
-                // the last of two identical keys, so one of the two facts would
-                // vanish silently and readers would get a list or a number
-                // depending on which line came last.
                 "sealed_instances": manifest.map(|m| m.instances.len()),
-                // Capture gaps: `global_sequence` ranges the recorder allocated
-                // whose events never reached the tape. Already computed at seal
-                // time and, until now, surfaced nowhere — it is the evidence the
-                // tail-truncation work was reconstructing from ledger sequence
-                // numbers by hand.
                 "gaps": manifest.map(|m| m.instances.iter().map(|i| i.gaps.len()).sum::<usize>()),
+                "source_snapshot_counts": source_snapshot_counts,
             })
         })
         .collect();
@@ -1543,47 +1559,27 @@ fn manifest_revision(manifest: &deja_compactor::SessionManifest) -> Option<Strin
     }
 }
 
-/// The deployment-and-day a recording belongs to, or `None` when its id does not
-/// name BOTH a revision and a start date.
-///
-/// Both, and the distinction is live rather than theoretical. A row's
-/// `identity.revision` can come from the MANIFEST when the id does not carry
-/// one (`revision_source: "manifest"`), so a boot-derived recording can report
-/// a revision and still have no group — `run-1789076520165195354` does exactly
-/// that today, with revision `28d8299` and 59 correlations. The manifest
-/// supplies the revision; nothing supplies the day, because the id has no start
-/// date and the recording's own `latest_date` is the day it last WROTE, which
-/// for a session straddling midnight is not the day it belongs to.
-///
-/// Grouping it by the wrong day would put a recording in a selection whose
-/// scope nobody named, which is worse than leaving it ungroupable: the pipeline
-/// already excludes these on the main-deployment test, so nothing is lost by
-/// declining to guess.
-///
-/// `<revision>-<MMDD>`, derived rather than stored. The id ALREADY carries the
-/// minute a recording started, so the day is a prefix of something every
-/// recording has had all along — no new id shape, nothing to mint, and every
-/// recording ever sealed is groupable the moment this ships.
-///
-/// This is the unit a replay actually wants. A pod's recording is an arbitrary
-/// slice: pods are replaced every thirty minutes, so "the traffic this
-/// deployment served that day" is spread across dozens of them — 82 on the day
-/// this was measured — and picking one is picking a fraction for no reason a
-/// caller could state.
-fn group_of(identity: &deja_orchestrator::RecordingIdentity) -> Option<String> {
-    match identity {
-        deja_orchestrator::RecordingIdentity::Described {
-            revision,
-            recorded_at,
-            ..
-        } => Some(format!(
-            "{revision}-{}",
-            &recorded_at[..4.min(recorded_at.len())]
-        )),
-        _ => None,
-    }
+/// An empty terminal marker records a source snapshot, not a replayable tape.
+fn empty_terminal_manifest(manifest: &deja_compactor::SessionManifest) -> bool {
+    manifest.status == "empty"
 }
 
+fn is_sealed_replayable(manifest: &deja_compactor::SessionManifest) -> bool {
+    !empty_terminal_manifest(manifest)
+}
+
+fn without_empty_terminal_markers(
+    recordings: Vec<deja_compactor::LandedRecording>,
+    manifests: Vec<Option<deja_compactor::SessionManifest>>,
+) -> Vec<deja_compactor::LandedRecording> {
+    recordings
+        .into_iter()
+        .zip(manifests)
+        .filter_map(|(recording, manifest)| {
+            (!manifest.as_ref().is_some_and(empty_terminal_manifest)).then_some(recording)
+        })
+        .collect()
+}
 fn from_main_deployment(r: &deja_compactor::LandedRecording, prefix: &str) -> bool {
     !r.instances.is_empty() && r.instances.iter().all(|i| i.starts_with(prefix))
 }
@@ -1636,16 +1632,12 @@ struct AvailableQuery {
 
 /// What the store can say about one recording's correlations.
 ///
-/// Three answers, kept apart on purpose. "Sealed, and here they are" and "it is
-/// there but nothing has ingested it yet, so the list is not knowable cheaply"
-/// and "no such recording" are three different facts, and a caller that flattens
-/// them tells a user something false — most damagingly by rendering the middle
-/// one as a recording with zero correlations, i.e. as nothing worth running.
+/// Five answers, kept apart on purpose: rows, a terminal empty marker, a legacy
+/// missing index, unsealed landing data, and no such recording. Flattening them
+/// can turn a recording whose rows are unknowable into one with zero correlations.
 enum RecordingCorrelations {
+    Empty,
     Sealed(Vec<deja_orchestrator::s3::CorrelationSummary>),
-    /// Sealed, but the index sidecar is absent — a seal written before it
-    /// existed. The manifest still knows how many correlations it covered, so
-    /// the count is answerable even though the rows are not.
     SealedWithoutIndex {
         correlations: usize,
     },
@@ -1718,6 +1710,7 @@ async fn v1_recording_correlations(
             )
         };
         match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
+            CorrelationIndex::Empty => Ok(RecordingCorrelations::Empty),
             CorrelationIndex::Rows(rows) => Ok(RecordingCorrelations::Sealed(rows)),
             // Sealed before the index sidecar existed. The recording is real and
             // the landing area can still say what is in it, so this reads it
@@ -1748,6 +1741,7 @@ async fn v1_recording_correlations(
     let needle = q.q.as_deref().map(str::to_lowercase);
 
     match found {
+        RecordingCorrelations::Empty => empty_correlations_response(&id, offset, limit),
         RecordingCorrelations::Sealed(rows) => {
             // The index also carries a row for UNCORRELATED events — ambient
             // background traffic, shared across cases. It is accounted for
@@ -1837,6 +1831,18 @@ async fn v1_recording_correlations(
             error_resp(404, &format!("recording {id} is not in {searched}"))
         }
     }
+}
+fn empty_correlations_response(recording_id: &str, offset: usize, limit: usize) -> Response {
+    json_ok(serde_json::json!({
+        "recording_id": recording_id,
+        "status": "empty",
+        "total": 0,
+        "matched": 0,
+        "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+        "offset": offset,
+        "limit": limit,
+        "correlations": Vec::<serde_json::Value>::new(),
+    }))
 }
 
 /// How many runs `GET /api/v1/runs` returns.
@@ -4114,8 +4120,29 @@ async fn spa_fallback(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
-
     #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn an_empty_terminal_recording_response_is_200_with_zero_correlations() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let response = empty_correlations_response("day-empty", 7, 25);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = rt
+            .block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["recording_id"], "day-empty");
+        assert_eq!(body["status"], "empty");
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["matched"], 0);
+        assert_eq!(body["offset"], 7);
+        assert_eq!(body["limit"], 25);
+        assert_eq!(body["correlations"], serde_json::json!([]));
+        assert!(body.get("note").is_none());
+    }
 
     /// The bin's tests share one process environment too. See the lib's
     /// `test_env` for why readers hold this as well as writers.
@@ -5443,6 +5470,45 @@ mod tests {
         assert_eq!(super::manifest_revision(&m).as_deref(), Some("4157177"));
     }
 
+    #[test]
+    fn empty_marker_is_distinguished_from_an_ordinary_seal() {
+        let mut empty = manifest_with_codes(&[]);
+        empty.status = "empty".to_owned();
+        empty.counts.events = 0;
+        empty.counts.correlations = 0;
+        assert!(super::empty_terminal_manifest(&empty));
+        assert!(!super::is_sealed_replayable(&empty));
+
+        let sealed = manifest_with_codes(&[]);
+        assert!(super::is_sealed_replayable(&sealed));
+        assert!(empty.data_parts.is_empty());
+        assert_eq!(empty.counts.correlations, 0);
+        assert_eq!(empty.counts.events, 0);
+        assert_eq!(empty.counts.landing_objects, 1);
+        assert_eq!(empty.counts.lines_in, 1);
+        let recording = |id: &str| deja_compactor::LandedRecording {
+            session_id: id.to_owned(),
+            dates: Vec::new(),
+            prefix: "landing/v1".to_owned(),
+            objects: 1,
+            instances: Vec::new(),
+        };
+        let selected = super::without_empty_terminal_markers(
+            vec![
+                recording("empty"),
+                recording("sealed"),
+                recording("unsealed"),
+            ],
+            vec![Some(empty), Some(sealed), None],
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|recording| recording.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sealed", "unsealed"]
+        );
+    }
     /// Two different shas means the recording spans revisions, so it has no
     /// single one. Picking either would be a confident lie in exactly the case
     /// where a caller most needs to know it cannot compare a candidate to this

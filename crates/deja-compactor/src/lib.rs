@@ -25,16 +25,12 @@
 //! concurrently, from several runs, with no lock between them:
 //!
 //! - Write order is data parts, then index, then manifest. A seal interrupted
-//!   anywhere before the last PUT leaves no manifest at all, so the session is
-//!   indistinguishable from one still landing and the caller rescans. There is
-//!   no state in which a reader can be handed a manifest naming an object that
-//!   is not yet durable.
-//! - Part and index keys are content-addressed by [`seal_id`]. Sealers that read
-//!   the same landing write byte-identical objects to identical keys; sealers
-//!   that read DIFFERENT landings (one saw more of a still-flushing session)
-//!   write disjoint key sets, so neither can truncate the other's parts. The
-//!   manifest key is shared and its PUT is atomic, so the last writer wins — and
-//!   the manifest that wins names only its own, complete, immutable parts.
+//!   before the last PUT leaves no manifest, so the session is rescanned.
+//! - Part and index keys are content-addressed by [`seal_id`]. Identical scans
+//!   write identical objects; different scans write disjoint key sets. The
+//!   shared manifest PUT is atomic, but last-writer-wins is NOT a concurrency
+//!   guarantee: a slower scan of older input can replace a newer manifest and
+//!   hide its later tail. Compare-and-swap publication is needed.
 //!
 //! Dedup is per `(instance_id, record kind, global_sequence)` — gseq is a
 //! per-process counter, so two producers may legitimately share gseq values,
@@ -50,6 +46,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub mod day;
 pub mod pass;
 pub mod settings;
 
@@ -611,7 +608,8 @@ pub mod layout {
 pub struct SessionManifest {
     pub manifest_version: u32,
     pub session_id: String,
-    /// "sealed" — the manifest is written last, so its presence IS the seal.
+    /// "sealed" names a replayable tape. "empty" is a terminal day snapshot
+    /// with no tape, written when reassignment leaves the day with no lines.
     pub status: String,
     /// Content address of this seal's data (see [`seal_id`]), and the directory
     /// component its parts and index live under. Empty on manifests written
@@ -695,6 +693,22 @@ pub struct Counts {
     /// with it, and nothing would say so.
     #[serde(default)]
     pub graph_nodes: usize,
+    /// Lines read from this recording's partitions that belong to another day
+    /// of the same session, and are sealed there. Zero for a whole session.
+    /// For a day split, `lines_in + other_day_lines` accounts for every line
+    /// read; `lines_without_ingress` is a subset of `lines_in`, not additive.
+    #[serde(default)]
+    pub other_day_lines: usize,
+    /// Retained lines belonging to correlated requests whose sequence-zero
+    /// ingress was not found in any listed partition. Counted within
+    /// `lines_in`, on the earliest observed day, but explicitly incomplete.
+    #[serde(default)]
+    pub lines_without_ingress: usize,
+    /// Objects in every non-own date partition consulted to resolve this day.
+    /// Includes earlier partitions as well as later ones: either may reveal
+    /// that an already-published selection has changed.
+    #[serde(default)]
+    pub day_dependency_objects: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1040,18 +1054,17 @@ pub fn list_objects(cfg: &S3Config, prefix: &str) -> Result<Vec<String>, String>
 /// One recording as it exists in the landing area, discovered by listing.
 ///
 /// Held so a caller can name a recording instead of constructing a path to it.
-/// The partitions a session spans are kept because they are a property of when
-/// the aggregator flushed, not of the recording: a session that runs across
-/// midnight lands under two dates, and a prefix naming only one of them
-/// silently ingests part of it.
+/// A session that lands under more than one date partition is listed once per
+/// day, as `<session>.<date>` (see [`day`]); the others are listed whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandedRecording {
+    /// The recording id: a session, or one day of one.
     pub session_id: String,
-    /// Partition dates this session appears under, earliest first. Empty for a
-    /// layout that carries no date partition.
+    /// Partition dates this recording appears under. One for a day of a
+    /// session; empty for a layout that carries no date partition.
     pub dates: Vec<String>,
-    /// The prefix to ingest from — the shared parent when a session spans more
-    /// than one partition, so the scan sees all of it.
+    /// The partition prefix that names this recording. Sealing a day reads all
+    /// session partitions to resolve arbitrarily late request tails.
     pub prefix: String,
     pub objects: usize,
     /// `inst=` discriminators seen under the session, sorted. For a session
@@ -1095,10 +1108,11 @@ pub fn list_landed_recordings(cfg: &S3Config, root: &str) -> Result<Vec<LandedRe
 /// understand can be stated as examples rather than discovered in production.
 pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
     let root = root.trim_end_matches('/');
-    // (session, (dates, objects, instances)) — BTreeMaps/Sets so everything
-    // comes out sorted without a pass.
+    // (session, (date, (objects, instances))) — BTreeMaps/Sets so everything
+    // comes out sorted without a pass. `None` is the layout with no partition.
     #[allow(clippy::type_complexity)]
-    let mut found: BTreeMap<String, (BTreeSet<String>, usize, BTreeSet<String>)> = BTreeMap::new();
+    let mut found: BTreeMap<String, BTreeMap<Option<String>, (usize, BTreeSet<String>)>> =
+        BTreeMap::new();
     for key in keys {
         let Some(rest) = key.strip_prefix(root).map(|r| r.trim_start_matches('/')) else {
             continue;
@@ -1120,36 +1134,49 @@ pub fn index_landed_keys(root: &str, keys: &[String]) -> Vec<LandedRecording> {
             }
         }
         let Some(session) = session else { continue };
-        let entry = found.entry(session.to_owned()).or_default();
-        if let Some(d) = date {
-            entry.0.insert(d.to_owned());
-        }
-        entry.1 += 1;
+        let entry = found
+            .entry(session.to_owned())
+            .or_default()
+            .entry(date.map(str::to_owned))
+            .or_default();
+        entry.0 += 1;
         if let Some(inst) = instance {
-            entry.2.insert(inst.to_owned());
+            entry.1.insert(inst.to_owned());
         }
     }
 
-    let mut out: Vec<LandedRecording> = found
-        .into_iter()
-        .map(|(session_id, (dates, objects, instances))| {
-            let dates: Vec<String> = dates.into_iter().collect();
-            // One partition: address it directly. Several (or none): address the
-            // root, so a straddling session is ingested whole.
-            let prefix = match dates.as_slice() {
-                [only] => format!("{root}/dt={only}/session={session_id}"),
-                [] => format!("{root}/session={session_id}"),
-                _ => root.to_owned(),
-            };
-            LandedRecording {
-                session_id,
-                dates,
-                prefix,
-                objects,
-                instances: instances.into_iter().collect(),
+    let mut out: Vec<LandedRecording> = Vec::new();
+    for (session_id, by_date) in found {
+        let dates: Vec<String> = by_date.keys().flatten().cloned().collect();
+        if dates.len() > 1 {
+            // A session across several partitions is one recording PER DAY —
+            // see [`day`]. Each is addressed at its own partition.
+            for (date, (objects, instances)) in by_date {
+                let Some(date) = date else { continue };
+                out.push(LandedRecording {
+                    session_id: day::day_recording_id(&session_id, &date),
+                    prefix: format!("{root}/dt={date}/session={session_id}"),
+                    dates: vec![date],
+                    objects,
+                    instances: instances.into_iter().collect(),
+                });
             }
-        })
-        .collect();
+            continue;
+        }
+        let prefix = match dates.as_slice() {
+            [only] => format!("{root}/dt={only}/session={session_id}"),
+            _ => format!("{root}/session={session_id}"),
+        };
+        let objects = by_date.values().map(|(n, _)| n).sum();
+        let instances: BTreeSet<String> = by_date.into_values().flat_map(|(_, i)| i).collect();
+        out.push(LandedRecording {
+            session_id,
+            dates,
+            prefix,
+            objects,
+            instances: instances.into_iter().collect(),
+        });
+    }
     // Newest first: by last partition, then by id so the order is total.
     out.sort_by(|a, b| {
         b.latest_date()
@@ -1267,10 +1294,18 @@ pub enum SealReadiness {
     Absent,
     /// Written to within the quiet period. Sealing now would seal a prefix of
     /// the recording.
-    Active { quiet_for_secs: u64, objects: usize },
+    Active {
+        quiet_for_secs: u64,
+        objects: usize,
+        dependency_objects: usize,
+    },
     /// Every producer instance that appears in this session emitted its
     /// end-of-stream marker. The recording is finished, whatever the clock says.
-    Complete { instances: usize, objects: usize },
+    Complete {
+        instances: usize,
+        objects: usize,
+        dependency_objects: usize,
+    },
     /// Quiet for longer than the period, but at least one instance never said it
     /// finished — the usual cause is a pod that was killed rather than shut
     /// down, which never gets to write its marker. Sealing is correct here, and
@@ -1278,6 +1313,7 @@ pub enum SealReadiness {
     Quiesced {
         quiet_for_secs: u64,
         objects: usize,
+        dependency_objects: usize,
         instances_without_eof: Vec<String>,
     },
 }
@@ -1303,16 +1339,32 @@ impl SealReadiness {
             | SealReadiness::Quiesced { objects, .. } => *objects,
         }
     }
+
+    fn dependency_objects(&self) -> usize {
+        match self {
+            SealReadiness::Absent => 0,
+            SealReadiness::Active {
+                dependency_objects, ..
+            }
+            | SealReadiness::Complete {
+                dependency_objects, ..
+            }
+            | SealReadiness::Quiesced {
+                dependency_objects, ..
+            } => *dependency_objects,
+        }
+    }
 }
 
 /// What a sealing pass should do about one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealDecision {
-    /// Write a seal. For an already-sealed session this is a RE-seal, because
-    /// the landing has grown since.
+    /// Write a seal. For an earlier replayable manifest this is a reseal,
+    /// because its source snapshot changed.
     Seal { resealing: bool },
-    /// A seal already covers everything that has landed. Nothing to do.
-    AlreadyCurrent { sealed_objects: usize },
+    /// The current manifest's source snapshot matches the landing. It may be a
+    /// replayable seal or a terminal empty-day marker.
+    AlreadyCurrent { source_objects: usize },
     /// Not finished yet.
     NotReady,
 }
@@ -1330,30 +1382,34 @@ pub enum SealDecision {
 /// looking at the landing, so the events that arrived after the seal become
 /// invisible rather than merely unsealed.
 ///
-/// The landing object count decides it. The manifest records how many objects
-/// its seal was built from, so more objects now means the recording grew, and a
-/// re-seal supersedes the short manifest — safely, because seals are
-/// content-addressed: the longer seal writes a disjoint key set and the manifest
-/// PUT that names it is last and atomic.
-///
-/// Fewer or equal means nothing new, INCLUDING the case where the landing has
-/// been swept behind an existing seal (zero objects), which must not read as a
-/// reason to re-seal from nothing.
+/// The source object counts decide it while the landing is present. The
+/// manifest records its own-partition count and every non-own partition
+/// consulted for selection; only an equal snapshot is current. A wholly swept
+/// session is the exception: no landing is not evidence that the replayable
+/// seal changed. Per-day seals do not get that exception, because their
+/// dependencies can disappear while the day's own objects remain.
 pub fn seal_decision(
     existing: Option<&SessionManifest>,
     readiness: &SealReadiness,
 ) -> SealDecision {
     match existing {
-        Some(manifest) if readiness.objects() <= manifest.counts.landing_objects => {
+        Some(manifest)
+            if (matches!(readiness, SealReadiness::Absent)
+                && manifest.status == "sealed"
+                && day::split_recording_id(&manifest.session_id).day.is_none())
+                || (readiness.objects() == manifest.counts.landing_objects
+                    && readiness.dependency_objects()
+                        == manifest.counts.day_dependency_objects) =>
+        {
             SealDecision::AlreadyCurrent {
-                sealed_objects: manifest.counts.landing_objects,
+                source_objects: manifest.counts.landing_objects,
             }
         }
-        // Grown, or never sealed. Either way the readiness gate still applies:
-        // a session that is still being written is sealed as a prefix of itself.
+        // A changed snapshot, or no manifest yet. The readiness gate still
+        // applies: a session being written is sealed as a prefix of itself.
         _ if !readiness.should_seal() => SealDecision::NotReady,
         existing => SealDecision::Seal {
-            resealing: existing.is_some(),
+            resealing: existing.is_some_and(|manifest| manifest.status == "sealed"),
         },
     }
 }
@@ -1442,6 +1498,8 @@ async fn readiness_of(
     let Some(location) = locate_landing(store, session_id, root).await? else {
         return Ok(SealReadiness::Absent);
     };
+    let recording_id = session_id;
+    let session_id = day::split_recording_id(recording_id).session_id;
 
     let mut metas: Vec<object_store::ObjectMeta> = Vec::new();
     for prefix in &location.prefixes {
@@ -1453,17 +1511,32 @@ async fn readiness_of(
             .map_err(|e| format!("s3 list {prefix}: {e}"))?;
         metas.extend(page);
     }
-    // Prefixes cannot overlap — they differ by date partition — but the filter
-    // stays because a prefix match is not a segment match: listing
-    // `…/session=s1` also returns `…/session=s10`.
+    // `…/session=s1` also returns `…/session=s10`. A day's quiet period is
+    // based on its own partition; every other listed partition for this session
+    // is a dependency because any can change the selected tape.
     let mine: Vec<&object_store::ObjectMeta> = metas
         .iter()
-        .filter(|m| key_names_session(m.location.as_ref(), session_id))
+        .filter(|m| {
+            key_names_session(m.location.as_ref(), session_id) && location.owns(m.location.as_ref())
+        })
         .collect();
     if mine.is_empty() {
         return Ok(SealReadiness::Absent);
     }
 
+    // Every listed non-own partition can alter selection: ingress may arrive
+    // after the tail was initially assigned, or a previously-missing ingress
+    // may appear in an earlier partition. Track the full dependency snapshot.
+    let dependency_objects = metas
+        .iter()
+        .filter(|m| {
+            location.day.is_some()
+                && key_names_session(m.location.as_ref(), session_id)
+                && !location.owns(m.location.as_ref())
+        })
+        .count();
+    // Readiness is based on this day's own partition only. A change in any
+    // listed non-own partition independently triggers replanning.
     let newest = mine
         .iter()
         .map(|m| m.last_modified.timestamp())
@@ -1483,6 +1556,7 @@ async fn readiness_of(
         return Ok(SealReadiness::Active {
             quiet_for_secs,
             objects,
+            dependency_objects,
         });
     }
 
@@ -1612,11 +1686,13 @@ async fn readiness_of(
         return Ok(SealReadiness::Complete {
             instances: instances.len(),
             objects,
+            dependency_objects,
         });
     }
     Ok(SealReadiness::Quiesced {
         quiet_for_secs,
         objects,
+        dependency_objects,
         instances_without_eof: without,
     })
 }
@@ -1727,6 +1803,8 @@ pub enum CorrelationIndex {
     SealedWithoutIndex {
         correlations: usize,
     },
+    /// A terminal empty marker, distinct from a missing index on a legacy seal.
+    Empty,
     Rows(Vec<CorrelationSummary>),
 }
 
@@ -1736,16 +1814,24 @@ pub fn read_correlation_index(
 ) -> Result<CorrelationIndex, String> {
     let store = cfg.build()?;
     let rt = runtime()?;
-    rt.block_on(async {
-        let Some(manifest) = manifest_of(&store, session_id).await? else {
-            return Ok(CorrelationIndex::NotSealed);
-        };
-        Ok(match correlation_index_of(&store, &manifest).await? {
-            Some(rows) => CorrelationIndex::Rows(rows),
-            None => CorrelationIndex::SealedWithoutIndex {
-                correlations: manifest.counts.correlations,
-            },
-        })
+    rt.block_on(read_correlation_index_from_store(&store, session_id))
+}
+
+async fn read_correlation_index_from_store(
+    store: &DynStore,
+    session_id: &str,
+) -> Result<CorrelationIndex, String> {
+    let Some(manifest) = manifest_of(store, session_id).await? else {
+        return Ok(CorrelationIndex::NotSealed);
+    };
+    if manifest.status == "empty" {
+        return Ok(CorrelationIndex::Empty);
+    }
+    Ok(match correlation_index_of(store, &manifest).await? {
+        Some(rows) => CorrelationIndex::Rows(rows),
+        None => CorrelationIndex::SealedWithoutIndex {
+            correlations: manifest.counts.correlations,
+        },
     })
 }
 
@@ -1831,6 +1917,7 @@ pub fn compact_session(
         Compaction::RefusedTooLarge { .. } => Err(format!(
             "internal: unbudgeted compaction of {session_id} reported a size refusal"
         )),
+        Compaction::EmptyDay { manifest, .. } => Ok(*manifest),
     }
 }
 
@@ -1909,16 +1996,21 @@ pub enum Compaction {
         /// overstate it by however much its neighbours weigh.
         shared_prefix: bool,
     },
+    /// A terminal date partition with no lines assigned to its own day. Its
+    /// empty manifest supersedes any earlier tape for this day.
+    EmptyDay {
+        manifest: Box<SessionManifest>,
+        other_day_lines: usize,
+        lines_without_ingress: usize,
+    },
 }
 
 /// [`compact_session`] with a ceiling on the decompressed landing it may hold.
 ///
-/// The ceiling is MEASURED as objects are read, not predicted from their
-/// compressed size. A prediction needs a compression ratio, and a ratio safe
-/// enough to never let an OOM through is conservative enough to refuse
-/// recordings that would have sealed fine — it would trade a loud failure for
-/// a quiet one. Measuring costs a refused recording up to `max_landing_bytes`
-/// of fetching before it is refused, which is bounded and happens once a pass.
+/// The ceiling is measured across the entire session's decoded landing as
+/// objects are read, not per recording day and not predicted from compressed
+/// size. A daily seal can therefore be refused when the whole session exceeds
+/// the ceiling. Measuring costs a refusal up to `max_landing_bytes` of fetching.
 pub fn compact_session_within(
     cfg: &S3Config,
     session_id: &str,
@@ -1960,26 +2052,77 @@ struct LandingLocation {
     /// to buy nothing; but it should be read as a capability with no caller
     /// rather than as a live branch, and it must not be cited as tested.
     shared: bool,
+    /// Set when the recording is one day of a session: which day and its own
+    /// prefix. Every other listed date is consulted for request reassignment.
+    day: Option<DayScope>,
 }
 
-/// Find a session's landing, in either layout a bucket may use.
-///
-/// The flat `{root}/session={id}` layout is tried first: one cheap list, exact
-/// when it hits. The deployed Vector aggregator partitions by DATE first, so a
+struct DayScope {
+    day: String,
+    own_prefix: String,
+    /// Every day the session is listed under.
+    days: BTreeSet<String>,
+}
+
+impl LandingLocation {
+    /// count, its quiet time, and its end-of-stream markers. A day owns only
+    /// its own date partition.
+    fn owns(&self, key: &str) -> bool {
+        self.day.as_ref().is_none_or(|d| {
+            key.strip_prefix(&d.own_prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+}
+
+/// The date partition a landing key names, if any.
+fn key_date(key: &str) -> Option<&str> {
+    key.split('/').find_map(|s| s.strip_prefix("dt="))
+}
 /// session it wrote is not under the flat prefix at all — which is why sealing
 /// by id used to fail with "no landing objects" for a recording plainly present
 /// in the bucket. Both layouts are read, because which one a bucket uses belongs
 /// to the deployment.
 async fn locate_landing(
     store: &DynStore,
-    session_id: &str,
+    recording_id: &str,
     root: &str,
 ) -> Result<Option<LandingLocation>, String> {
+    let wanted = day::split_recording_id(recording_id);
+    let session_id = wanted.session_id;
+    if let Some(day) = wanted.day {
+        let keys: Vec<String> = list_keys(store, root)
+            .await?
+            .into_iter()
+            .map(|p| p.as_ref().to_owned())
+            .collect();
+        let root = root.trim_end_matches('/');
+        let dates: BTreeSet<String> = index_landed_keys(root, &keys)
+            .into_iter()
+            .filter(|r| day::split_recording_id(&r.session_id).session_id == session_id)
+            .flat_map(|r| r.dates)
+            .collect();
+        if !dates.contains(day) {
+            return Ok(None);
+        }
+        let at = |date: &str| format!("{root}/dt={date}/session={session_id}");
+        let prefixes: Vec<String> = dates.iter().map(|d| at(d)).collect();
+        return Ok(Some(LandingLocation {
+            day: Some(DayScope {
+                day: day.to_owned(),
+                own_prefix: at(day),
+                days: dates,
+            }),
+            prefixes,
+            shared: false,
+        }));
+    }
     let flat = layout::landing_prefix_in(root, session_id);
     if !list_keys(store, &flat).await?.is_empty() {
         return Ok(Some(LandingLocation {
             prefixes: vec![flat],
             shared: false,
+            day: None,
         }));
     }
     let keys: Vec<String> = list_keys(store, root)
@@ -1988,29 +2131,26 @@ async fn locate_landing(
         .map(|p| p.as_ref().to_owned())
         .collect();
     let root = root.trim_end_matches('/');
-    Ok(index_landed_keys(root, &keys)
+    // One prefix per date partition, each naming the session. The listing
+    // already knows which partitions a session appears under — it lists a
+    // multi-day session once per day — so the parent never has to be read.
+    let prefixes: Vec<String> = index_landed_keys(root, &keys)
         .into_iter()
-        .find(|found| found.session_id == session_id)
-        .map(|found| {
-            // One prefix per date partition, each naming the session. The
-            // listing already knows which partitions a session appears under,
-            // so the parent never has to be read: `dates` is exactly the set
-            // of `dt=` segments its keys carried.
-            let prefixes: Vec<String> = if found.dates.len() > 1 {
-                found
-                    .dates
-                    .iter()
-                    .map(|date| format!("{root}/dt={date}/session={session_id}"))
-                    .collect()
-            } else {
-                vec![found.prefix]
-            };
-            // Derived from the prefixes rather than from the partition count,
-            // because it is a question about the KEYS: a prefix that names the
-            // session cannot hold another one's objects.
-            let shared = prefixes.iter().any(|p| !p.contains("session="));
-            LandingLocation { prefixes, shared }
-        }))
+        .filter(|found| day::split_recording_id(&found.session_id).session_id == session_id)
+        .map(|found| found.prefix)
+        .collect();
+    if prefixes.is_empty() {
+        return Ok(None);
+    }
+    // Derived from the prefixes rather than from the partition count, because
+    // it is a question about the KEYS: a prefix that names the session cannot
+    // hold another one's objects.
+    let shared = prefixes.iter().any(|p| !p.contains("session="));
+    Ok(Some(LandingLocation {
+        prefixes,
+        shared,
+        day: None,
+    }))
 }
 
 /// The lines of ONE session out of objects that may hold several, and the number
@@ -2060,6 +2200,8 @@ async fn compact_session_inner(
              never landed, or it landed under a different root"
         ));
     };
+    let recording_id = session_id;
+    let session_id = day::split_recording_id(recording_id).session_id;
     // Every prefix the session appears under, and only keys that NAME it: a
     // prefix match is not a segment match, so listing `…/session=s1` also
     // returns `…/session=s10`.
@@ -2102,11 +2244,10 @@ async fn compact_session_inner(
         // Checked after the push, so `read_bytes` is what is actually held
         // rather than what is about to be.
         //
-        // The guard is on THIS recording's landing now. It used to also be
-        // the only thing standing between a straddling session and the whole
-        // day's traffic, because such a session was addressed at the partition
-        // parent; `locate_landing` now addresses one prefix per partition, so
-        // what is read here is the session's own objects and nothing else.
+        // For a day recording this currently reads every listed partition of
+        // its session to resolve request ownership. The guard therefore
+        // measures the whole session, not just the selected day: a small day
+        // can be refused once a long-lived session exceeds the budget.
         if read_bytes > budget {
             return Ok(Compaction::RefusedTooLarge {
                 budget_bytes: budget,
@@ -2117,6 +2258,56 @@ async fn compact_session_inner(
                 shared_prefix: location.shared,
             });
         }
+    }
+
+    if let Some(scope) = &location.day {
+        // One day of a session. The lines are chosen by when each request
+        // began, so the objects are filtered rather than taken whole; each
+        // stays its own run, so the merge still holds a window.
+        let objects: Vec<(&str, &[u8])> = keys
+            .iter()
+            .zip(&chunks)
+            .map(|(k, c)| (key_date(k.as_ref()).unwrap_or(&scope.day), c.as_slice()))
+            .collect();
+        let selected = day::select_day(&objects, &scope.day, &scope.days);
+        let landing_objects = keys.iter().filter(|k| location.owns(k.as_ref())).count();
+        let day_dependency_objects = keys
+            .iter()
+            .filter(|k| key_names_session(k.as_ref(), session_id) && !location.owns(k.as_ref()))
+            .count();
+        if selected.kept.iter().all(Vec::is_empty) {
+            let manifest = write_empty_day(
+                store,
+                recording_id,
+                landing_objects,
+                selected.other_day_lines,
+                selected.lines_without_ingress,
+                day_dependency_objects,
+            )
+            .await?;
+            return Ok(Compaction::EmptyDay {
+                manifest: Box::new(manifest),
+                other_day_lines: selected.other_day_lines,
+                lines_without_ingress: selected.lines_without_ingress,
+            });
+        }
+        let mut collated = collate_runs_excluding(
+            selected
+                .kept
+                .iter()
+                .map(|lines| lines.iter().map(|l| Cow::Borrowed(l.as_str()))),
+            &selected.elsewhere,
+        );
+        collated.other_day_lines = selected.other_day_lines;
+        collated.lines_without_ingress = selected.lines_without_ingress;
+        collated.day_dependency_objects = day_dependency_objects;
+        return Ok(Compaction::Sealed {
+            merge: collated.merge.clone(),
+            manifest: Box::new(write_seal(store, recording_id, collated, landing_objects).await?),
+            landing_bytes_read: read_bytes,
+            landing_bytes_fetched: fetched_bytes,
+            shared_prefix: false,
+        });
     }
 
     let landing_objects: usize;
@@ -2152,7 +2343,7 @@ async fn compact_session_inner(
     };
     Ok(Compaction::Sealed {
         merge: collated.merge.clone(),
-        manifest: Box::new(write_seal(store, session_id, collated, landing_objects).await?),
+        manifest: Box::new(write_seal(store, recording_id, collated, landing_objects).await?),
         landing_bytes_read: read_bytes,
         landing_bytes_fetched: fetched_bytes,
         shared_prefix: location.shared,
@@ -2184,6 +2375,49 @@ pub fn seal_session(
     })
 }
 
+/// Publish the terminal snapshot for a day whose current lines all belong
+/// elsewhere. Unlike a sealed tape, this marker is explicitly non-replayable;
+/// writing it last replaces any stale manifest for the day.
+async fn write_empty_day(
+    store: &DynStore,
+    session_id: &str,
+    landing_objects: usize,
+    other_day_lines: usize,
+    lines_without_ingress: usize,
+    day_dependency_objects: usize,
+) -> Result<SessionManifest, String> {
+    let manifest = SessionManifest {
+        manifest_version: 1,
+        session_id: session_id.to_owned(),
+        status: "empty".to_owned(),
+        seal_id: String::new(),
+        capture_mode: "session".to_owned(),
+        envelope_schema_versions: Vec::new(),
+        event_schema_versions: Vec::new(),
+        code: Vec::new(),
+        instances: Vec::new(),
+        counts: Counts {
+            landing_objects,
+            lines_in: 0,
+            events: 0,
+            duplicates_dropped: 0,
+            correlations: 0,
+            graph_nodes: 0,
+            other_day_lines,
+            lines_without_ingress,
+            day_dependency_objects,
+        },
+        data_parts: Vec::new(),
+        created_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    let bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("manifest encode: {e}"))?;
+    put(store, &layout::manifest_key(session_id), bytes).await?;
+    Ok(manifest)
+}
 /// Write the sealed form: data parts, then the correlations index, then the
 /// manifest LAST.
 ///
@@ -2275,6 +2509,9 @@ async fn write_seal(
                 .filter(|row| row.correlation_id.is_some())
                 .count(),
             graph_nodes: collated.graph_nodes,
+            other_day_lines: collated.other_day_lines,
+            lines_without_ingress: collated.lines_without_ingress,
+            day_dependency_objects: collated.day_dependency_objects,
         },
         data_parts,
         created_unix_ms: std::time::SystemTime::now()
@@ -2311,6 +2548,13 @@ struct Collated {
     /// repaired before anything is derived from it. It means the window was
     /// beaten and a sort was paid for.
     merge: MergeReport,
+    /// See [`Counts::other_day_lines`].
+    other_day_lines: usize,
+    /// See [`Counts::lines_without_ingress`].
+    lines_without_ingress: usize,
+    /// Objects in all non-own partitions consulted to resolve requests for
+    /// this day.
+    day_dependency_objects: usize,
 }
 
 /// The order a seal's records are written in: by instance, then by the
@@ -2565,6 +2809,20 @@ where
     R: Iterator<Item = L>,
     L: Iterator<Item = Cow<'a, str>>,
 {
+    collate_runs_excluding(runs, &BTreeMap::new())
+}
+
+/// [`collate_runs`] for a recording that is one day of a session: `elsewhere`
+/// names, per instance, the sequences another day holds, which are not holes
+/// in this one.
+fn collate_runs_excluding<'a, R, L>(
+    runs: R,
+    elsewhere: &BTreeMap<String, BTreeSet<u64>>,
+) -> Collated
+where
+    R: Iterator<Item = L>,
+    L: Iterator<Item = Cow<'a, str>>,
+{
     let mut seen: BTreeSet<(String, RecordKind, u64)> = BTreeSet::new();
     let mut dupes_by_instance: BTreeMap<String, u64> = BTreeMap::new();
     // Sequence ranges the RECORDER says it shed, per instance, from `dropped`
@@ -2737,6 +2995,9 @@ where
         }
     }
     for cov in &mut instances {
+        if let Some(other) = elsewhere.get(&cov.instance_id) {
+            cov.gaps = day::subtract_elsewhere(&cov.gaps, other);
+        }
         // Only ranges that are ACTUALLY missing are reported as accounted for.
         // A recorder can shed a sequence whose event nonetheless arrives — a
         // later retry, or a marker written before the batch it describes got
@@ -2829,6 +3090,9 @@ where
         instances,
         correlations,
         merge,
+        other_day_lines: 0,
+        lines_without_ingress: 0,
+        day_dependency_objects: 0,
     }
 }
 
@@ -2854,10 +3118,17 @@ pub fn locate_landing_prefix(
     if !list_objects(cfg, &flat)?.is_empty() {
         return Ok(Some(flat));
     }
-    Ok(list_landed_recordings(cfg, root)?
-        .into_iter()
-        .find(|found| found.session_id == session_id)
-        .map(|found| found.prefix))
+    let found = list_landed_recordings(cfg, root)?;
+    if let Some(exact) = found.iter().find(|r| r.session_id == session_id) {
+        return Ok(Some(exact.prefix.clone()));
+    }
+    // A session listed per day, named whole: its days are under the root, and
+    // the scan separates it from its neighbours by the envelope's session id.
+    let days = found
+        .iter()
+        .filter(|r| day::split_recording_id(&r.session_id).session_id == session_id)
+        .count();
+    Ok((days > 0).then(|| root.trim_end_matches('/').to_owned()))
 }
 
 #[cfg(test)]
@@ -2893,26 +3164,37 @@ mod tests {
     }
 
     #[test]
-    fn a_session_spanning_midnight_is_addressed_whole() {
-        // The partition is when the aggregator flushed, not when the recording
-        // happened. A prefix naming one of the two dates would ingest half a
-        // recording and report it as a whole one.
+    fn a_session_spanning_midnight_is_listed_once_per_day() {
+        // A pod's session outlives a day, so a recording per session grows for
+        // the pod's whole life and is grouped under the day it booted. Each
+        // day is its own recording, at its own partition.
         let found = index_landed_keys(
             "landing/v1",
             &keys(&[
+                "landing/v1/dt=2026-07-29/session=run-x/inst=r1/8.log.gz",
                 "landing/v1/dt=2026-07-29/session=run-x/inst=r1/9.log.gz",
-                "landing/v1/dt=2026-07-30/session=run-x/inst=r1/0.log.gz",
+                "landing/v1/dt=2026-07-30/session=run-x/inst=r2/0.log.gz",
             ]),
         );
-        assert_eq!(found.len(), 1);
-        let x = &found[0];
-        assert_eq!(x.dates, vec!["2026-07-29", "2026-07-30"]);
-        assert_eq!(x.objects, 2);
+        let ids: Vec<&str> = found.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(
-            x.prefix, "landing/v1",
-            "a straddling session must be scanned from the shared parent"
+            ids,
+            ["run-x.2026-07-30", "run-x.2026-07-29"],
+            "newest day first"
         );
-        assert_eq!(x.latest_date(), Some("2026-07-30"));
+        let (later, earlier) = (&found[0], &found[1]);
+        assert_eq!(earlier.dates, ["2026-07-29"]);
+        assert_eq!(earlier.objects, 2);
+        assert_eq!(earlier.instances, ["r1"]);
+        assert_eq!(earlier.prefix, "landing/v1/dt=2026-07-29/session=run-x");
+        assert_eq!(later.objects, 1);
+        assert_eq!(later.instances, ["r2"]);
+        assert_eq!(later.prefix, "landing/v1/dt=2026-07-30/session=run-x");
+        assert_eq!(
+            found.iter().map(|r| r.objects).sum::<usize>(),
+            3,
+            "every object is listed under exactly one day"
+        );
     }
 
     #[test]
@@ -2992,9 +3274,8 @@ mod tests {
         );
         assert_eq!(dated[0].prefix, "landing/v1/dt=2026-08-04/session=run-b");
 
-        // And a session spanning two dates resolves to the shared parent, which
-        // holds OTHER sessions — so whoever ingests it must filter by the
-        // session id in each envelope rather than trusting the prefix.
+        // And a session spanning two dates is listed per day, each at a
+        // prefix that names it, so no prefix holds another session.
         let spanning = index_landed_keys(
             "landing/v1",
             &keys(&[
@@ -3003,12 +3284,12 @@ mod tests {
                 "landing/v1/dt=2026-08-05/session=run-d/inst=r1/0.log.gz",
             ]),
         );
-        let c = spanning.iter().find(|r| r.session_id == "run-c").unwrap();
-        assert_eq!(c.prefix, "landing/v1");
-        assert!(
-            spanning.iter().any(|r| r.session_id == "run-d"),
-            "the shared parent holds another session — content, not the prefix, separates them"
-        );
+        let c = spanning
+            .iter()
+            .find(|r| r.session_id == "run-c.2026-08-05")
+            .unwrap();
+        assert_eq!(c.prefix, "landing/v1/dt=2026-08-05/session=run-c");
+        assert!(spanning.iter().any(|r| r.session_id == "run-d"));
     }
 
     /// A plain object is handed back in the buffer it was fetched into, not
@@ -3229,8 +3510,7 @@ mod tests {
     /// failure to read the bucket — so it must not surface as an error, which
     /// is how it reached the API as a 502 on a healthy recording.
     ///
-    /// Unreachable today: nothing has ever been sealed. It becomes reachable
-    /// the first time the sealer runs against a session an older layout wrote.
+    /// Reachable when the sealer runs against a session an older layout wrote.
     #[test]
     fn a_seal_with_no_index_sidecar_is_a_state_not_an_error() {
         let store = memory();
@@ -3255,6 +3535,16 @@ mod tests {
             Ok(Some(_)) => panic!("there is no sidecar at the unscoped key"),
             Err(e) => panic!("a missing sidecar must not read as a failure: {e}"),
         }
+    }
+    #[test]
+    fn an_empty_terminal_manifest_is_not_read_as_a_missing_index() {
+        let store = memory();
+        block(write_empty_day(&store, "day-empty", 0, 1, 0, 1)).unwrap();
+
+        assert!(matches!(
+            block(read_correlation_index_from_store(&store, "day-empty")).unwrap(),
+            CorrelationIndex::Empty
+        ));
     }
 
     fn seal(store: &DynStore, session_id: &str, lines: &[String]) -> SessionManifest {
@@ -4520,7 +4810,8 @@ mod tests {
             readiness,
             SealReadiness::Complete {
                 instances: 1,
-                objects: 2
+                objects: 2,
+                dependency_objects: 0
             },
             "objects tied at the newest second are all scanned; got {readiness:?}"
         );
@@ -4554,7 +4845,8 @@ mod tests {
             readiness,
             SealReadiness::Complete {
                 instances: 1,
-                objects: 1
+                objects: 1,
+                dependency_objects: 0
             },
             "the marker is the key instance's, whatever the envelope spells; got {readiness:?}"
         );
@@ -4640,7 +4932,8 @@ mod tests {
             readiness,
             SealReadiness::Complete {
                 instances: 1,
-                objects: 1
+                objects: 1,
+                dependency_objects: 0
             }
         );
         assert!(readiness.should_seal());
@@ -4722,7 +5015,8 @@ mod tests {
             readiness,
             SealReadiness::Complete {
                 instances: 1,
-                objects: 2
+                objects: 2,
+                dependency_objects: 0
             },
             "i9 belongs to s2 and must not hold s1's seal back"
         );
@@ -4978,6 +5272,7 @@ mod tests {
         let landing_now = SealReadiness::Quiesced {
             quiet_for_secs: 1_000,
             objects: 5,
+            dependency_objects: 0,
             instances_without_eof: vec!["i1".to_owned()],
         };
         assert_eq!(
@@ -4994,22 +5289,33 @@ mod tests {
         let unchanged = SealReadiness::Complete {
             instances: 1,
             objects: 5,
+            dependency_objects: 0,
         };
         assert_eq!(
             seal_decision(Some(&sealed_five), &unchanged),
-            SealDecision::AlreadyCurrent { sealed_objects: 5 }
+            SealDecision::AlreadyCurrent { source_objects: 5 }
         );
     }
 
     #[test]
-    fn a_swept_landing_behind_a_seal_is_not_a_reason_to_reseal_from_nothing() {
-        // Once a session is sealed its landing may be cleaned up. Zero objects
-        // now is not "the recording shrank" — it is "the landing is gone" — and
-        // re-sealing from it would try to build a seal out of nothing.
+    fn a_swept_whole_session_landing_keeps_its_replayable_seal_current() {
+        // Whole-session seals have no day dependencies. Once their landing is
+        // swept, absence alone cannot distinguish cleanup from lost content.
         let sealed_five = manifest_covering(5);
         assert_eq!(
             seal_decision(Some(&sealed_five), &SealReadiness::Absent),
-            SealDecision::AlreadyCurrent { sealed_objects: 5 }
+            SealDecision::AlreadyCurrent { source_objects: 5 }
+        );
+    }
+
+    #[test]
+    fn an_absent_day_dependency_invalidates_its_published_seal() {
+        let mut day_seal = manifest_covering(5);
+        day_seal.session_id = "s1.2026-10-07".to_owned();
+        day_seal.counts.day_dependency_objects = 2;
+        assert_eq!(
+            seal_decision(Some(&day_seal), &SealReadiness::Absent),
+            SealDecision::NotReady
         );
     }
 
@@ -5023,6 +5329,7 @@ mod tests {
         let still_writing = SealReadiness::Active {
             quiet_for_secs: 5,
             objects: 9,
+            dependency_objects: 0,
         };
         assert_eq!(
             seal_decision(Some(&sealed_two), &still_writing),
@@ -5035,6 +5342,7 @@ mod tests {
         let ready = SealReadiness::Complete {
             instances: 1,
             objects: 3,
+            dependency_objects: 0,
         };
         assert_eq!(
             seal_decision(None, &ready),
@@ -5054,7 +5362,8 @@ mod tests {
         assert_eq!(
             SealReadiness::Active {
                 quiet_for_secs: 1,
-                objects: 7
+                objects: 7,
+                dependency_objects: 0
             }
             .objects(),
             7
@@ -5062,7 +5371,8 @@ mod tests {
         assert_eq!(
             SealReadiness::Complete {
                 instances: 2,
-                objects: 4
+                objects: 4,
+                dependency_objects: 0
             }
             .objects(),
             4
@@ -5071,6 +5381,7 @@ mod tests {
             SealReadiness::Quiesced {
                 quiet_for_secs: 1,
                 objects: 6,
+                dependency_objects: 0,
                 instances_without_eof: vec![]
             }
             .objects(),

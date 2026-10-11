@@ -72,6 +72,9 @@ pub struct IngestReport {
     /// in a log is not something a consumer can check. Empty for a single
     /// recording and for a group that was pulled whole.
     pub excluded_members: Vec<String>,
+    /// Terminal empty-day markers, omitted because they have no replayable tape.
+    #[serde(default)]
+    pub excluded_empty_members: Vec<String>,
     /// Which seal of each member this pull read, in `members` order.
     ///
     /// A recording is sealed on quiet and re-sealed as it grows, so its name
@@ -1048,6 +1051,7 @@ impl PullTally {
             },
             members,
             excluded_members: Vec::new(),
+            excluded_empty_members: Vec::new(),
             member_seals: manifests.iter().map(MemberSeal::of).collect(),
             landing_objects: self.landing_objects,
             lines_in: self.lines_in,
@@ -1169,6 +1173,11 @@ pub fn pull_recordings(
                  minutes), or name a day whose recordings are all sealed."
             ));
         };
+        if manifest.status == "empty" {
+            return Err(format!(
+                "{recording_id} is a terminal empty day with no replayable tape"
+            ));
+        }
         // Scoped so the lines, the joined bytes and the parsed events are all
         // released before the next member is read. Without this the peak is the
         // sum again and the bound above is a comment rather than a property.
@@ -1363,6 +1372,7 @@ pub fn pull_recording_from_prefix(
         members: vec![resolved.clone()],
         // One session, resolved whole: nothing was left out.
         excluded_members: Vec::new(),
+        excluded_empty_members: Vec::new(),
         member_seals: Vec::new(),
         landing_objects: session_objects,
         lines_in: collated.lines_in,
@@ -1637,6 +1647,9 @@ mod tests {
             duplicates_dropped: dupes,
             correlations,
             graph_nodes: 0,
+            other_day_lines: 0,
+            day_dependency_objects: 0,
+            lines_without_ingress: 0,
         }
     }
 
@@ -1876,6 +1889,7 @@ mod tests {
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
             excluded_members: Vec::new(),
+            excluded_empty_members: Vec::new(),
             member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
@@ -1906,6 +1920,7 @@ mod tests {
         let report = IngestReport {
             members: vec!["rec-sealed".to_owned()],
             excluded_members: vec!["rec-still-open".to_owned()],
+            excluded_empty_members: vec!["rec-empty".to_owned()],
             member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
@@ -1924,13 +1939,20 @@ mod tests {
         assert_eq!(
             json["excluded_members"],
             serde_json::json!(["rec-still-open"]),
-            "the artifact a reader acts on has to carry the exclusion"
+            "unsealed-only exclusions retain their existing meaning"
         );
         assert_eq!(
-            json["members"],
-            serde_json::json!(["rec-sealed"]),
-            "beside what was drawn from, not instead of it"
+            json["excluded_empty_members"],
+            serde_json::json!(["rec-empty"])
         );
+        assert_eq!(json["members"], serde_json::json!(["rec-sealed"]));
+        let all_ids = report
+            .members
+            .iter()
+            .chain(&report.excluded_members)
+            .chain(&report.excluded_empty_members)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(all_ids.len(), 3, "each group member belongs to one bucket");
     }
 
     #[test]
@@ -1939,6 +1961,7 @@ mod tests {
         let report = IngestReport {
             members: vec!["rec-test".to_owned()],
             excluded_members: Vec::new(),
+            excluded_empty_members: Vec::new(),
             member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,

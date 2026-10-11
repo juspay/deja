@@ -962,6 +962,41 @@ fn stage_resolve_recording(
                 total,
                 &format!("fetching recording {recording_id}"),
             );
+            // Check the durable seal even when the local tape is already present:
+            // a bare session id can retain an old single-day seal after the
+            // session has split into per-day recordings.
+            let cfg = crate::s3::S3Config::from_env();
+            let (location, _) = crate::system::recording_scope(run.spec.system())?;
+            let mut cfg = cfg;
+            location.apply(&mut cfg);
+            if let Some(manifest) = deja_compactor::read_manifest(&cfg, &recording_id)? {
+                if is_empty_terminal_manifest(&manifest.status) {
+                    return Err(format!(
+                        "recording {recording_id} is an empty day with no replayable tape"
+                    ));
+                }
+            }
+            if deja_compactor::day::split_recording_id(&recording_id)
+                .day
+                .is_none()
+            {
+                // A bare seal remains valid only while the landing is still a
+                // single partition. The scan is the same scoped listing used by
+                // group selection, and detects day-addressed rows for this session.
+                let scope = crate::system::recording_scope(run.spec.system())?.1;
+                let found = deja_compactor::list_landed_recordings(&cfg, &scope)?;
+                let days: std::collections::BTreeSet<_> = found
+                    .iter()
+                    .filter(|row| {
+                        deja_compactor::day::split_recording_id(&row.session_id).session_id
+                            == recording_id
+                    })
+                    .flat_map(|row| row.dates.iter().cloned())
+                    .collect();
+                if let Some(error) = stale_bare_recording_error(&recording_id, &days) {
+                    return Err(error);
+                }
+            }
             if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
                 pull_recording(root, ctx, &recording_id, run.spec.system())?;
             }
@@ -6238,18 +6273,37 @@ fn is_group(name: &str) -> bool {
 /// there is nothing to seal — sending that reader to wait thirty minutes costs
 /// them thirty minutes and tells them nothing true.
 ///
-/// Both were present, but the unsealed check ran first and answered for both,
-/// so a mistyped group reported "all 0 of them are still being written". The
-/// message written for that case had become unreachable.
+/// A previous ordering check let the unsealed case answer for a group that
+/// named nothing, reporting "all 0" still being written.
+/// Empty terminal markers are different again: the day is complete, but has no
+/// tape. They are excluded from selection and never counted as unsealed.
+///
+/// An all-empty group reports that there is no replayable tape rather than
+/// claiming that the sealer still needs to process those members.
 fn empty_group_error(
     recording_id: &str,
     bucket: &str,
     landing_root: &str,
     kept: usize,
     excluded: &[String],
+    empty: &[String],
 ) -> Option<String> {
     if kept > 0 {
         return None;
+    }
+    if !empty.is_empty() {
+        if excluded.is_empty() {
+            return Some(format!(
+                "group {recording_id} has no replayable sealed recordings: {} terminal empty day marker(s) contain no tape",
+                empty.len()
+            ));
+        }
+        return Some(format!(
+            "group {recording_id} has no replayable sealed recordings: {} terminal empty day marker(s) contain no tape; {} unsealed member(s) are still being written ({})",
+            empty.len(),
+            excluded.len(),
+            excluded.join(", ")
+        ));
     }
     if excluded.is_empty() {
         return Some(format!(
@@ -6262,6 +6316,21 @@ fn empty_group_error(
          written, and a replay cannot seal them itself. The sealer runs every 30 minutes.",
         excluded.len()
     ))
+}
+/// Refuse a historical bare-session seal once the landing has day partitions.
+fn stale_bare_recording_error(
+    recording_id: &str,
+    days: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    (days.len() > 1).then(|| {
+        format!(
+            "recording {recording_id} has multiple day partitions; replay a day explicitly with id {recording_id}.<YYYY-MM-DD>"
+        )
+    })
+}
+/// Whether a manifest is a terminal empty marker rather than a replayable seal.
+fn is_empty_terminal_manifest(status: &str) -> bool {
+    status == "empty"
 }
 
 /// The source the unsealed pull rescans, for a landing prefix located through
@@ -6313,6 +6382,16 @@ fn pull_recording(
     // it: a session spanning two dates is addressed from the shared parent, so
     // the prefix holds other sessions too, and only content can separate them.
     if !is_group_name && deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
+        // A day of a session is chosen by when each request began, which only
+        // the sealer computes; the prefix scan below would read the session
+        // whole. Refused by name rather than replayed as something else.
+        if let Some(day) = deja_compactor::day::split_recording_id(recording_id).day {
+            return Err(format!(
+                "recording {recording_id} is the {day} day of a session that runs across \
+                 several days, and it is not sealed yet — the sealer seals a day once its \
+                 partition goes quiet, so replay it after that"
+            ));
+        }
         // Where this system's recordings land is declared per system, so the
         // root comes from the run's system rather than from one global: a
         // deployment replaying two systems has two answers and a global would
@@ -6344,6 +6423,7 @@ fn pull_recording(
     // line, or the persisted verdict describes a subset as though it were the
     // whole day.
     let mut excluded: Vec<String> = Vec::new();
+    let mut empty_members: Vec<String> = Vec::new();
     let members: Vec<String> = match is_group_name {
         // Not a group: the caller named one pod's slice, not a day. Left alone.
         false => vec![recording_id.to_owned()],
@@ -6397,6 +6477,9 @@ fn pull_recording(
             let mut kept = Vec::with_capacity(ids.len());
             for (id, manifest) in ids.into_iter().zip(manifests) {
                 match manifest {
+                    Ok(Some(manifest)) if is_empty_terminal_manifest(&manifest.status) => {
+                        empty_members.push(id)
+                    }
                     Ok(Some(_)) => kept.push(id),
                     Ok(None) => excluded.push(id),
                     // A store that cannot answer is not evidence of an unsealed
@@ -6407,12 +6490,13 @@ fn pull_recording(
             }
             ids = kept;
             debug_assert_eq!(
-                ids.len() + excluded.len(),
+                ids.len() + excluded.len() + empty_members.len(),
                 members_before,
-                "every member is either kept or named as excluded; \
-                 {members_before} in, {} kept, {} excluded",
+                "every member is kept, unsealed, or an empty terminal marker; \
+                 {members_before} in, {} kept, {} unsealed, {} empty",
                 ids.len(),
-                excluded.len()
+                excluded.len(),
+                empty_members.len()
             );
             if let Some(err) = empty_group_error(
                 recording_id,
@@ -6420,6 +6504,7 @@ fn pull_recording(
                 &cfg.bucket_key(&landing_root),
                 ids.len(),
                 &excluded,
+                &empty_members,
             ) {
                 return Err(err);
             }
@@ -6430,6 +6515,15 @@ fn pull_recording(
                     ids.len(),
                     excluded.len(),
                     excluded.join(", ")
+                );
+                eprintln!("lifecycle: {line}");
+                ctx.log("ingest", &line);
+            }
+            if !empty_members.is_empty() {
+                let line = format!(
+                    "group {recording_id}: excluding {} terminal empty day marker(s) with no replayable tape ({})",
+                    empty_members.len(),
+                    empty_members.join(", ")
                 );
                 eprintln!("lifecycle: {line}");
                 ctx.log("ingest", &line);
@@ -6451,6 +6545,7 @@ fn pull_recording(
     // the artifact describes a partial run as a whole one, and the exclusion
     // survives only as prose in a log.
     report.excluded_members = std::mem::take(&mut excluded);
+    report.excluded_empty_members = std::mem::take(&mut empty_members);
     // Gaps are per instance and instances do not span members, so the sum over
     // every member's manifest is the selection's gap count rather than a
     // double-count.
@@ -8054,7 +8149,7 @@ mod tests {
 
     #[test]
     fn an_empty_group_is_not_told_to_wait_for_the_sealer() {
-        let err = super::empty_group_error("grp-typo", "bkt", "landing/v1", 0, &[])
+        let err = super::empty_group_error("grp-typo", "bkt", "landing/v1", 0, &[], &[])
             .expect("a group that resolves to nothing is an error");
         assert!(
             err.contains("names no recordings"),
@@ -8071,7 +8166,7 @@ mod tests {
     #[test]
     fn a_wholly_unsealed_group_is_told_to_wait_for_the_sealer() {
         let excluded = vec!["rec-a".to_owned(), "rec-b".to_owned()];
-        let err = super::empty_group_error("grp-today", "bkt", "landing/v1", 0, &excluded)
+        let err = super::empty_group_error("grp-today", "bkt", "landing/v1", 0, &excluded, &[])
             .expect("keeping nothing is an error");
         assert!(
             err.contains("no sealed recordings yet"),
@@ -8088,10 +8183,36 @@ mod tests {
     #[test]
     fn a_group_with_one_sealed_member_is_not_an_error() {
         assert!(
-            super::empty_group_error("g", "bkt", "landing/v1", 1, &["rec-open".to_owned()])
+            super::empty_group_error("g", "bkt", "landing/v1", 1, &["rec-open".to_owned()], &[])
                 .is_none(),
             "one sealed member is enough to replay"
         );
+    }
+    #[test]
+    fn terminal_empty_group_members_are_not_reported_as_unsealed() {
+        let empty = vec!["rec-a.2026-10-08".to_owned()];
+        let err = super::empty_group_error("grp", "bkt", "landing/v1", 0, &[], &empty)
+            .expect("an all-empty group has no replayable tape");
+        assert!(err.contains("terminal empty day marker"), "{err}");
+        assert!(!err.contains("still being written"), "{err}");
+    }
+
+    #[test]
+    fn stale_bare_id_requires_a_day_address_after_split() {
+        let one_day = ["2026-10-08".to_owned()].into_iter().collect();
+        assert!(super::stale_bare_recording_error("rec-a", &one_day).is_none());
+
+        let split_days = ["2026-10-08".to_owned(), "2026-10-09".to_owned()]
+            .into_iter()
+            .collect();
+        let err = super::stale_bare_recording_error("rec-a", &split_days)
+            .expect("a historical bare seal must not be replayed after a split");
+        assert!(err.contains("rec-a.<YYYY-MM-DD>"), "{err}");
+    }
+    #[test]
+    fn empty_status_is_a_terminal_non_replayable_marker() {
+        assert!(super::is_empty_terminal_manifest("empty"));
+        assert!(!super::is_empty_terminal_manifest("sealed"));
     }
 
     /// A three-event recording on disk, opened at whole-session scope.
@@ -9573,6 +9694,7 @@ mod tests {
         let report = crate::s3::IngestReport {
             members: vec!["rec-fixture".to_owned()],
             excluded_members: Vec::new(),
+            excluded_empty_members: Vec::new(),
             member_seals: Vec::new(),
             prefix: "s3://b/p".into(),
             landing_objects: 1,
