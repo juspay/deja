@@ -63,6 +63,9 @@ struct AppState {
     auth: Arc<deja_orchestrator::auth::AuthState>,
     /// Verdict restates in flight, one per pull request.
     restates: Arc<Restates>,
+    /// Deployment tracking, from the configuration's `[cd]` block. `None`
+    /// when no block is declared: the endpoints say so and write nothing.
+    cd: Option<Arc<deja_orchestrator::cd::CdConfig>>,
 }
 
 /// Which executor drives runs, resolved ONCE at startup. K8s carries the
@@ -231,6 +234,25 @@ async fn main() {
             }
         });
     }
+    // The same document as [auth], read once: the environment list is
+    // deployment shape, not a setting that moves while a page is open.
+    let cd = match deja_orchestrator::settings::load() {
+        Ok(s) => deja_orchestrator::cd::CdConfig::from_settings(&s).map(Arc::new),
+        Err(e) => {
+            // Already refused above if it mattered for sign-in; here it only
+            // means deployment tracking is off.
+            eprintln!("deja-orchestrator: [cd] not read ({e}); deployment tracking off");
+            None
+        }
+    };
+    match &cd {
+        Some(c) => eprintln!(
+            "deja-orchestrator: deployment tracking on for {} across {}",
+            c.systems.join(", "),
+            c.environments.join(" → ")
+        ),
+        None => eprintln!("deja-orchestrator: no [cd] block; deployment tracking off"),
+    }
     let state = AppState {
         root: root.clone(),
         store,
@@ -238,6 +260,7 @@ async fn main() {
         executor,
         auth,
         restates: Arc::default(),
+        cd,
     };
 
     // Restart-durable reconciler (#34 V3/V7). The per-launch watcher in
@@ -316,6 +339,13 @@ fn app_router(state: AppState) -> Router {
         state.mutation_auth.clone(),
         require_service_auth,
     ));
+    // Deployment facts come from the pipeline (Jenkins) only, under the same
+    // service token: a version it built, a deployment it made, what Argo
+    // reports. Reading them is open, like runs.
+    let service = middleware::from_fn_with_state(state.mutation_auth.clone(), require_service_auth);
+    let post_cd_version = post(v1_cd_post_version).route_layer(service.clone());
+    let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
+    let post_cd_observed = post(v1_cd_post_observed).route_layer(service);
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
@@ -349,7 +379,21 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit))
-        .route("/auth/me", get(v1_auth_me));
+        .route("/auth/me", get(v1_auth_me))
+        .route("/cd/config", get(v1_cd_config))
+        .route("/cd/versions", post_cd_version.get(v1_cd_versions))
+        .route("/cd/versions/{version}", get(v1_cd_version))
+        .route("/cd/deployments", post_cd_deployment)
+        .route("/cd/environments", get(v1_cd_environments))
+        .route("/cd/environments/{env}/observed", post_cd_observed)
+        .route(
+            "/cd/environments/{env}/deployments",
+            get(v1_cd_environment_deployments),
+        )
+        .route(
+            "/cd/pull-requests/{owner}/{repo}/{number}",
+            get(v1_cd_pull_request),
+        );
 
     Router::new()
         .nest("/api/v1", api_v1)
@@ -4091,6 +4135,494 @@ fn error_resp(status: u16, msg: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Continuous deployment: what runs where. The decision is
+// deja_orchestrator::cd; this is its HTTP and its store calls.
+// ---------------------------------------------------------------------------
+
+/// The `[cd]` block, or a 404 saying deployment tracking is off.
+#[allow(clippy::result_large_err)] // the Err is an axum Response; cold path
+fn require_cd(st: &AppState) -> Result<Arc<deja_orchestrator::cd::CdConfig>, Response> {
+    st.cd.clone().ok_or_else(|| {
+        error_resp(
+            404,
+            "deployment tracking is off: no [cd] block in the configuration",
+        )
+    })
+}
+
+/// `?system=` or the first tracked system; a name the block does not list
+/// is refused, so a typo in a job cannot open a system of its own.
+#[allow(clippy::result_large_err)]
+fn cd_system(
+    cd: &deja_orchestrator::cd::CdConfig,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, Response> {
+    match q
+        .get("system")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) if cd.knows_system(s) => Ok(s.to_owned()),
+        Some(s) => Err(error_resp(
+            400,
+            &format!(
+                "unknown system {s:?}; [cd] tracks {}",
+                cd.systems.join(", ")
+            ),
+        )),
+        None => Ok(cd.systems[0].clone()),
+    }
+}
+
+fn cd_limit(q: &std::collections::HashMap<String, String>, default: i64) -> i64 {
+    q.get("limit")
+        .and_then(|l| l.parse::<i64>().ok())
+        .filter(|l| *l > 0)
+        .unwrap_or(default)
+        .min(1000)
+}
+
+const CD_DEPLOYMENT_STATES: [&str; 6] = [
+    "requested",
+    "committed",
+    "syncing",
+    "live",
+    "failed",
+    "rolled_back",
+];
+
+async fn cd_audit(
+    store: &deja_store::Store,
+    actor: &str,
+    action: &str,
+    object_type: &str,
+    object_id: &str,
+    details: &serde_json::Value,
+) {
+    if let Err(e) = store
+        .audit(actor, action, object_type, object_id, details)
+        .await
+    {
+        eprintln!(
+            "deja-orchestrator: audit of {action} on {object_id} by {actor} was not written: {e}"
+        );
+    }
+}
+
+/// `GET /api/v1/cd/config`: whether tracking is on and what it tracks.
+/// Never 404: the viewer decides whether to show the tab.
+async fn v1_cd_config(State(st): State<AppState>) -> Response {
+    match &st.cd {
+        Some(cd) => json_ok(
+            serde_json::json!({ "enabled": true, "systems": cd.systems, "environments": cd.environments, "promotable": cd.promotable }),
+        ),
+        None => json_ok(serde_json::json!({ "enabled": false })),
+    }
+}
+
+/// `POST /api/v1/cd/versions`: the pipeline posts a version it built, with
+/// the pull requests it carries. Idempotent.
+async fn v1_cd_post_version(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut v: deja_store::NewCdVersion = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&v.system) {
+        return error_resp(400, &format!("unknown system {:?}", v.system));
+    }
+    if v.version.trim().is_empty() {
+        return error_resp(400, "version is required");
+    }
+    if v.kind != "merge" && v.kind != "release" {
+        return error_resp(400, "kind must be merge or release");
+    }
+    v.prs.retain(|p| !p.repo.trim().is_empty());
+    if let Err(e) = store.cd_version_upsert(&v).await {
+        return error_resp(500, &format!("version: {e}"));
+    }
+    cd_audit(
+        &store,
+        &actor.0,
+        "cd.version",
+        "version",
+        &format!("{}/{}", v.system, v.version),
+        &serde_json::json!({ "kind": v.kind, "commit_sha": v.commit_sha, "prs": v.prs.len() }),
+    )
+    .await;
+    json_ok(serde_json::json!({ "ok": true }))
+}
+
+/// `POST /api/v1/cd/deployments`: a job records what it asked an
+/// environment to run and how that went. The version must be known.
+async fn v1_cd_post_deployment(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut d: deja_store::NewCdDeployment = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&d.system) {
+        return error_resp(400, &format!("unknown system {:?}", d.system));
+    }
+    if !cd.knows_environment(&d.environment) {
+        return error_resp(
+            400,
+            &format!(
+                "unknown environment {:?}; [cd] has {}",
+                d.environment,
+                cd.environments.join(", ")
+            ),
+        );
+    }
+    if !CD_DEPLOYMENT_STATES.contains(&d.state.as_str()) {
+        return error_resp(
+            400,
+            &format!("state must be one of {}", CD_DEPLOYMENT_STATES.join(", ")),
+        );
+    }
+    if d.requested_by.trim().is_empty() {
+        d.requested_by = actor.0.clone();
+    }
+    if d.detail.is_null() {
+        d.detail = serde_json::json!({});
+    }
+    match store.cd_version_get(&d.system, &d.version).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_resp(
+                409,
+                &format!(
+                    "unknown version {:?}: post it to /cd/versions first",
+                    d.version
+                ),
+            )
+        }
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    }
+    let row = match store.cd_deployment_append(&d).await {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("deployment: {e}")),
+    };
+    cd_audit(&store, &actor.0, "cd.deployment", "environment", &format!("{}/{}", d.system, d.environment),
+        &serde_json::json!({ "version": d.version, "state": d.state, "requested_by": d.requested_by, "jenkins_build": d.jenkins_build })).await;
+    json_ok_ser(&row)
+}
+
+/// `POST /api/v1/cd/environments/{env}/observed`: what Argo reports. A row
+/// is appended only when it says something the newest row does not.
+async fn v1_cd_post_observed(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(env): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    use deja_orchestrator::cd::{kind_of_version_name, transition, Latest, Observation};
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let obs: Observation = match serde_json::from_slice(&body) {
+        Ok(o) => o,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&obs.system) {
+        return error_resp(400, &format!("unknown system {:?}", obs.system));
+    }
+    if !cd.knows_environment(&env) {
+        return error_resp(400, &format!("unknown environment {env:?}"));
+    }
+    if obs.desired_version.trim().is_empty() {
+        return error_resp(400, "desired_version is required");
+    }
+    let latest = match store.cd_latest_per_environment(&obs.system).await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| r.environment == env)
+            .map(|r| Latest {
+                version: r.version,
+                state: r.state,
+            }),
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    // The decision needs to know whether the synced version was live here
+    // before; one query, asked ahead so the decision stays a pure function.
+    let synced = obs.synced_version.clone().unwrap_or_default();
+    let was_live = if synced.is_empty() {
+        false
+    } else {
+        match store.cd_was_live(&obs.system, &env, &synced).await {
+            Ok(b) => b,
+            Err(e) => return error_resp(500, &format!("deployments: {e}")),
+        }
+    };
+    let asked = match store
+        .cd_was_requested(&obs.system, &env, &obs.desired_version)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let Some(t) = transition(
+        latest.as_ref(),
+        &obs,
+        |v| v == obs.desired_version && asked,
+        |v| v == synced && was_live,
+    ) else {
+        return json_ok(serde_json::json!({ "appended": null }));
+    };
+    if let Err(e) = store
+        .cd_version_ensure(&obs.system, &t.version, kind_of_version_name(&t.version))
+        .await
+    {
+        return error_resp(500, &format!("version: {e}"));
+    }
+    let row = match store
+        .cd_deployment_append(&deja_store::NewCdDeployment {
+            system: obs.system.clone(),
+            environment: env.clone(),
+            version: t.version.clone(),
+            state: t.state.clone(),
+            requested_by: "observed".to_owned(),
+            requested_by_sub: None,
+            request_id: None,
+            jenkins_build: None,
+            detail: serde_json::json!({
+                "out_of_band": t.out_of_band,
+                "sync": obs.sync, "health": obs.health,
+                "desired_version": obs.desired_version, "synced_version": obs.synced_version,
+                "chart": obs.chart, "image_tag": obs.image_tag, "observed_at": obs.observed_at,
+            }),
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("deployment: {e}")),
+    };
+    cd_audit(&store, &actor.0, "cd.observed", "environment", &format!("{}/{env}", obs.system),
+        &serde_json::json!({ "version": t.version, "state": t.state, "out_of_band": t.out_of_band })).await;
+    json_ok(serde_json::json!({ "appended": row }))
+}
+
+/// `GET /api/v1/cd/environments?system=`: every tracked environment with its
+/// newest row and what it last ran for certain, in pipeline order.
+async fn v1_cd_environments(
+    State(st): State<AppState>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (latest, live) = match (
+        store.cd_latest_per_environment(&system).await,
+        store.cd_latest_live_per_environment(&system).await,
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let mut versions = std::collections::BTreeMap::new();
+    for row in latest.iter().chain(live.iter()) {
+        if !versions.contains_key(&row.version) {
+            match store.cd_version_get(&system, &row.version).await {
+                Ok(v) => {
+                    versions.insert(row.version.clone(), v);
+                }
+                Err(e) => return error_resp(500, &format!("version: {e}")),
+            }
+        }
+    }
+    let environments: Vec<serde_json::Value> = cd
+        .environments
+        .iter()
+        .map(|env| {
+            let l = latest.iter().find(|r| &r.environment == env);
+            let v = live.iter().find(|r| &r.environment == env);
+            serde_json::json!({
+                "environment": env,
+                "latest": l,
+                "live": v,
+                "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+                "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+            })
+        })
+        .collect();
+    json_ok(serde_json::json!({ "system": system, "environments": environments }))
+}
+
+/// `GET /api/v1/cd/environments/{env}/deployments?system=&limit=`: history.
+async fn v1_cd_environment_deployments(
+    State(st): State<AppState>,
+    Path(env): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !cd.knows_environment(&env) {
+        return error_resp(404, &format!("unknown environment {env:?}"));
+    }
+    match store
+        .cd_deployments_for_environment(&system, &env, cd_limit(&q, 200))
+        .await
+    {
+        Ok(rows) => json_ok_ser(&rows),
+        Err(e) => error_resp(500, &format!("deployments: {e}")),
+    }
+}
+
+/// `GET /api/v1/cd/versions?system=&limit=`: versions newest first, each with
+/// where it is on every environment it has touched.
+async fn v1_cd_versions(State(st): State<AppState>, axum::extract::Query(q): Query) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let versions = match store.cd_versions_list(&system, cd_limit(&q, 100)).await {
+        Ok(v) => v,
+        Err(e) => return error_resp(500, &format!("versions: {e}")),
+    };
+    let places = match store.cd_latest_per_environment_version(&system).await {
+        Ok(p) => p,
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let out: Vec<serde_json::Value> = versions
+        .into_iter()
+        .map(|v| {
+            let where_: Vec<&deja_store::CdDeploymentRow> =
+                places.iter().filter(|p| p.version == v.version).collect();
+            serde_json::json!({ "version": v, "where": where_ })
+        })
+        .collect();
+    json_ok(serde_json::json!({ "system": system, "versions": out }))
+}
+
+/// `GET /api/v1/cd/versions/{version}?system=`: one version and its history.
+async fn v1_cd_version(
+    State(st): State<AppState>,
+    Path(version): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let v = match store.cd_version_get(&system, &version).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error_resp(404, "no such version"),
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    };
+    match store
+        .cd_deployments_of_version(&system, &version, 200)
+        .await
+    {
+        Ok(rows) => json_ok(serde_json::json!({ "version": v, "deployments": rows })),
+        Err(e) => error_resp(500, &format!("deployments: {e}")),
+    }
+}
+
+/// `GET /api/v1/cd/pull-requests/{owner}/{repo}/{number}`: the versions
+/// carrying one pull request and where each is.
+async fn v1_cd_pull_request(
+    State(st): State<AppState>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> Response {
+    if require_cd(&st).is_err() {
+        return error_resp(
+            404,
+            "deployment tracking is off: no [cd] block in the configuration",
+        );
+    }
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let full = format!("{owner}/{repo}");
+    let versions = match store.cd_versions_of_pull_request(&full, number).await {
+        Ok(v) => v,
+        Err(e) => return error_resp(500, &format!("versions: {e}")),
+    };
+    let mut out = Vec::with_capacity(versions.len());
+    for v in versions {
+        let places = match store
+            .cd_deployments_of_version(&v.system, &v.version, 50)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return error_resp(500, &format!("deployments: {e}")),
+        };
+        // Newest row per environment: where this version is now.
+        let mut seen = std::collections::BTreeSet::new();
+        let where_: Vec<&deja_store::CdDeploymentRow> = places
+            .iter()
+            .filter(|p| seen.insert(p.environment.clone()))
+            .collect();
+        out.push(serde_json::json!({ "version": v, "where": where_ }));
+    }
+    json_ok(
+        serde_json::json!({ "repo": full.to_ascii_lowercase(), "pr_number": number, "versions": out }),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Embedded dashboard
 // ---------------------------------------------------------------------------
 
@@ -4703,6 +5235,7 @@ mod tests {
             executor: Arc::new(ExecutorSelection::Compose),
             auth: deja_orchestrator::auth::AuthState::disabled(),
             restates: Arc::default(),
+            cd: None,
         }
     }
 
@@ -6038,6 +6571,7 @@ mod sign_in {
             executor: Arc::new(ExecutorSelection::Compose),
             auth,
             restates: Arc::default(),
+            cd: None,
         }
     }
 

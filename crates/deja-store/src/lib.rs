@@ -207,6 +207,93 @@ pub struct NewAcknowledgement {
     pub value_hash: Option<String>,
 }
 
+/// One thing a system can run: a merge (one pull request, named by its short
+/// sha) or a release (a CalVer tag on one of those commits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdVersionRow {
+    pub system: String,
+    pub version: String,
+    pub kind: String,
+    pub commit_sha: Option<String>,
+    pub image_tag: Option<String>,
+    pub chart: Option<String>,
+    /// For a release, the merge version it was tagged on.
+    pub released_from: Option<String>,
+    pub merged_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    /// What the version carries, as posted with it.
+    #[serde(default)]
+    pub prs: Vec<CdVersionPr>,
+}
+
+/// A version as the pipeline posts it: everything but what the database
+/// fills in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewCdVersion {
+    pub system: String,
+    pub version: String,
+    pub kind: String,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub image_tag: Option<String>,
+    #[serde(default)]
+    pub chart: Option<String>,
+    #[serde(default)]
+    pub released_from: Option<String>,
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub prs: Vec<CdVersionPr>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdVersionPr {
+    pub repo: String,
+    pub pr_number: i64,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub merged_at: Option<DateTime<Utc>>,
+}
+
+/// One change to what an environment is asked to run or observed running.
+/// Append-only; an environment's state is its newest row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdDeploymentRow {
+    pub id: i64,
+    pub system: String,
+    pub environment: String,
+    pub version: String,
+    pub state: String,
+    pub requested_by: String,
+    /// The sign-in subject beside the name, never serialised (see
+    /// `AcknowledgementRow`).
+    #[serde(default, skip_serializing)]
+    pub requested_by_sub: Option<String>,
+    pub request_id: Option<i64>,
+    pub jenkins_build: Option<String>,
+    pub detail: serde_json::Value,
+    pub at: DateTime<Utc>,
+}
+
+/// A deployment row to append, everything but what the database fills in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewCdDeployment {
+    pub system: String,
+    pub environment: String,
+    pub version: String,
+    pub state: String,
+    pub requested_by: String,
+    #[serde(default)]
+    pub requested_by_sub: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<i64>,
+    #[serde(default)]
+    pub jenkins_build: Option<String>,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
 impl Store {
     /// Connect and run migrations. Errors are returned (the caller decides
     /// whether the store is mandatory).
@@ -442,6 +529,338 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    // -- continuous deployment -----------------------------------------------
+
+    /// Create or update a version with its pull requests, in one transaction.
+    /// Idempotent: the pipeline posts a version when it builds it and again
+    /// when it learns more (a release's chart, say). A posted field replaces
+    /// the stored one; an absent one leaves it alone, so a later post that
+    /// knows less than an earlier one does not erase anything. The pull
+    /// requests are replaced as a set when any are given.
+    pub async fn cd_version_upsert(&self, v: &NewCdVersion) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO cd_versions
+               (system, version, kind, commit_sha, image_tag, chart, released_from, merged_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (system, version) DO UPDATE
+               SET kind = EXCLUDED.kind,
+                   commit_sha = COALESCE(EXCLUDED.commit_sha, cd_versions.commit_sha),
+                   image_tag = COALESCE(EXCLUDED.image_tag, cd_versions.image_tag),
+                   chart = COALESCE(EXCLUDED.chart, cd_versions.chart),
+                   released_from = COALESCE(EXCLUDED.released_from, cd_versions.released_from),
+                   merged_at = COALESCE(EXCLUDED.merged_at, cd_versions.merged_at)",
+        )
+        .bind(&v.system)
+        .bind(&v.version)
+        .bind(&v.kind)
+        .bind(&v.commit_sha)
+        .bind(&v.image_tag)
+        .bind(&v.chart)
+        .bind(&v.released_from)
+        .bind(v.merged_at)
+        .execute(&mut *tx)
+        .await?;
+        if !v.prs.is_empty() {
+            sqlx::query("DELETE FROM cd_version_prs WHERE system = $1 AND version = $2")
+                .bind(&v.system)
+                .bind(&v.version)
+                .execute(&mut *tx)
+                .await?;
+            for pr in &v.prs {
+                sqlx::query(
+                    "INSERT INTO cd_version_prs
+                       (system, version, repo, pr_number, title, author, merged_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (system, version, repo, pr_number) DO UPDATE
+                       SET title = EXCLUDED.title, author = EXCLUDED.author,
+                           merged_at = EXCLUDED.merged_at",
+                )
+                .bind(&v.system)
+                .bind(&v.version)
+                .bind(pr.repo.to_ascii_lowercase())
+                .bind(pr.pr_number)
+                .bind(&pr.title)
+                .bind(&pr.author)
+                .bind(pr.merged_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// A version known only from an observation: the row exists so a
+    /// deployment can reference it, with no contents until the pipeline
+    /// posts them. Does nothing if the version is already known.
+    pub async fn cd_version_ensure(
+        &self,
+        system: &str,
+        version: &str,
+        kind: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO cd_versions (system, version, kind) VALUES ($1, $2, $3)
+             ON CONFLICT (system, version) DO NOTHING",
+        )
+        .bind(system)
+        .bind(version)
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cd_version_get(
+        &self,
+        system: &str,
+        version: &str,
+    ) -> Result<Option<CdVersionRow>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "{CD_VERSION_SELECT} WHERE system = $1 AND version = $2"
+        ))
+        .bind(system)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let mut v = cd_version_row(row);
+        v.prs = self
+            .cd_prs_of(&[v.version.clone()], system)
+            .await?
+            .remove(&v.version)
+            .unwrap_or_default();
+        Ok(Some(v))
+    }
+
+    /// The newest `limit` versions of a system, by merge time then by when
+    /// they were posted, with their pull requests.
+    pub async fn cd_versions_list(
+        &self,
+        system: &str,
+        limit: i64,
+    ) -> Result<Vec<CdVersionRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{CD_VERSION_SELECT} WHERE system = $1
+             ORDER BY merged_at DESC NULLS LAST, created_at DESC LIMIT $2"
+        ))
+        .bind(system)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut versions: Vec<CdVersionRow> = rows.into_iter().map(cd_version_row).collect();
+        let names: Vec<String> = versions.iter().map(|v| v.version.clone()).collect();
+        let mut prs = self.cd_prs_of(&names, system).await?;
+        for v in &mut versions {
+            v.prs = prs.remove(&v.version).unwrap_or_default();
+        }
+        Ok(versions)
+    }
+
+    async fn cd_prs_of(
+        &self,
+        versions: &[String],
+        system: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<CdVersionPr>>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT version, repo, pr_number, title, author, merged_at
+             FROM cd_version_prs WHERE system = $1 AND version = ANY($2)
+             ORDER BY merged_at DESC NULLS LAST, pr_number DESC",
+        )
+        .bind(system)
+        .bind(versions)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: std::collections::HashMap<String, Vec<CdVersionPr>> = Default::default();
+        for r in rows {
+            out.entry(r.get(0)).or_default().push(CdVersionPr {
+                repo: r.get(1),
+                pr_number: r.get(2),
+                title: r.get(3),
+                author: r.get(4),
+                merged_at: r.get(5),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every version carrying one pull request: its merge and each release.
+    pub async fn cd_versions_of_pull_request(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<CdVersionRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{CD_VERSION_SELECT} WHERE (system, version) IN
+               (SELECT system, version FROM cd_version_prs WHERE repo = $1 AND pr_number = $2)
+             ORDER BY kind, merged_at DESC NULLS LAST, created_at DESC"
+        ))
+        .bind(repo.to_ascii_lowercase())
+        .bind(pr_number)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_version_row).collect())
+    }
+
+    pub async fn cd_deployment_append(
+        &self,
+        d: &NewCdDeployment,
+    ) -> Result<CdDeploymentRow, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO cd_deployments
+               (system, environment, version, state, requested_by, requested_by_sub,
+                request_id, jenkins_build, detail)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING {CD_DEPLOYMENT_COLUMNS}"
+        ))
+        .bind(&d.system)
+        .bind(&d.environment)
+        .bind(&d.version)
+        .bind(&d.state)
+        .bind(&d.requested_by)
+        .bind(&d.requested_by_sub)
+        .bind(d.request_id)
+        .bind(&d.jenkins_build)
+        .bind(&d.detail)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(cd_deployment_row(row))
+    }
+
+    /// An environment's history, newest first.
+    pub async fn cd_deployments_for_environment(
+        &self,
+        system: &str,
+        environment: &str,
+        limit: i64,
+    ) -> Result<Vec<CdDeploymentRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {CD_DEPLOYMENT_COLUMNS} FROM cd_deployments
+             WHERE system = $1 AND environment = $2 ORDER BY id DESC LIMIT $3"
+        ))
+        .bind(system)
+        .bind(environment)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_deployment_row).collect())
+    }
+
+    /// Every environment's newest row: where each one is now.
+    pub async fn cd_latest_per_environment(
+        &self,
+        system: &str,
+    ) -> Result<Vec<CdDeploymentRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT ON (environment) {CD_DEPLOYMENT_COLUMNS} FROM cd_deployments
+             WHERE system = $1 ORDER BY environment, id DESC"
+        ))
+        .bind(system)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_deployment_row).collect())
+    }
+
+    /// Every environment's newest `live` row: what each one last ran for
+    /// certain, whatever it is moving to now.
+    pub async fn cd_latest_live_per_environment(
+        &self,
+        system: &str,
+    ) -> Result<Vec<CdDeploymentRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT ON (environment) {CD_DEPLOYMENT_COLUMNS} FROM cd_deployments
+             WHERE system = $1 AND state IN ('live', 'rolled_back')
+             ORDER BY environment, id DESC"
+        ))
+        .bind(system)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_deployment_row).collect())
+    }
+
+    /// Each version's newest row on each environment: where every version
+    /// is, in one query, for a list.
+    pub async fn cd_latest_per_environment_version(
+        &self,
+        system: &str,
+    ) -> Result<Vec<CdDeploymentRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT ON (environment, version) {CD_DEPLOYMENT_COLUMNS} FROM cd_deployments
+             WHERE system = $1 ORDER BY environment, version, id DESC"
+        ))
+        .bind(system)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_deployment_row).collect())
+    }
+
+    /// Whether a version has ever been live on an environment.
+    pub async fn cd_was_live(
+        &self,
+        system: &str,
+        environment: &str,
+        version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cd_deployments
+             WHERE system = $1 AND environment = $2 AND version = $3
+               AND state IN ('live', 'rolled_back')",
+        )
+        .bind(system)
+        .bind(environment)
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
+    }
+
+    /// Whether a job (not an observation) asked for a version on an
+    /// environment since the last time something else was live there: the
+    /// difference between a deploy the pipeline made and one made by hand.
+    pub async fn cd_was_requested(
+        &self,
+        system: &str,
+        environment: &str,
+        version: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cd_deployments d
+             WHERE d.system = $1 AND d.environment = $2 AND d.version = $3
+               AND d.requested_by <> 'observed'
+               AND d.id > COALESCE((SELECT max(id) FROM cd_deployments
+                                    WHERE system = $1 AND environment = $2
+                                      AND version <> $3
+                                      AND state IN ('live', 'rolled_back')), 0)",
+        )
+        .bind(system)
+        .bind(environment)
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
+    }
+
+    /// The newest rows naming one version, across environments, newest
+    /// first: where it went and what became of it.
+    pub async fn cd_deployments_of_version(
+        &self,
+        system: &str,
+        version: &str,
+        limit: i64,
+    ) -> Result<Vec<CdDeploymentRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT {CD_DEPLOYMENT_COLUMNS} FROM cd_deployments
+             WHERE system = $1 AND version = $2 ORDER BY id DESC LIMIT $3"
+        ))
+        .bind(system)
+        .bind(version)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_deployment_row).collect())
     }
 
     // -- recordings ----------------------------------------------------------
@@ -935,6 +1354,43 @@ fn ack_row(r: sqlx::postgres::PgRow) -> AcknowledgementRow {
         proposed_by_sub: r.get(15),
         acknowledged_by_sub: r.get(16),
         withdrawn_by_sub: r.get(17),
+    }
+}
+
+const CD_VERSION_SELECT: &str = "SELECT system, version, kind, commit_sha, image_tag, chart, \
+     released_from, merged_at, created_at FROM cd_versions";
+
+fn cd_version_row(r: sqlx::postgres::PgRow) -> CdVersionRow {
+    CdVersionRow {
+        system: r.get(0),
+        version: r.get(1),
+        kind: r.get(2),
+        commit_sha: r.get(3),
+        image_tag: r.get(4),
+        chart: r.get(5),
+        released_from: r.get(6),
+        merged_at: r.get(7),
+        created_at: r.get(8),
+        prs: Vec::new(),
+    }
+}
+
+const CD_DEPLOYMENT_COLUMNS: &str = "id, system, environment, version, state, requested_by, \
+     requested_by_sub, request_id, jenkins_build, detail, at";
+
+fn cd_deployment_row(r: sqlx::postgres::PgRow) -> CdDeploymentRow {
+    CdDeploymentRow {
+        id: r.get(0),
+        system: r.get(1),
+        environment: r.get(2),
+        version: r.get(3),
+        state: r.get(4),
+        requested_by: r.get(5),
+        requested_by_sub: r.get(6),
+        request_id: r.get(7),
+        jenkins_build: r.get(8),
+        detail: r.get(9),
+        at: r.get(10),
     }
 }
 
