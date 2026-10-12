@@ -67,6 +67,10 @@ pub struct CallSide {
     pub span_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_node_id: Option<u64>,
+    /// Observed side only: which locus resolved the call (`span_instance`,
+    /// `span_path`, …), so the tiers can be counted from the ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_locus: Option<String>,
 }
 
 impl CallSide {
@@ -183,6 +187,7 @@ fn recorded_side(ev: &BoundaryEvent) -> CallSide {
         // not the event; the graph node is the event's own.
         span_path: None,
         graph_node_id: ev.graph_node_id,
+        resolved_locus: None,
     }
 }
 
@@ -210,6 +215,7 @@ fn observed_side(obs: &ObservedCall) -> CallSide {
         call_column: obs.call_column,
         span_path: obs.span_path.clone(),
         graph_node_id: obs.graph_node_id,
+        resolved_locus: obs.resolved_locus.clone(),
     }
 }
 
@@ -897,6 +903,7 @@ mod tests {
             args: serde_json::json!({"obs": true}),
             resolved,
             resolved_rank: rank,
+            resolved_locus: None,
             source_event_global_sequence: src,
             timestamp_ns: 0,
             end_timestamp_ns: None,
@@ -1185,10 +1192,11 @@ mod tests {
         let events = vec![event(1, "db", Some("c1")), event(2, "redis", Some("c1"))];
         let spans: HashMap<u64, String> = [(1, "root>db".to_owned())].into_iter().collect();
         // observed: matched call to seq 1, plus a novel db call (unresolved)
-        let observed = vec![
+        let mut observed = vec![
             obs("db", Some("c1"), true, Some(2), Some(1)),
             obs("db", Some("c1"), false, None, None),
         ];
+        observed[0].resolved_locus = Some("span_instance".to_owned());
         let rows = build(
             &events,
             &observed,
@@ -1207,6 +1215,7 @@ mod tests {
         let obs_side = m.observed.as_ref().unwrap();
         assert_eq!(obs_side.call_file.as_deref(), Some("y.rs"));
         assert_eq!(obs_side.graph_node_id, Some(42));
+        assert_eq!(obs_side.resolved_locus.as_deref(), Some("span_instance"));
 
         let novel = find(&rows, "novel");
         assert_eq!(novel.len(), 1);

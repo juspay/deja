@@ -99,6 +99,27 @@ pub struct Acknowledgement {
     pub acknowledged_by: Option<String>,
     #[serde(default)]
     pub withdrawn: bool,
+    /// The sign-in subjects behind the two names; `None` when the action was
+    /// taken with sign-in off or by the service token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_by_sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_by_sub: Option<String>,
+}
+
+impl Acknowledgement {
+    /// Whether this counts as confirmed. With sign-in required, a
+    /// confirmation given by nobody in particular — before sign-in, under a
+    /// typed name — is only a proposal: the row keeps its history and asks
+    /// to be decided again by someone who can be named.
+    fn confirmed(&self, require_subjects: bool) -> bool {
+        self.acknowledged_by.is_some()
+            && (!require_subjects
+                || self
+                    .acknowledged_by_sub
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +177,16 @@ impl Effective {
 /// For a row, the newest live acknowledgement with its key wins, a confirmed
 /// one over a proposal. Withdrawn acknowledgements are ignored. Rows the
 /// delta does not charge to the candidate are never touched.
-pub fn apply(delta: &mut Delta, acks: &[Acknowledgement], change_id: Option<&str>) -> Effective {
+///
+/// `require_subjects` is sign-in being on: then only a confirmation given by
+/// a signed-in person counts, and one from before sign-in reads as a
+/// proposal, so a decision nobody authenticated never passes the gate.
+pub fn apply(
+    delta: &mut Delta,
+    acks: &[Acknowledgement],
+    change_id: Option<&str>,
+    require_subjects: bool,
+) -> Effective {
     let live: Vec<&Acknowledgement> = acks.iter().filter(|a| !a.withdrawn).collect();
     let (mut acknowledged, mut proposed, mut stale, mut uncovered) = (0, 0, 0, 0);
     for row in delta.rows.iter_mut() {
@@ -165,10 +195,20 @@ pub fn apply(delta: &mut Delta, acks: &[Acknowledgement], change_id: Option<&str
             continue;
         }
         let key = Key::of_row(row);
-        let best = live
-            .iter()
-            .filter(|a| a.key == key)
-            .max_by_key(|a| (a.acknowledged_by.is_some(), a.id));
+        // One acknowledgement speaks for the row: one given on THIS version
+        // of the change before any from an earlier one, then a confirmed one
+        // before a proposal, then the newest. A confirmation from an earlier
+        // version must not stand in front of a proposal on this one: the row
+        // would read stale, offer "propose again" to the very maintainer who
+        // should be confirming, and hide the proposal that is waiting for
+        // them (PR #2471, 2026-10-09: proposals 3/4 hidden behind 1/2).
+        let best = live.iter().filter(|a| a.key == key).max_by_key(|a| {
+            (
+                change_id == Some(a.change_id.as_str()),
+                a.confirmed(require_subjects),
+                a.id,
+            )
+        });
         let Some(ack) = best else {
             row.acknowledgement = None;
             if row.blocking {
@@ -176,11 +216,11 @@ pub fn apply(delta: &mut Delta, acks: &[Acknowledgement], change_id: Option<&str
             }
             continue;
         };
-        let state = match (change_id, ack.acknowledged_by.as_deref()) {
+        let state = match (change_id, ack.confirmed(require_subjects)) {
             (None, _) => State::Stale,
             (Some(c), _) if c != ack.change_id => State::Stale,
-            (_, Some(_)) => State::Acknowledged,
-            (_, None) => State::Proposed,
+            (_, true) => State::Acknowledged,
+            (_, false) => State::Proposed,
         };
         let value_changed = match (&row.y, &ack.value_hash) {
             (Side::Hash(h), Some(v)) => h != v,
@@ -335,7 +375,47 @@ mod tests {
             proposed_by: "author".into(),
             acknowledged_by: confirmed.then(|| "maintainer".to_owned()),
             withdrawn: false,
+            proposed_by_sub: Some("sub-author".into()),
+            acknowledged_by_sub: confirmed.then(|| "sub-maintainer".to_owned()),
         }
+    }
+
+    /// Sign-in on: a confirmation nobody authenticated is a proposal, and
+    /// it does not outrank a newer signed-in proposal for the same shape.
+    #[test]
+    fn with_sign_in_on_a_confirmation_from_before_it_is_only_a_proposal() {
+        let r = row(body("c", "$.suffix"), Bucket::Introduced, "v1");
+        let key = Key::of_row(&r);
+        let mut before = ack(1, key.clone(), true);
+        before.proposed_by_sub = None;
+        before.acknowledged_by_sub = None;
+        // Off, it counts as it always did.
+        let mut d = delta(vec![r.clone()]);
+        assert_eq!(
+            apply(&mut d, std::slice::from_ref(&before), Some("c1"), false),
+            Effective::Acknowledged
+        );
+        // On, it is a proposal that asks to be decided again.
+        let mut d = delta(vec![r.clone()]);
+        assert_eq!(
+            apply(&mut d, std::slice::from_ref(&before), Some("c1"), true),
+            Effective::Fail
+        );
+        assert_eq!(
+            d.rows[0].acknowledgement.as_ref().unwrap().state,
+            State::Proposed
+        );
+        // A newer signed-in proposal wins over it, and a signed-in
+        // confirmation passes.
+        let signed = ack(2, key.clone(), false);
+        let mut d = delta(vec![r.clone()]);
+        apply(&mut d, &[before.clone(), signed], Some("c1"), true);
+        assert_eq!(d.rows[0].acknowledgement.as_ref().unwrap().id, 2);
+        let mut d = delta(vec![r]);
+        assert_eq!(
+            apply(&mut d, &[before, ack(3, key, true)], Some("c1"), true),
+            Effective::Acknowledged
+        );
     }
 
     #[test]
@@ -362,7 +442,7 @@ mod tests {
             "v1",
         )]);
         let key = Key::of_row(&row(body("corr-1", "$.suffix"), Bucket::Introduced, "v1"));
-        let e = apply(&mut d, &[ack(1, key, true)], Some("c1"));
+        let e = apply(&mut d, &[ack(1, key, true)], Some("c1"), false);
         assert_eq!(e, Effective::Acknowledged);
         let a = d.rows[0].acknowledgement.as_ref().unwrap();
         assert_eq!(a.state, State::Acknowledged);
@@ -380,7 +460,7 @@ mod tests {
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
         assert_eq!(
-            apply(&mut d, &[ack(1, key, false)], Some("c1")),
+            apply(&mut d, &[ack(1, key, false)], Some("c1"), false),
             Effective::Fail
         );
         assert_eq!(
@@ -396,7 +476,7 @@ mod tests {
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
         assert_eq!(
-            apply(&mut d, &[ack(1, key, true)], Some("c2")),
+            apply(&mut d, &[ack(1, key, true)], Some("c2"), false),
             Effective::Fail
         );
         assert_eq!(
@@ -413,7 +493,7 @@ mod tests {
         let mut a = ack(1, key, true);
         a.withdrawn = true;
         let mut d = delta(vec![r]);
-        assert_eq!(apply(&mut d, &[a], Some("c1")), Effective::Fail);
+        assert_eq!(apply(&mut d, &[a], Some("c1"), false), Effective::Fail);
         assert!(d.rows[0].acknowledgement.is_none());
     }
 
@@ -423,7 +503,7 @@ mod tests {
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
         assert_eq!(
-            apply(&mut d, &[ack(1, key, true)], Some("c1")),
+            apply(&mut d, &[ack(1, key, true)], Some("c1"), false),
             Effective::Acknowledged
         );
         assert!(d.rows[0].acknowledgement.as_ref().unwrap().value_changed);
@@ -435,7 +515,10 @@ mod tests {
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
         let acks = [ack(1, key.clone(), true), ack(2, key, false)];
-        assert_eq!(apply(&mut d, &acks, Some("c1")), Effective::Acknowledged);
+        assert_eq!(
+            apply(&mut d, &acks, Some("c1"), false),
+            Effective::Acknowledged
+        );
         assert_eq!(d.rows[0].acknowledgement.as_ref().unwrap().id, 1);
     }
 
@@ -445,7 +528,7 @@ mod tests {
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
         assert_eq!(
-            apply(&mut d, &[ack(1, key, true)], Some("c1")),
+            apply(&mut d, &[ack(1, key, true)], Some("c1"), false),
             Effective::Pass
         );
         assert!(d.rows[0].acknowledgement.is_none());
@@ -457,11 +540,51 @@ mod tests {
         let r = row(call("c", 1, Some(3)), Bucket::Introduced, "v1");
         let key = Key::of_row(&r);
         let mut d = delta(vec![r]);
-        assert_eq!(apply(&mut d, &[ack(1, key, true)], None), Effective::Fail);
+        assert_eq!(
+            apply(&mut d, &[ack(1, key, true)], None, false),
+            Effective::Fail
+        );
         assert_eq!(
             d.rows[0].acknowledgement.as_ref().unwrap().state,
             State::Stale
         );
         assert_eq!(d.verdict.stale, 1);
+    }
+
+    /// PR #2471, 2026-10-09: a shape confirmed on an earlier version of the
+    /// change, then proposed again on this one. The row must show the
+    /// proposal waiting for confirmation, not the old confirmation as stale,
+    /// or a maintainer is offered "propose again" instead of "approve".
+    #[test]
+    fn a_proposal_on_this_change_outranks_a_confirmation_on_an_earlier_one() {
+        let r = row(body("c", "$.probe"), Bucket::Introduced, "v1");
+        let key = Key::of_row(&r);
+        let mut earlier = ack(1, key.clone(), true);
+        earlier.change_id = "c0".into();
+        let current = ack(3, key.clone(), false);
+        let mut d = delta(vec![r.clone()]);
+        assert_eq!(
+            apply(
+                &mut d,
+                &[earlier.clone(), current.clone()],
+                Some("c1"),
+                true
+            ),
+            Effective::Fail
+        );
+        let shown = d.rows[0].acknowledgement.as_ref().unwrap();
+        assert_eq!((shown.id, shown.state), (3, State::Proposed));
+        assert_eq!((d.verdict.proposed, d.verdict.stale), (1, 0));
+
+        // Once this version's proposal is confirmed, it is what counts.
+        let mut confirmed = current;
+        confirmed.acknowledged_by = Some("maintainer".into());
+        confirmed.acknowledged_by_sub = Some("sub-maintainer".into());
+        let mut d = delta(vec![r]);
+        assert_eq!(
+            apply(&mut d, &[earlier, confirmed], Some("c1"), true),
+            Effective::Acknowledged
+        );
+        assert_eq!(d.rows[0].acknowledgement.as_ref().unwrap().id, 3);
     }
 }

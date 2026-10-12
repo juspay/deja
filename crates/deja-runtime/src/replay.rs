@@ -7,7 +7,7 @@
 //! Missing calls are recovered via sliding-window search; novel calls trigger
 //! graceful synthesis.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -1932,6 +1932,13 @@ pub enum Locus {
     /// occurrence counter. That was identity wearing a locus's clothes; the
     /// identity now lives on [`LookupKey`] and this is a path again.
     SpanPath { path: String },
+    /// Rank 2, tried before [`Locus::SpanPath`] — the same path with each span
+    /// INSTANCE told apart from its same-name siblings by creation ordinal
+    /// (`CallsiteIdentity::span_instance`). Separates twins: concurrent branches
+    /// in same-named spans making identical calls, which `SpanPath` can only
+    /// tell apart by arrival order. A miss here falls through to `SpanPath`, so
+    /// where creation order itself races nothing is worse than before.
+    SpanInstance { path: String },
     /// Rank 3 — NO location claimed: match on identity, args and occurrence
     /// alone, wherever the call is made from.
     ///
@@ -1989,9 +1996,21 @@ impl Locus {
     pub fn rank(&self) -> u8 {
         match self {
             Locus::DeclaredSite(_) => 1,
-            Locus::SpanPath { .. } => 2,
+            Locus::SpanInstance { .. } | Locus::SpanPath { .. } => 2,
             Locus::Unlocated => 3,
             Locus::SourceLocation { .. } => 5,
+        }
+    }
+
+    /// Which locus this is, by name — the tier a resolved call reports, since
+    /// two loci share rank 2.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Locus::DeclaredSite(_) => "declared_site",
+            Locus::SpanInstance { .. } => "span_instance",
+            Locus::SpanPath { .. } => "span_path",
+            Locus::Unlocated => "unlocated",
+            Locus::SourceLocation { .. } => "source_location",
         }
     }
 }
@@ -2072,6 +2091,10 @@ pub struct ObservedCall {
     pub resolved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_rank: Option<u8>,
+    /// The [`Locus::kind`] that resolved this call. Names the tier where a rank
+    /// cannot: `span_instance` and `span_path` are both rank 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_locus: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_event_global_sequence: Option<u64>,
     /// Replay-side wall-clock start timestamp for this observed call. This is
@@ -2230,6 +2253,8 @@ struct ObservedCallWire {
     #[serde(default)]
     resolved_rank: Option<u8>,
     #[serde(default)]
+    resolved_locus: Option<String>,
+    #[serde(default)]
     source_event_global_sequence: Option<u64>,
     #[serde(default)]
     timestamp_ns: u64,
@@ -2294,6 +2319,7 @@ impl From<ObservedCallWire> for ObservedCall {
             args: wire.args,
             resolved: wire.resolved,
             resolved_rank: wire.resolved_rank,
+            resolved_locus: wire.resolved_locus,
             source_event_global_sequence: wire.source_event_global_sequence,
             timestamp_ns: wire.timestamp_ns,
             end_timestamp_ns: wire.end_timestamp_ns,
@@ -2506,7 +2532,7 @@ pub fn loci_for(
     identity: Option<&crate::CallsiteIdentity>,
     location: Option<(&str, u32, u32)>,
 ) -> Vec<Locus> {
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(5);
     if let Some(id) = identity {
         if matches!(id.source, crate::CallsiteSource::Explicit) {
             if let Some(tag) = &id.id {
@@ -2516,6 +2542,11 @@ pub fn loci_for(
         // Rank 2 — logical span-path. Strongest non-explicit locus: stable
         // across line/signature edits AND distinct per concurrent span, so the
         // occurrence tiebreak is span-scoped (no positional swap).
+        if let Some(instance) = &id.span_instance {
+            out.push(Locus::SpanInstance {
+                path: instance.clone(),
+            });
+        }
         if let Some(path) = &id.span_path {
             out.push(Locus::SpanPath { path: path.clone() });
         }
@@ -3266,7 +3297,12 @@ pub struct LookupTableHook {
     /// holds — additive, by its own contract — so the exact entries are the whole
     /// population and the args-free sequence is one sequence over it.
     arg_free_table: HashMap<ArgFreeKey, HookEntry>,
-    /// Occurrence assigners — exact, by identity, and args-free — under one
+    ///
+    /// Exact event rows claimed by calls on a tape carrying span-instance loci.
+    /// Event sequences are global within one recording, so this is the event
+    /// identity shared by every locus and both exact indexes.
+    claimed_events: Mutex<HashSet<u64>>,
+    claim_tracking: bool,
     /// lock, so no interleaving can advance one without the other. Each call
     /// advances the exact one it is addressed by, for every rank, in lockstep
     /// with the renderer's, and the args-free one always. The exact one once
@@ -3350,12 +3386,27 @@ impl LookupTableHook {
         // collapses a repeat, and an args-free sequence that counted it twice
         // would be one longer than the sequence the calls walk.
         let exact = index(table.entries);
+        let identity_table = index(table.identity_entries);
+        let claim_tracking = exact
+            .keys()
+            .chain(identity_table.keys())
+            .any(|key| matches!(key.locus, Locus::SpanInstance { .. }));
+        // Every claim key is a source event represented in one of these
+        // immutable maps. Reserving their combined size here avoids growing
+        // the claim set on the lookup hot path.
+        let claim_capacity = if claim_tracking {
+            exact.len().saturating_add(identity_table.len())
+        } else {
+            0
+        };
         let arg_free_table = arg_free_index(&exact);
         Ok(Self {
             table: exact,
             arg_mismatch_policy,
-            identity_table: index(table.identity_entries),
+            identity_table,
             arg_free_table,
+            claimed_events: Mutex::new(HashSet::with_capacity(claim_capacity)),
+            claim_tracking,
             stamper: Mutex::new(Stampers::default()),
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
@@ -3454,10 +3505,19 @@ impl LookupTableHook {
         // an older table is read exactly as before.
         let by_identity =
             !self.identity_table.is_empty() && crate::identity::identity_applies(query.args);
-        // A pure function of this call's own args, so it is computed before the
-        // lock; the lock guards the occurrence counters, and the one sequence
-        // this call is addressed by advances under it.
+        // A pure function of this call's args, computed before either lock.
+        // The stamper lock guards occurrence counters and advances only the
+        // sequence this call is addressed by.
         let identity_hash = by_identity.then(|| crate::identity::identity_args_hash(query.args));
+        // Serializing stamping together with selection matters: if another
+        // caller claims first after this call already stamped an occurrence,
+        // the remaining unclaimed row may sit at a later occurrence. Legacy
+        // tables have no instance locus and retain their historical behavior.
+        let mut claims = self.claim_tracking.then(|| {
+            self.claimed_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let (keys, arg_free_keys) = match self.stamper.lock() {
             Ok(mut stampers) => stampers.stamp_call(
                 correlation_id.as_deref(),
@@ -3476,9 +3536,21 @@ impl LookupTableHook {
             &self.table
         };
         let mut hit: Option<(&HookEntry, u8)> = None;
+        let mut hit_locus: Option<&'static str> = None;
         for key in &keys {
             if let Some(entry) = table.get(key) {
+                let sequence = entry.source_event_global_sequence;
+                if claims
+                    .as_ref()
+                    .is_some_and(|claimed| claimed.contains(&sequence))
+                {
+                    continue;
+                }
                 hit = Some((entry, key.locus.rank()));
+                hit_locus = Some(key.locus.kind());
+                if let Some(claimed) = claims.as_mut() {
+                    claimed.insert(sequence);
+                }
                 break;
             }
         }
@@ -3515,12 +3587,21 @@ impl LookupTableHook {
         {
             for key in &arg_free_keys {
                 if let Some(entry) = self.arg_free_table.get(key) {
+                    let sequence = entry.source_event_global_sequence;
+                    if claims
+                        .as_ref()
+                        .is_some_and(|claimed| claimed.contains(&sequence))
+                    {
+                        continue;
+                    }
                     hit = Some((entry, key.locus.rank()));
+                    hit_locus = Some(key.locus.kind());
                     arg_divergent = true;
                     break;
                 }
             }
         }
+        drop(claims);
 
         use std::sync::atomic::Ordering::Relaxed;
         if arg_divergent {
@@ -3546,6 +3627,7 @@ impl LookupTableHook {
             location: location.map(|(f, l, c)| (f.to_owned(), l, c)),
             graph_node_id,
             resolved_rank: hit.map(|(_, rank)| rank),
+            resolved_locus: hit_locus,
             // Left absent on an args-free serve. The sequence is a claim that
             // THIS call is the recorded event at it, and an args-free serve is
             // not that claim: the arguments differ. Which event the value came
@@ -3577,6 +3659,7 @@ struct Resolution {
     location: Option<(String, u32, u32)>,
     graph_node_id: Option<u64>,
     resolved_rank: Option<u8>,
+    resolved_locus: Option<&'static str>,
     source_event_global_sequence: Option<u64>,
     recorded_result: Option<serde_json::Value>,
     /// `recorded_result` came from the same address with different arguments.
@@ -3616,6 +3699,7 @@ impl Resolution {
             // continued anyway.
             resolved: self.recorded_result.is_some() && !self.arg_divergent,
             resolved_rank: self.resolved_rank,
+            resolved_locus: self.resolved_locus.map(str::to_owned),
             source_event_global_sequence: self.source_event_global_sequence,
             timestamp_ns: crate::now_ns(),
             end_timestamp_ns: None,
@@ -3830,6 +3914,7 @@ impl DejaHook for LookupTableHook {
             args: event.args.to_value(),
             resolved: false,
             resolved_rank: None,
+            resolved_locus: None,
             source_event_global_sequence: None,
             timestamp_ns: event.timestamp_ns,
             end_timestamp_ns: event.end_timestamp_ns,
@@ -5512,6 +5597,7 @@ mod tests {
             lexical_path: Some(path.to_owned()),
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -5526,6 +5612,7 @@ mod tests {
             lexical_path: None,
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -5741,6 +5828,7 @@ mod tests {
             lexical_path: Some("router::routing".to_owned()),
             syntax_hash: Some(99),
             span_path: Some("http>pay".to_owned()),
+            span_instance: None,
         };
         let loci = loci_for(Some(&declared), Some(("routing.rs", 10, 3)));
 
@@ -5892,6 +5980,7 @@ mod tests {
             lexical_path: None,
             syntax_hash: None,
             span_path: None,
+            span_instance: None,
         };
         assert!(
             !loci_for(Some(&bare_identity), None).is_empty(),
@@ -5917,15 +6006,25 @@ mod tests {
             lexical_path: Some("router::core".to_owned()),
             syntax_hash: Some(7),
             span_path: Some("http>pay".to_owned()),
+            span_instance: Some("http>pay".to_owned()),
         };
-        let ranks: Vec<u8> = loci_for(Some(&full), Some(("f.rs", 1, 2)))
-            .iter()
-            .map(Locus::rank)
-            .collect();
+        let loci = loci_for(Some(&full), Some(("f.rs", 1, 2)));
+        let ranks: Vec<u8> = loci.iter().map(Locus::rank).collect();
         assert_eq!(
             ranks,
-            vec![1, 2, 5, 3],
-            "declared site, span path, source location, then the floor"
+            vec![1, 2, 2, 5, 3],
+            "declared site, span instance, span path, source location, then the floor"
+        );
+        assert_eq!(
+            loci.iter().map(Locus::kind).collect::<Vec<_>>(),
+            vec![
+                "declared_site",
+                "span_instance",
+                "span_path",
+                "source_location",
+                "unlocated"
+            ],
+            "the instance is tried before the plain path it falls back to"
         );
         assert!(
             !ranks.contains(&4) && !ranks.contains(&6),
@@ -5962,6 +6061,7 @@ mod tests {
             lexical_path: Some("router::core".to_owned()),
             syntax_hash: Some(0xAAAA),
             span_path: Some("http>pay".to_owned()),
+            span_instance: None,
         };
         let disguised_identity = CallsiteIdentity {
             scope: Some("time::common_utils::date_time::now".to_owned()),
@@ -7464,6 +7564,7 @@ mod tests {
             lexical_path: Some("crate::module".to_owned()),
             syntax_hash: Some(crate::stable_callsite_hash(scope)),
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -7761,6 +7862,7 @@ mod tests {
             lexical_path: Some("crate::module".to_owned()),
             syntax_hash: Some(crate::stable_callsite_hash(scope)),
             span_path: Some(logical.to_owned()),
+            span_instance: None,
         };
         let id_attempt = make("payments_core>update_payment_attempt");
         let id_intent = make("payments_core>update_payment_intent");
@@ -7995,6 +8097,7 @@ mod tests {
             lexical_path: Some(lexical_path.to_owned()),
             syntax_hash: Some(crate::stable_callsite_hash(scope)),
             span_path: None,
+            span_instance: None,
         }
     }
 
@@ -8185,6 +8288,247 @@ mod tests {
         });
         assert_eq!(value, Some(serde_json::json!("by_explicit")));
         assert_eq!(handle.lock().unwrap()[0].resolved_rank, Some(1));
+    }
+
+    fn span_identity(instance: Option<&str>, site: Option<&str>) -> CallsiteIdentity {
+        CallsiteIdentity {
+            version: 1,
+            source: if site.is_some() {
+                CallsiteSource::Explicit
+            } else {
+                CallsiteSource::SyntacticHash
+            },
+            id: site.map(str::to_owned),
+            scope: None,
+            occurrence: 0,
+            caller_function: None,
+            lexical_path: None,
+            syntax_hash: None,
+            span_path: Some("root>same_span".to_owned()),
+            span_instance: instance.map(str::to_owned),
+        }
+    }
+
+    fn entry_for_key(key: LookupKey, value: &str, sequence: u64) -> LookupEntry {
+        LookupEntry {
+            key,
+            result: std::sync::Arc::new(serde_json::json!(value)),
+            source_event_global_sequence: sequence,
+        }
+    }
+
+    #[test]
+    fn exact_locus_claim_skips_alias_and_falls_back_to_unclaimed_path_row() {
+        let args = serde_json::json!({});
+        let first_identity = span_identity(Some("recorded-instance"), None);
+        let fallback_identity = span_identity(Some("raced-instance"), Some("claimed-site"));
+        let identity = CallIdentity {
+            boundary: "redis",
+            component: "RedisStore",
+            operation: "get_key",
+        };
+        let addresses_a = loci_for(Some(&first_identity), None);
+        let addresses_b = loci_for(Some(&fallback_identity), None);
+        let mut stamper = KeyStamper::new();
+        let stamp = |stamper: &mut KeyStamper, addresses: &[Locus]| {
+            stamper.stamp(
+                Some("corr-claim"),
+                Some(crate::ROOT_TASK_ID),
+                0,
+                identity,
+                addresses,
+                canonical_args_hash(&args),
+            )
+        };
+        let first_keys = stamp(&mut stamper, &addresses_a);
+        let fallback_keys = stamp(&mut stamper, &addresses_b);
+        let first_instance = first_keys
+            .iter()
+            .find(|key| matches!(key.locus, Locus::SpanInstance { .. }))
+            .expect("the first candidate has an instance locus")
+            .clone();
+        let site_alias = fallback_keys
+            .iter()
+            .find(|key| matches!(key.locus, Locus::DeclaredSite(_)))
+            .expect("the raced candidate has a declared-site alias")
+            .clone();
+        let fallback_path = fallback_keys
+            .iter()
+            .find(|key| matches!(key.locus, Locus::SpanPath { .. }))
+            .expect("the raced candidate has a span-path locus")
+            .clone();
+        let table = LookupTable {
+            recording_id: "recording".to_owned(),
+            policy_version: POLICY_VERSION,
+            event_schema_version: Some(crate::CURRENT_EVENT_SCHEMA_VERSION),
+            entries: vec![
+                entry_for_key(first_instance, "recorded-row", 11),
+                // This is another exact address for the event already served
+                // at its instance locus. The path address names a different,
+                // still-unclaimed event and must remain eligible.
+                entry_for_key(site_alias.clone(), "recorded-row", 11),
+                entry_for_key(fallback_path.clone(), "other-row", 12),
+            ],
+            identity_entries: Vec::new(),
+        };
+        let observed = InMemoryObservedSink::new();
+        let calls = observed.handle();
+        let hook =
+            LookupTableHook::from_source(VecSource(Some(table.clone())), observed).expect("hook");
+        let _correlation = deja_context::enter_correlation_id("corr-claim");
+
+        let replay = |callsite_identity: &CallsiteIdentity| {
+            hook.try_replay_with_context(ReplayLookup {
+                boundary: "redis",
+                trait_name: "RedisStore",
+                method_name: "get_key",
+                args: &args,
+                callsite_identity: Some(callsite_identity),
+                caller_location: None,
+            })
+        };
+        assert_eq!(
+            replay(&first_identity),
+            Some(serde_json::json!("recorded-row"))
+        );
+        assert_eq!(
+            replay(&fallback_identity),
+            Some(serde_json::json!("other-row")),
+            "the claimed site's alias must be skipped, while a weaker unclaimed path row remains usable"
+        );
+        let observed_calls = calls.lock().unwrap().clone();
+        assert_eq!(observed_calls.len(), 2);
+        assert_eq!(
+            observed_calls[0].resolved_locus.as_deref(),
+            Some("span_instance")
+        );
+        assert_eq!(
+            observed_calls[1].resolved_locus.as_deref(),
+            Some("span_path")
+        );
+        assert_eq!(observed_calls[1].source_event_global_sequence, Some(12));
+        assert_eq!(
+            hook.lookup_tally(),
+            LookupTally {
+                total: 2,
+                exact: 2,
+                arg_free: 0,
+                missed: 0,
+            }
+        );
+        assert!(hook.lookup_tally().balances());
+
+        // A pre-instance tape stays on its old behavior: without any instance
+        // locus in the loaded table, the same alias is not claim-filtered.
+        let legacy = LookupTable {
+            entries: vec![
+                entry_for_key(
+                    first_keys
+                        .iter()
+                        .find(|key| matches!(key.locus, Locus::SpanPath { .. }))
+                        .expect("first path key")
+                        .clone(),
+                    "recorded-row",
+                    11,
+                ),
+                entry_for_key(site_alias.clone(), "recorded-row", 11),
+                entry_for_key(fallback_path.clone(), "other-row", 12),
+            ],
+            ..table.clone()
+        };
+        let observed = InMemoryObservedSink::new();
+        let legacy_hook =
+            LookupTableHook::from_source(VecSource(Some(legacy)), observed).expect("legacy hook");
+        let replay_legacy = |identity: &CallsiteIdentity| {
+            legacy_hook.try_replay_with_context(ReplayLookup {
+                boundary: "redis",
+                trait_name: "RedisStore",
+                method_name: "get_key",
+                args: &args,
+                callsite_identity: Some(identity),
+                caller_location: None,
+            })
+        };
+        assert_eq!(
+            replay_legacy(&first_identity),
+            Some(serde_json::json!("recorded-row"))
+        );
+        assert_eq!(
+            replay_legacy(&fallback_identity),
+            Some(serde_json::json!("recorded-row"))
+        );
+        let observed = InMemoryObservedSink::new();
+        let concurrent_calls = observed.handle();
+        let concurrent_hook = std::sync::Arc::new(
+            LookupTableHook::from_source(
+                VecSource(Some(LookupTable {
+                    entries: vec![
+                        entry_for_key(
+                            first_keys
+                                .iter()
+                                .find(|key| matches!(key.locus, Locus::SpanInstance { .. }))
+                                .expect("first instance key")
+                                .clone(),
+                            "recorded-row",
+                            11,
+                        ),
+                        entry_for_key(site_alias, "recorded-row", 11),
+                        entry_for_key(fallback_path, "other-row", 12),
+                    ],
+                    ..table
+                })),
+                observed,
+            )
+            .expect("concurrent hook"),
+        );
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let threads =
+            [first_identity.clone(), fallback_identity.clone()].map(|callsite_identity| {
+                let hook = std::sync::Arc::clone(&concurrent_hook);
+                let start = std::sync::Arc::clone(&start);
+                let args = args.clone();
+                std::thread::spawn(move || {
+                    let _correlation = deja_context::enter_correlation_id("corr-claim");
+                    start.wait();
+                    hook.try_replay_with_context(ReplayLookup {
+                        boundary: "redis",
+                        trait_name: "RedisStore",
+                        method_name: "get_key",
+                        args: &args,
+                        callsite_identity: Some(&callsite_identity),
+                        caller_location: None,
+                    })
+                })
+            });
+        start.wait();
+        let concurrent_results = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("concurrent lookup panicked"))
+            .collect::<Vec<_>>();
+        let concurrent_values = concurrent_results
+            .into_iter()
+            .map(|result| {
+                result
+                    .expect("both concurrent lookups find an unclaimed row")
+                    .as_str()
+                    .expect("results are strings")
+                    .to_owned()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            concurrent_values,
+            HashSet::from(["other-row".to_owned(), "recorded-row".to_owned()]),
+            "racing exact loci must claim each source row at most once"
+        );
+        let mut sequences = concurrent_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|call| call.source_event_global_sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, [11, 12]);
+        assert!(concurrent_hook.lookup_tally().balances());
     }
 
     // -----------------------------------------------------------------------

@@ -963,6 +963,7 @@ mod tests {
             lexical_path: None,
             syntax_hash: None,
             span_path: Some("request>load".to_owned()),
+            span_instance: None,
         };
         let site = |name: &str| serde_json::to_value(identity(name)).expect("an identity");
         let mut first = event("db", 1, site("x"));

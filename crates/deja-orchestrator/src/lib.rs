@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod api;
 pub mod artifact_kinds;
+pub mod auth;
 pub mod change_coverage;
 pub mod codebundle;
 pub mod config_layer;

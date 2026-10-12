@@ -202,7 +202,7 @@ Each boundary call produces one `BoundaryEvent` — a single memoization cache e
 | `declaration` | Optional typed effect/op/returns metadata plus `reply_canon`/`state_canon` canonicalization declarations — judged by the divergence scorer, never used for routing. |
 | `duration_us` | Elapsed microseconds across the dispatch. |
 | `call_file` / `call_line` / `call_column` | `#[track_caller]` callsite — the application site that called the annotated function. |
-| `callsite_identity` | Structured identity (span path, syntax hash, lexical path, per-scope occurrence) built once per invocation by the macro. On the current proof tape 197/207 events carry it (all except http_incoming middleware events) and replay resolves at ranks 2–3. |
+| `callsite_identity` | Structured identity (span path, optional span-instance path, syntax hash, lexical path, per-scope occurrence) built once per invocation by the macro. The instance path is stamped on new recordings; older events omit it and remain readable. |
 | `recording_run_id` | Stable run identifier (`DEJA_RECORDING_RUN_ID → DEJA_RUN_ID → run-{now_ns}`), shared across all events in one recording session. |
 | `event_schema_version` | Required wire field (no serde default — recordings must carry it). Current version **8**: v6 = autoref `capture!` args; v7 = task-lineage/canonicalization scaffolding; v8 = stamp-only detached spawning + canonical `bucket_id`/`fork_seq`. Compatibility comes from per-field `#[serde(default)]` on added fields. |
 
@@ -313,28 +313,27 @@ The replay candidate runs with `DEJA_MODE=replay`. No external egress happens �
 | Variant | Env | Mechanism | ArgMismatchPolicy |
 |---|---|---|---|
 | `Replay` (`ReplayHook`) | `DEJA_MODE=replay` | In-process identity-first cascade (explicit / syntactic-hash / lexical identity, then positional fallbacks: location-exact, sequence+method+args, sliding window) — independent of the rank 1–6 ladder | Applied (`Never` / `OnlyForArgful` (default) / `Always`) |
-| `LookupReplay` (`LookupTableHook`) | `DEJA_MODE=replay` + `DEJA_LOOKUP_TABLE` set | O(1) hash-map lookup from orchestrator-pre-rendered table | Not applied — policy lives in orchestrator |
+| `LookupReplay` (`LookupTableHook`) | `DEJA_MODE=replay` + `DEJA_LOOKUP_TABLE` set | Ranked hash-map probes over an orchestrator-pre-rendered table | Applied to args-free fallback (`Never` / `OnlyForArgful` (default) / `Always`) |
 
-When the Deja orchestrator harness drives replay, it pre-renders the recording into a frozen lookup table (JSON/JSONL) and injects the path via `DEJA_LOOKUP_TABLE`. The candidate's `LookupTableHook` performs a single O(1) lookup per call — no cascade, no in-process policy. The candidate emits an `ObservedCall` record per call to `DEJA_OBSERVED_SINK`; divergence detection runs post-hoc in the orchestrator. This is the production harness path.
+When the Deja orchestrator harness drives replay, it pre-renders the recording into a frozen lookup table (JSON/JSONL) and injects the path via `DEJA_LOOKUP_TABLE`. The candidate's `LookupTableHook` probes the available loci against that table in precedence order and emits an `ObservedCall` to `DEJA_OBSERVED_SINK`; divergence detection runs post-hoc in the orchestrator. This is the production harness path.
 
 ### How do we achieve full mock?
 
 Substitute replay is a **memoization lookup**. The recording is the cache; each `BoundaryEvent` is a cache entry. For every Substitute call the replay candidate makes, the lookup returns the stored response instead of hitting a live system — and the guarantee is **fail-stop, never fall-through**: reconstruction is two-state (`Reconstructed::Value` / `Reconstructed::Failed`), a recorded `Err` is stored as a non-reconstructable `{"deja_err": …}` sentinel, and both a `Failed` reconstruction and a lookup miss halt the one request rather than silently running the real boundary or serving stale data. Reconstruction is declared per site via `codec =` — built-in `SerdeCodec` (whole-value serde) and `ResultOkCodec` (Ok-arm only), or a custom `ReplayCodec` such as `HttpResponseCodec`; a site with no codec declaration is record-only Debug capture whose result cannot be reconstructed (fail-stop if substituted). The DB seam records the versioned `DejaDatabaseResult` envelope only.
 
-The lookup key combines **callsite identity, args, and occurrence**. Deja uses a rank-aware address ladder for the identity component, falling back from stronger to weaker discriminators:
+The lookup key combines **call identity, args, and occurrence**. The hook tries these loci in order; reported rank is a historical scoring label, not necessarily probe order:
 
-| Rank | Kind | Discriminator |
-|---|---|---|
-| 1 | `Explicit` | Caller-supplied address |
-| 2 | `SpanPath` | Root→leaf `tracing` span-name path — survives benign line-shift edits and disambiguates concurrent same-callsite calls |
-| 3 | `SyntacticHash` | Macro-time hash of `boundary::operation` |
-| 4 | `LexicalPath` | `module_path` + per-scope occurrence |
-| 5 | `SourceLocation` | `call_file:call_line:call_column` |
-| 6 | `Sequence` | Position in the event stream — positional last resort |
+| Probe order | Reported rank | Locus | Discriminator |
+|---|---|---|---|
+| 1 | 1 | `DeclaredSite` | Explicit caller-supplied tag, when present |
+| 2 | 2 | `SpanInstance` | Root→leaf span names with same-name sibling creation ordinals (`#n`); reserved literal `%`, `>` and `#` characters are escaped in each name |
+| 3 | 2 | `SpanPath` | Unescaped root→leaf `tracing` span-name path; also serves old tapes without instance addresses |
+| 4 | 5 | `SourceLocation` | `call_file:call_line:call_column`, when present |
+| 5 | 3 | `Unlocated` | Call identity and args without a location |
 
-Occurrence keys are additionally partitioned by task lineage: same-callsite occurrences are scoped per (correlation, lineage bucket, callsite) using the event's `bucket_id`/`fork_seq` stamps, so detached-task calls never collide with main-path occurrences. The ladder takes the strongest available hit; a Substitute miss fail-stops.
+Occurrence keys are additionally partitioned by task lineage: same-callsite occurrences are scoped per (correlation, lineage bucket, callsite) using the event's `bucket_id`/`fork_seq` stamps. On a table carrying instance addresses, the hook atomically claims each recorded event by its global sequence across exact loci: a candidate that misses its instance cannot serve a row already taken at another locus, but can still use an unclaimed weaker match. An args-free serve does not claim event identity. Tables without instance addresses retain their previous lookup behavior. A Substitute miss fail-stops.
 
-Callsite identity is **shipped**: the macro codegen builds a `CallsiteIdentity` once per invocation (syntactic hash, lexical path, span path, per-scope occurrence) and stamps it on every event, so the strong ranks are operative; rank resolution is reported per run (`resolved_by_rank` in the scorecard — the current proof tape resolves at ranks 2–3).
+The macro builds a `CallsiteIdentity` once per invocation and stamps it on each boundary event. Both `SpanInstance` and `SpanPath` report rank 2; `resolved_locus` distinguishes which one served a call.
 
 **Detached work.** Fire-and-forget effects are not forced to finish before the response: recording is observationally neutral and replay executes freely. **Order-tolerant judgment replaces execution determinism** (ratified: `docs/design/effect-algebra.md`): the scorer judges per-(correlation, bucket, callsite) occurrences against declared canonicalization — never against the tape's accidental linearization.
 

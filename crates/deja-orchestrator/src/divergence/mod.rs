@@ -8401,6 +8401,7 @@ mod tests {
             args: serde_json::json!({}),
             resolved,
             resolved_rank: rank,
+            resolved_locus: None,
             source_event_global_sequence: src,
             timestamp_ns: 0,
             end_timestamp_ns: None,

@@ -187,6 +187,16 @@ pub struct AcknowledgementRow {
     pub acknowledged_at: Option<DateTime<Utc>>,
     pub withdrawn_by: Option<String>,
     pub withdrawn_at: Option<DateTime<Utc>>,
+    /// The sign-in issuer's stable id beside each name; null when the
+    /// action was taken with sign-in off or by the service token. Never
+    /// serialised: a Google subject is a stable account id across
+    /// services, and no reader of the API needs it.
+    #[serde(default, skip_serializing)]
+    pub proposed_by_sub: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub acknowledged_by_sub: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub withdrawn_by_sub: Option<String>,
 }
 
 /// One divergence to acknowledge: the row's key, and its value for display.
@@ -259,8 +269,17 @@ impl Store {
     // -- acknowledgements ----------------------------------------------------
 
     /// Propose `items` as intended divergences of one pull request, in one
-    /// transaction, all with the same note and proposer. Returns the new ids
-    /// in the order given.
+    /// transaction, all with the same note and proposer. Returns the ids in
+    /// the order given.
+    ///
+    /// A shape that already has a live (not withdrawn) acknowledgement on
+    /// this version of the change -- proposed or confirmed, by anyone -- is
+    /// not proposed again: its existing id is returned instead. A second
+    /// proposal of the same shape only splits the decision across two rows
+    /// (one person confirms one, the other stays open forever); and the same
+    /// request sent twice, a double click, must not leave two. Proposals on
+    /// one pull request are serialized by an advisory lock so two requests
+    /// at once cannot both see "none yet".
     #[allow(clippy::too_many_arguments)] // one call per proposal, every column named
     pub async fn acknowledgements_propose(
         &self,
@@ -269,20 +288,45 @@ impl Store {
         change_id: &str,
         origin_run_id: &str,
         proposed_by: &str,
+        proposed_by_sub: Option<&str>,
         note: &str,
         items: &[NewAcknowledgement],
     ) -> Result<Vec<i64>, sqlx::Error> {
+        let repo = repo.to_ascii_lowercase();
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("acknowledgements:{repo}#{pr_number}"))
+            .execute(&mut *tx)
+            .await?;
         let mut ids = Vec::with_capacity(items.len());
         for item in items {
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM acknowledgements
+                  WHERE repo = $1 AND pr_number = $2 AND change_id = $3
+                    AND lane IS NOT DISTINCT FROM $4 AND pattern = $5
+                    AND withdrawn_at IS NULL
+                  ORDER BY (acknowledged_at IS NOT NULL) DESC, id DESC
+                  LIMIT 1",
+            )
+            .bind(&repo)
+            .bind(pr_number)
+            .bind(change_id)
+            .bind(&item.lane)
+            .bind(&item.pattern)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(id) = existing {
+                ids.push(id);
+                continue;
+            }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO acknowledgements
                    (repo, pr_number, change_id, lane, pattern, value_hash, note,
-                    origin_run_id, proposed_by)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    origin_run_id, proposed_by, proposed_by_sub)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  RETURNING id",
             )
-            .bind(repo.to_ascii_lowercase())
+            .bind(&repo)
             .bind(pr_number)
             .bind(change_id)
             .bind(&item.lane)
@@ -291,6 +335,7 @@ impl Store {
             .bind(note)
             .bind(origin_run_id)
             .bind(proposed_by)
+            .bind(proposed_by_sub)
             .fetch_one(&mut *tx)
             .await?;
             ids.push(id);
@@ -312,13 +357,20 @@ impl Store {
 
     /// Confirm a proposal. False when it was already confirmed or withdrawn:
     /// the first decision stands, a second press changes nothing.
-    pub async fn acknowledgement_confirm(&self, id: i64, by: &str) -> Result<bool, sqlx::Error> {
+    pub async fn acknowledgement_confirm(
+        &self,
+        id: i64,
+        by: &str,
+        by_sub: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
         let n = sqlx::query(
-            "UPDATE acknowledgements SET acknowledged_by = $2, acknowledged_at = now()
+            "UPDATE acknowledgements
+             SET acknowledged_by = $2, acknowledged_by_sub = $3, acknowledged_at = now()
              WHERE id = $1 AND acknowledged_at IS NULL AND withdrawn_at IS NULL",
         )
         .bind(id)
         .bind(by)
+        .bind(by_sub)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -328,13 +380,20 @@ impl Store {
     /// Withdraw a proposal or a confirmed acknowledgement. False when already
     /// withdrawn. The row stays: who proposed, who confirmed and who withdrew
     /// remain readable.
-    pub async fn acknowledgement_withdraw(&self, id: i64, by: &str) -> Result<bool, sqlx::Error> {
+    pub async fn acknowledgement_withdraw(
+        &self,
+        id: i64,
+        by: &str,
+        by_sub: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
         let n = sqlx::query(
-            "UPDATE acknowledgements SET withdrawn_by = $2, withdrawn_at = now()
+            "UPDATE acknowledgements
+             SET withdrawn_by = $2, withdrawn_by_sub = $3, withdrawn_at = now()
              WHERE id = $1 AND withdrawn_at IS NULL",
         )
         .bind(id)
         .bind(by)
+        .bind(by_sub)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -888,7 +947,8 @@ impl Store {
 
 const ACK_SELECT: &str = "SELECT id, repo, pr_number, change_id, lane, pattern, value_hash, note, \
      origin_run_id, proposed_by, proposed_at, acknowledged_by, acknowledged_at, \
-     withdrawn_by, withdrawn_at FROM acknowledgements";
+     withdrawn_by, withdrawn_at, proposed_by_sub, acknowledged_by_sub, withdrawn_by_sub \
+     FROM acknowledgements";
 
 fn ack_row(r: sqlx::postgres::PgRow) -> AcknowledgementRow {
     AcknowledgementRow {
@@ -907,6 +967,9 @@ fn ack_row(r: sqlx::postgres::PgRow) -> AcknowledgementRow {
         acknowledged_at: r.get(12),
         withdrawn_by: r.get(13),
         withdrawn_at: r.get(14),
+        proposed_by_sub: r.get(15),
+        acknowledged_by_sub: r.get(16),
+        withdrawn_by_sub: r.get(17),
     }
 }
 

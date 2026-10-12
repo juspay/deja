@@ -456,6 +456,15 @@ dialog.launch {
   box-shadow: 0 24px 64px rgba(0,0,0,0.55);
 }
 dialog.launch::backdrop { background: rgba(6, 9, 13, 0.66); }
+dialog.signin {
+  width: min(440px, calc(100vw - 2rem)); padding: var(--s5); border: 1px solid var(--border);
+  border-radius: var(--r-lg); background: var(--surface-raised); color: var(--text);
+  box-shadow: 0 24px 64px rgba(0,0,0,0.55); text-align: center;
+}
+dialog.signin::backdrop { background: rgba(6, 9, 13, 0.66); }
+dialog.signin h2 { margin: 0 0 var(--s2); font-size: var(--fs-18); }
+dialog.signin .hint { max-width: 36ch; margin: 0 auto var(--s4); }
+.signin-actions { display: flex; justify-content: center; gap: var(--s3); margin-bottom: var(--s3); }
 .launchhead { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s3); margin-bottom: var(--s4); }
 .launchlabel { color: var(--text-faint); font-size: var(--fs-11); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
 .launchid { font-family: var(--font-mono); font-size: var(--fs-15); color: var(--text); user-select: all; }
@@ -1218,3 +1227,12 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .delta-ack-table th:nth-child(3) { min-width: 260px; }
 .delta-ack-table .what { display: block; }
 @media (min-width: 1401px) { .ack-grid { grid-template-columns: minmax(0, 1fr) 280px; } }
+
+/* ---- sign-in ---- */
+.whoami { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--fs-12); color: var(--text-subtle); }
+.whoami img { width: 22px; height: 22px; border-radius: 50%; }
+.whoami .email { color: var(--text); }
+.whoami .roles { color: var(--green-fg); }
+.btn.signin { font-weight: 600; }
+.login { max-width: 420px; margin: 10vh auto 0; display: grid; gap: var(--s3); text-align: center; justify-items: center; }
+.login h1 { margin: 0; }

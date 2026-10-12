@@ -5,7 +5,8 @@
 // for display and call the four endpoints.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, Delta, DeltaAddress, DeltaRow, EffectiveVerdict, actor, api, deltaFamily } from "./api";
+import { ApiError, Delta, DeltaAddress, DeltaRow, EffectiveVerdict, api, deltaFamily } from "./api";
+import { useActor } from "./me";
 
 /** The server's key, recomputed only to group rows for display. */
 export function shapeOf(a: DeltaAddress): string {
@@ -127,5 +128,5 @@ export function useAckActions(runId: string, against: string, onError: (msg: str
   });
   const confirm = useMutation({ mutationFn: (id: number) => api.confirmAcknowledgement(id), onSuccess: refresh, onError: fail });
   const withdraw = useMutation({ mutationFn: (id: number) => api.withdrawAcknowledgement(id), onSuccess: refresh, onError: fail });
-  return { propose, confirm, withdraw, me: actor() };
+  return { propose, confirm, withdraw, me: useActor() };
 }
