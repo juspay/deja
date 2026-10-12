@@ -230,6 +230,15 @@ The Kafka partition key remains correlation-oriented so one request's events sta
 
 **Downstream:** Kafka topic `hyperswitch-deja-recording-events` (local demo broker `kafka0:29092`) → Vector pipeline `deja_recording` source → S3-compatible storage. Vector lands the full envelope (no unwrap transform) under `landing/v1/session={capture.session_id}/inst={instance_id}/` with zstd NDJSON objects and S3 acknowledgements enabled. The compactor seals the session by writing `sessions/v1/{id}/data/`, `sessions/v1/{id}/index/`, and `sessions/v1/{id}/manifest.json` (manifest written last). Replay preparation then uses `deja-orchestrator::s3::pull_recording` to read the sealed session, unwrap envelopes, dedup/sort by recording identity and `global_sequence`, and materialize the harness copy at `{harness-root}/recordings/{id}/events.jsonl`.
 
+`GET /api/v1/recordings/available` reports `seal_pending: null` when a seal
+covers the landing. Otherwise it names `still_writing`,
+`quiet_but_not_sealed`, `age_unknown` (no object modification time), or
+`threshold_unknown` (no quiet window declared to the orchestrator). The
+sealer's JSONL `not_ready` row reports its observed quiet age when known,
+object count, and applied threshold. If `DEJA_SEAL_QUIET_SECS` is set only on
+the sealer job, the orchestrator reports `threshold_unknown` rather than
+assuming that job's configured or default threshold.
+
 ```mermaid
 flowchart LR
     SE[BoundaryEvent] --> RH[RecordingHook\nAsyncRecordWriter]
