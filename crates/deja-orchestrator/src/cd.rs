@@ -57,11 +57,13 @@ impl CdConfig {
     }
 }
 
-/// Whether a version name is a CalVer release (`2026.10.10.0`) rather than a
-/// merge's short sha. Only for a version first seen on an environment, which
-/// the pipeline never posted a kind for.
+/// Whether a version name is a CalVer release (`2026.10.10.0`, or a hotfix
+/// of one, `2026.09.28.1-hotfix1`) rather than a merge's short sha. Only for
+/// a version first seen on an environment, which the pipeline never posted a
+/// kind for.
 pub fn kind_of_version_name(version: &str) -> &'static str {
-    let parts: Vec<&str> = version.split('.').collect();
+    let base = version.split_once('-').map_or(version, |(b, _)| b);
+    let parts: Vec<&str> = base.split('.').collect();
     let calver = parts.len() == 4
         && parts
             .iter()
@@ -303,7 +305,9 @@ mod tests {
     fn version_kind_from_the_name() {
         assert_eq!(kind_of_version_name("2026.10.10.0"), "release");
         assert_eq!(kind_of_version_name("2026.10.12.11"), "release");
+        assert_eq!(kind_of_version_name("2026.09.28.1-hotfix1"), "release");
         assert_eq!(kind_of_version_name("8eaddb0b85"), "merge");
         assert_eq!(kind_of_version_name("1.2.3.4"), "merge");
+        assert_eq!(kind_of_version_name("8ead-db0b"), "merge");
     }
 }
