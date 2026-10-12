@@ -26,6 +26,8 @@ branch). The full architecture and technical reference lives at
   the candidate boots with `DEJA_MODE=replay` and a `LookupTableHook` that
   substitutes recorded results per call. Every lookup emits an `ObservedCall`;
   a post-hoc divergence detector scores the run into a verdict + scorecard.
+  The scorecard persists a warning when an unclaimed call covered by the
+  lookup table is absent from the loaded tape; the ledger has no row for it.
 - **Cross-version addressing** — lookups resolve through a 6-rank address
   ladder (explicit · logical span-path · syntactic hash · lexical path · source
   location · positional). Rank 2, the span-path, survives line shifts and

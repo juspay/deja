@@ -7754,7 +7754,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecard> {
     let art = load_artifacts(root, run_id)?;
     let graph_plan = GraphScoringPlan::build(&art);
-    let card = detect_with_plan(&art, &graph_plan);
+    let mut card = detect_with_plan(&art, &graph_plan);
     let path = root
         .root
         .join("runs")
@@ -7765,8 +7765,24 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     // Streamed straight to the file. Collecting first held every resolved row —
     // each carrying the recorded side's full `args` and `result` — alongside the
     // parsed table and graph, which is what OOMKilled the runner on a dense tape.
-    if let Err(e) = stream_ledger(&root.call_ledger_path(run_id), &art, &graph_plan) {
-        eprintln!("divergence: ledger stream failed for {run_id}: {e}");
+    let warning_count = card.warnings.len();
+    match stream_ledger(
+        &root.call_ledger_path(run_id),
+        &art,
+        &graph_plan,
+        &mut card.warnings,
+    ) {
+        Err(e) => eprintln!("divergence: ledger stream failed for {run_id}: {e}"),
+        Ok(()) if card.warnings.len() > warning_count => {
+            let bytes = serde_json::to_vec_pretty(&card).map_err(io::Error::other);
+            match bytes.and_then(|bytes| behaviour_tree::write_atomic(&path, &bytes)) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("divergence: ledger warning persistence failed for {run_id}: {e}")
+                }
+            }
+        }
+        Ok(()) => {}
     }
     Ok(card)
 }
@@ -7783,10 +7799,16 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     let graph_plan = GraphScoringPlan::build(art);
     let mut rows = Vec::new();
-    build_ledger_into(art, &graph_plan, &mut |row| {
-        rows.push(row);
-        Ok(())
-    })?;
+    let mut warnings = Vec::new();
+    build_ledger_into(
+        art,
+        &graph_plan,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+        &mut warnings,
+    )?;
     Ok(rows)
 }
 
@@ -7794,6 +7816,7 @@ pub(crate) fn build_ledger_into(
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
     sink: &mut dyn FnMut(CallRecord) -> io::Result<()>,
+    warnings: &mut Vec<String>,
 ) -> io::Result<()> {
     let events = &art.events;
     let span_paths = ledger::recorded_span_paths(&art.table);
@@ -7849,6 +7872,7 @@ pub(crate) fn build_ledger_into(
         &art.unplanted_presence,
         &SeedGapCascade::build(art),
         graph_plan,
+        warnings,
         sink,
     )
 }
@@ -7858,17 +7882,23 @@ fn stream_ledger(
     path: &std::path::Path,
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
+    warnings: &mut Vec<String>,
 ) -> io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    build_ledger_into(art, graph_plan, &mut |row| {
-        let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
-        out.write_all(&line)?;
-        out.write_all(b"\n")
-    })?;
+    build_ledger_into(
+        art,
+        graph_plan,
+        &mut |row| {
+            let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
+            out.write_all(&line)?;
+            out.write_all(b"\n")
+        },
+        warnings,
+    )?;
     out.flush()
 }
 
@@ -8620,6 +8650,49 @@ mod tests {
             card.summary.omitted_calls, 1,
             "the driven-but-unobserved c-keep call is a real omission; \
              the undriven c-drop call must not count"
+        );
+    }
+
+    #[test]
+    fn missing_tape_event_warning_is_persisted_in_scorecard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-missing-tape-event";
+        run_with_namespaces(&root, run_id, Vec::new());
+        let events = vec![db_read_ev(
+            "c1",
+            "payment_attempt",
+            1,
+            serde_json::json!({"attempt_id": "present"}),
+            100,
+            110,
+            "root",
+            0,
+        )];
+        write_recording_tape(&crate::scope::TapeSlot::for_write(&root, "rec-ns"), &events);
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: "rec-ns".to_owned(),
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+                entries: vec![
+                    seq_entry(Some("c1"), "db", 1),
+                    seq_entry(Some("c1"), "db", 2),
+                ],
+                identity_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        detect_and_score(&root, run_id).unwrap();
+        let card: Scorecard = crate::read_json(&root.scorecard_path(run_id)).unwrap();
+        assert!(
+            card.warnings
+                .iter()
+                .any(|warning| warning.contains("no row for 1 unclaimed recorded call")),
+            "the persisted scorecard must name the missing tape event: {:?}",
+            card.warnings
         );
     }
 

@@ -507,6 +507,7 @@ pub(crate) fn build_with_inconclusive(
     tail_gap: &TailGapEvidence,
 ) -> Vec<CallRecord> {
     let mut rows = Vec::new();
+    let mut warnings = Vec::new();
     let _ = build_with_inconclusive_into(
         events,
         observed,
@@ -517,6 +518,7 @@ pub(crate) fn build_with_inconclusive(
         &super::UnplantedPresence::default(),
         &super::SeedGapCascade::default(),
         None,
+        &mut warnings,
         &mut |row| {
             rows.push(row);
             Ok(())
@@ -544,6 +546,7 @@ pub(crate) fn build_with_inconclusive_into(
     unplanted: &super::UnplantedPresence,
     cascade: &super::SeedGapCascade,
     plan: Option<&GraphScoringPlan>,
+    warnings: &mut Vec<String>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let expected_seqs = &expected_sequences(table);
@@ -956,11 +959,10 @@ pub(crate) fn build_with_inconclusive_into(
         )));
     }
     if tally.no_recorded_event > 0 {
-        eprintln!(
-            "divergence: ledger has no row for {} unclaimed recorded call(s) the lookup table \
-             covers but the loaded tape does not carry",
+        warnings.push(format!(
+            "ledger has no row for {} unclaimed recorded call(s) the lookup table covers but the loaded tape does not carry",
             tally.no_recorded_event
-        );
+        ));
     }
 
     Ok(())
@@ -993,6 +995,7 @@ pub(crate) fn build_with_plan_into(
     unplanted: &super::UnplantedPresence,
     cascade: &super::SeedGapCascade,
     plan: &GraphScoringPlan,
+    warnings: &mut Vec<String>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     // One builder over every call. The shared `CallPairing` decides what pairs;
@@ -1009,6 +1012,7 @@ pub(crate) fn build_with_plan_into(
         unplanted,
         cascade,
         Some(plan),
+        warnings,
         sink,
     )
 }
@@ -1478,6 +1482,7 @@ mod tests {
         let table = table_for(&events, &HashMap::new());
         let loaded = &events[..1];
         let mut rows = Vec::new();
+        let mut warnings = Vec::new();
         let built = build_with_inconclusive_into(
             loaded,
             &[],
@@ -1488,6 +1493,7 @@ mod tests {
             &super::super::UnplantedPresence::default(),
             &super::super::SeedGapCascade::default(),
             None,
+            &mut warnings,
             &mut |row| {
                 rows.push(row);
                 Ok(())
@@ -1499,6 +1505,31 @@ mod tests {
             1,
             "the loaded event still has its row: {rows:?}"
         );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("no row for 1 unclaimed recorded call"),
+            "{warnings:?}"
+        );
+        rows.clear();
+        warnings.clear();
+        let normal = build_with_inconclusive_into(
+            &events,
+            &[],
+            &table,
+            &HashSet::new(),
+            &InconclusiveRaceEvidence::default(),
+            &TailGapEvidence::default(),
+            &super::super::UnplantedPresence::default(),
+            &super::super::SeedGapCascade::default(),
+            None,
+            &mut warnings,
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        );
+        assert!(normal.is_ok(), "{normal:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// A recorded call with a window, for the nesting tests below.
