@@ -579,13 +579,27 @@ impl Store {
     /// baseline is computed, else `pending` (a side is still running) or
     /// `refused` (the pairing can never give one). Idempotent; the newest
     /// computation wins.
-    pub async fn set_delta_verdict(&self, run_id: &str, verdict: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE replay_runs SET delta_verdict = $2 WHERE run_id = $1")
-            .bind(run_id)
-            .bind(verdict)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Record what the run's delta against `against` said. A verdict is a fact
+    /// about a pair, so it lands only while the row still names that baseline:
+    /// a settlement that was computing against the old baseline when the run
+    /// was re-pointed finds the row naming the new one and writes nothing.
+    /// `false` says it did not land.
+    pub async fn set_delta_verdict(
+        &self,
+        run_id: &str,
+        against: &str,
+        verdict: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE replay_runs SET delta_verdict = $2
+             WHERE run_id = $1 AND params ->> 'delta_against' = $3",
+        )
+        .bind(run_id)
+        .bind(verdict)
+        .bind(against)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Re-point a run at another baseline. The delta verdict goes back to
@@ -960,6 +974,7 @@ fn recording_row(r: sqlx::postgres::PgRow) -> RecordingRow {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     /// The digest is a CONTRACT ACROSS TWO LANGUAGES with no compiler between
     /// its halves: Postgres builds the object, TypeScript reads it, and nothing
@@ -1060,5 +1075,143 @@ mod tests {
              from every open tab, and it OOMKilled the orchestrator ten times \
              on 2026-09-17. A caller that needs a scorecard fetches one run."
         );
+    }
+
+    /// Against a real Postgres, named by `DEJA_TEST_DB_URL`; absent, these
+    /// tests pass without running, and say so. The race they pin is in the
+    /// SQL, so nothing short of the store can pin it.
+    async fn store_under_test() -> Option<super::Store> {
+        let url = std::env::var("DEJA_TEST_DB_URL").ok()?;
+        Some(
+            super::Store::connect(&url)
+                .await
+                .expect("DEJA_TEST_DB_URL names a reachable Postgres"),
+        )
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::now_v7())
+    }
+
+    async fn completed_run(store: &super::Store, run_id: &str, against: &str) {
+        let params = serde_json::json!({ "mode": "replay", "delta_against": against });
+        store
+            .insert_run(
+                run_id,
+                "replay",
+                Some("rec-test"),
+                &serde_json::json!({ "kind": "prebuilt_image", "image": "test" }),
+                &params,
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+        store
+            .update_run_state(run_id, "completed", None)
+            .await
+            .unwrap();
+    }
+
+    async fn row(store: &super::Store, run_id: &str) -> (Option<String>, Option<String>) {
+        let row = store
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .expect("the run exists");
+        let against = row
+            .params
+            .get("delta_against")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        (against, row.delta_verdict)
+    }
+
+    async fn remove(store: &super::Store, run_id: &str) {
+        sqlx::query("DELETE FROM replay_runs WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    /// A settlement against the old baseline that was in flight when the run
+    /// was re-pointed must not land: the row would say A's verdict while
+    /// naming B. The verdict update is conditioned on the baseline it was
+    /// computed against, and the re-point's reset to pending is in the same
+    /// statement as the re-point, so there is no row that names B and carries
+    /// A's word.
+    #[tokio::test]
+    async fn a_verdict_against_the_old_baseline_does_not_land_after_a_repoint() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (y, a, b) = (unique("run-y"), unique("run-a"), unique("run-b"));
+        completed_run(&store, &y, &a).await;
+
+        assert!(store.set_delta_verdict(&y, &a, "fail").await.unwrap());
+        assert_eq!(
+            row(&store, &y).await,
+            (Some(a.clone()), Some("fail".into()))
+        );
+
+        assert!(store.set_run_delta_against(&y, &b).await.unwrap());
+        assert_eq!(
+            row(&store, &y).await,
+            (Some(b.clone()), Some("pending".into())),
+            "the re-point names the new baseline and forgets the old verdict in one statement"
+        );
+
+        assert!(
+            !store.set_delta_verdict(&y, &a, "fail").await.unwrap(),
+            "the late settlement against the old baseline lands nowhere"
+        );
+        assert_eq!(
+            row(&store, &y).await,
+            (Some(b.clone()), Some("pending".into()))
+        );
+
+        assert!(store.set_delta_verdict(&y, &b, "pass").await.unwrap());
+        assert_eq!(
+            row(&store, &y).await,
+            (Some(b.clone()), Some("pass".into()))
+        );
+
+        assert!(
+            !store
+                .set_run_delta_against(&unique("run-nowhere"), &b)
+                .await
+                .unwrap(),
+            "a run the store does not hold is not re-pointed"
+        );
+        remove(&store, &y).await;
+    }
+
+    /// The new baseline's finish settles the re-pointed run, and the old
+    /// baseline's finish no longer does: both read the key the re-point writes.
+    #[tokio::test]
+    async fn a_repointed_run_is_measured_against_its_new_baseline() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (y, a, b) = (unique("run-y"), unique("run-a"), unique("run-b"));
+        completed_run(&store, &y, &a).await;
+        assert_eq!(
+            store.runs_measured_against(&a).await.unwrap(),
+            vec![y.clone()]
+        );
+
+        assert!(store.set_run_delta_against(&y, &b).await.unwrap());
+        assert_eq!(
+            store.runs_measured_against(&a).await.unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            store.runs_measured_against(&b).await.unwrap(),
+            vec![y.clone()]
+        );
+        remove(&store, &y).await;
     }
 }
