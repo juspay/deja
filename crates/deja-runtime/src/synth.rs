@@ -308,13 +308,18 @@ impl SubstituteMiss {
             return vec![String::new(); count];
         }
         let seed = digest(self, &format!("words/{count}/{length}"));
-        let drawn: Vec<char> = draw_over(&ALPHANUMERIC, seed, count.saturating_mul(length))
-            .chars()
-            .collect();
-        drawn
-            .chunks(length)
-            .take(count)
-            .map(|chunk| chunk.iter().collect())
+        let total = count.saturating_mul(length);
+        let mut draws = positions(seed, total);
+        (0..count)
+            .map_while(|_| {
+                let mut word = String::with_capacity(length);
+                for _ in 0..length {
+                    let draw = draws.next()?;
+                    let index = usize::try_from(draw % ALPHANUMERIC.len() as u64).unwrap_or(0);
+                    word.push(ALPHANUMERIC[index]);
+                }
+                Some(word)
+            })
             .collect()
     }
 
@@ -396,13 +401,14 @@ impl SubstituteMiss {
     /// draws, which is what a caller's `shuffle` promises.
     pub fn permutation(&self, length: usize) -> Vec<usize> {
         let seed = digest(self, &format!("permutation/{length}"));
-        let words: Vec<u64> = positions(seed, length).collect();
         let mut out: Vec<usize> = (0..length).collect();
         for position in (1..length).rev() {
-            let (Some(word), Ok(span)) = (words.get(position), u64::try_from(position + 1)) else {
+            let (Ok(span), Ok(position_word)) =
+                (u64::try_from(position + 1), u64::try_from(position))
+            else {
                 continue;
             };
-            if let Ok(pick) = usize::try_from(word % span) {
+            if let Ok(pick) = usize::try_from(mix(seed, position_word) % span) {
                 out.swap(position, pick);
             }
         }
