@@ -3381,10 +3381,11 @@ mod tests {
         // And it reaches a recording row, which is what every caller reads.
         let found = index_landed_objects("landing/v1", &objects);
         assert_eq!(found[0].newest_object_unix_secs, Some(at));
+        let now = now_unix_secs();
         assert_eq!(
-            found[0].seal_pending(None, Some(120), now_unix_secs()),
+            found[0].seal_pending(None, Some(120), now),
             Some(SealPending::StillWriting {
-                quiet_for_secs: found[0].quiet_for_secs(now_unix_secs()).unwrap(),
+                quiet_for_secs: now.saturating_sub(at).max(0) as u64,
                 quiet_after_secs: 120,
                 objects: 1,
             }),
