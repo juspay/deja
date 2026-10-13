@@ -1,6 +1,6 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, RunSummaryRow } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import {
@@ -14,6 +14,8 @@ import {
 } from "../lib/result";
 import { ResultChip } from "../components/Result";
 import { KillRun } from "../components/KillRun";
+import { useSystems } from "../lib/systems";
+import { MERGE_QUEUE, changeOf, reposOf, scopesOf } from "../lib/scope";
 
 function when(iso: string): { short: string; full: string } {
   const d = new Date(iso);
@@ -38,6 +40,7 @@ function haystack(r: RunSummaryRow): string {
     r.failure?.message ?? "",
     r.scorecard_digest?.reason ?? "",
     r.expectation ?? "",
+    changeOf(r) ?? "",
   ]
     .join(" ")
     .toLowerCase();
@@ -47,10 +50,33 @@ export default function RunsPage() {
   const debug = useDebug();
   const [q, setQ] = React.useState("");
   const [filter, setFilter] = React.useState<ResultState | "">("");
+  // In the URL, like `?debug=1`: a link to "the merge queue's runs" should
+  // open the merge queue's runs for whoever it is pasted to.
+  const [params, setParams] = useSearchParams();
+  const scope = params.get("system") ?? "";
+  const pickScope = (s: string) => {
+    const next = new URLSearchParams(params);
+    if (s) next.set("system", s);
+    else next.delete("system");
+    setParams(next, { replace: true });
+  };
 
   const runs = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 5000 });
+  const systems = useSystems();
+  const defaultName = systems.defaultSystem?.name;
 
   const all = runs.data ?? [];
+  const scopes = React.useMemo(() => scopesOf(all, defaultName), [all, defaultName]);
+  const repos = React.useMemo(() => reposOf(all, defaultName), [all, defaultName]);
+  // One choice per system the orchestrator declares, then the queue. Counts
+  // are over the whole list, so they do not move as you search.
+  const choices = React.useMemo(() => {
+    const count = (s: string) => all.filter((r) => scopes.get(r.run_id) === s).length;
+    return [
+      ...systems.all.map((s) => ({ key: s.name, label: repos.get(s.name) ?? s.name, n: count(s.name) })),
+      { key: MERGE_QUEUE, label: "merge queue", n: count(MERGE_QUEUE) },
+    ];
+  }, [all, scopes, repos, systems.all]);
   // Attempt ordinals are derived over the WHOLE list, not the filtered view —
   // "attempt 3 of 4" must not change because you typed in the search box.
   const attempts = React.useMemo(() => attemptOrdinals(all), [all]);
@@ -58,11 +84,12 @@ export default function RunsPage() {
   const rows = React.useMemo(() => {
     const needle = q.trim().toLowerCase();
     return all.filter((r) => {
+      if (scope && scopes.get(r.run_id) !== scope) return false;
       if (filter && resultOf(r).state !== filter) return false;
       if (!needle) return true;
       return haystack(r).includes(needle);
     });
-  }, [all, q, filter]);
+  }, [all, q, filter, scope, scopes]);
 
   if (runs.isLoading) return <p className="hint">loading…</p>;
   if (runs.error)
@@ -78,6 +105,17 @@ export default function RunsPage() {
         <h1>Runs</h1>
         <Link className="btn" to={withDebug("/", debug)}>New run</Link>
       </div>
+
+      <nav className="systempick" aria-label="System">
+        <button className={scope ? "tab" : "tab active"} onClick={() => pickScope("")}>
+          all <span className="n">{all.length}</span>
+        </button>
+        {choices.map((c) => (
+          <button key={c.key} className={scope === c.key ? "tab active" : "tab"} onClick={() => pickScope(c.key)}>
+            {c.label} <span className="n">{c.n}</span>
+          </button>
+        ))}
+      </nav>
 
       <div className="runfilters">
         <input
@@ -111,6 +149,7 @@ export default function RunsPage() {
         <div className="runrow runhead" aria-hidden="true">
           <span>when</span>
           <span>result</span>
+          <span>pull request · label</span>
           <span>candidate</span>
           <span>recording</span>
           <span>what happened</span>
@@ -125,6 +164,7 @@ export default function RunsPage() {
           const cand = candidateRef(r);
           const said = whatHappened(r);
           const at = attempts.get(r.run_id);
+          const change = changeOf(r);
           const t = when(r.created_at);
           // The whole row is the link: middle-click, copy-link-address and
           // keyboard focus all work, and there is no dead zone between cells.
@@ -151,6 +191,7 @@ export default function RunsPage() {
                     </span>
                   )}
                 </span>
+                <span className="rl-change" title={change ?? undefined}>{change ?? "—"}</span>
                 <span className="rl-cand mono" title={cand.full}>
                   {cand.label}
                   {/* Only a non-default system is worth a badge — every legacy
