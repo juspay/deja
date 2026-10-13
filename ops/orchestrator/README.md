@@ -35,6 +35,10 @@ docker push 223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-replay-orc
 | `[auth]` block of the config (`DEJA_CONFIG_TOML` or `DEJA__AUTH__*`) | sign-in: `enabled`, `client_id`, `client_secret` + `session_secret` (Secrets, both required when enabled), `domain_allowlist` (`@`-prefixed suffixes), `roles.<role>` (ConfigMap, re-read every 15 s), `cookie_secure` (default true; false only for a plain-http dev server). A declared block that does not resolve refuses to start; `enabled` itself only changes with a restart (the 15 s reload moves the lists, never the switch). |
 | candidate image pulls | DinD daemon needs ECR auth — run `docker login` against the sock at boot, or pre-provision `~/.docker/config.json` via the chart |
 
+Use one orchestrator writer per `HARNESS_STATE_DIR`: baseline re-points and
+push-back events that rewrite a run record share an in-process lock, so a late
+recording event cannot restore an older baseline. The lock is not distributed.
+
 ## Known-unverified (test before relying on it)
 
 - The DinD daemon's ECR auth path (login lands in the APP container's docker

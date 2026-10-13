@@ -63,10 +63,9 @@ struct AppState {
     auth: Arc<deja_orchestrator::auth::AuthState>,
     /// Verdict restates in flight, one per pull request.
     restates: Arc<Restates>,
-    /// Re-points in flight. One lock for all of them: a re-point is rare and
-    /// short, and two on one run must not interleave their record and row
-    /// writes, or one's restore undo the other's success. A lock per run would
-    /// need a map nothing prunes; one for all serialises per run as well.
+    /// One process-wide lock serializes baseline re-points with file-side
+    /// RunEvent read-modify-writes, preventing either snapshot from overwriting
+    /// the other's changes. Store-only events do not need the file lock.
     repoints: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -992,6 +991,20 @@ async fn v1_ingest_run_event(
 
     // File-side mirror: the run record must exist (the orchestrator created it
     // before launching the Job) — an unknown id is a 404, not an upsert.
+    // Serialize file mutations with re-points from before reading the record:
+    // otherwise a stale snapshot could erase the re-point's baseline.
+    let file_mutation = matches!(
+        &ev,
+        RunEvent::Stage { .. }
+            | RunEvent::State { .. }
+            | RunEvent::Finish { .. }
+            | RunEvent::Recording { .. }
+    );
+    let _file_mutation_guard = if file_mutation {
+        Some(st.repoints.lock().await)
+    } else {
+        None
+    };
     let run_path = st.root.run_path(&run_id);
     let mut run: Run = match deja_orchestrator::read_json(&run_path) {
         Ok(run) => run,
@@ -1073,6 +1086,7 @@ async fn v1_ingest_run_event(
             return error_resp(500, &format!("persist run: {e}"));
         }
     }
+    drop(_file_mutation_guard);
 
     if let Some(store) = &st.store {
         if let Err(e) = apply_run_event(store, &run_id, &ev).await {
@@ -5052,6 +5066,44 @@ mod tests {
             "the later one read what the earlier one wrote"
         );
         assert_eq!(serde_json::json!(last), later.1["delta_against"]);
+    }
+
+    /// A trailing recording event must preserve a baseline written by a
+    /// concurrent re-point. The held lock makes ingest wait before it snapshots
+    /// the completed run; without the wait, the request can write stale state.
+    #[tokio::test]
+    async fn trailing_recording_event_preserves_concurrent_repoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        finished_run(&state, "run-y", Some("run-m1"));
+        finished_run(&state, "run-m2", None);
+
+        let in_flight = state.repoints.clone().lock_owned().await;
+        let recording = tokio::spawn(post_event(
+            state.clone(),
+            "run-y",
+            serde_json::json!({ "event": "recording", "recording_id": "rec-late" }),
+        ));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !recording.is_finished(),
+            "file-mutating ingest waits for an in-flight re-point"
+        );
+        let repoint = tokio::spawn(put_baseline(
+            state.clone(),
+            "run-y",
+            serde_json::json!({ "delta_against": "run-m2" }),
+            Some("ci"),
+        ));
+        drop(in_flight);
+
+        assert_eq!(recording.await.unwrap(), StatusCode::ACCEPTED);
+        assert_eq!(repoint.await.unwrap(), StatusCode::OK);
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(run.spec.delta_against.as_deref(), Some("run-m2"));
+        assert_eq!(run.recording_id.as_deref(), Some("rec-late"));
     }
 
     /// A run re-pointed at another baseline names that baseline from then on,
