@@ -25,6 +25,13 @@ import ReportPage from "./pages/ReportPage";
 import DeltaPage from "./pages/DeltaPage";
 import AcknowledgePage from "./pages/AcknowledgePage";
 import AuditPage from "./pages/AuditPage";
+import DeploymentsPage, {
+  EnvironmentPage,
+  EnvironmentsPage,
+  PullRequestPage,
+  VersionPage,
+  VersionsPage,
+} from "./pages/DeploymentsPage";
 import LoginPage from "./pages/LoginPage";
 
 const queryClient = new QueryClient({
@@ -134,6 +141,7 @@ function Shell() {
           {tab("/", "New run", true)}
           {tab("/runs", "Runs")}
           {tab("/recordings", "Recordings")}
+          {tab("/deployments", "Deployments")}
           {tab("/audit", "Audit")}
         </nav>
         <Identity />
@@ -174,6 +182,12 @@ const router = createBrowserRouter([
       { path: "/runs/:runId/scorecard", element: <LegacyRunRedirect /> },
       { path: "/recordings", element: <RecordingsPage /> },
       { path: "/audit", element: <AuditPage /> },
+      { path: "/deployments", element: <DeploymentsPage /> },
+      { path: "/deployments/versions", element: <VersionsPage /> },
+      { path: "/deployments/versions/:version", element: <VersionPage /> },
+      { path: "/deployments/environments", element: <EnvironmentsPage /> },
+      { path: "/deployments/environments/:env", element: <EnvironmentPage /> },
+      { path: "/deployments/pull-requests/:owner/:repo/:number", element: <PullRequestPage /> },
     ],
   },
 ]);

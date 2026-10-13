@@ -4381,13 +4381,14 @@ async fn v1_cd_post_observed(
             Err(e) => return error_resp(500, &format!("deployments: {e}")),
         }
     };
-    let asked = match store
-        .cd_was_requested(&obs.system, &env, &obs.desired_version)
+    let requester = match store
+        .cd_requested_by(&obs.system, &env, &obs.desired_version)
         .await
     {
-        Ok(b) => b,
+        Ok(r) => r,
         Err(e) => return error_resp(500, &format!("deployments: {e}")),
     };
+    let asked = requester.is_some();
     let Some(t) = transition(
         latest.as_ref(),
         &obs,
@@ -4408,12 +4409,15 @@ async fn v1_cd_post_observed(
             environment: env.clone(),
             version: t.version.clone(),
             state: t.state.clone(),
+            // The row is the observation's, so `requested_by` says so; who
+            // asked for the version, when someone did, rides on it.
             requested_by: "observed".to_owned(),
-            requested_by_sub: None,
+            requested_by_sub: requester.as_ref().and_then(|r| r.requested_by_sub.clone()),
             request_id: None,
-            jenkins_build: None,
+            jenkins_build: requester.as_ref().and_then(|r| r.jenkins_build.clone()),
             detail: serde_json::json!({
                 "out_of_band": t.out_of_band,
+                "asked_by": requester.as_ref().map(|r| r.requested_by.clone()),
                 "sync": obs.sync, "health": obs.health,
                 "desired_version": obs.desired_version, "synced_version": obs.synced_version,
                 "chart": obs.chart, "image_tag": obs.image_tag, "observed_at": obs.observed_at,

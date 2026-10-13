@@ -276,6 +276,17 @@ pub struct CdDeploymentRow {
     pub at: DateTime<Utc>,
 }
 
+/// Who asked for a version on an environment: the job's actor and build,
+/// from its newest `requested`/`committed` row since the previous version
+/// went live. Copied onto the observation row that records the arrival, so
+/// a `live` row says who it was for without a second lookup.
+#[derive(Debug, Clone)]
+pub struct CdRequester {
+    pub requested_by: String,
+    pub requested_by_sub: Option<String>,
+    pub jenkins_build: Option<String>,
+}
+
 /// A deployment row to append, everything but what the database fills in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewCdDeployment {
@@ -702,7 +713,17 @@ impl Store {
         .bind(pr_number)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(cd_version_row).collect())
+        let mut out: Vec<CdVersionRow> = rows.into_iter().map(cd_version_row).collect();
+        // With what each carries: the page names the pull request by the
+        // title a version recorded for it.
+        for v in &mut out {
+            v.prs = self
+                .cd_prs_of(std::slice::from_ref(&v.version), &v.system)
+                .await?
+                .remove(&v.version)
+                .unwrap_or_default();
+        }
+        Ok(out)
     }
 
     pub async fn cd_deployment_append(
@@ -817,30 +838,38 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Whether a job (not an observation) asked for a version on an
-    /// environment since the last time something else was live there: the
-    /// difference between a deploy the pipeline made and one made by hand.
-    pub async fn cd_was_requested(
+    /// Who asked for a version on an environment since the last time
+    /// something else was live there -- the job's newest `requested` or
+    /// `committed` row -- or `None` when nobody did: the difference between
+    /// a deploy the pipeline made and one made by hand.
+    pub async fn cd_requested_by(
         &self,
         system: &str,
         environment: &str,
         version: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cd_deployments d
+    ) -> Result<Option<CdRequester>, sqlx::Error> {
+        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT d.requested_by, d.requested_by_sub, d.jenkins_build FROM cd_deployments d
              WHERE d.system = $1 AND d.environment = $2 AND d.version = $3
                AND d.requested_by <> 'observed'
                AND d.id > COALESCE((SELECT max(id) FROM cd_deployments
                                     WHERE system = $1 AND environment = $2
                                       AND version <> $3
-                                      AND state IN ('live', 'rolled_back')), 0)",
+                                      AND state IN ('live', 'rolled_back')), 0)
+             ORDER BY d.id DESC LIMIT 1",
         )
         .bind(system)
         .bind(environment)
         .bind(version)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(n > 0)
+        Ok(row.map(
+            |(requested_by, requested_by_sub, jenkins_build)| CdRequester {
+                requested_by,
+                requested_by_sub,
+                jenkins_build,
+            },
+        ))
     }
 
     /// The newest rows naming one version, across environments, newest
