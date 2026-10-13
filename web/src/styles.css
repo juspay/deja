@@ -1304,7 +1304,9 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .cd-facts dd { margin: 0; }
 .cd-envlist { list-style: none; padding: 0; margin: 0; display: flex; gap: var(--s3); }
 .cd-envlist a { padding: var(--s2) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); text-decoration: none; }
-.cd-history td, .cd-versions td { vertical-align: middle; }
+.cd-history td, .cd-versions td, .cd-hops td { vertical-align: middle; }
+.cd-hopruns { white-space: nowrap; }
+.cd-hopreason { max-width: 360px; white-space: normal; }
 @media (max-width: 760px) {
   .cd-pipeline { grid-template-columns: 1fr; }
   .cd-gap { padding: var(--s2) 0; }
