@@ -43,6 +43,29 @@ pub struct Settings {
     /// `enabled = false`: the typed actor name, as before.
     #[serde(default)]
     pub auth: Option<AuthSettings>,
+    /// Continuous deployment: which systems are tracked across which
+    /// environments. Absent: the deployment pages are off.
+    #[serde(default)]
+    pub cd: Option<CdSettings>,
+}
+
+/// `[cd]`: what the deployment pages show and, later, what may be promoted
+/// from them. The pipeline posts facts under a system name and an environment
+/// name; this says which names exist, in pipeline order, so an environment
+/// nothing has been posted for still appears, empty.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct CdSettings {
+    /// The systems tracked. Default: the deployment's default system only.
+    #[serde(default, deserialize_with = "list_or_csv")]
+    pub systems: Option<Vec<String>>,
+    /// The environments, in the order versions move through them.
+    /// Default `integ, sandbox, prod`.
+    #[serde(default, deserialize_with = "list_or_csv")]
+    pub environments: Option<Vec<String>>,
+    /// The environments a person may promote to from the pages. Nothing yet
+    /// reads this; it is declared with the rest so the shape is settled.
+    #[serde(default, deserialize_with = "list_or_csv")]
+    pub promotable: Option<Vec<String>>,
 }
 
 /// `[auth]`: Google sign-in in front of the actions that need a person behind
