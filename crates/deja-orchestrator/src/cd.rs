@@ -124,26 +124,30 @@ pub struct Transition {
 }
 
 /// The decision. `latest` is the environment's newest row of any state.
-/// `asked` answers whether a job asked for a version on this environment
-/// (as opposed to it turning up); `was_live_before` whether the observed
-/// synced version has been live here earlier (a return to it is a rollback,
-/// a first arrival is a deploy). Both are store questions, asked ahead so
-/// this stays a pure function.
+/// `asked` answers whether an unfailed job request remains eligible;
+/// `was_live_before` whether the observed synced version has been live here
+/// earlier, and `last_confirmed_version` is the newest version ever confirmed
+/// live here. Both are store questions, asked ahead so this stays pure.
 ///
-/// Nothing is appended when the observation says what the newest row
-/// already says, so a reconcile every five minutes writes only on change.
+/// A failed latest row does not imply a new deploy merely because Argo is
+/// healthy at that same version: it is an observation of previously confirmed
+/// state, not evidence that the failed intent succeeded.
 pub fn transition(
     latest: Option<&Latest>,
     obs: &Observation,
     asked: impl Fn(&str) -> bool,
     was_live_before: impl Fn(&str) -> bool,
+    last_confirmed_version: Option<&str>,
 ) -> Option<Transition> {
     if obs.is_live() {
         let v = obs.desired_version.as_str();
         return match latest {
-            // Already recorded as running this.
             Some(l) if l.version == v && (l.state == "live" || l.state == "rolled_back") => None,
-            // What a job asked for arrived, or something nobody asked for.
+            Some(l)
+                if l.version == v && l.state == "failed" && last_confirmed_version == Some(v) =>
+            {
+                None
+            }
             _ => Some(Transition {
                 version: v.to_owned(),
                 state: if !asked(v) && was_live_before(v) {
@@ -155,15 +159,10 @@ pub fn transition(
             }),
         };
     }
-    // Not live yet: Argo is moving to `desired`, or is stuck there. Record
-    // `syncing` for the desired version once; a later observation that still
-    // is not live appends nothing, and the one that is appends `live`.
     let v = obs.desired_version.as_str();
     match latest {
-        Some(l) if l.version == v && l.state != "live" && l.state != "rolled_back" => None,
-        // Desired is what we last had live: Argo reports it degraded or out
-        // of sync, which is a health fact, not a deployment. Nothing to append.
-        Some(l) if l.version == v => None,
+        Some(l) if l.version == v && l.state != "failed" => None,
+        Some(l) if l.version == v && l.state == "failed" && !asked(v) => None,
         _ => Some(Transition {
             version: v.to_owned(),
             state: "syncing".to_owned(),
@@ -205,6 +204,7 @@ mod tests {
             &obs("8eaddb0b85", Some("8eaddb0b85"), "Synced", "Healthy"),
             |_| true,
             |_| false,
+            None,
         )
         .unwrap();
         assert_eq!(t.state, "live");
@@ -215,10 +215,16 @@ mod tests {
     fn the_same_observation_twice_appends_nothing() {
         let live = latest("8eaddb0b85", "live");
         let o = obs("8eaddb0b85", Some("8eaddb0b85"), "Synced", "Healthy");
-        assert_eq!(transition(Some(&live), &o, |_| false, |_| false), None);
+        assert_eq!(
+            transition(Some(&live), &o, |_| false, |_| false, Some("8eaddb0b85")),
+            None
+        );
         let sync = latest("8eaddb0b85", "syncing");
         let o = obs("8eaddb0b85", Some("efdd705fea"), "OutOfSync", "Progressing");
-        assert_eq!(transition(Some(&sync), &o, |_| true, |_| false), None);
+        assert_eq!(
+            transition(Some(&sync), &o, |_| true, |_| false, Some("8eaddb0b85")),
+            None
+        );
     }
 
     #[test]
@@ -228,6 +234,7 @@ mod tests {
             &obs("2026.10.10.0", Some("2026.10.10.0"), "Synced", "Healthy"),
             |_| false,
             |_| false,
+            None,
         )
         .unwrap();
         assert_eq!((t.state.as_str(), t.out_of_band), ("live", true));
@@ -240,6 +247,7 @@ mod tests {
             &obs("2026.10.12.0", Some("2026.10.12.0"), "Synced", "Healthy"),
             |_| false,
             |v| v == "2026.10.12.0",
+            Some("2026.10.12.1"),
         )
         .unwrap();
         assert_eq!(t.state, "rolled_back");
@@ -253,6 +261,7 @@ mod tests {
             &obs("2026.10.12.0", Some("2026.10.12.0"), "Synced", "Healthy"),
             |_| true,
             |_| true,
+            Some("2026.10.12.1"),
         )
         .unwrap();
         assert_eq!(t.state, "live");
@@ -265,6 +274,7 @@ mod tests {
             &obs("efdd705fea", Some("8eaddb0b85"), "OutOfSync", "Healthy"),
             |_| false,
             |_| false,
+            Some("8eaddb0b85"),
         )
         .unwrap();
         assert_eq!((t.state.as_str(), t.out_of_band), ("syncing", true));
@@ -274,8 +284,87 @@ mod tests {
             &obs("efdd705fea", Some("8eaddb0b85"), "OutOfSync", "Progressing"),
             |_| true,
             |_| false,
+            Some("8eaddb0b85"),
         );
         assert_eq!(t, None, "committed already says a move is under way");
+    }
+
+    #[test]
+    fn failed_new_version_observation_is_out_of_band_not_stale_request() {
+        let t = transition(
+            Some(&latest("B", "failed")),
+            &obs("B", Some("B"), "Synced", "Healthy"),
+            |_| false,
+            |_| false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (t.version.as_str(), t.state.as_str(), t.out_of_band),
+            ("B", "live", true)
+        );
+    }
+
+    #[test]
+    fn failed_retry_preserves_last_confirmed_version_and_retry_can_complete() {
+        let o = obs("B", Some("B"), "Synced", "Healthy");
+        assert_eq!(
+            transition(
+                Some(&latest("B", "failed")),
+                &o,
+                |_| false,
+                |v| v == "B",
+                Some("B")
+            ),
+            None
+        );
+        let t = transition(
+            Some(&latest("B", "requested")),
+            &o,
+            |v| v == "B",
+            |v| v == "B",
+            Some("A"),
+        )
+        .unwrap();
+        assert_eq!((t.state.as_str(), t.out_of_band), ("live", false));
+    }
+
+    #[test]
+    fn failed_observation_of_superseded_historically_live_version_is_rollback() {
+        let t = transition(
+            Some(&latest("A", "failed")),
+            &obs("A", Some("A"), "Synced", "Healthy"),
+            |_| false,
+            |v| v == "A",
+            Some("B"),
+        )
+        .unwrap();
+        assert_eq!(
+            (t.version.as_str(), t.state.as_str(), t.out_of_band),
+            ("A", "rolled_back", true)
+        );
+
+        assert_eq!(
+            transition(
+                Some(&latest("B", "failed")),
+                &obs("B", Some("B"), "Synced", "Healthy"),
+                |_| false,
+                |v| v == "B",
+                Some("B"),
+            ),
+            None,
+            "a failed attempt at the currently confirmed version is not duplicated"
+        );
+
+        let retry = transition(
+            Some(&latest("A", "failed")),
+            &obs("A", Some("A"), "Synced", "Healthy"),
+            |v| v == "A",
+            |v| v == "A",
+            Some("B"),
+        )
+        .unwrap();
+        assert_eq!((retry.state.as_str(), retry.out_of_band), ("live", false));
     }
 
     #[test]
@@ -285,6 +374,7 @@ mod tests {
             &obs("8eaddb0b85", Some("8eaddb0b85"), "Synced", "Degraded"),
             |_| false,
             |_| false,
+            Some("8eaddb0b85"),
         );
         assert_eq!(t, None);
     }
@@ -296,6 +386,7 @@ mod tests {
             &obs("2026.10.09.1", Some("2026.10.09.1"), "Synced", "Healthy"),
             |_| false,
             |_| false,
+            None,
         )
         .unwrap();
         assert_eq!((t.state.as_str(), t.out_of_band), ("live", true));

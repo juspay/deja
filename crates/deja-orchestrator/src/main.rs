@@ -582,16 +582,19 @@ async fn require_cd_reader(
     next: Next,
 ) -> Response {
     if let Some(supplied) = bearer_token(req.headers()) {
-        return match st.mutation_auth.service_token.as_deref() {
-            Some(expected) if !service_token_matches(expected, supplied) => {
-                error_resp(401, "invalid bearer token")
-            }
-            _ => {
+        return match st
+            .mutation_auth
+            .service_token
+            .as_deref()
+            .filter(|expected| service_token_matches(expected, supplied))
+        {
+            Some(_) => {
                 req.extensions_mut()
                     .insert(AuthenticatedActor(SERVICE_ACTOR.to_owned()));
                 req.extensions_mut().insert(ActorSubject(None));
                 next.run(req).await
             }
+            None => error_resp(401, "invalid bearer token"),
         };
     }
     let cfg = st.auth.config();
@@ -4726,6 +4729,13 @@ async fn v1_cd_post_observed(
             Err(e) => return error_resp(500, &format!("deployments: {e}")),
         }
     };
+    let last_confirmed_version = match store
+        .cd_latest_live_for_environment(&obs.system, &env)
+        .await
+    {
+        Ok(row) => row.map(|r| r.version),
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
     let requester = match store
         .cd_requested_by(&obs.system, &env, &obs.desired_version)
         .await
@@ -4739,6 +4749,7 @@ async fn v1_cd_post_observed(
         &obs,
         |v| v == obs.desired_version && asked,
         |v| v == synced && was_live,
+        last_confirmed_version.as_deref(),
     ) else {
         return json_ok(serde_json::json!({ "appended": null }));
     };
@@ -7260,6 +7271,31 @@ mod sign_in {
         )
         .await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn absent_service_token_rejects_bearer_but_allows_maintainer_cookie() {
+        let (auth, signer) = enabled(&["ravi@juspay.in"]);
+        let st = state(auth, None);
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer attacker-chosen")
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+
+        let (code, body) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, "ravi@juspay.in"));
     }
 
     #[tokio::test]
