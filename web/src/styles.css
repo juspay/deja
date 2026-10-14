@@ -1330,3 +1330,16 @@ h1 .beta { font-size: 11px; }
 .cd-pauseform input { width: 100%; }
 .cd-pauseactions { display: flex; gap: var(--s2); }
 .btn.danger { background: var(--red-fg); color: var(--on-accent); border-color: transparent; font-weight: 600; }
+
+/* Promotion: the in-flight request, the dialog. */
+.cd-promo { display: grid; gap: var(--s2); padding: 0 var(--s4) var(--s3); }
+.cd-promoreq { border: 1px dashed var(--accent); border-radius: var(--r-sm); padding: var(--s2) var(--s3); display: grid; gap: var(--s2); font-size: var(--fs-12); }
+.cd-steps { list-style: none; display: flex; flex-wrap: wrap; gap: 4px; padding: 0; margin: 0; }
+.cd-steps li { padding: 1px 7px; border-radius: 999px; font-size: var(--fs-11); background: var(--surface-overlay); color: var(--text-faint); }
+.cd-steps li.done { background: rgba(63,185,80,0.14); color: var(--green-fg); }
+.cd-steps li.now { background: rgba(210,153,34,0.18); color: var(--amber-fg); font-weight: 600; }
+.cd-promoactions { display: flex; gap: var(--s2); flex-wrap: wrap; }
+.cd-dialog { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; padding: var(--s4); z-index: 50; }
+.cd-dialogbox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md, 10px); padding: var(--s5); width: min(640px, 100%); max-height: 90vh; overflow: auto; display: grid; gap: var(--s3); }
+.cd-dialogbox select, .cd-dialogbox input { width: 100%; }
+.cd-checks { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; font-size: var(--fs-13); }

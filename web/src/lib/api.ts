@@ -1094,6 +1094,26 @@ export type CdHopRow = {
   run_delta_verdict: string | null;
 };
 
+/** A promotion request, as deja keeps it (migration 0013). */
+export type CdPromotion = {
+  id: number;
+  system: string;
+  environment: string;
+  from_version: string;
+  release: string | null;
+  state: string;
+  requested_by: string;
+  note: string | null;
+  evidence: Record<string, unknown>;
+  step_detail: Record<string, { reason?: string | null; jenkins_build?: string | null; by?: string; at?: string } | undefined>;
+  picked_by_build: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+};
+
+export type CdPromotionCheck = { id: string; ok: boolean; why: string };
+
 export type CdEnvironment = {
   environment: string;
   /** The newest row of any state: what is happening. */
@@ -1110,6 +1130,28 @@ const sys = (system: string) => `system=${encodeURIComponent(system)}`;
 
 export const cdApi = {
   config: () => request<CdConfig>("/api/v1/cd/config"),
+  promotionCheck: (system: string, environment: string, version: string) =>
+    request<{ ok: boolean; from: string; target_live: string | null; checks: CdPromotionCheck[] }>(
+      `/api/v1/cd/environments/${encodeURIComponent(environment)}/promotion-check?${sys(system)}&version=${encodeURIComponent(version)}`,
+    ),
+  promote: (system: string, environment: string, version: string, note: string) =>
+    request<CdPromotion>(`/api/v1/cd/environments/${encodeURIComponent(environment)}/promotions`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ system, version, note }),
+    }),
+  promotions: (system: string, environment: string, limit = 10) =>
+    request<CdPromotion[]>(`/api/v1/cd/promotion-requests?${sys(system)}&environment=${encodeURIComponent(environment)}&limit=${limit}`),
+  cancelPromotion: (id: number) =>
+    request<CdPromotion>(`/api/v1/cd/promotion-requests/${id}`, { method: "DELETE", credentials: "same-origin" }),
+  markPromotionFailed: (id: number, reason: string) =>
+    request<CdPromotion>(`/api/v1/cd/promotion-requests/${id}/fail`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
   /** Pause or resume a system's pipeline: a signed-in maintainer only. */
   setPause: (system: string, paused: boolean, reason: string) =>
     request<CdControl>("/api/v1/cd/pause", {

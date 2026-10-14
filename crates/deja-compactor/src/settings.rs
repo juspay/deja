@@ -62,10 +62,20 @@ pub struct CdSettings {
     /// Default `integ, sandbox, prod`.
     #[serde(default, deserialize_with = "list_or_csv")]
     pub environments: Option<Vec<String>>,
-    /// The environments a person may promote to from the pages. Nothing yet
-    /// reads this; it is declared with the rest so the shape is settled.
+    /// The environments a person may promote to from the pages, each from
+    /// the environment before it in `environments`.
     #[serde(default, deserialize_with = "list_or_csv")]
     pub promotable: Option<Vec<String>>,
+    /// How long a version must have been live on the environment before a
+    /// promotable one before it may be promoted. Default 0: the person
+    /// promoting decides.
+    #[serde(default)]
+    pub soak_hours: Option<u32>,
+    /// What a promotion needs from the version's hop replay against the
+    /// release the target runs: `result` (one came back, any verdict;
+    /// the default) or `none`.
+    #[serde(default)]
+    pub hop_required: Option<String>,
 }
 
 /// `[auth]`: Google sign-in in front of the actions that need a person behind

@@ -4,7 +4,7 @@
 // them -- "live since", "six merges not yet on sandbox", "made outside déjà"
 // -- is decided here.
 
-import type { CdDeploymentRow, CdHopRow, CdVersionRow, CdVersionWhere } from "./api";
+import type { CdDeploymentRow, CdHopRow, CdPromotion, CdVersionRow, CdVersionWhere } from "./api";
 
 /** A deployment-log state that means the version is what the environment runs. */
 export function isRunning(state: string): boolean {
@@ -157,4 +157,41 @@ export function hopWord(h: Pick<CdHopRow, "state" | "verdict" | "run_state" | "r
     default:
       return { word: "unknown", tone: "muted" };
   }
+}
+
+/** The versions a promotion from `source` may pick: merges live there, newest
+ *  first, after what the target runs when that is known. deja checks each
+ *  again when one is picked; this only decides what the picker lists. */
+export function promotionCandidates(
+  versions: { version: CdVersionRow; where: CdVersionWhere[] }[],
+  source: string,
+  targetLive: CdVersionRow | null | undefined,
+): CdVersionRow[] {
+  const ran = (w: CdVersionWhere[]) => w.some((r) => r.environment === source && isRunning(r.state));
+  const everLive = versions.filter((x) => x.version.kind === "merge" && (ran(x.where) || x.where.some((r) => r.environment === source)));
+  const since = mergesSince(versions.map((x) => x.version), targetLive);
+  const allowed = since ? new Set(since.map((v) => v.version)) : null;
+  return everLive.map((x) => x.version).filter((v) => !allowed || allowed.has(v.version));
+}
+
+/** A request's steps for the progress line, each done, current or to come. */
+export const PROMOTION_STEPS = ["pending", "picked", "tagged", "built", "committed", "live"] as const;
+
+export function promotionProgress(p: Pick<CdPromotion, "state">): { step: string; at: "done" | "now" | "todo" }[] {
+  const i = PROMOTION_STEPS.indexOf(p.state as (typeof PROMOTION_STEPS)[number]);
+  return PROMOTION_STEPS.map((step, j) => ({
+    step,
+    at: i < 0 ? "todo" : j < i || (j === i && p.state === "live") ? "done" : j === i ? "now" : "todo",
+  }));
+}
+
+/** Whether a request still holds its environment. */
+export function inFlight(p: Pick<CdPromotion, "state">): boolean {
+  return !["live", "failed", "cancelled"].includes(p.state);
+}
+
+/** "5 h ago", or "just now" without a second "ago". */
+export function agoText(iso: string, now: number = Date.now()): string {
+  const a = ago(iso, now);
+  return a === "just now" ? a : `${a} ago`;
 }
