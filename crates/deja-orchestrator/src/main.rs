@@ -35,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post, MethodRouter},
+    routing::{delete, get, post, put, MethodRouter},
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
@@ -66,6 +66,10 @@ struct AppState {
     /// Deployment tracking, from the configuration's `[cd]` block. `None`
     /// when no block is declared: the endpoints say so and write nothing.
     cd: Option<Arc<deja_orchestrator::cd::CdConfig>>,
+    /// One process-wide lock serializes baseline re-points with file-side
+    /// RunEvent read-modify-writes, preventing either snapshot from overwriting
+    /// the other's changes. Store-only events do not need the file lock.
+    repoints: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Which executor drives runs, resolved ONCE at startup. K8s carries the
@@ -261,6 +265,7 @@ async fn main() {
         auth,
         restates: Arc::default(),
         cd,
+        repoints: Arc::default(),
     };
 
     // Restart-durable reconciler (#34 V3/V7). The per-launch watcher in
@@ -324,6 +329,8 @@ fn app_router(state: AppState) -> Router {
     let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
     // Killing a run is a human action like creating one: same auth, and audited.
     let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
+    let repoint_baseline =
+        put(v1_repoint_baseline).route_layer(middleware::from_fn(require_human_auth));
     // Acknowledging a divergence is a human action, twice over: one person
     // proposes, another confirms. Same auth as creating a run, and audited.
     // ...and the one place a person has to be signed in once sign-in is on:
@@ -367,6 +374,7 @@ fn app_router(state: AppState) -> Router {
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
         .route("/runs/{run_id}/kill", kill_run_route)
+        .route("/runs/{run_id}/baseline", repoint_baseline)
         .route("/runs/{run_id}", get(v1_get_run))
         .route("/runs/{run_id}/stages", get(v1_run_stages))
         .route("/runs/{run_id}/logs", get(v1_run_logs))
@@ -1107,6 +1115,20 @@ async fn v1_ingest_run_event(
 
     // File-side mirror: the run record must exist (the orchestrator created it
     // before launching the Job) — an unknown id is a 404, not an upsert.
+    // Serialize file mutations with re-points from before reading the record:
+    // otherwise a stale snapshot could erase the re-point's baseline.
+    let file_mutation = matches!(
+        &ev,
+        RunEvent::Stage { .. }
+            | RunEvent::State { .. }
+            | RunEvent::Finish { .. }
+            | RunEvent::Recording { .. }
+    );
+    let _file_mutation_guard = if file_mutation {
+        Some(st.repoints.lock().await)
+    } else {
+        None
+    };
     let run_path = st.root.run_path(&run_id);
     let mut run: Run = match deja_orchestrator::read_json(&run_path) {
         Ok(run) => run,
@@ -1188,6 +1210,7 @@ async fn v1_ingest_run_event(
             return error_resp(500, &format!("persist run: {e}"));
         }
     }
+    drop(_file_mutation_guard);
 
     if let Some(store) = &st.store {
         if let Err(e) = apply_run_event(store, &run_id, &ev).await {
@@ -2004,6 +2027,138 @@ fn live_json(live: &Run) -> serde_json::Value {
         "failure_reason": live.failure_reason,
         "candidate_image": live.candidate_image,
     })
+}
+
+/// `PUT /api/v1/runs/{run_id}/baseline` — re-point a run at another baseline.
+///
+/// A run names the baseline it is measured against when it is created
+/// (`delta_against`). The pipeline that created it may replay the baseline
+/// again afterwards — the tape was resealed between the two runs and the
+/// delta refused the pair — and nothing could tell deja. The run kept naming
+/// the first baseline, so its row stayed refused and the report opened the
+/// refused comparison, while the pipeline had already measured it against the
+/// second. The re-point says so. The delta is settled again against the new
+/// baseline, off this request, exactly as it would be on either run's finish.
+///
+/// Only a finished run can be re-pointed. The lifecycle holds the record in
+/// memory while the run drives and writes it back at every transition, so a
+/// re-point mid-run would be written over by the next one and the file and
+/// the row would name different baselines. The pipeline re-points after the
+/// candidate's finish, which is the one time it is safe.
+async fn v1_repoint_baseline(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    run_id: RunId,
+    body: axum::body::Bytes,
+) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Repoint {
+        delta_against: String,
+    }
+    let Repoint { delta_against } = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_resp(400, &format!("parse body: {e}")),
+    };
+    let against = match delta_against.parse::<RunId>() {
+        Ok(id) => id,
+        Err(e) => return error_resp(400, &format!("delta_against: {e}")),
+    };
+    if against == run_id {
+        return error_resp(400, "delta_against: a run is not its own baseline");
+    }
+    // Everything from the read to the write, or the restore, under one lock:
+    // two re-points of one run must not interleave.
+    let _serialised = st.repoints.lock().await;
+
+    // The live record, as the ingest path writes it: a run the store has not
+    // seen (or no store at all) is still re-pointed where its delta is read.
+    let live = match confined(st.root.run_path(&run_id), &st.root.root.join("runs")) {
+        Some(path) => match deja_orchestrator::read_json::<Run>(&path) {
+            Ok(run) => Some((path, run)),
+            Err(e) => return error_resp(500, &format!("read run: {e}")),
+        },
+        None => None,
+    };
+    let row = match &st.store {
+        Some(store) => match store.get_run(&run_id).await {
+            Ok(row) => row,
+            Err(e) => return error_resp(500, &format!("get run: {e}")),
+        },
+        None => None,
+    };
+    // The record is authoritative for the state, as it is for the baseline.
+    let state = match (&live, &row) {
+        (Some((_, run)), _) => format!("{:?}", run.status).to_lowercase(),
+        (None, Some(row)) => row.state.clone(),
+        (None, None) => return error_resp(404, "run not found"),
+    };
+    if !matches!(state.as_str(), "completed" | "failed") {
+        return error_resp(
+            409,
+            &format!("run is {state}; a baseline can be re-pointed once the run has finished"),
+        );
+    }
+    let baseline_known = confined(st.root.run_path(&against), &st.root.root.join("runs")).is_some()
+        || match &st.store {
+            Some(store) => match store.get_run(&against).await {
+                Ok(row) => row.is_some(),
+                Err(e) => return error_resp(500, &format!("get baseline run: {e}")),
+            },
+            None => false,
+        };
+    if !baseline_known {
+        return error_resp(404, "baseline run not found");
+    }
+
+    let previous = live
+        .as_ref()
+        .and_then(|(_, run)| run.spec.delta_against.clone())
+        .or_else(|| {
+            row.as_ref()
+                .and_then(|row| row.params.get("delta_against"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    // The file first, then the row; a row that will not take the change puts
+    // the file back, so a refused re-point changes nothing.
+    if let Some((path, run)) = &live {
+        let mut repointed = run.clone();
+        repointed.spec.delta_against = Some(against.to_string());
+        if let Err(e) = deja_orchestrator::write_json(path, &repointed) {
+            return error_resp(500, &format!("persist run: {e}"));
+        }
+    }
+    if let Some(store) = &st.store {
+        if let Err(e) = store.set_run_delta_against(&run_id, &against).await {
+            if let Some((path, run)) = &live {
+                if let Err(restore) = deja_orchestrator::write_json(path, run) {
+                    return error_resp(
+                        500,
+                        &format!(
+                            "re-point run: {e}; and the record could not be put back: {restore}"
+                        ),
+                    );
+                }
+            }
+            return error_resp(500, &format!("re-point run: {e}"));
+        }
+        audit_or_say(
+            store,
+            &actor.0,
+            "run.repoint_baseline",
+            "run",
+            &run_id,
+            &serde_json::json!({ "from": previous, "to": against.as_str() }),
+        )
+        .await;
+    }
+    // Settled against the new baseline, or left pending until it finishes.
+    tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
+    json_ok(serde_json::json!({
+        "run_id": run_id.as_str(),
+        "delta_against": against.as_str(),
+        "previous": previous,
+    }))
 }
 
 /// `GET /api/v1/runs/{id}` — store row + live file-store snapshot merged: the
@@ -3212,7 +3367,7 @@ async fn delta_for_run(
             // The row is settled from the cache too: a column that was reset,
             // or never written because the store was away, catches up on the
             // next view rather than waiting for a recomputation.
-            record_delta_verdict(st, y_id, Ok(&doc)).await;
+            record_delta_verdict(st, y_id, m_id, Ok(&doc)).await;
             return Ok(doc);
         }
     }
@@ -3233,23 +3388,33 @@ async fn delta_for_run(
         }
         Err(why) => Err(why),
     };
-    record_delta_verdict(st, y_id, computed.as_ref()).await;
+    record_delta_verdict(st, y_id, m_id, computed.as_ref()).await;
     computed
 }
 
 /// The run row's delta verdict, from a computed delta or the reason there is
-/// none. Idempotent; the newest answer wins.
+/// none. Idempotent; the newest answer wins — for the baseline it was computed
+/// against. A verdict against another run than the row names (a comparison
+/// the report asked for by hand, or a settlement the run was re-pointed out
+/// from under) is not the row's verdict, and lands nowhere.
 async fn record_delta_verdict(
     st: &AppState,
     y_id: &str,
+    m_id: &str,
     computed: Result<&serde_json::Value, &Unavailable>,
 ) {
     if let Some(store) = &st.store {
-        if let Err(e) = store
-            .set_delta_verdict(y_id, delta_verdict_word(computed))
+        match store
+            .set_delta_verdict(y_id, m_id, delta_verdict_word(computed))
             .await
         {
-            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "deja-orchestrator: delta verdict for {y_id} against {m_id} not recorded: the run names another baseline"
+            ),
+            Err(e) => {
+                eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}")
+            }
         }
     }
 }
@@ -3587,11 +3752,12 @@ async fn audit_or_say(
     store: &deja_store::Store,
     actor: &str,
     action: &str,
+    object_type: &str,
     target: &str,
     details: &serde_json::Value,
 ) {
     if let Err(e) = store
-        .audit(actor, action, "pull_request", target, details)
+        .audit(actor, action, object_type, target, details)
         .await
     {
         eprintln!(
@@ -3751,6 +3917,7 @@ async fn v1_propose_acknowledgements(
         &store,
         &actor.0,
         "acknowledgement.propose",
+        "pull_request",
         &format!("{}#{}", gh.repo, gh.pr_number),
         &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
     )
@@ -3800,6 +3967,7 @@ async fn v1_confirm_acknowledgement(
         &store,
         &actor.0,
         "acknowledgement.confirm",
+        "pull_request",
         &format!("{}#{}", row.repo, row.pr_number),
         &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
     )
@@ -3853,6 +4021,7 @@ async fn v1_withdraw_acknowledgement(
         &store,
         &actor.0,
         "acknowledgement.withdraw",
+        "pull_request",
         &format!("{}#{}", row.repo, row.pr_number),
         &serde_json::json!({ "id": ack_id }),
     )
@@ -5548,6 +5717,7 @@ mod tests {
             auth: deja_orchestrator::auth::AuthState::disabled(),
             restates: Arc::default(),
             cd: None,
+            repoints: Arc::default(),
         }
     }
 
@@ -5638,6 +5808,214 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         app_router(state).oneshot(req).await.unwrap().status()
+    }
+
+    async fn put_baseline_full(
+        state: AppState,
+        run_id: &str,
+        body: serde_json::Value,
+        actor: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/runs/{run_id}/baseline"))
+            .header("content-type", "application/json");
+        if let Some(actor) = actor {
+            req = req.header("X-Deja-Actor", actor);
+        }
+        let req = req.body(Body::from(body.to_string())).unwrap();
+        let response = app_router(state).oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    async fn put_baseline(
+        state: AppState,
+        run_id: &str,
+        body: serde_json::Value,
+        actor: Option<&str>,
+    ) -> StatusCode {
+        put_baseline_full(state, run_id, body, actor).await.0
+    }
+
+    fn finished_run(state: &AppState, id: &str, against: Option<&str>) {
+        let mut run = pending_run(id);
+        run.status = deja_orchestrator::RunStatus::Completed;
+        run.spec.delta_against = against.map(str::to_owned);
+        deja_orchestrator::write_json(&state.root.run_path(id), &run).unwrap();
+    }
+
+    fn baseline_of(state: &AppState, id: &str) -> Option<String> {
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path(id)).unwrap();
+        run.spec.delta_against
+    }
+
+    /// Two re-points of one run do not interleave: a re-point waits for the
+    /// one in flight, and reads the record that one wrote.
+    #[tokio::test]
+    async fn overlapping_repoints_are_serialised() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        finished_run(&state, "run-y", Some("run-m1"));
+        for id in ["run-m1", "run-m2", "run-m3"] {
+            finished_run(&state, id, None);
+        }
+        let against = |id: &str| serde_json::json!({ "delta_against": id });
+
+        // A re-point in flight: the next one waits on it, and the record is
+        // untouched while it waits.
+        let in_flight = state.repoints.clone().lock_owned().await;
+        let waiting = tokio::spawn(put_baseline_full(
+            state.clone(),
+            "run-y",
+            against("run-m2"),
+            Some("ci"),
+        ));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "a re-point does not run past one in flight"
+        );
+        assert_eq!(baseline_of(&state, "run-y").as_deref(), Some("run-m1"));
+        drop(in_flight);
+        let (status, body) = waiting.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["previous"], "run-m1");
+        assert_eq!(baseline_of(&state, "run-y").as_deref(), Some("run-m2"));
+
+        // Two at once, neither to the baseline the record names now: the
+        // earlier one reads the record as it was, the later one reads what the
+        // earlier one wrote, and the record ends as the later one left it.
+        let (first, second) = tokio::join!(
+            put_baseline_full(state.clone(), "run-y", against("run-m3"), Some("ci")),
+            put_baseline_full(state.clone(), "run-y", against("run-m1"), Some("ci")),
+        );
+        assert_eq!((first.0, second.0), (StatusCode::OK, StatusCode::OK));
+        let last = baseline_of(&state, "run-y").unwrap();
+        let (earlier, later) = if first.1["previous"] == "run-m2" {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(
+            earlier.1["previous"], "run-m2",
+            "the earlier one read the record as it was"
+        );
+        assert_eq!(
+            later.1["previous"], earlier.1["delta_against"],
+            "the later one read what the earlier one wrote"
+        );
+        assert_eq!(serde_json::json!(last), later.1["delta_against"]);
+    }
+
+    /// A trailing recording event must preserve a baseline written by a
+    /// concurrent re-point. The held lock makes ingest wait before it snapshots
+    /// the completed run; without the wait, the request can write stale state.
+    #[tokio::test]
+    async fn trailing_recording_event_preserves_concurrent_repoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        finished_run(&state, "run-y", Some("run-m1"));
+        finished_run(&state, "run-m2", None);
+
+        let in_flight = state.repoints.clone().lock_owned().await;
+        let recording = tokio::spawn(post_event(
+            state.clone(),
+            "run-y",
+            serde_json::json!({ "event": "recording", "recording_id": "rec-late" }),
+        ));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !recording.is_finished(),
+            "file-mutating ingest waits for an in-flight re-point"
+        );
+        let repoint = tokio::spawn(put_baseline(
+            state.clone(),
+            "run-y",
+            serde_json::json!({ "delta_against": "run-m2" }),
+            Some("ci"),
+        ));
+        drop(in_flight);
+
+        assert_eq!(recording.await.unwrap(), StatusCode::ACCEPTED);
+        assert_eq!(repoint.await.unwrap(), StatusCode::OK);
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(run.spec.delta_against.as_deref(), Some("run-m2"));
+        assert_eq!(run.recording_id.as_deref(), Some("rec-late"));
+    }
+
+    /// A run re-pointed at another baseline names that baseline from then on,
+    /// where its delta is read from. Each refusal is the kind the pipeline
+    /// would otherwise discover later: no actor, no such run, a baseline that
+    /// is not a run id, a run named as its own baseline.
+    #[tokio::test]
+    async fn a_run_can_be_repointed_at_another_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let mut run = pending_run("run-y");
+        run.status = deja_orchestrator::RunStatus::Completed;
+        run.spec.delta_against = Some("run-m1".to_owned());
+        deja_orchestrator::write_json(&state.root.run_path("run-y"), &run).unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-m2"), &pending_run("run-m2"))
+            .unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-live"), &pending_run("run-live"))
+            .unwrap();
+        let against = |id: &str| serde_json::json!({ "delta_against": id });
+
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-m2"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-missing", against("run-m2"), Some("ci")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("../run-m2"), Some("ci")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-y"), Some("ci")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-nowhere"), Some("ci")).await,
+            StatusCode::NOT_FOUND,
+            "a baseline that does not exist is refused here, not at the settle"
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-live", against("run-m2"), Some("ci")).await,
+            StatusCode::CONFLICT,
+            "a run still driving would write the old baseline back over a re-point"
+        );
+        let untouched: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(
+            untouched.spec.delta_against.as_deref(),
+            Some("run-m1"),
+            "a refused re-point changes nothing"
+        );
+
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-m2"), Some("ci")).await,
+            StatusCode::OK
+        );
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(run.spec.delta_against.as_deref(), Some("run-m2"));
+        assert_eq!(
+            run_params_for(&state, "run-y")
+                .await
+                .and_then(|p| p.delta_against)
+                .as_deref(),
+            Some("run-m2"),
+            "the delta reads the baseline from the same record"
+        );
     }
 
     #[tokio::test]
@@ -6884,6 +7262,7 @@ mod sign_in {
             auth,
             restates: Arc::default(),
             cd: None,
+            repoints: Arc::default(),
         }
     }
 

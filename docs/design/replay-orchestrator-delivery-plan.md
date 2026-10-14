@@ -476,7 +476,7 @@ preview renders the two-field body.
 `DEJA_S3_REGION=ap-south-1`, `DEJA_S3_ALLOW_HTTP=false`, `DEJA_S3_ACCESS_KEY=""` +
 `DEJA_S3_SECRET_KEY=""` (explicit empty so IRSA engages — `S3Config` defaults to `minioadmin` and
 `has_static_credentials()` masks IRSA → 403), `DEJA_REPLAY_ENV=sbx-mirror`,
-`DEJA_CANDIDATE_REGISTRY_DEFAULT=223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router`,
+`DEJA_CANDIDATE_REGISTRY_DEFAULT=<aws-account-id>.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router`,
 `DEJA_CANDIDATE_REPO_DEFAULT=juspay/hyperswitch`, `DEJA_CANDIDATE_GIT_REMOTE` only if O12
 confirmed. **Remove** the static-key `replay-orchestrator-aws` secretRefs so they cannot mask
 IRSA. The demo-MinIO S3 defaults in code (`compactor lib.rs:57-64`) stay as-is and are overridden
