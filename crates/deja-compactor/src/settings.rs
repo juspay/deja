@@ -372,7 +372,7 @@ s3_bucket = "from-toml"
 manages_stores = true
 scored_span_namespaces = ["a::", "b::"]
 [systems.prism]
-s3_bucket = "example-connector-recordings"
+s3_bucket = "ucs-deja"
 "#,
         );
         // The environment overrides one value and leaves the rest of the table.
@@ -398,7 +398,7 @@ s3_bucket = "example-connector-recordings"
             Some(&["a::".to_owned(), "b::".to_owned()][..])
         );
         let p = &s.systems["prism"];
-        assert_eq!(p.s3_bucket.as_deref(), Some("example-connector-recordings"));
+        assert_eq!(p.s3_bucket.as_deref(), Some("ucs-deja"));
         assert_eq!(
             p.scored_span_namespaces.as_deref(),
             Some(&["ucs::".to_owned(), "connector::".to_owned()][..]),
@@ -433,8 +433,8 @@ s3_bucket = "example-connector-recordings"
         assert_eq!(s.systems["solo"].s3_prefix, None);
     }
 
-    /// One bucket, a directory each. This illustrative shared-bucket layout
-    /// must not be refused.
+    /// One bucket, a directory each. This is the ap-south-2 layout and the case
+    /// the guard must NOT refuse.
     #[test]
     fn two_systems_in_one_bucket_with_their_own_prefixes_load() {
         let _lock = env_guard();
@@ -515,15 +515,17 @@ s3_bucket = "example-connector-recordings"
         );
     }
 
-    /// A bucket per system with no prefix; the guard must allow this layout.
+    /// A bucket per system with no prefix at all: what ap-south-1 runs today.
+    /// The guard must leave it alone, or it breaks the deployment it is meant to
+    /// protect.
     #[test]
     fn a_bucket_per_system_needs_no_prefix() {
         let _lock = env_guard();
         clear();
         std::env::set_var(
             "DEJA_CONFIG_TOML",
-            "[systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n\
-             [systems.prism]\ns3_bucket = \"example-connector-recordings\"\n",
+            "[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
+             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
         );
         let loaded = load();
         clear();
@@ -590,14 +592,14 @@ s3_bucket = "example-connector-recordings"
         clear();
         std::env::set_var(
             "DEJA_CONFIG_TOML",
-            "[systems.prism]\ns3_bucket = \"example-connector-recordings\"\n[systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n",
+            "[systems.prism]\ns3_bucket = \"ucs-deja\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
         );
         let s = load().expect("loads");
         clear();
 
         let bucket = |name: &str| s.systems.get(name).and_then(|d| d.s3_bucket.as_deref());
-        assert_eq!(bucket("prism"), Some("example-connector-recordings"));
-        assert_eq!(bucket("hyperswitch"), Some("example-router-recordings"));
+        assert_eq!(bucket("prism"), Some("ucs-deja"));
+        assert_eq!(bucket("hyperswitch"), Some("hyperswitch-art"));
         // An undeclared system resolves to nothing — which a caller must report
         // as "not declared", never by falling back to another system's bucket.
         // Borrowing one system's recordings under another's name would not fail;

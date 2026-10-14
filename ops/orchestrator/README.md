@@ -8,14 +8,12 @@ mirror `docker:27-dind` and any DockerHub compose images to ECR, or extend
 
 ## Build (from the repo root)
 
-Set the orchestrator's image repository (separate from the candidate router image)
-and the deployment's AWS region before building:
+Set `ORCHESTRATOR_IMAGE_REPO` to the deployment's ECR repository for this image
+(not the candidate/router repository):
 
 ```sh
-: "${ORCHESTRATOR_IMAGE_REPO:?Set ORCHESTRATOR_IMAGE_REPO to the operator-owned ECR repository URI}"
-: "${DEJA_S3_REGION:?Set DEJA_S3_REGION to the operator-provided AWS region}"
-ORCHESTRATOR_IMAGE="${ORCHESTRATOR_IMAGE_REPO}:<tag>"
-
+: "${ORCHESTRATOR_IMAGE_REPO:?Set ORCHESTRATOR_IMAGE_REPO to the orchestrator ECR repository URI}"
+ORCHESTRATOR_IMAGE="${ORCHESTRATOR_IMAGE_REPO}:2026.07.11.0"
 # .dockerignore must exclude the heavy state: demo/* except the four bundled
 # assets, vendor/*/target, vendor/*/.git, target/
 docker build -f ops/orchestrator/Dockerfile -t "$ORCHESTRATOR_IMAGE" .
@@ -24,10 +22,9 @@ docker build -f ops/orchestrator/Dockerfile -t "$ORCHESTRATOR_IMAGE" .
 ## Push (GATED — ask before pushing anywhere, including ECR)
 
 ```sh
-ECR_REGISTRY="${ORCHESTRATOR_IMAGE_REPO%%/*}"
-aws ecr get-login-password --region "$DEJA_S3_REGION" \
-  | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-# Create the repository once if it does not exist; supply its name and region.
+aws ecr get-login-password --region ap-south-1 \
+  | docker login --username AWS --password-stdin "${ORCHESTRATOR_IMAGE_REPO%%/*}"
+# create the repo once: aws ecr create-repository --repository-name hyperswitch-replay-orchestrator --region ap-south-1
 docker push "$ORCHESTRATOR_IMAGE"
 ```
 
