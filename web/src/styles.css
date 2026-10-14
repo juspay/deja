@@ -333,16 +333,22 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
    ========================================================================== */
 .pagehead { display: flex; align-items: center; justify-content: space-between; gap: var(--s4); margin-bottom: var(--s4); }
 .pagehead h1 { margin: 0; }
+.systempick { display: flex; gap: var(--s1); flex-wrap: wrap; margin-bottom: var(--s3); }
+.systempick .tab { border: 0; font: inherit; cursor: pointer; }
+.systempick .tab:not(.active):not(:hover) { background: transparent; }
+.systempick .n { color: var(--text-subtle); font-variant-numeric: tabular-nums; margin-left: 4px; }
+.rl-change { color: var(--text); }
 .runfilters { display: flex; align-items: center; gap: var(--s3); margin-bottom: var(--s3); flex-wrap: wrap; }
 .search {
   flex: 1; min-width: 260px; max-width: 520px;
   background: var(--bg); color: var(--text); border: 1px solid var(--border);
   border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; font-size: var(--fs-13);
 }
-.runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+.runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow-x: auto; overflow-y: hidden; }
+.runlist > .runrow, .runlist > .runrowwrap { min-width: 1142px; }
 .runrow {
   display: grid; align-items: center;
-  grid-template-columns: 90px 118px minmax(130px, 1fr) minmax(150px, 1.1fr) minmax(200px, 2.4fr) 74px 132px;
+  grid-template-columns: 90px 118px minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(200px, 2fr) 74px 132px;
   gap: var(--s3); padding: var(--s2) var(--s3); font-size: var(--fs-12);
   color: var(--text-muted); text-decoration: none; border-bottom: 1px solid var(--border-muted);
 }
