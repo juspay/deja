@@ -344,7 +344,8 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
   background: var(--bg); color: var(--text); border: 1px solid var(--border);
   border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; font-size: var(--fs-13);
 }
-.runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+.runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow-x: auto; overflow-y: hidden; }
+.runlist > .runrow, .runlist > .runrowwrap { min-width: 1142px; }
 .runrow {
   display: grid; align-items: center;
   grid-template-columns: 90px 118px minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(200px, 2fr) 74px 132px;
