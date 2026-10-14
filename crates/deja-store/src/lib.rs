@@ -305,6 +305,19 @@ pub struct NewCdDeployment {
     pub detail: serde_json::Value,
 }
 
+/// A system's pause switch (migration 0011). No row reads as running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdControlRow {
+    pub system: String,
+    pub paused: bool,
+    pub reason: Option<String>,
+    pub changed_by: String,
+    /// The sign-in subject beside the name, never serialised.
+    #[serde(default, skip_serializing)]
+    pub changed_by_sub: Option<String>,
+    pub changed_at: DateTime<Utc>,
+}
+
 impl Store {
     /// Connect and run migrations. Errors are returned (the caller decides
     /// whether the store is mandatory).
@@ -892,6 +905,46 @@ impl Store {
         Ok(rows.into_iter().map(cd_deployment_row).collect())
     }
 
+    // -- cd pause switch -----------------------------------------------------
+
+    pub async fn cd_control_get(&self, system: &str) -> Result<Option<CdControlRow>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT system, paused, reason, changed_by, changed_by_sub, changed_at
+             FROM cd_controls WHERE system = $1",
+        )
+        .bind(system)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(cd_control_row))
+    }
+
+    pub async fn cd_control_set(
+        &self,
+        system: &str,
+        paused: bool,
+        reason: Option<&str>,
+        by: &str,
+        by_sub: Option<&str>,
+    ) -> Result<CdControlRow, sqlx::Error> {
+        let row = sqlx::query(
+            "INSERT INTO cd_controls (system, paused, reason, changed_by, changed_by_sub, changed_at)
+             VALUES ($1, $2, $3, $4, $5, now())
+             ON CONFLICT (system) DO UPDATE
+               SET paused = EXCLUDED.paused, reason = EXCLUDED.reason,
+                   changed_by = EXCLUDED.changed_by, changed_by_sub = EXCLUDED.changed_by_sub,
+                   changed_at = EXCLUDED.changed_at
+             RETURNING system, paused, reason, changed_by, changed_by_sub, changed_at",
+        )
+        .bind(system)
+        .bind(paused)
+        .bind(reason)
+        .bind(by)
+        .bind(by_sub)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(cd_control_row(row))
+    }
+
     // -- recordings ----------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)] // mirrors the catalog row shape
@@ -1420,6 +1473,17 @@ fn cd_deployment_row(r: sqlx::postgres::PgRow) -> CdDeploymentRow {
         jenkins_build: r.get(8),
         detail: r.get(9),
         at: r.get(10),
+    }
+}
+
+fn cd_control_row(r: sqlx::postgres::PgRow) -> CdControlRow {
+    CdControlRow {
+        system: r.get(0),
+        paused: r.get(1),
+        reason: r.get(2),
+        changed_by: r.get(3),
+        changed_by_sub: r.get(4),
+        changed_at: r.get(5),
     }
 }
 

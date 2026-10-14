@@ -1310,3 +1310,21 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
   .cd-gap { padding: var(--s2) 0; }
   .cd-gap svg { transform: rotate(90deg); }
 }
+
+/* Deployments beta: the label, and the pause switch. */
+.beta {
+  display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; vertical-align: middle;
+  color: var(--amber-fg); background: rgba(210,153,34,0.14);
+}
+h1 .beta { font-size: 11px; }
+.cd-pause {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s3); flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2) var(--s3); margin-bottom: var(--s4);
+}
+.cd-pause.on { border-color: var(--red-fg); background: rgba(248,81,73,0.10); }
+.cd-pause.on b { color: var(--red-fg); }
+.cd-pauseform { display: grid; gap: var(--s2); width: 100%; }
+.cd-pauseform input { width: 100%; }
+.cd-pauseactions { display: flex; gap: var(--s2); }
+.btn.danger { background: var(--red-fg); color: var(--on-accent); border-color: transparent; font-weight: 600; }

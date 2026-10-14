@@ -125,11 +125,16 @@ function ActorBox() {
 
 function Shell() {
   const loc = useLocation();
-  const tab = (path: string, label: string, exact = false) => {
+  const me = useMe();
+  // Deployments is in beta for maintainers: the tab is drawn for a signed-in
+  // maintainer only (the API refuses everyone else anyway).
+  const maintainer = !!me.data?.configured && !!me.data.authenticated && (me.data.roles ?? []).includes("maintainer");
+  const tab = (path: string, label: string, exact = false, beta = false) => {
     const on = exact ? loc.pathname === path : loc.pathname.startsWith(path);
     return (
       <Link className={on ? "tab active" : "tab"} to={path}>
         {label}
+        {beta && <span className="beta">beta</span>}
       </Link>
     );
   };
@@ -141,7 +146,7 @@ function Shell() {
           {tab("/", "New run", true)}
           {tab("/runs", "Runs")}
           {tab("/recordings", "Recordings")}
-          {tab("/deployments", "Deployments")}
+          {maintainer && tab("/deployments", "Deployments", false, true)}
           {tab("/audit", "Audit")}
         </nav>
         <Identity />

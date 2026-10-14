@@ -1008,9 +1008,26 @@ export function deltaFamily(b: DeltaBucket): DeltaFamily {
 // answers HTML (see `request`). The pages treat all three as "off".
 // ===========================================================================
 
+/** A system's pause switch, when it is paused. */
+export type CdControl = {
+  system: string;
+  paused: boolean;
+  reason: string | null;
+  changed_by: string;
+  changed_at: string;
+};
+
 export type CdConfig =
   | { enabled: false }
-  | { enabled: true; systems: string[]; environments: string[]; promotable: string[] };
+  | {
+      enabled: true;
+      beta?: boolean;
+      systems: string[];
+      environments: string[];
+      promotable: string[];
+      /** The paused systems only; a system absent here is running. */
+      paused?: Record<string, CdControl>;
+    };
 
 export type CdVersionPr = {
   repo: string;
@@ -1066,6 +1083,14 @@ const sys = (system: string) => `system=${encodeURIComponent(system)}`;
 
 export const cdApi = {
   config: () => request<CdConfig>("/api/v1/cd/config"),
+  /** Pause or resume a system's pipeline: a signed-in maintainer only. */
+  setPause: (system: string, paused: boolean, reason: string) =>
+    request<CdControl>("/api/v1/cd/pause", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ system, paused, reason }),
+    }),
   environments: (system: string) =>
     request<{ system: string; environments: CdEnvironment[] }>(`/api/v1/cd/environments?${sys(system)}`),
   environmentDeployments: (system: string, environment: string, limit = 200) =>

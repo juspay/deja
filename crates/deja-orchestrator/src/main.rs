@@ -35,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, MethodRouter},
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
@@ -341,11 +341,18 @@ fn app_router(state: AppState) -> Router {
     ));
     // Deployment facts come from the pipeline (Jenkins) only, under the same
     // service token: a version it built, a deployment it made, what Argo
-    // reports. Reading them is open, like runs.
+    // reports. Deployments is in beta: reading them takes the same token or
+    // a signed-in maintainer (require_cd_reader), and the pause switch is a
+    // signed-in maintainer's alone.
     let service = middleware::from_fn_with_state(state.mutation_auth.clone(), require_service_auth);
+    let reader = middleware::from_fn_with_state(state.clone(), require_cd_reader);
+    let cd_read = |h: MethodRouter<AppState>| h.route_layer(reader.clone());
     let post_cd_version = post(v1_cd_post_version).route_layer(service.clone());
     let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
     let post_cd_observed = post(v1_cd_post_observed).route_layer(service);
+    let cd_pause = cd_read(get(v1_cd_pause)).merge(post(v1_cd_set_pause).route_layer(
+        middleware::from_fn_with_state(state.clone(), require_session),
+    ));
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
@@ -380,19 +387,23 @@ fn app_router(state: AppState) -> Router {
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit))
         .route("/auth/me", get(v1_auth_me))
-        .route("/cd/config", get(v1_cd_config))
-        .route("/cd/versions", post_cd_version.get(v1_cd_versions))
-        .route("/cd/versions/{version}", get(v1_cd_version))
+        .route("/cd/config", cd_read(get(v1_cd_config)))
+        .route("/cd/pause", cd_pause)
+        .route(
+            "/cd/versions",
+            cd_read(get(v1_cd_versions)).merge(post_cd_version),
+        )
+        .route("/cd/versions/{version}", cd_read(get(v1_cd_version)))
         .route("/cd/deployments", post_cd_deployment)
-        .route("/cd/environments", get(v1_cd_environments))
+        .route("/cd/environments", cd_read(get(v1_cd_environments)))
         .route("/cd/environments/{env}/observed", post_cd_observed)
         .route(
             "/cd/environments/{env}/deployments",
-            get(v1_cd_environment_deployments),
+            cd_read(get(v1_cd_environment_deployments)),
         )
         .route(
             "/cd/pull-requests/{owner}/{repo}/{number}",
-            get(v1_cd_pull_request),
+            cd_read(get(v1_cd_pull_request)),
         );
 
     Router::new()
@@ -551,6 +562,70 @@ async fn require_session(
         };
     }
     error_resp(401, "sign in to do this")
+}
+
+/// Deployments is in beta, for maintainers: every read under `/cd` takes
+/// the pipeline's bearer token (the Jenkins jobs read what they act on), or
+/// a signed-in person holding `maintainer`. With sign-in not configured
+/// there is no maintainer to recognise, so only the token reads.
+async fn require_cd_reader(
+    State(st): State<AppState>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(supplied) = bearer_token(req.headers()) {
+        return match st.mutation_auth.service_token.as_deref() {
+            Some(expected) if !service_token_matches(expected, supplied) => {
+                error_resp(401, "invalid bearer token")
+            }
+            _ => {
+                req.extensions_mut()
+                    .insert(AuthenticatedActor(SERVICE_ACTOR.to_owned()));
+                req.extensions_mut().insert(ActorSubject(None));
+                next.run(req).await
+            }
+        };
+    }
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(
+            401,
+            "Deployments is in beta for maintainers, and sign-in is not configured on this deployment",
+        );
+    }
+    let Some(session) = session_from_headers(&st, req.headers()) else {
+        return error_resp(401, "Deployments is in beta for maintainers: sign in");
+    };
+    if !cfg.domain_allowed(&session.email) {
+        return error_resp(401, "this account is no longer allowed to sign in");
+    }
+    if !cfg.has_role(&session.email, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return error_resp(403, "Deployments is in beta for maintainers only");
+    }
+    req.extensions_mut()
+        .insert(AuthenticatedActor(session.email));
+    req.extensions_mut()
+        .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
+    next.run(req).await
+}
+
+/// Why a pause or resume is refused, or None. A person's act: a signed-in
+/// maintainer, never the pipeline's token, so every flip names someone.
+fn pause_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return Some("pausing needs sign-in, which is not configured on this deployment");
+    }
+    if actor == SERVICE_ACTOR || actor_sub.filter(|s| !s.is_empty()).is_none() {
+        return Some("pausing needs a signed-in person");
+    }
+    if !cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return Some("only a maintainer may pause or resume the pipeline");
+    }
+    None
 }
 
 fn session_from_headers(
@@ -4212,12 +4287,113 @@ async fn cd_audit(
 /// `GET /api/v1/cd/config`: whether tracking is on and what it tracks.
 /// Never 404: the viewer decides whether to show the tab.
 async fn v1_cd_config(State(st): State<AppState>) -> Response {
-    match &st.cd {
-        Some(cd) => json_ok(
-            serde_json::json!({ "enabled": true, "systems": cd.systems, "environments": cd.environments, "promotable": cd.promotable }),
-        ),
-        None => json_ok(serde_json::json!({ "enabled": false })),
+    let Some(cd) = &st.cd else {
+        return json_ok(serde_json::json!({ "enabled": false }));
+    };
+    // Each system's pause switch, so the pages can say so without a second
+    // call. A system with no row is running.
+    let mut paused = serde_json::Map::new();
+    if let Some(store) = &st.store {
+        for system in &cd.systems {
+            match store.cd_control_get(system).await {
+                Ok(Some(row)) if row.paused => {
+                    paused.insert(
+                        system.clone(),
+                        serde_json::to_value(&row).unwrap_or_default(),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => return error_resp(500, &format!("pause switch: {e}")),
+            }
+        }
     }
+    json_ok(serde_json::json!({
+        "enabled": true,
+        "beta": true,
+        "systems": cd.systems,
+        "environments": cd.environments,
+        "promotable": cd.promotable,
+        "paused": paused,
+    }))
+}
+
+/// `GET /api/v1/cd/pause?system=`: the pause switch as it stands. What the
+/// jobs read before they act; any answer but this one reads as paused there.
+async fn v1_cd_pause(State(st): State<AppState>, axum::extract::Query(q): Query) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.cd_control_get(&system).await {
+        Ok(Some(row)) => json_ok_ser(&row),
+        Ok(None) => json_ok(serde_json::json!({ "system": system, "paused": false })),
+        Err(e) => error_resp(500, &format!("pause switch: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetPause {
+    system: String,
+    paused: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /api/v1/cd/pause` `{system, paused, reason}`: a signed-in
+/// maintainer pauses or resumes the pipeline. Pausing needs a reason.
+async fn v1_cd_set_pause(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Some(why) = pause_refusal(&st.auth.config(), &actor.0, subject.0.as_deref()) {
+        return error_resp(403, why);
+    }
+    let b: SetPause = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&b.system) {
+        return error_resp(400, &format!("unknown system {:?}", b.system));
+    }
+    let reason = b.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if b.paused && reason.is_none() {
+        return error_resp(400, "say why: pausing needs a reason");
+    }
+    let row = match store
+        .cd_control_set(&b.system, b.paused, reason, &actor.0, subject.0.as_deref())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("pause switch: {e}")),
+    };
+    cd_audit(
+        &store,
+        &actor.0,
+        if b.paused { "cd.pause" } else { "cd.resume" },
+        "system",
+        &b.system,
+        &serde_json::json!({ "reason": reason }),
+    )
+    .await;
+    json_ok_ser(&row)
 }
 
 /// `POST /api/v1/cd/versions`: the pipeline posts a version it built, with
@@ -6631,6 +6807,115 @@ mod sign_in {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn cd_reader_router(st: AppState) -> Router {
+        let reader = middleware::from_fn_with_state(st.clone(), require_cd_reader);
+        Router::new()
+            .route("/cd-read", get(whoami).route_layer(reader))
+            .with_state(st)
+    }
+
+    fn get_cd_read() -> axum::http::request::Builder {
+        Request::builder().method(Method::GET).uri("/cd-read")
+    }
+
+    #[tokio::test]
+    async fn deployments_reads_are_for_maintainers_and_the_pipeline() {
+        let (auth, signer) = enabled(&["ravi@juspay.in"]);
+        let st = state(auth, Some("tok"));
+        // Anonymous: sign in.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(body.contains("beta"), "{body}");
+        // A typed name is nobody.
+        let (code, _) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header("x-deja-actor", "ravi@juspay.in")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        // Signed in, not a maintainer.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+        // A maintainer reads, as themselves.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, "ravi@juspay.in"));
+        // The pipeline's token reads; a wrong one does not.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, SERVICE_ACTOR));
+        let (code, _) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn without_sign_in_only_the_pipeline_reads_deployments() {
+        let st = state(AuthState::disabled(), Some("tok"));
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header("x-deja-actor", "ravi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("sign-in is not configured"), "{body}");
+        let (code, _) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    #[test]
+    fn only_a_signed_in_maintainer_pauses() {
+        let (auth, _) = enabled(&["ravi@juspay.in"]);
+        let cfg = auth.config();
+        assert_eq!(pause_refusal(&cfg, "ravi@juspay.in", Some("s-ravi")), None);
+        assert!(pause_refusal(&cfg, "asha@juspay.in", Some("s-asha")).is_some());
+        assert!(pause_refusal(&cfg, SERVICE_ACTOR, None).is_some());
+        assert!(pause_refusal(&cfg, "ravi@juspay.in", None).is_some());
+        assert!(pause_refusal(&AuthState::disabled().config(), "ravi", Some("s")).is_some());
     }
 
     fn post_gated() -> axum::http::request::Builder {

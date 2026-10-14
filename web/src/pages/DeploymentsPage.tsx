@@ -1,8 +1,11 @@
 // Deployments: what runs in each environment, how it got there, and where
-// each version and pull request is. Read-only; every fact comes from the CD
-// pipeline's posts and the reconcile job's observations, through
-// `/api/v1/cd/*`. Promotion (phase 5) is not here yet, and no control for it
-// is drawn until it is.
+// each version and pull request is. Every fact comes from the CD pipeline's
+// posts and the reconcile job's observations, through `/api/v1/cd/*`.
+// Promotion (phase 5) is not here yet, and no control for it is drawn until
+// it is. The one control is the pause switch.
+//
+// BETA, for maintainers: the API answers a signed-in maintainer (or the
+// pipeline's token) only, and the tab is drawn for maintainers only.
 //
 // Five views under /deployments, all keyed by `?system=` so a link carries
 // the system it was read from:
@@ -13,11 +16,13 @@
 //   /deployments/pull-requests/:owner/:repo/:n     where a pull request is
 
 import React from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 
+import { loginUrl } from "../lib/me";
 import {
   cdApi,
+  type ApiError,
   type CdConfig,
   type CdDeploymentRow,
   type CdEnvironment,
@@ -29,7 +34,8 @@ import { ago, argoOf, carries, howOf, isRunning, mergesSince, placesOf, pullRequ
 // ---- shared ---------------------------------------------------------------
 
 function useCdConfig() {
-  return useQuery({ queryKey: ["cd", "config"], queryFn: cdApi.config, staleTime: Infinity, retry: false });
+  // Polled, so a pause made by someone else shows up here too.
+  return useQuery({ queryKey: ["cd", "config"], queryFn: cdApi.config, staleTime: 15_000, refetchInterval: 30_000, retry: false });
 }
 
 /** The system the page reads, from `?system=`, else the first tracked one. */
@@ -63,6 +69,105 @@ function Off({ why }: { why?: string }) {
   );
 }
 
+/** What someone who is not a maintainer sees: the reason, and the way in. */
+function MaintainersOnly({ err }: { err: ApiError }) {
+  const signIn = err.status === 401 && !String(err.message).includes("not configured");
+  return (
+    <div className="empty">
+      <div className="et">
+        Deployments <span className="beta">beta</span>
+      </div>
+      <p className="hint">
+        Deployments is in beta and open to maintainers only.{" "}
+        {err.status === 403
+          ? "Your account is not on the maintainer list; ask to be added to it in the déjà configuration."
+          : signIn
+            ? "Sign in with a maintainer account."
+            : "Sign-in is not configured on this deployment, so no one can open it here."}
+      </p>
+      {signIn && (
+        <a className="btn primary" href={loginUrl()}>
+          Sign in
+        </a>
+      )}
+    </div>
+  );
+}
+
+/** The pipeline's pause switch: a banner while paused, a control either way.
+ *  The API takes it from a signed-in maintainer only. */
+function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; system: string }) {
+  const qc = useQueryClient();
+  const paused = cfg.paused?.[system];
+  const [asking, setAsking] = React.useState(false);
+  const [reason, setReason] = React.useState("");
+  const flip = useMutation({
+    mutationFn: (next: boolean) => cdApi.setPause(system, next, reason.trim()),
+    onSuccess: () => {
+      setAsking(false);
+      setReason("");
+      void qc.invalidateQueries({ queryKey: ["cd", "config"] });
+    },
+  });
+  if (paused) {
+    return (
+      <div className="cd-pause on" role="status">
+        <div>
+          <b>Pipeline paused</b> for {system}. No merge is deployed to integ, and no hop replay or release is started, until it
+          is resumed. Reconcile keeps reporting what runs.
+          <div className="hint">
+            by {paused.changed_by} · {when(paused.changed_at)} · {ago(paused.changed_at) === "just now" ? "just now" : `${ago(paused.changed_at)} ago`}{paused.reason ? ` · ${paused.reason}` : ""}
+          </div>
+          {flip.error && <div className="err">{String(flip.error)}</div>}
+        </div>
+        <button className="btn primary" disabled={flip.isPending} onClick={() => flip.mutate(false)}>
+          Resume
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="cd-pause">
+      {!asking ? (
+        <>
+          <span className="hint">Pipeline running for {system}.</span>
+          <button className="btn" onClick={() => setAsking(true)}>
+            Pause pipeline
+          </button>
+        </>
+      ) : (
+        <form
+          className="cd-pauseform"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (reason.trim()) flip.mutate(true);
+          }}
+        >
+          <label htmlFor="cd-pause-reason">
+            Why pause? integ-deploy, hop replays and releases stop before their next step; a step already running finishes.
+          </label>
+          <input
+            id="cd-pause-reason"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. integ is broken by #2501, investigating"
+            autoFocus
+          />
+          <div className="cd-pauseactions">
+            <button className="btn danger" type="submit" disabled={!reason.trim() || flip.isPending}>
+              Pause
+            </button>
+            <button className="btn" type="button" onClick={() => setAsking(false)}>
+              Cancel
+            </button>
+          </div>
+          {flip.error && <div className="err">{String(flip.error)}</div>}
+        </form>
+      )}
+    </div>
+  );
+}
+
 /** The page frame: title, system switcher, sub-navigation. Children render
  *  only once the config says tracking is on. */
 function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: React.ReactNode; children: (cfg: Extract<CdConfig, { enabled: true }>, system: string) => React.ReactNode }) {
@@ -78,13 +183,17 @@ function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: Rea
     );
   };
   if (cfg.isLoading) return <p className="hint">loading…</p>;
+  const status = (cfg.error as ApiError | null)?.status;
+  if (cfg.error && (status === 401 || status === 403)) return <MaintainersOnly err={cfg.error as ApiError} />;
   if (cfg.error) return <Off why={String(cfg.error)} />;
   if (!cfg.data || !cfg.data.enabled) return <Off />;
   const c = cfg.data;
   return (
     <>
       <div className="pagehead">
-        <h1>{title}</h1>
+        <h1>
+          {title} <span className="beta" title="In beta, for maintainers">beta</span>
+        </h1>
         <div className="cd-switch">
           <label className="hint" htmlFor="cd-system">
             System
@@ -103,6 +212,7 @@ function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: Rea
         {sub("/deployments/versions", "Versions")}
         {sub("/deployments/environments", "Environments")}
       </div>
+      <PauseSwitch cfg={c} system={system} />
       {crumb && <div className="crumb">{crumb}</div>}
       {children(c, system)}
     </>
