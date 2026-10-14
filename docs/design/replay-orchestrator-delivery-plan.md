@@ -15,7 +15,7 @@ Legend: **[DECIDED]** ratified direction · **[BUILT]** exists and works today �
 
 A user triggers a replay from the dashboard with exactly **two strings**:
 
-1. a **recording** — an S3 path (`s3://hyperswitch-art/2026/07/11`) or a catalog id, and
+1. a **recording** — an S3 path (`s3://<recording-bucket>/2026/07/11`) or a catalog id, and
 2. a **candidate** — a branch / PR# / short-sha / tag / full image ref.
 
 From that pair the system derives everything else. A replay run is
@@ -100,8 +100,8 @@ the running pod's `ns:sa` is denied and S3/SecretsManager fail closed, so this t
 
 | plane | namespace | ServiceAccount | IRSA role | trust subject | policy |
 |---|---|---|---|---|---|
-| control (orchestrator Deployment) | `replay-orchestrator-sandbox` *(keep existing Argo destination)* | `replay-orchestrator-role` | `sandbox-hyperswitch-replay-orchestrator-role` | `system:serviceaccount:replay-orchestrator-sandbox:replay-orchestrator-role` | S3 **RW** on `hyperswitch-art` |
-| env (Jobs) | `replay-sbx` *(dedicated, Amendment 1)* | `replay-job-role` | `sandbox-hyperswitch-replay-job-role` | `system:serviceaccount:replay-sbx:replay-job-role` | S3 **read** on `hyperswitch-art` + SecretsManager read on `sandbox/hyperswitch*` (+ `kms:Decrypt` if CMK) |
+| control (orchestrator Deployment) | `replay-orchestrator-sandbox` *(keep existing Argo destination)* | `replay-orchestrator-role` | `sandbox-hyperswitch-replay-orchestrator-role` | `system:serviceaccount:replay-orchestrator-sandbox:replay-orchestrator-role` | S3 **RW** on `<recording-bucket>` |
+| env (Jobs) | `replay-sbx` *(dedicated, Amendment 1)* | `replay-job-role` | `sandbox-hyperswitch-replay-job-role` | `system:serviceaccount:replay-sbx:replay-job-role` | S3 **read** on `<recording-bucket>` + SecretsManager read on `sandbox/hyperswitch*` (+ `kms:Decrypt` if CMK) |
 
 Orchestrator→Jobs RBAC is a **cross-namespace** Kubernetes grant: Role `replay-job-manager` in
 `replay-sbx` + a RoleBinding in `replay-sbx` whose subject is the orchestrator SA in
@@ -118,8 +118,8 @@ points.** Orchestrator-side (before POST, refusal is free): P0 P1 P3 P4 P5 P7 P8
 `fingerprints.json`.
 
 **R7 — Push-back URL is chart-rendered, never compiled in.** `DEJA_ORCHESTRATOR_CALLBACK_URL =
-http://sandbox-replay-orchestrator.replay-orchestrator-sandbox.svc.cluster.local:80` (fullname
-helper, **port 80** = the Service port; targetPort 8080 is not answerable on the ClusterIP).
+http://{{ include "replay-orchestrator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:80`
+(fullname helper, **port 80** = the Service port; targetPort 8080 is not answerable on the ClusterIP).
 The executor copies it verbatim into the Job's `DEJA_ORCHESTRATOR_URL`; the runner appends
 `/api/v1/runs/{id}/events`. This fixes the verified 3-axis push-back bug (name, namespace, port).
 
@@ -472,11 +472,11 @@ controls: `recording` (S3 path or catalog dropdown) and `candidate` (one text bo
 fields, and the binaryPath field (move the build-a-binary snippet to a help tab). Live curl
 preview renders the two-field body.
 
-**C-DEFAULTS — cluster Layer-B env (chart)** *(CS8, infra)*. `DEJA_S3_BUCKET=hyperswitch-art`,
-`DEJA_S3_REGION=ap-south-1`, `DEJA_S3_ALLOW_HTTP=false`, `DEJA_S3_ACCESS_KEY=""` +
+**C-DEFAULTS — cluster Layer-B env (chart)** *(CS8, infra)*. `DEJA_S3_BUCKET=<recording-bucket>`,
+`DEJA_S3_REGION=<operator-provided-region>`, `DEJA_S3_ALLOW_HTTP=false`, `DEJA_S3_ACCESS_KEY=""` +
 `DEJA_S3_SECRET_KEY=""` (explicit empty so IRSA engages — `S3Config` defaults to `minioadmin` and
 `has_static_credentials()` masks IRSA → 403), `DEJA_REPLAY_ENV=sbx-mirror`,
-`DEJA_CANDIDATE_REGISTRY_DEFAULT=223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router`,
+`DEJA_CANDIDATE_REGISTRY_DEFAULT=<aws-account-id>.dkr.ecr.<region>.amazonaws.com/hyperswitch-router`,
 `DEJA_CANDIDATE_REPO_DEFAULT=juspay/hyperswitch`, `DEJA_CANDIDATE_GIT_REMOTE` only if O12
 confirmed. **Remove** the static-key `replay-orchestrator-aws` secretRefs so they cannot mask
 IRSA. The demo-MinIO S3 defaults in code (`compactor lib.rs:57-64`) stay as-is and are overridden
@@ -544,8 +544,8 @@ tightened image.
 Two coordinated repo pieces + a named ask list. **The repo self-serves everything up to the
 `terragrunt apply` boundary** (Atlantis owns apply; ArgoCD only syncs manifests). Load-bearing
 ordering: merge the terragrunt PR → infra applies → `role_arn` in tfstate → ArgoCD resolves the
-`$<…>$` tokens. First, drop the stray Vector sink diff:
-`git checkout -- infra-configurations/vector/sandbox-hyperswitch-art-s3.yaml`.
+`$<…>$` tokens. First, drop the stray Vector S3 sink diff from the infra checkout;
+replay ingests the deployed layout.
 
 **E-ORCH — transform the replay-orchestrator chart** off the superseded DinD model into the thin
 control plane *(infra S1/S2/S3/S4/S12, incluster I1/I2/I5/I6)*:
@@ -555,8 +555,7 @@ control plane *(infra S1/S2/S3/S4/S12, incluster I1/I2/I5/I6)*:
   $<replay_orchestrator.role_arn>$` (SA `replay-orchestrator-role`); **blank both S3 keys to `""`**
   and **remove** the `replay-orchestrator-aws` secretRefs (deletion alone leaves the `minioadmin`
   default).
-- Callback + executor knobs: `DEJA_ORCHESTRATOR_CALLBACK_URL =
-  http://sandbox-replay-orchestrator.replay-orchestrator-sandbox.svc.cluster.local:80` (R7);
+- Callback + executor knobs: `DEJA_ORCHESTRATOR_CALLBACK_URL = http://{{ include "replay-orchestrator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:80` (R7);
   `DEJA_EXECUTOR=k8s`, `DEJA_REPLAY_ENV=sbx-mirror`, `DEJA_JOB_NAMESPACE=replay-sbx`,
   `DEJA_JOB_SHAPE` (echo first), `DEJA_RUNNER_IMAGE`, `DEJA_JOB_SERVICE_ACCOUNT=replay-job-role`,
   `DEJA_CANDIDATE_IMAGE_DEFAULT`, `DEJA_PG_IMAGE`, `DEJA_REDIS_IMAGE`, `DEJA_JOB_TTL_SECONDS=86400`,
@@ -602,11 +601,11 @@ module (@ `tf/app/revenue-recovery-v0.1.0` — generic IRSA+S3, role name
 provider, **no separate OIDC ask**) *(infra S5/S6)*:
 - `apps/replay-orchestrator/terragrunt.hcl` — `app_name=replay-orchestrator`,
   `cluster_service_accounts {cluster => [{namespace=replay-orchestrator-sandbox,
-  name=replay-orchestrator-role}]}`, `s3={create=false, bucket_arn=arn:aws:s3:::hyperswitch-art}`
+  name=replay-orchestrator-role}]}`, `s3={create=false, bucket_arn=arn:aws:s3:::<recording-bucket>}`
   (RW, never re-creates the bucket).
 - `apps/replay-job/terragrunt.hcl` — `app_name=replay-job`, `{namespace=replay-sbx,
   name=replay-job-role}`, **no** s3 block (module policy is hardcoded RW); grant least-privilege
-  via `inline_policies`: S3 read-only on `hyperswitch-art`, SecretsManager read on
+  via `inline_policies`: S3 read-only on `<recording-bucket>`, SecretsManager read on
   `sandbox/hyperswitch*`, optional `kms:Decrypt` on the CMK once O6 confirms.
 
 **E-ECR** *(infra S10)* — add `hyperswitch-replay-orchestrator` to the repositories map in
@@ -782,7 +781,7 @@ compose) · `DEJA_REPLAY_ENV` · `DEJA_JOB_NAMESPACE=replay-sbx` · `DEJA_JOB_SH
 `DEJA_CANDIDATE_REGISTRY_DEFAULT` · `DEJA_CANDIDATE_REPO_DEFAULT` · `DEJA_CANDIDATE_IMAGE_DEFAULT` ·
 `DEJA_CANDIDATE_GIT_REMOTE` (optional) · `DEJA_CODE_BUNDLE_PREFIX` · `DEJA_DB_URL` (mandatory in
 k8s/local) · `DEJA_PG_IMAGE` · `DEJA_REDIS_IMAGE`. **Set-for-cluster (existing keys):**
-`DEJA_S3_BUCKET=hyperswitch-art`, `DEJA_S3_REGION=ap-south-1`, `DEJA_S3_ALLOW_HTTP=false`,
+`DEJA_S3_BUCKET=<recording-bucket>`, `DEJA_S3_REGION=<operator-provided-region>`, `DEJA_S3_ALLOW_HTTP=false`,
 `DEJA_S3_ACCESS_KEY=""`, `DEJA_S3_SECRET_KEY=""`.
 
 **Job-injected by the typed patch.** `DEJA_RUN_ID`, `DEJA_RUN_SPEC`, `DEJA_ORCHESTRATOR_URL`,
@@ -862,11 +861,11 @@ decode path replay already uses — instead of `to_string()`-ing the wrapper.
 - **V8 [BLOCKER, verified ✓] none of the design is in the working tree.** `dind.enabled: true`, `privileged: true` (`templates/deployment.yaml:93`); no `helm-charts/charts/replay-env/`; no `terraform/.../apps/replay-*` unit; zero `replay-sbx`/`replay-job-role`/`replay-env` strings. Handed over as-is Monday it delivers the *opposite* of every locked decision, and carries a stray breaking Vector-sink diff. **The PR must be built before it can be handed over — it does not exist yet.**
 - **V9 [BLOCKER] Job ServiceAccount name is contradictory across areas** — `replay-job-role` (infra area) vs `replay-orchestrator-job-role` (spine area). IRSA is a byte-match of `system:serviceaccount:<ns>:<sa>`; disagreement fails every Job's S3 pull + crypto ESO closed. Reconcile to ONE name.
 - **V10 [MAJOR] the orchestrator's own `replay-orchestrator-api` token secret is an unlisted dependency** — nothing produces it, it's not in the ask-list; a missing `secretKeyRef` target is `CreateContainerConfigError`, the orchestrator never boots.
-- Verified **SOUND** (do not chase): the push-back URL `sandbox-replay-orchestrator.replay-orchestrator-sandbox.svc:80` is correct on all three axes; the tfstate underscore-key/hyphen-dir split is real; the terraform module supports `create=false`+existing-bucket and exports `role_arn`; the crypto `sandbox/hyperswitch` path is real.
+- Verified **SOUND** (do not chase): the chart-rendered push-back URL is correct on all three axes; the tfstate underscore-key/hyphen-dir split is real; the terraform module supports `create=false`+existing-bucket and exports `role_arn`; the crypto `sandbox/hyperswitch` path is real.
 
 ## Config + local parity (attacker 3)
 
-- **V11 [HIGH, verified ✓] sha_R cannot be resolved for the aggregator (date-partitioned) layout — the headline input.** `read_manifest` (`compactor/lib.rs:319`) GETs only the session-layout `manifest.json`; the aggregator prefix has none (`pull_recording_from_prefix` returns `sealed:false`, no manifest). So the ideal body `recording: "s3://hyperswitch-art/2026/07/11"` → manifest NotFound → P0 refuses **every** run. CS3 (manifest always present) contradicts SPINE-4 (envelope CodeProbe). And the envelope route only works if the record env set `identity.code_sha` — which sandbox does not. The two-param promise leaks a record-time dependency.
+- **V11 [HIGH, verified ✓] sha_R cannot be resolved for the aggregator (date-partitioned) layout — the headline input.** `read_manifest` (`compactor/lib.rs:319`) GETs only the session-layout `manifest.json`; the aggregator prefix has none (`pull_recording_from_prefix` returns `sealed:false`, no manifest). So the ideal body `recording: "s3://<recording-bucket>/2026/07/11"` → manifest NotFound → P0 refuses **every** run. CS3 (manifest always present) contradicts SPINE-4 (envelope CodeProbe). And the envelope route only works if the record env set `identity.code_sha` — which sandbox does not. The two-param promise leaks a record-time dependency.
 - **V12 [HIGH, verified ✓] the local pipeline's A3 guard cannot fire in its fast tier.** Tier-1a runs a host-native runner + a container router mounting the same dir at different absolute paths, so `root.lookup_table_path` (host) can never string-equal `REPLAY__SOURCE` (container `/state/…`). The guard that is supposed to make "local success predict cluster success" for the live-traffic-leak bug is always-false in the tier billed as the inner loop.
 - **V13 [MED-HIGH] `DEJA_EXECUTOR` is defined four incompatible ways** across the four areas (`compose|k8s` / `compose|local|k8s` / `compose|external` / `k8s`); the spine's default-to-compose fallthrough re-introduces the double-drive bug the local pipeline exists to prevent. Must be ONE enum with a "not-compose ⇒ never `spawn_worker`" rule.
 - **V14 [MED] the headline candidate `deja-pr-patch-real-change` resolves to the git-egress tier** that can't run Monday, and the branch-vs-tag shape heuristic can't disambiguate it from a bare tag; a wrong guess is an ImagePullBackOff caught only at pod-pull, no preflight. **V15 [LOW] a bare recording prefix mis-parses the bucket** (`to_config` treats segment 0 as the bucket).

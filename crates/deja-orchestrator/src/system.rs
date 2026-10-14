@@ -476,15 +476,10 @@ mod tests {
         }
     }
 
-    /// The deployment's declaration, resolved by the code that reads it.
-    ///
-    /// A verbatim copy of what sandbox sets in DEJA_CONFIG_TOML (infra:
-    /// deployment-configs/replay-orchestrator/sandbox-values-dep.yaml), so the
-    /// producer and the consumer of this document are checked against each
-    /// other rather than each being separately plausible. Copies drift, and a
-    /// drifted copy here is a failing test rather than a silent misconfiguration.
+    /// Illustrative configuration for resolution semantics; these values do
+    /// not represent a deployed roster or prove deployed configuration.
     #[test]
-    fn sbx_deployment_values_resolve_as_intended() {
+    fn illustrative_system_values_resolve_as_intended() {
         let _lock = env_guard();
         toml(INFRA_TOML);
         let reg = registry();
@@ -503,7 +498,7 @@ mod tests {
             .expect("a default is marked");
         assert_eq!(h.name, "hyperswitch");
         assert_eq!(h.error, None, "{:?}", h.error);
-        assert_eq!(h.s3_bucket.as_deref(), Some("hyperswitch-art"));
+        assert_eq!(h.s3_bucket.as_deref(), Some("example-router-recordings"));
         assert!(h.manages_stores && h.has_code_bundle);
         assert_eq!(
             h.manages_stores_declared,
@@ -511,21 +506,18 @@ mod tests {
             "declared, not inherited"
         );
         assert_eq!(h.job_template_key.as_deref(), Some("job.json"));
-        const MAIN: &str = "sbx-hyperswitch-server-";
+        const MAIN: &str = "example-router-server-";
         assert_eq!(
             h.main_instance_prefix.as_deref(),
             Some(MAIN),
             "recording selection needs to know which pods are the main deployment"
         );
-        // The anchor is the point of the field, so the test states it: the
-        // custom deployments must fail this prefix. If someone ever shortens the
-        // declaration to the bare service name, this is what fails.
         for custom in [
-            "sbx-custom-cug-hyperswitch-server-54d4746479-d2qr7",
-            "sbx-custom-vbt-hyperswitch-server-f984678bf-57vvv",
+            "example-custom-cug-router-server-54d4746479-d2qr7",
+            "example-custom-vbt-router-server-f984678bf-57vvv",
         ] {
             assert!(
-                custom.contains("hyperswitch-server"),
+                custom.contains("router-server"),
                 "precondition: the custom pod carries the bare service name"
             );
             assert!(
@@ -533,13 +525,10 @@ mod tests {
                 "`{custom}` must not read as the main deployment"
             );
         }
-        // The document and the comparator are checked against each other here:
-        // this is the exact string a deployment writes, in the exact grammar the
-        // recorder mints, so the move to a vendor declaration is a copy.
         assert_eq!(
             h.reply_canons.get("http_incoming").map(String::as_str),
             Some("bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"),
-            "the payment-methods list is declared unordered for the router's ingress"
+            "the payment-methods list is declared unordered for ingress"
         );
         assert_eq!(
             h.candidate_env.get("MODE_ENV").map(String::as_str),
@@ -557,30 +546,23 @@ mod tests {
             .expect("prism is declared");
         assert_eq!(p.error, None, "{:?}", p.error);
         assert!(!p.is_default);
-        assert_eq!(p.s3_bucket.as_deref(), Some("ucs-deja"));
+        assert_eq!(p.s3_bucket.as_deref(), Some("example-connector-recordings"));
         assert!(!p.manages_stores && !p.has_code_bundle);
         assert_eq!(p.instance_pattern.as_deref(), Some("ucs"));
-        // Declared, so a caller asking to be restricted to main instances is
-        // served rather than refused. Asserted as the SELECTION it performs and
-        // not as a string, because the string alone cannot fail usefully: the
-        // prefix has to admit the pods UCS actually deploys and reject a tape
-        // written outside that deployment, and both of those are live today.
         let main_pods = p
             .main_instance_prefix
             .as_deref()
             .expect("prism declares its primary deployment");
         assert!(
-            "sbx-custom-hyperswitch-ucs-5dd9b6457d-tbvn6".starts_with(main_pods),
-            "the prefix must admit a UCS deployment pod"
+            "example-custom-router-ucs-5dd9b6457d-tbvn6".starts_with(main_pods),
+            "the prefix must admit a primary deployment pod"
         );
         assert!(
             !"pi-1-1787741712798221595".starts_with(main_pods),
             "a tape from outside the deployment must not pass as a main instance"
         );
-        // Anchored, not a substring — the distinction that keeps this from
-        // behaving like `instance_pattern` above.
         assert!(
-            !"prod-sbx-custom-hyperswitch-ucs-1".starts_with(main_pods),
+            !"prod-example-custom-router-ucs-1".starts_with(main_pods),
             "the prefix is anchored at the start of the pod name"
         );
         assert_eq!(p.scored_span_namespaces, vec!["ucs::", "connector::"]);
@@ -601,41 +583,29 @@ mod tests {
             Some("CS__DEJA__RUN_ID")
         );
         assert_eq!(p.candidate_config_files, None, "no bundle, no files");
-
-        // The attribution that used to mislabel: a router pod is now unknown.
         assert_eq!(
             match_instances(&reg, &["inst=ucs-api-7d9".to_owned()]).as_deref(),
             Some("prism")
         );
         assert_eq!(
-            match_instances(&reg, &["inst=hyperswitch-router-abc".to_owned()]),
+            match_instances(&reg, &["inst=router-api-abc".to_owned()]),
             None
         );
     }
 
-    /// Verbatim from infra. If this drifts from what is deployed, the test
-    /// above is checking a document nobody ships.
+    /// Representative system declarations for exercising resolution behavior.
     const INFRA_TOML: &str = r#"default_system = "hyperswitch"
 
-# The payment router. Records into hyperswitch-art. The harness owns its
-# postgres and redis, and it publishes a CodeBundle the replay Job stages
-# before boot; the files that bundle carries besides migrations are the
-# router's own deployment configs and the offline Superposition fallback
-# (see the note under DEJA_CANDIDATE_CONFIG_FILES below for why
-# docker_compose.toml is deliberately not among them).
+# Illustrative declarations: bucket and image repository values are fictional.
 [systems.hyperswitch]
-s3_bucket = "hyperswitch-art"
-candidate_image_repo = "223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router"
+s3_bucket = "example-router-recordings"
+candidate_image_repo = "000000000000.dkr.ecr.example.invalid/router"
 candidate_env_prefix = "ROUTER__"
 manages_stores = true
 has_code_bundle = true
 job_template_key = "job.json"
-# Which pods are the PRIMARY deployment. Sandbox also runs custom pods
-# (sbx-custom-cug-…, sbx-custom-vbt-…) which carry their own code and whose
-# tapes are not what a pull-request replay wants to be compared against.
-# Anchored, and it has to be: the custom names contain the bare service name
-# `hyperswitch-server`, so only the `sbx-` boundary separates them.
-main_instance_prefix = "sbx-hyperswitch-server-"
+# Anchored prefix excludes custom deployments carrying the same service name.
+main_instance_prefix = "example-router-server-"
 candidate_config_files = [
   "config/deployments/sandbox.toml",
   "config/deployments/production.toml",
@@ -643,46 +613,21 @@ candidate_config_files = [
   "config/superposition_seed.toml",
 ]
 
-# UCS, the unified connector service. Records into its own bucket
-# (vector-ucs-deja unit, 30-day retention), never mixed into
-# hyperswitch-art; the recordings page's prism filter scans it, which needs
-# the read whitelist on the replay-orchestrator and replay-job IRSA roles.
-# No harness-managed stores and no CodeBundle: its job template
-# (job.prism.json in the replay-env chart) has neither postgres nor
-# migrations, and a bundle resolved for it would arm a patch against an
-# init container that template deliberately does not have. Candidates come
-# from a different image repo — bare refs qualify against it, and without
-# it the orchestrator refuses bare prism refs by name, because a prism sha
-# qualified against the router repo is a guaranteed dead pull (it happened,
-# twice).
-# The payment-methods list is emitted from an unordered source, so the same
-# methods come back in a different order run to run. Declared in the recorder's
-# own grammar: when the router's declaration at request_id.rs grows this clause,
-# this line is deleted — and until it does, the scorecard reports the path as
-# governed by "both", which is how a deployment knows it is safe to delete.
 [systems.hyperswitch.reply_canons]
 http_incoming = "bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"
 
 [systems.prism]
-s3_bucket = "ucs-deja"
-candidate_image_repo = "223655089699.dkr.ecr.ap-south-1.amazonaws.com/connector-service"
+s3_bucket = "example-connector-recordings"
+candidate_image_repo = "000000000000.dkr.ecr.example.invalid/connector-service"
 candidate_env_prefix = "CS__"
 manages_stores = false
 has_code_bundle = false
 job_template_key = "job.prism.json"
 instance_pattern = "ucs"
-# Which pods are the PRIMARY deployment. Note this is a `sbx-custom-` name,
-# which for hyperswitch above marks a pod to EXCLUDE: there, custom pods carry
-# their own code and the main deployment is `sbx-hyperswitch-server-`. UCS has
-# no such pair — every pod it records from is `sbx-custom-hyperswitch-ucs-`, so
-# for this system that prefix IS the primary deployment rather than the thing
-# selection avoids. Do not "correct" it to match hyperswitch's shape.
-# What it excludes is the other kind of stray: recordings written outside the
-# deployment entirely, like `pi-1-<nanos>`, which is a boot-derived local tape
-# no pull-request replay wants to be compared against.
-main_instance_prefix = "sbx-custom-hyperswitch-ucs-"
+main_instance_prefix = "example-custom-router-ucs-"
 scored_span_namespaces = ["ucs::", "connector::"]
-source_repo = "juspay/hyperswitch-prism""#;
+source_repo = "juspay/hyperswitch-prism"
+"#;
 
     #[test]
     fn a_declared_system_resolves_every_field() {
@@ -714,7 +659,6 @@ scored_span_namespaces = ["a::", "b::"]
         assert_eq!(c.s3_bucket.as_deref(), Some("regsys-bucket"));
         assert_eq!(c.recording_root.as_deref(), Some("landing/v9"));
         assert_eq!(c.s3_prefix.as_deref(), Some("regsys"));
-        // Trailing slash stripped, so joining a reference cannot double it.
         assert_eq!(
             c.candidate_image_repo.as_deref(),
             Some("registry.example/repo")
@@ -731,7 +675,6 @@ scored_span_namespaces = ["a::", "b::"]
         assert_eq!(c.config_source_container.as_deref(), Some("ctr"));
         assert_eq!(c.instance_pattern.as_deref(), Some("regsys"));
         assert_eq!(c.scored_span_namespaces, vec!["a::", "b::"]);
-        // The prefix names four slots; the explicit name wins the fifth.
         assert_eq!(
             c.candidate_env.get("MODE_ENV").map(String::as_str),
             Some("X__DEJA__MODE")
@@ -742,20 +685,14 @@ scored_span_namespaces = ["a::", "b::"]
         );
     }
 
-    /// The replay pull path resolves a recording the same way the listing does.
-    /// It did not: the pull read the deployment's own bucket, so a run whose
-    /// recording lives in another system's bucket failed "no landing objects"
-    /// for a recording the listing had just offered — before admission, which
-    /// is why admission's ingress gap was never the first obstacle.
-    ///
-    /// Deployment values, so this fails if the document changes shape.
+    /// Illustrative declarations ensure systems resolve to their own buckets.
     #[test]
     fn a_recording_resolves_to_its_own_systems_bucket() {
         let _lock = env_guard();
         toml(
             "default_system = \"hyperswitch\"\n\
-             [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
-             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+             [systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n\
+             [systems.prism]\ns3_bucket = \"example-connector-recordings\"\n",
         );
         let prism = recording_scope("prism");
         let hyperswitch = recording_scope("hyperswitch");
@@ -764,12 +701,12 @@ scored_span_namespaces = ["a::", "b::"]
 
         assert_eq!(
             prism.as_ref().map(|(b, _)| b.bucket.as_str()),
-            Ok("ucs-deja"),
+            Ok("example-connector-recordings"),
             "a prism run pulls from prism's bucket"
         );
         assert_eq!(
             hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
-            Ok("hyperswitch-art")
+            Ok("example-router-recordings")
         );
         assert_ne!(
             prism.as_ref().map(|(b, _)| b.bucket.as_str()),

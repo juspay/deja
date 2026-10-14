@@ -1344,10 +1344,10 @@ async fn v1_available_recordings(
     let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
     // The SCANNED bucket, not the deployment's default. The rows above came from
     // whichever bucket `scan_scope` resolved for the named system, so reading
-    // their manifests from `from_env()` would look for a prism recording's seal
-    // in hyperswitch-art — finding nothing, and reporting every prism row as
-    // unsealed with null counts. That failure is silent: "not sealed" is a valid
-    // answer, so nothing downstream could tell it from the truth.
+    // their manifests from `from_env()` would look for a recording's seal in a
+    // different bucket — finding nothing, and reporting every row as unsealed
+    // with null counts. That failure is silent: "not sealed" is a valid answer,
+    // so nothing downstream could tell it from the truth.
     let cfg_for_manifests = scanned.clone();
     // This listing does not distinguish "not sealed" from "could not tell" —
     // read_manifests preserves that per-recording, a replay's membership check
@@ -4308,7 +4308,7 @@ mod tests {
             .expect("runtime");
         std::env::set_var(
             "DEJA_CONFIG_TOML",
-            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n",
         );
         let dir = tempfile::tempdir().unwrap();
         let response = rt.block_on(v1_recording_correlations(
@@ -4339,22 +4339,16 @@ mod tests {
     }
 
     /// Both recording endpoints answer questions about the same recording, so
-    /// they must resolve it the same way. `/recordings/available?system=prism`
-    /// reported a recording in `ucs-deja` while
-    /// `/recordings/{id}/correlations?system=prism` looked in the default
-    /// bucket and answered "is not in s3://hyperswitch-art/landing/v1" — a
-    /// recording that existed to one endpoint and not to its sibling.
-    ///
-    /// Values are the deployment's own, so this fails if the document changes
-    /// shape rather than passing against a plausible invention.
+    /// separate illustrative system buckets must resolve consistently.
+    /// This tests resolver behavior, not deployed configuration.
     #[test]
     fn both_recording_endpoints_resolve_a_system_the_same_way() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(
             "DEJA_CONFIG_TOML",
             "default_system = \"hyperswitch\"\n\
-             [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n\
-             [systems.prism]\ns3_bucket = \"ucs-deja\"\n",
+             [systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n\
+             [systems.prism]\ns3_bucket = \"example-connector-recordings\"\n",
         );
         let prism = scan_scope(Some("prism"));
         let hyperswitch = scan_scope(Some("hyperswitch"));
@@ -4364,12 +4358,12 @@ mod tests {
 
         assert_eq!(
             prism.as_ref().map(|(b, _)| b.bucket.as_str()),
-            Ok("ucs-deja"),
+            Ok("example-connector-recordings"),
             "a prism recording is in prism's bucket, whichever endpoint asks"
         );
         assert_eq!(
             hyperswitch.as_ref().map(|(b, _)| b.bucket.as_str()),
-            Ok("hyperswitch-art")
+            Ok("example-router-recordings")
         );
         assert_eq!(hyperswitch, omitted, "naming the default is omitting it");
         let refusal = undeclared.expect_err("an undeclared system is refused");

@@ -455,7 +455,7 @@ export default function NewRunPage() {
             </span>
             <input
               type="text"
-              placeholder="s3://hyperswitch-art/landing/v1/dt=2026-08-04/session=run-…"
+              placeholder="s3://example-recording-bucket/landing/v1/dt=2026-08-04/session=run-…"
               value={s3Path}
               onChange={(e) => setS3Path(e.target.value)}
             />
@@ -487,7 +487,7 @@ export default function NewRunPage() {
           <span className="hint">(a deployed image ref, e.g. the ECR build)</span>
           <input
             type="text"
-            placeholder="223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router:<tag>"
+            placeholder="000000000000.dkr.ecr.us-east-1.amazonaws.com/example-router:<tag>"
             value={imageRef}
             onChange={(e) => setImageRef(e.target.value)}
           />

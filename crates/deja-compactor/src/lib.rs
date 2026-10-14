@@ -1515,10 +1515,9 @@ async fn readiness_of(
     // The newest objects of each instance — plural, because every object that
     // TIES on the newest timestamp is kept.
     //
-    // No tie-break, deliberately. `last_modified` is second-granularity, and the
-    // aggregator names objects `<unix-seconds>-<uuid>`
-    // (infra `vector/sandbox-hyperswitch-art-s3.yaml`: no `filename_time_format`,
-    // so Vector's `%s` default, plus `filename_append_uuid: true`). So two
+    // No tie-break, deliberately. `last_modified` is second-granularity, and
+    // the aggregator names objects `<unix-seconds>-<uuid>` (the deployed Vector
+    // sink uses `%s`-style timestamps and appends a UUID). So two
     // objects of one instance can share a second, and within that second the
     // key order is a random uuid — a tie-break on the key would look total and
     // decide arbitrarily. Scanning the whole tied group instead is one object in
@@ -5177,18 +5176,14 @@ mod tests {
         assert_eq!(row.boundaries.len(), MAX_BOUNDARIES_PER_CORRELATION);
         assert!(!row.boundaries_truncated);
     }
-    // -- the sealer resolves a system the way the deployment declares it -------
-
-    /// The sandbox document's load-bearing lines for a SEALER, verbatim from
-    /// `deja-orchestrator`'s `INFRA_TOML` fixture (which carries the whole
-    /// document and is asserted by `sbx_deployment_values_resolve_as_intended`).
-    /// Only the facts the sealer uses are repeated here; the orchestrator's copy
-    /// stays the one that pins the rest.
+    // -- the sealer resolves illustrative system declarations ----------------
+    /// Representative declarations used to prove the sealer resolves each
+    /// system's independently configured bucket; these are not deployment data.
     const SBX_DOC: &str = r#"default_system = "hyperswitch"
 [systems.hyperswitch]
-s3_bucket = "hyperswitch-art"
+s3_bucket = "example-router-recordings"
 [systems.prism]
-s3_bucket = "ucs-deja"
+s3_bucket = "example-connector-recordings"
 "#;
 
     fn with_doc<T>(doc: &str, f: impl FnOnce() -> T) -> T {
@@ -5227,18 +5222,21 @@ s3_bucket = "ucs-deja"
     }
 
     #[test]
-    fn the_sealer_resolves_the_deployed_document_the_way_the_orchestrator_does() {
-        // Two readers, one document. The orchestrator resolves a system to
-        // launch it; the sealer resolves the same system to find its recordings.
-        // They cannot share a resolver — deja-orchestrator depends on this crate
-        // — so this asserts they agree on the deployed values rather than on an
-        // abstraction.
+    fn the_sealer_resolves_illustrative_system_values() {
+        // The orchestrator resolves a system to launch it; the sealer resolves
+        // that system to find its recordings. They cannot share a resolver, so
+        // compare their configuration-resolution behavior on illustrative data.
         let _lock = test_env::env_guard();
         with_doc(SBX_DOC, || {
-            assert_eq!(bucket_for_system("hyperswitch").unwrap(), "hyperswitch-art");
-            assert_eq!(bucket_for_system("prism").unwrap(), "ucs-deja");
-            // Neither declares a root, so both use the standard layout — the
-            // same default `scan_scope` applies.
+            assert_eq!(
+                bucket_for_system("hyperswitch").unwrap(),
+                "example-router-recordings"
+            );
+            assert_eq!(
+                bucket_for_system("prism").unwrap(),
+                "example-connector-recordings"
+            );
+            // Neither declares a root, so both use the standard layout.
             assert_eq!(recording_root_for("prism").unwrap(), DEFAULT_RECORDING_ROOT);
             // Nor a prefix: a bucket per system keeps its roots at the top.
             assert_eq!(prefix_for_system("prism").unwrap(), "");

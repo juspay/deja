@@ -222,9 +222,12 @@ mod tests {
     fn the_job_carries_the_declaration_the_pod_resolves_from() {
         let _lock = crate::test_env::env_guard();
         const DOCUMENT: &str = "default_system = \"hyperswitch\"\n\
-                                [systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n";
+                                [systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n";
         std::env::set_var("DEJA_CONFIG_TOML", DOCUMENT);
-        std::env::set_var("DEJA__SYSTEMS__PRISM__S3_BUCKET", "ucs-deja");
+        std::env::set_var(
+            "DEJA__SYSTEMS__PRISM__S3_BUCKET",
+            "example-connector-recordings",
+        );
         let env = runner_env("runner", "run-1", "{}", None);
         std::env::remove_var("DEJA__SYSTEMS__PRISM__S3_BUCKET");
 
@@ -239,7 +242,8 @@ mod tests {
         // the same document.
         assert!(
             env.iter()
-                .any(|e| e.name == "DEJA__SYSTEMS__PRISM__S3_BUCKET" && e.value == "ucs-deja"),
+                .any(|e| e.name == "DEJA__SYSTEMS__PRISM__S3_BUCKET"
+                    && e.value == "example-connector-recordings"),
             "a DEJA__ override the orchestrator resolved must reach the pod"
         );
 
@@ -247,7 +251,7 @@ mod tests {
         // pull path makes at stage 1.
         assert_eq!(
             crate::system::recording_scope("hyperswitch").map(|(b, _)| b.bucket),
-            Ok("hyperswitch-art".to_owned()),
+            Ok("example-router-recordings".to_owned()),
             "the pod's resolution succeeds on the carried document"
         );
         std::env::remove_var("DEJA_CONFIG_TOML");

@@ -8677,7 +8677,7 @@ mod tests {
         let _lock = crate::test_env::env_guard();
         std::env::set_var(
             "DEJA_CONFIG_TOML",
-            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"hyperswitch-art\"\n",
+            "default_system = \"hyperswitch\"\n[systems.hyperswitch]\ns3_bucket = \"example-router-recordings\"\n",
         );
         let refused = wait_s3_objects("rec-1", "zzz", std::time::Duration::from_secs(1));
         std::env::remove_var("DEJA_CONFIG_TOML");

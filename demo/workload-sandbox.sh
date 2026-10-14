@@ -4,11 +4,11 @@
 # This is a thin wrapper over demo/workload.sh: same flow definition, different
 # target. It exists because three things differ from the local compose rig:
 #
-#   1. Routing. All three custom pods share `sandbox.hyperswitch.io`; Istio
-#      picks one by an exact `x-feature` header match. Every request in the flow
-#      must carry it — one that doesn't lands on the stock sandbox router, which
-#      has no Deja instrumentation. That request is then missing from the tape
-#      while its side effects are real.
+#   1. Routing. Custom pods share the same sandbox gateway; Istio picks one by
+#      an exact `x-feature` header match. Every request in the flow must carry it —
+#      one that does not lands on the stock router, which has no Deja
+#      instrumentation. That request is then missing from the tape while its
+#      side effects are real.
 #   2. Provisioning. Sandbox is shared. An org + merchant + API key per flow is
 #      antisocial and needs the environment's admin key, so the default here is
 #      to reuse an existing merchant (WORKLOAD_API_KEY).
@@ -25,6 +25,7 @@
 # environment and never echoed.
 #
 # Usage:
+#   export SANDBOX_BASE_URL=<operator-provided-sandbox-url>
 #   export WORKLOAD_API_KEY=<merchant api key>       # reuse an existing merchant
 #   export WORKLOAD_MERCHANT_ID=<merchant id>
 #   export WORKLOAD_SKIP_MCA=true                    # if it already has a Stripe connector
@@ -54,20 +55,23 @@ while [[ $# -gt 0 ]]; do
       esac
       shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
-    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) ITERATIONS="$1"; shift ;;
   esac
 done
 
-SANDBOX_BASE_URL="${SANDBOX_BASE_URL:-https://sandbox.hyperswitch.io}"
+if [[ -z "${SANDBOX_BASE_URL:-}" ]]; then
+  echo "ERROR: SANDBOX_BASE_URL is required; set it to the operator-provided sandbox URL." >&2
+  exit 2
+fi
+SANDBOX_BASE_URL="${SANDBOX_BASE_URL%/}"
 ROUTE_HEADER="${SANDBOX_ROUTE_HEADER:-x-feature: ${POD}}"
 
 # A fresh label per recording, so correlation ids never collide across runs.
 RUN_LABEL="${WORKLOAD_RUN_LABEL:-sbx-$(date +%Y%m%d-%H%M%S)}"
 
 if [[ -z "${WORKLOAD_API_KEY:-}" && -z "${ADMIN_API_KEY:-}" ]]; then
-  echo "ERROR: set WORKLOAD_API_KEY (reuse an existing merchant, preferred on a" >&2
-  echo "       shared environment) or ADMIN_API_KEY (provision a new one)." >&2
+  echo "ERROR: set WORKLOAD_API_KEY (reuse an existing merchant) or ADMIN_API_KEY (provision a new one)." >&2
   exit 2
 fi
 
@@ -86,21 +90,10 @@ cat <<SUMMARY
 ────────────────────────────────────────────────────────────────
 SUMMARY
 
-# Reachability preflight.
-#
-# Deliberately sent WITHOUT the route header. `/health` sits behind the same
-# App-level middleware as every other route, so a probe carrying the header
-# would land on the deja pod and be recorded — one junk correlation in every
-# tape. Omitting it costs no coverage: an unmatched `x-feature` simply falls
-# through to the default route, so a header-carrying probe returns 200 either
-# way and proves nothing extra.
-#
-# Consequently this proves the gateway answers; it CANNOT prove the header
-# steered us to the deja-enabled pod, because nothing in the response identifies
-# the upstream. Confirm that from the recording side (see below).
+# Reachability preflight, deliberately without the route header: a request with
+# it could be recorded as an unwanted extra correlation. This only proves the
+# gateway responds; confirm the recording landed to verify routing.
 probe() {
-  # curl already emits `000` for a connection failure; a `|| echo 000` fallback
-  # would concatenate a second one onto it.
   local out
   out="$(curl -s -o /dev/null -w '%{http_code}' \
     --connect-timeout 5 --max-time 15 \
@@ -115,9 +108,9 @@ if [[ "$code" != "200" ]]; then
 fi
 echo "preflight: GET /health -> 200 (unrouted; keeps the probe out of the tape)"
 echo
+
 echo "NOTE: a 200 does not prove the '${ROUTE_HEADER}' match steers you to the"
-echo "      deja pod — the response carries no upstream identity. Verify by"
-echo "      confirming the recording landed (see the tail of this run)."
+echo "      Deja pod — verify by confirming the recording landed."
 echo
 
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -151,6 +144,6 @@ echo "    ${WORKLOAD_ARTIFACT_DIR}/payment-workload.jsonl"
 echo
 echo "The recording reaches S3 via Kafka -> Vector. Confirm objects landed under"
 echo "the run's prefix before starting a replay; an empty prefix means the route"
-echo "header missed the deja pod, or the sampler declined."
+echo "header missed the Deja pod, or the sampler declined."
 echo "────────────────────────────────────────────────────────────────"
 exit $rc

@@ -60,7 +60,7 @@ aws --version
 Required access:
 
 - Docker daemon access for the current user.
-- AWS credentials that can read/write `s3://hyperswitch-art` and read from ECR registry `223655089699.dkr.ecr.ap-south-1.amazonaws.com`.
+- AWS credentials that can read/write `s3://$DEJA_S3_BUCKET` and read from the operator-selected ECR repository.
 - A Stripe **test** secret key for the record workload. The workload passes it on stdin and does not put it in the curl argument list.
 
 Set the Stripe key without echoing it:
@@ -72,24 +72,23 @@ export STRIPE_API_KEY
 
 ## 2. AWS/S3 environment
 
-The deployed S3 target for tomorrow is `hyperswitch-art` in `ap-south-1`. The orchestrator reads these `DEJA_S3_*` variables when it pulls recordings from AWS S3, including `RunSpec.s3_source` replay runs.
+The orchestrator reads these `DEJA_S3_*` values for AWS replay runs. Supply the bucket and region from the active deployment; do not use these settings for the local MinIO-backed recording flow in Section 8.2.
 
-Important mode boundary:
-
-- Use the AWS values below for **replay-from-S3** demo runs.
-- For a **local record→replay** run that uses the bundled Compose `vector` + `minio` path, do not pass these AWS values to the orchestrator. The current `demo/overlays/hyperswitch/vector.deja.yaml` lands recordings in the local MinIO bucket `deja-recordings`, while `DEJA_S3_*` controls where the orchestrator waits/pulls. Mixing AWS `DEJA_S3_*` with the local MinIO vector sink makes record runs wait in the wrong bucket.
-
-AWS replay-from-S3 values:
 ```bash
-export DEJA_S3_REGION="ap-south-1"
-export DEJA_S3_BUCKET="hyperswitch-art"
-export DEJA_S3_ENDPOINT="https://s3.ap-south-1.amazonaws.com"
-export DEJA_S3_ALLOW_HTTP="false"
+: "${DEJA_S3_REGION:?Set DEJA_S3_REGION to the deployment region}"
+: "${DEJA_S3_BUCKET:?Set DEJA_S3_BUCKET to the recording bucket}"
+export DEJA_S3_ENDPOINT="${DEJA_S3_ENDPOINT:-https://s3.${DEJA_S3_REGION}.amazonaws.com}"
+export DEJA_S3_ALLOW_HTTP="${DEJA_S3_ALLOW_HTTP:-false}"
 
 # Prefer values from the active AWS profile/session. These commands do not print secrets.
-export DEJA_S3_ACCESS_KEY="$(aws configure get aws_access_key_id)"
-read -rsp 'DEJA_S3_SECRET_KEY: ' DEJA_S3_SECRET_KEY; echo
-export DEJA_S3_SECRET_KEY
+if [[ -z "${DEJA_S3_ACCESS_KEY:-}" ]]; then
+  DEJA_S3_ACCESS_KEY="$(aws configure get aws_access_key_id)"
+  export DEJA_S3_ACCESS_KEY
+fi
+if [[ -z "${DEJA_S3_SECRET_KEY:-}" ]]; then
+  read -rsp 'DEJA_S3_SECRET_KEY: ' DEJA_S3_SECRET_KEY; echo
+  export DEJA_S3_SECRET_KEY
+fi
 
 # Sanity check only non-secret values.
 printf 'S3 bucket=%s region=%s endpoint=%s allow_http=%s\n' \
@@ -100,12 +99,14 @@ If the secret key is already available in a secure environment variable, set `DE
 
 ## 3. ECR login command
 
-Do not run this runbook step unless the host is expected to pull the Jenkins image and AWS credentials are already configured. The command below does not print the token; it streams it to Docker.
+Do not run this step unless this host is expected to pull the Jenkins image and AWS credentials are configured. Supply the repository URI from the operator-owned candidate registry; the image tag or digest is needed only when pulling an image later.
 
 ```bash
-aws ecr get-login-password --region ap-south-1 \
-  | docker login --username AWS --password-stdin \
-      223655089699.dkr.ecr.ap-south-1.amazonaws.com
+: "${DEJA_CANDIDATE_IMAGE_REPO:?Set DEJA_CANDIDATE_IMAGE_REPO to the operator-owned candidate image repository URI}"
+export CANDIDATE_IMAGE_REPO="${DEJA_CANDIDATE_IMAGE_REPO}"
+ECR_REGISTRY="${CANDIDATE_IMAGE_REPO%%/*}"
+aws ecr get-login-password --region "$DEJA_S3_REGION" \
+  | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 ```
 
 ## 4. Vendor checkout must match the candidate image source SHA
@@ -271,7 +272,7 @@ This is the primary Jenkins/ECR morning-demo flow: pull an existing deployed rec
 Use this flow only after ECR login and `docker image inspect "$CANDIDATE_IMAGE"` have succeeded. `CANDIDATE_IMAGE` must be a real operator-supplied image URI or digest; it must not be empty and must not be `deja-demo`.
 
 ```bash
-export CANDIDATE_IMAGE='<operator-supplied-ECR-image-uri-or-digest>'
+: "${CANDIDATE_IMAGE:?Set CANDIDATE_IMAGE to the operator-provided image URI or digest}"
 docker pull "$CANDIDATE_IMAGE"
 docker image inspect "$CANDIDATE_IMAGE" \
   --format 'Entrypoint={{json .Config.Entrypoint}} Cmd={{json .Config.Cmd}} WorkingDir={{json .Config.WorkingDir}} ExposedPorts={{json .Config.ExposedPorts}}'
@@ -280,7 +281,7 @@ docker image inspect "$CANDIDATE_IMAGE" \
 Point `S3_SOURCE_PATH` at the deployed aggregator prefix that contains Deja envelope lines. If the prefix contains exactly one session, leave `S3_SESSION_ID` empty and the orchestrator auto-resolves it. If it contains multiple sessions, set `S3_SESSION_ID` to the desired envelope `capture.session_id`.
 
 ```bash
-export S3_SOURCE_PATH='s3://hyperswitch-art/<prefix-containing-deja-envelope-lines>'
+export S3_SOURCE_PATH="s3://$DEJA_S3_BUCKET/<prefix-containing-deja-envelope-lines>"
 export S3_SESSION_ID=''   # optional; set only when the prefix contains multiple sessions
 
 PREBUILT_AWS_REP_RUN_ID="$(
@@ -289,20 +290,24 @@ PREBUILT_AWS_REP_RUN_ID="$(
       --arg image "$CANDIDATE_IMAGE" \
       --arg path "$S3_SOURCE_PATH" \
       --arg session "$S3_SESSION_ID" \
+      --arg region "$DEJA_S3_REGION" \
+      --arg endpoint "$DEJA_S3_ENDPOINT" \
       '{
         mode:"replay",
         candidate_spec:{kind:"prebuilt_image", image:$image},
         recording_id:$session,
-        s3_source:{path:$path, region:"ap-south-1", endpoint:"https://s3.ap-south-1.amazonaws.com"}
+        s3_source:{path:$path, region:$region, endpoint:$endpoint}
       }'
   else
     jq -nc \
       --arg image "$CANDIDATE_IMAGE" \
       --arg path "$S3_SOURCE_PATH" \
+      --arg region "$DEJA_S3_REGION" \
+      --arg endpoint "$DEJA_S3_ENDPOINT" \
       '{
         mode:"replay",
         candidate_spec:{kind:"prebuilt_image", image:$image},
-        s3_source:{path:$path, region:"ap-south-1", endpoint:"https://s3.ap-south-1.amazonaws.com"}
+        s3_source:{path:$path, region:$region, endpoint:$endpoint}
       }'
   fi \
   | curl -fsS \
@@ -401,7 +406,7 @@ Do **not** use the Jenkins/ECR prebuilt router image for the record run unless y
 2. Replay that `RECORDING_ID` with the Jenkins/ECR prebuilt image below.
 
 ```bash
-export CANDIDATE_IMAGE='<operator-supplied-ECR-image-uri-or-digest>'
+: "${CANDIDATE_IMAGE:?Set CANDIDATE_IMAGE to the operator-provided image URI or digest}"
 docker pull "$CANDIDATE_IMAGE"
 docker image inspect "$CANDIDATE_IMAGE" \
   --format 'Entrypoint={{json .Config.Entrypoint}} Cmd={{json .Config.Cmd}} WorkingDir={{json .Config.WorkingDir}} ExposedPorts={{json .Config.ExposedPorts}}'
@@ -444,7 +449,7 @@ curl -fsS "$API/api/v1/runs/$PREBUILT_REP_RUN_ID/scorecard" \
 Use this section for a Jenkins-built router image in ECR when you want to prove the overlay contract directly. The repo-proven source fact is `juspay/hyperswitch:deja-pr @ ff191d7f79`; the exact image URI is operator-supplied unless you have independently proven it from Jenkins or image metadata.
 
 ```bash
-export CANDIDATE_IMAGE='<operator-supplied-ECR-image-uri-or-digest>'
+: "${CANDIDATE_IMAGE:?Set CANDIDATE_IMAGE to the operator-provided image URI or digest}"
 export REPLAY_HOST_PORT="${DEMO_REPLAY_PORT:-8090}"
 export HARNESS_STATE="$HARNESS_STATE_DIR"
 export RECORDING_ID="$RECORDING_ID"
