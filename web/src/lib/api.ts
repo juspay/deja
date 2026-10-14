@@ -41,8 +41,12 @@ export type RunParams = {
   /** Why the run exists when it is not a candidate under test: `baseline`. */
   purpose?: string;
   /** What the candidate is, in the creator's words: a PR number and title,
-   *  or the main commit a baseline stands for. Displayed, never parsed. */
+   *  or the main commit a baseline stands for. Displayed, never parsed —
+   *  except for the merge-queue prefix, see `lib/scope.ts`. */
   label?: string;
+  /** The pull request a PR or merge-queue run stands for. Absent on
+   *  baselines, nightly and manual runs. */
+  github?: GithubRef;
 };
 
 /** The request a row carries, or null when it predates the record.
