@@ -478,11 +478,11 @@ mod tests {
 
     /// The deployment's declaration, resolved by the code that reads it.
     ///
-    /// A verbatim copy of what sandbox sets in DEJA_CONFIG_TOML (infra:
+    /// A copy of what sandbox sets in DEJA_CONFIG_TOML (infra:
     /// deployment-configs/replay-orchestrator/sandbox-values-dep.yaml), so the
     /// producer and the consumer of this document are checked against each
-    /// other rather than each being separately plausible. Copies drift, and a
-    /// drifted copy here is a failing test rather than a silent misconfiguration.
+    /// other rather than each being separately plausible. The account-specific ECR
+    /// hostnames are masked; the remaining deployment assertions are retained.
     #[test]
     fn sbx_deployment_values_resolve_as_intended() {
         let _lock = env_guard();
@@ -613,8 +613,8 @@ mod tests {
         );
     }
 
-    /// Verbatim from infra. If this drifts from what is deployed, the test
-    /// above is checking a document nobody ships.
+    /// Deployment declaration with account-specific ECR hostnames masked; the
+    /// remaining values and assertions mirror infra.
     const INFRA_TOML: &str = r#"default_system = "hyperswitch"
 
 # The payment router. Records into hyperswitch-art. The harness owns its
@@ -625,7 +625,7 @@ mod tests {
 # docker_compose.toml is deliberately not among them).
 [systems.hyperswitch]
 s3_bucket = "hyperswitch-art"
-candidate_image_repo = "223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router"
+candidate_image_repo = "000000000000.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router"
 candidate_env_prefix = "ROUTER__"
 manages_stores = true
 has_code_bundle = true
@@ -665,7 +665,7 @@ http_incoming = "bag:$.payment_methods_enabled[],$.payment_methods_enabled[].car
 
 [systems.prism]
 s3_bucket = "ucs-deja"
-candidate_image_repo = "223655089699.dkr.ecr.ap-south-1.amazonaws.com/connector-service"
+candidate_image_repo = "000000000000.dkr.ecr.ap-south-1.amazonaws.com/connector-service"
 candidate_env_prefix = "CS__"
 manages_stores = false
 has_code_bundle = false
