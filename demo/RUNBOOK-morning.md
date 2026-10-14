@@ -60,7 +60,7 @@ aws --version
 Required access:
 
 - Docker daemon access for the current user.
-- AWS credentials that can read/write `s3://hyperswitch-art` and read from ECR registry `223655089699.dkr.ecr.ap-south-1.amazonaws.com`.
+- AWS credentials that can read/write `s3://hyperswitch-art` and read from the ECR registry named by `DEJA_CANDIDATE_IMAGE_REPO`.
 - A Stripe **test** secret key for the record workload. The workload passes it on stdin and does not put it in the curl argument list.
 
 Set the Stripe key without echoing it:
@@ -103,9 +103,10 @@ If the secret key is already available in a secure environment variable, set `DE
 Do not run this runbook step unless the host is expected to pull the Jenkins image and AWS credentials are already configured. The command below does not print the token; it streams it to Docker.
 
 ```bash
+: "${DEJA_CANDIDATE_IMAGE_REPO:?Set DEJA_CANDIDATE_IMAGE_REPO to the candidate ECR repository URI}"
 aws ecr get-login-password --region ap-south-1 \
   | docker login --username AWS --password-stdin \
-      223655089699.dkr.ecr.ap-south-1.amazonaws.com
+      "${DEJA_CANDIDATE_IMAGE_REPO%%/*}"
 ```
 
 ## 4. Vendor checkout must match the candidate image source SHA

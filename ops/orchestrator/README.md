@@ -8,20 +8,24 @@ mirror `docker:27-dind` and any DockerHub compose images to ECR, or extend
 
 ## Build (from the repo root)
 
+Set `ORCHESTRATOR_IMAGE_REPO` to the deployment's ECR repository for this image
+(not the candidate/router repository):
+
 ```sh
+: "${ORCHESTRATOR_IMAGE_REPO:?Set ORCHESTRATOR_IMAGE_REPO to the orchestrator ECR repository URI}"
+ORCHESTRATOR_IMAGE="${ORCHESTRATOR_IMAGE_REPO}:2026.07.11.0"
 # .dockerignore must exclude the heavy state: demo/* except the four bundled
 # assets, vendor/*/target, vendor/*/.git, target/
-docker build -f ops/orchestrator/Dockerfile \
-  -t 223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-replay-orchestrator:2026.07.11.0 .
+docker build -f ops/orchestrator/Dockerfile -t "$ORCHESTRATOR_IMAGE" .
 ```
 
 ## Push (GATED — ask before pushing anywhere, including ECR)
 
 ```sh
 aws ecr get-login-password --region ap-south-1 \
-  | docker login --username AWS --password-stdin 223655089699.dkr.ecr.ap-south-1.amazonaws.com
+  | docker login --username AWS --password-stdin "${ORCHESTRATOR_IMAGE_REPO%%/*}"
 # create the repo once: aws ecr create-repository --repository-name hyperswitch-replay-orchestrator --region ap-south-1
-docker push 223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-replay-orchestrator:2026.07.11.0
+docker push "$ORCHESTRATOR_IMAGE"
 ```
 
 ## What the container expects at runtime (provided by the chart)
