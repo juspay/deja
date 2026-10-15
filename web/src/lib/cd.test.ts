@@ -78,16 +78,19 @@ describe("carries / placesOf / tone / ago", () => {
     expect(carries(v({ version: "2026.09.28.1-hotfix1", kind: "release" }))).toBe("contents not recorded");
   });
 
-  test("placesOf keeps the pipeline order and marks what runs", () => {
-    const where = [
-      { id: 2, system: "prism", environment: "sandbox", version: "v", state: "committed", requested_by: "qa", request_id: null, jenkins_build: null, detail: {}, at: "2026-10-12T00:00:00Z" },
-      { id: 1, system: "prism", environment: "integ", version: "v", state: "live", requested_by: "merge #1", request_id: null, jenkins_build: null, detail: {}, at: "2026-10-11T00:00:00Z" },
-    ];
-    expect(placesOf(where, ["integ", "sandbox", "prod"])).toEqual([
-      { environment: "integ", state: "live", present: true },
-      { environment: "sandbox", state: "committed", present: false },
-      { environment: "prod", state: null, present: false },
-    ]);
+  test("only the observed live version is highlighted across deployment transitions", () => {
+    const row = (id: number, version: string, state: string) => ({
+      id, system: "prism", environment: "integ", version, state, requested_by: "pipeline", request_id: null,
+      jenkins_build: null, detail: {}, at: `2026-10-1${id}T00:00:00Z`,
+    });
+    const place = (rows: { id: number; system: string; environment: string; version: string; state: string; requested_by: string; request_id: null; jenkins_build: null; detail: {}; at: string }[], liveVersion: string, version: string) =>
+      placesOf(rows.filter((r) => r.version === version), ["integ"], [{ environment: "integ", version: liveVersion }])[0];
+
+    const aLive = [row(1, "A", "live")];
+    expect(place([...aLive, row(2, "B", "live")], "B", "A")).toMatchObject({ state: "live", present: false, lastConfirmed: false });
+    expect(place([...aLive, row(2, "B", "syncing")], "A", "A")).toMatchObject({ present: true, lastConfirmed: true });
+    expect(place([row(2, "A", "failed"), ...aLive], "A", "A")).toMatchObject({ state: "failed", present: true, lastConfirmed: true });
+    expect(place([row(2, "A", "rolled_back")], "A", "A")).toMatchObject({ present: true, lastConfirmed: true });
   });
 
   test("tones", () => {

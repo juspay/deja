@@ -40,6 +40,14 @@ docker push "$ORCHESTRATOR_IMAGE"
 | `[cd]` block of the config (`DEJA_CONFIG_TOML` or `DEJA__CD__*`) | deployment tracking: `systems` (default: the default system), `environments` in pipeline order (default `integ, sandbox, prod`), `promotable`. Read once at start. Absent: `/api/v1/cd/*` reads 404 and the pipeline's posts are refused. The pipeline posts with the service token plus `X-Deja-Actor`, like run events. |
 | candidate image pulls | DinD daemon needs ECR auth — run `docker login` against the sock at boot, or pre-provision `~/.docker/config.json` via the chart |
 
+CD reads require either a signed-in maintainer or the **configured** service
+token. An arbitrary bearer is never accepted when that token is unset. The
+Deployments pages distinguish historical rows from the last version confirmed
+live by an observation; a pending or failed intent is not proof of what runs
+now. Until a CD writer and Argo observer are deployed, use the live Kubernetes
+provider for the current-version picker rather than treating CD history as
+current deployment state.
+
 Use one orchestrator writer per `HARNESS_STATE_DIR`: baseline re-points and
 push-back events that rewrite a run record share an in-process lock, so a late
 recording event cannot restore an older baseline. The lock is not distributed.

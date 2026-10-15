@@ -16,7 +16,7 @@
 //   /deployments/pull-requests/:owner/:repo/:n     where a pull request is
 
 import React from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 
 import { loginUrl } from "../lib/me";
@@ -339,8 +339,8 @@ function Pipeline({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
     queryFn: () => cdApi.versions(system),
     refetchInterval: 30_000,
   });
-  if (envs.isLoading) return <p className="hint">loading…</p>;
-  if (envs.error) return <p className="err">{String(envs.error)}</p>;
+  if (envs.isLoading || versions.isLoading) return <p className="hint">loading…</p>;
+  if (envs.error || versions.error) return <p className="err">{String(envs.error ?? versions.error)}</p>;
   const rows = envs.data?.environments ?? [];
   const byName = new Map(rows.map((r) => [r.environment, r]));
   const all = versions.data?.versions.map((x) => x.version) ?? [];
@@ -453,7 +453,7 @@ function EnvCard({ env, row, system, cfg, promotable }: { env: string; row: CdEn
               </div>
             )}
             <div className="cd-row">
-              <span className="l">Live since</span>
+              <span className="l">Last confirmed live</span>
               <span title={live.at}>
                 {when(live.at)} · {ago(live.at)}
               </span>
@@ -519,8 +519,10 @@ export function VersionsPage() {
 function Versions({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; system: string }) {
   const [kind, setKind] = React.useState<"" | "release" | "merge">("");
   const q = useQuery({ queryKey: ["cd", "versions", system], queryFn: () => cdApi.versions(system), refetchInterval: 30_000 });
-  if (q.isLoading) return <p className="hint">loading…</p>;
-  if (q.error) return <p className="err">{String(q.error)}</p>;
+  const envs = useQuery({ queryKey: ["cd", "environments", system], queryFn: () => cdApi.environments(system), refetchInterval: 15_000 });
+  if (q.isLoading || envs.isLoading) return <p className="hint">loading…</p>;
+  if (q.error || envs.error) return <p className="err">{String(q.error ?? envs.error)}</p>;
+  const observed = envs.data?.environments.map((e) => ({ environment: e.environment, version: e.live?.version ?? null })) ?? [];
   const rows = (q.data?.versions ?? []).filter((x) => !kind || x.version.kind === kind);
   return (
     <>
@@ -562,7 +564,7 @@ function Versions({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
                   <PrCell v={v} />
                 </td>
                 <td>
-                  <WhereBar where={where} environments={cfg.environments} />
+                  <WhereBar where={where} environments={cfg.environments} observed={observed} />
                 </td>
                 <td>
                   <HopChip hop={hop} />
@@ -579,19 +581,25 @@ function Versions({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
   );
 }
 
-/** One segment per environment: solid where the version runs, faded where it
- *  has been or is on its way, empty where it never was. */
-function WhereBar({ where, environments }: { where: CdVersionWhere[]; environments: string[] }) {
-  const places = placesOf(where, environments);
+function placeLabel(p: { state: string | null; lastConfirmed: boolean }): string {
+  if (p.lastConfirmed) return "last confirmed live";
+  if (p.state && isRunning(p.state)) return "previously live";
+  return p.state?.replace("_", " ") ?? "never";
+}
+
+/** One segment per environment: solid for its last confirmed live version,
+ *  faded where the version was or is on its way, empty where it never was. */
+function WhereBar({ where, environments, observed = [] }: { where: CdVersionWhere[]; environments: string[]; observed?: { environment: string; version: string | null }[] }) {
+  const places = placesOf(where, environments, observed);
   return (
-    <span className="cd-where" aria-label={places.map((p) => `${p.environment}: ${p.state ?? "never"}`).join(", ")}>
+    <span className="cd-where" aria-label={places.map((p) => `${p.environment}: ${placeLabel(p)}`).join(", ")}>
       {places.map((p) => (
         <span
           key={p.environment}
           className={`cd-seg cd-seg-${p.environment} ${p.present ? "on" : p.state ? "was" : ""}`}
-          title={`${p.environment}: ${p.state ?? "never"}`}
+          title={`${p.environment}: ${placeLabel(p)}`}
         >
-          {p.present ? p.environment : p.state ? `${p.environment} · ${p.state.replace("_", " ")}` : p.environment}
+          {p.lastConfirmed ? `${p.environment} · last confirmed live` : p.state ? `${p.environment} · ${placeLabel(p)}` : p.environment}
         </span>
       ))}
     </span>
@@ -620,14 +628,15 @@ export function VersionPage() {
 
 function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enabled: true }>; system: string; version: string }) {
   const q = useQuery({ queryKey: ["cd", "version", system, version], queryFn: () => cdApi.version(system, version), refetchInterval: 15_000 });
-  if (q.isLoading) return <p className="hint">loading…</p>;
-  if (q.error) return <p className="err">{String(q.error)}</p>;
+  const envs = useQuery({ queryKey: ["cd", "environments", system], queryFn: () => cdApi.environments(system), refetchInterval: 15_000 });
+  if (q.isLoading || envs.isLoading) return <p className="hint">loading…</p>;
+  if (q.error || envs.error) return <p className="err">{String(q.error ?? envs.error)}</p>;
   if (!q.data) return null;
   const v = q.data.version;
   const rows = q.data.deployments;
-  // Newest row per environment: where it is now.
   const seen = new Set<string>();
   const now = rows.filter((r) => (seen.has(r.environment) ? false : (seen.add(r.environment), true)));
+
   return (
     <>
       <dl className="cd-facts">
@@ -670,7 +679,7 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
       </dl>
 
       <section>
-        <h2>Where it is</h2>
+        <h2>Deployment history</h2>
         {now.length === 0 ? (
           <p className="hint">Not deployed anywhere yet.</p>
         ) : (
@@ -694,10 +703,11 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
                     </td>
                     <td>
                       <StateChip state={r.state} />
+                      {envs.data?.environments.find((e) => e.environment === r.environment)?.live?.version === v.version
+                        ? <span className="hint"> · last confirmed live</span>
+                        : null}
                     </td>
-                    <td title={r.at}>
-                      {when(r.at)} · {ago(r.at)}
-                    </td>
+                    <td title={r.at}>{when(r.at)} · {ago(r.at)}</td>
                     <td>
                       <HowCell row={r} />
                     </td>
@@ -940,7 +950,26 @@ export function PullRequestPage() {
   });
   const cfg = useCdConfig();
   const environments = cfg.data?.enabled ? cfg.data.environments : [];
+  const systems = [...new Set(q.data?.versions.map(({ version }) => version.system) ?? [])];
+  const observations = useQueries({
+    queries: systems.map((system) => ({
+      queryKey: ["cd", "environments", system],
+      queryFn: () => cdApi.environments(system),
+      enabled: !!cfg.data?.enabled,
+      refetchInterval: 15_000,
+    })),
+  });
+  const observedBySystem = new Map(
+    systems.flatMap((system, index) => {
+      const result = observations[index];
+      return result?.data
+        ? [[system, result.data.environments.map((e) => ({ environment: e.environment, version: e.live?.version ?? null }))] as const]
+        : [];
+    }),
+  );
   const title = q.data?.versions.flatMap((x) => x.version.prs).find((p) => p.pr_number === n)?.title ?? "";
+  const observationsLoading = systems.some((_, index) => observations[index]?.isLoading);
+  const observationsError = observations.find((result) => result?.error)?.error;
   return (
     <>
       <div className="crumb">
@@ -958,7 +987,7 @@ export function PullRequestPage() {
         {" · "}
         <Link to="/runs">replays</Link>
       </p>
-      {q.isLoading || cfg.isLoading ? (
+      {q.isLoading || cfg.isLoading || (!!q.data?.versions.length && observationsLoading) ? (
         <p className="hint">loading…</p>
       ) : q.error ? (
         (q.error as { status?: number }).status === 404 ? (
@@ -966,6 +995,10 @@ export function PullRequestPage() {
         ) : (
           <p className="err">{String(q.error)}</p>
         )
+      ) : cfg.error ? (
+        <p className="err">{String(cfg.error)}</p>
+      ) : observationsError ? (
+        <p className="err">{String(observationsError)}</p>
       ) : (q.data?.versions.length ?? 0) === 0 ? (
         <div className="empty">
           <div className="et">Not deployed anywhere yet</div>
@@ -973,7 +1006,7 @@ export function PullRequestPage() {
         </div>
       ) : (
         <section>
-          <h2>Deployed</h2>
+          <h2>Versions carrying this pull request</h2>
           <table>
             <thead>
               <tr>
@@ -984,28 +1017,32 @@ export function PullRequestPage() {
               </tr>
             </thead>
             <tbody>
-              {q.data!.versions.map(({ version: v, where }) => (
-                <tr key={`${v.system}/${v.version}`}>
-                  <td>
-                    <VersionLink version={v.version} system={v.system} cfg={cfg.data} />
-                  </td>
-                  <td>
-                    <span className={`chip ${v.kind === "release" ? "inconclusive" : "muted"}`}>{v.kind}</span>
-                  </td>
-                  <td>
-                    <WhereBar where={where} environments={environments} />
-                  </td>
-                  <td className="hint">
-                    {placesOf(where, environments)
-                      .filter((p) => p.state)
-                      .map((p) => {
-                        const row = where.find((w) => w.environment === p.environment)!;
-                        return `${p.environment}: ${p.state!.replace("_", " ")} since ${when(row.at)}`;
-                      })
-                      .join(" · ") || "—"}
-                  </td>
-                </tr>
-              ))}
+              {q.data!.versions.map(({ version: v, where }) => {
+                const observed = observedBySystem.get(v.system);
+                return (
+                  <tr key={`${v.system}/${v.version}`}>
+                    <td>
+                      <VersionLink version={v.version} system={v.system} cfg={cfg.data} />
+                      {systems.length > 1 && <span className="hint"> · {v.system}</span>}
+                    </td>
+                    <td>
+                      <span className={`chip ${v.kind === "release" ? "inconclusive" : "muted"}`}>{v.kind}</span>
+                    </td>
+                    <td>
+                      <WhereBar where={where} environments={environments} observed={observed} />
+                    </td>
+                    <td className="hint">
+                      {placesOf(where, environments, observed)
+                        .filter((p) => p.state)
+                        .map((p) => {
+                          const row = where.find((w) => w.environment === p.environment)!;
+                          return `${p.environment}: ${placeLabel(p)} (last event ${when(row.at)})`;
+                        })
+                        .join(" · ") || "—"}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </section>
