@@ -60,6 +60,10 @@ demo/run-deja-matrix.sh                    # one recording, three candidates (se
 just verify    # fmt-check + clippy -D warnings + tests
 ```
 
+The dashboard's runs list keeps the system picker outside the results table.
+On narrow screens, scroll the table horizontally to reach its final columns
+and the running row's kill control; the header scrolls with the rows.
+
 ## History
 
 Déjà began as a zero-code, syscall-level (`LD_PRELOAD`) capture/replay

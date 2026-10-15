@@ -496,7 +496,7 @@ export default function NewRunPage() {
           <span className="hint">(a deployed image ref, e.g. the ECR build)</span>
           <input
             type="text"
-            placeholder="223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router:<tag>"
+            placeholder="000000000000.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-router:<tag>"
             value={imageRef}
             onChange={(e) => setImageRef(e.target.value)}
           />

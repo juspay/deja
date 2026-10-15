@@ -25,6 +25,13 @@ import ReportPage from "./pages/ReportPage";
 import DeltaPage from "./pages/DeltaPage";
 import AcknowledgePage from "./pages/AcknowledgePage";
 import AuditPage from "./pages/AuditPage";
+import DeploymentsPage, {
+  EnvironmentPage,
+  EnvironmentsPage,
+  PullRequestPage,
+  VersionPage,
+  VersionsPage,
+} from "./pages/DeploymentsPage";
 import LoginPage from "./pages/LoginPage";
 
 const queryClient = new QueryClient({
@@ -118,11 +125,16 @@ function ActorBox() {
 
 function Shell() {
   const loc = useLocation();
-  const tab = (path: string, label: string, exact = false) => {
+  const me = useMe();
+  // Deployments is in beta for maintainers: the tab is drawn for a signed-in
+  // maintainer only (the API refuses everyone else anyway).
+  const maintainer = !!me.data?.configured && !!me.data.authenticated && (me.data.roles ?? []).includes("maintainer");
+  const tab = (path: string, label: string, exact = false, beta = false) => {
     const on = exact ? loc.pathname === path : loc.pathname.startsWith(path);
     return (
       <Link className={on ? "tab active" : "tab"} to={path}>
         {label}
+        {beta && <span className="beta">beta</span>}
       </Link>
     );
   };
@@ -134,6 +146,7 @@ function Shell() {
           {tab("/", "New run", true)}
           {tab("/runs", "Runs")}
           {tab("/recordings", "Recordings")}
+          {maintainer && tab("/deployments", "Deployments", false, true)}
           {tab("/audit", "Audit")}
         </nav>
         <Identity />
@@ -174,6 +187,12 @@ const router = createBrowserRouter([
       { path: "/runs/:runId/scorecard", element: <LegacyRunRedirect /> },
       { path: "/recordings", element: <RecordingsPage /> },
       { path: "/audit", element: <AuditPage /> },
+      { path: "/deployments", element: <DeploymentsPage /> },
+      { path: "/deployments/versions", element: <VersionsPage /> },
+      { path: "/deployments/versions/:version", element: <VersionPage /> },
+      { path: "/deployments/environments", element: <EnvironmentsPage /> },
+      { path: "/deployments/environments/:env", element: <EnvironmentPage /> },
+      { path: "/deployments/pull-requests/:owner/:repo/:number", element: <PullRequestPage /> },
     ],
   },
 ]);
