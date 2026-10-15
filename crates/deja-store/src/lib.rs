@@ -917,6 +917,23 @@ impl Store {
         .await?;
         Ok(rows.into_iter().map(cd_deployment_row).collect())
     }
+    /// The newest confirmed live version for one environment.
+    pub async fn cd_latest_live_for_environment(
+        &self,
+        system: &str,
+        environment: &str,
+    ) -> Result<Option<CdDeploymentRow>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {CD_DEPLOYMENT_COLUMNS} FROM cd_deployments
+             WHERE system = $1 AND environment = $2 AND state IN ('live', 'rolled_back')
+             ORDER BY id DESC LIMIT 1"
+        ))
+        .bind(system)
+        .bind(environment)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(cd_deployment_row))
+    }
 
     /// Each version's newest row on each environment: where every version
     /// is, in one query, for a list.
@@ -954,10 +971,10 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Who asked for a version on an environment since the last time
-    /// something else was live there -- the job's newest `requested` or
-    /// `committed` row -- or `None` when nobody did: the difference between
-    /// a deploy the pipeline made and one made by hand.
+    /// The newest non-observation deployment row for this version must itself
+    /// be `requested` or `committed`, after the last confirmed live version
+    /// on this environment. A failed or completed request cannot attribute a
+    /// later observation, but a fresh retry has its own requester.
     pub async fn cd_requested_by(
         &self,
         system: &str,
@@ -967,10 +984,13 @@ impl Store {
         let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT d.requested_by, d.requested_by_sub, d.jenkins_build FROM cd_deployments d
              WHERE d.system = $1 AND d.environment = $2 AND d.version = $3
-               AND d.requested_by <> 'observed'
+               AND d.state IN ('requested', 'committed')
+               AND d.id = (SELECT max(current.id) FROM cd_deployments current
+                           WHERE current.system = $1 AND current.environment = $2
+                             AND current.version = $3
+                             AND current.requested_by <> 'observed')
                AND d.id > COALESCE((SELECT max(id) FROM cd_deployments
                                     WHERE system = $1 AND environment = $2
-                                      AND version <> $3
                                       AND state IN ('live', 'rolled_back')), 0)
              ORDER BY d.id DESC LIMIT 1",
         )
@@ -2193,5 +2213,239 @@ mod tests {
             vec![y.clone()]
         );
         remove(&store, &y).await;
+    }
+
+    async fn append_cd_deployment(
+        store: &super::Store,
+        system: &str,
+        environment: &str,
+        version: &str,
+        state: &str,
+        requested_by: &str,
+        jenkins_build: Option<&str>,
+    ) {
+        store
+            .cd_deployment_append(&super::NewCdDeployment {
+                system: system.to_owned(),
+                environment: environment.to_owned(),
+                version: version.to_owned(),
+                state: state.to_owned(),
+                requested_by: requested_by.to_owned(),
+                requested_by_sub: None,
+                request_id: None,
+                jenkins_build: jenkins_build.map(str::to_owned),
+                detail: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn latest_confirmed_cd_version_is_scoped_to_one_environment() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (system, environment, other, a, b) = (
+            unique("cd-system"),
+            unique("cd-env"),
+            unique("cd-env"),
+            unique("cd-version-a"),
+            unique("cd-version-b"),
+        );
+        store.cd_version_ensure(&system, &a, "merge").await.unwrap();
+        store.cd_version_ensure(&system, &b, "merge").await.unwrap();
+        append_cd_deployment(&store, &system, &environment, &a, "live", "observed", None).await;
+        append_cd_deployment(
+            &store,
+            &system,
+            &environment,
+            &b,
+            "requested",
+            "alice",
+            None,
+        )
+        .await;
+        append_cd_deployment(&store, &system, &other, &b, "live", "observed", None).await;
+
+        assert_eq!(
+            store
+                .cd_latest_live_for_environment(&system, &environment)
+                .await
+                .unwrap()
+                .map(|row| row.version),
+            Some(a.clone())
+        );
+        assert_eq!(
+            store
+                .cd_latest_live_for_environment(&system, &other)
+                .await
+                .unwrap()
+                .map(|row| row.version),
+            Some(b.clone())
+        );
+        assert!(store
+            .cd_latest_live_for_environment(&system, &unique("cd-env"))
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("DELETE FROM cd_deployments WHERE system = $1")
+            .bind(&system)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM cd_versions WHERE system = $1")
+            .bind(&system)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_cd_request_is_not_attributed_to_later_observation_or_retry() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (system, environment, a, b) = (
+            unique("cd-system"),
+            unique("cd-env"),
+            unique("cd-version-a"),
+            unique("cd-version-b"),
+        );
+
+        store.cd_version_ensure(&system, &a, "merge").await.unwrap();
+        store.cd_version_ensure(&system, &b, "merge").await.unwrap();
+
+        append_cd_deployment(&store, &system, &environment, &a, "live", "observed", None).await;
+        append_cd_deployment(
+            &store,
+            &system,
+            &environment,
+            &b,
+            "requested",
+            "alice",
+            Some("build-1"),
+        )
+        .await;
+        assert_eq!(
+            store
+                .cd_requested_by(&system, &environment, &b)
+                .await
+                .unwrap()
+                .map(|r| (r.requested_by, r.jenkins_build)),
+            Some(("alice".into(), Some("build-1".into())))
+        );
+
+        append_cd_deployment(&store, &system, &environment, &b, "failed", "alice", None).await;
+        append_cd_deployment(&store, &system, &environment, &b, "live", "observed", None).await;
+        assert!(
+            store
+                .cd_requested_by(&system, &environment, &b)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed request must not attribute the later observation"
+        );
+
+        append_cd_deployment(
+            &store,
+            &system,
+            &environment,
+            &b,
+            "requested",
+            "bob",
+            Some("build-2"),
+        )
+        .await;
+        assert_eq!(
+            store
+                .cd_requested_by(&system, &environment, &b)
+                .await
+                .unwrap()
+                .map(|r| (r.requested_by, r.jenkins_build)),
+            Some(("bob".into(), Some("build-2".into()))),
+            "a fresh retry request carries its own requester"
+        );
+
+        let other_environment = unique("cd-env");
+        append_cd_deployment(
+            &store,
+            &system,
+            &other_environment,
+            &a,
+            "live",
+            "observed",
+            None,
+        )
+        .await;
+        append_cd_deployment(
+            &store,
+            &system,
+            &other_environment,
+            &b,
+            "requested",
+            "carol",
+            Some("build-3"),
+        )
+        .await;
+        append_cd_deployment(
+            &store,
+            &system,
+            &other_environment,
+            &a,
+            "live",
+            "observed",
+            None,
+        )
+        .await;
+        assert!(
+            store
+                .cd_requested_by(&system, &other_environment, &b)
+                .await
+                .unwrap()
+                .is_none(),
+            "a different version becoming live supersedes the earlier request"
+        );
+
+        let completed_environment = unique("cd-env");
+        append_cd_deployment(
+            &store,
+            &system,
+            &completed_environment,
+            &b,
+            "requested",
+            "dan",
+            Some("build-4"),
+        )
+        .await;
+        append_cd_deployment(
+            &store,
+            &system,
+            &completed_environment,
+            &b,
+            "live",
+            "observed",
+            None,
+        )
+        .await;
+        assert!(
+            store
+                .cd_requested_by(&system, &completed_environment, &b)
+                .await
+                .unwrap()
+                .is_none(),
+            "an already observed arrival must not reuse its completed request"
+        );
+
+        sqlx::query("DELETE FROM cd_deployments WHERE system = $1")
+            .bind(&system)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM cd_versions WHERE system = $1")
+            .bind(&system)
+            .execute(&store.pool)
+            .await
+            .unwrap();
     }
 }

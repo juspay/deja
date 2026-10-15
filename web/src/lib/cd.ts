@@ -82,12 +82,19 @@ export function mergesSince(
     .sort((a, b) => Date.parse(b.merged_at!) - Date.parse(a.merged_at!));
 }
 
-/** Where a version is on each environment, from the newest row per
- *  environment the API sends with it. `present` = running there now. */
-export function placesOf(where: CdVersionWhere[], environments: string[]): { environment: string; state: string | null; present: boolean }[] {
+/** Historical rows say where a version was; environment observations identify
+ * the last confirmed live version. A newer syncing/failed intent does not
+ * replace that observation. */
+export function placesOf(
+  where: CdVersionWhere[],
+  environments: string[],
+  observed: { environment: string; version: string | null }[] = [],
+): { environment: string; state: string | null; present: boolean; lastConfirmed: boolean }[] {
   return environments.map((environment) => {
     const row = where.find((w) => w.environment === environment);
-    return { environment, state: row?.state ?? null, present: row ? isRunning(row.state) : false };
+    const liveVersion = observed.find((o) => o.environment === environment)?.version;
+    const lastConfirmed = liveVersion != null && liveVersion === row?.version;
+    return { environment, state: row?.state ?? null, present: lastConfirmed, lastConfirmed };
   });
 }
 
