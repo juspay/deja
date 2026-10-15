@@ -58,11 +58,11 @@ fn is_date(s: &str) -> bool {
             .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
-/// The UTC date of a nanosecond timestamp, as `YYYY-MM-DD`.
-pub fn utc_date(unix_nanos: u64) -> String {
-    // Civil-from-days (H. Hinnant), valid for every date a u64 of nanoseconds
-    // can name.
-    let days = (unix_nanos / 86_400_000_000_000) as i64;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// Civil-from-days (H. Hinnant), shared by captured timestamps and the
+// publication clock so both agree on which UTC calendar day has ended.
+fn civil_from_days(days: i64) -> String {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -75,6 +75,92 @@ pub fn utc_date(unix_nanos: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// The UTC date of a nanosecond timestamp, as `YYYY-MM-DD`.
+pub fn utc_date(unix_nanos: u64) -> String {
+    civil_from_days((unix_nanos / 86_400_000_000_000) as i64)
+}
+
+/// The current UTC calendar day in canonical `YYYY-MM-DD` form.
+pub fn current_utc_day(now: SystemTime) -> Result<String, String> {
+    let days = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("current time precedes Unix epoch: {error}"))?
+        .as_secs()
+        / 86_400;
+    let days = i64::try_from(days).map_err(|_| "current UTC day exceeds i64 range")?;
+    Ok(civil_from_days(days))
+}
+
+/// Whether a canonical UTC calendar day has ended at the supplied current day.
+pub fn day_has_ended(day: &str, current_utc_day: &str) -> Result<bool, String> {
+    fn valid(value: &str) -> bool {
+        if value.len() != 10
+            || !value.as_bytes().iter().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    *b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            })
+        {
+            return false;
+        }
+        let (year, month, date) = (&value[..4], &value[5..7], &value[8..]);
+        let (Ok(year), Ok(month), Ok(date)) = (
+            year.parse::<u32>(),
+            month.parse::<u32>(),
+            date.parse::<u32>(),
+        ) else {
+            return false;
+        };
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let max_day = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return false,
+        };
+        date > 0 && date <= max_day
+    }
+    if !valid(day) {
+        return Err(format!(
+            "invalid UTC day {day:?}; expected canonical YYYY-MM-DD"
+        ));
+    }
+    if !valid(current_utc_day) {
+        return Err(format!(
+            "invalid current UTC day {current_utc_day:?}; expected canonical YYYY-MM-DD"
+        ));
+    }
+    Ok(day < current_utc_day)
+}
+
+#[cfg(test)]
+mod utc_day_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn utc_day_boundary_is_strict() {
+        let day_start = UNIX_EPOCH + Duration::from_secs(1_798_761_600); // 2027-01-01T00:00:00Z
+        let cutoff = |day, current| day_has_ended(day, current).expect("valid UTC calendar days");
+        assert_eq!(
+            current_utc_day(day_start - Duration::from_secs(1)).expect("valid clock"),
+            "2026-12-31"
+        );
+        assert_eq!(
+            current_utc_day(day_start).expect("valid clock"),
+            "2027-01-01"
+        );
+        assert!(!cutoff("2026-12-31", "2026-12-31"));
+        assert!(cutoff("2026-12-31", "2027-01-01"));
+        assert!(!cutoff("2027-01-01", "2026-12-31"));
+        assert!(cutoff("2026-12-30", "2026-12-31"));
+        assert!(cutoff("2024-02-29", "2024-03-01"));
+        assert!(day_has_ended("2026-02-30", "2026-03-01").is_err());
+    }
+}
 #[derive(Deserialize)]
 struct LineProbe {
     #[serde(default)]
@@ -101,6 +187,9 @@ struct RecordProbe {
     /// A graph node's start.
     #[serde(default)]
     started_ns: Option<u64>,
+    /// Legacy boundary envelopes used this name for the same UTC nanoseconds.
+    #[serde(default)]
+    started_at_unix_nanos: Option<u64>,
 }
 
 impl LineProbe {
@@ -142,9 +231,34 @@ fn place(line: &str) -> Option<Placed> {
         // A graph node's `sequence` is its own; only a boundary event says
         // where it falls in its request.
         request_sequence: record.request_sequence.filter(|_| !graph),
-        started_ns: record.timestamp_ns.or(record.started_ns),
+        started_ns: record
+            .timestamp_ns
+            .or(record.started_ns)
+            .or(record.started_at_unix_nanos),
         boundary_seq,
     })
+}
+
+/// Latest envelope timestamp when an older bare recording lacks sequence-zero
+/// ingress metadata. It cannot prove the request's start day, but it can refute
+/// a completed-day claim when a dated source contains a newer event.
+pub(crate) fn latest_observed_utc_day(objects: &[(&str, &[u8])]) -> Option<String> {
+    let mut latest: Option<String> = None;
+    for (_, chunk) in objects {
+        for line in chunk.split(|&byte| byte == b'\n') {
+            let text = String::from_utf8_lossy(line);
+            if let Some(timestamp) = place(&text).and_then(|record| record.started_ns) {
+                let observed = utc_date(timestamp);
+                if latest
+                    .as_ref()
+                    .is_none_or(|prior| observed.as_str() > prior.as_str())
+                {
+                    latest = Some(observed);
+                }
+            }
+        }
+    }
+    latest
 }
 
 /// Membership information derived from one durable object.

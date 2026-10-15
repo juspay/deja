@@ -69,6 +69,18 @@ Same-count object replacement invalidates the affected source snapshot. Raw
 source deletion marks the session incomplete and refuses a partial reseal; old
 pinned day revisions remain readable until their immutable S3 parts expire.
 
+A request-start day is eligible for publication only once its UTC calendar day
+has ended: the first possible pass is on the following UTC day, subject to the
+existing source-quietness check. The pass still indexes today's raw objects,
+but records `day_in_progress` rather than publishing a thin same-day seal.
+Manual compaction of a dated current-day recording is refused too; a bare
+recording's request-start dates are checked against its envelopes rather than
+trusted from its `dt=` partitions. A late tail arriving today can still create
+a new immutable revision of an earlier day.
+The recommendation ignores older same-day seals until that day ends. This
+prevents premature selection, but a completed day with little traffic still
+does not establish coverage of a PR's changed path.
+
 Earlier draft smoke (before the Postgres index) against disposable MinIO plus API:
 initial D7/D8 pass sealed both; a later D9 tail for D7 caused reseal (seal ID
 `7a52560118d34354` → `8a404437ea48ee45`, events 1 → 2), D9 published a
@@ -114,6 +126,14 @@ S3 correlation index as sealed. The real-Postgres regression also confirms
 that an orphan-only source object blocks day publication and hides existing
 current heads until another object supplies its ingress. No Kubernetes
 recommendation or full stage-two replay was exercised by this smoke.
+
+A separate real `deja-compactor pass` smoke with disposable Postgres and MinIO
+indexed a D14 request and a D15 request in one session on D15. It sealed D14
+and reported D15 as `not_ready` (`day_in_progress`), with no D15 view head.
+After another D15 object carried a late D14 tail, the next pass re-sealed D14:
+Postgres retained two immutable D14 revisions and one current D14 head, while
+D15 remained unsealed. This exercises the scheduled pass, not a Kubernetes
+deployment or a full replay.
 
 An oversized recording is a named refusal in the pass ledger, not necessarily
 a failed Job; the current refusal path can exit successfully. Alert on ledger

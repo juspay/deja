@@ -1344,12 +1344,13 @@ pub(crate) async fn materialize_indexed_days_from_index(
     eligible_days: &BTreeSet<String>,
 ) -> Result<(usize, u64, u64), String> {
     let session_id = scope.session_id.as_str();
+    let current_utc_day = day::current_utc_day(std::time::SystemTime::now())?;
     let mut count = 0;
     let mut bytes_read = 0u64;
     let mut bytes_fetched = 0u64;
     let mut source_checked = false;
     for item in days {
-        if !eligible_days.contains(&item.day) {
+        if !eligible_days.contains(&item.day) || !day::day_has_ended(&item.day, &current_utc_day)? {
             continue;
         }
         if !source_checked {
@@ -2769,6 +2770,14 @@ pub(crate) async fn compact_session_inner_indexed(
     };
     let recording_id = session_id;
     let session_id = day::split_recording_id(recording_id).session_id;
+    let current_utc_day = day::current_utc_day(std::time::SystemTime::now())?;
+    if let Some(day) = location.day.as_ref().map(|scope| scope.day.as_str()) {
+        if !day::day_has_ended(day, &current_utc_day)? {
+            return Err(format!(
+                "UTC day {day} is still in progress; no recording seal was written"
+            ));
+        }
+    }
     // Every prefix the session appears under, and only keys that NAME it: a
     // prefix match is not a segment match, so listing `…/session=s1` also
     // returns `…/session=s10`.
@@ -2794,6 +2803,18 @@ pub(crate) async fn compact_session_inner_indexed(
         (key_instance(a.as_ref()), a.as_ref()).cmp(&(key_instance(b.as_ref()), b.as_ref()))
     });
     keys.dedup();
+    // A bare recording has no logical day in its ID. For dated source keys,
+    // refuse the whole-session override while any of its partitions is still
+    // in progress. A named historical day may still reseal from today's tail.
+    if location.day.is_none() {
+        if let Some(latest) = keys.iter().filter_map(|key| key_date(key.as_ref())).max() {
+            if !day::day_has_ended(latest, &current_utc_day)? {
+                return Err(format!(
+                    "UTC source day {latest} is still in progress; no whole-session seal was written"
+                ));
+            }
+        }
+    }
     let mut chunks = Vec::with_capacity(keys.len());
     // No budget is `u64::MAX` rather than a branch, so the loop below has one
     // shape and the unbudgeted path is the same code the budgeted path takes.
@@ -2831,6 +2852,46 @@ pub(crate) async fn compact_session_inner_indexed(
     } else {
         None
     };
+    if location.day.is_none() {
+        let require_ended = |day: &str| -> Result<(), String> {
+            if day::day_has_ended(day, &current_utc_day)? {
+                Ok(())
+            } else {
+                Err(format!(
+                    "UTC request-start day {day} is still in progress; no whole-session seal was written"
+                ))
+            }
+        };
+        if let Some((_, days)) = &indexed {
+            for day in days {
+                require_ended(&day.day)?;
+            }
+        } else {
+            let objects: Vec<(&str, &[u8])> = keys
+                .iter()
+                .zip(&chunks)
+                .map(|(key, bytes)| (key.as_ref(), bytes.as_slice()))
+                .collect();
+            let mut missing_ingress = false;
+            for membership in day::index_objects(&objects) {
+                for request in membership.requests {
+                    require_ended(&request.day)?;
+                }
+                for day in membership.object_days {
+                    require_ended(&day)?;
+                }
+                missing_ingress |= !membership.unresolved_correlations.is_empty();
+            }
+            // Older envelopes may lack request_sequence even when they carry
+            // an event timestamp. Preserve their explicit bare compaction,
+            // but never let an old dt= partition hide an unended observed day.
+            if missing_ingress && keys.iter().any(|key| key_date(key.as_ref()).is_some()) {
+                if let Some(latest) = day::latest_observed_utc_day(&objects) {
+                    require_ended(&latest)?;
+                }
+            }
+        }
+    }
 
     if let Some(scope) = &location.day {
         // One day of a session. The lines are chosen by when each request

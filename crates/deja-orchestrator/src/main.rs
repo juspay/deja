@@ -1830,6 +1830,7 @@ async fn v1_available_recordings(
                 },
             ),
             Ok(ready_pods) => {
+                let now = std::time::SystemTime::now();
                 let ids: Vec<String> = found.iter().map(|r| r.session_id.clone()).collect();
                 let manifests = manifests_for_recordings(
                     &st,
@@ -1901,6 +1902,7 @@ async fn v1_available_recordings(
                             &ready_pods,
                             system_config.main_instance_prefix.as_deref(),
                             &logical_days,
+                            &now,
                         ),
                         Err(reason) => (
                             None,
@@ -2360,6 +2362,7 @@ fn recommend_from_serving_pods(
     ready_pods: &[String],
     main_prefix: Option<&str>,
     logical_days: &std::collections::HashSet<String>,
+    now: &std::time::SystemTime,
 ) -> (Option<String>, RecommendationState) {
     let unavailable = |reason: String| {
         (
@@ -2369,6 +2372,10 @@ fn recommend_from_serving_pods(
                 reason: Some(reason),
             },
         )
+    };
+    let current_day = match deja_compactor::day::current_utc_day(*now) {
+        Ok(day) => day,
+        Err(reason) => return unavailable(reason),
     };
     if ready_pods.is_empty() {
         return unavailable("workload has no ready serving pods".into());
@@ -2472,6 +2479,11 @@ fn recommend_from_serving_pods(
         }
         let split = deja_compactor::day::split_recording_id(id);
         if let Some(day) = split.day {
+            match deja_compactor::day::day_has_ended(day, &current_day) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(reason) => return unavailable(reason),
+            }
             if serving_sessions.contains(split.session_id)
                 && matches!(
                     deja_orchestrator::parse_recording_id(id),
@@ -2489,6 +2501,11 @@ fn recommend_from_serving_pods(
         }
         let split = deja_compactor::day::split_recording_id(&recording.session_id);
         let Some(day) = split.day else { continue };
+        match deja_compactor::day::day_has_ended(day, &current_day) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(reason) => return unavailable(reason),
+        }
         // A physical S3 partition can contain only the tail of a request
         // whose ingress belongs to an earlier day. It is not a logical day
         // member and must not veto that earlier day's complete replay group.
@@ -7681,6 +7698,9 @@ mod tests {
             instances: instances.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
+    fn recommendation_time(epoch_seconds: u64) -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch_seconds)
+    }
 
     fn newest_first(mut rows: Vec<deja_compactor::LandedRecording>) -> Vec<String> {
         rows.sort_by_cached_key(super::selection_order_key);
@@ -7795,6 +7815,7 @@ mod tests {
             &["sbx-hyperswitch-server-a".to_owned()],
             Some("sbx-hyperswitch-server-"),
             &logical,
+            &recommendation_time(1_791_590_400),
         );
         assert_eq!(rollback_state.state, "ready");
         assert_eq!(rollback_group.as_deref(), Some("a1b2c3d-20261008"));
@@ -7805,6 +7826,7 @@ mod tests {
             &["sbx-hyperswitch-server-b".to_owned()],
             Some("sbx-hyperswitch-server-"),
             &logical,
+            &recommendation_time(1_791_590_400),
         );
         assert_eq!(newer_state.state, "ready");
         assert_eq!(newer_group.as_deref(), Some("bbbbbbb-20261009"));
@@ -7840,6 +7862,7 @@ mod tests {
             &["sbx-hyperswitch-server-a".into()],
             Some("sbx-hyperswitch-server-"),
             &std::collections::HashSet::from([sealed_id.to_owned(), empty_id.to_owned()]),
+            &recommendation_time(1_791_590_400),
         );
         assert_eq!(state.state, "ready");
         assert_eq!(group.as_deref(), Some("a1b2c3d-20261008"));
@@ -7873,6 +7896,7 @@ mod tests {
             &pods,
             Some("sbx-hyperswitch-server-"),
             &logical,
+            &recommendation_time(1_791_590_400),
         );
         assert_eq!(state.state, "ready");
         assert_eq!(group.as_deref(), Some("a1b2c3d-20261007"));
@@ -7885,6 +7909,7 @@ mod tests {
             &pods,
             Some("sbx-hyperswitch-server-"),
             &logical,
+            &recommendation_time(1_791_590_400),
         );
         assert_eq!(state.state, "unavailable");
         assert!(group.is_none());
@@ -7897,6 +7922,100 @@ mod tests {
             &pods,
             Some("sbx-hyperswitch-server-"),
             &logical,
+            &recommendation_time(1_791_590_400),
+        );
+        assert_eq!(state.state, "unavailable");
+        assert!(group.is_none());
+    }
+    #[test]
+    fn recommendation_waits_for_utc_day_end_and_ignores_today_as_a_veto() {
+        let yesterday = "rec-a1b2c3d-10072359-x.2026-10-14";
+        let today = "rec-a1b2c3d-10072359-x.2026-10-15";
+        let found = vec![
+            landed(yesterday, "2026-10-14", &["sbx-hyperswitch-server-a"]),
+            landed(today, "2026-10-15", &["sbx-hyperswitch-server-a"]),
+        ];
+        let sealed = |id: &str| {
+            let mut manifest = manifest_with_codes(&[Some("a1b2c3d")]);
+            manifest.session_id = id.to_owned();
+            manifest.data_parts.push(deja_compactor::DataPart {
+                key: format!("sessions/v1/{id}/data/part-00000.ndjsonl.zst"),
+                events: 1,
+                bytes: 1,
+            });
+            manifest
+        };
+        let manifests = std::collections::HashMap::from([
+            (yesterday.to_owned(), Ok(Some(sealed(yesterday)))),
+            (today.to_owned(), Ok(Some(sealed(today)))),
+        ]);
+        let pods = ["sbx-hyperswitch-server-a".to_owned()];
+        let logical = std::collections::HashSet::from([yesterday.to_owned(), today.to_owned()]);
+
+        // A complete D14 remains recommendable during D15, even when a stale
+        // same-day S3 manifest exists and claims to be replayable.
+        let (group, state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+            &recommendation_time(1_792_022_400),
+        );
+        assert_eq!(state.state, "ready");
+        assert_eq!(group.as_deref(), Some("a1b2c3d-20261014"));
+
+        // Today's indexed-only ingress cannot veto D14 either.
+        let (group, state) = super::recommend_from_serving_pods(
+            &found[..1],
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+            &recommendation_time(1_792_022_400),
+        );
+        assert_eq!(state.state, "ready");
+        assert_eq!(group.as_deref(), Some("a1b2c3d-20261014"));
+
+        // A current-day partial/unsealed row is likewise ignored until tomorrow.
+        let manifests =
+            std::collections::HashMap::from([(yesterday.to_owned(), Ok(Some(sealed(yesterday))))]);
+        let (group, state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+            &recommendation_time(1_792_022_400),
+        );
+        assert_eq!(state.state, "ready");
+        assert_eq!(group.as_deref(), Some("a1b2c3d-20261014"));
+        let manifests = std::collections::HashMap::from([
+            (yesterday.to_owned(), Ok(Some(sealed(yesterday)))),
+            (today.to_owned(), Ok(Some(sealed(today)))),
+        ]);
+        // On D16 a complete D15 is the newest eligible group.
+        let (group, state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+            &recommendation_time(1_792_108_800),
+        );
+        assert_eq!(state.state, "ready");
+        assert_eq!(group.as_deref(), Some("a1b2c3d-20261015"));
+
+        // But an unsealed D15 remains a veto for older days once D15 has ended.
+        let manifests =
+            std::collections::HashMap::from([(yesterday.to_owned(), Ok(Some(sealed(yesterday))))]);
+        let (group, state) = super::recommend_from_serving_pods(
+            &found[..1],
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+            &recommendation_time(1_792_108_800),
         );
         assert_eq!(state.state, "unavailable");
         assert!(group.is_none());

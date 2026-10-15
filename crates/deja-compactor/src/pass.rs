@@ -88,10 +88,8 @@ pub enum Outcome {
     },
     /// The current manifest's source snapshot matches the landing.
     AlreadyCurrent { source_objects: usize },
-    /// Still being written. Not a drop: the recording is fine and the next
-    /// pass will find it finished.
+    /// A UTC request-start day still in progress. No daily or bare seal is published.
     NotReady { state: String, objects: usize },
-    /// The landing passed the pass's memory budget while it was being read, so
     /// no seal was attempted. A DROP: this recording will not seal until
     /// either the budget rises or compaction stops holding the whole landing.
     TooLarge {
@@ -585,8 +583,17 @@ async fn seal_outcome_indexed_in(
 ) -> Result<Outcome, String> {
     let mut cfg = S3Config::from_env();
     cfg.bucket = bucket.to_owned();
-    let existing = if index.is_some() && crate::day::split_recording_id(recording_id).day.is_some()
-    {
+    let recording_day = crate::day::split_recording_id(recording_id);
+    if let Some(day) = recording_day.day {
+        let current_utc_day = crate::day::current_utc_day(std::time::SystemTime::now())?;
+        if !crate::day::day_has_ended(day, &current_utc_day)? {
+            return Ok(Outcome::NotReady {
+                state: "day_in_progress".to_owned(),
+                objects: 0,
+            });
+        }
+    }
+    let existing = if index.is_some() && recording_day.day.is_some() {
         None
     } else {
         crate::manifest_of(store, recording_id).await?
@@ -904,6 +911,10 @@ fn seal_system(
         Err(_) => return unreachable("connect durable index failed".to_owned()),
     };
     runtime.block_on(async {
+        let current_utc_day = match crate::day::current_utc_day(std::time::SystemTime::now()) {
+            Ok(day) => day,
+            Err(error) => return unreachable(error),
+        };
         let scope_root = cfg.bucket_key(&root);
         let known_generations = match db.active_landing_session_generations(system, &cfg.bucket, &scope_root).await {
             Ok(generations) => generations,
@@ -968,21 +979,43 @@ fn seal_system(
                 continue;
             }
             if days.is_empty() {
-                let row = seal_one_in(
-                    &store,
+                let row = failed_row(
                     system,
                     &session,
-                    &root,
-                    quiet_after_secs,
-                    max_landing_bytes,
-                )
-                .await;
+                    "no indexed UTC request-start day; refuse an unbounded whole-session seal"
+                        .to_owned(),
+                );
                 observe(&row);
                 ledger.planned.push(session);
                 ledger.rows.push(row);
                 continue;
             }
             for day in &days {
+                let id = crate::day::day_recording_id(&session, &day.day);
+                let ended = match crate::day::day_has_ended(&day.day, &current_utc_day) {
+                    Ok(ended) => ended,
+                    Err(error) => {
+                        let row = failed_row(system, &id, format!("check day cutoff: {error}"));
+                        observe(&row);
+                        ledger.planned.push(id);
+                        ledger.rows.push(row);
+                        continue;
+                    }
+                };
+                if !ended {
+                    ledger.planned.push(id.clone());
+                    let row = Row {
+                        system: system.to_owned(),
+                        recording_id: id,
+                        outcome: Outcome::NotReady {
+                            state: "day_in_progress".to_owned(),
+                            objects: day.object_keys.len(),
+                        },
+                    };
+                    observe(&row);
+                    ledger.rows.push(row);
+                    continue;
+                }
                 let current = match db.day_view_head(&scope, &day.day).await {
                     Ok(current) => current,
                     Err(error) => {
@@ -1001,7 +1034,6 @@ fn seal_system(
                 {
                     continue;
                 }
-                let id = crate::day::day_recording_id(&session, &day.day);
                 ledger.planned.push(id.clone());
                 let outcome = async {
                     let newest = {
@@ -1783,6 +1815,123 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    #[test]
+    fn an_unended_day_waits_while_a_previous_day_can_reseal() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let store = store();
+        let now = SystemTime::now();
+        let unended = crate::day::current_utc_day(now + Duration::from_secs(172_800)).unwrap();
+        let previous = crate::day::current_utc_day(now - Duration::from_secs(172_800)).unwrap();
+        let previous_ns = u64::try_from(
+            (now - Duration::from_secs(172_800))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let now_ns = u64::try_from(now.duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let future_ns = u64::try_from(
+            (now + Duration::from_secs(172_800))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+
+        land_dated(
+            &store,
+            &unended,
+            "active",
+            0,
+            &[timed("active", 0, "new", 0, future_ns)],
+        );
+        let active_id = crate::day::day_recording_id("active", &unended);
+        let row = block(seal_one_in(&store, "sys", &active_id, ROOT, 0, None));
+        assert!(
+            matches!(row.outcome, Outcome::NotReady { ref state, .. } if state == "day_in_progress")
+        );
+        assert!(block(crate::manifest_of(&store, &active_id))
+            .unwrap()
+            .is_none());
+        let day_override = block(crate::compact_session_inner(&store, &active_id, ROOT, None))
+            .expect_err("manual compaction cannot publish an unended day");
+        assert!(day_override.contains("still in progress"), "{day_override}");
+        let bare_override = block(crate::compact_session_inner(&store, "active", ROOT, None))
+            .expect_err("bare whole-session override cannot publish an unended partition");
+        assert!(
+            bare_override.contains("still in progress"),
+            "{bare_override}"
+        );
+        assert!(block(crate::manifest_of(&store, "active"))
+            .unwrap()
+            .is_none());
+
+        // Partition date is not ingress date. A bare override cannot use an
+        // old `dt=` directory to publish an unfinished request-start day.
+        land_dated(
+            &store,
+            &previous,
+            "misplaced",
+            0,
+            &[timed("misplaced", 0, "future", 0, future_ns)],
+        );
+        let mismatched = block(crate::compact_session_inner(
+            &store,
+            "misplaced",
+            ROOT,
+            None,
+        ))
+        .expect_err("bare compaction must inspect the recorded ingress day");
+        assert!(mismatched.contains("request-start day"), "{mismatched}");
+        assert!(block(crate::manifest_of(&store, "misplaced"))
+            .unwrap()
+            .is_none());
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&timed("legacy-dated", 0, "future", 0, future_ns)).unwrap();
+        let event = legacy["event"].as_object_mut().unwrap();
+        event.remove("request_sequence");
+        event.remove("timestamp_ns");
+        event.insert(
+            "started_at_unix_nanos".to_owned(),
+            serde_json::json!(future_ns),
+        );
+        land_dated(&store, &previous, "legacy-dated", 0, &[legacy.to_string()]);
+        let legacy_error = block(crate::compact_session_inner(
+            &store,
+            "legacy-dated",
+            ROOT,
+            None,
+        ))
+        .expect_err("legacy timestamp in an older partition must not publish early");
+        assert!(legacy_error.contains("request-start day"), "{legacy_error}");
+
+        land_dated(
+            &store,
+            &previous,
+            "older",
+            0,
+            &[timed("older", 0, "prior", 0, previous_ns)],
+        );
+        let older_id = crate::day::day_recording_id("older", &previous);
+        let first = block(seal_one_in(&store, "sys", &older_id, ROOT, 0, None));
+        assert!(matches!(first.outcome, Outcome::Sealed { .. }));
+        land_dated(
+            &store,
+            &unended,
+            "older",
+            1,
+            &[timed("older", 1, "prior", 1, now_ns)],
+        );
+        let revised = block(seal_one_in(&store, "sys", &older_id, ROOT, 0, None));
+        assert!(matches!(
+            revised.outcome,
+            Outcome::Sealed { resealed: true, .. }
+        ));
+        assert_eq!(correlations_of(&store, &older_id), ["prior#0", "prior#1"]);
     }
 
     /// A pod's session runs across midnight. The pass seals it as two days,
