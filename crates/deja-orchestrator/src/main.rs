@@ -358,6 +358,15 @@ fn app_router(state: AppState) -> Router {
     let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
     let post_cd_observed = post(v1_cd_post_observed).route_layer(service.clone());
     let post_cd_hop = post(v1_cd_post_hop).route_layer(service);
+    let session = || middleware::from_fn_with_state(state.clone(), require_session);
+    let promote = post(v1_cd_promote).route_layer(session());
+    let promotions = cd_read(get(v1_cd_promotions_list));
+    let promotion_step = post(v1_cd_promotion_step).route_layer(middleware::from_fn_with_state(
+        state.mutation_auth.clone(),
+        require_service_auth,
+    ));
+    let promotion_cancel = delete(v1_cd_promotion_cancel).route_layer(session());
+    let promotion_fail = post(v1_cd_promotion_mark_failed).route_layer(session());
     let cd_pause = cd_read(get(v1_cd_pause)).merge(post(v1_cd_set_pause).route_layer(
         middleware::from_fn_with_state(state.clone(), require_session),
     ));
@@ -398,6 +407,15 @@ fn app_router(state: AppState) -> Router {
         .route("/auth/me", get(v1_auth_me))
         .route("/cd/config", cd_read(get(v1_cd_config)))
         .route("/cd/pause", cd_pause)
+        .route(
+            "/cd/environments/{env}/promotion-check",
+            cd_read(get(v1_cd_promotion_check)),
+        )
+        .route("/cd/environments/{env}/promotions", promote)
+        .route("/cd/promotion-requests", promotions)
+        .route("/cd/promotion-requests/{id}", promotion_cancel)
+        .route("/cd/promotion-requests/{id}/fail", promotion_fail)
+        .route("/cd/promotion-requests/{id}/{step}", promotion_step)
         .route(
             "/cd/versions",
             cd_read(get(v1_cd_versions)).merge(post_cd_version),
@@ -4519,6 +4537,476 @@ async fn v1_cd_pause(State(st): State<AppState>, axum::extract::Query(q): Query)
     }
 }
 
+/// Who may promote to an environment: a signed-in person holding
+/// `<environment>_upgrader`, or, while Deployments is in beta, `maintainer`.
+/// Never the pipeline's token.
+fn promote_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    target: &str,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<String> {
+    if !cfg.enabled {
+        return Some("promoting needs sign-in, which is not configured on this deployment".into());
+    }
+    if actor == SERVICE_ACTOR || actor_sub.filter(|s| !s.is_empty()).is_none() {
+        return Some("promoting needs a signed-in person".into());
+    }
+    let role = format!("{target}_upgrader");
+    if cfg.has_role(actor, &role) || cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return None;
+    }
+    Some(format!(
+        "only a {role} (or, in beta, a maintainer) may promote to {target}"
+    ))
+}
+
+/// Everything the promotion checks read, for one version and target.
+#[allow(clippy::too_many_arguments)]
+async fn promotion_facts(
+    st: &AppState,
+    store: &deja_store::Store,
+    cd: &deja_orchestrator::cd::CdConfig,
+    system: &str,
+    target: &str,
+    version: &str,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Result<deja_orchestrator::cd::PromotionFacts, String> {
+    let source = cd.source_of(target).unwrap_or_default().to_owned();
+    let v = store
+        .cd_version_get(system, version)
+        .await
+        .map_err(|e| e.to_string())?;
+    let live = store
+        .cd_latest_live_per_environment(system)
+        .await
+        .map_err(|e| e.to_string())?;
+    let target_live = live
+        .iter()
+        .find(|r| r.environment == target)
+        .map(|r| r.version.clone());
+    let target_merged_at = match &target_live {
+        Some(t) => store
+            .cd_version_get(system, t)
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|v| v.merged_at),
+        None => None,
+    };
+    let hop = store
+        .cd_hops_of_version(system, version, 1)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .map(|h| (h.state, h.against_version));
+    Ok(deja_orchestrator::cd::PromotionFacts {
+        refused: promote_refusal(&st.auth.config(), target, actor, actor_sub),
+        live_on_source_since: if source.is_empty() {
+            None
+        } else {
+            store
+                .cd_first_live(system, &source, version)
+                .await
+                .map_err(|e| e.to_string())?
+        },
+        source,
+        target: target.to_owned(),
+        version_kind: v.as_ref().map(|v| v.kind.clone()),
+        version_merged_at: v.and_then(|v| v.merged_at),
+        target_live,
+        target_merged_at,
+        hop,
+        in_flight: store
+            .cd_promotion_in_flight(system, target)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|r| r.id),
+        paused: store
+            .cd_control_get(system)
+            .await
+            .map_err(|e| e.to_string())?
+            .filter(|c| c.paused)
+            .map(|c| c.reason.unwrap_or_default()),
+        now: chrono::Utc::now(),
+    })
+}
+
+/// `GET /api/v1/cd/environments/{env}/promotion-check?system=&version=`:
+/// the checks a promotion of `version` to `env` would be accepted under,
+/// for the person asking, each with its reason.
+async fn v1_cd_promotion_check(
+    State(st): State<AppState>,
+    Path(env): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if cd.source_of(&env).is_none() {
+        return error_resp(400, &format!("{env:?} is not promotable"));
+    }
+    let Some(version) = q.get("version").map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return error_resp(400, "version is required");
+    };
+    let facts = match promotion_facts(
+        &st,
+        &store,
+        &cd,
+        &system,
+        &env,
+        version,
+        &actor.0,
+        subject.0.as_deref(),
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => return error_resp(500, &format!("promotion check: {e}")),
+    };
+    let checks = deja_orchestrator::cd::promotion_checks(&cd, &facts);
+    json_ok(serde_json::json!({
+        "system": system,
+        "environment": env,
+        "from": facts.source,
+        "version": version,
+        "target_live": facts.target_live,
+        "ok": checks.iter().all(|c| c.ok),
+        "checks": checks,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct Promote {
+    system: String,
+    version: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `POST /api/v1/cd/environments/{env}/promotions` `{system, version, note}`:
+/// a signed-in upgrader asks for `version` on `env`. Every check runs again
+/// here; the request is written only when all pass. The promote job picks
+/// it up by polling: deja never calls Jenkins.
+async fn v1_cd_promote(
+    State(st): State<AppState>,
+    Path(env): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let b: Promote = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&b.system) {
+        return error_resp(400, &format!("unknown system {:?}", b.system));
+    }
+    if cd.source_of(&env).is_none() {
+        return error_resp(400, &format!("{env:?} is not promotable"));
+    }
+    let facts = match promotion_facts(
+        &st,
+        &store,
+        &cd,
+        &b.system,
+        &env,
+        &b.version,
+        &actor.0,
+        subject.0.as_deref(),
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => return error_resp(500, &format!("promotion check: {e}")),
+    };
+    let checks = deja_orchestrator::cd::promotion_checks(&cd, &facts);
+    if let Some(person) = checks.iter().find(|c| c.id == "person" && !c.ok) {
+        return error_resp(403, &person.why);
+    }
+    if !checks.iter().all(|c| c.ok) {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({ "error": "not every check passes", "checks": checks })),
+        )
+            .into_response();
+    }
+    let note = b.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let evidence = serde_json::json!({
+        "checks": checks,
+        "from": facts.source,
+        "target_live": facts.target_live,
+        "hop": facts.hop.map(|(state, against)| serde_json::json!({ "state": state, "against": against })),
+    });
+    let row = match store
+        .cd_promotion_create(
+            &b.system,
+            &env,
+            &b.version,
+            &actor.0,
+            subject.0.as_deref(),
+            note,
+            &evidence,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) if deja_store::is_unique_violation(&e) => {
+            return error_resp(409, &format!("another promotion to {env} is in flight"))
+        }
+        Err(e) => return error_resp(500, &format!("promotion: {e}")),
+    };
+    cd_audit(
+        &store,
+        &actor.0,
+        "cd.promote",
+        "environment",
+        &format!("{}/{}", b.system, env),
+        &serde_json::json!({ "request": row.id, "version": b.version, "note": note }),
+    )
+    .await;
+    json_ok_ser(&row)
+}
+
+/// `GET /api/v1/cd/promotion-requests?system=&state=&environment=&limit=`:
+/// with `state`, that queue oldest first (what the promote job polls);
+/// without, the newest requests.
+async fn v1_cd_promotions_list(
+    State(st): State<AppState>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let state = q.get("state").map(String::as_str).filter(|s| !s.is_empty());
+    let environment = q
+        .get("environment")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    match store
+        .cd_promotions_list(&system, state, environment, cd_limit(&q, 50))
+        .await
+    {
+        Ok(rows) => json_ok_ser(&rows),
+        Err(e) => error_resp(500, &format!("promotions: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PromotionStep {
+    #[serde(default)]
+    release: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    jenkins_build: Option<String>,
+    #[serde(default)]
+    detail: serde_json::Value,
+}
+
+fn step_refusal(e: deja_store::CdStepRefusal, step: &str) -> Response {
+    match e {
+        deja_store::CdStepRefusal::NoSuchRequest => error_resp(404, "no such promotion request"),
+        deja_store::CdStepRefusal::WrongState(s) => {
+            error_resp(409, &format!("the request is {s}; it cannot go to {step}"))
+        }
+        deja_store::CdStepRefusal::Db(e) => error_resp(500, &format!("promotion: {e}")),
+    }
+}
+
+/// `POST /api/v1/cd/promotion-requests/{id}/{step}`: the promote job reports
+/// a step (`picked`, `tagged` with the release, `built`, `committed`,
+/// `live`, `failed` with a reason). Each is accepted only after the step
+/// before it; `picked` therefore succeeds once, and a second job that loses
+/// the race gets 409.
+async fn v1_cd_promotion_step(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path((id, step)): Path<(i64, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !["picked", "tagged", "built", "committed", "live", "failed"].contains(&step.as_str()) {
+        return error_resp(400, &format!("no step {step:?}"));
+    }
+    let b: PromotionStep = if body.is_empty() {
+        PromotionStep::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(b) => b,
+            Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+        }
+    };
+    if step == "tagged" && b.release.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return error_resp(400, "tagged needs the release");
+    }
+    if step == "failed" && b.reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return error_resp(400, "failed needs a reason");
+    }
+    let detail = serde_json::json!({
+        "reason": b.reason,
+        "jenkins_build": b.jenkins_build,
+        "by": actor.0,
+        "at": chrono::Utc::now(),
+        "detail": if b.detail.is_null() { serde_json::json!({}) } else { b.detail },
+    });
+    let picked_by = (step == "picked")
+        .then_some(b.jenkins_build.as_deref())
+        .flatten();
+    match store
+        .cd_promotion_step(id, &step, b.release.as_deref(), picked_by, &detail)
+        .await
+    {
+        Ok(row) => {
+            cd_audit(
+                &store,
+                &actor.0,
+                &format!("cd.promotion.{step}"),
+                "promotion",
+                &id.to_string(),
+                &serde_json::json!({ "release": row.release, "reason": b.reason }),
+            )
+            .await;
+            json_ok_ser(&row)
+        }
+        Err(e) => step_refusal(e, &step),
+    }
+}
+
+/// `DELETE /api/v1/cd/promotion-requests/{id}`: its requester, or a
+/// maintainer, takes back a request the job has not picked yet.
+async fn v1_cd_promotion_cancel(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let row = match store.cd_promotion_get(id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(404, "no such promotion request"),
+        Err(e) => return error_resp(500, &format!("promotion: {e}")),
+    };
+    let cfg = st.auth.config();
+    let mine = matches!((row.requested_by_sub.as_deref(), subject.0.as_deref()), (Some(a), Some(b)) if !a.is_empty() && a == b);
+    let maintainer =
+        subject.0.is_some() && cfg.has_role(&actor.0, deja_orchestrator::auth::ROLE_MAINTAINER);
+    if !cfg.enabled || !(mine || maintainer) {
+        return error_resp(
+            403,
+            "only its requester or a maintainer may cancel a promotion",
+        );
+    }
+    let detail = serde_json::json!({ "by": actor.0, "at": chrono::Utc::now() });
+    match store
+        .cd_promotion_step(id, "cancelled", None, None, &detail)
+        .await
+    {
+        Ok(row) => {
+            cd_audit(
+                &store,
+                &actor.0,
+                "cd.promotion.cancelled",
+                "promotion",
+                &id.to_string(),
+                &serde_json::json!({}),
+            )
+            .await;
+            json_ok_ser(&row)
+        }
+        Err(e) => step_refusal(e, "cancelled"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MarkFailed {
+    reason: String,
+}
+
+/// `POST /api/v1/cd/promotion-requests/{id}/fail` `{reason}`: a maintainer
+/// ends a request the job will not finish (its build died), so it no longer
+/// holds the environment.
+async fn v1_cd_promotion_mark_failed(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Some(why) = pause_refusal(&st.auth.config(), &actor.0, subject.0.as_deref()) {
+        return error_resp(
+            403,
+            &why.replace("pause or resume the pipeline", "mark a promotion failed")
+                .replace("pausing", "marking a promotion failed"),
+        );
+    }
+    let b: MarkFailed = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if b.reason.trim().is_empty() {
+        return error_resp(400, "say why");
+    }
+    let detail = serde_json::json!({ "reason": b.reason.trim(), "by": actor.0, "at": chrono::Utc::now(), "marked_by_person": true });
+    match store
+        .cd_promotion_step(id, "failed", None, None, &detail)
+        .await
+    {
+        Ok(row) => {
+            cd_audit(
+                &store,
+                &actor.0,
+                "cd.promotion.marked_failed",
+                "promotion",
+                &id.to_string(),
+                &serde_json::json!({ "reason": b.reason.trim() }),
+            )
+            .await;
+            json_ok_ser(&row)
+        }
+        Err(e) => step_refusal(e, "failed"),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct SetPause {
     system: String,
@@ -7452,6 +7940,28 @@ mod sign_in {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
+    }
+
+    #[test]
+    fn upgraders_and_in_beta_maintainers_promote() {
+        let (auth, _) = enabled(&["ravi@juspay.in"]);
+        let mut cfg = auth.config();
+        cfg.roles
+            .insert("sandbox_upgrader".into(), vec!["qa-1@example.com".into()]);
+        assert_eq!(
+            promote_refusal(&cfg, "sandbox", "qa-1@example.com", Some("s-qa")),
+            None
+        );
+        assert_eq!(
+            promote_refusal(&cfg, "sandbox", "ravi@juspay.in", Some("s-ravi")),
+            None
+        );
+        assert!(promote_refusal(&cfg, "sandbox", "asha@juspay.in", Some("s-asha")).is_some());
+        assert!(promote_refusal(&cfg, "sandbox", "qa-1@example.com", None).is_some());
+        assert!(promote_refusal(&cfg, "sandbox", SERVICE_ACTOR, None).is_some());
+        assert!(
+            promote_refusal(&AuthState::disabled().config(), "sandbox", "qa", Some("s")).is_some()
+        );
     }
 
     #[test]

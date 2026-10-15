@@ -370,6 +370,57 @@ pub struct NewCdHop {
     pub detail: serde_json::Value,
 }
 
+/// A promotion request (migration 0013).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdPromotionRow {
+    pub id: i64,
+    pub system: String,
+    pub environment: String,
+    pub from_version: String,
+    pub release: Option<String>,
+    pub state: String,
+    pub requested_by: String,
+    /// The sign-in subject beside the name, never serialised.
+    #[serde(default, skip_serializing)]
+    pub requested_by_sub: Option<String>,
+    pub note: Option<String>,
+    pub evidence: serde_json::Value,
+    pub step_detail: serde_json::Value,
+    pub picked_by_build: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// The states a request moves through, and where each may come from.
+pub const CD_PROMOTION_STEPS: [(&str, &[&str]); 7] = [
+    ("picked", &["pending"]),
+    ("tagged", &["picked"]),
+    ("built", &["tagged"]),
+    ("committed", &["built"]),
+    ("live", &["committed"]),
+    (
+        "failed",
+        &["pending", "picked", "tagged", "built", "committed"],
+    ),
+    ("cancelled", &["pending"]),
+];
+
+/// Whether an insert lost to a unique index (SQLSTATE 23505): for promotion
+/// requests, another one for the same environment is still in flight.
+pub fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23505"))
+}
+
+/// Why a step was not applied.
+#[derive(Debug)]
+pub enum CdStepRefusal {
+    NoSuchRequest,
+    /// The request is in a state this step may not follow.
+    WrongState(String),
+    Db(sqlx::Error),
+}
+
 impl Store {
     /// Connect and run migrations. Errors are returned (the caller decides
     /// whether the store is mandatory).
@@ -1082,6 +1133,156 @@ impl Store {
         Ok(rows.into_iter().map(cd_hop_row).collect())
     }
 
+    // -- cd promotion requests ------------------------------------------------
+
+    /// A new pending request. A second in-flight request for the same
+    /// environment fails on the unique index (SQLSTATE 23505).
+    #[allow(clippy::too_many_arguments)] // mirrors the row
+    pub async fn cd_promotion_create(
+        &self,
+        system: &str,
+        environment: &str,
+        from_version: &str,
+        requested_by: &str,
+        requested_by_sub: Option<&str>,
+        note: Option<&str>,
+        evidence: &serde_json::Value,
+    ) -> Result<CdPromotionRow, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO cd_promotion_requests
+               (system, environment, from_version, requested_by, requested_by_sub, note, evidence)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING {CD_PROMOTION_COLUMNS}"
+        ))
+        .bind(system)
+        .bind(environment)
+        .bind(from_version)
+        .bind(requested_by)
+        .bind(requested_by_sub)
+        .bind(note)
+        .bind(evidence)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(cd_promotion_row(row))
+    }
+
+    pub async fn cd_promotion_get(&self, id: i64) -> Result<Option<CdPromotionRow>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {CD_PROMOTION_COLUMNS} FROM cd_promotion_requests WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(cd_promotion_row))
+    }
+
+    /// A system's requests, oldest first when filtered to one state (the
+    /// job's queue), newest first otherwise (the pages).
+    pub async fn cd_promotions_list(
+        &self,
+        system: &str,
+        state: Option<&str>,
+        environment: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CdPromotionRow>, sqlx::Error> {
+        let order = if state.is_some() { "ASC" } else { "DESC" };
+        let rows = sqlx::query(&format!(
+            "SELECT {CD_PROMOTION_COLUMNS} FROM cd_promotion_requests
+             WHERE system = $1 AND ($2::text IS NULL OR state = $2)
+               AND ($3::text IS NULL OR environment = $3)
+             ORDER BY id {order} LIMIT $4"
+        ))
+        .bind(system)
+        .bind(state)
+        .bind(environment)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_promotion_row).collect())
+    }
+
+    /// The request for an environment that has not ended, if any.
+    pub async fn cd_promotion_in_flight(
+        &self,
+        system: &str,
+        environment: &str,
+    ) -> Result<Option<CdPromotionRow>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT {CD_PROMOTION_COLUMNS} FROM cd_promotion_requests
+             WHERE system = $1 AND environment = $2
+               AND state NOT IN ('live', 'failed', 'cancelled')"
+        ))
+        .bind(system)
+        .bind(environment)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(cd_promotion_row))
+    }
+
+    /// Move a request to `step`, only from a state that step may follow:
+    /// a conditional update, so two jobs picking the same request cannot
+    /// both win. `detail` is merged into `step_detail` under the step's name.
+    pub async fn cd_promotion_step(
+        &self,
+        id: i64,
+        step: &str,
+        release: Option<&str>,
+        picked_by_build: Option<&str>,
+        detail: &serde_json::Value,
+    ) -> Result<CdPromotionRow, CdStepRefusal> {
+        let Some((_, from)) = CD_PROMOTION_STEPS.iter().find(|(s, _)| *s == step) else {
+            return Err(CdStepRefusal::WrongState(format!("no step {step:?}")));
+        };
+        let from: Vec<String> = from.iter().map(|s| (*s).to_owned()).collect();
+        let terminal = matches!(step, "live" | "failed" | "cancelled");
+        let row = sqlx::query(&format!(
+            "UPDATE cd_promotion_requests
+                SET state = $2,
+                    release = COALESCE($3, release),
+                    picked_by_build = COALESCE($4, picked_by_build),
+                    step_detail = step_detail || jsonb_build_object($2::text, $5::jsonb),
+                    updated_at = now(),
+                    finished_at = CASE WHEN $6 THEN now() ELSE finished_at END
+              WHERE id = $1 AND state = ANY($7)
+              RETURNING {CD_PROMOTION_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(step)
+        .bind(release)
+        .bind(picked_by_build)
+        .bind(detail)
+        .bind(terminal)
+        .bind(&from)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(CdStepRefusal::Db)?;
+        match row {
+            Some(r) => Ok(cd_promotion_row(r)),
+            None => match self.cd_promotion_get(id).await.map_err(CdStepRefusal::Db)? {
+                None => Err(CdStepRefusal::NoSuchRequest),
+                Some(r) => Err(CdStepRefusal::WrongState(r.state)),
+            },
+        }
+    }
+
+    /// When a version first went live on an environment, if it ever did.
+    pub async fn cd_first_live(
+        &self,
+        system: &str,
+        environment: &str,
+        version: &str,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT min(at) FROM cd_deployments
+             WHERE system = $1 AND environment = $2 AND version = $3 AND state = 'live'",
+        )
+        .bind(system)
+        .bind(environment)
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     // -- recordings ----------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)] // mirrors the catalog row shape
@@ -1682,6 +1883,30 @@ fn cd_hop_row(r: sqlx::postgres::PgRow) -> CdHopRow {
         at: r.get(13),
         run_state: r.get(14),
         run_delta_verdict: r.get(15),
+    }
+}
+
+const CD_PROMOTION_COLUMNS: &str = "id, system, environment, from_version, release, state, \
+     requested_by, requested_by_sub, note, evidence, step_detail, picked_by_build, created_at, \
+     updated_at, finished_at";
+
+fn cd_promotion_row(r: sqlx::postgres::PgRow) -> CdPromotionRow {
+    CdPromotionRow {
+        id: r.get(0),
+        system: r.get(1),
+        environment: r.get(2),
+        from_version: r.get(3),
+        release: r.get(4),
+        state: r.get(5),
+        requested_by: r.get(6),
+        requested_by_sub: r.get(7),
+        note: r.get(8),
+        evidence: r.get(9),
+        step_detail: r.get(10),
+        picked_by_build: r.get(11),
+        created_at: r.get(12),
+        updated_at: r.get(13),
+        finished_at: r.get(14),
     }
 }
 

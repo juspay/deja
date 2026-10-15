@@ -19,7 +19,7 @@ import React from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 
-import { loginUrl } from "../lib/me";
+import { loginUrl, useMe } from "../lib/me";
 import {
   cdApi,
   type ApiError,
@@ -30,7 +30,7 @@ import {
   type CdVersionRow,
   type CdVersionWhere,
 } from "../lib/api";
-import { ago, argoOf, carries, hopWord, howOf, isRunning, mergesSince, placesOf, pullRequestOf, stateTone, when } from "../lib/cd";
+import { ago, agoText, argoOf, carries, hopWord, howOf, inFlight, isRunning, mergesSince, placesOf, promotionCandidates, promotionProgress, pullRequestOf, stateTone, when } from "../lib/cd";
 
 // ---- shared ---------------------------------------------------------------
 
@@ -114,10 +114,10 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
     return (
       <div className="cd-pause on" role="status">
         <div>
-          <b>Pipeline paused</b> for {system}. No merge is deployed to integ, and no hop replay or release is started, until it
-          is resumed. Reconcile keeps reporting what runs.
+          <b>Pipeline paused</b> for {system}. No merge is deployed to integ, and no hop replay, release or promotion is
+          started, until it is resumed; one already past its first step finishes. Reconcile keeps reporting what runs.
           <div className="hint">
-            by {paused.changed_by} · {when(paused.changed_at)} · {ago(paused.changed_at) === "just now" ? "just now" : `${ago(paused.changed_at)} ago`}{paused.reason ? ` · ${paused.reason}` : ""}
+            by {paused.changed_by} · {when(paused.changed_at)} · {agoText(paused.changed_at)}{paused.reason ? ` · ${paused.reason}` : ""}
           </div>
           {flip.error && <div className="err">{String(flip.error)}</div>}
         </div>
@@ -145,7 +145,7 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
           }}
         >
           <label htmlFor="cd-pause-reason">
-            Why pause? integ-deploy, hop replays and releases stop before their next step; a step already running finishes.
+            Why pause? integ-deploy, hop replays, releases and promotions stop before their next step; a step already running finishes.
           </label>
           <input
             id="cd-pause-reason"
@@ -371,7 +371,15 @@ function Pipeline({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
                 )}
               </div>
             )}
-            <EnvCard env={env} row={byName.get(env)} system={system} cfg={cfg} promotable={cfg.promotable.includes(env)} />
+            <EnvCard
+              env={env}
+              row={byName.get(env)}
+              system={system}
+              cfg={cfg}
+              promotable={cfg.promotable.includes(env)}
+              source={i > 0 ? cfg.environments[i - 1] : null}
+              versions={versions.data?.versions ?? []}
+            />
           </React.Fragment>
         ))}
       </div>
@@ -420,7 +428,23 @@ function Pipeline({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
   );
 }
 
-function EnvCard({ env, row, system, cfg, promotable }: { env: string; row: CdEnvironment | undefined; system: string; cfg: CdConfig; promotable: boolean }) {
+function EnvCard({
+  env,
+  row,
+  system,
+  cfg,
+  promotable,
+  source,
+  versions,
+}: {
+  env: string;
+  row: CdEnvironment | undefined;
+  system: string;
+  cfg: CdConfig;
+  promotable: boolean;
+  source: string | null;
+  versions: { version: CdVersionRow; where: CdVersionWhere[] }[];
+}) {
   const live = row?.live ?? null;
   const latest = row?.latest ?? null;
   const lv = row?.live_version ?? null;
@@ -497,10 +521,213 @@ function EnvCard({ env, row, system, cfg, promotable }: { env: string; row: CdEn
           </div>
         )}
       </div>
+      {promotable && source && <Promotions env={env} source={source} system={system} cfg={cfg} targetLive={row?.live_version ?? null} versions={versions} />}
       <div className="cd-envfoot">
         <Link className="btn" to={href(`/deployments/environments/${encodeURIComponent(env)}`, system, cfg)}>
           History
         </Link>
+      </div>
+    </div>
+  );
+}
+
+// ---- promotion ----------------------------------------------------------------
+
+/** Whether the signed-in person may promote to `env`: `<env>_upgrader`, or in
+ *  beta a maintainer. The API decides; this only decides what is drawn. */
+function useMayPromote(env: string): boolean {
+  const me = useMe();
+  const roles = me.data?.roles ?? [];
+  return !!me.data?.authenticated && (roles.includes(`${env}_upgrader`) || roles.includes("maintainer"));
+}
+
+/** The promotable card's promotion section: the request in flight with its
+ *  step, or the Promote control. */
+function Promotions({
+  env,
+  source,
+  system,
+  cfg,
+  targetLive,
+  versions,
+}: {
+  env: string;
+  source: string;
+  system: string;
+  cfg: CdConfig;
+  targetLive: CdVersionRow | null;
+  versions: { version: CdVersionRow; where: CdVersionWhere[] }[];
+}) {
+  const may = useMayPromote(env);
+  const me = useMe();
+  const qc = useQueryClient();
+  const [open, setOpen] = React.useState(false);
+  const q = useQuery({ queryKey: ["cd", "promotions", system, env], queryFn: () => cdApi.promotions(system, env), refetchInterval: 10_000 });
+  const current = (q.data ?? []).find(inFlight) ?? null;
+  const last = !current ? (q.data ?? [])[0] ?? null : null;
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: ["cd", "promotions", system, env] });
+    void qc.invalidateQueries({ queryKey: ["cd", "environments", system] });
+  };
+  const cancel = useMutation({ mutationFn: (id: number) => cdApi.cancelPromotion(id), onSuccess: refresh });
+  const fail = useMutation({ mutationFn: ({ id, reason }: { id: number; reason: string }) => cdApi.markPromotionFailed(id, reason), onSuccess: refresh });
+  const maintainer = (me.data?.roles ?? []).includes("maintainer");
+  return (
+    <div className="cd-promo">
+      {current ? (
+        <div className="cd-promoreq">
+          <div>
+            <b>
+              Promoting <VersionLink version={current.from_version} system={system} cfg={cfg} />
+            </b>
+            {current.release && (
+              <>
+                {" as "}
+                <VersionLink version={current.release} system={system} cfg={cfg} />
+              </>
+            )}
+          </div>
+          <ol className="cd-steps">
+            {promotionProgress(current).map((s) => (
+              <li key={s.step} className={s.at}>
+                {s.step}
+              </li>
+            ))}
+          </ol>
+          <div className="hint">
+            #{current.id} by {current.requested_by} · {agoText(current.created_at)}{current.note ? ` · ${current.note}` : ""}
+          </div>
+          <div className="cd-promoactions">
+            {current.state === "pending" && (
+              <button className="btn" disabled={cancel.isPending} onClick={() => cancel.mutate(current.id)}>
+                Cancel
+              </button>
+            )}
+            {current.state !== "pending" && maintainer && (
+              <button
+                className="btn"
+                disabled={fail.isPending}
+                title="For a request the promote job will not finish: frees the environment for the next one"
+                onClick={() => {
+                  const reason = window.prompt("Why mark this promotion failed?");
+                  if (reason && reason.trim()) fail.mutate({ id: current.id, reason: reason.trim() });
+                }}
+              >
+                Mark failed
+              </button>
+            )}
+          </div>
+          {(cancel.error || fail.error) && <div className="err">{String(cancel.error ?? fail.error)}</div>}
+        </div>
+      ) : (
+        <>
+          {last && (
+            <div className="hint">
+              Last: #{last.id} {last.from_version}
+              {last.release ? ` as ${last.release}` : ""} · <span className={`chip ${last.state === "live" ? "ok" : last.state === "failed" ? "failed" : "muted"}`}>{last.state}</span>
+              {last.state === "failed" && (last.step_detail.failed?.reason ? ` · ${last.step_detail.failed.reason}` : "")}
+            </div>
+          )}
+          {may && (
+            <button className="btn primary" onClick={() => setOpen(true)}>
+              Promote to {env}
+            </button>
+          )}
+        </>
+      )}
+      {open && (
+        <PromoteDialog
+          env={env}
+          source={source}
+          system={system}
+          candidates={promotionCandidates(versions, source, targetLive)}
+          onClose={() => setOpen(false)}
+          onDone={() => {
+            setOpen(false);
+            refresh();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function PromoteDialog({
+  env,
+  source,
+  system,
+  candidates,
+  onClose,
+  onDone,
+}: {
+  env: string;
+  source: string;
+  system: string;
+  candidates: CdVersionRow[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [pick, setPick] = React.useState(candidates[0]?.version ?? "");
+  const [note, setNote] = React.useState("");
+  const check = useQuery({
+    queryKey: ["cd", "promotion-check", system, env, pick],
+    queryFn: () => cdApi.promotionCheck(system, env, pick),
+    enabled: !!pick,
+  });
+  const go = useMutation({ mutationFn: () => cdApi.promote(system, env, pick, note.trim()), onSuccess: onDone });
+  const picked = candidates.find((c) => c.version === pick);
+  const riding = candidates.slice(candidates.findIndex((c) => c.version === pick));
+  return (
+    <div className="cd-dialog" role="dialog" aria-modal="true" aria-labelledby="cd-promote-title">
+      <div className="cd-dialogbox">
+        <h2 id="cd-promote-title">
+          Promote to {env} <span className="beta">beta</span>
+        </h2>
+        {candidates.length === 0 ? (
+          <p className="hint">No merge has reached {source} since what {env} runs.</p>
+        ) : (
+          <>
+            <label htmlFor="cd-promote-pick">
+              Version, from what ran on {source}. It and every merge before it go to {env}; merges after it stay on {source}.
+            </label>
+            <select id="cd-promote-pick" value={pick} onChange={(e) => setPick(e.target.value)}>
+              {candidates.map((c) => (
+                <option key={c.version} value={c.version}>
+                  {c.version} · {carries(c)}
+                </option>
+              ))}
+            </select>
+            {picked && (
+              <p className="hint">
+                {riding.length === 1 ? `Only this merge goes to ${env}.` : `${riding.length} merges go to ${env}, this one and the ${riding.length - 1} before it.`} A release (CalVer tag on {picked.version}) is cut if
+                none exists yet, then deployed and synced.
+              </p>
+            )}
+            <h3>Checks</h3>
+            {check.isLoading && <p className="hint">checking…</p>}
+            {check.error && <p className="err">{String(check.error)}</p>}
+            {check.data && (
+              <ul className="cd-checks">
+                {check.data.checks.map((c) => (
+                  <li key={c.id} className={c.ok ? "ok" : "no"}>
+                    <span className={`chip ${c.ok ? "ok" : "failed"}`}>{c.ok ? "pass" : "fail"}</span> {c.why}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <label htmlFor="cd-promote-note">Note (optional, shown on the request)</label>
+            <input id="cd-promote-note" value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. QA signed off the avs check" />
+            {go.error && <p className="err">{String(go.error)}</p>}
+          </>
+        )}
+        <div className="cd-promoactions">
+          <button className="btn primary" disabled={!check.data?.ok || go.isPending} onClick={() => go.mutate()}>
+            {go.isPending ? "Promoting…" : `Promote ${pick || ""}`}
+          </button>
+          <button className="btn" onClick={onClose}>
+            Cancel
+          </button>
+        </div>
       </div>
     </div>
   );
